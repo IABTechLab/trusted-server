@@ -7,6 +7,47 @@ use error_stack::Report;
 use super::PlatformError;
 use super::image_optimizer::PlatformImageOptimizerOptions;
 
+/// What the caller wants the platform's intermediary cache to do with this request.
+///
+/// One enum rather than independent flags because on Fastly they are *not* independent:
+/// `set_surrogate_key` and `set_ttl` each "override any previous `Request::set_pass` call"
+/// (`fastly-0.12.1/src/http/request.rs:2462`, `:2381`). A pair of booleans could express
+/// "bypass the cache, and tag it for purge", which on Fastly silently means "do not
+/// bypass" — the opposite of how it reads. This type makes that combination unspellable.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PlatformCacheIntent {
+    /// Let the platform apply its default behavior, honoring origin freshness.
+    #[default]
+    Default,
+    /// Do not use the intermediary cache for this request.
+    Bypass,
+    /// Allow caching, tagged with a surrogate key so it can be purged.
+    Shared {
+        /// Key attached to the stored object.
+        surrogate_key: String,
+    },
+}
+
+impl PlatformCacheIntent {
+    /// Whether this intent asks the platform to skip its cache entirely.
+    #[must_use]
+    pub fn is_bypass(&self) -> bool {
+        matches!(self, Self::Bypass)
+    }
+
+    /// The surrogate key to tag the stored object with, when there is one.
+    ///
+    /// `None` for both [`Self::Default`] and [`Self::Bypass`]: attaching a key to a
+    /// bypassed request would reverse the bypass on Fastly.
+    #[must_use]
+    pub fn surrogate_key(&self) -> Option<&str> {
+        match self {
+            Self::Shared { surrogate_key } => Some(surrogate_key),
+            Self::Default | Self::Bypass => None,
+        }
+    }
+}
+
 /// Outbound HTTP request paired with a pre-resolved backend name.
 ///
 /// Uses `EdgeZero`'s neutral [`EdgeRequest`] type so adapters share one
@@ -23,12 +64,11 @@ pub struct PlatformHttpRequest {
     /// Adapters that cannot attach this metadata to their send path should
     /// return an error rather than silently dropping transformations.
     pub image_optimizer: Option<PlatformImageOptimizerOptions>,
-    /// Whether the platform's intermediary response cache must be bypassed.
+    /// What the platform's intermediary response cache should do with this request.
     ///
-    /// Adapters without an intermediary outbound cache may treat this as already
-    /// satisfied. The option defaults to `false` so existing call sites preserve
-    /// their current cache behavior.
-    pub bypass_cache: bool,
+    /// Adapters without an intermediary outbound cache may ignore it. Defaults to
+    /// [`PlatformCacheIntent::Default`] so existing call sites preserve their behavior.
+    pub cache_intent: PlatformCacheIntent,
     /// Whether the response body should stay streaming in the platform response.
     ///
     /// Adapters that cannot preserve streaming response bodies should return an
@@ -44,7 +84,7 @@ impl PlatformHttpRequest {
             request,
             backend_name: backend_name.into(),
             image_optimizer: None,
-            bypass_cache: false,
+            cache_intent: PlatformCacheIntent::Default,
             stream_response: false,
         }
     }
@@ -63,7 +103,19 @@ impl PlatformHttpRequest {
     /// Bypass the platform's intermediary response cache for this request.
     #[must_use]
     pub fn with_cache_bypass(mut self) -> Self {
-        self.bypass_cache = true;
+        self.cache_intent = PlatformCacheIntent::Bypass;
+        self
+    }
+
+    /// Allow the platform to cache this response, tagged for purge.
+    ///
+    /// Replaces any prior bypass rather than combining with it, because the two cannot
+    /// both hold: see [`PlatformCacheIntent`].
+    #[must_use]
+    pub fn with_shared_cache(mut self, surrogate_key: impl Into<String>) -> Self {
+        self.cache_intent = PlatformCacheIntent::Shared {
+            surrogate_key: surrogate_key.into(),
+        };
         self
     }
 
@@ -396,8 +448,9 @@ mod tests {
             "stub-backend",
         );
 
-        assert!(
-            !request.bypass_cache,
+        assert_eq!(
+            request.cache_intent,
+            PlatformCacheIntent::Default,
             "should preserve existing cache behavior by default"
         );
     }
@@ -412,9 +465,58 @@ mod tests {
         )
         .with_cache_bypass();
 
-        assert!(
-            request.bypass_cache,
+        assert_eq!(
+            request.cache_intent,
+            PlatformCacheIntent::Bypass,
             "should enable intermediary cache bypass"
+        );
+    }
+
+    #[test]
+    fn cache_intent_cannot_request_bypass_and_a_surrogate_key_at_once() {
+        // The whole reason this is an enum. On Fastly a surrogate key reverses a prior
+        // set_pass, so "bypass, and tag for purge" would silently mean "do not bypass".
+        let bypass = PlatformCacheIntent::Bypass;
+        let shared = PlatformCacheIntent::Shared {
+            surrogate_key: "ts-origin".to_owned(),
+        };
+
+        assert!(bypass.is_bypass());
+        assert!(bypass.surrogate_key().is_none());
+        assert!(!shared.is_bypass());
+        assert_eq!(shared.surrogate_key(), Some("ts-origin"));
+        assert!(PlatformCacheIntent::Default.surrogate_key().is_none());
+        assert!(!PlatformCacheIntent::Default.is_bypass());
+    }
+
+    #[test]
+    fn the_last_cache_builder_call_wins_rather_than_combining() {
+        // Builders replace rather than accumulate: a request cannot end up asking for
+        // both, whichever order a caller writes them in.
+        let base = || {
+            PlatformHttpRequest::new(
+                request_builder()
+                    .body(Body::empty())
+                    .expect("should build request"),
+                "stub-backend",
+            )
+        };
+
+        assert_eq!(
+            base()
+                .with_cache_bypass()
+                .with_shared_cache("ts-origin")
+                .cache_intent,
+            PlatformCacheIntent::Shared {
+                surrogate_key: "ts-origin".to_owned()
+            }
+        );
+        assert_eq!(
+            base()
+                .with_shared_cache("ts-origin")
+                .with_cache_bypass()
+                .cache_intent,
+            PlatformCacheIntent::Bypass
         );
     }
 

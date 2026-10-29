@@ -50,7 +50,7 @@ Simulates the full Fastly production environment locally.
 Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastly), then install Viceroy:
 
 ```bash
-cargo install viceroy --version 0.17.0 --locked --force
+cargo install viceroy --version 0.21.0 --locked --force
 ```
 
 Create and push the starter config, then start the local Fastly simulator:
@@ -80,6 +80,10 @@ the variables into your shell before starting the server.
 cp trusted-server.example.toml trusted-server.toml
 set -a && source .env.dev && set +a
 
+# Use the repository's default app-config store name and key for this quickstart.
+unset EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME
+unset EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY
+
 # Create the local blob-backed config-store entry.
 ts config push --adapter axum --local --yes
 export TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG="$(
@@ -106,11 +110,24 @@ The server will be available at `http://localhost:8787`. Set `PORT=<port>` befor
 | Config store value | `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` | `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG=…` |
 | Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PROXY_KEY=…`            |
 
+The repeated `TRUSTED_SERVER_CONFIG` segments in the example are intentional:
+`TRUSTED_SERVER_CONFIG_` is the adapter prefix, followed by the resolved store
+name and blob key. Both default to `[stores.config].default` in `edgezero.toml`,
+currently `trusted_server_config`. The commands above assume that repository
+default and clear any name/key overrides left in the shell.
+
+If you customize the defaults or use `EDGEZERO__STORES__CONFIG__<ID>__NAME` or
+`__KEY`, adjust the exported variable's store/key segments and the `jq` key to
+match. Pass a matching `--key` to `ts config push` when overriding the runtime
+key. The local JSON filename still uses the logical store ID, even with a
+physical-name override.
+
 The config-store value is the verified app-config blob. Secret-store values are
 looked up by the key names in that blob. Store names and key names are uppercased
-with hyphens and dots replaced by underscores. The quick-start exports ephemeral
-secret-store values only into the current shell; do not put secret values in the
-TOML config, config-store blob, or a source-controlled environment file.
+with hyphens, dots, and spaces replaced by underscores. The quick-start exports
+ephemeral secret-store values only into the current shell; do not put secret
+values in the TOML config, config-store blob, or a source-controlled environment
+file.
 
 > **Dev server limitations:** The Axum adapter does not support KV store,
 > geo lookup, config/secret-store writes, or admin key-management routes.
@@ -147,7 +164,7 @@ ts config init
 To bootstrap from a public publisher page, run an audit first:
 
 ```bash
-ts audit https://publisher.example
+ts audit generate https://publisher.example
 ```
 
 The audit command writes `js-assets.toml` plus a draft `trusted-server.toml`.
@@ -190,9 +207,31 @@ Restart or redeploy instances after secret rotation. See
 
 ## Deploy to Fastly
 
+Trusted Server declares Config, KV, and Secret Stores, so deployment must go
+through EdgeZero's managed path. That path links each selected physical store
+to the service version under its logical ID; `fastly compute publish` clones
+the active version's links instead and activates a version whose logical links
+are missing.
+
 ```bash
-fastly compute publish
+TRUSTED_SERVER__GIT_VERSION=v1.3.0 \
+  EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
+  ts deploy --adapter fastly --service-id <service-id> --application-release "<release-root>"
 ```
+
+See [the Fastly guide](/guide/fastly#upgrading-from-edgezero-v0-0-8) when
+upgrading a service that was deployed before logical store links, and
+[the CLI guide](/guide/cli#lifecycle-commands) for where `<release-root>`
+comes from.
+
+The build compiles `TRUSTED_SERVER__GIT_VERSION` into the binary and reports it
+in the `x-ts-version` response header, so the variable must be set for the
+build the deploy runs, not just for the activation step. The Fastly service
+version is in `x-ts-fastly-version`. Without the variable, a build reports the
+checked-out tag, else the branch, else the first 6 characters of the commit,
+and a build outside a git checkout omits the header. The value is public on
+every response, so pass a neutral value such as the commit hash when a branch
+name is sensitive.
 
 ## Next Steps
 

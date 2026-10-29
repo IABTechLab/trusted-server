@@ -3,6 +3,8 @@
 //! This module provides functionality for parsing, stripping, and forwarding cookies used in the
 //! trusted server system.
 
+pub(crate) mod template_cache_policy;
+
 use cookie::{Cookie, CookieJar};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};

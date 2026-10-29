@@ -7,7 +7,7 @@ use crate::auction::telemetry::{AuctionTelemetrySink, NoopAuctionTelemetrySink};
 
 use super::{
     PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
-    PlatformSecretStore,
+    PlatformSecretStore, PlatformTimer,
 };
 
 /// Geographic information extracted from a request.
@@ -170,7 +170,7 @@ pub struct RuntimeServices {
     pub(crate) kv_store: Arc<dyn PlatformKvStore>,
     /// Shared transformed-template cache. Defaults to
     /// [`UnavailableTemplateCache`], so adapters without one degrade to transforming
-    /// per request rather than failing. Spike-only; see
+    /// per request rather than failing. See
     /// [`crate::platform::template_cache`].
     pub(crate) template_cache: Arc<dyn super::PlatformTemplateCache>,
     /// Platform-specific cold-response template assembler.
@@ -188,6 +188,8 @@ pub struct RuntimeServices {
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
+    /// Optional cooperative timer; absent on blocking host runtimes.
+    pub(crate) timer: Option<Arc<dyn PlatformTimer>>,
 }
 
 impl RuntimeServices {
@@ -215,6 +217,12 @@ impl RuntimeServices {
         RuntimeServicesBuilder::new()
     }
 
+    /// Return the request's optional cooperative timer.
+    #[must_use]
+    pub fn timer(&self) -> Option<&dyn PlatformTimer> {
+        self.timer.as_deref()
+    }
+
     /// Returns the config store service.
     #[must_use]
     pub fn config_store(&self) -> &dyn PlatformConfigStore {
@@ -233,7 +241,7 @@ impl RuntimeServices {
         &*self.kv_store
     }
 
-    /// The shared transformed-template cache. Spike-only.
+    /// The shared transformed-template cache.
     #[must_use]
     pub fn template_cache(&self) -> &dyn super::PlatformTemplateCache {
         &*self.template_cache
@@ -296,8 +304,6 @@ impl RuntimeServices {
     }
 
     /// Returns a clone of this instance with the template cache replaced.
-    ///
-    /// Spike-only (#1009).
     #[must_use]
     pub fn with_template_cache(self, cache: Arc<dyn super::PlatformTemplateCache>) -> Self {
         Self {
@@ -342,6 +348,7 @@ pub struct RuntimeServicesBuilder {
     geo: Option<Arc<dyn PlatformGeo>>,
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
+    timer: Option<Arc<dyn PlatformTimer>>,
 }
 
 impl RuntimeServicesBuilder {
@@ -357,7 +364,15 @@ impl RuntimeServicesBuilder {
             geo: None,
             auction_telemetry_sink: None,
             client_info: None,
+            timer: None,
         }
+    }
+
+    /// Set the cooperative timer for request-time yielding work.
+    #[must_use]
+    pub fn timer(mut self, timer: Arc<dyn PlatformTimer>) -> Self {
+        self.timer = Some(timer);
+        self
     }
 
     /// Set the config store implementation.
@@ -374,7 +389,7 @@ impl RuntimeServicesBuilder {
         self
     }
 
-    /// Set the shared transformed-template cache. Spike-only.
+    /// Set the shared transformed-template cache.
     #[must_use]
     pub fn template_cache(mut self, cache: Arc<dyn super::PlatformTemplateCache>) -> Self {
         self.template_cache = Some(cache);
@@ -444,6 +459,7 @@ impl RuntimeServicesBuilder {
     #[must_use]
     pub fn build(self) -> RuntimeServices {
         RuntimeServices {
+            timer: self.timer,
             config_store: self
                 .config_store
                 .expect("should set config_store before building RuntimeServices"),

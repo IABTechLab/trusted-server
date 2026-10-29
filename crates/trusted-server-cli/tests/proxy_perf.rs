@@ -3,7 +3,7 @@
 //! These tests assert deterministic connection and handshake counts. Their
 //! wall-clock output is evidence for manual comparison, never a CI threshold.
 
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 #![allow(clippy::print_stdout)]
 
 use std::sync::Arc;

@@ -7,9 +7,10 @@ use edgezero_cli::args::{
 };
 use trusted_server_core::config::TrustedServerAppConfig;
 
-use crate::commands::audit::AuditArgs;
-use crate::commands::audit::browser_collector::BrowserAuditCollector;
+use crate::commands::audit::{AuditArgs, run_audit};
+use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
 use crate::commands::config::init::{ConfigInitArgs, run_config_init};
+use crate::commands::pbs::{self, PbsArgs};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
 #[derive(Debug, Parser)]
@@ -23,12 +24,15 @@ struct Args {
 enum Command {
     /// Print the currently active deployment version for a target adapter.
     ActiveVersion(ActiveVersionArgs),
-    /// Audit a public page and write draft Trusted Server artifacts.
-    Audit(AuditArgs),
+    /// Browser-backed page and ad-template audits.
+    Audit(Box<AuditArgs>),
     /// Sign in / out / status against an `EdgeZero` adapter.
     Auth(AuthArgs),
     /// Build the project for a target adapter.
     Build(BuildArgs),
+    /// Shared template cache commands.
+    #[command(subcommand)]
+    Cache(crate::commands::cache::CacheCommand),
     /// Trusted Server app-config commands.
     #[command(subcommand)]
     Config(ConfigCommand),
@@ -44,13 +48,19 @@ enum Command {
     Rollback(RollbackArgs),
     /// Serve the project locally through a target adapter.
     Serve(ServeArgs),
-    /// Local developer tools (e.g. the macOS-only production-hostname proxy).
+    /// Local developer tools (e.g. the macOS/Linux production-hostname proxy).
     #[command(subcommand)]
     Dev(crate::commands::dev::DevCommand),
+    /// Questions about a publisher origin's behaviour.
+    #[command(subcommand)]
+    Origin(crate::commands::origin::OriginCommand),
 }
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    /// Diagnose server-side ad-template configuration and path matching.
+    #[command(name = "ad-templates", subcommand)]
+    AdTemplates(AdTemplatesCommand),
     /// Initialize a Trusted Server config file from the example template.
     Init(ConfigInitArgs),
     /// Diff `trusted-server.toml` against the live `EdgeZero` config.
@@ -71,8 +81,30 @@ struct PrebidArgs {
 
 #[derive(Debug, Subcommand)]
 enum PrebidCommand {
-    /// Generate a local external Prebid bundle and update config metadata.
-    Bundle(PrebidBundleArgs),
+    /// Generate a local external Prebid client bundle and update config metadata.
+    Client(PrebidBundleArgs),
+    /// Configure and operate a self-hosted Prebid Server deployment.
+    Server(PbsArgs),
+}
+
+/// Process-level outcome for commands that distinguish drift from tool errors.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RunOutcome {
+    /// Command completed without drift.
+    Success,
+    /// Command ran successfully and found assertion drift.
+    AssertionFailed,
+}
+
+impl RunOutcome {
+    /// Stable process exit code for this outcome.
+    #[must_use]
+    pub const fn exit_code(self) -> i32 {
+        match self {
+            Self::Success => 0,
+            Self::AssertionFailed => 1,
+        }
+    }
 }
 
 /// Run the CLI using process arguments.
@@ -81,52 +113,73 @@ enum PrebidCommand {
 ///
 /// Returns an error when command parsing, config validation, `EdgeZero`
 /// delegation, audit collection, config initialization, or Prebid bundle generation fails.
-pub fn run_from_env() -> Result<(), String> {
+pub fn run_from_env() -> Result<RunOutcome, String> {
     dispatch(Args::parse())
 }
 
-fn dispatch(args: Args) -> Result<(), String> {
+fn dispatch(args: Args) -> Result<RunOutcome, String> {
     match args.command {
-        Command::ActiveVersion(args) => edgezero_cli::run_active_version(&args),
-        Command::Audit(args) => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            let collector = BrowserAuditCollector;
-            crate::commands::audit::run_audit(&args, &collector, &mut out)
+        Command::ActiveVersion(args) => {
+            edgezero_cli::run_active_version(&args).map(|()| RunOutcome::Success)
         }
-        Command::Auth(args) => edgezero_cli::run_auth(&args),
-        Command::Build(args) => edgezero_cli::run_build(&args),
-        Command::Config(ConfigCommand::Init(args)) => run_config_init(&args),
+        Command::Auth(args) => edgezero_cli::run_auth(&args).map(|()| RunOutcome::Success),
+        Command::Audit(args) => run_audit(&args),
+        Command::Build(args) => edgezero_cli::run_build(&args).map(|()| RunOutcome::Success),
+        Command::Config(ConfigCommand::AdTemplates(args)) => run_ad_templates(&args),
+        Command::Config(ConfigCommand::Init(args)) => {
+            run_config_init(&args).map(|()| RunOutcome::Success)
+        }
         Command::Config(ConfigCommand::Diff(args)) => {
             match edgezero_cli::run_config_diff_typed::<TrustedServerAppConfig>(&args) {
-                Ok(edgezero_cli::DiffExit { code: 0 }) => Ok(()),
+                Ok(edgezero_cli::DiffExit { code: 0 }) => Ok(RunOutcome::Success),
+                Ok(edgezero_cli::DiffExit { code: 1 }) => Ok(RunOutcome::AssertionFailed),
                 Ok(edgezero_cli::DiffExit { code }) => process::exit(code),
                 Err(err) => Err(err),
             }
         }
-        Command::Config(ConfigCommand::Gc(args)) => edgezero_cli::run_config_gc(&args),
+        Command::Config(ConfigCommand::Gc(args)) => {
+            edgezero_cli::run_config_gc(&args).map(|()| RunOutcome::Success)
+        }
         Command::Config(ConfigCommand::Push(args)) => {
             edgezero_cli::run_config_push_typed::<TrustedServerAppConfig>(&args)
+                .map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Validate(args)) => {
             edgezero_cli::run_config_validate_typed::<TrustedServerAppConfig>(&args)
+                .map(|()| RunOutcome::Success)
         }
-        Command::Deploy(args) => edgezero_cli::run_deploy(&args),
-        Command::Healthcheck(args) => edgezero_cli::run_healthcheck(&args),
-        Command::Prebid(prebid) => {
-            let mut generator = NpmPrebidBundleGenerator;
-            let mut stdout = std::io::stdout();
-            let mut stderr = std::io::stderr();
-            match prebid.command {
-                PrebidCommand::Bundle(args) => {
-                    run_bundle(&args, &mut generator, &mut stdout, &mut stderr)
-                }
+        Command::Deploy(args) => edgezero_cli::run_deploy(&args).map(|()| RunOutcome::Success),
+        Command::Healthcheck(args) => {
+            edgezero_cli::run_healthcheck(&args).map(|()| RunOutcome::Success)
+        }
+        Command::Prebid(prebid) => match prebid.command {
+            PrebidCommand::Client(args) => {
+                let mut generator = NpmPrebidBundleGenerator;
+                let mut stdout = std::io::stdout();
+                let mut stderr = std::io::stderr();
+                run_bundle(&args, &mut generator, &mut stdout, &mut stderr)
+                    .map(|()| RunOutcome::Success)
             }
+            PrebidCommand::Server(args) => pbs::run(&args)
+                .map(|()| RunOutcome::Success)
+                .map_err(|error| error.current_context().to_string()),
+        },
+        Command::Provision(args) => {
+            edgezero_cli::run_provision(&args).map(|()| RunOutcome::Success)
         }
-        Command::Provision(args) => edgezero_cli::run_provision(&args),
-        Command::Rollback(args) => edgezero_cli::run_rollback(&args),
-        Command::Serve(args) => edgezero_cli::run_serve(&args),
-        Command::Dev(command) => crate::commands::dev::run(command),
+        Command::Rollback(args) => edgezero_cli::run_rollback(&args).map(|()| RunOutcome::Success),
+        Command::Serve(args) => edgezero_cli::run_serve(&args).map(|()| RunOutcome::Success),
+        Command::Dev(command) => crate::commands::dev::run(command).map(|()| RunOutcome::Success),
+        Command::Cache(command) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::commands::cache::run(command, &mut out).map(|()| RunOutcome::Success)
+        }
+        Command::Origin(command) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::commands::origin::run(command, &mut out).map(|()| RunOutcome::Success)
+        }
     }
 }
 
@@ -134,7 +187,6 @@ fn dispatch(args: Args) -> Result<(), String> {
 mod tests {
     use std::path::PathBuf;
 
-    use clap::Parser as _;
     use edgezero_cli::args::{AuthSub, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs};
 
     use super::*;
@@ -151,6 +203,100 @@ mod tests {
             err.kind(),
             clap::error::ErrorKind::DisplayVersion,
             "should print the version rather than fail to parse"
+        );
+    }
+
+    #[test]
+    fn prebid_rejects_retired_bundle_command() {
+        let error = Args::try_parse_from(["ts", "prebid", "bundle"])
+            .expect_err("should reject intentionally retired bundle spelling");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn prebid_server_secret_help_explains_descriptor_relative_paths() {
+        let error = Args::try_parse_from(["ts", "prebid", "server", "secrets", "set", "--help"])
+            .expect_err("should display secret help");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(
+            error
+                .to_string()
+                .contains("Deployment descriptor; paths inside it are relative to this file")
+        );
+    }
+
+    #[test]
+    fn parses_prebid_server_inspect() {
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "prebid",
+                "server",
+                "inspect",
+                "--config",
+                "trusted-server.toml",
+                "--json",
+            ])
+            .is_ok(),
+            "should accept PBS commands under the Prebid namespace"
+        );
+    }
+
+    #[test]
+    fn prebid_server_rejects_ambiguous_secret_inputs_and_unimplemented_commands() {
+        for arguments in [
+            vec!["ts", "prebid", "server", "deploy"],
+            vec!["ts", "prebid", "server", "rollback", "--release", "example"],
+            vec!["ts", "prebid", "server", "check"],
+            vec![
+                "ts",
+                "prebid",
+                "server",
+                "secrets",
+                "set",
+                "examplebidder",
+                "--deployment",
+                "deployment.yaml",
+                "--region",
+                "us-east-1",
+                "--yes",
+            ],
+            vec![
+                "ts",
+                "prebid",
+                "server",
+                "secrets",
+                "set",
+                "examplebidder",
+                "--deployment",
+                "deployment.yaml",
+                "--region",
+                "us-east-1",
+                "--file",
+                "secret.json",
+                "--stdin",
+            ],
+        ] {
+            assert!(
+                Args::try_parse_from(arguments).is_err(),
+                "should reject unsafe or unsupported command shape"
+            );
+        }
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "prebid",
+                "server",
+                "check",
+                "--deployment",
+                "deployment.yaml",
+                "--json",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Args::try_parse_from(["ts", "prebid", "client", "--config", "trusted-server.toml"])
+                .is_ok()
         );
     }
 
@@ -354,61 +500,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_audit_with_default_outputs() {
-        let args = parse(&["ts", "audit", "https://publisher.example"]);
-        let Command::Audit(audit) = args.command else {
-            panic!("expected audit command");
-        };
-        assert_eq!(audit.url, "https://publisher.example");
-        assert_eq!(audit.js_assets, None);
-        assert_eq!(audit.config, None);
-        assert!(!audit.no_js_assets);
-        assert!(!audit.no_config);
-        assert!(!audit.force);
-    }
-
-    #[test]
-    fn parses_audit_with_custom_outputs() {
-        let args = parse(&[
-            "ts",
-            "audit",
-            "https://publisher.example",
-            "--js-assets",
-            "audit/js-assets.toml",
-            "--config",
-            "audit/trusted-server.toml",
-            "--no-js-assets",
-            "--no-config",
-            "--force",
-        ]);
-        let Command::Audit(audit) = args.command else {
-            panic!("expected audit command");
-        };
-        assert_eq!(audit.js_assets, Some(PathBuf::from("audit/js-assets.toml")));
-        assert_eq!(
-            audit.config,
-            Some(PathBuf::from("audit/trusted-server.toml"))
-        );
-        assert!(audit.no_js_assets);
-        assert!(audit.no_config);
-        assert!(audit.force);
-    }
-
-    #[test]
-    fn audit_does_not_accept_adapter_option() {
-        let error = Args::try_parse_from([
-            "ts",
-            "audit",
-            "https://publisher.example",
-            "--adapter",
-            "fastly",
-        ])
-        .expect_err("should reject audit adapter option");
-        assert!(
-            error.to_string().contains("unexpected argument")
-                || error.to_string().contains("Found argument"),
-            "error should explain unsupported option"
-        );
+    fn run_outcomes_use_documented_exit_codes() {
+        assert_eq!(RunOutcome::Success.exit_code(), 0);
+        assert_eq!(RunOutcome::AssertionFailed.exit_code(), 1);
     }
 
     #[test]
@@ -498,7 +592,7 @@ mod tests {
         let Command::Config(ConfigCommand::Push(push)) = args.command else {
             panic!("expected config push command");
         };
-        assert!(push.staging, "should target the derived staging key");
+        assert!(push.staging, "should target the staging publication flow");
 
         Args::try_parse_from([
             "ts",
@@ -521,7 +615,7 @@ mod tests {
         };
         assert!(
             diff.staging,
-            "should compare against the derived staging key"
+            "should compare against the staging publication flow"
         );
 
         Args::try_parse_from([
@@ -639,22 +733,438 @@ mod tests {
     }
 
     #[test]
-    fn prebid_bundle_defaults_match_spec() {
-        let args = parse(&["ts", "prebid", "bundle"]);
-        let Command::Prebid(prebid) = args.command else {
-            panic!("expected prebid command");
+    fn config_ad_templates_match_parses_app_config_flags() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "ad-templates",
+            "match",
+            "--app-config",
+            "publisher-a.toml",
+            "--no-env",
+            "--details",
+            "/news/story",
+        ]);
+        let Command::Config(ConfigCommand::AdTemplates(AdTemplatesCommand::Match(match_args))) =
+            args.command
+        else {
+            panic!("expected ad-templates match command");
         };
-        let PrebidCommand::Bundle(bundle) = prebid.command;
-        assert_eq!(bundle.config, PathBuf::from("trusted-server.toml"));
-        assert_eq!(bundle.out, PathBuf::from("dist/prebid"));
+        assert_eq!(
+            match_args.config.app_config,
+            Some(PathBuf::from("publisher-a.toml"))
+        );
+        assert!(match_args.config.no_env);
+        assert!(match_args.details);
+        assert_eq!(match_args.path_or_url, "/news/story");
     }
 
     #[test]
-    fn prebid_bundle_accepts_custom_paths() {
+    fn config_ad_templates_check_parses_expected_slots() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "ad-templates",
+            "check",
+            "/sports/game",
+            "--expected-slot",
+            "atf",
+            "--expected-slot",
+            "sports-sidebar",
+            "--allow-extra-slots",
+        ]);
+        let Command::Config(ConfigCommand::AdTemplates(AdTemplatesCommand::Check(check_args))) =
+            args.command
+        else {
+            panic!("expected ad-templates check command");
+        };
+        assert_eq!(check_args.path_or_url, "/sports/game");
+        assert_eq!(check_args.expected_slots, ["atf", "sports-sidebar"]);
+        assert!(check_args.allow_extra_slots);
+        assert!(!check_args.expect_no_slots);
+    }
+
+    #[test]
+    fn config_ad_templates_check_requires_an_expectation_mode() {
+        assert!(Args::try_parse_from(["ts", "config", "ad-templates", "check", "/news"]).is_err());
+    }
+
+    #[test]
+    fn config_ad_templates_check_rejects_extra_slots_with_no_slots_mode() {
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "config",
+                "ad-templates",
+                "check",
+                "/news",
+                "--expect-no-slots",
+                "--allow-extra-slots",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn config_ad_templates_explain_rejects_removed_edgezero_model() {
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "config",
+                "ad-templates",
+                "explain",
+                "/news",
+                "--edgezero-enabled",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        // clap validates `requires` / `conflicts_with` argument-id references
+        // only from an explicit `debug_assert`. Without this, renaming or
+        // typoing an id compiles and ships.
+        <Args as clap::CommandFactory>::command().debug_assert();
+    }
+
+    #[test]
+    fn bare_audit_namespace_displays_help_as_an_error() {
+        let error = Args::try_parse_from(["ts", "audit"]).expect_err("should require audit mode");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+    }
+
+    #[test]
+    fn audit_legacy_url_parses_with_artifact_generation_flags() {
+        let args = parse(&[
+            "ts",
+            "audit",
+            "https://www.example.com/",
+            "--js-assets",
+            "audit/assets.toml",
+            "--config",
+            "audit/config.toml",
+            "--force",
+            "--cookie",
+            "session=example",
+            "--chrome",
+            "/tmp/test-chrome",
+            "--headful",
+            "--no-assume-consent",
+            "--browser-proxy",
+            "127.0.0.1:8080",
+            "--settle-quiet-ms",
+            "900",
+            "--settle-max-ms",
+            "13000",
+            "--danger-accept-invalid-certs",
+        ]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        assert_eq!(
+            audit.legacy_generate.js_assets,
+            Some(PathBuf::from("audit/assets.toml"))
+        );
+        assert_eq!(
+            audit.legacy_generate.config,
+            Some(PathBuf::from("audit/config.toml"))
+        );
+        assert!(audit.legacy_generate.force);
+        assert_eq!(
+            audit.legacy_generate.cookies,
+            [("session".to_string(), "example".to_string())]
+        );
+        assert_eq!(
+            audit.legacy_generate.browser.chrome,
+            Some(PathBuf::from("/tmp/test-chrome"))
+        );
+        assert!(audit.legacy_generate.browser.headful);
+        assert!(audit.legacy_generate.browser.no_assume_consent);
+        assert_eq!(
+            audit.legacy_generate.browser.browser_proxy.as_deref(),
+            Some("127.0.0.1:8080")
+        );
+        assert_eq!(audit.legacy_generate.browser.settle_quiet_ms, 900);
+        assert_eq!(audit.legacy_generate.browser.settle_max_ms, 13_000);
+        assert!(audit.legacy_generate.browser.danger_accept_invalid_certs);
+    }
+
+    #[test]
+    fn audit_help_does_not_advertise_hidden_legacy_browser_flags() {
+        let error =
+            Args::try_parse_from(["ts", "audit", "--help"]).expect_err("should render audit help");
+        let help = error.to_string();
+
+        for flag in [
+            "--chrome",
+            "--headful",
+            "--no-assume-consent",
+            "--browser-proxy",
+            "--settle-quiet-ms",
+            "--settle-max-ms",
+            "--danger-accept-invalid-certs",
+        ] {
+            assert!(
+                !help.contains(flag),
+                "`{flag}` is a legacy-only alias flag and must stay hidden; got {help}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_rejects_parent_browser_flags_before_a_subcommand() {
+        // `is_err()` alone would also pass if `--chrome` were deleted from
+        // `LegacyBrowserOpts` (an `UnknownArgument`), which is the opposite of
+        // the invariant this pins: the flag exists but requires the legacy URL.
+        let error = Args::try_parse_from([
+            "ts",
+            "audit",
+            "--chrome",
+            "/tmp/test-chrome",
+            "generate",
+            "https://www.example.com/",
+        ])
+        .expect_err("a parent-level browser flag must not be silently ignored");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "should reject the flag for lacking the legacy URL it requires"
+        );
+    }
+
+    #[test]
+    fn audit_page_subcommand_parses_with_page_settle_defaults() {
+        let args = parse(&["ts", "audit", "page", "https://www.example.com/"]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let Some(crate::commands::audit::AuditSubcommand::Page(page)) = audit.command else {
+            panic!("expected audit page command");
+        };
+        assert_eq!(page.browser.settle_quiet_ms, 750);
+        assert_eq!(page.browser.settle_max_ms, 10_000);
+    }
+
+    #[test]
+    fn audit_generate_subcommands_use_generation_settle_defaults() {
+        let args = parse(&["ts", "audit", "generate", "https://www.example.com/"]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let Some(crate::commands::audit::AuditSubcommand::Generate(generate)) = audit.command
+        else {
+            panic!("expected audit generate command");
+        };
+        assert_eq!(generate.browser.settle_quiet_ms, 750);
+        assert_eq!(generate.browser.settle_max_ms, 12_000);
+
+        let args = parse(&[
+            "ts",
+            "audit",
+            "ad-templates",
+            "generate",
+            "https://www.example.com/",
+        ]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let Some(crate::commands::audit::AuditSubcommand::AdTemplates(
+            crate::commands::audit::AuditAdTemplatesCommand::Generate(generate),
+        )) = audit.command
+        else {
+            panic!("expected audit ad-templates generate command");
+        };
+        assert_eq!(generate.browser.settle_quiet_ms, 750);
+        assert_eq!(generate.browser.settle_max_ms, 12_000);
+        assert!(!generate.scroll, "generation should not scroll by default");
+    }
+
+    #[test]
+    fn audit_ad_templates_generate_parses_scroll() {
+        let args = parse(&[
+            "ts",
+            "audit",
+            "ad-templates",
+            "generate",
+            "https://www.example.com/",
+            "--scroll",
+        ]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let Some(crate::commands::audit::AuditSubcommand::AdTemplates(
+            crate::commands::audit::AuditAdTemplatesCommand::Generate(generate),
+        )) = audit.command
+        else {
+            panic!("expected audit ad-templates generate command");
+        };
+
+        assert!(
+            generate.scroll,
+            "--scroll should enable generation scrolling"
+        );
+    }
+
+    #[test]
+    fn audit_ad_templates_verify_parses() {
+        let args = parse(&[
+            "ts",
+            "audit",
+            "ad-templates",
+            "verify",
+            "https://www.example.com/",
+        ]);
+        assert!(matches!(args.command, Command::Audit(_)));
+    }
+
+    #[test]
+    fn audit_browser_options_are_shared_by_generate_and_verify() {
+        for mode in ["generate", "verify"] {
+            let args = parse(&[
+                "ts",
+                "audit",
+                "ad-templates",
+                mode,
+                "https://www.example.com/",
+                "--chrome",
+                "/tmp/test-chrome",
+                "--headful",
+                "--browser-proxy",
+                "127.0.0.1:8080",
+                "--no-assume-consent",
+                "--settle-quiet-ms",
+                "100",
+                "--settle-max-ms",
+                "200",
+            ]);
+            let Command::Audit(audit) = args.command else {
+                panic!("expected audit command");
+            };
+            let (chrome, headful, no_assume_consent, browser_proxy, validation) =
+                match audit.command.expect("should parse audit subcommand") {
+                    crate::commands::audit::AuditSubcommand::AdTemplates(
+                        crate::commands::audit::AuditAdTemplatesCommand::Generate(args),
+                    ) => {
+                        let validation = args.browser.validate();
+                        (
+                            args.browser.chrome,
+                            args.browser.headful,
+                            args.browser.no_assume_consent,
+                            args.browser.browser_proxy,
+                            validation,
+                        )
+                    }
+                    crate::commands::audit::AuditSubcommand::AdTemplates(
+                        crate::commands::audit::AuditAdTemplatesCommand::Verify(args),
+                    ) => {
+                        let validation = args.browser.validate();
+                        (
+                            args.browser.chrome,
+                            args.browser.headful,
+                            args.browser.no_assume_consent,
+                            args.browser.browser_proxy,
+                            validation,
+                        )
+                    }
+                    _ => panic!("expected ad-template mode"),
+                };
+            assert_eq!(chrome, Some(PathBuf::from("/tmp/test-chrome")));
+            assert!(headful);
+            assert!(no_assume_consent);
+            assert_eq!(browser_proxy.as_deref(), Some("127.0.0.1:8080"));
+            validation.expect("should validate settle bounds");
+        }
+    }
+
+    #[test]
+    fn audit_generate_does_not_expose_the_ignored_browser_profile_flag() {
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "audit",
+                "ad-templates",
+                "generate",
+                "https://www.example.com/",
+                "--browser-profile",
+                "mobile",
+            ])
+            .is_err(),
+            "generation device selection must use --profiles"
+        );
+    }
+
+    #[test]
+    fn browser_settle_quiet_cannot_exceed_maximum() {
+        let args = parse(&[
+            "ts",
+            "audit",
+            "page",
+            "https://www.example.com/",
+            "--settle-quiet-ms",
+            "201",
+            "--settle-max-ms",
+            "200",
+        ]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let crate::commands::audit::AuditSubcommand::Page(page) =
+            audit.command.expect("should parse page subcommand")
+        else {
+            panic!("expected page audit");
+        };
+        assert!(page.browser.validate().is_err());
+    }
+
+    #[test]
+    fn audit_ad_templates_without_verify_is_error() {
+        assert!(Args::try_parse_from(["ts", "audit", "ad-templates"]).is_err());
+    }
+
+    #[test]
+    fn audit_rejects_non_http_url() {
+        assert!(Args::try_parse_from(["ts", "audit", "ftp://www.example.com/"]).is_err());
+    }
+
+    #[test]
+    fn audit_does_not_accept_adapter_option() {
+        let error = Args::try_parse_from([
+            "ts",
+            "audit",
+            "page",
+            "https://www.example.com/",
+            "--adapter",
+            "fastly",
+        ])
+        .expect_err("should reject audit adapter option");
+        assert!(error.to_string().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn prebid_client_defaults_match_spec() {
+        let args = parse(&["ts", "prebid", "client"]);
+        let Command::Prebid(prebid) = args.command else {
+            panic!("expected prebid command");
+        };
+        let PrebidCommand::Client(client) = prebid.command else {
+            panic!("expected prebid client command");
+        };
+        assert_eq!(client.config, PathBuf::from("trusted-server.toml"));
+        assert_eq!(client.out, PathBuf::from("dist/prebid"));
+    }
+
+    #[test]
+    fn prebid_client_accepts_custom_paths() {
         let args = parse(&[
             "ts",
             "prebid",
-            "bundle",
+            "client",
             "--config",
             "publisher.toml",
             "--out",
@@ -663,19 +1173,49 @@ mod tests {
         let Command::Prebid(prebid) = args.command else {
             panic!("expected prebid command");
         };
-        let PrebidCommand::Bundle(bundle) = prebid.command;
-        assert_eq!(bundle.config, PathBuf::from("publisher.toml"));
-        assert_eq!(bundle.out, PathBuf::from("build/prebid"));
+        let PrebidCommand::Client(client) = prebid.command else {
+            panic!("expected prebid client command");
+        };
+        assert_eq!(client.config, PathBuf::from("publisher.toml"));
+        assert_eq!(client.out, PathBuf::from("build/prebid"));
     }
 
     #[test]
-    fn prebid_bundle_does_not_accept_adapter_option() {
-        let error = Args::try_parse_from(["ts", "prebid", "bundle", "--adapter", "fastly"])
+    fn prebid_client_does_not_accept_adapter_option() {
+        let error = Args::try_parse_from(["ts", "prebid", "client", "--adapter", "fastly"])
             .expect_err("should reject prebid adapter option");
         assert!(
             error.to_string().contains("unexpected argument")
                 || error.to_string().contains("Found argument"),
             "error should explain unsupported option"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dev_proxy_bare_invocation_shows_help_before_running() {
+        let error = Args::try_parse_from(["ts", "dev", "proxy"])
+            .expect_err("a bare `ts dev proxy` should short-circuit to help, not run");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+            "should print help instead of touching system proxy state or attempting sudo"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dev_proxy_ca_subcommands_still_parse_under_arg_required_else_help() {
+        for action in ["path", "install", "uninstall", "regenerate"] {
+            parse(&["ts", "dev", "proxy", "ca", action]);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dev_proxy_partial_rule_parses_instead_of_showing_help() {
+        // An explicit but incomplete rule (`--from` with no `--to`) must reach
+        // `run` and surface the concise no-rule error there, not clap help.
+        parse(&["ts", "dev", "proxy", "--from", "a.example.com"]);
     }
 }

@@ -1,7 +1,8 @@
 //! Simplified HTML processor that combines URL replacement and integration injection
 //!
 //! This module provides a `StreamProcessor` implementation for HTML content.
-use std::cell::Cell;
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,144 +18,58 @@ use crate::integrations::datadome::{DATADOME_INTEGRATION_ID, DataDomeClientTagSu
 use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
 use crate::integrations::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
-    IntegrationHtmlContext, IntegrationHtmlPostProcessor, IntegrationRegistry,
-    IntegrationScriptContext, ScriptRewriteAction,
+    IntegrationHtmlContext, IntegrationRegistry, IntegrationScriptContext, ScriptRewriteAction,
 };
 use crate::publisher::build_empty_bids_script;
-use crate::publisher_late_binding::HtmlInjectionTracker;
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
 
-/// Wraps [`HtmlRewriterAdapter`] with optional post-processing.
-///
-/// When `post_processors` is empty (the common streaming path), chunks pass
-/// through immediately with no extra copying. When post-processors are
-/// registered, intermediate output is accumulated in `accumulated_output`
-/// until `is_last`, then post-processors run on the full document. This adds
-/// an extra copy per chunk compared to the pre-streaming adapter (which
-/// accumulated raw input instead of rewriter output). The overhead is
-/// acceptable because the post-processor path is already fully buffered —
-/// the real streaming win comes from the empty-post-processor path in Phase 2.
-struct HtmlWithPostProcessing {
-    inner: HtmlRewriterAdapter,
-    post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
-    /// Buffer that accumulates all intermediate output when post-processors
-    /// need the full document. Left empty on the streaming-only path.
-    accumulated_output: Vec<u8>,
-    /// Cumulative decoded input length seen on the post-processing path. Bounded
-    /// independently of `accumulated_output` so a rewriter that stashes the
-    /// original payload in `document_state` and emits a small placeholder (e.g.
-    /// the Next.js RSC rewriter) cannot grow the Wasm heap past the cap behind
-    /// the output check. Unused on the streaming-only path.
-    decoded_input_len: usize,
-    /// Upper bound on `accumulated_output` (and the post-processed result) to
-    /// prevent the buffered post-processing path from growing the Wasm heap
-    /// without limit on highly-compressible documents.
-    max_buffered_body_bytes: usize,
-    origin_host: String,
-    request_host: String,
-    request_scheme: String,
-    document_state: IntegrationDocumentState,
+pub(crate) mod finish;
+
+use finish::HtmlProcessorStage;
+
+pub(crate) struct HtmlWithStreamingProcessors {
+    inner: Box<dyn StreamProcessor>,
+    stages: Vec<HtmlProcessorStage>,
+    finish_index: Option<usize>,
+    finish_marker: Option<Vec<u8>>,
 }
 
-impl StreamProcessor for HtmlWithPostProcessing {
+// This composite uses begin_finish/finish_next rather than the leaf async_finish
+// callback so each completed stage can release output before the next one awaits.
+impl StreamProcessor for HtmlWithStreamingProcessors {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
-        // Streaming-optimized path: no post-processors, pass through immediately
-        // with no buffering cap (legacy parity: the streaming path is unbounded).
-        if self.post_processors.is_empty() {
-            return self.inner.process_chunk(chunk, is_last);
-        }
-
-        // On the buffered post-processing path, bound the cumulative decoded
-        // input before the rewriter runs. The rewriter (and the post-processors
-        // it feeds) may stash the original payload in `document_state` and emit
-        // only a small placeholder, so the `accumulated_output` check below
-        // cannot observe that growth. Capping decoded input first closes that
-        // hole. Matches the `BoundedWriter` error path (mapped to a 5xx proxy
-        // error downstream).
-        self.decoded_input_len = self.decoded_input_len.saturating_add(chunk.len());
-        if self.decoded_input_len > self.max_buffered_body_bytes {
+        self.validate_capabilities()?;
+        if is_last && self.requires_async_finish() {
             return Err(io::Error::other(
-                "publisher body exceeded maximum buffered size",
+                "HTML processors require asynchronous EOF completion",
             ));
         }
-
-        let output = self.inner.process_chunk(chunk, is_last)?;
-
-        // Post-processors need the full document. Accumulate until the last chunk,
-        // but enforce the buffering cap before growing the heap so a highly
-        // compressible document cannot OOM the accumulator.
-        if self.accumulated_output.len() + output.len() > self.max_buffered_body_bytes {
-            return Err(io::Error::other(
-                "publisher body exceeded maximum buffered size",
-            ));
+        let mut output = self.inner.process_chunk(chunk, is_last)?;
+        for stage in &mut self.stages {
+            output = stage.process(
+                &output,
+                is_last,
+                self.finish_marker.as_ref().map_or(0, Vec::len),
+            )?;
         }
-        self.accumulated_output.extend_from_slice(&output);
-        if !is_last {
-            return Ok(Vec::new());
-        }
-
-        // Final chunk: run post-processors on the full accumulated output.
-        let full_output = std::mem::take(&mut self.accumulated_output);
-        if full_output.is_empty() {
-            return Ok(full_output);
-        }
-
-        let Ok(output_str) = std::str::from_utf8(&full_output) else {
-            return Ok(full_output);
-        };
-
-        let ctx = IntegrationHtmlContext {
-            request_host: &self.request_host,
-            request_scheme: &self.request_scheme,
-            origin_host: &self.origin_host,
-            document_state: &self.document_state,
-        };
-
-        // Preflight to avoid allocating a `String` unless at least one post-processor wants to run.
-        if !self
-            .post_processors
-            .iter()
-            .any(|p| p.should_process(output_str, &ctx))
-        {
-            return Ok(full_output);
-        }
-
-        let mut html = String::from_utf8(full_output).map_err(|e| {
-            io::Error::other(format!(
-                "HTML post-processing expected valid UTF-8 output: {e}"
-            ))
-        })?;
-
-        let mut changed = false;
-        for processor in &self.post_processors {
-            if processor.should_process(&html, &ctx) {
-                changed |= processor.post_process(&mut html, &ctx);
-            }
-        }
-
-        if changed {
-            log::debug!("HTML post-processing complete: output_len={}", html.len());
-        }
-
-        // Post-processors may append content (e.g. injected scripts); enforce the
-        // same cap on the final document so growth during post-processing cannot
-        // push the buffer past the limit either.
-        if html.len() > self.max_buffered_body_bytes {
-            return Err(io::Error::other(
-                "publisher body exceeded maximum buffered size",
-            ));
-        }
-
-        Ok(html.into_bytes())
+        Ok(output)
     }
 
-    /// No-op. `HtmlWithPostProcessing` wraps a single-use
-    /// [`HtmlRewriterAdapter`] that cannot be reset. Clearing auxiliary
-    /// state without resetting the rewriter would leave the processor
-    /// in an inconsistent state, so this method intentionally does nothing.
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        self.inner.reset();
+        for stage in &mut self.stages {
+            stage.reset();
+        }
+        self.finish_index = None;
+    }
+
+    fn requires_async_finish(&self) -> bool {
+        self.stages
+            .iter()
+            .any(HtmlProcessorStage::requires_async_finish)
+    }
 }
 
 /// What the `</body>` seam injects.
@@ -174,33 +89,13 @@ pub enum BodyCloseInjection {
     /// Read the auction result from `ad_bids_state` and inject it, falling back to
     /// an empty payload. Today's shipped behaviour.
     InlineBids,
+    /// Emit a request-specific marker at a structural body end. The publisher
+    /// streaming controller removes it after the auction completes.
+    DeferredInlineMarker(String),
     /// Emit this markup verbatim — an inert marker the assembly step splits on.
     /// Must be identical for every request that reaches the transform, or the
     /// cached template is not shared-safe.
     Marker(String),
-}
-
-/// How SSAT bids are inserted into parser-confirmed body end tags.
-#[derive(Clone)]
-pub enum BidInjectionMode {
-    /// Read the current bids script from shared state at the body end tag.
-    DirectState,
-    /// Insert an opaque placeholder for a later parser-safe replacement pass.
-    Placeholder {
-        /// Placeholder HTML inserted before the body end tag.
-        html: String,
-        /// Shared tracker for parser-owned head and body insertion ordering.
-        tracker: Arc<HtmlInjectionTracker>,
-    },
-}
-
-/// Whether full-document HTML post-processors run inside this processor.
-#[derive(Clone, Copy)]
-pub enum HtmlPostProcessingMode {
-    /// Run registered full-document post-processors at EOF.
-    Enabled,
-    /// Skip post-processors so callers can run them after bid late binding.
-    Disabled,
 }
 
 /// Configuration for HTML processing
@@ -217,9 +112,8 @@ pub struct HtmlProcessorConfig {
     /// Handler reads this in `el.on_end_tag()` on the body element.
     /// `None` means no auction ran; inject empty `tsjs.bids = {}` as fallback.
     pub ad_bids_state: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    /// Maximum bytes the post-processing accumulator may buffer before the
-    /// processor aborts. Mirrors `publisher.max_buffered_body_bytes` so the
-    /// full-document buffering done for post-processors is bounded.
+    /// Maximum bytes an integration may retain while processing one script or
+    /// unresolved streaming group.
     pub max_buffered_body_bytes: usize,
     /// Request-scoped conditional diagnostics delivery decision.
     pub gpt_diagnostics: Option<GptDiagnosticsRequestDecision>,
@@ -233,13 +127,6 @@ pub struct HtmlProcessorConfig {
     /// `None` on every path that cannot store a shared template, so an ordinary inline
     /// request does not pay for handlers whose only consumer is the template-cache gate.
     pub csp_nonce_observed: Option<Arc<AtomicBool>>,
-    /// Bid insertion strategy for parser-confirmed body end tags.
-    pub bid_injection_mode: BidInjectionMode,
-    /// Controls whether full-document post-processors run inside this processor.
-    pub post_processing_mode: HtmlPostProcessingMode,
-    /// Per-document integration state shared by script rewriters and optional
-    /// post-processors.
-    pub document_state: IntegrationDocumentState,
 }
 
 impl HtmlProcessorConfig {
@@ -264,9 +151,6 @@ impl HtmlProcessorConfig {
             body_close: BodyCloseInjection::None,
             suppress_datadome_client_side_tag: false,
             csp_nonce_observed: None,
-            bid_injection_mode: BidInjectionMode::DirectState,
-            post_processing_mode: HtmlPostProcessingMode::Enabled,
-            document_state: IntegrationDocumentState::default(),
         }
     }
 
@@ -322,35 +206,6 @@ impl HtmlProcessorConfig {
         self.suppress_datadome_client_side_tag = suppress;
         self
     }
-
-    /// Insert `placeholder_html` at the parser-confirmed body end tag instead
-    /// of reading bids directly from shared state.
-    #[must_use]
-    pub fn with_bid_placeholder(
-        mut self,
-        placeholder_html: String,
-        tracker: Arc<HtmlInjectionTracker>,
-    ) -> Self {
-        self.bid_injection_mode = BidInjectionMode::Placeholder {
-            html: placeholder_html,
-            tracker,
-        };
-        self
-    }
-
-    /// Disable full-document post-processors for a caller-managed buffered pass.
-    #[must_use]
-    pub fn without_post_processing(mut self) -> Self {
-        self.post_processing_mode = HtmlPostProcessingMode::Disabled;
-        self
-    }
-
-    /// Use caller-provided document state for multi-phase processing.
-    #[must_use]
-    pub fn with_document_state(mut self, document_state: IntegrationDocumentState) -> Self {
-        self.document_state = document_state;
-        self
-    }
 }
 
 /// Create an HTML processor with URL replacement and integration hooks.
@@ -360,12 +215,24 @@ impl HtmlProcessorConfig {
 /// Panics if the `ad_bids_state` `Mutex` is poisoned. This cannot happen in
 /// normal operation since no code holds the lock across a panic boundary.
 #[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the returned processor owns request configuration captured by its handlers"
+)]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
-    let post_processors = match config.post_processing_mode {
-        HtmlPostProcessingMode::Enabled => config.integrations.html_post_processors(),
-        HtmlPostProcessingMode::Disabled => Vec::new(),
-    };
-    let document_state = config.document_state.clone();
+    create_html_processor_with_document_state(config, &IntegrationDocumentState::default())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "static parser callbacks capture owned request configuration"
+)]
+pub(crate) fn create_html_processor_with_document_state(
+    config: HtmlProcessorConfig,
+    document_state: &IntegrationDocumentState,
+) -> HtmlWithStreamingProcessors {
+    let stream_processor_factories = config.integrations.html_stream_processor_factories();
+
     if config.suppress_datadome_client_side_tag {
         document_state.get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
     }
@@ -440,8 +307,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let ad_slots_script = config.ad_slots_script.clone();
     let body_close = config.body_close.clone();
     let ad_bids_state = config.ad_bids_state.clone();
-    let bid_injection_mode = config.bid_injection_mode.clone();
-    let head_bid_injection_mode = bid_injection_mode.clone();
     let gpt_diagnostics = config.gpt_diagnostics.clone();
 
     // No source-comment neutralization here: rewriting a publisher comment that happens
@@ -473,18 +338,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let document_state = document_state.clone();
             let ad_slots_script = ad_slots_script.clone();
             let gpt_diagnostics = gpt_diagnostics.clone();
-            let head_bid_injection_mode = head_bid_injection_mode.clone();
             move |el| {
-                if injected_tsjs.get() {
-                    return Ok(());
-                }
-                if let BidInjectionMode::Placeholder { tracker, .. } = &head_bid_injection_mode
-                    && (tracker.head_injected() || tracker.bid_placeholder_inserted())
-                {
-                    injected_tsjs.set(true);
-                    return Ok(());
-                }
-                {
+                if !injected_tsjs.get() {
                     let mut snippet = String::new();
                     // Inject ad slots script first so it appears before tsjs bundle.
                     if let Some(ref slots_script) = ad_slots_script {
@@ -527,10 +382,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     let deferred_ids = integrations.js_module_ids_deferred();
                     snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
                     el.prepend(&snippet, ContentType::Html);
-                    if let BidInjectionMode::Placeholder { tracker, .. } = &head_bid_injection_mode
-                    {
-                        tracker.mark_head_injected();
-                    }
                     injected_tsjs.set(true);
                 }
                 Ok(())
@@ -547,53 +398,47 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let state = ad_bids_state.clone();
             let injected_bids = injected_bids.clone();
             let body_close = body_close.clone();
-            let bid_injection_mode = bid_injection_mode.clone();
             move |el| {
-                let placeholder_mode =
-                    matches!(&bid_injection_mode, BidInjectionMode::Placeholder { .. });
-                if matches!(body_close, BodyCloseInjection::None) && !placeholder_mode {
+                if matches!(body_close, BodyCloseInjection::None) {
                     return Ok(());
                 }
                 let state = state.clone();
                 let injected_bids = injected_bids.clone();
                 let body_close = body_close.clone();
-                let bid_injection_mode = bid_injection_mode.clone();
                 if let Some(handlers) = el.end_tag_handlers() {
                     let handler: EndTagHandler<'static> =
                         Box::new(move |end_tag: &mut EndTag<'_>| {
                             if injected_bids.swap(true, Ordering::SeqCst) {
                                 return Ok(());
                             }
-                            let markup = if let BidInjectionMode::Placeholder { html, tracker } =
-                                &bid_injection_mode
-                            {
-                                tracker.mark_bid_placeholder_inserted();
-                                html.clone()
-                            } else {
-                                match &body_close {
-                                    // Verbatim, and identical on every request that
-                                    // reaches the transform — that is what makes the
-                                    // cached template shared-safe.
-                                    BodyCloseInjection::Marker(marker) => marker.clone(),
-                                    BodyCloseInjection::InlineBids => {
-                                        let script_guard =
-                                            state.lock().expect("should lock bid state");
-                                        match &*script_guard {
-                                            Some(s) => s.clone(),
-                                            None => build_empty_bids_script(),
-                                        }
-                                    }
-                                    // Unreachable: the element handler returned early
-                                    // above. Kept exhaustive rather than using `_` so a
-                                    // new variant is a compile error here.
-                                    BodyCloseInjection::None => return Ok(()),
+                            let markup = match &body_close {
+                                // Verbatim, and identical on every request that
+                                // reaches the transform — that is what makes the
+                                // cached template shared-safe.
+                                BodyCloseInjection::Marker(marker)
+                                | BodyCloseInjection::DeferredInlineMarker(marker) => {
+                                    marker.clone()
                                 }
+                                BodyCloseInjection::InlineBids => {
+                                    let script_guard = state.lock().expect("should lock bid state");
+                                    match &*script_guard {
+                                        Some(s) => s.clone(),
+                                        None => build_empty_bids_script(),
+                                    }
+                                }
+                                // Unreachable: the element handler returned early
+                                // above. Kept exhaustive rather than using `_` so a
+                                // new variant is a compile error here.
+                                BodyCloseInjection::None => return Ok(()),
                             };
                             end_tag.before(&markup, ContentType::Html);
                             Ok(())
                         });
                     handlers.push(handler);
-                } else if matches!(body_close, BodyCloseInjection::InlineBids) {
+                } else if matches!(
+                    body_close,
+                    BodyCloseInjection::InlineBids | BodyCloseInjection::DeferredInlineMarker(_)
+                ) {
                     // No end tag (implicitly closed or EOF `<body>`): lol_html
                     // cannot attach an end-tag handler, so tsjs.bids/adInit() are
                     // never injected even though adSlots was injected at `<head>`.
@@ -853,35 +698,65 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }));
     }
 
-    for script_rewriter in script_rewriters {
-        let selector = script_rewriter.selector();
-        let rewriter = script_rewriter.clone();
-        let patterns = patterns.clone();
-        let document_state = document_state.clone();
-        element_content_handlers.push(text!(selector, {
-            let rewriter = rewriter.clone();
-            let patterns = patterns.clone();
-            let document_state = document_state.clone();
-            move |text| {
+    // Selector callbacks retain lol_html's CSS matching; only the composed text
+    // callback mutates a fragment. Start each script with fresh match state.
+    // Match flags are flat: nested SVG scripts do not restore an outer script's
+    // flags when the inner script ends.
+    // Without script rewriters, skip script text capture entirely.
+    if !script_rewriters.is_empty() {
+        let script_matches = Rc::new(RefCell::new(vec![false; script_rewriters.len()]));
+        let reset_matches = script_matches.clone();
+        element_content_handlers.push(element!("script", move |_el| {
+            reset_matches.borrow_mut().fill(false);
+            Ok(())
+        }));
+        for (index, rewriter) in script_rewriters.iter().enumerate() {
+            let matches = script_matches.clone();
+            element_content_handlers.push(element!(rewriter.selector(), move |_el| {
+                matches.borrow_mut()[index] = true;
+                Ok(())
+            }));
+        }
+        let script_patterns = patterns.clone();
+        let script_document_state = document_state.clone();
+        element_content_handlers.push(text!("script", move |text| {
+            let mut working = Cow::Borrowed(text.as_str());
+            let mut changed = false;
+            for (rewriter, matched) in script_rewriters.iter().zip(script_matches.borrow().iter()) {
+                if !matched {
+                    continue;
+                }
                 let ctx = IntegrationScriptContext {
-                    selector,
-                    request_host: &patterns.request_host,
-                    request_scheme: &patterns.request_scheme,
-                    origin_host: &patterns.origin_host,
+                    selector: rewriter.selector(),
+                    request_host: &script_patterns.request_host,
+                    request_scheme: &script_patterns.request_scheme,
+                    origin_host: &script_patterns.origin_host,
                     is_last_in_text_node: text.last_in_text_node(),
-                    document_state: &document_state,
+                    max_buffered_script_bytes: config.max_buffered_body_bytes,
+                    document_state: &script_document_state,
                 };
-                match rewriter.rewrite(text.as_str(), &ctx) {
+                match rewriter.rewrite(&working, &ctx) {
                     ScriptRewriteAction::Keep => {}
                     ScriptRewriteAction::Replace(rewritten) => {
-                        text.replace(&rewritten, ContentType::Text);
+                        working = Cow::Owned(rewritten);
+                        changed = true;
                     }
                     ScriptRewriteAction::RemoveNode => {
-                        text.remove();
+                        working = Cow::Borrowed("");
+                        changed = true;
                     }
                 }
-                Ok(())
             }
+            if changed {
+                if working.is_empty() {
+                    text.remove();
+                } else if let Cow::Owned(rewritten) = working {
+                    // Script is raw text: HTML entities would change JS/JSON data.
+                    // Emit composed source verbatim rather than escaping it again.
+                    text.replace(&rewritten, ContentType::Html);
+                }
+            }
+            Ok(())
         }));
     }
 
@@ -893,17 +768,25 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 
     let inner = HtmlRewriterAdapter::new(rewriter_settings);
 
-    HtmlWithPostProcessing {
-        inner,
-        post_processors,
-        accumulated_output: Vec::new(),
-        decoded_input_len: 0,
-        max_buffered_body_bytes: config.max_buffered_body_bytes,
-        origin_host: config.origin_host,
-        request_host: config.request_host,
-        request_scheme: config.request_scheme,
-        document_state,
-    }
+    let stream_context = crate::integrations::IntegrationHtmlStreamContext {
+        request_host: config.request_host.clone(),
+        request_scheme: config.request_scheme.clone(),
+        origin_host: config.origin_host.clone(),
+        document_state: document_state.clone(),
+    };
+    let stages = stream_processor_factories
+        .into_iter()
+        .map(|factory| {
+            HtmlProcessorStage::new(
+                factory.integration_id(),
+                factory.create(stream_context.clone()),
+                factory.requires_async_finish(),
+                factory.buffer_output_until_eof(),
+                config.max_buffered_body_bytes,
+            )
+        })
+        .collect();
+    HtmlWithStreamingProcessors::from_stages(Box::new(inner), stages)
 }
 
 #[cfg(test)]
@@ -911,7 +794,7 @@ mod tests {
     use super::*;
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-        IntegrationHeadInjector, IntegrationHtmlContext,
+        IntegrationHeadInjector, IntegrationHtmlContext, IntegrationScriptRewriter,
     };
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
@@ -937,9 +820,127 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
-            bid_injection_mode: BidInjectionMode::DirectState,
-            post_processing_mode: HtmlPostProcessingMode::Enabled,
-            document_state: IntegrationDocumentState::default(),
+        }
+    }
+
+    struct SuppressingScript;
+    impl IntegrationScriptRewriter for SuppressingScript {
+        fn integration_id(&self) -> &'static str {
+            "suppress"
+        }
+        fn selector(&self) -> &'static str {
+            "script[data-suppress='yes']"
+        }
+        fn rewrite(&self, _text: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+            assert_eq!(
+                ctx.selector,
+                self.selector(),
+                "should pass the registered selector to the suppressing stage"
+            );
+            ScriptRewriteAction::RemoveNode
+        }
+    }
+
+    struct FlushingScript;
+    impl IntegrationScriptRewriter for FlushingScript {
+        fn integration_id(&self) -> &'static str {
+            "flush"
+        }
+        fn selector(&self) -> &'static str {
+            "script#flush"
+        }
+        fn rewrite(&self, text: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+            assert_eq!(
+                ctx.selector,
+                self.selector(),
+                "should pass the registered selector to the flushing stage"
+            );
+            assert!(text.is_empty(), "should see upstream suppression");
+            if ctx.is_last_in_text_node {
+                ScriptRewriteAction::Replace("flushed-once".into())
+            } else {
+                ScriptRewriteAction::Keep
+            }
+        }
+    }
+
+    #[test]
+    fn script_actions_compose_with_selector_reset_and_empty_final_flush() {
+        let mut config = create_test_config();
+        config.integrations = IntegrationRegistry::from_rewriters(
+            Vec::new(),
+            vec![Arc::new(SuppressingScript), Arc::new(FlushingScript)],
+        );
+        let mut processor = create_html_processor(config);
+        let mut output = processor
+            .process_chunk(b"<script id='flush' data-suppress='yes'>first_", false)
+            .expect("should accept first fragment");
+        output.extend(
+            processor
+                .process_chunk(b"second</script><script>ordinary_</script>", true)
+                .expect("should finalize all matching stages"),
+        );
+        let output = String::from_utf8(output).expect("should emit UTF-8");
+        assert!(
+            output.contains("<script id='flush' data-suppress='yes'>flushed-once</script>"),
+            "should flush downstream even on suppressed final: {output}"
+        );
+        assert!(
+            output.contains("<script>ordinary_</script>"),
+            "should reset CSS match state between scripts"
+        );
+        assert_eq!(
+            output.matches("flushed-once").count(),
+            1,
+            "should emit the flushed fragment exactly once"
+        );
+    }
+
+    #[test]
+    fn terminal_document_state_exposes_parser_observations() {
+        struct ArticleObserver;
+        impl IntegrationScriptRewriter for ArticleObserver {
+            fn integration_id(&self) -> &'static str {
+                "example_article"
+            }
+            fn selector(&self) -> &'static str {
+                "script[type='text/plain']"
+            }
+            fn rewrite(
+                &self,
+                content: &str,
+                context: &IntegrationScriptContext<'_>,
+            ) -> ScriptRewriteAction {
+                context
+                    .document_state
+                    .get_or_insert_with("example_article", || content.to_string());
+                ScriptRewriteAction::Keep
+            }
+        }
+        for text in ["Example first article", "Example second article"] {
+            let state = IntegrationDocumentState::default();
+            let mut config = create_test_config();
+            config.integrations =
+                IntegrationRegistry::from_rewriters(Vec::new(), vec![Arc::new(ArticleObserver)]);
+            let mut processor = create_html_processor_with_document_state(config, &state);
+            let _ = processor
+                .process_chunk(
+                    format!("<html><body><script type='text/plain'>{text}</script></body></html>")
+                        .as_bytes(),
+                    false,
+                )
+                .expect("should process article HTML");
+            let _ = processor
+                .process_chunk(&[], true)
+                .expect("should close the synchronous parser");
+            let article = state
+                .get::<String>("example_article")
+                .expect("should expose parser state to the terminal phase");
+            assert_eq!(
+                article.as_str(),
+                text,
+                "should expose the text observed by this document's parser"
+            );
         }
     }
 
@@ -1672,251 +1673,72 @@ mod tests {
     }
 
     #[test]
-    fn post_processors_accumulate_while_streaming_path_passes_through() {
-        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor as _};
-        use lol_html::Settings;
+    fn html_stream_processors_compose_in_order_and_receive_final_once() {
+        struct DecoratingProcessor {
+            prefix: u8,
+            final_calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
 
-        // --- Streaming path: no post-processors → output emitted per chunk ---
-        let mut streaming = HtmlWithPostProcessing {
-            inner: HtmlRewriterAdapter::new(Settings::default()),
-            post_processors: Vec::new(),
-            accumulated_output: Vec::new(),
-            decoded_input_len: 0,
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            origin_host: String::new(),
-            request_host: String::new(),
-            request_scheme: String::new(),
-            document_state: IntegrationDocumentState::default(),
-        };
-
-        let chunk1 = streaming
-            .process_chunk(b"<html><body>", false)
-            .expect("should process chunk1");
-        let chunk2 = streaming
-            .process_chunk(b"<p>hello</p>", false)
-            .expect("should process chunk2");
-        let chunk3 = streaming
-            .process_chunk(b"</body></html>", true)
-            .expect("should process final chunk");
-
-        assert!(
-            !chunk1.is_empty() || !chunk2.is_empty(),
-            "should emit intermediate output on streaming path"
-        );
-
-        let mut streaming_all = chunk1;
-        streaming_all.extend_from_slice(&chunk2);
-        streaming_all.extend_from_slice(&chunk3);
-
-        // --- Buffered path: post-processor registered → accumulates until is_last ---
-        struct NoopPostProcessor;
-        impl IntegrationHtmlPostProcessor for NoopPostProcessor {
-            fn integration_id(&self) -> &'static str {
-                "test-noop"
-            }
-            fn post_process(&self, _html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
-                false
+        impl StreamProcessor for DecoratingProcessor {
+            fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> io::Result<Vec<u8>> {
+                if is_last {
+                    self.final_calls.fetch_add(1, Ordering::SeqCst);
+                }
+                let mut output = vec![self.prefix];
+                output.extend_from_slice(chunk);
+                Ok(output)
             }
         }
 
-        let mut buffered = HtmlWithPostProcessing {
-            inner: HtmlRewriterAdapter::new(Settings::default()),
-            post_processors: vec![Arc::new(NoopPostProcessor)],
-            accumulated_output: Vec::new(),
-            decoded_input_len: 0,
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            origin_host: String::new(),
-            request_host: String::new(),
-            request_scheme: String::new(),
-            document_state: IntegrationDocumentState::default(),
-        };
-
-        let buf1 = buffered
-            .process_chunk(b"<html><body>", false)
-            .expect("should process chunk1");
-        let buf2 = buffered
-            .process_chunk(b"<p>hello</p>", false)
-            .expect("should process chunk2");
-        let buf3 = buffered
-            .process_chunk(b"</body></html>", true)
-            .expect("should process final chunk");
-
-        assert!(
-            buf1.is_empty() && buf2.is_empty(),
-            "should return empty for intermediate chunks when post-processors are registered"
+        let inner_final_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_final_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_final_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut processor = HtmlWithStreamingProcessors::from_stages(
+            Box::new(DecoratingProcessor {
+                prefix: b'I',
+                final_calls: Arc::clone(&inner_final_calls),
+            }),
+            vec![
+                HtmlProcessorStage::new(
+                    "A",
+                    Box::new(DecoratingProcessor {
+                        prefix: b'A',
+                        final_calls: Arc::clone(&first_final_calls),
+                    }),
+                    false,
+                    false,
+                    64,
+                ),
+                HtmlProcessorStage::new(
+                    "B",
+                    Box::new(DecoratingProcessor {
+                        prefix: b'B',
+                        final_calls: Arc::clone(&second_final_calls),
+                    }),
+                    false,
+                    false,
+                    64,
+                ),
+            ],
         );
-        assert!(
-            !buf3.is_empty(),
-            "should emit all output in final chunk when post-processors are registered"
-        );
 
-        // Both paths should produce identical output
-        let streaming_str =
-            String::from_utf8(streaming_all).expect("streaming output should be valid UTF-8");
-        let buffered_str = String::from_utf8(buf3).expect("buffered output should be valid UTF-8");
         assert_eq!(
-            streaming_str, buffered_str,
-            "streaming and buffered paths should produce identical output"
+            processor
+                .process_chunk(b"x", false)
+                .expect("should process intermediate chunk"),
+            b"BAIx",
+            "should emit intermediate output in registration order",
         );
-    }
-
-    #[test]
-    fn post_processing_accumulator_rejects_growth_past_cap() {
-        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
-        use lol_html::Settings;
-
-        struct NoopPostProcessor;
-        impl IntegrationHtmlPostProcessor for NoopPostProcessor {
-            fn integration_id(&self) -> &'static str {
-                "test-noop"
-            }
-            fn post_process(&self, _html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
-                false
-            }
-        }
-
-        // Tiny cap so a single non-final chunk overflows the accumulator.
-        let mut processor = HtmlWithPostProcessing {
-            inner: HtmlRewriterAdapter::new(Settings::default()),
-            post_processors: vec![Arc::new(NoopPostProcessor)],
-            accumulated_output: Vec::new(),
-            decoded_input_len: 0,
-            max_buffered_body_bytes: 16,
-            origin_host: String::new(),
-            request_host: String::new(),
-            request_scheme: String::new(),
-            document_state: IntegrationDocumentState::default(),
-        };
-
-        // A complete element well past the cap. The error must fire on this
-        // non-final chunk — proving the accumulator itself is bounded, not just
-        // the final write after the whole document was already buffered.
-        let oversized = format!("<p>{}</p>", "a".repeat(100));
-        let err = processor
-            .process_chunk(oversized.as_bytes(), false)
-            .expect_err("accumulator growth past the cap must error mid-stream");
-        assert!(
-            err.to_string().contains("exceeded maximum buffered size"),
-            "should report the buffering cap violation, got: {err}"
+        assert_eq!(
+            processor
+                .process_chunk(b"y", true)
+                .expect("should process final chunk"),
+            b"BAIy",
+            "should preserve processor order for final output",
         );
-
-        // The accumulator must never retain more than the configured cap.
-        assert!(
-            processor.accumulated_output.len() <= 16,
-            "accumulator must not grow past the cap, held {} bytes",
-            processor.accumulated_output.len()
-        );
-    }
-
-    #[test]
-    fn decoded_input_cap_rejects_oversized_input_with_small_output() {
-        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
-        use lol_html::Settings;
-
-        struct NoopPostProcessor;
-        impl IntegrationHtmlPostProcessor for NoopPostProcessor {
-            fn integration_id(&self) -> &'static str {
-                "test-noop"
-            }
-            fn post_process(&self, _html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
-                false
-            }
-        }
-
-        // Tiny cap so a single oversized chunk overflows the decoded-input bound.
-        let mut processor = HtmlWithPostProcessing {
-            inner: HtmlRewriterAdapter::new(Settings::default()),
-            post_processors: vec![Arc::new(NoopPostProcessor)],
-            accumulated_output: Vec::new(),
-            decoded_input_len: 0,
-            max_buffered_body_bytes: 16,
-            origin_host: String::new(),
-            request_host: String::new(),
-            request_scheme: String::new(),
-            document_state: IntegrationDocumentState::default(),
-        };
-
-        // An unclosed tag far larger than the cap. lol_html buffers it internally
-        // and emits little or no output, so the output accumulator stays small —
-        // the same shape as a rewriter stashing the payload in `document_state`
-        // behind a small placeholder. The decoded-input bound must still reject
-        // it, which the output-only check could not.
-        let oversized = format!("<div data-x=\"{}\"", "a".repeat(100));
-        let err = processor
-            .process_chunk(oversized.as_bytes(), false)
-            .expect_err("oversized decoded input must error even when output is small");
-        assert!(
-            err.to_string().contains("exceeded maximum buffered size"),
-            "should report the buffering cap violation, got: {err}"
-        );
-        assert!(
-            processor.accumulated_output.is_empty(),
-            "the decoded-input bound must catch the overflow before the output accumulator grows"
-        );
-    }
-
-    #[test]
-    fn active_post_processor_receives_full_document_and_mutates_output() {
-        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor as _};
-        use lol_html::Settings;
-
-        struct AppendCommentProcessor;
-        impl IntegrationHtmlPostProcessor for AppendCommentProcessor {
-            fn integration_id(&self) -> &'static str {
-                "test-append"
-            }
-            fn should_process(&self, html: &str, _ctx: &IntegrationHtmlContext<'_>) -> bool {
-                html.contains("</html>")
-            }
-            fn post_process(&self, html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
-                html.push_str("<!-- processed -->");
-                true
-            }
-        }
-
-        let mut processor = HtmlWithPostProcessing {
-            inner: HtmlRewriterAdapter::new(Settings::default()),
-            post_processors: vec![Arc::new(AppendCommentProcessor)],
-            accumulated_output: Vec::new(),
-            decoded_input_len: 0,
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            origin_host: String::new(),
-            request_host: String::new(),
-            request_scheme: String::new(),
-            document_state: IntegrationDocumentState::default(),
-        };
-
-        // Feed multiple chunks
-        let r1 = processor
-            .process_chunk(b"<html><body>", false)
-            .expect("should process chunk1");
-        let r2 = processor
-            .process_chunk(b"<p>content</p>", false)
-            .expect("should process chunk2");
-        let r3 = processor
-            .process_chunk(b"</body></html>", true)
-            .expect("should process final chunk");
-
-        // Intermediate chunks return empty (buffered for post-processor)
-        assert!(
-            r1.is_empty() && r2.is_empty(),
-            "should buffer intermediate chunks"
-        );
-
-        // Final chunk contains the full document with post-processor mutation
-        let output = String::from_utf8(r3).expect("should be valid UTF-8");
-        assert!(
-            output.contains("<p>content</p>"),
-            "should contain original content"
-        );
-        assert!(
-            output.contains("</html>"),
-            "should contain complete document"
-        );
-        assert!(
-            output.contains("<!-- processed -->"),
-            "should contain post-processor mutation"
-        );
+        assert_eq!(inner_final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first_final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_final_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1936,9 +1758,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
-            bid_injection_mode: BidInjectionMode::DirectState,
-            post_processing_mode: HtmlPostProcessingMode::Enabled,
-            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2016,9 +1835,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
-            bid_injection_mode: BidInjectionMode::DirectState,
-            post_processing_mode: HtmlPostProcessingMode::Enabled,
-            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2058,9 +1874,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
-            bid_injection_mode: BidInjectionMode::DirectState,
-            post_processing_mode: HtmlPostProcessingMode::Enabled,
-            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         // Malformed HTML with two <body> elements (common in CMS template pages)
@@ -2099,9 +1912,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
-            bid_injection_mode: BidInjectionMode::DirectState,
-            post_processing_mode: HtmlPostProcessingMode::Enabled,
-            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2158,9 +1968,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
-            bid_injection_mode: BidInjectionMode::DirectState,
-            post_processing_mode: HtmlPostProcessingMode::Enabled,
-            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2191,9 +1998,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
-            bid_injection_mode: BidInjectionMode::DirectState,
-            post_processing_mode: HtmlPostProcessingMode::Enabled,
-            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2219,9 +2023,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
-            bid_injection_mode: BidInjectionMode::DirectState,
-            post_processing_mode: HtmlPostProcessingMode::Enabled,
-            document_state: IntegrationDocumentState::default(),
         }
     }
 
@@ -2283,6 +2084,131 @@ mod tests {
             1,
             "should emit exactly one transform-owned marker: {html}"
         );
+    }
+
+    #[test]
+    fn deferred_inline_marker_uses_only_the_structural_body_end() {
+        const TOKEN: &str = "<!--ts-inline-body-close-test-->";
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(Some("must-not-be-read".to_string())));
+        let mut config = marker_mode_config(TOKEN, None);
+        config.body_close = BodyCloseInjection::DeferredInlineMarker(TOKEN.to_string());
+        config.ad_bids_state = state;
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(
+                br#"<html><body><script>const x="</body>";</script><!-- </body> --></body></html>"#,
+                true,
+            )
+            .expect("should process deferred marker document");
+        let html = String::from_utf8(output).expect("output should be UTF-8");
+
+        assert_eq!(
+            html.matches(TOKEN).count(),
+            1,
+            "should emit one marker: {html}"
+        );
+        assert!(
+            html.contains(&format!("<!-- </body> -->{TOKEN}</body>")),
+            "marker should precede only the structural close: {html}"
+        );
+        assert!(!html.contains("must-not-be-read"));
+    }
+
+    #[test]
+    fn deferred_inline_marker_is_absent_without_an_explicit_body_end() {
+        const TOKEN: &str = "<!--ts-inline-body-close-test-->";
+        let mut config = marker_mode_config(TOKEN, None);
+        config.body_close = BodyCloseInjection::DeferredInlineMarker(TOKEN.to_string());
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(b"<html><script>const x='</body>'</script></html>", true)
+            .expect("should process bodyless document");
+        let html = String::from_utf8(output).expect("output should be UTF-8");
+
+        assert!(
+            !html.contains(TOKEN),
+            "bodyless document must have no marker: {html}"
+        );
+    }
+
+    #[test]
+    fn deferred_inline_marker_uses_parser_context_across_every_source_split() {
+        const TOKEN: &str = "<!--ts-inline-body-close-test-->";
+        for source in [
+            "<html><body><p>x</p></BoDy></html>",
+            "<html><body><script>const x='</body>';</script><p>later</p></body></html>",
+            "<html><body><!-- </body> --><p>later</p></body></html>",
+        ] {
+            for split in 0..=source.len() {
+                let mut config = marker_mode_config(TOKEN, None);
+                config.body_close = BodyCloseInjection::DeferredInlineMarker(TOKEN.to_string());
+                let mut processor = create_html_processor(config);
+                let mut output = processor
+                    .process_chunk(&source.as_bytes()[..split], false)
+                    .expect("should process first source fragment");
+                output.extend(
+                    processor
+                        .process_chunk(&source.as_bytes()[split..], true)
+                        .expect("should process final source fragment"),
+                );
+                let html = String::from_utf8(output).expect("output should be UTF-8");
+                assert_eq!(
+                    html.matches(TOKEN).count(),
+                    1,
+                    "should mark one structural close for split {split}: {html}"
+                );
+                assert!(
+                    html.to_ascii_lowercase()
+                        .contains(&format!("{TOKEN}</body>")),
+                    "marker should precede structural close for split {split}: {html}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nextjs_output_overflow_restores_in_progress_script_at_every_split() {
+        let mut settings = create_test_settings();
+        settings.integrations.insert(
+            "nextjs".to_owned(),
+            json!({"enabled": true, "max_combined_payload_bytes": 128}),
+        );
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(crate::auction::compile_auction_plan(&settings).expect("should compile plan")),
+        )
+        .expect("should create registry");
+        let first = r#"<html><body><script>self.__next_f.push([1,"1:T3,ab"])</script>"#;
+        let script = r#"self.__next_f.push([1,"c"])"#;
+        let padding = "x".repeat(129);
+        let expected = format!("{first}{padding}<script>{script}</script></body></html>");
+
+        for split in 1..script.len() {
+            let mut config = create_test_config();
+            config.integrations = registry.clone();
+            let mut processor = create_html_processor(config);
+            let mut output = processor
+                .process_chunk(first.as_bytes(), false)
+                .expect("should process unresolved RSC group");
+            let second = format!("{padding}<script>{}", &script[..split]);
+            output.extend(
+                processor
+                    .process_chunk(second.as_bytes(), false)
+                    .expect("should process output overflow and partial script"),
+            );
+            let third = format!("{}</script></body></html>", &script[split..]);
+            output.extend(
+                processor
+                    .process_chunk(third.as_bytes(), true)
+                    .expect("should finish bypassed script"),
+            );
+            assert_eq!(
+                String::from_utf8(output).expect("should retain UTF-8"),
+                expected,
+                "should restore all original bytes when overflow occurs at script split {split}"
+            );
+        }
     }
 
     #[test]
@@ -2358,9 +2284,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
-            bid_injection_mode: BidInjectionMode::DirectState,
-            post_processing_mode: HtmlPostProcessingMode::Enabled,
-            document_state: IntegrationDocumentState::default(),
         };
         let source =
             format!(r#"<html><head></head><script>var collision="{MARKER}";</script></html>"#);

@@ -1,0 +1,16 @@
+# Fictional targets and image. Local check fixture, not deployable infrastructure.
+schema_version: 1
+environment: sandbox
+runtime: ec2-compose
+aws:
+  account_id: '123456789012'
+  profile: pbs-sandbox
+pbs:
+  config: pbs.yaml
+  image: registry.example.com/pbs@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  bindings: bindings.json
+regions:
+  us-east-1:
+    instance_ids:
+      - i-0123456789abcdef0
+    overrides: east.yaml

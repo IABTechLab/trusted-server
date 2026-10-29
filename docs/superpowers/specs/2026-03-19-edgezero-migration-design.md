@@ -1,7 +1,7 @@
 # EdgeZero Migration Plan
 
 > Migration plan for moving trusted-server from direct Fastly Compute SDK usage
-> to the [EdgeZero](https://github.com/stackpop/edgezero) framework, enabling
+> to the [EdgeZero](https://github.com/IABTechLab/edgezero) framework, enabling
 > deployment across Fastly, Cloudflare Workers, and native Axum/Tokio from a
 > single codebase.
 
@@ -91,25 +91,25 @@ mid-migration confusion. All subsequent PRs use the new names.
 The trusted-server uses these Fastly-specific primitives across ~28 source
 files in `crates/trusted-server-core` and `crates/trusted-server-adapter-fastly`:
 
-| Primitive                              | Files Affected                                      | EdgeZero Status                                                                                                                                                                          |
-| -------------------------------------- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `fastly::Request` / `Response`         | All (~28 files)                                     | Ready (`http` crate types)                                                                                                                                                               |
-| `fastly::Body`                         | publisher, proxy, integrations                      | Ready (`edgezero_core::Body`)                                                                                                                                                            |
-| `fastly::backend::Backend` (dynamic)   | backend.rs, all integrations                        | Backlog ([#79-87](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087))                                                        |
-| `req.send()` / `req.send_async()`      | proxy.rs, all integrations                          | Partial (`ProxyClient` exists — needs generalization to `HttpClient`, see PR 2 notes)                                                                                                    |
-| `select(Vec<PendingRequest>)`          | auction/orchestrator.rs                             | Backlog ([#147-148](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148))                                                                                       |
-| `fastly::ConfigStore`                  | fastly_storage.rs                                   | In review ([#51-58](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2051%2052%2053%2054%2055%2056%2057%2058), PR [#209](https://github.com/stackpop/edgezero/pull/209)) |
-| `fastly::SecretStore`                  | fastly_storage.rs                                   | Backlog ([#59-67](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2059%2060%2061%2062%2063%2064%2065%2066%2067))                                                        |
-| KV Store (counter, opid, creative)     | fastly_storage.rs                                   | In review ([#43-50](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2043%2044%2045%2046%2047%2048%2049%2050), PR [#165](https://github.com/stackpop/edgezero/pull/165)) |
-| `fastly::geo::geo_lookup`              | geo.rs                                              | Covered by [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (Client Info)                                                             |
-| `req.get_client_ip_addr()`             | geo.rs, synthetic.rs, didomi.rs, auction/formats.rs | Backlog ([#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092))                                                                            |
-| `req.get_tls_protocol()`               | http_util.rs                                        | Covered by [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (Client Info)                                                             |
-| `log_fastly::Logger`                   | main.rs                                             | Ready (adapter handles logging)                                                                                                                                                          |
-| `#[fastly::main]`                      | main.rs                                             | Ready (`dispatch()`)                                                                                                                                                                     |
-| `fastly::http::Url`                    | integrations/prebid.rs                              | Trivial (use `url::Url`)                                                                                                                                                                 |
-| `fastly::mime`                         | request_signing/endpoints.rs                        | Trivial (use `mime` crate)                                                                                                                                                               |
-| `response.get_backend_name()`          | auction/orchestrator.rs                             | Filed as [#213](https://github.com/stackpop/edgezero/issues/213)                                                                                                                         |
-| Fastly API transport (runtime updates) | fastly_storage.rs, request_signing/rotation.rs      | Adapter-specific implementation behind abstraction                                                                                                                                       |
+| Primitive                              | Files Affected                                      | EdgeZero Status                                                                                                                                                                              |
+| -------------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fastly::Request` / `Response`         | All (~28 files)                                     | Ready (`http` crate types)                                                                                                                                                                   |
+| `fastly::Body`                         | publisher, proxy, integrations                      | Ready (`edgezero_core::Body`)                                                                                                                                                                |
+| `fastly::backend::Backend` (dynamic)   | backend.rs, all integrations                        | Backlog ([#79-87](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087))                                                          |
+| `req.send()` / `req.send_async()`      | proxy.rs, all integrations                          | Partial (`ProxyClient` exists — needs generalization to `HttpClient`, see PR 2 notes)                                                                                                        |
+| `select(Vec<PendingRequest>)`          | auction/orchestrator.rs                             | Backlog ([#147-148](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148))                                                                                         |
+| `fastly::ConfigStore`                  | fastly_storage.rs                                   | In review ([#51-58](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2051%2052%2053%2054%2055%2056%2057%2058), PR [#209](https://github.com/IABTechLab/edgezero/pull/209)) |
+| `fastly::SecretStore`                  | fastly_storage.rs                                   | Backlog ([#59-67](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2059%2060%2061%2062%2063%2064%2065%2066%2067))                                                          |
+| KV Store (counter, opid, creative)     | fastly_storage.rs                                   | In review ([#43-50](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2043%2044%2045%2046%2047%2048%2049%2050), PR [#165](https://github.com/IABTechLab/edgezero/pull/165)) |
+| `fastly::geo::geo_lookup`              | geo.rs                                              | Covered by [#88-92](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (Client Info)                                                               |
+| `req.get_client_ip_addr()`             | geo.rs, synthetic.rs, didomi.rs, auction/formats.rs | Backlog ([#88-92](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092))                                                                              |
+| `req.get_tls_protocol()`               | http_util.rs                                        | Covered by [#88-92](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (Client Info)                                                               |
+| `log_fastly::Logger`                   | main.rs                                             | Ready (adapter handles logging)                                                                                                                                                              |
+| `#[fastly::main]`                      | main.rs                                             | Ready (`dispatch()`)                                                                                                                                                                         |
+| `fastly::http::Url`                    | integrations/prebid.rs                              | Trivial (use `url::Url`)                                                                                                                                                                     |
+| `fastly::mime`                         | request_signing/endpoints.rs                        | Trivial (use `mime` crate)                                                                                                                                                                   |
+| `response.get_backend_name()`          | auction/orchestrator.rs                             | Filed as [#213](https://github.com/IABTechLab/edgezero/issues/213)                                                                                                                           |
+| Fastly API transport (runtime updates) | fastly_storage.rs, request_signing/rotation.rs      | Adapter-specific implementation behind abstraction                                                                                                                                           |
 
 ### Import Locations
 
@@ -147,10 +147,10 @@ files in `crates/trusted-server-core` and `crates/trusted-server-adapter-fastly`
 
 These are close to landing and unblock early migration phases.
 
-| Feature                  | Issues                                                                                                             | PR                                                    | Notes                                                                        |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------- | ---------------------------------------------------------------------------- |
-| KV Store Abstraction     | [#43-50](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2043%2044%2045%2046%2047%2048%2049%2050) | [#165](https://github.com/stackpop/edgezero/pull/165) | Covers the generic runtime KV abstraction used by current live KV call sites |
-| Config Store Abstraction | [#51-58](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2051%2052%2053%2054%2055%2056%2057%2058) | [#209](https://github.com/stackpop/edgezero/pull/209) | Covers jwks_store, runtime config                                            |
+| Feature                  | Issues                                                                                                               | PR                                                      | Notes                                                                        |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| KV Store Abstraction     | [#43-50](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2043%2044%2045%2046%2047%2048%2049%2050) | [#165](https://github.com/IABTechLab/edgezero/pull/165) | Covers the generic runtime KV abstraction used by current live KV call sites |
+| Config Store Abstraction | [#51-58](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2051%2052%2053%2054%2055%2056%2057%2058) | [#209](https://github.com/IABTechLab/edgezero/pull/209) | Covers jwks_store, runtime config                                            |
 
 > **Note:** EdgeZero Config Store and Secret Store provide **read** interfaces.
 > Management write CRUD (put/delete for config, create/delete for secrets) is a
@@ -163,7 +163,7 @@ These are close to landing and unblock early migration phases.
 These must land before trusted-server can fully migrate. Ordered by dependency
 chain.
 
-#### 1. Secret Store Abstraction (Issues [#59-67](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2059%2060%2061%2062%2063%2064%2065%2066%2067))
+#### 1. Secret Store Abstraction (Issues [#59-67](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2059%2060%2061%2062%2063%2064%2065%2066%2067))
 
 Trusted-server stores Ed25519 signing keys and API credentials in
 `fastly::SecretStore`. Every request that does request signing or key rotation
@@ -190,7 +190,7 @@ What EdgeZero needs:
 > trait contract and PR 9). Implementers should not wait on EdgeZero for
 > write support.
 
-#### 2. Dynamic Backend Abstraction (Issues [#79-87](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087))
+#### 2. Dynamic Backend Abstraction (Issues [#79-87](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087))
 
 Trusted-server creates backends on-the-fly from URLs for every upstream call.
 This is the most pervasive networking primitive — used by every integration,
@@ -219,7 +219,7 @@ What EdgeZero needs:
 - Cloudflare adapter via Fetch API with custom `RequestInit`
 - Axum adapter via `reqwest::Client` with timeout config
 
-#### 3. Client Info Abstraction (Issues [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092))
+#### 3. Client Info Abstraction (Issues [#88-92](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092))
 
 Trusted-server uses client IP for geolocation and TLS protocol for scheme
 detection. Both are platform-specific APIs.
@@ -241,7 +241,7 @@ What EdgeZero needs:
 - Cloudflare: from `CF-Connecting-IP` header and `cf` object
 - Axum: from connection info and `X-Forwarded-For`
 
-#### 4. Concurrent Request Fan-out (Issues [#147-148](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148))
+#### 4. Concurrent Request Fan-out (Issues [#147-148](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148))
 
 The auction orchestrator sends bid requests to multiple providers
 simultaneously, then processes responses as they arrive using
@@ -276,7 +276,7 @@ What EdgeZero needs:
   failure path, not only success path)
 - Must work in WASM (no `tokio::spawn`, no `Send` requirement)
 
-#### 5. Content Rewriting (Issues [#114-117](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20114%20115%20116%20117))
+#### 5. Content Rewriting (Issues [#114-117](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%20114%20115%20116%20117))
 
 The publisher proxy streams HTML responses through a pipeline that injects
 `<script>` tags at `<head>`, rewrites ad-related HTML attributes, and handles
@@ -298,18 +298,18 @@ What EdgeZero needs:
 
 ### Important — Needed for Full Feature Parity
 
-#### 6. Cookie Support (Issues [#93-95](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2093%2094%2095))
+#### 6. Cookie Support (Issues [#93-95](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2093%2094%2095))
 
 Usage in `cookies.rs`: parse `Cookie` header from requests, build `Set-Cookie`
 response headers with `SameSite`, `Secure`, `HttpOnly`, `Domain`, `Path`,
 `Max-Age`.
 
-#### 7. Static File Serving with ETag (Issues [#104-106](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20104%20105%20106))
+#### 7. Static File Serving with ETag (Issues [#104-106](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%20104%20105%20106))
 
 Usage in `http_util.rs`: `serve_static_with_etag()` serves JS bundles with
 SHA-256 ETag, `If-None-Match` → 304, `Cache-Control` headers.
 
-#### 8. Response Header Injection via Config (Issues [#102-103](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20102%20103))
+#### 8. Response Header Injection via Config (Issues [#102-103](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%20102%20103))
 
 Operator-configured response headers added to every response in
 `finalize_response()`.
@@ -321,12 +321,12 @@ to existing EdgeZero issues. Features that are core business logic (not EdgeZero
 concerns) are marked N/A. Features that were initially thought to need new
 issues have been resolved:
 
-| Feature                           | Issue                                                                                               | Resolution                                                                                                                                                                       | Blocks TS PRs                                                                                                                  |
-| --------------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| Geolocation Abstraction           | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) | Already covered by Client Info epic (via [#89](https://github.com/stackpop/edgezero/issues/89)). `GeoLookup` included in client metadata.                                        | PR 7                                                                                                                           |
-| Response Backend Correlation      | [#213](https://github.com/stackpop/edgezero/issues/213)                                             | New task filed under [#79](https://github.com/stackpop/edgezero/issues/79). Async responses must carry an identifier for upstream correlation (`get_backend_name()` equivalent). | Swaps in after PR 6 (PR 6 uses `PlatformResponse.backend_name: Option<String>`; `Some` on Fastly, `None` on others until #213) |
-| TLS/Scheme Detection              | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) | Already covered by Client Info epic (via [#89](https://github.com/stackpop/edgezero/issues/89)). `ClientInfo` includes TLS protocol and cipher info.                             | PR 7                                                                                                                           |
-| Request-Signing Management Writes | N/A (core business logic)                                                                           | Not an EdgeZero concern. Core signing code composes platform store CRUD primitives (`PlatformConfigStore`, `PlatformSecretStore`). No signing-specific trait.                    | PR 9 (store wiring)                                                                                                            |
+| Feature                           | Issue                                                                                                 | Resolution                                                                                                                                                                         | Blocks TS PRs                                                                                                                  |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Geolocation Abstraction           | [#88-92](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) | Already covered by Client Info epic (via [#89](https://github.com/IABTechLab/edgezero/issues/89)). `GeoLookup` included in client metadata.                                        | PR 7                                                                                                                           |
+| Response Backend Correlation      | [#213](https://github.com/IABTechLab/edgezero/issues/213)                                             | New task filed under [#79](https://github.com/IABTechLab/edgezero/issues/79). Async responses must carry an identifier for upstream correlation (`get_backend_name()` equivalent). | Swaps in after PR 6 (PR 6 uses `PlatformResponse.backend_name: Option<String>`; `Some` on Fastly, `None` on others until #213) |
+| TLS/Scheme Detection              | [#88-92](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) | Already covered by Client Info epic (via [#89](https://github.com/IABTechLab/edgezero/issues/89)). `ClientInfo` includes TLS protocol and cipher info.                             | PR 7                                                                                                                           |
+| Request-Signing Management Writes | N/A (core business logic)                                                                             | Not an EdgeZero concern. Core signing code composes platform store CRUD primitives (`PlatformConfigStore`, `PlatformSecretStore`). No signing-specific trait.                      | PR 9 (store wiring)                                                                                                            |
 
 ### Not Required from EdgeZero
 
@@ -1574,20 +1574,20 @@ do not block any Phase 0 or Phase 1 work; they are swapped in later.
 
 ```
 Week 1-2:   TS PRs 1-2 (crate rename + RuntimeServices traits)
-            EZ: Land KV Store (PR [#165](https://github.com/stackpop/edgezero/pull/165)), Config Store (PR [#209](https://github.com/stackpop/edgezero/pull/209))
+            EZ: Land KV Store (PR [#165](https://github.com/IABTechLab/edgezero/pull/165)), Config Store (PR [#209](https://github.com/IABTechLab/edgezero/pull/209))
 
 Week 3-4:   TS PR 3 (config store + split fastly_storage.rs)
             TS PRs 6-8, 10 (behavior extractions — in parallel)
 
 Week 5:     TS PRs 4-5 (secret store + KV store — in parallel, after PR 3)
             TS PR 9 (request signing — after PR 4, shared files)
-            EZ: Build Secret Store ([#59-67](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2059%2060%2061%2062%2063%2064%2065%2066%2067)), Client Info ([#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092)),
-                Dynamic Backend ([#79-87](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087))
+            EZ: Build Secret Store ([#59-67](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2059%2060%2061%2062%2063%2064%2065%2066%2067)), Client Info ([#88-92](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092)),
+                Dynamic Backend ([#79-87](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087))
 
 Week 6-7:   TS PR 11 (utility layer type migration + compatibility adapter)
             TS PR 12 (handler layer type migration)
-            EZ: Build Concurrent Fan-out ([#147-148](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148)),
-                Content Rewriting ([#114-117](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20114%20115%20116%20117))
+            EZ: Build Concurrent Fan-out ([#147-148](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148)),
+                Content Rewriting ([#114-117](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%20114%20115%20116%20117))
 
 Week 8:     TS PR 12.5 (thread RuntimeServices into integration/provider
             entry points — pure signature changes, no type migration)
@@ -1623,23 +1623,23 @@ EdgeZero features **do not block** Phase 0 or Phase 1. During Phase 1, all
 trait implementations are backed by direct Fastly SDK calls. EdgeZero adapter
 implementations are swapped in when available — no application code changes.
 
-| Priority | Feature                                 | EdgeZero Issues                                                                                                                                                 | Status                                                                                              | Swap-in Point |
-| -------- | --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ------------- |
-| P0       | KV Store                                | [#43-50](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2043%2044%2045%2046%2047%2048%2049%2050)                                              | In review (PR [#165](https://github.com/stackpop/edgezero/pull/165))                                | After PR 5    |
-| P0       | Config Store                            | [#51-58](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2051%2052%2053%2054%2055%2056%2057%2058)                                              | In review (PR [#209](https://github.com/stackpop/edgezero/pull/209))                                | After PR 3    |
-| P0       | Secret Store                            | [#59-67](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2059%2060%2061%2062%2063%2064%2065%2066%2067)                                         | Backlog                                                                                             | After PR 4    |
-| P0       | Dynamic Backend                         | [#79-87](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087)                                         | Backlog                                                                                             | After PR 6    |
-| P0       | Client Info (IP, TLS)                   | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092)                                                             | Backlog                                                                                             | After PR 7    |
-| P0       | Concurrent Fan-out                      | [#147-148](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148)                                                                        | Backlog                                                                                             | After PR 6    |
-| P0       | ProxyClient → HttpClient generalization | TBD (file before PR 6 merges)                                                                                                                                   | Not filed — file to generalize `ProxyClient` into `HttpClient` supporting sync send + async fan-out | After PR 6    |
-| —        | Request-Signing Logic                   | N/A (core business logic)                                                                                                                                       | Uses store CRUD                                                                                     | PR 9          |
-| P1       | Content Rewriting                       | [#114-117](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20114%20115%20116%20117)                                                            | Backlog                                                                                             | After PR 8    |
-| P1       | Cookie Support                          | [#93-95](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2093%2094%2095)                                                                       | Backlog                                                                                             | PR 11         |
-| P1       | Static File ETag                        | [#104-106](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20104%20105%20106)                                                                  | Backlog                                                                                             | PR 11         |
-| P1       | Response Headers                        | [#102-103](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20102%20103)                                                                        | Backlog                                                                                             | PR 14         |
-| P1       | Geolocation                             | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (via [#89](https://github.com/stackpop/edgezero/issues/89)) | Backlog                                                                                             | After PR 7    |
-| P2       | Backend Correlation                     | [#213](https://github.com/stackpop/edgezero/issues/213) (under [#79](https://github.com/stackpop/edgezero/issues/79))                                           | Filed                                                                                               | After PR 6    |
-| P2       | TLS Detection                           | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (via [#89](https://github.com/stackpop/edgezero/issues/89)) | Backlog                                                                                             | After PR 7    |
+| Priority | Feature                                 | EdgeZero Issues                                                                                                                                                     | Status                                                                                              | Swap-in Point |
+| -------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ------------- |
+| P0       | KV Store                                | [#43-50](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2043%2044%2045%2046%2047%2048%2049%2050)                                                | In review (PR [#165](https://github.com/IABTechLab/edgezero/pull/165))                              | After PR 5    |
+| P0       | Config Store                            | [#51-58](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2051%2052%2053%2054%2055%2056%2057%2058)                                                | In review (PR [#209](https://github.com/IABTechLab/edgezero/pull/209))                              | After PR 3    |
+| P0       | Secret Store                            | [#59-67](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2059%2060%2061%2062%2063%2064%2065%2066%2067)                                           | Backlog                                                                                             | After PR 4    |
+| P0       | Dynamic Backend                         | [#79-87](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087)                                           | Backlog                                                                                             | After PR 6    |
+| P0       | Client Info (IP, TLS)                   | [#88-92](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092)                                                               | Backlog                                                                                             | After PR 7    |
+| P0       | Concurrent Fan-out                      | [#147-148](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148)                                                                          | Backlog                                                                                             | After PR 6    |
+| P0       | ProxyClient → HttpClient generalization | TBD (file before PR 6 merges)                                                                                                                                       | Not filed — file to generalize `ProxyClient` into `HttpClient` supporting sync send + async fan-out | After PR 6    |
+| —        | Request-Signing Logic                   | N/A (core business logic)                                                                                                                                           | Uses store CRUD                                                                                     | PR 9          |
+| P1       | Content Rewriting                       | [#114-117](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%20114%20115%20116%20117)                                                              | Backlog                                                                                             | After PR 8    |
+| P1       | Cookie Support                          | [#93-95](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2093%2094%2095)                                                                         | Backlog                                                                                             | PR 11         |
+| P1       | Static File ETag                        | [#104-106](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%20104%20105%20106)                                                                    | Backlog                                                                                             | PR 11         |
+| P1       | Response Headers                        | [#102-103](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%20102%20103)                                                                          | Backlog                                                                                             | PR 14         |
+| P1       | Geolocation                             | [#88-92](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (via [#89](https://github.com/IABTechLab/edgezero/issues/89)) | Backlog                                                                                             | After PR 7    |
+| P2       | Backend Correlation                     | [#213](https://github.com/IABTechLab/edgezero/issues/213) (under [#79](https://github.com/IABTechLab/edgezero/issues/79))                                           | Filed                                                                                               | After PR 6    |
+| P2       | TLS Detection                           | [#88-92](https://github.com/IABTechLab/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (via [#89](https://github.com/IABTechLab/edgezero/issues/89)) | Backlog                                                                                             | After PR 7    |
 
 ### Trusted-Server Issue Backlog
 

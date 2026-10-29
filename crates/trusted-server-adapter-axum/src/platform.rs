@@ -26,7 +26,9 @@ fn normalize_env_segment(s: &str) -> String {
     s.to_uppercase().replace(['-', '.', ' '], "_")
 }
 
-fn config_env_var(store_name: &str, key: &str) -> String {
+/// Returns the environment-variable name for a config store entry.
+#[must_use]
+pub fn config_env_var(store_name: &str, key: &str) -> String {
     format!(
         "TRUSTED_SERVER_CONFIG_{}_{}",
         normalize_env_segment(store_name),
@@ -522,16 +524,13 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 ///
 /// # Degraded features in dev
 ///
-/// KV store is [`trusted_server_core::platform::UnavailableKvStore`] — any route
-/// touching synthetic-ID or consent KV will degrade gracefully. A `warn` log is
+/// The generic runtime KV slot uses
+/// [`trusted_server_core::platform::UnavailableKvStore`]. A `warn` log is
 /// emitted once per process.
 pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
-        log::warn!(
-            "Axum dev server: KV store is unavailable (UnavailableKvStore). \
-             Routes that depend on synthetic-ID or consent KV will degrade gracefully."
-        );
+        log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
     });
 
     let client_ip = edgezero_adapter_axum::context::AxumRequestContext::get(ctx.request())
@@ -552,7 +551,11 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     static BACKEND: std::sync::OnceLock<Arc<dyn PlatformBackend>> = std::sync::OnceLock::new();
     static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
 
+    static TIMER: std::sync::OnceLock<Arc<dyn trusted_server_core::platform::PlatformTimer>> =
+        std::sync::OnceLock::new();
+
     RuntimeServices::builder()
+        .timer(Arc::clone(TIMER.get_or_init(|| Arc::new(AxumTimer))))
         .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
             Arc::new(AxumPlatformConfigStore) as Arc<dyn PlatformConfigStore>
         })))
@@ -582,6 +585,16 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .build()
 }
 
+struct AxumTimer;
+
+impl trusted_server_core::platform::PlatformTimer for AxumTimer {
+    fn delay(&self, duration: std::time::Duration) -> futures::future::LocalBoxFuture<'static, ()> {
+        Box::pin(async move {
+            tokio::time::sleep(duration).await;
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -592,6 +605,27 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn html_finalization_timer_is_shared_without_an_executor() {
+        let request = edgezero_core::http::request_builder()
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build a request");
+        let context = edgezero_core::context::RequestContext::new(request, Default::default());
+        let services = build_runtime_services(&context);
+        let next_services = build_runtime_services(&context);
+        assert!(
+            std::ptr::eq(
+                services
+                    .timer()
+                    .expect("should install a cooperative timer"),
+                next_services
+                    .timer()
+                    .expect("should reuse the cooperative timer"),
+            ),
+            "should share the stateless timer without requiring an executor"
+        );
+    }
 
     #[test]
     fn auction_http_capabilities_are_explicit() {
@@ -605,6 +639,15 @@ mod tests {
         assert!(
             !capabilities.has_enforceable_total_request_deadline(),
             "reqwest's transport timeout is not an adapter-enforced auction deadline"
+        );
+    }
+
+    #[test]
+    fn config_env_var_normalizes_store_and_key() {
+        assert_eq!(
+            config_env_var("my-store.name", "my key"),
+            "TRUSTED_SERVER_CONFIG_MY_STORE_NAME_MY_KEY",
+            "should normalize environment-variable segments"
         );
     }
 

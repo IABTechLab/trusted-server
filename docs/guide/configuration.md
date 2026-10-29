@@ -69,6 +69,49 @@ resolved only while an instance builds runtime settings. An adapter can map the
 logical ID to a different physical name. For example, Fastly commonly maps
 `trusted_server_secrets` to physical store `ts_secrets`.
 
+Two accepted secret-shaped fields are deliberately different:
+
+- `trusted_client_ip.shared_secret` is an inline value in the app-config blob;
+  it is redacted by debug formatting but is not resolved from a secret store.
+- `tinybird.access_token_secret` is deprecated input. It is accepted for
+  migration, then discarded and omitted from serialized config; use
+  `tinybird.auction_token_secret` as the store key name instead.
+
+The four deprecated `secret_store` selectors under Tinybird, DataDome, its
+protection-test bypass, and S3 route authentication are also accepted and
+discarded. Store selection comes from the adapter's EdgeZero mapping.
+
+::: warning CLI output and inline secrets
+`ts config diff`, `ts config push --dry-run`, and the interactive push preview
+can print deliberately inline values. Use `ts config push --no-diff` when that
+output is not safe for the current terminal or CI log. The flag suppresses the
+diff; it does not move inline values to a secret store.
+:::
+
+The following table records the independent lifecycle, key-identity,
+serialization, runtime, and secret axes for every exceptional field:
+
+| Path                                                         | Lifecycle  | Key identity                        | Serialization | Runtime              | Secret handling          |
+| ------------------------------------------------------------ | ---------- | ----------------------------------- | ------------- | -------------------- | ------------------------ |
+| `AssetOriginAuth.s3_sig_v4`                                  | deprecated | alias of `AssetOriginAuth.s3_sigv4` | skipped       | deserialization only | none                     |
+| `DataDomeConfig.server_side_key_secret_name`                 | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `DataDomeConfig.server_side_key_secret_store`                | deprecated | canonical                           | skipped       | normalized away      | none                     |
+| `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | skipped       | normalized away      | none                     |
+| `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `Handler.password`                                           | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `S3SigV4AuthConfig.secret_store`                             | deprecated | canonical                           | skipped       | normalized away      | none                     |
+| `S3SigV4AuthConfig.session_token`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `TinybirdSettings.access_token_secret`                       | deprecated | canonical                           | skipped       | normalized away      | accepted, then discarded |
+| `TinybirdSettings.auction_token_secret`                      | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `TinybirdSettings.secret_store`                              | deprecated | canonical                           | skipped       | normalized away      | none                     |
+| `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical                           | serialized    | active               | deliberately inline      |
+
 Prepare an initial reference-based deployment in this order:
 
 1. Create the physical store and configure its `trusted_server_secrets` mapping.
@@ -78,8 +121,16 @@ Prepare an initial reference-based deployment in this order:
 4. Run `ts config validate`, then `ts config push --adapter fastly`.
 5. Start or deploy instances after the store and pushed config are both ready.
 
-Changing a store value does not alter already-built state. Restart or redeploy
-instances when rotating static credentials.
+Migrate an existing deployment in this order:
+
+1. Populate the physical store mapped from `trusted_server_secrets` with the
+   existing credential values without printing them in shell history, logs, or
+   CI output.
+2. Replace each active credential value with a stable key name and remove the
+   legacy Tinybird, DataDome, and S3 `secret_store` selectors.
+3. Run `ts config validate`, then `ts config push --adapter fastly --no-diff`.
+4. Restart/redeploy instances as needed to load the new values. Rotation is
+   startup-scoped; changing a store value does not alter already-built state.
 
 Keep `publisher.proxy_secret` and `ec.passphrase` stable unless intentionally
 rotating signed URLs or EC identifiers. On Spin, the app-config blob is stored
@@ -141,18 +192,25 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-| Section               | Purpose                                      |
-| --------------------- | -------------------------------------------- |
-| `[publisher]`         | Domain, origin, proxy settings               |
-| `[trusted_client_ip]` | Authenticated client-IP forwarding           |
-| `[ec]`                | Edge Cookie (EC) ID generation               |
-| `[tester_cookie]`     | Optional tester-cookie endpoint              |
-| `[proxy]`             | Proxy SSRF allowlist and asset routes        |
-| `[cache]`             | Static/rehosted asset cache policy rules     |
-| `[image_optimizer]`   | Reusable Image Optimizer profile sets        |
-| `[request_signing]`   | Ed25519 request signing                      |
-| `[auction]`           | Auction orchestration                        |
-| `[integrations.*]`    | Partner integrations (Prebid, Next.js, etc.) |
+| Section                    | Purpose                                                                 |
+| -------------------------- | ----------------------------------------------------------------------- |
+| `[auction]`                | Auction orchestration, provider instances, bidder routes, and mediation |
+| `[cache]`                  | Static and rehosted asset cache policy                                  |
+| `[consent]`                | Consent interpretation, forwarding, and conflict resolution             |
+| `[creative_opportunities]` | Server-side page ad opportunities and templates                         |
+| `[debug]`                  | Explicit non-production diagnostics                                     |
+| `[ec]`                     | Edge Cookie identity, persistence, and partner sync                     |
+| `[[handlers]]`             | Ordered HTTP Basic-auth rules                                           |
+| `[image_optimizer]`        | Reusable Fastly Image Optimizer profiles                                |
+| `[integrations.*]`         | Typed partner and browser integration settings                          |
+| `[proxy]`                  | Proxy allowlist, TLS policy, and asset routes                           |
+| `[publisher]`              | Publisher domain, origin, and proxy signing key                         |
+| `[request_signing]`        | Outbound Ed25519 request signing and management-store IDs               |
+| `[response_headers]`       | Headers added to Trusted Server responses                               |
+| `[rewrite]`                | First-party URL rewrite exclusions                                      |
+| `[tester_cookie]`          | Optional tester-cookie endpoints                                        |
+| `[tinybird]`               | Direct Tinybird auction telemetry                                       |
+| `[trusted_client_ip]`      | Authenticated front-door client-IP forwarding                           |
 
 ## Example: Production Setup
 
@@ -251,15 +309,16 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field                              | Type    | Required | Description                                                                      |
-| ---------------------------------- | ------- | -------- | -------------------------------------------------------------------------------- |
-| `domain`                           | String  | Yes      | Publisher's apex domain name                                                     |
-| `cookie_domain`                    | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                           |
-| `origin_url`                       | String  | Yes      | Full URL of publisher origin server                                              |
-| `origin_host_header_override`      | String  | No       | Outbound Host header to send while connecting to `origin_url`                    |
-| `proxy_secret`                     | String  | Yes      | Secret-store key name for the proxy URL secret                                   |
-| `ssat_compression_offload_enabled` | Boolean | No       | Fastly-only dynamic delivery compression for eligible SSAT HTML, default `false` |
-| `max_buffered_body_bytes`          | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB)      |
+| Field                          | Type    | Required | Description                                                                          |
+| ------------------------------ | ------- | -------- | ------------------------------------------------------------------------------------ |
+| `domain`                       | String  | Yes      | Publisher's apex domain name                                                         |
+| `cookie_domain`                | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                               |
+| `origin_url`                   | String  | Yes      | Full URL of publisher origin server                                                  |
+| `origin_host_header_override`  | String  | No       | Outbound Host header to send while connecting to `origin_url`                        |
+| `proxy_secret`                 | String  | Yes      | Secret-store key name for the proxy URL secret                                       |
+| `max_buffered_body_bytes`      | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB)          |
+| `allow_async_html_finish`      | Boolean | No       | Explicit permission for async HTML EOF work and its delivery cost (default false)    |
+| `html_finalization_timeout_ms` | Integer | No       | Shared optional EOF budget after decoder/parser EOF (default 5000 ms; range 1–60000) |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -274,8 +333,6 @@ origin_url = "https://origin.publisher.com"
 # Optional: connect to origin_url but send this outbound Host header.
 # origin_host_header_override = "www.publisher.com"
 proxy_secret = "publisher_proxy_secret"
-# Fastly only; disabled by default. Uncomment after deploying a compatible binary.
-# ssat_compression_offload_enabled = true
 ```
 
 **Environment Override**:
@@ -286,8 +343,9 @@ TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
-TRUSTED_SERVER__PUBLISHER__SSAT_COMPRESSION_OFFLOAD_ENABLED=true
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
+TRUSTED_SERVER__PUBLISHER__ALLOW_ASYNC_HTML_FINISH=false
+TRUSTED_SERVER__PUBLISHER__HTML_FINALIZATION_TIMEOUT_MS=5000
 ```
 
 ### Field Details
@@ -383,54 +441,63 @@ intentionally, and never put it in the TOML file or pushed app-config blob.
 Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations carefully and use graceful transition periods.
 :::
 
-#### `ssat_compression_offload_enabled`
+#### `allow_async_html_finish`
 
-**Purpose**: Offload delivery compression for eligible server-side ad stack
-(SSAT) HTML responses to Fastly dynamic compression.
+Explicit permission for integrations declaring asynchronous HTML processor completion.
+Defaults to `false`. An enabled integration requiring EOF I/O without permission is
+rejected with a configuration error; its requested work is not silently skipped.
+Permission alone does not change processing when no async factories are registered.
+No built-in integration currently declares async completion, so this setting has no
+effect in a stock build.
 
-When enabled on the Fastly adapter, Trusted Server continues to negotiate only
-supported encodings with the publisher origin. For processable HTML, it decodes
-the origin response, emits identity HTML, and sends `X-Compress-Hint: on` for
-Fastly delivery compression. `Vary: Accept-Encoding` is retained or added as
-needed. The setting applies only when the existing SSAT request gates pass and
-the response is processable HTML; non-HTML responses retain their negotiated
-origin encoding.
+Non-retaining processors can release ready HTML before EOF I/O on Fastly. A factory
+requesting output retention delays initial delivery until EOF or overflow. Axum,
+Workers and Spin currently buffer publisher responses, so enabled EOF I/O can add to
+TTFB there even without stage retention. Enable only when accepting that delivery cost.
 
-The setting defaults to `false`. Axum, Cloudflare, and Spin explicitly declare
-the capability unavailable, so enabling it there does not change request or
-response compression behavior.
-
-::: warning Fastly delivery billing
-Fastly bills dynamically compressed responses based on their uncompressed size
-before compression when the service is subject to metered delivery charges.
-This option can therefore increase billable delivery bytes even though browsers
-receive compressed content. Include uncompressed response size and projected
-delivery cost in rollout measurements. See Fastly's
-[compression guide](https://www.fastly.com/documentation/guides/concepts/compression/).
+::: warning Template caching is disabled
+Once an integration requiring async completion is enabled, processed HTML bypasses
+shared-template caching for every page, including pages where the stage leaves the
+output unchanged. Responses use `Cache-Control: no-store, private`. Caching
+document-deterministic async output is tracked in
+[#1397](https://github.com/IABTechLab/trusted-server/issues/1397).
 :::
 
-::: warning Deployment ordering
-Deploy a Trusted Server binary that supports this setting before enabling it.
-Before rolling back to an older binary, set the option to `false` and publish
-the configuration with the current CLI so the disabled field is omitted, then
-roll back the binary.
-:::
+#### `html_finalization_timeout_ms`
 
-**Environment Override**:
+Shared budget for optional asynchronous processor EOF work in milliseconds. The default
+is `5000`; accepted values are `1` through `60000`. It begins after decoder/parser EOF
+and does not change the auction deadline. The initial 5-second default follows the
+issue example; 60 seconds is a configuration ceiling, not a recommended delivery
+latency or a measured optimum. Timer expiry skips later optional I/O while
+still completing downstream synchronous EOF. Timeout retains the current un-emitted
+stage output; it cannot undo bytes already delivered or remote side effects.
 
-```bash
-TRUSTED_SERVER__PUBLISHER__SSAT_COMPRESSION_OFFLOAD_ENABLED=true
-```
+The setting is inert without async processors. Axum, Workers and Spin enforce it with
+a cooperative timer that can cancel yielding callbacks. Fastly has no timer: core
+checks the budget only before and after each callback, so an integration that does
+not bound its own blocking host calls can hold the response past this value.
+Opted-in processed HTML bypasses shared-template caching and uses private/no-store
+policy; raw-origin readthrough remains separate. Opted-in HTML with 206 or any
+`Content-Range` bypasses rewriting and EOF work while preserving encoded bytes and
+range/framing metadata. Full error HTML remains eligible and exposes actual status.
+See [Asynchronous HTML processor completion](/guide/integration-guide#asynchronous-html-processor-completion).
 
 #### `max_buffered_body_bytes`
 
-**Purpose**: Upper bound on how much of a publisher origin body the rewrite
-pipeline holds in memory — the post-rewrite output buffer on buffered adapters,
-and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
+**Purpose**: Upper bound on individual publisher body buffers: the post-rewrite
+output buffer on buffered adapters, and the cumulative raw/decoded byte ceiling
+on the Fastly streaming path. Opted-in async HTML processing enforces the same
+cumulative raw/decoded input ceilings on every adapter and body representation.
+Each buffer is limited separately; this is not an aggregate request-memory budget.
+Async retention collectors, replacement candidates, auction suffixes, codec state
+and adapter response buffers can coexist, so total memory may exceed this setting.
+Integration-owned allocations are outside the framework's bound.
 
 **Usage**:
 
-- On **buffered adapters** (Axum, Cloudflare, Spin) it caps the _decoded,
+- On **buffered adapters without async HTML processing** (Axum, Cloudflare, Spin)
+  it caps the _decoded,
   post-rewrite_ output buffer for a publisher response processed in full. It
   also bounds how much decoded gzip output may sit in the heap at any one
   moment, so a decompression bomb is rejected mid-decode rather than after its
@@ -443,6 +510,11 @@ and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
   emitted by the decompressor. The decoded cap is enforced _during_
   decompression, so a decompression bomb is rejected before its expansion is
   materialized rather than after.
+- On **opted-in async HTML paths**, all adapters enforce cumulative _raw_ and
+  _decoded_ input ceilings for both materialized and streamed bodies, using the
+  same capped decoder as the Fastly streaming path. Buffered responses also keep
+  their separate post-rewrite output cap. A processor that reduces the document
+  size cannot bypass these input limits.
 
 **Behavior when exceeded**:
 
@@ -465,6 +537,25 @@ a zero-byte cap fails every non-empty publisher response.
 ```bash
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 ```
+
+### Fastly SSAT delivery compression
+
+Fastly automatically offloads final compression for eligible, successful SSAT
+HTML responses. Trusted Server keeps its existing origin encoding negotiation,
+decodes supported origin encodings, and emits processed identity HTML with
+`X-Compress-Hint: on`. Fastly negotiates gzip or Brotli delivery using the reader's
+original `Accept-Encoding`. No publisher setting is required.
+
+This applies to eligible inline responses and assembled template misses and
+hits. Requests for which reader negotiation selects deflate or fails retain the
+existing in-guest encoding path. Non-SSAT, non-HTML, unsupported-encoding, error,
+redirect, and bodyless responses keep their existing behavior. Axum, Cloudflare,
+and Spin also retain their current compression behavior.
+
+Offload does not change template storage, cache admission, consent gates, or
+terminal private/no-store policies. It does not request identity from origin or
+change body-size limits. Local tests verify guest output; actual Fastly delivery
+encoding and performance require staging validation.
 
 ## Trusted Client IP Configuration
 
@@ -569,14 +660,15 @@ default and should only be enabled for intentional QA or troubleshooting flows.
 
 ### `[tester_cookie]`
 
-| Field     | Type    | Required | Description                                        |
-| --------- | ------- | -------- | -------------------------------------------------- |
-| `enabled` | Boolean | No       | Enables routes to set and clear `ts-tester` cookie |
+| Field             | Type    | Required | Description                                                                  |
+| ----------------- | ------- | -------- | ---------------------------------------------------------------------------- |
+| `enabled`         | Boolean | No       | Enables routes to set and clear `ts-tester` cookie                           |
+| `max_age_seconds` | Integer | No       | Lifetime of the `ts-tester` cookie in seconds. Defaults to 30 days (2592000) |
 
 When enabled, `GET /_ts/set-tester` returns `204 No Content` and sets:
 
 ```http
-Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax
+Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax; Max-Age=<max_age_seconds>
 Cache-Control: no-store, private
 ```
 
@@ -610,7 +702,13 @@ TRUSTED_SERVER__TESTER_COOKIE__ENABLED=true
 
 ## EC Configuration
 
-Settings for Edge Cookie identifier generation. The `ec_store` KV store is the only KV-backed EC lifecycle store. It holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
+Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Live consent is interpreted from request cookies, headers, geolocation, and policy defaults, not separate KV persistence.
+
+### Migrating from `consent_store`
+
+The legacy `[consent].consent_store` setting has been removed. Trusted Server uses a strict configuration schema, so TOML and JSON/app-config that still contain `consent_store` fail during configuration loading and prevent normal application state from being built. This is not partial consent degradation: user routes return adapter-specific 5xx startup-error responses until the field is removed. Run `ts config validate` before `ts config push` to catch the stale field before deployment.
+
+Legacy consent-store records are not read or migrated into `ec.ec_store`. Their payload schema is not authoritative EC lifecycle state, so do not copy those records into the identity store. You may retain the old store unchanged for a defined rollback window, then unlink its platform resource binding and delete it. No browser-cookie or EC identity-store migration is required.
 
 ### `[ec]`
 
@@ -673,6 +771,48 @@ TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 
 - Empty string
 
+## Consent Configuration
+
+`[consent]` controls request-local interpretation and forwarding of privacy
+signals. It does not create a second consent database. Set `consent_store` to a
+KV store name only when consent should persist with the EC identity graph.
+
+### `[consent]`
+
+| Field                                          | Type           | Default                     | Contract                                                    |
+| ---------------------------------------------- | -------------- | --------------------------- | ----------------------------------------------------------- |
+| `mode`                                         | String         | `"interpreter"`             | `interpreter` decodes signals; `proxy` forwards raw strings |
+| `check_expiration`                             | Boolean        | `true`                      | Check TCF timestamps                                        |
+| `max_consent_age_days`                         | Integer        | `395`                       | Clamped to `1..=3650`                                       |
+| `consent_store`                                | String or null | `null`                      | Optional KV store for EC-linked consent persistence         |
+| `gdpr.applies_in`                              | Array[String]  | EU/EEA and UK codes         | Observability only; does not synthesize consent             |
+| `us_states.privacy_states`                     | Array[String]  | Checked built-in state list | Jurisdictions with active comprehensive privacy laws        |
+| `us_privacy_defaults.notice_given`             | Boolean        | `true`                      | Publisher policy used for GPC-only requests                 |
+| `us_privacy_defaults.lspa_covered`             | Boolean        | `false`                     | Publisher LSPA posture                                      |
+| `us_privacy_defaults.gpc_implies_optout`       | Boolean        | `true`                      | Treat `Sec-GPC: 1` as sale opt-out                          |
+| `conflict_resolution.mode`                     | String         | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
+| `conflict_resolution.freshness_threshold_days` | Integer        | `30`                        | Age difference required by `newest`                         |
+
+In `proxy` mode Trusted Server does not decode the TC string, so it cannot
+confirm TCF Purpose 1 + 4. When a TC cookie is present, it fails closed:
+browser-supplied EIDs are neither forwarded in bid requests nor written to the
+EC identity graph, and server-side pull sync is skipped.
+
+```toml
+[consent]
+mode = "interpreter"
+check_expiration = true
+max_consent_age_days = 395
+
+[consent.conflict_resolution]
+mode = "restrictive"
+freshness_threshold_days = 30
+```
+
+`applies_in` and `privacy_states` are policy inputs. Review them against the
+publisher's operating jurisdictions instead of assuming the built-in lists are
+legal advice.
+
 ## Response Headers
 
 Custom headers added to all responses.
@@ -715,6 +855,77 @@ Edit TOML, validate, and push again for those changes.
 
 ::: warning Header Precedence
 Custom headers may be overwritten by application logic. Standard headers (`Content-Type`, `Content-Length`) are controlled by the application.
+:::
+
+### Origin URLs in proxied response headers
+
+Trusted Server rewrites publisher-origin URLs in page bodies to the serving
+host. It applies the same mapping to URL-bearing headers on every proxied
+publisher response, so the browser stays on the serving host. No configuration
+is required.
+
+| Header                                                               | Behavior                                                                                                                                     |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Location`, `Content-Location`                                       | An absolute or protocol-relative URL on the origin is mapped to the serving host. Relative URLs, other hosts, and other ports are unchanged. |
+| `Refresh`                                                            | The URL after the delay (`0; url=...`) is mapped the same way.                                                                               |
+| `Link`                                                               | Each `<...>` target and quoted `imagesrcset` candidate on the origin is mapped; `rel`, `as`, and other parameters are kept.                  |
+| `Content-Security-Policy`, <br>`Content-Security-Policy-Report-Only` | Every source naming the origin gains a serving-host source beside it. Origin sources are kept; `report-uri` and `report-to` are unchanged.   |
+
+For example, with the origin `origin.example.com` served at `www.example.com`:
+
+```http
+Location: https://origin.example.com/landing.html
+Content-Security-Policy: img-src https://origin.example.com data:
+```
+
+is delivered as:
+
+```http
+Location: https://www.example.com/landing.html
+Content-Security-Policy: img-src https://origin.example.com https://www.example.com data:
+```
+
+Two exceptions prevent a redirect loop. Rewriting either target would send the
+browser back to the same URL, and the origin would redirect again:
+
+- When the origin redirects to the URL being requested but under a different
+  scheme from `publisher.origin_url` (for example, an `http://` origin forcing
+  HTTPS), the `Location` or `Refresh` target is left unchanged.
+- When the origin answers a `GET` or `HEAD` with a `Location` to the URL being
+  requested, the target is left unchanged if the response sets no cookie, or
+  whatever cookies it sets when `publisher.origin_host_header_override` sends a
+  different `Host`. The origin is redirecting because of something Trusted
+  Server sends unchanged on every retry, such as that `Host`.
+
+Other same-scheme redirects to the current URL, such as after a form POST or
+one that sets a cookie without a `Host` override, are rewritten as usual, as
+is a `Refresh` reload.
+
+`Set-Cookie` headers are not rewritten. If the origin sets a cookie with a
+`Domain` attribute that does not cover the serving host (for example,
+`Domain=origin.example.com` served at `www.example.com`), the browser rejects
+it. A redirect to the current URL that relies on that cookie then repeats until
+the browser reports too many redirects. Have the origin set host-only cookies,
+or a `Domain` shared by both hosts.
+
+Each response keeps its own per-page values. A `[response_headers]` entry for
+the same header still replaces the rewritten value.
+
+Only response headers are covered. A `<meta http-equiv="refresh">` or
+`<meta http-equiv="Content-Security-Policy">` tag in the page body keeps its
+origin URLs, so the browser can still navigate to the origin or block rewritten
+resources. Deliver these as headers on proxied pages.
+
+::: warning CSP and injected scripts
+Host rewriting only adds serving-host sources. It does not authorize inline
+content Trusted Server inserts without a nonce, or the `/static/tsjs=` bundle
+when the policy allows neither `'self'` nor the serving host. Check
+`script-src` (or `default-src`) on pages with a restrictive policy.
+
+A serving-host source without a path also allows Trusted Server's own routes
+on that host, including `/first-party/proxy`, which serves any target that
+`/first-party/sign` signs. A policy that limited scripts to the origin now
+allows those too. Set `proxy.allowed_domains` to bound what the proxy serves.
 :::
 
 ## Request Signing
@@ -928,13 +1139,14 @@ before pushing the config.
 
 ## URL Rewrite Configuration
 
-Control which domains are excluded from first-party rewriting.
+Control which hosts first-party rewriting covers.
 
 ### `[rewrite]`
 
-| Field             | Type          | Required         | Description               |
-| ----------------- | ------------- | ---------------- | ------------------------- |
-| `exclude_domains` | Array[String] | No (default: []) | Domains to skip rewriting |
+| Field             | Type          | Required         | Description                                                                                         |
+| ----------------- | ------------- | ---------------- | --------------------------------------------------------------------------------------------------- |
+| `exclude_domains` | Array[String] | No (default: []) | Hosts never rewritten, for assets and click-through links                                           |
+| `include_domains` | Array[String] | No (default: []) | When non-empty, the only hosts whose asset URLs are proxied. Does not apply to click-through links. |
 
 **Example**:
 
@@ -945,12 +1157,14 @@ exclude_domains = [
     "first-party.publisher.com",  # Exact match
     "localhost",                  # Development
 ]
+include_domains = ["assets.example.com", "*.img.example.com"]
 ```
 
 **Environment Override**:
 
-EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
-`exclude_domains` in TOML, then validate and push the file again.
+EdgeZero v0.0.4 cannot replace these arrays or address their elements by index.
+Edit `exclude_domains` and `include_domains` in TOML, then validate and push the
+file again.
 
 ### Pattern Matching
 
@@ -978,6 +1192,55 @@ Matches:
 - ✅ `api.example.com`
 - ❌ `www.api.example.com`
 - ❌ `api.example.com.evil.com`
+
+**Normalization and precedence**:
+
+- Both lists are trimmed and lowercased at load, so matching is case-insensitive.
+- `exclude_domains` wins when a host matches both lists.
+- Each `include_domains` entry must be able to equal a URL host. After
+  lowercasing, an entry must be one of:
+  - a host name of ASCII letters, digits, `-`, `_` and `.`, optionally prefixed with
+    `*.`, with no leading or trailing `.` and no empty label;
+  - an IPv4 address in dotted-quad form, such as `192.0.2.1`;
+  - an IPv6 address in brackets, written the way URL hosts render it, such as
+    `[2001:db8::1]` or `[::ffff:c000:201]` (not `[::ffff:192.0.2.1]`).
+- Settings load and `ts config validate` reject any other `include_domains`
+  entry: an empty entry, a bare `*`, a `*` other than a leading `*.`, a scheme
+  (`https://`), a port, a path, spaces, an unbracketed IPv6 address, or any
+  entry a URL parser would rewrite or reject, such as an invalid `xn--` label.
+  Non-ASCII (internationalized) names are rejected too; write them in punycode,
+  such as `xn--bcher-kva.example`.
+- Empty and bare `*` entries in `exclude_domains` are dropped with a warning,
+  because they never match a host. Other `exclude_domains` entries that can
+  never match a host (for example `https://cdn.example.com` or
+  `cdn.example.com:443`) are kept but logged with a warning at load; fix them,
+  or their hosts stay proxied. This check is looser than the `include_domains`
+  grammar: a trailing `.` (such as `blocked.example.com.`), a `_` and a
+  wildcard IP address all match real URL hosts and are not flagged.
+- `include_domains` controls which asset URLs are newly rewritten or signed. It
+  is not enforced when a proxy URL is fetched: a proxy URL issued before a host
+  was removed from the list (for example, in a cached creative) still forwards
+  the EC ID to that host, subject only to `proxy.allowed_domains`.
+
+::: tip
+When both `include_domains` and `proxy.allowed_domains` are set, keep every
+`include_domains` host inside `proxy.allowed_domains`. Otherwise a listed asset
+is rewritten to a proxy URL that then fails with `403`.
+:::
+
+::: warning Upgrade sequencing and rollback for `include_domains`
+An empty `include_domains` is omitted from stored JSON. A non-empty list is
+serialized, and older binaries reject a blob that carries it because `[rewrite]`
+uses `deny_unknown_fields`.
+
+**Upgrading:** deploy the binary **first**, then add `include_domains` to
+`trusted-server.toml`, run `ts config validate`, and push.
+
+**Rolling back:** remove `include_domains` from the TOML, run
+`ts config validate`, push the resulting blob, and only then roll back the
+binary. Rolling back the binary also restores case-sensitive `exclude_domains`
+matching.
+:::
 
 ### Use Cases
 
@@ -1188,6 +1451,8 @@ Profile sets convert small request query controls into a closed set of Image Opt
 
 Profile values live under `[image_optimizer.profile_sets.<name>.profiles]` and use query-string syntax.
 
+Profile and profile-set names are trimmed. Names within the same map that become identical after trimming are rejected, even when their values match. Empty names continue to be discarded.
+
 ```toml
 [image_optimizer.profile_sets.default_images]
 base_params = "quality=70&resize-filter=bicubic"
@@ -1240,6 +1505,32 @@ when_missing = "smart"
 ```
 
 See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and Image Optimizer behavior.
+
+## Tinybird Configuration
+
+`[tinybird]` sends auction events directly to the Tinybird Events API. The
+emitter is active only when `enabled = true`; access-log emission is not wired.
+
+### `[tinybird]`
+
+| Field                  | Type           | Default                | Contract                                                           |
+| ---------------------- | -------------- | ---------------------- | ------------------------------------------------------------------ |
+| `enabled`              | Boolean        | `false`                | Enable auction telemetry                                           |
+| `api_host`             | String         | `""`                   | Required when enabled; regional host without scheme, port, or path |
+| `auction_dataset`      | String         | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                                |
+| `auction_token_secret` | String or null | `null`                 | Store key required when enabled; resolved value must be nonempty   |
+| `access_enabled`       | Boolean        | `false`                | Reserved; `true` fails startup because no emitter is wired         |
+| `access_dataset`       | String         | `"access_logs_raw"`    | Reserved access-log dataset name                                   |
+| `access_sample_rate`   | Number         | `0.0`                  | `0.0..=1.0`; reserved while access emission is disabled            |
+| `max_body_bytes`       | Integer        | `1048576`              | At least `1024` bytes                                              |
+
+`secret_store` and `access_token_secret` are deprecated compatibility inputs.
+Both are removed during normalization; neither reaches runtime or serialized
+output. New configurations use only `auction_token_secret`, whose value is
+resolved through `trusted_server_secrets`.
+
+The complete enabled example appears in
+[Tinybird auction telemetry](#tinybird-auction-telemetry).
 
 ## Cache Configuration
 
@@ -1362,8 +1653,27 @@ tracked in [#908](https://github.com/IABTechLab/trusted-server/issues/908).
 
 ## Integration Configurations
 
-Settings for built-in integrations (Prebid, Next.js, Osano, Permutive, Testlight). For other
-integrations (APS, Didomi, Lockr, GAM, etc.), see the relevant integration guides.
+Every deploy-validated integration ID is listed here. A section is optional
+unless its integration is enabled or a CLI workflow retains an explicit
+disabled stub.
+
+| Section                             | Reference                                                          |
+| ----------------------------------- | ------------------------------------------------------------------ |
+| `[integrations.adserver_mock]`      | [Ad Server Mock](/guide/integrations/adserver_mock)                |
+| `[integrations.aps]`                | [APS](/guide/integrations/aps)                                     |
+| `[integrations.datadome]`           | [DataDome](/guide/integrations/datadome)                           |
+| `[integrations.didomi]`             | [Didomi](/guide/integrations/didomi)                               |
+| `[integrations.google_tag_manager]` | [Google Tag Manager](/guide/integrations/google_tag_manager)       |
+| `[integrations.gpt]`                | [GPT](/guide/integrations/gpt)                                     |
+| `[integrations.gpt_diagnostics]`    | [GPT diagnostics](/guide/integrations/gpt-diagnostics)             |
+| `[integrations.js_asset_proxy]`     | [JS Asset Proxy](#js-asset-proxy-integration) (no dedicated guide) |
+| `[integrations.lockr]`              | [lockr](/guide/integrations/lockr)                                 |
+| `[integrations.nextjs]`             | [Next.js](/guide/integrations/nextjs)                              |
+| `[integrations.osano]`              | [Osano](/guide/integrations/osano)                                 |
+| `[integrations.permutive]`          | [Permutive](/guide/integrations/permutive)                         |
+| `[integrations.prebid]`             | [Prebid](/guide/integrations/prebid)                               |
+| `[integrations.sourcepoint]`        | [Sourcepoint](/guide/integrations/sourcepoint)                     |
+| `[integrations.testlight]`          | [Testlight](/guide/integrations/testlight)                         |
 
 ### Common Fields
 
@@ -1374,24 +1684,195 @@ apply when the integration section exists in `trusted-server.toml`.
 | --------- | ------- | ------------------------------ |
 | `enabled` | Boolean | Enable/disable the integration |
 
+### Ad Server Mock Integration
+
+**Section**: `[integrations.adserver_mock]`
+
+This integration is the optional auction mediator selected by
+`auction.mediator = "adserver_mock"`; it is not an OpenRTB provider.
+
+| Field                  | Type           | Default  | Contract                                          |
+| ---------------------- | -------------- | -------- | ------------------------------------------------- |
+| `enabled`              | Boolean        | `false`  | Enable mediator registration                      |
+| `endpoint`             | URL            | Required | Mediation service URL                             |
+| `timeout_ms`           | Integer        | `500`    | `1..=60000` milliseconds                          |
+| `price_floor`          | Number or null | `null`   | Optional minimum accepted CPM                     |
+| `context_query_params` | Object         | `{}`     | Maps admitted auction-context keys to query names |
+
+### APS Browser Integration
+
+**Section**: `[integrations.aps]`
+
+| Field            | Type    | Default            | Contract                               |
+| ---------------- | ------- | ------------------ | -------------------------------------- |
+| `enabled`        | Boolean | `false`            | Enable browser-side APS behavior       |
+| `rendering_mode` | String  | `"trusted_server"` | `trusted_server` or `publisher_native` |
+
+Server endpoint, timeout, account, inventory, and debug settings belong to an
+`aps` provider and its `profile_config`, not this browser section. See
+[APS](/guide/integrations/aps).
+
+### DataDome Integration
+
+**Section**: `[integrations.datadome]`
+
+The [DataDome guide](/guide/integrations/datadome) explains request behavior
+and exclusion-rule syntax. This table covers every canonical top-level field:
+
+| Field                                  | Type           | Default                          | Contract                                                        |
+| -------------------------------------- | -------------- | -------------------------------- | --------------------------------------------------------------- |
+| `enabled`                              | Boolean        | `false`                          | Enable DataDome registration                                    |
+| `sdk_origin`                           | URL            | `https://js.datadome.co`         | Browser SDK origin                                              |
+| `api_origin`                           | URL            | `https://api-js.datadome.co`     | Browser signal API origin                                       |
+| `cache_ttl_seconds`                    | Integer        | `3600`                           | `60..=86400` seconds                                            |
+| `rewrite_sdk`                          | Boolean        | `true`                           | Rewrite matching SDK URLs                                       |
+| `enable_protection`                    | Boolean        | `false`                          | Call the Protection API before route matching                   |
+| `server_side_key_secret_name`          | String or null | `null`                           | Secret-store key required when protection is enabled            |
+| `protection_api_origin`                | URL            | `https://api-fastly.datadome.co` | Protection API origin                                           |
+| `timeout_ms`                           | Integer        | `1500`                           | `1..=10000` milliseconds                                        |
+| `protection_excluded_methods`          | Array[String]  | `["OPTIONS"]`                    | Methods that bypass protection                                  |
+| `protection_excluded_asns`             | Array[Integer] | `[]`                             | Client ASNs that bypass protection                              |
+| `protection_excluded_ip_cidrs`         | Array[String]  | `[]`                             | Inline client-IP CIDRs that bypass protection                   |
+| `protection_excluded_ip_cidr_sources`  | Array[Object]  | `[]`                             | Config-store sources of client-IP CIDRs that bypass protection  |
+| `protection_ip_list_cache_ttl_seconds` | Integer        | `300`                            | `1..=86400` seconds                                             |
+| `protection_exclusion_rules`           | Array[Object]  | Static-asset path-regex rule     | Ordered typed exclusion rules                                   |
+| `protection_test_bypass`               | Object or null | `null`                           | Access-controlled test bypass; disabled when present by default |
+| `enable_graphql_support`               | Boolean        | `false`                          | Reserved; `true` is accepted but ignored in v1                  |
+| `client_side_key`                      | String         | `""`                             | Key used for browser-tag injection                              |
+| `inject_client_side_tag`               | Boolean        | `true`                           | Inject only when `client_side_key` is nonempty                  |
+| `client_side_tag_url`                  | String         | `/integrations/datadome/tags.js` | Root-relative or HTTPS injection URL                            |
+| `client_side_configuration`            | JSON value     | `{ "ajaxListenerPath": true }`   | Value assigned to `window.ddoptions`                            |
+
+Each `protection_excluded_ip_cidr_sources` item requires `key` and defaults
+`config_store` to `datadome-ip-bypass`. Each
+`protection_exclusion_rules` item requires `id` (legacy alias `name`), defaults
+`enabled` to `true`, defaults `methods` to every method, and selects one typed
+matcher: `path_exact`, `path_prefix`, `path_regex`,
+`query_param_non_empty`, `asn`, `ip_cidr`, or `ip_cidr_source`.
+
+When `protection_test_bypass` is present, its `enabled` field defaults to
+`false`; `credential_secret_name` identifies the secret-store key and becomes
+required only when the bypass is enabled. The resolved credential must contain
+at least 32 bytes.
+
+The deprecated `server_side_key_secret_store` and nested
+`credential_secret_store` inputs are accepted and discarded. Do not add them
+to new configurations.
+
+### Didomi Integration
+
+**Section**: `[integrations.didomi]`
+
+| Field        | Type           | Default                          | Contract                                                            |
+| ------------ | -------------- | -------------------------------- | ------------------------------------------------------------------- |
+| `enabled`    | Boolean        | `true`                           | Enable the reverse proxy when the section exists                    |
+| `proxy_path` | String or null | `/integrations/didomi/consent`   | No trailing slash, repeated slash, dot segment, or unsafe character |
+| `sdk_origin` | URL            | `https://sdk.privacy-center.org` | SDK upstream                                                        |
+| `api_origin` | URL            | `https://api.privacy-center.org` | API upstream                                                        |
+
+See [Didomi](/guide/integrations/didomi) for the routed endpoint shapes.
+
+### Google Tag Manager Integration
+
+**Section**: `[integrations.google_tag_manager]`
+
+| Field                  | Type    | Default                            | Contract                                            |
+| ---------------------- | ------- | ---------------------------------- | --------------------------------------------------- |
+| `enabled`              | Boolean | `false`                            | Enable tag-gateway routes and rewriting             |
+| `container_id`         | String  | Required                           | `GTM-` followed by 4–20 uppercase letters or digits |
+| `upstream_url`         | URL     | `https://www.googletagmanager.com` | Script upstream                                     |
+| `cache_max_age`        | Integer | `900`                              | `60..=86400` seconds                                |
+| `max_beacon_body_size` | Integer | `65536`                            | `1024..=1048576` bytes                              |
+
+See [Google Tag Manager](/guide/integrations/google_tag_manager).
+
+### GPT Integration
+
+**Section**: `[integrations.gpt]`
+
+| Field                     | Type           | Default                 | Contract                                               |
+| ------------------------- | -------------- | ----------------------- | ------------------------------------------------------ |
+| `enabled`                 | Boolean        | `true`                  | Enable GPT when the section exists                     |
+| `gam_attribution_enabled` | Boolean        | `false`                 | Add page-level `ts=true` targeting                     |
+| `script_url`              | URL            | Google's secure GPT URL | Bootstrap source                                       |
+| `cache_ttl_seconds`       | Integer        | `3600`                  | `60..=86400` seconds                                   |
+| `rewrite_script`          | Boolean        | `true`                  | Rewrite matching GPT script URLs                       |
+| `slim_prebid_url`         | String or null | `null`                  | Optional tsjs-prebid bundle loaded after `window.load` |
+
+See [GPT](/guide/integrations/gpt).
+
+### GPT Diagnostics Integration
+
+**Section**: `[integrations.gpt_diagnostics]`
+
+The only field is `enabled`, a Boolean that defaults to `false`. When enabled,
+the standalone diagnostics tag is available, but individual browser sessions
+still require the activation flow in [GPT diagnostics](/guide/integrations/gpt-diagnostics).
+
+### JS Asset Proxy Integration
+
+**Section**: `[integrations.js_asset_proxy]`
+
+Serves explicitly configured third-party JavaScript assets from first-party
+paths. Each asset maps one exact publisher-facing path to one exact HTTPS
+upstream URL and can independently enable proxying, disable proxying, or block
+matching script tags in publisher HTML. There is no dedicated integration
+guide; the registered routes appear in the
+[API reference](/guide/api-reference#integration-endpoints).
+
+| Field               | Type    | Default | Contract                                      |
+| ------------------- | ------- | ------- | --------------------------------------------- |
+| `enabled`           | Boolean | `false` | Enable asset proxying and HTML rewriting      |
+| `cache_ttl_seconds` | Integer | None    | Optional downstream cache TTL for every asset |
+| `assets`            | Array   | `[]`    | Asset mappings; required when enabled         |
+
+Each `[[integrations.js_asset_proxy.assets]]` entry:
+
+| Field               | Type    | Default   | Contract                                                  |
+| ------------------- | ------- | --------- | --------------------------------------------------------- |
+| `path`              | String  | Required  | Exact first-party request path served by Trusted Server   |
+| `origin_url`        | String  | Required  | Exact upstream JavaScript URL fetched and match-rewritten |
+| `proxy`             | String  | `enabled` | `enabled`, `disabled`, or `blocked` (removes script tags) |
+| `cache_ttl_seconds` | Integer | None      | Optional per-asset downstream cache TTL override          |
+
+### lockr Integration
+
+**Section**: `[integrations.lockr]`
+
+| Field               | Type            | Default                                             | Contract                             |
+| ------------------- | --------------- | --------------------------------------------------- | ------------------------------------ |
+| `enabled`           | Boolean         | `true`                                              | Enable lockr when the section exists |
+| `app_id`            | String          | Required                                            | Nonempty lockr application ID        |
+| `api_endpoint`      | URL             | `https://identity.loc.kr`                           | API origin                           |
+| `sdk_url`           | URL             | `https://aim.loc.kr/identity-lockr-trust-server.js` | SDK source                           |
+| `cache_ttl_seconds` | Integer         | `3600`                                              | `60..=86400` seconds                 |
+| `rewrite_sdk`       | Boolean         | `true`                                              | Rewrite matching lockr SDK URLs      |
+| `rewrite_sdk_host`  | Boolean or null | `null`                                              | Deprecated compatibility input       |
+| `origin_override`   | URL or null     | `null`                                              | Optional upstream `Origin` override  |
+
+See [lockr](/guide/integrations/lockr).
+
 ### Prebid Integration
 
 `[integrations.prebid]` owns browser behavior only. Server endpoint, provider
 timeout, routing, profile debug/test controls, consent forwarding, bidder-param
 overrides, and notification suppression belong under `[auction]`.
 
-| Browser field                         | Type          | Default                                                                | Description                                                                    |
-| ------------------------------------- | ------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `enabled`                             | Boolean       | `true`                                                                 | Enable browser bundle injection, interception, and the `trustedServer` adapter |
-| `account_id`                          | String        | `None`                                                                 | Optional account value injected into browser Prebid configuration              |
-| `timeout_ms`                          | Integer       | `1000`                                                                 | Browser Prebid.js timeout; independent of every server provider timeout        |
-| `debug`                               | Boolean       | `false`                                                                | Browser Prebid.js debug flag; independent of server profile debug              |
-| `client_side_bidders`                 | Array[String] | `[]`                                                                   | Bidders kept on native browser adapters                                        |
-| `excluded_gam_ad_unit_path_suffixes`  | Array[String] | `[]`                                                                   | GAM suffixes excluded from Trusted Server refresh auctions                     |
-| `script_patterns`                     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                    |
-| `external_bundle_url`                 | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                  |
-| `external_bundle_sha256` / `*_sri`    | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                   |
-| `bundle.adapters` / `user_id_modules` | Array[String] | CLI selection                                                          | Inputs used by `ts prebid bundle`                                              |
+| Browser field                        | Type          | Default                                                                | Description                                                                    |
+| ------------------------------------ | ------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `enabled`                            | Boolean       | `true`                                                                 | Enable browser bundle injection, interception, and the `trustedServer` adapter |
+| `account_id`                         | String        | `None`                                                                 | Optional account value injected into browser Prebid configuration              |
+| `timeout_ms`                         | Integer       | `1000`                                                                 | Browser Prebid.js timeout; independent of every server provider timeout        |
+| `debug`                              | Boolean       | `false`                                                                | Browser Prebid.js debug flag; independent of server profile debug              |
+| `client_side_bidders`                | Array[String] | `[]`                                                                   | Bidders kept on native browser adapters                                        |
+| `excluded_gam_ad_unit_path_suffixes` | Array[String] | `[]`                                                                   | GAM suffixes excluded from Trusted Server refresh auctions                     |
+| `script_patterns`                    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                    |
+| `external_bundle_url`                | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                  |
+| `external_bundle_sha256` / `*_sri`   | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                   |
+| `bundle.modules.bidder`              | Array[String] | Required and non-empty                                                 | Exact bidder module stems used by `ts prebid client`                           |
+| `bundle.modules.user_id`             | Array[String] | Curated preset when omitted                                            | Exact User ID module stems used by `ts prebid client`                          |
+| `bundle.modules.analytics`           | Array[String] | `[]`                                                                   | Exact analytics module stems used by `ts prebid client`                        |
+| `managed_user_ids`                   | Array[Table]  | `[]`                                                                   | Prebid User ID modules Trusted Server installs and keeps installed (see below) |
 
 Server-side bidder codes are derived from validated `[auction.bidders.*]`
 routes and injected into the browser. There is no second server bidder list in
@@ -1405,15 +1886,26 @@ routes and injected into the browser. There is no second server bidder list in
 enabled = true
 timeout_ms = 1000
 debug = false
-client_side_bidders = ["example-browser"]
+client_side_bidders = ["rubicon"]
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 script_patterns = ["/prebid.js", "/prebid.min.js"]
+
+[[integrations.prebid.managed_user_ids]]
+name = "sharedId"
+
+[integrations.prebid.managed_user_ids.storage]
+type = "cookie"
+name = "_sharedid"
+expires = 15
+refresh_in_seconds = 1800
 
 [proxy]
 allowed_domains = ["assets.example.com"]
 
-[integrations.prebid.bundle]
-adapters = ["example-browser"]
+[integrations.prebid.bundle.modules]
+bidder = ["rubiconBidAdapter"]
+user_id = ["sharedIdSystem"]
+analytics = ["atsAnalyticsAdapter"]
 
 [auction.providers.pbs-main]
 protocol = "openrtb-2.6"
@@ -1453,6 +1945,47 @@ Environment overlays only replace existing scalar leaves. Keep
 `client_side_bidders`, provider profile tables, bidder-parameter overrides, and
 rules in TOML, then validate and push the edited file.
 
+**Managed User ID modules**:
+
+Each `[[integrations.prebid.managed_user_ids]]` entry names a Prebid
+`userSync.userIds` module that Trusted Server installs on the page and
+reinstates whenever publisher JavaScript replaces the User ID configuration.
+Trusted Server does not interpret module-specific fields; every registered
+module uses the same vendor-neutral surface. The managed `name` must match a
+`configNames` entry in the checked-in `user_id_modules.json` registry:
+
+| Field                        | Type    | Default                        | Description                                                                          |
+| ---------------------------- | ------- | ------------------------------ | ------------------------------------------------------------------------------------ |
+| `name`                       | String  | Required                       | Prebid `userSync.userIds` entry name, for example `sharedId`. Unique across entries  |
+| `params`                     | Table   | `{}`                           | Module-specific parameters, forwarded to Prebid unchanged                            |
+| `storage.type`               | String  | `cookie`                       | Browser storage: `cookie` or `html5`                                                 |
+| `storage.name`               | String  | Required when `storage` exists | Cookie or local-storage key the module reads and writes                              |
+| `storage.expires`            | Integer | Prebid's own default           | Storage lifetime in days; must be at least 1. Any per-module ceiling is the module's |
+| `storage.refresh_in_seconds` | Integer | Prebid's own default           | Seconds before the module may refresh the stored value; must be at least 1           |
+
+The module must be present in the built bundle. Name it under
+`[integrations.prebid.bundle].user_id_modules`, or omit that list to take the
+generator's default preset. `ts prebid client` resolves each managed `name`
+through the checked-in `user_id_modules.json` registry, rejects unknown names,
+ambiguous names, and two names that resolve to the same module, and confirms the
+required modules in the newly generated
+manifest. A failure identifies the managed name or required module and does not
+update the configured bundle hash or SRI. The browser diagnostic remains a
+fallback for externally hosted, stale, or modified bundles. Trusted Server core
+does not interpret module-specific `params`; it forwards them to Prebid.js
+unchanged.
+
+Persisting a resolved ID into the Edge Cookie identity graph additionally
+requires a matching `[[ec.partners]]` entry whose `source_domain` equals the
+module's OpenRTB EID source, and, when a TCF signal is present, consent to
+TCF Purpose 1 and Purpose 4.
+
+`managed_user_ids` is an array of tables, so it cannot be set through a
+`TRUSTED_SERVER__` environment variable; the scalar overlay only replaces leaves
+the published TOML already declares. See
+[Managed User ID modules](/guide/integrations/prebid#managed-user-id-modules)
+for consent, timing, privacy, degraded behavior, and validation guidance.
+
 **Script Pattern Matching**:
 
 The `script_patterns` configuration determines which Prebid scripts are intercepted and replaced with empty JavaScript responses. This prevents client-side Prebid.js from loading when using server-side bidding.
@@ -1481,11 +2014,11 @@ win on conflicts.
 
 **Section**: `[integrations.nextjs]`
 
-| Field                        | Type          | Default                 | Description                   |
-| ---------------------------- | ------------- | ----------------------- | ----------------------------- |
-| `enabled`                    | Boolean       | `false`                 | Enable Next.js integration    |
-| `rewrite_attributes`         | Array[String] | `["href","link","url"]` | Attributes to rewrite         |
-| `max_combined_payload_bytes` | Integer       | `10485760`              | Max combined RSC payload size |
+| Field                        | Type          | Default                   | Contract                                           |
+| ---------------------------- | ------------- | ------------------------- | -------------------------------------------------- |
+| `enabled`                    | Boolean       | `false`                   | Enable Next.js integration                         |
+| `rewrite_attributes`         | Array[String] | `["href", "link", "url"]` | Nonempty set of structured payload keys to rewrite |
+| `max_combined_payload_bytes` | Integer       | `10485760`                | Maximum combined RSC payload size in bytes         |
 
 **Example**:
 
@@ -1532,16 +2065,16 @@ The Osano mirror runs in the browser, so consent cookies it writes are available
 
 **Section**: `[integrations.permutive]`
 
-| Field                     | Type    | Default                                | Description                      |
-| ------------------------- | ------- | -------------------------------------- | -------------------------------- |
-| `enabled`                 | Boolean | `true`                                 | Enable Permutive integration     |
-| `organization_id`         | String  | Required                               | Permutive organization ID        |
-| `workspace_id`            | String  | Required                               | Permutive workspace ID           |
-| `project_id`              | String  | `""`                                   | Permutive project ID             |
-| `api_endpoint`            | String  | `https://api.permutive.com`            | Permutive API URL                |
-| `secure_signals_endpoint` | String  | `https://secure-signals.permutive.app` | Secure signals URL               |
-| `cache_ttl_seconds`       | Integer | `3600`                                 | Cache TTL in seconds             |
-| `rewrite_sdk`             | Boolean | `true`                                 | Rewrite Permutive SDK references |
+| Field                     | Type    | Default                                | Contract                                     |
+| ------------------------- | ------- | -------------------------------------- | -------------------------------------------- |
+| `enabled`                 | Boolean | `true`                                 | Enable Permutive integration                 |
+| `organization_id`         | String  | Required                               | Nonempty Permutive organization ID           |
+| `workspace_id`            | String  | Required                               | Nonempty Permutive workspace ID              |
+| `project_id`              | String  | `""`                                   | Optional project ID; reserved for future use |
+| `api_endpoint`            | URL     | `https://api.permutive.com`            | Permutive API URL                            |
+| `secure_signals_endpoint` | URL     | `https://secure-signals.permutive.app` | Secure Signals URL                           |
+| `cache_ttl_seconds`       | Integer | `3600`                                 | `60..=86400` seconds                         |
+| `rewrite_sdk`             | Boolean | `true`                                 | Rewrite Permutive SDK references             |
 
 **Example**:
 
@@ -1557,17 +2090,31 @@ cache_ttl_seconds = 7200
 rewrite_sdk = true
 ```
 
+### Sourcepoint Integration
+
+**Section**: `[integrations.sourcepoint]`
+
+| Field               | Type           | Default                        | Contract                                                          |
+| ------------------- | -------------- | ------------------------------ | ----------------------------------------------------------------- |
+| `enabled`           | Boolean        | `false`                        | Enable Sourcepoint proxying and rewriting                         |
+| `rewrite_sdk`       | Boolean        | `true`                         | Rewrite matching Sourcepoint URLs                                 |
+| `cdn_origin`        | URL            | `https://cdn.privacy-mgmt.com` | HTTP(S) URL whose host is exactly `cdn.privacy-mgmt.com`          |
+| `auth_cookie_name`  | String or null | `null`                         | 1–64 letters, digits, `_`, or `-`; built-in cookies need no entry |
+| `cache_ttl_seconds` | Integer        | `3600`                         | `60..=86400` seconds                                              |
+
+See [Sourcepoint](/guide/integrations/sourcepoint).
+
 ### Testlight Integration
 
 **Section**: `[integrations.testlight]`
 
-| Field             | Type    | Default                                     | Description                         |
-| ----------------- | ------- | ------------------------------------------- | ----------------------------------- |
-| `enabled`         | Boolean | `true`                                      | Enable Testlight integration        |
-| `endpoint`        | String  | Required                                    | Testlight auction endpoint          |
-| `timeout_ms`      | Integer | `1000`                                      | Request timeout in milliseconds     |
-| `shim_src`        | String  | `/static/tsjs=tsjs-unified.min.js?v=<hash>` | Script source for testlight shim    |
-| `rewrite_scripts` | Boolean | `false`                                     | Rewrite Testlight script references |
+| Field             | Type    | Default                            | Contract                            |
+| ----------------- | ------- | ---------------------------------- | ----------------------------------- |
+| `enabled`         | Boolean | `false`                            | Enable Testlight integration        |
+| `endpoint`        | URL     | Required                           | Testlight auction endpoint          |
+| `timeout_ms`      | Integer | `1000`                             | `10..=60000` milliseconds           |
+| `shim_src`        | String  | `/static/tsjs=tsjs-unified.min.js` | Nonempty script source for the shim |
+| `rewrite_scripts` | Boolean | `false`                            | Rewrite Testlight script references |
 
 **Example**:
 
@@ -1588,15 +2135,16 @@ provider or bidder route.
 
 ### `[auction]`
 
-| Field                  | Type    | Default            | Description                                                    |
-| ---------------------- | ------- | ------------------ | -------------------------------------------------------------- |
-| `enabled`              | Boolean | `false`            | Enable the auction orchestrator                                |
-| `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery |
-| `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid `adm` through first-party endpoints        |
-| `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                         |
-| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                     |
-| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                     |
-| `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                 |
+| Field                  | Type    | Default            | Description                                                                                                  |
+| ---------------------- | ------- | ------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `enabled`              | Boolean | `false`            | Enable the auction orchestrator                                                                              |
+| `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery                                               |
+| `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid asset URLs through first-party endpoints                                                 |
+| `rewrite_clicks`       | Boolean | unset              | Wrap creative links in `/first-party/click`; unset follows `rewrite_creatives` (proxied HTML keeps wrapping) |
+| `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                                                                       |
+| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                                                                   |
+| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                                                                   |
+| `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                                                               |
 
 Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
 path is processed by two independent passes. With `sanitize_creatives = true`
@@ -1604,23 +2152,32 @@ path is processed by two independent passes. With `sanitize_creatives = true`
 and event handlers) is stripped together with its inner content. This blanks
 script-based creatives, so enable it only when creatives render in a context
 that shares the publisher's origin. With `rewrite_creatives = true` (the
-default), eligible absolute or protocol-relative resource and click URLs not
-excluded by rewrite configuration are converted to signed first-party
-endpoints, and any bidder-supplied `<base>` element is removed. The
-`POST /auction` path emits root-relative endpoints and injects the creative TSJS
-runtime exactly once, whether or not the bidder supplied a `<body>`, since bare
+default), eligible absolute or protocol-relative asset URLs not excluded by
+rewrite configuration are converted to signed `/first-party/proxy` endpoints.
+`rewrite_clicks` controls click-through links (`<a href>`, `<area href>`)
+separately: when it is unset, it follows `rewrite_creatives`, so existing
+configs keep their asset and link behavior. One change applies to existing
+configs too: whenever either setting is on, a bidder-supplied `<base>` element
+loses its `href`; it keeps a `target` and is removed when it has none (before
+this release the whole element was removed). With `sanitize_creatives = true`,
+the sanitizer removes `<base>` entirely before the rewrite pass. The `POST /auction` path emits
+root-relative endpoints and, when either setting is on, injects the creative
+TSJS runtime exactly once, whether or not the bidder supplied a `<body>`, since bare
 fragments are the common `adm` shape. The foreign-origin SSAT renderer emits
-absolute endpoints and does not inject that bundle. With both disabled, `adm`
-ships exactly as the bidder returned it, except that a creative larger than the
+absolute endpoints and does not inject that bundle. With all three disabled,
+`adm` ships exactly as the bidder returned it, except that a creative larger than the
 1 MiB per-creative cap is rejected in every mode and its `adm` is dropped.
-Accepted external URLs are not host allowlisted by the sanitizer. Neither
-setting affects HTML or CSS fetched through `/first-party/proxy`. See
+Accepted external URLs are not host allowlisted by the sanitizer.
+`rewrite_creatives` and `sanitize_creatives` do not affect HTML or CSS fetched
+through `/first-party/proxy`. An explicitly set `rewrite_clicks` does apply to
+links in proxied HTML; unset, proxied HTML keeps wrapping links. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 ::: warning Existing configs, upgrade sequencing, and rollback
 Default values are omitted from stored JSON; non-default values
-(`sanitize_creatives = true`, `rewrite_creatives = false`) are serialized, and
-older `AuctionConfig` schemas reject unknown fields.
+(`sanitize_creatives = true`, `rewrite_creatives = false`, and any explicit
+`rewrite_clicks`) are serialized, and older `AuctionConfig` schemas reject
+unknown fields.
 
 **Upgrading:** binaries that predate `sanitize_creatives` reject a blob that
 carries it, so in a rolling deployment upgrade the binary **first**, then push
@@ -1634,14 +2191,26 @@ on new code, while an explicit `true` fails startup on old code.
 **Rolling back:** before reverting to a binary that does not know a field,
 remove that field's non-default value (and any environment override), run
 `ts config validate`, push the resulting default-compatible blob, and only then
-roll back the binary.
+roll back the binary. Older binaries tie click wrapping to `rewrite_creatives`
+in both directions: rolling back from `rewrite_creatives = true` with
+`rewrite_clicks = false` turns click wrapping back on, and rolling back from
+`rewrite_creatives = false` with `rewrite_clicks = true` turns it off. Rolling
+back from any `rewrite_clicks = false` also turns click wrapping back on in HTML
+fetched through `/first-party/proxy`.
 
 **Environment overlays:** The pinned EdgeZero loader cannot create missing TOML
 leaves. Existing configs must add **both** leaves under `[auction]`
 (`rewrite_creatives` and `sanitize_creatives`) before
 `TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES` /
 `TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES` can take effect. An override for a
-missing leaf is silently ignored.
+missing leaf is silently ignored. `rewrite_clicks` is unset by default and so
+cannot appear as a TOML leaf until you set it; add `rewrite_clicks = true` or
+`false` under `[auction]` before relying on
+`TRUSTED_SERVER__AUCTION__REWRITE_CLICKS`. The leaf only preserves today's
+behavior when it matches what unset resolves to: with `rewrite_creatives =
+true`, `rewrite_clicks = true` does, but with `rewrite_creatives = false` no
+value does (`true` wraps auction links, `false` stops wrapping links in HTML
+fetched through `/first-party/proxy`).
 :::
 
 ### Provider map
@@ -1737,6 +2306,28 @@ timeout_ms = 500
 | `profile_config` | No       | `{}`            | Typed object owned by the selected profile                    |
 | `notifications`  | No       | No suppression  | Common `nurl`/`burl` suppression after response normalization |
 
+### Profile configuration
+
+The table reflects the typed profile schemas. `Required` refers to the selected
+profile's `profile_config` object, not to the provider wrapper.
+
+| Profile         | Field                      | Required | Default | Provider timeout default | Constraints                                                                                                      |
+| --------------- | -------------------------- | -------- | ------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `aps`           | `account_id`               | Yes      | —       | `800 ms`                 | String or integer; trimmed, nonempty, at most 1024 bytes                                                         |
+| `aps`           | `allow_script_creatives`   | No       | `false` | `800 ms`                 | Script creatives are ineligible unless enabled                                                                   |
+| `aps`           | `debug`                    | No       | `false` | `800 ms`                 | May expose unredacted request and response data                                                                  |
+| `aps`           | `inventory_domain`         | No       | `None`  | `800 ms`                 | DNS name, at most 253 bytes; configure with inventory_page_origin                                                |
+| `aps`           | `inventory_page_origin`    | No       | `None`  | `800 ms`                 | HTTPS origin without credentials, port, path, query, or fragment; host must equal or be beneath inventory_domain |
+| `prebid-server` | `bid_param_override_rules` | No       | `[]`    | `1000 ms`                | Ordered exact-match rules; at least one matcher and a nonempty set object                                        |
+| `prebid-server` | `bid_param_overrides`      | No       | `{}`    | `1000 ms`                | Per-bidder nonempty shallow-merge objects                                                                        |
+| `prebid-server` | `bid_param_zone_overrides` | No       | `{}`    | `1000 ms`                | Per-bidder, per-zone nonempty shallow-merge objects                                                              |
+| `prebid-server` | `consent_forwarding`       | No       | `both`  | `1000 ms`                | `openrtb_only`, `cookies_only`, or `both`                                                                        |
+| `prebid-server` | `debug`                    | No       | `false` | `1000 ms`                | Includes upstream exchange diagnostics                                                                           |
+| `prebid-server` | `debug_query_params`       | No       | `None`  | `1000 ms`                | Optional legacy page-URL query fragment                                                                          |
+| `prebid-server` | `test_mode`                | No       | `false` | `1000 ms`                | Sets OpenRTB `test = 1`                                                                                          |
+| `standard`      | `imp_ext`                  | No       | `{}`    | Auction timeout          | JSON object; at most 16384 bytes, depth 8, and 256 keys per object                                               |
+| `standard`      | `request_ext`              | No       | `{}`    | Auction timeout          | JSON object; at most 16384 bytes, depth 8, and 256 keys per object; `trusted_server` is reserved                 |
+
 Timeout defaults are 1000 ms for `prebid-server`, 800 ms for `aps`, and the
 auction timeout for `standard`. An explicit provider timeout overrides the
 profile default. Runtime uses `min(provider timeout, auction time remaining)`
@@ -1760,8 +2351,9 @@ exact ID `trustedServer`. Browser `trustedServer.bidderParams` accepts at most
 
 For the `standard` profile, `profile_config.request_ext` and `imp_ext` must be
 JSON objects. Each object is limited to 16 KiB serialized, eight container
-levels, and 256 keys at any one object level. Reserved driver, profile, and
-signing fields cannot be overwritten.
+levels, and 256 keys at any one object level. Within `request_ext`, the
+`trusted_server` member is reserved and cannot be overwritten. `imp_ext` has no
+reserved-member guard in the current implementation.
 
 Common notification suppression uses exact returned OpenRTB seat values, not
 bidder route IDs:
@@ -1806,8 +2398,9 @@ finishes local decision and delivery. An auction can therefore exceed its
 configured wall-clock timeout.
 
 Creative sanitization is opt-in. `sanitize_creatives = true` strips executable
-markup before delivery. `rewrite_creatives = false` skips first-party URL
-rewriting and creative TSJS injection. See
+markup before delivery. `rewrite_creatives = false` leaves asset URLs
+direct; links are wrapped, and creative TSJS injected on `POST /auction`,
+only when `rewrite_clicks = true`. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 **Environment overrides** replace map leaves that already exist in TOML:
@@ -1899,9 +2492,12 @@ TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
 
 ### Shared template assembly (`assembly_mode = "esi"`)
 
-This configuration is an experimental validation spike scoped to
-[IABTechLab/trusted-server#1009](https://github.com/IABTechLab/trusted-server/issues/1009),
-not a settled production cache interface.
+`inline` remains the default. `esi` is opt-in per deployment, covered by the
+`template-cache-local-test.sh` harness and by rendered-document byte-identity tests, and
+originated in
+[IABTechLab/trusted-server#1009](https://github.com/IABTechLab/trusted-server/issues/1009).
+Enable it deliberately and verify with the harness first; the keys below are the safety
+contract that makes it safe to do so.
 
 `assembly_mode` controls how initial-page slot and bid state is delivered:
 
@@ -1925,9 +2521,9 @@ the mode but safely fall back to the inline transform on every request. This is
 not a top-level HTTP cache hit: Compute still runs and the final assembled
 response is always `Cache-Control: private, no-store`.
 
-All four keys below belong directly under `[creative_opportunities]`. They are
+All keys below belong directly under `[creative_opportunities]`. They are
 one feature contract: `assembly_mode` selects how creative-opportunity state is
-delivered, while the other three constrain when and how long that mode may share
+delivered, while the other keys constrain when and how long that mode may share
 its template.
 They are not a general top-level HTTP-cache configuration.
 
@@ -1948,8 +2544,14 @@ template_cache_vary = [
 # The origin's remaining edge freshness may make the actual lifetime shorter.
 template_cache_max_age_seconds = 1200
 
-# Default false. Enable only after proving publisher HTML ignores Cookie.
-origin_is_cookie_independent = true
+# Optional bounded variant and personal-session policies; omitted means empty.
+template_cache_key_cookies = ["ab_bucket"]
+template_cache_bypass_cookies = ["session"]
+
+# Default false. With the lists above, false still bypasses every request that
+# carries any other cookie, including the TS identity cookie. Set true only
+# after proving those unlisted cookies do not change origin HTML.
+origin_is_cookie_independent = false
 ```
 
 The cache fails closed. A template is stored only for a `GET` with a processable
@@ -1986,20 +2588,110 @@ stored as a shared template.
 
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
-origin identity, complete template-shaping settings, TSJS content, and schema
-version all participate in an opaque SHA-256 cache key. `Accept-Encoding` does
-not: the stored template is decoded identity and the assembled result is encoded
-for each reader with `Vary: Accept-Encoding`. This assumes the origin's
+origin identity, complete template-shaping settings, TSJS content, core build
+inputs, and schema version all participate in an opaque SHA-256 cache key. The
+build digest covers every core source file (including Rust-inlined head scripts)
+except hidden, `#`-prefixed, and `~`-suffixed editor artifacts, plus the core
+build script, core and workspace manifests, `edgezero.toml`, and the workspace
+lockfile when present. Any change to these inputs causes a cold template fill
+per URL variant after deployment, even if the change does not affect rendered
+HTML. Core-owned formats (cached metadata, the seam marker, and the assembly
+contract) are covered by the same digest. A manual `TEMPLATE_SCHEMA_VERSION`
+bump is needed only for template-compatibility changes outside those inputs,
+such as the Fastly adapter's template storage or the Rust side of
+`trusted-server-js`, unless another fingerprint input already isolates the
+change.
+
+`Accept-Encoding` does not participate in the key: the stored template is
+decoded identity and the assembled result is encoded for each reader with
+`Vary: Accept-Encoding`. This assumes the origin's
 `Accept-Encoding` variants differ only by HTTP content coding, as normal
 compression negotiation does. Do not enable ESI for an origin that changes the
 document's meaning based on `Accept-Encoding`. Never put `Cookie` or
 `Authorization` in `template_cache_vary`; startup rejects both because raw cookie
-or credential values are not reader-neutral template dimensions. With
-`origin_is_cookie_independent = false` (the safe default), all cookie-bearing
-requests bypass. With it set to `true`, an origin `Vary: Cookie` still overrides
-the assertion and refuses storage. Every other name the origin emits in `Vary`
+or credential values are not reader-neutral template dimensions. An origin
+`Vary: Cookie` always refuses storage, including when a named cookie policy is
+configured or `origin_is_cookie_independent` is `true`.
+Every other name the origin emits in `Vary`
 must appear in the configured list; an uncovered name safely refuses template
 storage.
+
+The optional cookie lists control both template lookup and storage:
+
+- `template_cache_key_cookies` includes each named cookie's presence and value in
+  the template key. Use bounded, reader-neutral variants such as experiment arms
+  or region buckets, never account IDs, session tokens, or TS identity IDs. Missing
+  and empty values select different variants. Multiple names form a combined variant.
+- `template_cache_bypass_cookies` forces inline processing whenever any named
+  cookie is present, including an empty value such as `session=`. This applies
+  regardless of the independence assertion or any key cookies in the request.
+- When either list is nonempty, `origin_is_cookie_independent` applies only to
+  unlisted cookies. The safe default, `false`, bypasses requests containing any
+  unlisted cookie; `true` asserts that those cookies do not change origin HTML.
+  TS identity and consent cookies have no implicit exception.
+- When both lists are omitted or empty, the existing all-cookie behavior remains:
+  `false` bypasses every request carrying a `Cookie` header; `true` asserts that
+  all cookies are irrelevant to origin HTML.
+
+Cookie names match exactly and case-sensitively: `session` and `Session` are
+different names. Use nonempty ASCII HTTP token names; whitespace, `;`, `=`, and
+non-ASCII characters are invalid. Configuration rejects invalid names, duplicates
+within a list, overlap between lists, and TS identity cookies (`ts-ec`, `ts-eids`,
+`sharedId`) in the key list. Identity cookies may be listed for bypass. Wildcards,
+prefixes, and regular expressions are not supported. With either list nonempty, parsing of all
+`Cookie` fields after existing request preparation bypasses duplicate key-cookie names,
+invalid names, and malformed key-cookie values. When independence is `true`,
+duplicate unlisted names are allowed if every value passes framing checks, and
+unlisted values may also contain commas and balanced double quotes, supporting
+compact JSON cookies such as `g_state` and comma-separated experiment metadata.
+Unmatched quotes, whitespace within values, backslashes, controls, non-ASCII bytes,
+and comma-separated fragments resembling another `name=value` cookie still bypass.
+The origin must parse semicolon-separated cookies independently and treat these
+unlisted values as opaque. If its parser stops at a nonstandard value or changes
+how later key cookies are interpreted, the independence assertion is not valid.
+Cookies are forwarded unchanged by this policy; their values are not exposed in
+cache diagnostics. There is no value allowlist or cardinality limit, so operators
+must ensure keyed values stay bounded and account for every origin HTML dependency.
+
+If a downstream CDN translates `ab_bucket=A` into `X-Exp-Variant: A` after the
+request passes TS, configure both dimensions:
+
+```toml
+[creative_opportunities]
+assembly_mode = "esi"
+# Retain any other header dimensions required by the origin.
+template_cache_vary = ["x-exp-variant"]
+template_cache_key_cookies = ["ab_bucket"]
+template_cache_bypass_cookies = ["session"]
+# Only after verifying that all remaining cookies leave origin HTML unchanged.
+origin_is_cookie_independent = true
+```
+
+The cookie dimension separates experiment arms at TS even when the header is
+absent there; the header dimension covers the origin's `Vary: X-Exp-Variant`.
+Configuring the header alone cannot distinguish these readers. TS cannot verify
+the downstream mapping or discover other inputs selecting origin HTML. During a
+canary, check correct content for each arm, absent and empty experiment values,
+and session-bearing requests, as well as cache diagnostics.
+
+The lists can also be used independently within `[creative_opportunities]`. For
+experiment-only HTML, omit the bypass list:
+
+```toml
+template_cache_vary = ["x-exp-variant"]
+template_cache_key_cookies = ["ab_bucket"]
+origin_is_cookie_independent = true
+```
+
+For anonymous sharing with a logged-in population, omit the key list:
+
+```toml
+template_cache_bypass_cookies = ["session"]
+origin_is_cookie_independent = true
+```
+
+Both examples require the same assertion that unlisted cookies do not change
+origin HTML and retain all other ESI eligibility and header-coverage requirements.
 
 For a canary, inspect `X-TS-Template-Cache`. Its bounded values are `hit`,
 `miss-stored`, `miss-store-error`, `miss-reserved`, `bypass-request`,
@@ -2019,21 +2711,206 @@ The two headers together are the reliable verification signal. Timing alone can
 vary with the origin, auction, compression, browser connection reuse, and local
 proxy buffering.
 
+> **Upgrade note.** This release adds `/_ts/admin/cache/purge` to the admin endpoints
+> startup validation covers. A configuration whose `[[handlers]]` enumerate admin paths
+> individually, rather than using the `^/_ts/admin` prefix, fails to start until that path
+> is covered too. The failure is at startup and explicit, not at request time.
+
 Rollback must preserve configuration compatibility:
 
 1. Change `assembly_mode` to `inline` and deploy/push that configuration.
 2. Before rolling back to a binary that predates these fields, remove
-   `assembly_mode`, `template_cache_vary`, `template_cache_max_age_seconds`, and
-   `origin_is_cookie_independent`, then push the cleaned configuration. Older binaries
-   use `deny_unknown_fields` and intentionally reject unknown keys.
-3. Purge the Fastly surrogate key `ts-template` using the service's normal purge
-   tooling, or wait for the bounded origin-derived lifetime to expire.
+   `assembly_mode`, `template_cache_vary`, `template_cache_max_age_seconds`,
+   `template_cache_key_cookies`, `template_cache_bypass_cookies`,
+   `origin_is_cookie_independent`, and `origin_readthrough_enabled`, then push the
+   cleaned configuration. Older binaries
+   use `deny_unknown_fields` and intentionally reject unknown keys, even empty lists.
+   When rolling back only the named-cookie feature to a binary that supports ESI,
+   remove both cookie-list fields and keep `origin_is_cookie_independent = false`
+   or disable ESI if the origin depends on cookies. Keeping `true` after removing
+   the lists loses variant separation and session bypass.
+   Remove `origin_readthrough_enabled` even when rolling it back: `false` still
+   serializes the field and older binaries reject it.
+3. Purge the template cache with `ts cache purge --service <url> --all`, or
+   `--page <url>` for a single reader-facing URL. Use its exact scheme, host, and
+   port: `http://example.com/article` and `https://example.com/article` have different
+   purge keys. A success acknowledges invalidation of the requested key, not that an
+   object existed. `--service` requires HTTPS, except for loopback development
+   services (`localhost`, `127.0.0.1`, or `::1`). The admin endpoint
+   `POST /_ts/admin/cache/purge` is the same operation for a CMS webhook. Either clears
+   the `ts-template` surrogate key; waiting out the bounded origin-derived lifetime also
+   works. With readthrough caching enabled, `--all` also purges tagged origin
+   documents, so the next requests refetch those documents from the origin. Check
+   whether the origin can absorb that load before purging during a traffic peak.
 
 Run `scripts/template-cache-local-test.sh esi` before a rollout and
 `scripts/template-cache-local-test.sh inline` as its control. The harness uses a temporary
 manifest, never edits the tracked `fastly.toml`, verifies cold/warm origin
 counts and response integrity, and executes the generated GPT module against
-the served seam to require a real `defineSlot` call.
+the served seam to require a real `defineSlot` call. Both modes also exercise a
+cookie-selected origin: A/B isolation without a client variant header, absent
+versus empty buckets, ignored compact JSON and comma-list cookies, and session
+bypass on warm and cold URLs. Each request checks the selected HTML, cache
+diagnostics, private response policy, winning-bid assembly, and origin fetch count.
+
+### Origin readthrough caching
+
+`origin_readthrough_enabled` controls a **different cache** from everything above.
+The template cache stores Trusted Server's own transformed HTML. Readthrough is the
+platform's own cache sitting in front of the publisher origin, and it stores the
+origin's bytes.
+
+```toml
+[creative_opportunities]
+# Default false. Enable only after `ts origin probe-shareability` passes on every
+# axis and every verdict.
+origin_readthrough_enabled = true
+```
+
+Left at the default, the existing caching policy is preserved: ad-serving requests
+bypass the origin cache, while other publisher requests (including ordinary assets)
+keep the platform's default caching behavior. Setting it to `true` applies request
+shareability instead: eligible ad-serving requests can use the cache, while
+ineligible non-ad requests bypass it. Eligible requests are `GET`s with a `Host`,
+no disqualifying authorization or cookie, and no remaining conditional or range
+semantics.
+
+**Document requests only.** The gate answers a question about pages — whether the
+origin's HTML may be shared between readers — so it applies to document requests
+(`Sec-Fetch-Dest: document` and equivalents, or a navigation when that header is
+absent). Subresources keep the platform default whether the flag is on or off.
+Judging them on shareability would bypass the edge cache for every cookie-bearing
+or conditional asset request, which is most repeat-visitor asset traffic, and would
+tag every cached asset with `ts-template`, turning the template rollback purge into
+an origin-wide asset flush.
+
+#### This cache has far weaker guarantees than the template cache
+
+Read this before enabling it. The template cache refuses storage on inspection of
+the origin's _response_ — `Set-Cookie`, a CSP nonce, missing positive freshness, an
+uncovered `Vary`, and the rest of the list above. **Readthrough has none of those
+refusals**, and cannot: the decision is made before the origin replies, and no
+post-response hook is reachable on the Fastly adapter.
+
+What that means concretely, for each refusal the template cache performs:
+
+| Template-cache refusal      | Covered on readthrough?                           |
+| --------------------------- | ------------------------------------------------- |
+| No positive freshness       | **No** — probe verdict only                       |
+| Origin `Set-Cookie`         | **No** — probe verdict only                       |
+| Response CSP nonce          | **No** — probe verdict only                       |
+| Origin marks it unshareable | Yes — the platform honours `private` / `no-store` |
+| Non-`200` status            | Yes — the platform honours status                 |
+| Uncovered `Vary`            | Yes — the platform keys on the origin's `Vary`    |
+| Not HTML                    | Not applicable; readthrough caches per origin     |
+
+Every row marked **No** is an accepted risk carried by the operator, not by the
+code. An origin that personalises HTML without saying so in its headers can
+cross-serve one reader's page to another, including session fixation through a
+cached `Set-Cookie`. That last case is the sharpest: readthrough admits requests
+carrying _no_ cookie, which is exactly the first-time visitor an origin issues a
+session cookie to.
+
+`origin_is_cookie_independent = true` also widens this gate: cookie-bearing
+requests with unlisted cookies can become readthrough-eligible. Named bypass
+cookies and malformed cookie policies still refuse admission. Configuring any
+`template_cache_key_cookies` disables readthrough, even when those cookies are
+absent: the platform cache does not include their variant values in its key.
+The template cache continues to separate those variants. On the template cache,
+an origin's `Vary: Cookie` still overrides the independence assertion. On readthrough there is no such
+response-side guard. Setting both flags is the highest-risk configuration and
+requires a cookie-axis probe pass specifically.
+
+#### You cannot verify this locally
+
+Viceroy does not implement the readthrough cache. Measured with the gate enabled, the
+request judged shareable, and a stub origin answering `Cache-Control: public, max-age=60`
+with no `Set-Cookie`, two identical navigations still produced two origin fetches. The
+local harness can therefore show the _decision_ this gate makes, and never its effect.
+
+The first evidence either way comes from a deployed service. Treat any local timing as
+saying nothing about this setting.
+
+#### Enablement
+
+1. Run `ts origin probe-shareability --url <representative URLs>`. Publisher cookies a
+   real reader carries go in `TRUSTED_SERVER_PROBE_COOKIES` as one cookie header value
+   (`name=value; name=value`), and a bot-wall admission cookie in
+   `TRUSTED_SERVER_PROBE_ADMISSION_COOKIE`. Both are environment-only, never flags:
+   these are credentials, and an argument is visible to every process on the host
+   through `ps` and lands in shell history. Each `--url` must be HTTPS; plain HTTP is
+   accepted only for a loopback development origin. Admission-cookie runs are
+   diagnostic only: every request carries that cookie, so cookieless responses remain
+   untested and the safety gate fails. Rerun against the origin without it before
+   enabling caching.
+2. **Every axis and every verdict must pass.** Do not enable on a partial pass.
+   The probe checks status and safety headers on every sampled response, including
+   repeats. Each axis compares what a cache would store — the body **and** the policy
+   headers replayed with it, such as `Content-Security-Policy` — so an origin that
+   serves one document under two policies fails just as a varying document does.
+   Crawler user agents and prefetch requests are their own axes: neither
+   classification blocks readthrough, so an origin that answers a bot or a prefetch
+   with a different document without declaring `Vary` would otherwise have that
+   document cross-served to a reader. Any `Age` header, including `Age: 0`, blocks the verdict because a
+   fresh cached response can hide origin personalization. Pass `--vary-header <name>=<value>`
+   for each representative value of an additional request header, for example
+   `--vary-header x-exp-variant=A --vary-header x-exp-variant=B`. Each value is compared
+   against the absent baseline and the other supplied values, both with and without RSC.
+   Bare `--vary-header <name>` samples `1` for compatibility; it cannot establish safety
+   for categorical values the origin actually uses. Supply every relevant variant.
+   A declared `Vary` can explain a user-agent, RSC,
+   or custom-header difference only when every response declares it. Cookie
+   differences and different decoded gzip/identity documents always fail, because
+   the template cache requires those representations to be identical.
+   Navigation samples send HTML `Accept` and navigation Fetch Metadata and must
+   return `text/html`. RSC uses an explicit same-origin fetch profile, permitting
+   HTML fallback or `text/x-component`. A separate fetch control keeps `RSC`
+   variation independent of `Accept` and Fetch Metadata changes. If navigation
+   and fetch controls differ, all changed profile headers must be declared in
+   `Vary`; this conservative check cannot attribute a combined-profile difference
+   to one header. `Vary: *`, revalidation directives, and unreadable safety headers
+   always fail.
+   The probe is the only response-safety control on the readthrough path.
+3. Read the probe's stated limits. It runs from one client address, so
+   personalisation keyed on the reader's IP — geo, rate class — is invisible to
+   it, as are `Accept-Language` and client-hint variants it does not vary.
+4. Set `origin_readthrough_enabled = true` and push the configuration.
+5. Watch the `origin_cache_shareable` breakdown in publisher summary telemetry.
+   Its denominator is matching-slot candidates, including skipped auctions; it
+   does not measure every publisher origin fetch or a site-wide admission rate.
+   See the [telemetry population and query](https://github.com/IABTechLab/trusted-server/blob/main/tinybird/README.md#the-denominator-is-matching-slot-candidates-not-all-requests).
+   The predicate estimates eligibility in that population before or after enablement,
+   not actual cache hits.
+6. Confirm the origin's own hit rate and page correctness before widening to more
+   URLs.
+
+#### Rollback
+
+1. Set `origin_readthrough_enabled = false` and push. This takes effect on the
+   next request with no deploy and restores the previous policy: ad-serving
+   requests bypass, while non-ad traffic keeps the platform default. It does not
+   disable origin caching globally.
+2. Purge tagged objects with `ts cache purge --service <https-service-url> --all`,
+   or `--page <reader-url>` for one exact reader-facing URL. Both the template cache
+   and opted-in origin readthrough objects carry the page key and `ts-template`
+   purge-all key. The readthrough tags use the original reader URL, before origin
+   rewriting, and work in both inline and ESI assembly modes.
+3. Objects stored by older versions without readthrough tags remain unreachable
+   through these purge keys and must expire on the origin's TTL. Changing the
+   origin's TTL does not shorten an already-cached object's lifetime.
+4. **Use `--all` on multi-host or dual-scheme deployments.** The template cache keys
+   on scheme and host, so purging each spelling you serve covers it. Readthrough does
+   not line up the same way: reader URLs that rewrite to one origin URL — `http://`
+   and `https://`, or `www.` and the apex on one service — share a single stored
+   object, tagged with the reader URL of whichever request filled it first. A
+   `--page https://example.com/a` can therefore leave an `http://`-tagged object in
+   place, and the next template miss refetches through it and re-stores the stale page
+   into the freshly purged template cache. If you serve one page under more than one
+   reader-facing spelling, purge with `--all`.
+
+The Fastly SDK attaches these tags to cached objects; production hit and purge
+behavior still requires validation on a deployed service, since Viceroy does not
+implement readthrough caching.
 
 ### `gam_unit_path` templating
 
@@ -2131,32 +3008,78 @@ no slot at all, so no template is rendered for it.
 Startup validation rejects a malformed template: an unknown placeholder (e.g.
 `{oops}`), an unmatched or nested `{`, a stray `}`, or an empty `gam_unit_path`.
 
+## Debug Configuration
+
+Every debug switch defaults to `false`. These controls expose request,
+auction, TLS, or creative data and are for controlled non-production use only.
+
+### `[debug]`
+
+| Field                                                     | Type          | Default                                | Contract                                                         |
+| --------------------------------------------------------- | ------------- | -------------------------------------- | ---------------------------------------------------------------- |
+| `ja4_endpoint_enabled`                                    | Boolean       | `false`                                | Expose `GET /_ts/debug/ja4` on Fastly                            |
+| `auction_html_comment`                                    | Boolean       | `false`                                | Insert an auction diagnostic comment before `</body>`            |
+| `inject_adm_for_testing`                                  | Boolean       | `false`                                | Enable the direct GAM-replace test path and raw `debug_bid` data |
+| `auction_html_comment_options.include_provider_responses` | Boolean       | `true`                                 | Include provider response summaries                              |
+| `auction_html_comment_options.include_mediator_response`  | Boolean       | `true`                                 | Include mediator response summaries                              |
+| `auction_html_comment_options.include_bids`               | Boolean       | `true`                                 | Include provider bid arrays                                      |
+| `auction_html_comment_options.metadata_keys`              | Array[String] | `error_type`, `http_status`, `message` | Must be a subset of this fixed allowlist                         |
+| `auction_html_comment_options.verbosity`                  | String        | `"redacted"`                           | `redacted`, `upstream`, or `full`                                |
+| `auction_html_comment_options.format`                     | String        | `"compact"`                            | `compact` or `pretty`                                            |
+
+The default options table is omitted from serialized config for rollback
+compatibility. A non-default table is serialized and therefore requires every
+running binary to understand it. `upstream` and `full` can expose
+identity-bearing provider data; `inject_adm_for_testing` carries raw creative
+markup. Do not enable them in production.
+
+```toml
+[debug]
+ja4_endpoint_enabled = false
+auction_html_comment = false
+inject_adm_for_testing = false
+```
+
 ## Fastly Runtime Config Store
 
 After the EdgeZero cutover, the Fastly adapter always dispatches through the
 EdgeZero entry point. The former `edgezero_enabled` and `edgezero_rollout_pct`
 canary keys are no longer read.
 
-The Fastly service must still provide a `trusted_server_config` config store
-because the entry point opens it before dispatch and passes the handle to
-EdgeZero-backed platform services. The store may be empty unless another feature
-adds keys to it.
+`[stores.config].default` in `edgezero.toml` supplies the logical config store
+ID, currently `trusted_server_config`. The Fastly runtime opens the store by
+that logical ID and reads the entry under the same key on every target. Store
+selection is a deploy-time input: a managed `ts deploy --adapter fastly` links
+the physical store named by
+`EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` to the service version
+under the logical ID. No selector is read from a Config Store at runtime, and
+on Fastly the CLI rejects any `--key` or `__KEY` selector other than the
+logical ID.
 
-**Local development** (`fastly.toml`):
+Keep the `__NAME` selector set in the shell or deploy job for every push, so
+`ts config push` writes into the same physical store the deployment links.
+Isolate staging by selecting a different physical store. See
+[Secret Stores](/guide/fastly#secret-stores) and the
+[CLI lifecycle commands](/guide/cli#lifecycle-commands) for the full deploy and
+staging flow.
 
-```toml
-[local_server.config_stores]
-  [local_server.config_stores.trusted_server_config]
-    format = "inline-toml"
-    [local_server.config_stores.trusted_server_config.contents]
-```
+### Local development
 
-**Production setup** (Fastly CLI):
+The repository's Viceroy configuration uses the logical app-config store ID and
+key. Clear any production key override for the local push:
 
 ```bash
-# Create the store once and attach it to the service.
-fastly config-store create --name trusted_server_config
+env -u EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY \
+  ts config push --adapter fastly --local
 ```
+
+`--local` writes under `[local_server.config_stores.trusted_server_config]` in
+the tracked `fastly.toml`, the logical store ID, regardless of any `__NAME`
+selector. Review the generated diff and do not commit deployment-specific
+app-config entries. Credentials belong in secret stores; the app-config blob
+contains their key references.
+
+### Rollback
 
 Rollback to the legacy entry point is no longer controlled by runtime config
 keys. Use the normal deployment rollback path to restore a pre-cleanup service
@@ -2308,16 +3231,12 @@ trusted-server.dev.toml      # Development overrides
 - Rerun `ts config push` after changing a deploy-time override
 - Try explicit string: `VARIABLE='value'` not `VARIABLE=value`
 
-### Debug Configuration
+### Inspect Configuration Inputs
 
-**Print Loaded Config** (test only):
-
-```rust
-use trusted_server_core::settings_data::get_settings;
-
-let settings = get_settings()?;
-println!("{:#?}", settings);
-```
+Runtime adapters load the app-config envelope with
+`get_settings_from_config_store` from the `trusted_server_core::settings_data`
+module. For a source file or local fixture, use `Settings::from_toml`; there is
+no process-global settings accessor.
 
 **Check Environment**:
 

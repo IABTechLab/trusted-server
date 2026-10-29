@@ -1,5 +1,11 @@
 # Business Use Cases
 
+> [!CAUTION]
+> **Unverified planning material.** The claims, metrics, projections, and
+> capabilities in this document have not been validated against the current
+> implementation. Do not treat them as shipped behavior or product
+> commitments.
+
 Scenarios where publishers can realize measurable value with Trusted
 Server across revenue, consent handling, performance, and user
 experience.

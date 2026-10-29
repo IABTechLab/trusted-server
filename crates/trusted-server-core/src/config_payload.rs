@@ -17,8 +17,19 @@ use crate::settings::Settings;
 /// Canonical logical secret store used by Trusted Server app-config secrets.
 pub const DEFAULT_SECRET_STORE_ID: &str = "trusted_server_secrets";
 
+/// Default logical config-store id, from `[stores.config].default` in `edgezero.toml`.
+///
+/// Derived at build time so every adapter uses the repository manifest's default.
+pub const DEFAULT_CONFIG_STORE_ID: &str = env!("TRUSTED_SERVER_DEFAULT_CONFIG_STORE_ID");
+
 /// Default config-store key containing the Trusted Server app-config blob.
-pub const CONFIG_BLOB_KEY: &str = "trusted_server_config";
+///
+/// Intentionally matches the logical store ID: an ordinary `ts config push`
+/// writes there unless `--key` selects another key. This constant does not apply
+/// runtime overrides; use [`crate::settings_data::config_key`] with the adapter's
+/// runtime configuration, or [`crate::settings_data::default_config_key`] for
+/// process-environment overrides.
+pub const CONFIG_BLOB_KEY: &str = DEFAULT_CONFIG_STORE_ID;
 
 /// Reconstruct runtime [`Settings`] from a serialized config blob envelope.
 ///
@@ -725,6 +736,43 @@ mod tests {
     }
 
     #[test]
+    fn legacy_blob_without_rewrite_include_domains_loads_with_empty_list() {
+        let data =
+            serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
+        let rewrite = data
+            .get("rewrite")
+            .and_then(serde_json::Value::as_object)
+            .expect("should serialize rewrite settings as an object");
+        assert!(
+            !rewrite.contains_key("include_domains"),
+            "should omit the default include list from the payload"
+        );
+
+        let reconstructed = load_settings(&envelope_json(&test_settings()))
+            .expect("should reconstruct settings without include_domains");
+
+        assert!(
+            reconstructed.rewrite.include_domains.is_empty(),
+            "should load an empty include list from a blob without the key"
+        );
+    }
+
+    #[test]
+    fn rewrite_include_domains_survive_blob_round_trip() {
+        let mut original = test_settings();
+        original.rewrite.include_domains = vec!["*.cdn.example.com".to_owned()];
+
+        let reconstructed = load_settings(&envelope_json(&original))
+            .expect("should reconstruct settings with include_domains");
+
+        assert_eq!(
+            reconstructed.rewrite.include_domains,
+            vec!["*.cdn.example.com".to_owned()],
+            "should preserve the configured include list"
+        );
+    }
+
+    #[test]
     fn disabled_rewrite_creatives_survives_blob_round_trip() {
         let mut original = test_settings();
         original.auction.rewrite_creatives = false;
@@ -736,6 +784,50 @@ mod tests {
             !reconstructed.auction.rewrite_creatives,
             "should preserve the explicit rewrite opt-out"
         );
+    }
+
+    #[test]
+    fn legacy_blob_without_rewrite_clicks_follows_rewrite_creatives() {
+        for rewrite_creatives in [true, false] {
+            let mut original = test_settings();
+            original.auction.rewrite_creatives = rewrite_creatives;
+            let data = serde_json::to_value(&original).expect("should serialize settings to JSON");
+            assert!(
+                data["auction"].get("rewrite_clicks").is_none(),
+                "should omit unset rewrite_clicks from the payload"
+            );
+
+            let reconstructed = load_settings(&envelope_json(&original))
+                .expect("should reconstruct settings without rewrite_clicks");
+
+            assert_eq!(
+                reconstructed.auction.rewrite_clicks, None,
+                "should load a blob without rewrite_clicks as unset"
+            );
+            assert_eq!(
+                reconstructed.auction.rewrites_auction_clicks(),
+                rewrite_creatives,
+                "should follow rewrite_creatives = {rewrite_creatives} when unset"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_rewrite_clicks_survives_blob_round_trip() {
+        for (rewrite_creatives, rewrite_clicks) in [(true, false), (false, true)] {
+            let mut original = test_settings();
+            original.auction.rewrite_creatives = rewrite_creatives;
+            original.auction.rewrite_clicks = Some(rewrite_clicks);
+
+            let reconstructed = load_settings(&envelope_json(&original))
+                .expect("should reconstruct explicit rewrite_clicks");
+
+            assert_eq!(
+                reconstructed.auction.rewrite_clicks,
+                Some(rewrite_clicks),
+                "should preserve rewrite_clicks = {rewrite_clicks} with rewrite_creatives = {rewrite_creatives}"
+            );
+        }
     }
 
     #[test]

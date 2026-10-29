@@ -2,6 +2,9 @@
 
 **Design:** `docs/superpowers/specs/2026-07-24-prebid-refresh-gam-path-opt-out-design.md`
 
+> **Update (2026-09-16):** The `ts prebid bundle` command referenced in this
+> plan was later renamed to `ts prebid client`.
+
 **Goal:** Let operators exclude selected GAM ad-unit-path suffixes from Trusted
 Server's Prebid refresh auctions without suppressing the corresponding GAM refresh.
 

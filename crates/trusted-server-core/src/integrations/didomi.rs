@@ -289,12 +289,10 @@ impl DidomiIntegration {
             }
         }
 
-        if matches!(backend, DidomiBackend::Sdk) {
-            if let Some(geo) = authoritative_geo {
-                Self::set_geo_headers(geo, proxy_headers);
-            } else {
-                Self::copy_geo_headers(original_headers, proxy_headers);
-            }
+        if matches!(backend, DidomiBackend::Sdk)
+            && let Some(geo) = authoritative_geo
+        {
+            Self::set_geo_headers(geo, proxy_headers);
         }
     }
 
@@ -308,23 +306,6 @@ impl DidomiIntegration {
                 name,
                 HeaderValue::from_str(value).expect("should format validated Didomi geo header"),
             );
-        }
-    }
-
-    fn copy_geo_headers(
-        original_headers: &HeaderMap<HeaderValue>,
-        proxy_headers: &mut HeaderMap<HeaderValue>,
-    ) {
-        let geo_headers = [
-            ("X-Geo-Country", "FastlyGeo-CountryCode"),
-            ("X-Geo-Region", "FastlyGeo-Region"),
-            ("CloudFront-Viewer-Country", "FastlyGeo-CountryCode"),
-        ];
-
-        for (target, source) in geo_headers {
-            if let Some(value) = original_headers.get(source) {
-                proxy_headers.insert(target, value.clone());
-            }
         }
     }
 
@@ -434,19 +415,26 @@ impl IntegrationProxy for DidomiIntegration {
         let prefix = self.resolved_prefix();
         let consent_path = path.strip_prefix(&prefix).unwrap_or(&path);
         let backend = self.backend_for_path(consent_path);
-        let canonical_loader = if self.config.geo_query_parameters
-            && matches!(backend, DidomiBackend::Sdk)
-            && is_notice_loader(&parts.method, consent_path)
-        {
-            let geo = match services.geo().lookup(services.client_info().client_ip) {
-                Ok(Some(geo)) => match normalize_didomi_geo(&geo) {
-                    Ok(geo) => geo,
-                    Err(error) => return Ok(Self::geo_failure_response(error.reason())),
+        let trusted_geo = if matches!(backend, DidomiBackend::Sdk) {
+            Some(
+                match services.geo().lookup(services.client_info().client_ip) {
+                    Ok(Some(geo)) => normalize_didomi_geo(&geo).map_err(DidomiGeoError::reason),
+                    Ok(None) => Err("geo_unavailable"),
+                    Err(_) => Err("lookup_failed"),
                 },
-                Ok(None) => return Ok(Self::geo_failure_response("geo_unavailable")),
-                Err(_) => return Ok(Self::geo_failure_response("lookup_failed")),
+            )
+        } else {
+            None
+        };
+        let canonical_loader = if self.config.geo_query_parameters
+            && is_notice_loader(&parts.method, consent_path)
+            && let Some(geo) = &trusted_geo
+        {
+            let geo = match geo {
+                Ok(geo) => geo,
+                Err(reason) => return Ok(Self::geo_failure_response(reason)),
             };
-            let canonical = canonical_loader_url(&path, parts.uri.query(), &geo);
+            let canonical = canonical_loader_url(&path, parts.uri.query(), geo);
             let incoming_path_and_query = parts
                 .uri
                 .path_and_query()
@@ -454,18 +442,20 @@ impl IntegrationProxy for DidomiIntegration {
             if incoming_path_and_query != canonical.browser_target {
                 return Self::redirect_response(&canonical.browser_target);
             }
-            Some((geo, canonical))
+            Some(canonical)
         } else {
+            if let Some(Err(reason)) = &trusted_geo {
+                log::debug!("Didomi SDK request omits geo headers: reason={reason}");
+            }
             None
         };
         let base_origin = match backend {
             DidomiBackend::Sdk => self.config.sdk_origin.as_str(),
             DidomiBackend::Api => self.config.api_origin.as_str(),
         };
-        let query = canonical_loader.as_ref().map_or_else(
-            || parts.uri.query(),
-            |(_, canonical)| Some(&*canonical.query),
-        );
+        let query = canonical_loader
+            .as_ref()
+            .map_or_else(|| parts.uri.query(), |canonical| Some(&*canonical.query));
 
         let target_url = self
             .build_target_url(base_origin, consent_path, query)
@@ -492,14 +482,20 @@ impl IntegrationProxy for DidomiIntegration {
             services.client_info().client_ip,
             &parts.headers,
             proxy_req.headers_mut(),
-            canonical_loader.as_ref().map(|(geo, _)| geo),
+            trusted_geo.as_ref().and_then(|geo| geo.as_ref().ok()),
         );
 
+        // Dynamic loaders need a validated geo identity for shared caching.
+        // Other SDK GETs follow Didomi's origin cache policy for static assets.
+        let shared_cacheable = canonical_loader.is_some()
+            || (matches!(backend, DidomiBackend::Sdk)
+                && parts.method == Method::GET
+                && !consent_path.ends_with("/loader.js"));
         let platform_request = PlatformHttpRequest::new(proxy_req, backend_name);
-        let platform_request = if matches!(backend, DidomiBackend::Api) {
-            platform_request.with_cache_bypass()
-        } else {
+        let platform_request = if shared_cacheable {
             platform_request
+        } else {
+            platform_request.with_cache_bypass()
         };
         let mut response = services
             .http_client()
@@ -509,7 +505,8 @@ impl IntegrationProxy for DidomiIntegration {
 
         if matches!(backend, DidomiBackend::Sdk) {
             Self::add_cors_headers(&mut response.response);
-        } else {
+        }
+        if !shared_cacheable {
             crate::response_privacy::enforce_terminal_private_cache_privacy(&mut response.response);
         }
 
@@ -554,6 +551,7 @@ mod tests {
 
     use super::*;
     use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use crate::platform::PlatformCacheIntent;
     use crate::platform::test_support::{
         NoopConfigStore, NoopSecretStore, StubBackend, StubHttpClient,
         build_services_with_http_client,
@@ -562,6 +560,7 @@ mod tests {
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use http::Method;
 
+    #[derive(Clone)]
     enum GeoResult {
         Value(Option<GeoInfo>),
         Failure,
@@ -925,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_geo_preserves_existing_loader_behavior() {
+    fn disabled_geo_proxies_loader_without_geo_query() {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"loader".to_vec());
         let services = services_with_geo(
@@ -975,6 +974,362 @@ mod tests {
             vec!["https://sdk.example.com/sdk/v1/core.js?v=1"],
             "should not apply loader geo behavior to other SDK assets"
         );
+    }
+
+    const NONCANONICAL_SDK_CASES: [(bool, Method, &str); 5] = [
+        (false, Method::GET, "/key/loader.js"),
+        (false, Method::GET, "/sdk/v1/core.js"),
+        (true, Method::GET, "/sdk/v1/core.js"),
+        (false, Method::POST, "/key/loader.js"),
+        (true, Method::POST, "/key/loader.js"),
+    ];
+
+    #[test]
+    fn noncanonical_sdk_uses_trusted_geo_instead_of_caller_headers() {
+        for (enabled, method, path) in NONCANONICAL_SDK_CASES {
+            // Arrange conflicting caller geography and a normalized platform pair.
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"sdk".to_vec());
+            let services = services_with_geo(
+                Arc::clone(&stub),
+                GeoResult::Value(Some(geo_info(" us ", Some(" us-ca ")))),
+            );
+            let settings = create_test_settings();
+            let integration = DidomiIntegration::new(Arc::new(DidomiIntegrationConfig {
+                geo_query_parameters: enabled,
+                ..config(true)
+            }));
+            let request = http::Request::builder()
+                .method(method)
+                .uri(format!(
+                    "https://publisher.example/integrations/didomi/consent{path}?v=1"
+                ))
+                .header("FastlyGeo-CountryCode", "GB")
+                .header("FastlyGeo-Region", "LND")
+                .header("X-Geo-Country", "FR")
+                .header("X-Geo-Region", "IDF")
+                .header("CloudFront-Viewer-Country", "DE")
+                .body(EdgeBody::empty())
+                .expect("should build SDK request");
+
+            // Act.
+            let response =
+                futures::executor::block_on(integration.handle(&settings, &services, request))
+                    .expect("should proxy SDK request");
+
+            // Assert.
+            assert_eq!(
+                response.status(),
+                http::StatusCode::OK,
+                "should proxy without redirect"
+            );
+            assert_eq!(
+                stub.recorded_request_uris(),
+                vec![format!("https://sdk.example.com{path}?v=1")],
+                "should preserve noncanonical SDK URL"
+            );
+            let headers = stub.recorded_request_headers();
+            for (name, expected) in [
+                ("x-geo-country", "US"),
+                ("x-geo-region", "CA"),
+                ("cloudfront-viewer-country", "US"),
+            ] {
+                assert!(
+                    headers[0]
+                        .iter()
+                        .any(|(actual, value)| actual == name && value == expected),
+                    "should derive {name} only from trusted geo for {path}, geo option {enabled}"
+                );
+            }
+            assert!(
+                !headers[0]
+                    .iter()
+                    .any(|(name, _)| name.starts_with("fastlygeo-")),
+                "should not forward raw caller geo headers"
+            );
+        }
+    }
+
+    #[test]
+    fn noncanonical_sdk_omits_geo_when_trusted_pair_is_unavailable() {
+        for (enabled, method, path) in NONCANONICAL_SDK_CASES {
+            for geo_result in [
+                GeoResult::Value(None),
+                GeoResult::Failure,
+                GeoResult::Value(Some(geo_info("US", None))),
+                GeoResult::Value(Some(geo_info("US", Some(" ")))),
+                GeoResult::Value(Some(geo_info("XX", Some("CA")))),
+                GeoResult::Value(Some(geo_info("US", Some("GB-LND")))),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response(200, b"sdk".to_vec());
+                let services = services_with_geo(Arc::clone(&stub), geo_result);
+                let settings = create_test_settings();
+                let integration = DidomiIntegration::new(Arc::new(DidomiIntegrationConfig {
+                    geo_query_parameters: enabled,
+                    ..config(true)
+                }));
+                let request = http::Request::builder()
+                    .method(method.clone())
+                    .uri(format!(
+                        "https://publisher.example/integrations/didomi/consent{path}"
+                    ))
+                    .header("FastlyGeo-CountryCode", "GB")
+                    .header("FastlyGeo-Region", "LND")
+                    .header("X-Geo-Country", "FR")
+                    .header("X-Geo-Region", "IDF")
+                    .header("CloudFront-Viewer-Country", "DE")
+                    .body(EdgeBody::empty())
+                    .expect("should build SDK request");
+
+                let response =
+                    futures::executor::block_on(integration.handle(&settings, &services, request))
+                        .expect("should proxy SDK request without geo");
+
+                assert_eq!(
+                    response.status(),
+                    http::StatusCode::OK,
+                    "should tolerate unavailable geo outside enabled GET loaders"
+                );
+                let headers = stub.recorded_request_headers();
+                for name in [
+                    "x-geo-country",
+                    "x-geo-region",
+                    "cloudfront-viewer-country",
+                    "fastlygeo-countrycode",
+                    "fastlygeo-region",
+                ] {
+                    assert!(
+                        !headers[0].iter().any(|(actual, _)| actual == name),
+                        "should omit {name} without a complete trusted pair for {path}, geo option {enabled}"
+                    );
+                }
+            }
+        }
+    }
+
+    const UNCACHEABLE_SDK_CASES: [(bool, Method, &str); 6] = [
+        (false, Method::GET, "/key/loader.js"),
+        (true, Method::GET, "/nested/key/loader.js"),
+        (true, Method::GET, "/loader.js"),
+        (false, Method::POST, "/key/loader.js"),
+        (true, Method::POST, "/key/loader.js"),
+        (true, Method::POST, "/sdk/v1/core.js"),
+    ];
+
+    #[test]
+    fn noncanonical_loaders_and_sdk_posts_bypass_cache_and_strip_metadata() {
+        for (enabled, method, path) in UNCACHEABLE_SDK_CASES {
+            // Even absent geo cannot make a URL eligible for shared caching.
+            for geo_result in [
+                GeoResult::Value(Some(geo_info("US", Some("CA")))),
+                GeoResult::Value(None),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response_with_headers(
+                    200,
+                    b"sdk".to_vec(),
+                    vec![
+                        ("Cache-Control", "public, max-age=3600"),
+                        ("Expires", "Wed, 21 Oct 2037 07:28:00 GMT"),
+                        ("ETag", "\"sdk-response\""),
+                        ("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+                        ("Age", "120"),
+                        ("Surrogate-Control", "max-age=3600"),
+                        ("CDN-Cache-Control", "max-age=3600"),
+                        ("Cloudflare-CDN-Cache-Control", "max-age=3600"),
+                        ("Fastly-Surrogate-Control", "max-age=3600"),
+                    ],
+                );
+                let services = services_with_geo(Arc::clone(&stub), geo_result);
+                let settings = create_test_settings();
+                let integration = DidomiIntegration::new(Arc::new(DidomiIntegrationConfig {
+                    geo_query_parameters: enabled,
+                    ..config(true)
+                }));
+                let request = http::Request::builder()
+                    .method(method.clone())
+                    .uri(format!("https://publisher.example/integrations/didomi/consent{path}?country=GB&region=LND"))
+                    .header(header::IF_NONE_MATCH, "\"old-geo-response\"")
+                    .header(header::IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT")
+                    .body(EdgeBody::empty())
+                    .expect("should build SDK request");
+
+                let response =
+                    futures::executor::block_on(integration.handle(&settings, &services, request))
+                        .expect("should proxy SDK request");
+
+                assert_eq!(
+                    stub.recorded_cache_intents(),
+                    vec![PlatformCacheIntent::Bypass],
+                    "should bypass SDK cache without canonical geo identity for {path}, geo option {enabled}"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("no-store, private"),
+                    "should prohibit downstream storage"
+                );
+                assert!(
+                    response
+                        .extensions()
+                        .get::<crate::response_privacy::TerminalPrivateResponse>()
+                        .is_some(),
+                    "should preserve privacy through terminal response hooks"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("*"),
+                    "should retain SDK CORS"
+                );
+                for name in [
+                    "expires",
+                    "etag",
+                    "last-modified",
+                    "age",
+                    "surrogate-control",
+                    "cdn-cache-control",
+                    "cloudflare-cdn-cache-control",
+                    "fastly-surrogate-control",
+                ] {
+                    assert!(
+                        response.headers().get(name).is_none(),
+                        "should remove SDK cache metadata {name}"
+                    );
+                }
+                let headers = stub.recorded_request_headers();
+                assert!(
+                    !headers[0].iter().any(|(name, _)| matches!(
+                        name.as_str(),
+                        "if-none-match" | "if-modified-since"
+                    )),
+                    "should not revalidate a previously cached geo response"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn static_sdk_assets_keep_origin_cache_policy() {
+        for enabled in [false, true] {
+            for geo_result in [
+                GeoResult::Value(Some(geo_info("US", Some("CA")))),
+                GeoResult::Value(None),
+            ] {
+                for path in ["/sdk/v1/core.js", "/sdk/v1/ui.js", "/sdk/v1/iab-texts.js"] {
+                    let stub = Arc::new(StubHttpClient::new());
+                    let cache_headers = vec![
+                        ("Cache-Control", "public, max-age=31536000"),
+                        ("Expires", "Wed, 21 Oct 2037 07:28:00 GMT"),
+                        ("ETag", "\"sdk-chunk\""),
+                        ("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+                        ("Age", "120"),
+                        ("Surrogate-Control", "max-age=31536000"),
+                        ("CDN-Cache-Control", "max-age=31536000"),
+                        ("Cloudflare-CDN-Cache-Control", "max-age=31536000"),
+                        ("Fastly-Surrogate-Control", "max-age=31536000"),
+                    ];
+                    stub.push_response_with_headers(200, b"sdk".to_vec(), cache_headers.clone());
+                    let services = services_with_geo(Arc::clone(&stub), geo_result.clone());
+                    let settings = create_test_settings();
+                    let integration = DidomiIntegration::new(Arc::new(DidomiIntegrationConfig {
+                        geo_query_parameters: enabled,
+                        ..config(true)
+                    }));
+                    let request = http::Request::builder()
+                        .method(Method::GET)
+                        .uri(format!(
+                            "https://publisher.example/integrations/didomi/consent{path}?v=1"
+                        ))
+                        .body(EdgeBody::empty())
+                        .expect("should build SDK asset request");
+
+                    let response = futures::executor::block_on(
+                        integration.handle(&settings, &services, request),
+                    )
+                    .expect("should proxy SDK asset");
+
+                    assert_eq!(
+                        stub.recorded_cache_intents(),
+                        vec![PlatformCacheIntent::Default],
+                        "should follow origin cache policy for {path}, geo option {enabled}"
+                    );
+                    for (name, expected) in cache_headers {
+                        assert_eq!(
+                            response
+                                .headers()
+                                .get(name)
+                                .and_then(|value| value.to_str().ok()),
+                            Some(expected),
+                            "should preserve {name} for {path}, geo option {enabled}"
+                        );
+                    }
+                    assert!(
+                        response
+                            .extensions()
+                            .get::<crate::response_privacy::TerminalPrivateResponse>()
+                            .is_none(),
+                        "should allow origin cache policy through terminal response hooks"
+                    );
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("*"),
+                        "should retain SDK CORS for static assets"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn api_requests_do_not_forward_geo_headers() {
+        for enabled in [false, true] {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"event".to_vec());
+            let services = services_with_geo(
+                Arc::clone(&stub),
+                GeoResult::Value(Some(geo_info("US", Some("CA")))),
+            );
+            let settings = create_test_settings();
+            let integration = DidomiIntegration::new(Arc::new(DidomiIntegrationConfig {
+                geo_query_parameters: enabled,
+                ..config(true)
+            }));
+            let request = http::Request::builder()
+                .uri("https://publisher.example/integrations/didomi/consent/api/events")
+                .header("FastlyGeo-CountryCode", "GB")
+                .header("FastlyGeo-Region", "LND")
+                .header("X-Geo-Country", "FR")
+                .header("X-Geo-Region", "IDF")
+                .header("CloudFront-Viewer-Country", "DE")
+                .body(EdgeBody::empty())
+                .expect("should build API request");
+
+            futures::executor::block_on(integration.handle(&settings, &services, request))
+                .expect("should proxy API request");
+
+            let headers = stub.recorded_request_headers();
+            for name in [
+                "x-geo-country",
+                "x-geo-region",
+                "cloudfront-viewer-country",
+                "fastlygeo-countrycode",
+                "fastlygeo-region",
+            ] {
+                assert!(
+                    !headers[0].iter().any(|(actual, _)| actual == name),
+                    "should omit API geo header {name}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1057,8 +1412,8 @@ mod tests {
                 .expect("should proxy API request");
 
         assert_eq!(
-            stub.recorded_cache_bypass_flags(),
-            vec![true],
+            stub.recorded_cache_intents(),
+            vec![PlatformCacheIntent::Bypass],
             "should bypass the platform cache for API requests"
         );
         assert_eq!(
@@ -1085,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn sdk_responses_preserve_origin_cache_metadata() {
+    fn canonical_loader_responses_preserve_origin_cache_metadata() {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             200,
@@ -1116,8 +1471,8 @@ mod tests {
                 .expect("should proxy SDK request");
 
         assert_eq!(
-            stub.recorded_cache_bypass_flags(),
-            vec![false],
+            stub.recorded_cache_intents(),
+            vec![PlatformCacheIntent::Default],
             "should retain normal platform caching for canonical SDK loaders"
         );
         for (name, expected) in [

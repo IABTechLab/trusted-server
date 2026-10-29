@@ -17,6 +17,7 @@ use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
+use crate::streaming_processor::StreamProcessor;
 
 /// Action returned by attribute rewriters to describe how the runtime should mutate the element.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,11 +55,18 @@ pub enum AttributeRewriteOutcome {
     RemoveElement,
 }
 
-/// Action returned by inline script rewriters to describe how to mutate the node.
+/// Action on the current working script text fragment, composed in registration order.
+///
+/// Every matching stage receives the previous stage's output, including empty
+/// suppressed text and the original final-fragment flag. Only the composed result
+/// is applied to the parser fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptRewriteAction {
+    /// Preserve the current working text, not the original parser text.
     Keep,
+    /// Pass replacement text to subsequent matching stages.
     Replace(String),
+    /// Suppress this fragment; downstream stages still run and may flush held text.
     RemoveNode,
 }
 
@@ -92,11 +100,13 @@ pub struct IntegrationAttributeContext<'a> {
 /// Context passed to script/text rewriters for inline HTML handling.
 #[derive(Debug)]
 pub struct IntegrationScriptContext<'a> {
+    /// The individual rewriter's CSS selector, matched by `lol_html`.
     pub selector: &'a str,
     pub request_host: &'a str,
     pub request_scheme: &'a str,
     pub origin_host: &'a str,
     pub is_last_in_text_node: bool,
+    pub max_buffered_script_bytes: usize,
     pub document_state: &'a IntegrationDocumentState,
 }
 
@@ -530,13 +540,15 @@ pub trait IntegrationAttributeRewriter: Send + Sync {
     ) -> AttributeRewriteAction;
 }
 
-/// Trait for integration-provided inline script/text rewrite hooks.
+/// Trait for integration-provided inline script rewrite hooks.
 pub trait IntegrationScriptRewriter: Send + Sync {
     /// Identifier for logging/diagnostics.
     fn integration_id(&self) -> &'static str;
-    /// CSS selector (e.g. `script#__NEXT_DATA__`) that should trigger this rewriter.
+    /// CSS selector matching `<script>` elements, for example `script#__NEXT_DATA__`.
+    /// Only text inside matched scripts triggers this rewriter; non-script
+    /// elements are not supported.
     fn selector(&self) -> &'static str;
-    /// Attempt to rewrite the inline text content for the selector.
+    /// Attempt to rewrite the inline script content for the selector.
     fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction;
 }
 
@@ -549,26 +561,38 @@ pub struct IntegrationHtmlContext<'a> {
     pub document_state: &'a IntegrationDocumentState,
 }
 
-/// Trait for integration-provided HTML post-processors.
-/// These run after streaming HTML processing to handle cases that require
-/// access to the complete HTML (e.g., cross-script RSC T-chunks).
-pub trait IntegrationHtmlPostProcessor: Send + Sync {
-    /// Identifier for logging/diagnostics.
+/// Owned request data supplied when an integration creates an HTML stream processor.
+#[derive(Clone)]
+pub struct IntegrationHtmlStreamContext {
+    /// Publisher-facing host used for rewritten URLs.
+    pub request_host: String,
+    /// Publisher-facing scheme used for rewritten URLs.
+    pub request_scheme: String,
+    /// Origin host whose URLs may be rewritten.
+    pub origin_host: String,
+    /// Request-local state shared with the document's integration rewriters.
+    pub document_state: IntegrationDocumentState,
+}
+
+/// Creates one mutable HTML output processor for each document.
+pub trait IntegrationHtmlStreamProcessorFactory: Send + Sync {
+    /// Identifier for logging and diagnostics.
     fn integration_id(&self) -> &'static str;
 
-    /// Fast preflight check to decide whether post-processing should run for this document.
-    ///
-    /// Implementations should keep this cheap (e.g., a substring check) because it may run on
-    /// every HTML response when the integration is enabled.
-    fn should_process(&self, html: &str, ctx: &IntegrationHtmlContext<'_>) -> bool {
-        let _ = (html, ctx);
+    /// Declare optional asynchronous EOF capability before cache admission.
+    fn requires_async_finish(&self) -> bool {
         false
     }
 
-    /// Post-process complete HTML content.
-    /// This is called after streaming HTML processing with the complete HTML.
-    /// Implementations should mutate `html` in-place and return `true` when changes were made.
-    fn post_process(&self, html: &mut String, ctx: &IntegrationHtmlContext<'_>) -> bool;
+    /// Declare that core must retain this stage's synchronous output until EOF.
+    ///
+    /// Requires asynchronous completion and explicit operator permission.
+    fn buffer_output_until_eof(&self) -> bool {
+        false
+    }
+
+    /// Create a request-local streaming processor.
+    fn create(&self, context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor>;
 }
 
 /// Trait for integration-provided HTML head injections.
@@ -592,7 +616,7 @@ pub struct IntegrationRegistration {
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
-    pub html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
+    pub html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
 }
@@ -618,7 +642,7 @@ impl IntegrationRegistrationBuilder {
                 proxies: Vec::new(),
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
-                html_post_processors: Vec::new(),
+                html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
             },
@@ -647,11 +671,11 @@ impl IntegrationRegistrationBuilder {
     }
 
     #[must_use]
-    pub fn with_html_post_processor(
+    pub fn with_html_stream_processor(
         mut self,
-        processor: Arc<dyn IntegrationHtmlPostProcessor>,
+        processor: Arc<dyn IntegrationHtmlStreamProcessorFactory>,
     ) -> Self {
-        self.registration.html_post_processors.push(processor);
+        self.registration.html_stream_processors.push(processor);
         self
     }
 
@@ -708,7 +732,7 @@ struct IntegrationRegistryInner {
     disabled_js_ids: Vec<&'static str>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
-    html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
+    html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
 }
@@ -729,7 +753,7 @@ impl Default for IntegrationRegistryInner {
             disabled_js_ids: Vec::new(),
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
-            html_post_processors: Vec::new(),
+            html_stream_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
         }
@@ -886,8 +910,8 @@ impl IntegrationRegistry {
                 .extend(registration.attribute_rewriters);
             inner.script_rewriters.extend(registration.script_rewriters);
             inner
-                .html_post_processors
-                .extend(registration.html_post_processors);
+                .html_stream_processors
+                .extend(registration.html_stream_processors);
             inner.head_injectors.extend(registration.head_injectors);
             inner.request_filters.extend(registration.request_filters);
             if registration.js_disabled {
@@ -897,10 +921,12 @@ impl IntegrationRegistry {
             }
         }
 
-        Ok(Self {
+        let registry = Self {
             inner: Arc::new(inner),
             plan: Some(plan),
-        })
+        };
+        registry.ensure_async_html_finish_allowed(settings)?;
+        Ok(registry)
     }
 
     /// Return whether this registry and another consumer share the same plan allocation.
@@ -1069,19 +1095,67 @@ impl IntegrationRegistry {
         self.inner.script_rewriters.clone()
     }
 
-    /// Check whether any HTML post-processors are registered.
-    ///
-    /// Cheaper than [`html_post_processors()`](Self::html_post_processors) when
-    /// only the presence check is needed — avoids cloning `Vec<Arc<…>>`.
+    /// Expose registered per-document HTML stream processor factories.
     #[must_use]
-    pub fn has_html_post_processors(&self) -> bool {
-        !self.inner.html_post_processors.is_empty()
+    pub fn html_stream_processor_factories(
+        &self,
+    ) -> Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>> {
+        self.inner.html_stream_processors.clone()
     }
 
-    /// Expose registered HTML post-processors.
+    /// Report async EOF capability before any processed-template lookup.
     #[must_use]
-    pub fn html_post_processors(&self) -> Vec<Arc<dyn IntegrationHtmlPostProcessor>> {
-        self.inner.html_post_processors.clone()
+    pub fn has_async_html_finish(&self) -> bool {
+        self.inner
+            .html_stream_processors
+            .iter()
+            .any(|factory| factory.requires_async_finish())
+    }
+
+    /// Validate operator permission and factory retention declarations.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error for missing permission or inconsistent
+    /// factory metadata. Requested integration work is never silently omitted.
+    pub fn ensure_async_html_finish_allowed(
+        &self,
+        settings: &Settings,
+    ) -> Result<(), Report<TrustedServerError>> {
+        for factory in &self.inner.html_stream_processors {
+            if factory.buffer_output_until_eof() && !factory.requires_async_finish() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "Integration {} declares EOF buffering without async completion",
+                        factory.integration_id()
+                    ),
+                }));
+            }
+            if factory.requires_async_finish() && !settings.publisher.allow_async_html_finish {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "Integration {} requires publisher.allow_async_html_finish = true; EOF I/O can delay HTML delivery",
+                        factory.integration_id()
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Construct an isolated ordered processor registry for fixture controls.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn from_html_stream_processors(
+        factories: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(IntegrationRegistryInner {
+                html_stream_processors: factories,
+                ..Default::default()
+            }),
+            plan: None,
+        }
     }
 
     /// Collect HTML snippets for insertion at the start of `<head>`.
@@ -1254,7 +1328,7 @@ impl IntegrationRegistry {
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
-                html_post_processors: Vec::new(),
+                html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -1284,7 +1358,7 @@ impl IntegrationRegistry {
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
-                html_post_processors: Vec::new(),
+                html_stream_processors: Vec::new(),
                 head_injectors,
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -1310,7 +1384,7 @@ impl IntegrationRegistry {
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
-                html_post_processors: Vec::new(),
+                html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters,
                 deferred_js_ids: Vec::new(),
@@ -1376,7 +1450,7 @@ impl IntegrationRegistry {
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
-                html_post_processors: Vec::new(),
+                html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -1393,6 +1467,113 @@ mod tests {
     use crate::constants::COOKIE_TS_EC;
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn async_eof_requires_explicit_operator_permission() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        assert!(
+            !settings.publisher.allow_async_html_finish,
+            "should default to no EOF I/O permission"
+        );
+        settings
+            .integrations
+            .insert_config(
+                "html_finalization_fixture",
+                &serde_json::json!({
+                    "enabled": true,
+                    "lookup_url": "https://lookup.example.com/approve",
+                    "transport_timeout_ms": 1000,
+                }),
+            )
+            .expect("should configure the fictional EOF integration");
+        let error = IntegrationRegistry::new(&settings)
+            .err()
+            .expect("should reject enabled EOF I/O without operator permission");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("allow_async_html_finish"),
+            "should name the required setting"
+        );
+        assert!(
+            message.contains("html_finalization_fixture"),
+            "should identify the enabled integration"
+        );
+        settings.publisher.allow_async_html_finish = true;
+        let registry = IntegrationRegistry::new(&settings)
+            .expect("should register EOF I/O after explicit permission");
+        assert!(
+            registry.has_async_html_finish(),
+            "should expose capability before body processing"
+        );
+    }
+
+    #[test]
+    fn async_eof_permission_alone_adds_no_processing_path() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.publisher.allow_async_html_finish = true;
+        let registry = IntegrationRegistry::new(&settings).expect("should build ordinary registry");
+        assert!(
+            !registry.has_async_html_finish(),
+            "should retain the normal path without EOF factories"
+        );
+    }
+
+    struct RetentionWithoutAsyncFactory;
+
+    impl IntegrationHtmlStreamProcessorFactory for RetentionWithoutAsyncFactory {
+        fn integration_id(&self) -> &'static str {
+            "example_inconsistent_retention"
+        }
+        fn buffer_output_until_eof(&self) -> bool {
+            true
+        }
+        fn create(
+            &self,
+            _: IntegrationHtmlStreamContext,
+        ) -> Box<dyn crate::streaming_processor::StreamProcessor> {
+            Box::new(crate::streaming_replacer::StreamingReplacer::new(Vec::new()))
+        }
+    }
+
+    #[test]
+    fn async_eof_rejects_retention_without_async_capability() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.publisher.allow_async_html_finish = true;
+        let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+            RetentionWithoutAsyncFactory,
+        )]);
+        let error = registry
+            .ensure_async_html_finish_allowed(&settings)
+            .expect_err("should reject retention without declared EOF capability");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example_inconsistent_retention"),
+            "should identify the invalid factory"
+        );
+        assert!(
+            message.contains("buffering without async completion"),
+            "should explain the invalid metadata even with permission"
+        );
+    }
+
+    #[test]
+    fn html_finalizers_are_empty_by_default() {
+        let registry = IntegrationRegistry::from_request_filters(Vec::new());
+        assert!(
+            !registry.has_async_html_finish(),
+            "should retain the ordinary streaming path"
+        );
+        assert!(
+            registry.html_stream_processor_factories().is_empty(),
+            "should register no default finalizers"
+        );
+        let registration = IntegrationRegistration::builder("example_finalizer").build();
+        assert!(
+            registration.html_stream_processors.is_empty(),
+            "should make finalization opt-in"
+        );
+    }
 
     struct DefaultMetadataHeadInjector;
 
@@ -1512,18 +1693,6 @@ mod tests {
         }
     }
 
-    struct NoopHtmlPostProcessor;
-
-    impl IntegrationHtmlPostProcessor for NoopHtmlPostProcessor {
-        fn integration_id(&self) -> &'static str {
-            "noop"
-        }
-
-        fn post_process(&self, _html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
-            false
-        }
-    }
-
     struct EchoProxy;
 
     #[async_trait(?Send)]
@@ -1582,20 +1751,73 @@ mod tests {
         );
     }
 
-    #[test]
-    fn default_html_post_processor_should_process_is_false() {
-        let processor = NoopHtmlPostProcessor;
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "proxy.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-            document_state: &document_state,
-        };
+    struct CountingStreamFactory(&'static str);
 
-        assert!(
-            !processor.should_process("<html></html>", &ctx),
-            "Default `should_process` should be false to avoid running post-processing unexpectedly"
+    impl IntegrationHtmlStreamProcessorFactory for CountingStreamFactory {
+        fn integration_id(&self) -> &'static str {
+            self.0
+        }
+
+        fn create(&self, _context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
+            struct CountingStreamProcessor(usize);
+
+            impl StreamProcessor for CountingStreamProcessor {
+                fn process_chunk(
+                    &mut self,
+                    chunk: &[u8],
+                    _is_last: bool,
+                ) -> std::io::Result<Vec<u8>> {
+                    self.0 += 1;
+                    let mut output = self.0.to_string().into_bytes();
+                    output.extend_from_slice(chunk);
+                    Ok(output)
+                }
+            }
+
+            Box::new(CountingStreamProcessor(0))
+        }
+    }
+
+    #[test]
+    fn html_stream_factories_preserve_order_and_create_isolated_sessions() {
+        let registration = IntegrationRegistration::builder("test")
+            .with_html_stream_processor(Arc::new(CountingStreamFactory("first")))
+            .with_html_stream_processor(Arc::new(CountingStreamFactory("second")))
+            .build();
+        let identifiers: Vec<_> = registration
+            .html_stream_processors
+            .iter()
+            .map(|factory| factory.integration_id())
+            .collect();
+        assert_eq!(
+            identifiers,
+            ["first", "second"],
+            "should preserve factory registration order",
+        );
+
+        let context = IntegrationHtmlStreamContext {
+            request_host: "proxy.example.com".to_owned(),
+            request_scheme: "https".to_owned(),
+            origin_host: "origin.example.com".to_owned(),
+            document_state: IntegrationDocumentState::default(),
+        };
+        let factory = &registration.html_stream_processors[0];
+        let mut first = factory.create(context.clone());
+        let mut second = factory.create(context);
+
+        assert_eq!(
+            first
+                .process_chunk(b"a", false)
+                .expect("should process first session"),
+            b"1a",
+            "should initialize the first session counter",
+        );
+        assert_eq!(
+            second
+                .process_chunk(b"b", true)
+                .expect("should process second session"),
+            b"1b",
+            "should initialize an independent second session counter",
         );
     }
 

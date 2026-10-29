@@ -234,6 +234,32 @@ Failures are deduplicated and retain first-observed order. Detailed URLs, cache 
 payloads, markup, and error objects remain only in existing operational logging and do
 not enter diagnostics.
 
+### APS render failures
+
+An APS bid that wins targeting is served as a 1x1 universal creative that resizes
+itself only once the creative draws, so Ad Manager reports a non-empty render whether
+or not anything was drawn. These categories name the guard that stopped the render, so
+a blank slot is distinguishable from a delivered one.
+
+They are relayed diagnostics rather than bridge failures: the sandboxed renderer
+document or the Universal Creative source observes the failure and reports it, the
+reason is validated against a fixed allowlist, and the sender is authenticated against
+the slot the capability was served to. A reason never carries creative or descriptor
+content.
+
+| Failure                      | Observed by               | Meaning                                                                                                                                                                                                       |
+| ---------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `aps_bad_hash`               | Renderer document         | The frame loaded without a usable nonce fragment, so no descriptor was accepted.                                                                                                                              |
+| `aps_nonce_mismatch`         | Renderer document         | A descriptor arrived bearing a nonce other than the one the frame was opened with.                                                                                                                            |
+| `aps_descriptor_keys`        | Renderer document         | The descriptor's key set did not match either accepted shape.                                                                                                                                                 |
+| `aps_descriptor_fields`      | Renderer document         | A descriptor field was absent, the wrong type, or over its size limit.                                                                                                                                        |
+| `aps_descriptor_envelope`    | Renderer document         | The encoded bid envelope failed to decode or disagreed with the descriptor.                                                                                                                                   |
+| `aps_runner_script_error`    | Renderer document         | Amazon's `prebid-creative.js` failed to load, so the creative was never rendered.                                                                                                                             |
+| `aps_frame_timeout`          | Universal Creative source | The renderer frame never acknowledged within its timeout. A missing or erroring renderer route also surfaces here, because an iframe does not raise a load error for an HTTP status.                          |
+| `aps_frame_load_error`       | Universal Creative source | The renderer frame raised a load error. Rare; see the timeout row.                                                                                                                                            |
+| `aps_frame_reported_failure` | Universal Creative source | The frame reported a failure without naming a category.                                                                                                                                                       |
+| `aps_unknown`                | Universal Creative source | The frame reported an empty reason. A reason the top window does not recognize, which can happen when the renderer document and the script bundle are on different versions, is dropped rather than recorded. |
+
 ### Source-neutral GAM facts
 
 `slotRenderEnded` may expose line item, order, advertiser, creative, yield-group, and
@@ -491,6 +517,32 @@ trigger GPT or Prebid work, gate an auction, or delay delivery.
 GPT was not observed after listener installation. Confirm GPT initializes and
 executes queued `googletag.cmd` callbacks. Diagnostics do not create GPT, poll for it,
 or patch publisher request behavior.
+
+### Initial Trusted Server rendering remains pending
+
+Initial-render ownership has no five-second timeout that permits competing delivery.
+A Trusted Server claim protects its initial render until `slotRenderEnded` or the
+claim's element/navigation lifetime ends. A missing render event therefore keeps
+competing delivery suppressed; elapsed time alone does not release ownership.
+
+After five seconds, a still-current pending claim records one historical
+`pendingRenderDiagnostic` snapshot with `phase` and `ageMs`. Inspect it in browser
+DevTools, using the slot's DOM ID:
+
+```js
+window.tsjs?.firstImpression?.slots['example-slot']?.pendingRenderDiagnostic
+```
+
+Enable `window.tsjs.log.setLevel('debug')` before the check to also see
+`[tsjs-gpt] initial render remains pending`. The snapshot is recorded even when
+logging is disabled or unavailable. It indicates delayed rendering, not a confirmed
+failure, and does not unlock the slot. It remains historical if rendering later
+finishes. A slot deferred by GPT lazy loading (`enableLazyLoad()`) can routinely
+record this snapshot while waiting to approach the viewport.
+
+This initial-render diagnostic is available through debug logging and inspectable
+runtime state only. It is not shown in the GPT diagnostics panel or its JSON export,
+and does not require activation of that panel.
 
 ### Initial callbacks are missing
 

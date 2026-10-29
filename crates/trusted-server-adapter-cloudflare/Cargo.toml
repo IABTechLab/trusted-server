@@ -17,12 +17,15 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
+# Opt-in local runtime fixture and its diagnostic console sink.
+test-utils = ["trusted-server-core/test-utils"]
 # Keep for explicit `cargo check --features cloudflare --target wasm32-unknown-unknown`
 cloudflare = ["edgezero-adapter-cloudflare/cloudflare", "dep:worker"]
 
 [dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }
+derive_more = { workspace = true }
 edgezero-adapter-cloudflare = { workspace = true }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
@@ -30,7 +33,6 @@ futures = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { workspace = true }
-trusted-server-js = { workspace = true }
 worker = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -39,6 +41,8 @@ js-sys = { workspace = true }
 worker = { workspace = true }
 
 [dev-dependencies]
+trusted-server-core = { workspace = true, features = ["test-utils"] }
 base64 = { workspace = true }
 edgezero-core = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

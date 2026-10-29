@@ -37,6 +37,8 @@ use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 #[cfg(test)]
 const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
+    #[cfg(feature = "test-utils")]
+    crate::test_support::async_html_finalization::ID,
     "prebid",
     "aps",
     "adserver_mock",
@@ -109,7 +111,9 @@ impl<'de> Deserialize<'de> for TrustedServerAppConfig {
         D: Deserializer<'de>,
     {
         let mut settings = Settings::deserialize(deserializer)?;
-        settings.normalize_deserialized();
+        settings
+            .normalize_deserialized()
+            .map_err(serde::de::Error::custom)?;
         Ok(Self { settings })
     }
 }
@@ -306,6 +310,11 @@ fn validate_enabled_integrations(
     validate_prebid(settings, plan)?;
     validate_integration::<ApsConfig>(settings, "aps")?;
     validate_integration::<AdServerMockConfig>(settings, "adserver_mock")?;
+    #[cfg(feature = "test-utils")]
+    validate_integration::<crate::test_support::async_html_finalization::FixtureConfig>(
+        settings,
+        crate::test_support::async_html_finalization::ID,
+    )?;
     validate_integration::<TestlightConfig>(settings, "testlight")?;
     validate_integration::<NextJsIntegrationConfig>(settings, "nextjs")?;
     validate_integration::<PermutiveConfig>(settings, "permutive")?;
@@ -520,6 +529,7 @@ mod tests {
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
+    use edgezero_core::blob_envelope::BlobEnvelope;
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -574,6 +584,70 @@ formats = [{ width = 300, height = 250 }]
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
         settings
+    }
+
+    #[test]
+    fn settings_collections_produce_stable_envelope_hashes_across_parses() {
+        let mut source = serde_json::to_value(valid_settings()).expect("should serialize settings");
+        source["response_headers"] = serde_json::json!({"x-example-b": "b", "x-example-a": "a"});
+        source["image_optimizer"] = serde_json::json!({"profile_sets": {
+            "secondary": {"profiles": {"default": "width=200", "small": "width=100"}},
+            "primary": {"profiles": {"default": "width=400", "small": "width=200"}}
+        }});
+        source["auction"]["allowed_context_keys"] = serde_json::json!([
+            "zeta", "alpha", "gamma", "beta", "epsilon", "delta", "alpha"
+        ]);
+        source["auction"]["providers"] = serde_json::json!({
+            "secondary": {
+                "protocol": "openrtb-2.6", "endpoint": "https://secondary.example.com/auction",
+                "notifications": {"suppress_seats": ["seat-b", "seat-a"]},
+                "profile_config": {"second": 2, "first": 1}
+            },
+            "primary": {
+                "protocol": "openrtb-2.6", "endpoint": "https://primary.example.com/auction",
+                "notifications": {"suppress_seats": ["seat-b", "seat-a"]},
+                "profile_config": {"second": 2, "first": 1}
+            }
+        });
+        source["auction"]["bidders"] = serde_json::json!({
+            "bidder-b": {"provider": "secondary"}, "bidder-a": {"provider": "primary"}
+        });
+        source["creative_opportunities"] = serde_json::json!({
+            "gam_network_id": "99999",
+            "slot": [{
+                "id": "example-slot", "page_patterns": ["/*"],
+                "formats": [{"width": 300, "height": 250}],
+                "targeting": {"section": "example", "category": "news"},
+                "providers": {"prebid": {"bidders": {
+                    "bidder-b": {"placement": "b", "account": "example"},
+                    "bidder-a": {"placement": "a", "account": "example"}
+                }}}
+            }]
+        });
+        // The base fixture also has two integrations with multiple config entries.
+        // Exercise fresh hash seeds on every parse, including nested maps.
+        let parse = || {
+            serde_json::from_value::<TrustedServerAppConfig>(source.clone())
+                .expect("should parse collection-rich settings")
+        };
+        let serialize = |config: &TrustedServerAppConfig| {
+            serde_json::to_value(config).expect("should serialize typed config")
+        };
+        let first = serialize(&parse());
+        let expected_sha = BlobEnvelope::new(first, "2026-01-01T00:00:00Z".to_owned()).sha256;
+        for _ in 0..32 {
+            let value = serialize(&parse());
+            assert_eq!(
+                value["auction"]["allowed_context_keys"],
+                serde_json::json!(["alpha", "beta", "delta", "epsilon", "gamma", "zeta"]),
+                "should sort and deduplicate allowlist keys"
+            );
+            assert_eq!(
+                BlobEnvelope::new(value, "2026-01-01T00:00:00Z".to_owned()).sha256,
+                expected_sha,
+                "should produce one envelope hash for equal settings"
+            );
+        }
     }
 
     fn insert_aps_provider(settings: &mut Settings, account_id: &str) {
@@ -719,38 +793,6 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
-    fn wrapper_omits_disabled_ssat_compression_offload_for_legacy_compatibility() {
-        let mut settings = valid_settings();
-        settings.publisher.ssat_compression_offload_enabled = false;
-        let app_config =
-            TrustedServerAppConfig::new(settings).expect("should build disabled app config");
-        let value =
-            serde_json::to_value(&app_config).expect("should serialize disabled app config");
-        let publisher = value
-            .get("publisher")
-            .and_then(serde_json::Value::as_object)
-            .expect("should serialize publisher settings");
-
-        assert!(
-            !publisher.contains_key("ssat_compression_offload_enabled"),
-            "disabled setting must be omitted so older runtimes can load the config"
-        );
-
-        let mut settings = valid_settings();
-        settings.publisher.ssat_compression_offload_enabled = true;
-        let app_config =
-            TrustedServerAppConfig::new(settings).expect("should build enabled app config");
-        let value = serde_json::to_value(&app_config).expect("should serialize enabled app config");
-        assert_eq!(
-            value
-                .get("publisher")
-                .and_then(|publisher| publisher.get("ssat_compression_offload_enabled")),
-            Some(&serde_json::Value::Bool(true)),
-            "enabled setting must remain present in the published config"
-        );
-    }
-
-    #[test]
     fn wrapper_deserializes_from_settings_shape() {
         let toml = crate_test_settings_str();
         let app_config: TrustedServerAppConfig =
@@ -760,6 +802,79 @@ formats = [{ width = 300, height = 250 }]
             app_config.settings().publisher.domain,
             "test-publisher.com",
             "should load publisher settings"
+        );
+    }
+
+    #[test]
+    fn app_config_image_optimizer_rejects_trimmed_key_collisions() {
+        for (section, first, second) in [
+            (
+                r#"
+                [image_optimizer.profile_sets.default_images]
+                default_profile = "medium"
+                [image_optimizer.profile_sets.default_images.profiles]
+                medium = "width=100"
+                " medium" = "width=200"
+                "#,
+                "medium",
+                " medium",
+            ),
+            (
+                r#"
+                [image_optimizer.profile_sets.default_images.profiles]
+                default = "width=100"
+                [image_optimizer.profile_sets." default_images".profiles]
+                default = "width=200"
+                "#,
+                "default_images",
+                " default_images",
+            ),
+        ] {
+            let toml = crate_test_settings_str() + section;
+            let raw: Settings =
+                toml::from_str(&toml).expect("should deserialize unnormalized settings");
+            let value = serde_json::to_value(raw).expect("should serialize unnormalized settings");
+            let toml_error = toml::from_str::<TrustedServerAppConfig>(&toml)
+                .expect_err("should reject colliding app-config keys");
+            let json_error = serde_json::from_value::<TrustedServerAppConfig>(value)
+                .expect_err("should reject colliding app-config keys");
+
+            for message in [toml_error.to_string(), json_error.to_string()] {
+                for expected in [
+                    "image_optimizer.profile_sets",
+                    "default_images",
+                    "collide after trimming",
+                    &format!("{first:?}"),
+                    &format!("{second:?}"),
+                ] {
+                    assert!(
+                        message.contains(expected),
+                        "should preserve collision context with {expected:?}: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn app_config_image_optimizer_normalizes_non_colliding_keys() {
+        let toml = crate_test_settings_str()
+            + r#"
+            [image_optimizer.profile_sets." default_images "]
+            default_profile = " medium "
+            [image_optimizer.profile_sets." default_images ".profiles]
+            " medium " = " width=100 "
+            "#;
+        let app_config: TrustedServerAppConfig =
+            toml::from_str(&toml).expect("should deserialize non-colliding app config");
+        let profile_set = &app_config.settings().image_optimizer.profile_sets["default_images"];
+        assert_eq!(
+            profile_set.default_profile, "medium",
+            "should trim the default profile reference"
+        );
+        assert_eq!(
+            profile_set.profiles["medium"], "width=100",
+            "should trim profile keys and values"
         );
     }
 
@@ -886,7 +1001,9 @@ formats = [{ width = 300, height = 250 }]
         }));
         settings.proxy.asset_routes.push(route);
 
-        settings.normalize_deserialized();
+        settings
+            .normalize_deserialized()
+            .expect("should normalize settings without key collisions");
         let serialized = serde_json::to_string(&settings).expect("should serialize settings");
 
         for legacy_store in [
@@ -1307,7 +1424,9 @@ password = "production-admin-password-32-bytes"
                 "prebid",
                 &serde_json::json!({
                     "enabled": true,
-                    "bundle": { "adapters": ["exampleBidder"] }
+                    "bundle": {
+                        "modules": { "bidder": ["exampleBidderBidAdapter"] }
+                    }
                 }),
             )
             .expect("should insert enabled Prebid config");

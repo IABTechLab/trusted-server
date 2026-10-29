@@ -7,7 +7,7 @@
 #
 # Prerequisites:
 #   - Docker running
-#   - Viceroy installed: cargo install viceroy --version 0.17.0 --locked --force
+#   - Viceroy installed: cargo install viceroy --version 0.21.0 --locked --force
 #   - wasm32-wasip1 target: rustup target add wasm32-wasip1
 #   - Node.js with npx available
 #
@@ -61,7 +61,7 @@ echo "==> Building TSJS browser fixtures..."
 cd "$REPO_ROOT/$TSJS_LIB_DIR"
 npm ci
 npm run build
-npm run build:prebid-external
+npm run build:prebid-external -- --modules-json '{"bidder":["rubiconBidAdapter"]}'
 cd "$REPO_ROOT/$BROWSER_DIR"
 
 # --- Export env vars for global-setup.ts ---

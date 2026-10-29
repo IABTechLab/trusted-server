@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import envelope from '../../fixtures/aps-renderer-v1.json';
 import type { ApsRendererV1 } from '../../../src/core/types';
+import { GPT_DIAGNOSTICS_CREATIVE_FAILURES } from '../../../src/core/types';
 import { log } from '../../../src/core/log';
 import {
   APS_NATIVE_RENDERER_TIMEOUT_MS,
@@ -9,8 +10,10 @@ import {
   APS_RENDERER_PATH,
   APS_RENDERER_SANDBOX,
   APS_RENDERING_MODE_ATTRIBUTE_NAME,
+  APS_RENDER_FAILED_MESSAGE,
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  apsRenderFailureReason,
   apsRendererUrl,
   dispatchApsRendering as dispatchDefaultApsRendering,
   getApsPrebidRenderer,
@@ -465,6 +468,57 @@ describe('publisher-native APS runner contract tests', () => {
     expect(document.querySelectorAll('#div-header > iframe')).toHaveLength(1);
   });
 
+  it('renders in an authenticated outer container when GPT owns the container', async () => {
+    document.body.innerHTML =
+      '<div id="fictional-slot-container">' +
+      '<div id="fictional-slot"><span>existing</span></div>' +
+      '<iframe id="publisher-creative"></iframe>' +
+      '</div>';
+    const outer = document.getElementById('fictional-slot-container')!;
+    const source = document.getElementById('publisher-creative') as HTMLIFrameElement;
+
+    const accepted = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      source: source.contentWindow,
+      trustedServer: () => true,
+    });
+    const frame = outer.querySelector<HTMLIFrameElement>('iframe[title="Ad content"]');
+    expect(frame).not.toBeNull();
+    nativeRunnerState(frame!).runner.dispatchEvent(new Event('load'));
+
+    await expect(accepted).resolves.toBe(true);
+    expect(outer.children).toHaveLength(1);
+    expect(outer.firstElementChild).toBe(frame);
+  });
+
+  it('renders a dynamic slot prefix in its authenticated outer container', async () => {
+    document.body.innerHTML =
+      '<div id="div-responsive-wide-container">' +
+      '<div id="div-responsive-wide"><span>existing</span></div>' +
+      '<iframe id="publisher-creative"></iframe>' +
+      '</div>';
+    window.tsjs = {
+      adSlots: [{ id: 'responsive-slot', div_id: 'div-responsive-' }],
+    } as typeof window.tsjs;
+    const outer = document.getElementById('div-responsive-wide-container')!;
+    const source = document.getElementById('publisher-creative') as HTMLIFrameElement;
+
+    const accepted = dispatchApsRendering({
+      slotId: 'responsive-slot',
+      renderer: descriptor(),
+      source: source.contentWindow,
+      trustedServer: () => true,
+    });
+    const frame = outer.querySelector<HTMLIFrameElement>('iframe[title="Ad content"]');
+    expect(frame).not.toBeNull();
+    nativeRunnerState(frame!).runner.dispatchEvent(new Event('load'));
+
+    await expect(accepted).resolves.toBe(true);
+    expect(outer.children).toHaveLength(1);
+    expect(outer.firstElementChild).toBe(frame);
+  });
+
   it('uses the requesting frame to resolve a dynamic slot prefix', async () => {
     document.body.innerHTML =
       '<div id="div-header-first"><iframe></iframe></div>' +
@@ -673,6 +727,87 @@ describe('direct APS rendering', () => {
     expect(document.querySelector('#fictional-slot iframe')).toBeNull();
   });
 
+  it('tears down the frame when the renderer document reports a failure reason', () => {
+    expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
+    const iframe = document.querySelector('#fictional-slot iframe') as HTMLIFrameElement;
+    const postMessage = vi.spyOn(iframe.contentWindow!, 'postMessage');
+    iframe.dispatchEvent(new Event('load'));
+    const sent = postMessage.mock.calls[0][0] as { nonce: string };
+
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: {
+          message: 'trusted-server/aps/renderer-failed',
+          nonce: sent.nonce,
+          reason: 'descriptor_envelope',
+        },
+        source: iframe.contentWindow,
+      })
+    );
+
+    expect(document.querySelector('#fictional-slot iframe')).toBeNull();
+    expect(document.querySelector('#fictional-slot span')).not.toBeNull();
+  });
+
+  it('tears down the frame on a bad-hash report that carries no nonce to echo', () => {
+    expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
+    const iframe = document.querySelector('#fictional-slot iframe') as HTMLIFrameElement;
+    iframe.dispatchEvent(new Event('load'));
+
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: {
+          message: 'trusted-server/aps/renderer-failed',
+          nonce: undefined,
+          reason: 'bad_hash',
+        },
+        source: iframe.contentWindow,
+      })
+    );
+
+    expect(document.querySelector('#fictional-slot iframe')).toBeNull();
+  });
+
+  it('ignores a failure report bearing a foreign nonce', () => {
+    expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
+    const iframe = document.querySelector('#fictional-slot iframe') as HTMLIFrameElement;
+    iframe.dispatchEvent(new Event('load'));
+
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: {
+          message: 'trusted-server/aps/renderer-failed',
+          nonce: 'a-foreign-nonce',
+          reason: 'bad_hash',
+        },
+        source: iframe.contentWindow,
+      })
+    );
+
+    expect(document.querySelector('#fictional-slot iframe')).not.toBeNull();
+  });
+
+  it('still rejects a ready message carrying an unexpected extra key', () => {
+    expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
+    const iframe = document.querySelector('#fictional-slot iframe') as HTMLIFrameElement;
+    const postMessage = vi.spyOn(iframe.contentWindow!, 'postMessage');
+    iframe.dispatchEvent(new Event('load'));
+    const sent = postMessage.mock.calls[0][0] as { nonce: string };
+
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: {
+          message: 'trusted-server/aps/renderer-ready',
+          nonce: sent.nonce,
+          reason: 'unexpected',
+        },
+        source: iframe.contentWindow,
+      })
+    );
+
+    expect(iframe.style.display).toBe('none');
+  });
+
   it('removes an unacknowledged frame without clearing publisher content', () => {
     vi.useFakeTimers();
     try {
@@ -799,6 +934,216 @@ describe('Universal Creative APS source', () => {
       );
       await expect(rendered).resolves.toBeUndefined();
     } finally {
+      delete dynamicWindow.render;
+      document.body.innerHTML = '';
+    }
+  });
+});
+
+describe('APS render failure reason allowlist', () => {
+  it('maps every reason the renderer frame and creative source can emit', () => {
+    expect(apsRenderFailureReason('bad_hash')).toBe('aps_bad_hash');
+    expect(apsRenderFailureReason('nonce_mismatch')).toBe('aps_nonce_mismatch');
+    expect(apsRenderFailureReason('descriptor_keys')).toBe('aps_descriptor_keys');
+    expect(apsRenderFailureReason('descriptor_fields')).toBe('aps_descriptor_fields');
+    expect(apsRenderFailureReason('descriptor_envelope')).toBe('aps_descriptor_envelope');
+    expect(apsRenderFailureReason('amazon_script_error')).toBe('aps_runner_script_error');
+    expect(apsRenderFailureReason('frame_timeout')).toBe('aps_frame_timeout');
+    expect(apsRenderFailureReason('frame_load_error')).toBe('aps_frame_load_error');
+    expect(apsRenderFailureReason('frame_reported_failure')).toBe('aps_frame_reported_failure');
+    expect(apsRenderFailureReason('unknown')).toBe('aps_unknown');
+  });
+
+  it('resolves every mapped reason to a category the diagnostics store accepts', () => {
+    for (const wire of [
+      'bad_hash',
+      'nonce_mismatch',
+      'descriptor_keys',
+      'descriptor_fields',
+      'descriptor_envelope',
+      'amazon_script_error',
+      'frame_timeout',
+      'frame_load_error',
+      'frame_reported_failure',
+      'unknown',
+    ]) {
+      const reason = apsRenderFailureReason(wire);
+      expect(GPT_DIAGNOSTICS_CREATIVE_FAILURES).toContain(reason);
+    }
+  });
+
+  it('rejects unlisted, inherited, and non-string reasons from the cross-origin frame', () => {
+    expect(apsRenderFailureReason('not_a_real_reason')).toBeUndefined();
+    expect(apsRenderFailureReason('__proto__')).toBeUndefined();
+    expect(apsRenderFailureReason('constructor')).toBeUndefined();
+    expect(apsRenderFailureReason('toString')).toBeUndefined();
+    expect(apsRenderFailureReason('hasOwnProperty')).toBeUndefined();
+    expect(apsRenderFailureReason(42)).toBeUndefined();
+    expect(apsRenderFailureReason(undefined)).toBeUndefined();
+    expect(apsRenderFailureReason(null)).toBeUndefined();
+    expect(apsRenderFailureReason({ toString: () => 'frame_timeout' })).toBeUndefined();
+  });
+});
+
+describe('Universal Creative APS failure relay', () => {
+  /**
+   * Stand-in for the `sendMessage` helper Universal Creative passes to
+   * `render`. It mirrors the real one: the body is JSON, the helper stamps its
+   * own `adId`, and the payload is applied last so a caller can override both.
+   */
+  function pucHelper(adId: string): { sendMessage: (type: string, payload: object) => void } {
+    return {
+      sendMessage: (type, payload) =>
+        window.postMessage(JSON.stringify({ message: type, adId, ...payload }), '*'),
+    };
+  }
+
+  function captureRelays(): {
+    relayed: Array<Record<string, unknown>>;
+    stop: () => void;
+  } {
+    const relayed: Array<Record<string, unknown>> = [];
+    const capture = (event: MessageEvent): void => {
+      const data =
+        typeof event.data === 'string'
+          ? (JSON.parse(event.data) as Record<string, unknown>)
+          : (event.data as Record<string, unknown>);
+      if (data && data['message'] === APS_RENDER_FAILED_MESSAGE) relayed.push(data);
+    };
+    window.addEventListener('message', capture);
+    return { relayed, stop: () => window.removeEventListener('message', capture) };
+  }
+
+  it('relays the frame failure reason through the creative window helper', async () => {
+    const dynamicWindow = window as unknown as {
+      render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
+    };
+    const { relayed, stop } = captureRelays();
+    window.eval(APS_UNIVERSAL_CREATIVE_RENDERER);
+
+    try {
+      const rendered = dynamicWindow.render!(
+        { apsRenderer: descriptor(), rendererUrl: apsRendererUrl() },
+        pucHelper('example-ad-id'),
+        window
+      );
+      const iframe = document.body.querySelector('iframe')!;
+      const postMessage = vi.spyOn(iframe.contentWindow!, 'postMessage');
+      iframe.dispatchEvent(new Event('load'));
+      const sent = postMessage.mock.calls[0][0] as { nonce: string };
+
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: {
+            message: 'trusted-server/aps/renderer-failed',
+            nonce: sent.nonce,
+            reason: 'descriptor_envelope',
+          },
+          source: iframe.contentWindow,
+        })
+      );
+
+      await expect(rendered).rejects.toThrow();
+      // `postMessage` is delivered on a later task than the rejection microtask.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(relayed).toEqual([
+        {
+          message: APS_RENDER_FAILED_MESSAGE,
+          adId: 'example-ad-id',
+          reason: 'descriptor_envelope',
+        },
+      ]);
+    } finally {
+      stop();
+      delete dynamicWindow.render;
+      document.body.innerHTML = '';
+    }
+  });
+
+  it('reports a frame timeout when the renderer frame never acknowledges', async () => {
+    const dynamicWindow = window as unknown as {
+      render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
+    };
+    const { relayed, stop } = captureRelays();
+    vi.useFakeTimers();
+    window.eval(APS_UNIVERSAL_CREATIVE_RENDERER);
+
+    try {
+      const rendered = dynamicWindow.render!(
+        { apsRenderer: descriptor(), rendererUrl: apsRendererUrl() },
+        pucHelper('timeout-ad-id'),
+        window
+      );
+      rendered.catch(() => {});
+      document.body.querySelector('iframe')!.dispatchEvent(new Event('load'));
+
+      // Async advance so the queued `postMessage` dispatch task also runs.
+      await vi.advanceTimersByTimeAsync(10_001);
+
+      expect(relayed).toEqual([
+        { message: APS_RENDER_FAILED_MESSAGE, adId: 'timeout-ad-id', reason: 'frame_timeout' },
+      ]);
+    } finally {
+      vi.useRealTimers();
+      stop();
+      delete dynamicWindow.render;
+      document.body.innerHTML = '';
+    }
+  });
+
+  it('labels a frame that fails to load', async () => {
+    const dynamicWindow = window as unknown as {
+      render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
+    };
+    const { relayed, stop } = captureRelays();
+    window.eval(APS_UNIVERSAL_CREATIVE_RENDERER);
+
+    try {
+      const rendered = dynamicWindow.render!(
+        { apsRenderer: descriptor(), rendererUrl: apsRendererUrl() },
+        pucHelper('load-error-ad-id'),
+        window
+      );
+      rendered.catch(() => {});
+      const iframe = document.body.querySelector('iframe') as HTMLIFrameElement & {
+        onerror?: () => void;
+      };
+      iframe.onerror?.();
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(relayed.map((entry) => entry['reason'])).toEqual(['frame_load_error']);
+    } finally {
+      stop();
+      delete dynamicWindow.render;
+      document.body.innerHTML = '';
+    }
+  });
+
+  it('stays silent when Universal Creative provides no message helper', async () => {
+    const dynamicWindow = window as unknown as {
+      render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
+    };
+    const { relayed, stop } = captureRelays();
+    window.eval(APS_UNIVERSAL_CREATIVE_RENDERER);
+
+    try {
+      const rendered = dynamicWindow.render!(
+        { apsRenderer: descriptor(), rendererUrl: apsRendererUrl() },
+        undefined,
+        window
+      );
+      rendered.catch(() => {});
+      const iframe = document.body.querySelector('iframe') as HTMLIFrameElement & {
+        onerror?: () => void;
+      };
+      iframe.onerror?.();
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // No helper means no relay, and the render still rejects rather than hanging.
+      expect(relayed).toEqual([]);
+      await expect(rendered).rejects.toThrow();
+    } finally {
+      stop();
       delete dynamicWindow.render;
       document.body.innerHTML = '';
     }

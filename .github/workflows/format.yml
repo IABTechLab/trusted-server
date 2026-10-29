@@ -9,24 +9,93 @@ permissions:
   contents: read
 
 jobs:
+  check-claude-md-symlink:
+    name: CLAUDE.md symlink guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # AGENTS.md is the source of truth and CLAUDE.md must stay a symlink to
+      # it. A checkout with core.symlinks=false (the Git for Windows default)
+      # materializes the symlink as a plain text file containing "AGENTS.md";
+      # if that file is committed, agents silently load it as the entire
+      # project instructions. Guard the tree entry so the broken form cannot
+      # land (see issue #1091).
+      - name: Verify CLAUDE.md is a symlink to AGENTS.md
+        shell: bash
+        run: |
+          mode=$(git ls-tree HEAD CLAUDE.md | awk '{print $1}')
+          if [ "$mode" != "120000" ]; then
+            echo "::error file=CLAUDE.md::CLAUDE.md must be a symlink to AGENTS.md (tree mode 120000), found mode ${mode:-<missing>}. This usually means a checkout with core.symlinks=false committed the materialized text file; re-add the symlink with core.symlinks=true."
+            exit 1
+          fi
+          target=$(git cat-file blob HEAD:CLAUDE.md)
+          if [ "$target" != "AGENTS.md" ]; then
+            echo "::error file=CLAUDE.md::CLAUDE.md must point at AGENTS.md, found '${target}'."
+            exit 1
+          fi
+          if [ ! -f AGENTS.md ]; then
+            echo "::error file=AGENTS.md::CLAUDE.md points at AGENTS.md, but AGENTS.md does not exist."
+            exit 1
+          fi
+
+  check-ci-node-pin:
+    name: CI Node pin guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The guard's tests check the tree before the guard landed; fetch only
+      # that commit instead of the full history.
+      - name: Fetch the pre-guard commit
+        run: git fetch --no-tags --depth=1 origin 7a0ecb4cbfa39af3d83f7e1ed2733d7eabdc4cb1
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+
+      - name: Test the guard
+        run: node --test scripts/check-ci-node-pin.test.mjs
+
+      # Every job that compiles trusted-server-core also runs the TSJS build, so
+      # it must set up the `.tool-versions` Node first (see issue #1204).
+      - name: Verify jobs pin Node before compiling Rust
+        run: node scripts/check-ci-node-pin.mjs
+
   format-rust:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+      # Rust jobs must set up the toolchain through ./.github/actions/setup-rust,
+      # which removes the image's stable and only saves caches from main. A
+      # direct setup-rust-toolchain or rust-cache step skips both silently.
+      - name: Require the shared Rust setup action
         shell: bash
+        run: |
+          if grep -rnE "uses:[[:space:]]*[\"']?(actions-rust-lang/setup-rust-toolchain|Swatinem/rust-cache)@" .github \
+              | grep -v '^\.github/actions/setup-rust/action\.yml:'; then
+            echo "::error::Set up Rust with ./.github/actions/setup-rust, not setup-rust-toolchain or rust-cache directly."
+            exit 1
+          fi
 
       - name: Set up rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1,wasm32-unknown-unknown
           components: "clippy, rustfmt"
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-clippy
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1
@@ -43,6 +112,9 @@ jobs:
       - name: Run cargo clippy (Cloudflare — wasm32-unknown-unknown)
         run: cargo clippy-cloudflare-wasm
 
+      - name: Check wasm-safe clock usage in the Cloudflare build (wasm32-unknown-unknown)
+        run: scripts/lint-wasm-clock.sh
+
       - name: Run cargo clippy (Spin — native)
         run: cargo clippy-spin-native
 
@@ -56,6 +128,11 @@ jobs:
       # is not covered by any adapter-scoped alias, so lint it explicitly.
       - name: Run host-target OpenRTB codegen clippy
         run: cargo clippy --package trusted-server-openrtb-codegen --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
+
+      # The build-digest tests are native-only, so clippy-fastly compiles them
+      # to an empty crate. Lint them on the host.
+      - name: Run host-target core build-digest test clippy
+        run: cargo clippy --package trusted-server-core --target x86_64-unknown-linux-gnu --test template_build_digest -- -D warnings
 
   format-typescript:
     runs-on: ubuntu-latest
@@ -119,5 +196,36 @@ jobs:
       - name: Run Prettier (check)
         run: npm run format
 
+      - name: Run Prettier (check) — Markdown outside docs/
+        working-directory: .
+        run: >-
+          docs/node_modules/.bin/prettier --config docs/.prettierrc --check
+          "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"
+
       - name: Build with VitePress (fails on dead links)
         run: npm run build
+
+  docs-proposal-scripts:
+    name: docs-proposal scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve Node.js version
+        id: node-version
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.node-version }}
+
+      - name: Run shellcheck
+        run: shellcheck scripts/docs-proposal/*.sh
+
+      - name: Test hunk review builder
+        run: node --test scripts/docs-proposal/hunks.test.mjs
+
+      - name: Test proposal scripts
+        run: scripts/docs-proposal/test.sh

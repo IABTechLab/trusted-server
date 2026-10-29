@@ -90,18 +90,19 @@ cargo clippy-spin-wasm
 
 ## Design Patterns
 
-### RequestWrapper Trait
+### Platform services
 
-Abstracts HTTP request handling to support different backends:
+Core request and response values use the standard `http` types with
+`edgezero_core::body::Body`. Runtime-specific capabilities are supplied through
+`RuntimeServices`, which holds trait objects for configuration and secret
+stores, KV access, dynamic backends, outbound HTTP, geographic lookup, template
+assembly, and template caching.
 
-```rust
-// Placeholder example
-pub trait RequestWrapper {
-    fn get_header(&self, name: &str) -> Option<String>;
-    fn get_cookie(&self, name: &str) -> Option<String>;
-    // ...
-}
-```
+The contracts live under `trusted_server_core::platform`, including
+`PlatformConfigStore`, `PlatformSecretStore`, `PlatformBackend`,
+`PlatformHttpClient`, `PlatformGeo`, `PlatformTemplateAssembler`, and
+`PlatformTemplateCache`. Each adapter constructs the services it supports;
+unavailable capabilities fail through explicit unavailable implementations.
 
 ### Settings-Driven Configuration
 

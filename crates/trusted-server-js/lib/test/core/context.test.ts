@@ -1,8 +1,18 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+const CONTEXT_PROVIDERS_KEY = Symbol.for('trusted-server.contextProviders');
+const sharedGlobal = globalThis as typeof globalThis & {
+  [CONTEXT_PROVIDERS_KEY]?: unknown;
+};
 
 describe('context provider registry', () => {
-  beforeEach(async () => {
-    await vi.resetModules();
+  beforeEach(() => {
+    delete sharedGlobal[CONTEXT_PROVIDERS_KEY];
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    delete sharedGlobal[CONTEXT_PROVIDERS_KEY];
   });
 
   it('returns empty context when no providers registered', async () => {
@@ -44,6 +54,17 @@ describe('context provider registry', () => {
     });
     registerContextProvider('survivor', () => ({ survived: true }));
     expect(collectContext()).toEqual({ survived: true });
+  });
+
+  it('shares providers between separately loaded module instances', async () => {
+    const first = await import('../../src/core/context');
+    first.registerContextProvider('first', () => ({ a: 1 }));
+
+    vi.resetModules();
+    const second = await import('../../src/core/context');
+    expect(second.collectContext()).toEqual({ a: 1 });
+    second.registerContextProvider('second', () => ({ b: 2 }));
+    expect(first.collectContext()).toEqual({ a: 1, b: 2 });
   });
 
   it('re-registration with same id replaces previous provider', async () => {

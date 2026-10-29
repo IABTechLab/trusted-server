@@ -90,6 +90,32 @@ describe('auction/buildAdRequest', () => {
     expect(unit2!.bids[0].bidder).toBe('openx');
   });
 
+  it.each([{}, { storedRequest: false }, { storedRequest: true }, { storedRequest: null }])(
+    'passes bid params through verbatim in serialized shared requests: %j',
+    (intent) => {
+      const params = { bidderParams: {}, ...intent };
+      for (const input of [
+        [{ code: 'example-slot', bids: [{ bidder: 'trustedServer', params }] }],
+        [{ adUnitCode: 'example-slot', bidder: 'trustedServer', params }],
+      ]) {
+        const wire = JSON.parse(JSON.stringify(buildAdRequest(input)));
+        expect(wire.adUnits[0].bids[0].params).toEqual(params);
+      }
+    }
+  );
+
+  it('omits explicitly undefined bid params from serialized shared requests', () => {
+    const params = { bidderParams: {}, storedRequest: undefined };
+    for (const input of [
+      [{ code: 'example-slot', bids: [{ bidder: 'trustedServer', params }] }],
+      [{ adUnitCode: 'example-slot', bidder: 'trustedServer', params }],
+    ]) {
+      const wire = JSON.parse(JSON.stringify(buildAdRequest(input)));
+      expect(wire.adUnits[0].bids[0].params).toEqual({ bidderParams: {} });
+      expect(wire.adUnits[0].bids[0].params).not.toHaveProperty('storedRequest');
+    }
+  });
+
   it('handles empty units array', () => {
     const result = buildAdRequest([]);
     expect(result.adUnits).toEqual([]);

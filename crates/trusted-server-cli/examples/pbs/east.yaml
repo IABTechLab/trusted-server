@@ -1,0 +1,3 @@
+external_url: https://pbs-east.example.com
+auction_timeouts_ms:
+  default: 900

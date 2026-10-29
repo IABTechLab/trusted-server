@@ -10,6 +10,34 @@ const SCRIPT_CREATIVE_URL = "https://creative.example/script.js";
 const SANDBOX =
     "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation";
 const TSJS_CRATE = resolve(__dirname, "../../../../trusted-server-js");
+const PUC_BANNER = readFileSync(
+    resolve(
+        __dirname,
+        "../../node_modules/prebid-universal-creative/dist/banner.js",
+    ),
+    "utf8",
+);
+
+/**
+ * Read the renderer version from its declaration rather than restating it.
+ *
+ * The constant is bumped whenever the Universal Creative source changes, so a
+ * literal here turns every such change into an unrelated-looking failure in
+ * this spec.
+ */
+function universalCreativeRendererVersion(): number {
+    const source = readFileSync(
+        resolve(TSJS_CRATE, "lib/src/integrations/aps/render.ts"),
+        "utf8",
+    );
+    const match = /APS_UNIVERSAL_CREATIVE_RENDERER_VERSION = (\d+)/.exec(source);
+    if (!match) {
+        throw new Error(
+            "could not read APS_UNIVERSAL_CREATIVE_RENDERER_VERSION from render.ts",
+        );
+    }
+    return Number(match[1]);
+}
 
 function clientAuctionBundlePaths() {
     const manifestPath = resolve(TSJS_CRATE, "dist/prebid/manifest.json");
@@ -197,6 +225,295 @@ const SCRIPT_CREATIVE = `(function(){
 })();`;
 
 test.describe("APS rendering", () => {
+    test("renders through real PUC and expands only its authenticated 1x1 shell", async ({
+        page,
+    }) => {
+        const adId = "fictional-inline-ad-id";
+        const publisherOrigin = new URL(runtimeUrl("/")).origin;
+        const outerCreativeUrl = runtimeUrl("/fictional-puc-shell");
+        let creativeRequests = 0;
+
+        await page.route(runtimeUrl("/aps-puc-topology-test"), (route) =>
+            route.fulfill({
+                status: 200,
+                contentType: "text/html",
+                body: '<!doctype html><div id="div-aps"></div><div id="div-other"></div>',
+            }),
+        );
+        await page.route(outerCreativeUrl, (route) =>
+            route.fulfill({
+                status: 200,
+                contentType: "text/html",
+                body: `<!doctype html><script>${PUC_BANNER}</script><script>
+window.ucTag.renderAd(document, { adId: ${JSON.stringify(adId)}, pubUrl: ${JSON.stringify(publisherOrigin)} });
+</script>`,
+            }),
+        );
+        await page.route(IFRAME_CREATIVE_URL, (route) => {
+            creativeRequests += 1;
+            return route.fulfill({
+                status: 200,
+                contentType: "text/html",
+                body: IFRAME_CREATIVE,
+            });
+        });
+
+        await page.goto(runtimeUrl("/aps-puc-topology-test"));
+        await page.addScriptTag({ path: clientAuctionBundlePaths().gpt });
+        await page.evaluate(
+            ({ creativeUrl, outerUrl, selectedAdId }) => {
+                const typedWindow = window as unknown as {
+                    tsjs: Record<string, unknown>;
+                    pucEvents: Array<Record<string, unknown>>;
+                };
+                typedWindow.tsjs = {
+                    bids: {
+                        "aps-slot": {
+                            hb_adid: selectedAdId,
+                            hb_bidder: "fictional",
+                            hb_pb: "1.23",
+                            adm: `<iframe src="${creativeUrl}" width="300" height="250"></iframe>`,
+                            w: 300,
+                            h: 250,
+                        },
+                    },
+                    adSlots: [
+                        {
+                            id: "aps-slot",
+                            div_id: "div-aps",
+                            gam_unit_path: "/fictional/aps",
+                            formats: [[300, 250]],
+                        },
+                    ],
+                };
+                typedWindow.pucEvents = [];
+                const locator = document.createElement("iframe");
+                locator.name = "__pb_locator__";
+                document.body.appendChild(locator);
+                window.addEventListener("message", (event) => {
+                    try {
+                        const message = JSON.parse(
+                            String(event.data),
+                        ) as Record<string, unknown>;
+                        if (message.message === "Prebid Event") {
+                            typedWindow.pucEvents.push(message);
+                        }
+                    } catch {
+                        // Ignore unrelated publisher messages.
+                    }
+                });
+
+                const slot = document.getElementById("div-aps")!;
+                slot.style.width = "1px";
+                slot.style.height = "1px";
+                const outerShell = document.createElement("div");
+                outerShell.id = "aps-outer-shell";
+                outerShell.style.width = "1px";
+                outerShell.style.height = "1px";
+                const innerShell = document.createElement("div");
+                innerShell.id = "aps-inner-shell";
+                innerShell.style.width = "1px";
+                innerShell.style.height = "1px";
+                const frame = document.createElement("iframe");
+                frame.id = "google_ads_iframe_fictional_0";
+                frame.width = "1";
+                frame.height = "1";
+                frame.style.width = "1px";
+                frame.style.height = "1px";
+                frame.src = outerUrl;
+                innerShell.appendChild(frame);
+                outerShell.appendChild(innerShell);
+                slot.appendChild(outerShell);
+
+                const other = document.getElementById("div-other")!;
+                const otherFrame = document.createElement("iframe");
+                otherFrame.width = "1";
+                otherFrame.height = "1";
+                otherFrame.style.width = "1px";
+                otherFrame.style.height = "1px";
+                other.appendChild(otherFrame);
+            },
+            {
+                creativeUrl: IFRAME_CREATIVE_URL,
+                outerUrl: outerCreativeUrl,
+                selectedAdId: adId,
+            },
+        );
+
+        await expect.poll(() => creativeRequests).toBe(1);
+        await expect
+            .poll(() =>
+                page.evaluate(() =>
+                    (
+                        window as unknown as {
+                            pucEvents: Array<Record<string, unknown>>;
+                        }
+                    ).pucEvents.some(
+                        (event) => event.event === "adRenderSucceeded",
+                    ),
+                ),
+            )
+            .toBe(true);
+        await expect(page.locator("#google_ads_iframe_fictional_0")).toHaveCSS(
+            "width",
+            "300px",
+        );
+        await expect(page.locator("#google_ads_iframe_fictional_0")).toHaveCSS(
+            "height",
+            "250px",
+        );
+        await expect(page.locator("#div-aps")).toHaveCSS("width", "300px");
+        await expect(page.locator("#div-aps")).toHaveCSS("height", "250px");
+        await expect(page.locator("#aps-outer-shell")).toHaveCSS(
+            "width",
+            "300px",
+        );
+        await expect(page.locator("#aps-outer-shell")).toHaveCSS(
+            "height",
+            "250px",
+        );
+        await expect(page.locator("#aps-inner-shell")).toHaveCSS(
+            "width",
+            "300px",
+        );
+        await expect(page.locator("#aps-inner-shell")).toHaveCSS(
+            "height",
+            "250px",
+        );
+        await expect(page.locator("#div-other iframe")).toHaveCSS(
+            "width",
+            "1px",
+        );
+        await expect(page.locator("#div-other iframe")).toHaveCSS(
+            "height",
+            "1px",
+        );
+    });
+
+    // Only a real browser shows which realm a relay comes from and which slot
+    // the authenticated frame resolves to, so this is the one test that can
+    // prove a reason reaches diagnostics end to end. The renderer route is made
+    // to fail here: the frame loads, never acknowledges, and Universal Creative
+    // reports its own timeout through the creative-realm helper.
+    test("relays an APS render failure reason to diagnostics through real PUC", async ({
+        page,
+    }) => {
+        const adId = "fictional-relay-ad-id";
+        const publisherOrigin = new URL(runtimeUrl("/")).origin;
+        const outerCreativeUrl = runtimeUrl("/fictional-puc-relay-shell");
+        const apsRenderer = descriptor("iframe");
+
+        await page.route(runtimeUrl("/aps-puc-relay-test"), (route) =>
+            route.fulfill({
+                status: 200,
+                contentType: "text/html",
+                body: '<!doctype html><div id="div-aps"></div>',
+            }),
+        );
+        await page.route(outerCreativeUrl, (route) =>
+            route.fulfill({
+                status: 200,
+                contentType: "text/html",
+                body: `<!doctype html><script>${PUC_BANNER}</script><script>
+window.ucTag.renderAd(document, { adId: ${JSON.stringify(adId)}, pubUrl: ${JSON.stringify(publisherOrigin)} });
+</script>`,
+            }),
+        );
+        // The renderer document never answers, so the render times out and the
+        // Universal Creative source reports `frame_timeout`.
+        await page.route(runtimeUrl("/integrations/aps/renderer"), (route) =>
+            route.fulfill({
+                status: 200,
+                contentType: "text/html",
+                body: "<!doctype html><title>silent renderer</title>",
+            }),
+        );
+
+        await page.goto(runtimeUrl("/aps-puc-relay-test"));
+        await page.addScriptTag({ path: clientAuctionBundlePaths().gpt });
+        await page.evaluate(
+            ({ outerUrl, selectedAdId, renderer }) => {
+                const typedWindow = window as unknown as {
+                    tsjs: Record<string, unknown>;
+                    recordedFailures: Array<{
+                        attemptId: number;
+                        reason: string;
+                    }>;
+                };
+                typedWindow.recordedFailures = [];
+                typedWindow.tsjs = {
+                    bids: {
+                        "aps-slot": {
+                            hb_adid: selectedAdId,
+                            hb_bidder: "aps",
+                            hb_pb: "1.23",
+                            renderer,
+                        },
+                    },
+                    adSlots: [
+                        {
+                            id: "aps-slot",
+                            // A configured prefix, not the resolved DOM id, so
+                            // the slot has to come from the authenticated frame.
+                            div_id: "div-",
+                            gam_unit_path: "/fictional/aps",
+                            formats: [[300, 250]],
+                        },
+                    ],
+                    divToSlotId: { "div-aps": "aps-slot" },
+                    gptDiagnosticsRecorder: {
+                        recordTrustedServerOpportunity: () => undefined,
+                        recordTrustedServerCreativeRequest: () => 1,
+                        recordTrustedServerCreativeResponse: () => undefined,
+                        recordTrustedServerCreativeFailure: (
+                            attemptId: number,
+                            reason: string,
+                        ) =>
+                            typedWindow.recordedFailures.push({
+                                attemptId,
+                                reason,
+                            }),
+                    },
+                };
+
+                const locator = document.createElement("iframe");
+                locator.name = "__pb_locator__";
+                document.body.appendChild(locator);
+
+                const slot = document.getElementById("div-aps")!;
+                const frame = document.createElement("iframe");
+                frame.id = "google_ads_iframe_fictional_relay_0";
+                frame.width = "1";
+                frame.height = "1";
+                frame.src = outerUrl;
+                slot.appendChild(frame);
+            },
+            {
+                outerUrl: outerCreativeUrl,
+                selectedAdId: adId,
+                renderer: apsRenderer,
+            },
+        );
+
+        // The Universal Creative timeout is 10s, so allow for it.
+        await expect
+            .poll(
+                () =>
+                    page.evaluate(
+                        () =>
+                            (
+                                window as unknown as {
+                                    recordedFailures: Array<{
+                                        reason: string;
+                                    }>;
+                                }
+                            ).recordedFailures,
+                    ),
+                { timeout: 20_000 },
+            )
+            .toEqual([{ attemptId: 1, reason: "aps_frame_timeout" }]);
+    });
+
     test("renders a trustedServer adapter bid using Prebid's generated GAM ad ID", async ({
         page,
     }) => {
@@ -394,7 +711,7 @@ parent.postMessage(JSON.stringify({
             expect.objectContaining({
                 message: "Prebid Response",
                 adId: result.acceptedAdId,
-                rendererVersion: 4,
+                rendererVersion: universalCreativeRendererVersion(),
                 apsRenderer,
             }),
         );
@@ -730,6 +1047,51 @@ parent.postMessage(JSON.stringify({
         await page.waitForTimeout(100);
         expect(runnerRequests).toBe(requestsBeforeInvalid);
         await expect(page.locator("#malformed-slot .existing")).toHaveCount(1);
+
+        // The three rejections above are the only place the renderer document's
+        // wire names are checked by executing it, rather than by matching
+        // substrings in the Rust source. `nonce_mismatch` in particular is only
+        // useful if the frame echoes the nonce its parent expects, so assert the
+        // nonce as well as the reason.
+        const reportedFailures = await page.evaluate(() =>
+            (
+                window as unknown as {
+                    apsMessages: Array<{
+                        slotId: string;
+                        data: Record<string, unknown>;
+                    }>;
+                }
+            ).apsMessages
+                .filter(
+                    ({ data }) =>
+                        data["message"] ===
+                        "trusted-server/aps/renderer-failed",
+                )
+                .map(({ slotId, data }) => ({
+                    slotId,
+                    reason: data["reason"],
+                    nonce: data["nonce"],
+                })),
+        );
+        expect(reportedFailures).toEqual(
+            expect.arrayContaining([
+                {
+                    slotId: "mismatch-slot",
+                    reason: "nonce_mismatch",
+                    nonce: validNonce,
+                },
+                {
+                    slotId: "missing-fragment-slot",
+                    reason: "bad_hash",
+                    nonce: undefined,
+                },
+                {
+                    slotId: "malformed-slot",
+                    reason: "descriptor_keys",
+                    nonce: wrongNonce,
+                },
+            ]),
+        );
 
         const scriptNonce = "0123456789abcdefghijkl";
         await page.evaluate(

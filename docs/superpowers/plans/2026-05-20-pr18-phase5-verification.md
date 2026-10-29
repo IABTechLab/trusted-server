@@ -726,8 +726,8 @@ grep 'rev = ' Cargo.toml | head -1 | grep -oP '(?<=rev = ").*(?=")'
 Then add to `crates/integration-tests/Cargo.toml` `[dev-dependencies]` (replace `<REV>` with actual value):
 
 ```toml
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "<REV>", features = ["axum"] }
-edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "<REV>" }
+edgezero-adapter-axum = { git = "https://github.com/IABTechLab/edgezero", rev = "<REV>", features = ["axum"] }
+edgezero-core = { git = "https://github.com/IABTechLab/edgezero", rev = "<REV>" }
 ```
 
 > **Why git dep not path dep:** edgezero is a git dependency in the workspace (not a local crate). Since `integration-tests` is workspace-excluded it cannot use `{ workspace = true }` — it must replicate the git dep form with the same rev to get Cargo to unify the dependency with the workspace's Cargo.lock.

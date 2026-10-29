@@ -53,8 +53,8 @@ export function hasOpaqueOrigin(): boolean {
 //     Inherited from the embedder and therefore honours a publisher `<base>`.
 //
 // Pinning at load time means bidder script cannot redirect resolution later by
-// injecting `<base>`; the server-side rewriter also strips `<base>` from
-// creative markup whenever rewriting is enabled.
+// injecting `<base>`; the server-side rewriter also drops the `<base>` `href`
+// (keeping `target`) when asset or click rewriting is on.
 export const TRUSTED_BASE_URL: string = (() => {
   try {
     const stamped = normalizeTrustedOrigin(

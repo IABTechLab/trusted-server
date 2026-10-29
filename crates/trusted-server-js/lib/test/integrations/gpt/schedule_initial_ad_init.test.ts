@@ -1,9 +1,9 @@
 import { readFileSync } from 'node:fs';
-import path from 'node:path';
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { TsjsApi } from '../../../src/core/types';
+import { GPT_BOOTSTRAP_PATH } from '../../fixtures/paths';
 
 type TestWindow = Window & {
   googletag?: unknown;
@@ -12,10 +12,7 @@ type TestWindow = Window & {
 
 const originalPushState = history.pushState.bind(history);
 const originalReplaceState = history.replaceState.bind(history);
-const BOOTSTRAP_SOURCE = readFileSync(
-  path.resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
-  'utf8'
-);
+const BOOTSTRAP_SOURCE = readFileSync(GPT_BOOTSTRAP_PATH, 'utf8');
 
 function runBootstrap(): void {
   new Function(BOOTSTRAP_SOURCE)();

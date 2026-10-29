@@ -72,6 +72,15 @@ const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
     HEADER_X_FORWARDED_FOR,
 ];
 
+/// Request headers that describe a body and must not ride on a bodyless redirect follow-up.
+const REQUEST_BODY_HEADERS: [header::HeaderName; 5] = [
+    header::CONTENT_TYPE,
+    header::CONTENT_LENGTH,
+    header::CONTENT_ENCODING,
+    header::CONTENT_LANGUAGE,
+    header::CONTENT_LOCATION,
+];
+
 /// Curated request headers preserved for asset proxying.
 ///
 /// Unlike the HTML publisher fallback, asset requests need cache validation and
@@ -651,6 +660,18 @@ fn finalize_proxied_response(
     let ct = meta.ct_raw.to_ascii_lowercase();
     let compression = Compression::from_content_encoding(&meta.content_encoding);
 
+    // A HEAD response has no body to rewrite, and decoding its empty body would
+    // fail for a compressed type, so skip the rewrite. Its representation
+    // headers must still describe the body a GET would return: the GET path
+    // rewrites HTML and CSS and drops the upstream length, so drop it here too.
+    if req.method() == Method::HEAD {
+        if ct.contains("text/html") || ct.contains("text/css") {
+            beresp.headers_mut().remove(header::CONTENT_LENGTH);
+        }
+        apply_image_passthrough_metadata(req, target_url, &ct, &mut beresp, "");
+        return Ok(beresp);
+    }
+
     if ct.contains("text/html") {
         let processor = CreativeHtmlProcessor::new(settings);
         return process_response_with_pipeline(
@@ -759,6 +780,13 @@ struct ProxyRedirectPolicy<'a> {
 /// This forwards a curated header set, follows redirects when enabled, and can append
 /// the caller's EC ID as a `ts-ec` query parameter to the target URL.
 /// Optional bodies/headers can be supplied via [`ProxyRequestConfig`].
+///
+/// Followed `307`/`308` redirects keep the original method and body. Followed
+/// `301`/`302`/`303` redirects are sent as a bodyless `GET` (a `HEAD` stays
+/// `HEAD`) without body-describing headers such as `Content-Type`. A `301`/`302`
+/// answering any method other than `GET`, `HEAD` or `POST` (for example `PUT`)
+/// is not followed: the redirect response is returned to the caller, so an
+/// update is neither replayed elsewhere nor silently turned into a `GET`.
 ///
 /// # Errors
 ///
@@ -907,16 +935,8 @@ fn apply_asset_origin_auth(
                 &config.region,
                 &credentials,
                 // s3_sigv4 converts this via chrono's `DateTime::<Utc>::from`, which
-                // only accepts `std::time::SystemTime`. `std::time::SystemTime::now()`
-                // panics on `wasm32-unknown-unknown` (Cloudflare Workers), so derive an
-                // equivalent `std::time::SystemTime` from the wasm-safe `web_time` clock:
-                // `UNIX_EPOCH + elapsed` is pure arithmetic and never calls the panicking
-                // `now()`. On Fastly (wasm32-wasip1) and native, `web_time` delegates to
-                // the std clock, so behavior is unchanged there.
-                std::time::UNIX_EPOCH
-                    + web_time::SystemTime::now()
-                        .duration_since(web_time::UNIX_EPOCH)
-                        .unwrap_or_default(),
+                // only accepts `std::time::SystemTime`.
+                crate::ec::std_system_time_now(),
             )
         }
     }
@@ -1225,7 +1245,7 @@ fn append_ec_id(req: &Request<EdgeBody>, target_url_parsed: &mut url::Url) {
 ///
 /// When `allowed_domains` is empty every host is permitted (open mode).
 /// When non-empty the host must match at least one pattern via [`is_host_allowed`].
-fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
+pub(crate) fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
     allowed_domains.is_empty()
         || allowed_domains
             .iter()
@@ -1265,6 +1285,9 @@ async fn proxy_with_redirects(
 
     let mut current_url = target_url_parsed.to_string();
     let mut current_method: Method = req.method().clone();
+    let mut current_body = body;
+    // Set once a redirect rewrites the request into a bodyless follow-up.
+    let mut body_dropped = false;
 
     for redirect_attempt in 0..=MAX_REDIRECTS {
         let parsed_url = url::Url::parse(&current_url).map_err(|_| {
@@ -1346,10 +1369,15 @@ async fn proxy_with_redirects(
             // insert() replaces any existing value, matching set_header() semantics.
             outbound_headers.insert(name.clone(), value.clone());
         }
+        if body_dropped {
+            for header_name in &REQUEST_BODY_HEADERS {
+                outbound_headers.remove(header_name);
+            }
+        }
         for (name, value) in &outbound_headers {
             builder = builder.header(name, value);
         }
-        let body_bytes = body.map(<[u8]>::to_vec).unwrap_or_default();
+        let body_bytes = current_body.map(<[u8]>::to_vec).unwrap_or_default();
         let edge_req =
             builder
                 .body(EdgeBody::from(body_bytes))
@@ -1418,12 +1446,39 @@ async fn proxy_with_redirects(
             );
         };
 
+        // Fetch keeps methods other than POST on a 301/302, but replaying the
+        // body would reach a target the caller did not address, and rewriting
+        // to GET would report success for an update that never ran.
+        if matches!(status, StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND)
+            && current_method != Method::GET
+            && current_method != Method::HEAD
+            && current_method != Method::POST
+        {
+            log::warn!(
+                "not following {} redirect for {current_method} request to {current_url}; returning redirect response",
+                status.as_u16()
+            );
+            return finalize_response(
+                settings,
+                req,
+                &current_url,
+                beresp,
+                redirect_policy.stream_passthrough,
+            );
+        }
+
         if redirect_attempt == MAX_REDIRECTS {
             log::warn!(
                 "redirect limit reached for {}; returning redirect response",
                 current_url
             );
-            return finalize_proxied_response(settings, req, &current_url, beresp);
+            return finalize_response(
+                settings,
+                req,
+                &current_url,
+                beresp,
+                redirect_policy.stream_passthrough,
+            );
         }
 
         let next_url = url::Url::parse(location)
@@ -1477,8 +1532,24 @@ async fn proxy_with_redirects(
         );
 
         current_url = next_url.to_string();
-        if status == StatusCode::SEE_OTHER {
-            current_method = Method::GET;
+        // 307/308 replay the original method and body by design. 301/302/303
+        // become a bodyless GET (HEAD stays HEAD) so those redirects cannot
+        // carry the payload to a target the caller did not address.
+        if matches!(
+            status,
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
+        ) {
+            if current_body.is_some_and(|bytes| !bytes.is_empty()) {
+                log::warn!(
+                    "dropping {current_method} request body on {} redirect to {current_url}",
+                    status.as_u16()
+                );
+            }
+            if current_method != Method::HEAD {
+                current_method = Method::GET;
+            }
+            current_body = None;
+            body_dropped = true;
         }
     }
 
@@ -1621,7 +1692,10 @@ pub async fn handle_first_party_click(
 /// # Errors
 ///
 /// Returns an error if JSON parsing fails, the URL cannot be parsed, the URL uses an
-/// unsupported scheme, the URL lacks a host, or the host violates `proxy.allowed_domains`.
+/// unsupported scheme, the URL lacks a host, the host is declined by
+/// `rewrite.exclude_domains` or `rewrite.include_domains`, the host violates
+/// `proxy.allowed_domains`, or request metadata needed to determine the scheme
+/// contains a malformed host.
 pub async fn handle_first_party_proxy_sign(
     settings: &Settings,
     _services: &RuntimeServices,
@@ -1639,11 +1713,11 @@ pub async fn handle_first_party_proxy_sign(
     // adapter forwards verbatim — have no scheme of their own, so parsing would
     // hand back the placeholder base's `https` and make an HTTP dev server sign
     // an HTTPS target it then proxies over TLS against a plaintext service.
-    let request_scheme = req
-        .uri()
-        .scheme_str()
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| RequestInfo::from_request(&req, _services.client_info()).scheme);
+    let request_scheme = if let Some(scheme) = req.uri().scheme_str() {
+        scheme.to_ascii_lowercase()
+    } else {
+        RequestInfo::from_request(&req, _services.client_info())?.scheme
+    };
 
     let payload = if method == Method::POST {
         let body_bytes = request_body_bytes(req.into_body(), "first-party sign")?;
@@ -1670,37 +1744,33 @@ pub async fn handle_first_party_proxy_sign(
     };
 
     let trimmed = payload.url.trim();
-    let abs = if trimmed.starts_with("//") {
-        format!("{}:{}", request_scheme, trimmed)
+    let protocol_relative;
+    // A protocol-relative target inherits the signing request's scheme before
+    // normalization, so `//` and absolute input reach the same policy check.
+    let candidate = if trimmed.starts_with("//") {
+        protocol_relative = format!("{request_scheme}:{trimmed}");
+        protocol_relative.as_str()
     } else {
-        crate::creative::to_abs(settings, trimmed).ok_or_else(|| {
-            Report::new(TrustedServerError::Proxy {
-                message: "unsupported url".to_string(),
-            })
-        })?
+        trimmed
     };
-
-    if settings.rewrite.is_excluded(&abs) {
-        return Err(Report::new(TrustedServerError::Proxy {
+    let target = crate::creative::normalize_creative_url(candidate).ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
             message: "unsupported url".to_string(),
-        }));
-    }
-
-    let parsed = url::Url::parse(&abs).change_context(TrustedServerError::Proxy {
-        message: "invalid url".to_string(),
+        })
     })?;
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(Report::new(TrustedServerError::Proxy {
-            message: "unsupported scheme".to_string(),
-        }));
-    }
-
-    let host = parsed.host_str().ok_or_else(|| {
+    let host = target.host_str().ok_or_else(|| {
         Report::new(TrustedServerError::Proxy {
             message: "missing host".to_string(),
         })
     })?;
+    if !settings.rewrite.should_proxy_asset(host) {
+        log::debug!(
+            "sign request for `{host}` declined: host excluded or not in rewrite.include_domains"
+        );
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "unsupported url".to_string(),
+        }));
+    }
     if !is_host_permitted(&settings.proxy.allowed_domains, host) {
         log::warn!(
             "sign request for `{}` blocked: host not in proxy.allowed_domains",
@@ -1720,10 +1790,10 @@ pub async fn handle_first_party_proxy_sign(
         .to_string();
     let extras = vec![(String::from("tsexp"), tsexp)];
 
-    let mut base = parsed.clone();
+    let mut base = target.clone();
     base.set_query(None);
     base.set_fragment(None);
-    let proxied = crate::creative::build_proxy_url_with_extras(settings, &abs, &extras);
+    let proxied = crate::creative::build_proxy_url_with_extras(settings, target.as_str(), &extras);
 
     let resp = ProxySignResp {
         href: proxied,
@@ -2695,20 +2765,171 @@ mod tests {
             let mut settings = create_test_settings();
             settings.rewrite.exclude_domains = vec!["cdn.example".to_owned()];
 
-            for url in ["https://cdn.example/asset.js", "//cdn.example/asset.js"] {
-                let body = serde_json::json!({ "url": url });
-                let req =
-                    build_http_post_json_request("https://edge.example/first-party/sign", &body);
-                let err: Report<TrustedServerError> =
-                    handle_first_party_proxy_sign(&settings, &noop_services(), req)
-                        .await
-                        .expect_err("should reject excluded URL");
+            for method in [&Method::GET, &Method::POST] {
+                for url in [
+                    "https://cdn.example/asset.js",
+                    "//cdn.example/asset.js",
+                    "https://CDN.Example/asset.js",
+                ] {
+                    let req = build_proxy_sign_request(
+                        method,
+                        "https://edge.example/first-party/sign",
+                        url,
+                    );
+                    let err: Report<TrustedServerError> =
+                        handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                            .await
+                            .expect_err("should reject excluded URL");
 
-                assert_eq!(
-                    err.current_context().status_code(),
-                    StatusCode::BAD_GATEWAY,
-                    "should reject excluded URL `{url}` as unsupported"
-                );
+                    assert_eq!(
+                        err.current_context().status_code(),
+                        StatusCode::BAD_GATEWAY,
+                        "{} should reject excluded URL `{url}` as unsupported",
+                        method.as_str()
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn proxy_sign_rejects_excluded_urls_case_insensitively() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.rewrite.exclude_domains = vec!["CDN.Example".to_owned()];
+
+            for method in [&Method::GET, &Method::POST] {
+                for url in ["https://cdn.example/asset.js", "//cdn.example/asset.js"] {
+                    let req = build_proxy_sign_request(
+                        method,
+                        "https://edge.example/first-party/sign",
+                        url,
+                    );
+                    let err: Report<TrustedServerError> =
+                        handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                            .await
+                            .expect_err("should reject a host excluded by a mixed-case entry");
+
+                    assert_eq!(
+                        err.current_context().status_code(),
+                        StatusCode::BAD_GATEWAY,
+                        "{} should reject `{url}` excluded by a mixed-case entry as unsupported",
+                        method.as_str()
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn proxy_sign_applies_rewrite_include_domains_for_get_and_post() {
+        struct Case {
+            name: &'static str,
+            include_domains: &'static [&'static str],
+            exclude_domains: &'static [&'static str],
+            allowed_domains: &'static [&'static str],
+            target: &'static str,
+            expected: StatusCode,
+        }
+
+        let cases = [
+            Case {
+                name: "listed absolute",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "https://img.example.com/a.png",
+                expected: StatusCode::OK,
+            },
+            Case {
+                name: "listed protocol-relative",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "//img.example.com/a.png",
+                expected: StatusCode::OK,
+            },
+            Case {
+                name: "off-list absolute",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "https://img.example.net/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "off-list protocol-relative",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "//img.example.net/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "host in both lists",
+                include_domains: &["*.example.com"],
+                exclude_domains: &["img.example.com"],
+                allowed_domains: &[],
+                target: "https://img.example.com/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "off include list and off proxy allowlist",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &["*.example.org"],
+                target: "https://img.example.net/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "listed but off proxy allowlist",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &["*.example.org"],
+                target: "https://img.example.com/a.png",
+                expected: StatusCode::FORBIDDEN,
+            },
+            Case {
+                name: "mixed-case host",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "https://IMG.Example.COM/a.png",
+                expected: StatusCode::OK,
+            },
+        ];
+
+        let to_owned = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| (*value).to_owned()).collect()
+        };
+
+        futures::executor::block_on(async {
+            for case in &cases {
+                for method in [&Method::GET, &Method::POST] {
+                    let label = format!("{} {}", method.as_str(), case.name);
+                    let mut settings = create_test_settings();
+                    settings.rewrite.include_domains = to_owned(case.include_domains);
+                    settings.rewrite.exclude_domains = to_owned(case.exclude_domains);
+                    settings.proxy.allowed_domains = to_owned(case.allowed_domains);
+                    let req = build_proxy_sign_request(
+                        method,
+                        "https://edge.example.com/first-party/sign",
+                        case.target,
+                    );
+
+                    let status =
+                        match handle_first_party_proxy_sign(&settings, &noop_services(), req).await
+                        {
+                            Ok(response) => response.status(),
+                            Err(error) => error.current_context().status_code(),
+                        };
+
+                    assert_eq!(
+                        status, case.expected,
+                        "{label} should return {}",
+                        case.expected
+                    );
+                }
             }
         });
     }
@@ -3624,6 +3845,84 @@ mod tests {
     }
 
     #[test]
+    fn proxied_html_click_wrapping_follows_explicit_rewrite_clicks() {
+        let html = r#"<html><head><base href="https://base.example.com/"></head><body><a href="https://landing.example.com/page"><img src="https://cdn.example.com/ad.png"></a><a href="https://excluded.example.com/page">Excluded</a></body></html>"#;
+        // (rewrite_creatives, rewrite_clicks, expect wrapped clicks)
+        let cases = [
+            (true, None, true),
+            (false, None, true),
+            (true, Some(true), true),
+            (true, Some(false), false),
+            (false, Some(false), false),
+            (false, Some(true), true),
+        ];
+
+        for (rewrite_creatives, rewrite_clicks, expect_clicks) in cases {
+            let mut settings = create_test_settings();
+            settings.auction.rewrite_creatives = rewrite_creatives;
+            settings.auction.rewrite_clicks = rewrite_clicks;
+            settings.rewrite.exclude_domains = vec!["excluded.example.com".to_owned()];
+            let label =
+                format!("rewrite_creatives={rewrite_creatives} rewrite_clicks={rewrite_clicks:?}");
+            let req = build_http_request(Method::GET, "https://edge.example.com/first-party/proxy");
+            let mut response = build_http_response(StatusCode::OK, EdgeBody::from(html));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+
+            let body = response_body_string(
+                finalize(
+                    &settings,
+                    &req,
+                    "https://cdn.example.com/creative.html",
+                    response,
+                )
+                .expect("should finalize proxied HTML"),
+            );
+
+            assert!(
+                body.contains("/first-party/proxy?tsurl="),
+                "{label}: proxied HTML always proxies assets: {body}"
+            );
+            // A wrapped landing link carries the click URL in href and data-tsclick.
+            assert_eq!(
+                body.matches("/first-party/click?tsurl=").count(),
+                if expect_clicks { 2 } else { 0 },
+                "{label}: click wrapping in proxied HTML: {body}"
+            );
+            assert_eq!(
+                body.matches("data-tsclick").count(),
+                usize::from(expect_clicks),
+                "{label}: data-tsclick in proxied HTML: {body}"
+            );
+            if !expect_clicks {
+                let landing_href = body
+                    .split("<a href=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next());
+                assert_eq!(
+                    landing_href,
+                    Some("https://landing.example.com/page"),
+                    "{label}: landing link keeps its raw href: {body}"
+                );
+            }
+            assert!(
+                body.contains(r#"<a href="https://excluded.example.com/page">Excluded</a>"#),
+                "{label}: excluded link always stays raw: {body}"
+            );
+            assert!(
+                !body.contains("<base"),
+                "{label}: proxied HTML always removes <base>: {body}"
+            );
+            assert!(
+                body.contains("/static/tsjs="),
+                "{label}: proxied HTML always receives the runtime: {body}"
+            );
+        }
+    }
+
+    #[test]
     fn html_response_rewrite_preserves_non_standard_port() {
         // Verify that HTML rewriting preserves non-standard ports in sub-resource URLs.
         // This is the core test for the port preservation fix.
@@ -3986,6 +4285,460 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response_body_string(response), "redirected");
+        });
+    }
+
+    const REDIRECT_TEST_BODY: &[u8] = b"fictional-payload=example";
+
+    /// Send `method` with a body through one redirect of `status` and return the stub.
+    fn proxy_through_redirect(method: Method, status: u16) -> Arc<StubHttpClient> {
+        proxy_through_redirect_with_response(method, status).0
+    }
+
+    /// Like [`proxy_through_redirect`], but also return the proxied response.
+    fn proxy_through_redirect_with_response(
+        method: Method,
+        status: u16,
+    ) -> (Arc<StubHttpClient>, Response<EdgeBody>) {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            status,
+            Vec::new(),
+            vec![("location", "https://redirect.example.com/final")],
+        );
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(method, "https://edge.example/");
+
+        let response = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new("https://source.example.com/start")
+                .without_ec_id()
+                .without_forward_headers()
+                .with_body(REDIRECT_TEST_BODY.to_vec())
+                .with_header(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/x-www-form-urlencoded"),
+                )
+                .with_header(header::CONTENT_LANGUAGE, HeaderValue::from_static("en-US"))
+                .with_header(
+                    header::CONTENT_LENGTH,
+                    HeaderValue::from(REDIRECT_TEST_BODY.len()),
+                ),
+            &services,
+        ))
+        .expect("should follow redirect");
+
+        (stub, response)
+    }
+
+    fn recorded_header_names(stub: &StubHttpClient, index: usize) -> Vec<String> {
+        stub.recorded_request_headers()[index]
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn proxy_request_post_redirect_drops_body_for_301_302_303() {
+        for status in [301, 302, 303] {
+            let stub = proxy_through_redirect(Method::POST, status);
+
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["POST".to_string(), "GET".to_string()],
+                "should follow a {status} POST redirect with GET"
+            );
+            assert_eq!(
+                stub.recorded_request_uris()[1],
+                "https://redirect.example.com/final",
+                "should send the {status} follow-up to the Location target"
+            );
+            assert_eq!(
+                stub.recorded_request_bodies(),
+                vec![REDIRECT_TEST_BODY.to_vec(), Vec::new()],
+                "should send the body only on the first hop for {status}"
+            );
+            let first_hop_headers = recorded_header_names(&stub, 0);
+            let follow_up_headers = recorded_header_names(&stub, 1);
+            for body_header in ["content-type", "content-language", "content-length"] {
+                assert!(
+                    first_hop_headers.iter().any(|name| name == body_header),
+                    "should send {body_header} on the first {status} hop"
+                );
+                assert!(
+                    !follow_up_headers.iter().any(|name| name == body_header),
+                    "should not forward {body_header} on a bodyless {status} follow-up"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_request_returns_301_302_unfollowed_for_non_post_body_methods() {
+        for method in [Method::PUT, Method::PATCH, Method::DELETE] {
+            for status in [301, 302] {
+                let (stub, response) = proxy_through_redirect_with_response(method.clone(), status);
+
+                assert_eq!(
+                    response.status().as_u16(),
+                    status,
+                    "should return the {status} redirect for {method} to the caller"
+                );
+                assert_eq!(
+                    stub.recorded_request_methods(),
+                    vec![method.to_string()],
+                    "should not follow a {status} redirect for {method}"
+                );
+                assert_eq!(
+                    stub.recorded_request_bodies(),
+                    vec![REDIRECT_TEST_BODY.to_vec()],
+                    "should send the {method} body only to the addressed target on {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_request_put_redirect_becomes_bodyless_get_for_303() {
+        let (stub, response) = proxy_through_redirect_with_response(Method::PUT, 303);
+
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "should return the 303 target's response"
+        );
+        assert_eq!(
+            stub.recorded_request_methods(),
+            vec!["PUT".to_string(), "GET".to_string()],
+            "should follow a 303 PUT redirect with GET"
+        );
+        assert_eq!(
+            stub.recorded_request_bodies(),
+            vec![REDIRECT_TEST_BODY.to_vec(), Vec::new()],
+            "should send the PUT body only on the first hop"
+        );
+    }
+
+    #[test]
+    fn proxy_request_post_redirect_retains_method_and_body_for_307_308() {
+        for status in [307, 308] {
+            let stub = proxy_through_redirect(Method::POST, status);
+
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["POST".to_string(), "POST".to_string()],
+                "should keep POST across a {status} redirect"
+            );
+            assert_eq!(
+                stub.recorded_request_bodies(),
+                vec![REDIRECT_TEST_BODY.to_vec(), REDIRECT_TEST_BODY.to_vec()],
+                "should replay the exact body across a {status} redirect"
+            );
+            assert!(
+                recorded_header_names(&stub, 1)
+                    .iter()
+                    .any(|name| name == "content-type"),
+                "should keep Content-Type across a {status} redirect"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_request_post_body_stays_dropped_after_302_then_307() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            302,
+            Vec::new(),
+            vec![("location", "https://redirect.example.com/second")],
+        );
+        stub.push_response_with_headers(
+            307,
+            Vec::new(),
+            vec![("location", "https://redirect.example.com/final")],
+        );
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::POST, "https://edge.example/");
+
+        futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new("https://source.example.com/start")
+                .without_ec_id()
+                .without_forward_headers()
+                .with_body(REDIRECT_TEST_BODY.to_vec())
+                .with_header(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/x-www-form-urlencoded"),
+                )
+                .with_header(
+                    header::CONTENT_LENGTH,
+                    HeaderValue::from(REDIRECT_TEST_BODY.len()),
+                )
+                .with_header(
+                    header::CONTENT_ENCODING,
+                    HeaderValue::from_static("identity"),
+                )
+                .with_header(header::CONTENT_LANGUAGE, HeaderValue::from_static("en-US"))
+                .with_header(
+                    header::CONTENT_LOCATION,
+                    HeaderValue::from_static("https://source.example.com/payload"),
+                ),
+            &services,
+        ))
+        .expect("should follow the 302 then 307 chain");
+
+        assert_eq!(
+            stub.recorded_request_methods(),
+            vec!["POST".to_string(), "GET".to_string(), "GET".to_string()],
+            "should keep the 302 follow-up as GET across the later 307"
+        );
+        assert_eq!(
+            stub.recorded_request_bodies(),
+            vec![REDIRECT_TEST_BODY.to_vec(), Vec::new(), Vec::new()],
+            "should not restore the dropped body on the 307 hop"
+        );
+        let first_hop_headers = recorded_header_names(&stub, 0);
+        for body_header in [
+            "content-type",
+            "content-length",
+            "content-encoding",
+            "content-language",
+            "content-location",
+        ] {
+            assert!(
+                first_hop_headers.iter().any(|name| name == body_header),
+                "should send {body_header} on the first hop"
+            );
+            for hop in [1, 2] {
+                assert!(
+                    !recorded_header_names(&stub, hop)
+                        .iter()
+                        .any(|name| name == body_header),
+                    "should not send {body_header} on bodyless hop {hop}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_request_redirect_limit_response_strips_cors_policy() {
+        let stub = Arc::new(StubHttpClient::new());
+        for _ in 0..5 {
+            stub.push_response_with_headers(
+                302,
+                Vec::new(),
+                vec![
+                    ("location", "https://redirect.example.com/next"),
+                    ("access-control-allow-origin", "*"),
+                ],
+            );
+        }
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://edge.example/");
+
+        let response = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new("https://source.example.com/start")
+                .without_ec_id()
+                .without_forward_headers(),
+            &services,
+        ))
+        .expect("should return the redirect once the limit is reached");
+
+        assert_eq!(
+            stub.recorded_request_methods().len(),
+            5,
+            "should stop following after the redirect limit"
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::FOUND,
+            "should return the last redirect response"
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "should strip CORS headers from the redirect-limit response"
+        );
+    }
+
+    #[test]
+    fn proxy_request_redirect_limit_response_honors_stream_passthrough() {
+        let stub = Arc::new(StubHttpClient::new());
+        for _ in 0..5 {
+            stub.push_response_with_headers(
+                302,
+                b"<p>moved</p>".to_vec(),
+                vec![
+                    ("location", "https://redirect.example.com/next"),
+                    ("content-type", "text/html"),
+                ],
+            );
+        }
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://edge.example/");
+
+        let response = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new("https://source.example.com/start")
+                .without_ec_id()
+                .without_forward_headers()
+                .with_streaming(),
+            &services,
+        ))
+        .expect("should return the redirect once the limit is reached");
+
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/html")),
+            "should pass the redirect-limit response through without the HTML rewrite"
+        );
+    }
+
+    #[test]
+    fn proxy_request_head_redirect_stays_head_for_301_302_303() {
+        for status in [301, 302, 303] {
+            let stub = proxy_through_redirect(Method::HEAD, status);
+
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["HEAD".to_string(), "HEAD".to_string()],
+                "should keep HEAD across a {status} redirect"
+            );
+            assert!(
+                stub.recorded_request_bodies()[1].is_empty(),
+                "should send no body on the {status} HEAD follow-up"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_request_head_redirect_keeps_header_only_compressed_response() {
+        for (content_type, content_encoding) in [("text/html", "gzip"), ("text/css", "br")] {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                303,
+                Vec::new(),
+                vec![("location", "https://redirect.example.com/final")],
+            );
+            stub.push_response_with_headers(
+                200,
+                Vec::new(),
+                vec![
+                    ("content-type", content_type),
+                    ("content-encoding", content_encoding),
+                    ("content-length", "1234"),
+                    ("access-control-allow-origin", "*"),
+                ],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(Method::HEAD, "https://edge.example/");
+
+            let response = futures::executor::block_on(proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig::new("https://source.example.com/start")
+                    .without_ec_id()
+                    .without_forward_headers(),
+                &services,
+            ))
+            .expect("should return the header-only HEAD response");
+
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["HEAD".to_string(), "HEAD".to_string()],
+                "should keep HEAD across the 303 redirect"
+            );
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "should return the target's {content_type} HEAD status"
+            );
+            let headers = response.headers();
+            assert_eq!(
+                headers.get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static(content_type)),
+                "should keep the upstream Content-Type on a {content_type} HEAD response"
+            );
+            assert_eq!(
+                headers.get(header::CONTENT_ENCODING),
+                Some(&HeaderValue::from_static(content_encoding)),
+                "should keep the upstream Content-Encoding on a {content_type} HEAD response"
+            );
+            assert!(
+                headers.get(header::CONTENT_LENGTH).is_none(),
+                "should drop the upstream Content-Length on a {content_type} HEAD response because a GET rewrites the body"
+            );
+            assert!(
+                headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+                "should still strip CORS headers from a {content_type} HEAD response"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_request_post_redirect_still_enforces_per_hop_allowlist() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                307,
+                Vec::new(),
+                vec![("location", "https://blocked.example.com/final")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let allowed_domains = vec!["source.example.com".to_string()];
+            let req = build_http_request(Method::POST, "https://edge.example/");
+
+            let err = proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig::new("https://source.example.com/start")
+                    .without_ec_id()
+                    .without_forward_headers()
+                    .with_body(REDIRECT_TEST_BODY.to_vec())
+                    .with_allowed_domains(&allowed_domains),
+                &services,
+            )
+            .await
+            .expect_err("should block a redirect to a host outside the allowlist");
+
+            assert!(
+                matches!(
+                    err.current_context(),
+                    TrustedServerError::AllowlistViolation { host } if host == "blocked.example.com"
+                ),
+                "should report the blocked redirect host"
+            );
+            assert_eq!(
+                stub.recorded_request_bodies().len(),
+                1,
+                "should never send the body to the blocked host"
+            );
         });
     }
 

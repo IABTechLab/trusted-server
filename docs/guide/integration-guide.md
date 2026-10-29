@@ -1,380 +1,425 @@
-# Integration Guide
+# Integration Development
 
-This document explains how to integrate a new integration module with the Trusted Server runtime. The workflow mirrors the built-in `testlight` sample in `crates/trusted-server-core/src/integrations/testlight.rs`.
+Trusted Server integrations are platform-neutral registrations assembled by
+`IntegrationRegistry`. Adapter crates provide I/O through
+`RuntimeServices`; integration code must not import Fastly, Cloudflare,
+Axum, or Spin SDK types.
 
-## Architecture Overview
+## Choose the narrowest hook
 
-| Component                                                               | Purpose                                                                                                                                                                                                                                                      |
-| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `crates/trusted-server-core/src/integrations/registry.rs`               | Defines the `IntegrationProxy`, `IntegrationAttributeRewriter`, `IntegrationScriptRewriter`, and `IntegrationHeadInjector` traits and hosts the `IntegrationRegistry`, which drives proxy routing, HTML/text rewrites, and head injection.                   |
-| `Settings::integrations` (`crates/trusted-server-core/src/settings.rs`) | Free-form JSON blob keyed by integration ID. Use `IntegrationSettings::insert_config` to seed configs; each module deserializes and validates (`validator::Validate`) its own config and exposes an `enabled` flag so the core settings schema stays stable. |
-| Fastly entrypoint (`crates/trusted-server-adapter-fastly/src/main.rs`)  | Instantiates the registry once per request, routes `/integrations/<id>/…` requests to the appropriate proxy, and passes the registry to the publisher origin proxy so HTML rewriting remains integration-aware.                                              |
-| `html_processor.rs`                                                     | Applies first-party URL rewrites, injects the Trusted Server JS shim, and lets integrations override attribute values (for example to swap script URLs).                                                                                                     |
+- `IntegrationProxy` owns explicit method/path endpoints and receives
+  `Settings`, `RuntimeServices`, and an EdgeZero-neutral request.
+- `IntegrationAttributeRewriter` inspects selected HTML attributes.
+- `IntegrationScriptRewriter` handles one declared selector.
+- `IntegrationHeadInjector` inserts deterministic head markup.
+- `IntegrationHtmlPostProcessor` is for bounded whole-document work that
+  cannot be performed during streaming.
+- `IntegrationRequestFilter` makes an early request decision.
 
-## Step-by-Step Integration
+Build one `IntegrationRegistration` with only the hooks the feature needs.
+Use `with_deferred_js()` only for a separately loaded integration module and
+`without_js()` when another asset path owns delivery. Proxy routes should be
+namespaced and bounded; do not introduce a general outbound proxy.
 
-### 1. Define Integration Configuration
+## Compiling core-neutral fixture
 
-Add a `trusted-server.toml` block and any environment overrides under `TRUSTED_SERVER__INTEGRATIONS__<ID>__*`. Configuration values are exposed to your module via `Settings::integration_config(<id>)`.
+The fixture below registers an attribute rewriter and constructs every
+required `RuntimeServices` service without an adapter dependency. The
+documentation test extracts this exact fence and compiles it as an isolated
+crate.
 
-```toml
-[integrations.my_integration]
-endpoint = "https://example.com/api"
-timeout_ms = 1000
-rewrite_scripts = true
-```
-
-### 2. Create the Integration Module
-
-Add a module under `crates/trusted-server-core/src/integrations/<id>/mod.rs` (see `crates/trusted-server-core/src/integrations/testlight.rs` for reference) and expose it in `crates/trusted-server-core/src/integrations/mod.rs`.
-
-Key pieces:
-
-```rust
-#[derive(Deserialize, Validate)]
-struct MyIntegrationConfig {
-    #[serde(default = "default_enabled")]
-    enabled: bool,
-    // …
-}
-
-impl IntegrationConfig for MyIntegrationConfig {
-    fn is_enabled(&self) -> bool { self.enabled }
-}
-
-pub struct MyIntegration {
-    config: MyIntegrationConfig,
-}
-
-pub fn build(settings: &Settings) -> Option<Arc<MyIntegration>> {
-    let config = settings
-        .integration_config::<MyIntegrationConfig>("my_integration")
-        .ok()
-        .flatten()?;
-    Some(Arc::new(MyIntegration { config }))
-}
-
-// Tests or scaffolding code can seed configs without hand-writing JSON:
-settings
-    .integrations
-    .insert_config(
-        "my_integration",
-        &serde_json::json!({
-            "enabled": true,
-            "endpoint": "https://example.com/api"
-        }),
-    )?;
-```
-
-`Settings::integration_config::<T>` automatically deserializes the raw JSON blob, runs [`validator`](https://docs.rs/validator/latest/validator/) on the type, and drops configs whose `is_enabled` returns `false`. Always derive/implement `Validate` for schema enforcement and implement `IntegrationConfig` (typically wrapping a `#[serde(default)] enabled` flag) so operators can toggle integrations without code changes.
-
-### 3. Return an IntegrationRegistration
-
-Each integration registers itself via a `register` function that returns an `IntegrationRegistration`. This object describes which HTTP proxies and HTML rewrites the integration exposes:
+<!-- documentation-snippet:runtime-services:start -->
 
 ```rust
-pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
-    let integration = build(settings)?;
-    Some(
-        IntegrationRegistration::builder("my_integration")
-            .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration.clone())
-            .with_script_rewriter(integration.clone())
-            .with_head_injector(integration)
-            .with_asset("my_integration")
-            .build(),
-    )
-}
-```
+use std::net::IpAddr;
+use std::sync::Arc;
 
-Any combination of the vectors may be populated. Modules that only need HTML rewrites can skip the `proxies` field altogether, and vice versa. The registry automatically iterates over the static builder list in `crates/trusted-server-core/src/integrations/mod.rs`, so adding the new `register` function is enough to make the integration discoverable.
+use error_stack::Report;
+use trusted_server_core::integrations::{
+    AttributeRewriteAction, IntegrationAttributeContext,
+    IntegrationAttributeRewriter, IntegrationRegistration,
+};
+use trusted_server_core::platform::{
+    BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend,
+    PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo,
+    PlatformSecretStore, RuntimeServices, StoreId, StoreName,
+    UnavailableHttpClient, UnavailableKvStore,
+};
 
-### 4. Implement IntegrationProxy for Endpoints
+struct ReadOnlyStore;
 
-Implement the trait from `registry.rs` when your integration needs its own HTTP entrypoint:
-
-```rust
-#[async_trait(?Send)]
-impl IntegrationProxy for MyIntegration {
-    fn integration_name(&self) -> &'static str {
-        "my_integration"
-    }
-
-    fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![
-            self.post("/auction"),
-            self.get("/status"),
-        ]
-    }
-
-    async fn handle(
+impl PlatformConfigStore for ReadOnlyStore {
+    fn get(
         &self,
-        settings: &Settings,
-        req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        // Parse/generate EC IDs, forward upstream, and return the response.
+        _store: &StoreName,
+        _key: &str,
+    ) -> Result<String, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn put(
+        &self,
+        _store: &StoreId,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn delete(
+        &self,
+        _store: &StoreId,
+        _key: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
     }
 }
-```
 
-::: tip Route Helpers
-Use the provided helper methods to automatically namespace your routes under `/integrations/{integration_name()}/`. Available helpers: `get()`, `post()`, `put()`, `delete()`, and `patch()`. This lets you define routes with just their relative paths (e.g., `self.post("/auction")` becomes `"/integrations/my_integration/auction"`).
-:::
+impl PlatformSecretStore for ReadOnlyStore {
+    fn get_bytes(
+        &self,
+        _store: &StoreName,
+        _key: &str,
+    ) -> Result<Vec<u8>, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
 
-Routes are matched verbatim in `crates/trusted-server-adapter-fastly/src/main.rs`, so stick to stable paths and register whichever HTTP methods you need. **New integrations should namespace their routes under `/integrations/{INTEGRATION_NAME}/`** using the helper methods for consistency, but you can define routes manually if needed (e.g., for backwards compatibility).
+    fn create(
+        &self,
+        _store: &StoreId,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
 
-The shared context already injects Trusted Server logging, headers, and error handling; the handler only needs to deserialize the request, call the upstream endpoint, and stamp integration-specific headers.
+    fn delete(
+        &self,
+        _store: &StoreId,
+        _key: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
 
-#### Proxying Upstream Requests
+struct FixtureBackend;
 
-Use the shared helper in `crates/trusted-server-core/src/proxy.rs` to forward requests so you automatically get the same header copying, redirect handling, HTML/CSS rewrite behavior, and EC ID handling the first-party proxy uses:
+impl PlatformBackend for FixtureBackend {
+    fn naming_policy(&self) -> BackendNamingPolicy {
+        BackendNamingPolicy::Axum
+    }
 
-```rust
-use crate::proxy::{proxy_request, ProxyRequestConfig};
-use fastly::http::{header, HeaderValue};
+    fn predict_name(
+        &self,
+        spec: &PlatformBackendSpec,
+    ) -> Result<String, Report<PlatformError>> {
+        if spec.host.is_empty() {
+            Err(Report::new(PlatformError::Backend))
+        } else {
+            Ok("fixture-origin".to_owned())
+        }
+    }
 
-let payload = serde_json::to_vec(&my_body)?;
-let response = proxy_request(
-    settings,
-    req,
-    ProxyRequestConfig::new(&self.config.endpoint)
-        .with_body(payload)
-        .with_header(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))
-        .with_streaming(), // stream passthrough; disable if you need HTML rewrites
-)
-.await?;
-```
+    fn ensure(
+        &self,
+        spec: &PlatformBackendSpec,
+    ) -> Result<String, Report<PlatformError>> {
+        self.predict_name(spec)
+    }
+}
 
-Set `forward_ec_id` to `false` if the upstream should not receive the caller's EC ID (`Testlight` does this), and disable `follow_redirects` if you need to surface redirects directly to the caller.
+struct FixtureGeo;
 
-**Streaming passthrough example:**
+impl PlatformGeo for FixtureGeo {
+    fn lookup(
+        &self,
+        _client_ip: Option<IpAddr>,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+        Ok(None)
+    }
+}
 
-```rust
-let response = proxy_request(
-    settings,
-    req,
-    ProxyRequestConfig::new("https://example.com/pixel")
-        .with_streaming() // no HTML/CSS rewrites; preserves origin compression
-);
-```
+struct AssetRewriter;
 
-::: info When to Use Streaming
-Use streaming when the upstream response is binary or large and you do not need creative rewrites. Keep the default (non-streaming) mode when you want HTML/CSS content rewritten through the existing creative pipeline.
-:::
-
-### 5. Implement HTML Rewrite Hooks (Optional)
-
-If the integration needs to rewrite script/link tags or inject HTML, implement `IntegrationAttributeRewriter` for attribute mutation and `IntegrationScriptRewriter` for inline `<script>` or text content rewrites. Both traits return typed actions (`AttributeRewriteAction`, `ScriptRewriteAction`) so you can keep existing markup, swap values, or drop elements entirely.
-
-```rust
-impl IntegrationAttributeRewriter for MyIntegration {
-    fn integration_id(&self) -> &'static str { "my_integration" }
+impl IntegrationAttributeRewriter for AssetRewriter {
+    fn integration_id(&self) -> &'static str {
+        "example"
+    }
 
     fn handles_attribute(&self, attribute: &str) -> bool {
-        attribute == "src" || attribute == "href"
+        matches!(attribute, "src" | "href")
     }
 
     fn rewrite(
         &self,
-        attr_name: &str,
-        attr_value: &str,
-        ctx: &IntegrationAttributeContext<'_>,
+        _attribute: &str,
+        value: &str,
+        _context: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
-        if attr_value.contains("cdn.example.com/legacy.js") {
-            // Drop remote script entirely – unified bundle already contains the logic.
-            AttributeRewriteAction::remove_element()
-        } else if attr_name == "src" {
-            AttributeRewriteAction::replace(tsjs::unified_script_src())
-        } else {
-            AttributeRewriteAction::keep()
-        }
+        value
+            .strip_prefix("https://assets.example/")
+            .map(|path| AttributeRewriteAction::replace(format!("/assets/{path}")))
+            .unwrap_or_else(AttributeRewriteAction::keep)
     }
 }
 
-impl IntegrationScriptRewriter for MyIntegration {
-    fn integration_id(&self) -> &'static str { "my_integration" }
-    fn selector(&self) -> &'static str { "script#__NEXT_DATA__" }
+pub fn registration() -> IntegrationRegistration {
+    IntegrationRegistration::builder("example")
+        .with_attribute_rewriter(Arc::new(AssetRewriter))
+        .build()
+}
 
-    fn rewrite(
-        &self,
-        content: &str,
-        ctx: &IntegrationScriptContext<'_>,
-    ) -> ScriptRewriteAction {
-        if let Some(rewritten) = try_rewrite_next_payload(content) {
-            ScriptRewriteAction::replace(rewritten)
-        } else {
-            ScriptRewriteAction::keep()
-        }
-    }
+pub fn runtime_services() -> RuntimeServices {
+    let store = Arc::new(ReadOnlyStore);
+    RuntimeServices::builder()
+        .config_store(store.clone())
+        .secret_store(store)
+        .kv_store(Arc::new(UnavailableKvStore))
+        .backend(Arc::new(FixtureBackend))
+        .http_client(Arc::new(UnavailableHttpClient))
+        .geo(Arc::new(FixtureGeo))
+        .client_info(ClientInfo::default())
+        .build()
 }
 ```
 
-`html_processor.rs` calls these hooks after applying the standard origin→first-party rewrite, so you can simply swap URLs, append query parameters, or mutate inline JSON. Use this to point `<script>` tags at your own tsjs-managed bundle (for example, `/static/tsjs=tsjs-testlight.min.js`) or to rewrite embedded Next.js payloads.
+<!-- documentation-snippet:runtime-services:end -->
 
-::: warning Removing Elements
-Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects a safe alternative. Prebid, for example, removes publisher `prebid.js` tags because Trusted Server injects a first-party `/integrations/prebid/bundle.js` URL for the configured external bundle.
+Production adapters replace every unavailable or fixture service with the
+target implementation. The builder deliberately panics when a required service
+is omitted, so adapter startup must construct the complete service graph.
+
+## Proxy implementation rules
+
+An `IntegrationProxy::handle` implementation receives the complete runtime
+service graph. Register or predict backends through `services.backend()`,
+send through `services.http_client()`, bound request and response bodies, and
+return `Report<TrustedServerError>` with integration context. The registry
+strips internal identity headers before dispatch; an integration must opt into
+any explicit forwarding behavior.
+
+Streaming support is an adapter capability. Request
+`PlatformHttpRequest::with_stream_response()` only when the caller has
+checked `supports_streaming_responses()`; unsupported adapters must reject
+the request instead of silently buffering it.
+
+## Asynchronous HTML processor completion
+
+An integration can register an HTML stream processor that optionally awaits HTTP,
+KV or other request services after its synchronous EOF call. Use the existing
+`IntegrationHtmlStreamProcessorFactory` and `.with_html_stream_processor(...)`.
+Article signing is only one possible consumer; core implements the processor
+lifecycle, not a signing protocol or background job system.
+
+Factories declare `requires_async_finish()`. Sessions implement the matching
+`StreamProcessor::requires_async_finish()` and optional `async_finish(...)`.
+The default callback returns `None`, creating no future. Factory metadata is
+available before template lookup, so requested EOF work cannot be skipped by a
+processed cache hit. The factory and session share request-local
+`IntegrationDocumentState` with the existing parser hooks.
+
+A non-retaining session can make a KV lookup at EOF and append a fixed footer.
+
+::: warning Do not copy the KV lookup to Fastly
+The generic KV interface has no hard timeout, and Fastly installs no cooperative
+timer, so an unbounded KV call can hold the response indefinitely. The example
+skips the lookup when `input.deadline.has_cooperative_timer()` is false. On
+Fastly, use an HTTP lookup whose transport timeouts are capped with
+`input.deadline.remaining()` instead.
 :::
 
-### 5b. Implement Head Injection (Optional)
-
-If the integration needs to inject HTML snippets at the start of `<head>` (for example, configuration scripts or global bootstraps), implement `IntegrationHeadInjector`. Snippets are prepended into `<head>` before the TSJS bundle tags, so they run first.
+<!-- documentation-snippet:html-eof:start -->
 
 ```rust
-impl IntegrationHeadInjector for MyIntegration {
-    fn integration_id(&self) -> &'static str { "my_integration" }
+use error_stack::Report;
+use futures::future::LocalBoxFuture;
+use std::io;
+use trusted_server_core::integrations::{
+    IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory,
+};
+use trusted_server_core::streaming_processor::StreamProcessor;
+use trusted_server_core::streaming_processor::finish::{
+    StreamFinish, StreamFinishError, StreamFinishInput,
+};
 
-    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        vec![format!(
-            r#"<script>tsjs.setConfig({{ mode: "my_integration", host: "{}" }});</script>"#,
-            ctx.request_host
-        )]
+/// Append a fixed footer when an example KV key is present.
+pub struct ExampleFooterProcessor;
+
+/// Create a request-local footer processor with matching EOF capability.
+pub struct ExampleFooterFactory;
+
+impl IntegrationHtmlStreamProcessorFactory for ExampleFooterFactory {
+    fn integration_id(&self) -> &'static str {
+        "example_footer"
+    }
+
+    fn requires_async_finish(&self) -> bool {
+        true
+    }
+
+    fn create(&self, _context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
+        Box::new(ExampleFooterProcessor)
+    }
+}
+
+impl StreamProcessor for ExampleFooterProcessor {
+    fn process_chunk(&mut self, bytes: &[u8], _is_last: bool) -> io::Result<Vec<u8>> {
+        Ok(bytes.to_vec())
+    }
+
+    fn requires_async_finish(&self) -> bool {
+        true
+    }
+
+    fn async_finish<'a>(
+        &'a mut self,
+        input: StreamFinishInput<'a>,
+    ) -> Option<LocalBoxFuture<'a, Result<StreamFinish, Report<StreamFinishError>>>> {
+        Some(Box::pin(async move {
+            if !input.deadline.has_cooperative_timer() {
+                return Ok(StreamFinish::Unchanged);
+            }
+            let enabled = input
+                .services
+                .kv_store()
+                .get_bytes("example:footer")
+                .await
+                .map_err(|_| Report::new(StreamFinishError::Unavailable))?
+                .is_some();
+            if !enabled {
+                return Ok(StreamFinish::Unchanged);
+            }
+            input.replacement.append(input.output)?;
+            input.replacement.append(b"<!--example-footer-->")?;
+            Ok(StreamFinish::Replace)
+        }))
     }
 }
 ```
 
-`html_processor.rs` calls `head_inserts` once per HTML response when the `<head>` element is first encountered. The returned snippets are concatenated before the unified script tag, so ordering between integrations is not guaranteed — keep snippets self-contained.
+<!-- documentation-snippet:html-eof:end -->
 
-::: tip When to Use Head Injection
-Use `IntegrationHeadInjector` when you need to emit configuration, inline scripts, or `<meta>` tags that must appear early in `<head>`. For attribute or script content changes on existing elements, prefer `IntegrationAttributeRewriter` or `IntegrationScriptRewriter` instead.
-:::
+The factory and session both return `true` from `requires_async_finish()` for
+their entire lifetimes. Their capabilities must match; a mismatch fails the request.
+Leave `buffer_output_until_eof()` at its default `false` for this append
+operation. KV must be available on the runtime; unavailable lookup falls back to
+the synchronous tail. Fastly consumers must use host operations with independently
+bounded latency and cap configurable transport timeouts with `input.deadline.remaining()`;
+this generic KV interface does not provide a hard timeout. Checking the remaining
+budget alone cannot interrupt a blocking KV call.
 
-### 6. Register the Module
-
-Add the module to `crates/trusted-server-core/src/integrations/mod.rs`'s builder list. The registry will call its `register` function automatically. Once registered:
-
-- `crates/trusted-server-adapter-fastly/src/main.rs` automatically exposes the declared route(s).
-- `handle_publisher_request` receives the same registry so HTML responses get integration shims without further code changes.
-- `IntegrationRegistry::registered_integrations()` exposes a machine-readable summary of hooks for tests, tooling, or diagnostics.
-- Declared assets are injected automatically into `<head>`; the runtime emits `<script async data-tsjs-integration="<name>">` tags for every bundle discovered through `.with_asset(...)`.
-
-### 7. Provide Static Assets (If Needed)
-
-Place any integration-specific JavaScript entrypoint under `crates/trusted-server-js/lib/src/integrations/<integration-id>/index.ts` (for example, `crates/trusted-server-js/lib/src/integrations/testlight/index.ts`). The shared `npm run build` script automatically discovers every integration directory with an `index.ts` file and produces a bundle named `tsjs-<integration-id>.js`, which the Rust crate embeds as `/static/tsjs=tsjs-<integration-id>.min.js`.
-
-Integrations that ship additional JS (such as Testlight) typically expose a `shim_src` config and rewrite publisher tags to point at that URL. Prebid drops publisher tags because the server injects the configured external Prebid bundle through a first-party route.
-
-### 8. Test Locally
-
-1. Add minimal config (`trusted-server.toml` + `.env.*` overrides).
-2. Run `cargo fmt --all -- --check` and `cargo clippy-fastly && cargo clippy-axum`.
-3. Execute targeted tests, e.g. `cargo test -p trusted-server-core html_processor`.
-4. Use `fastly compute serve` (with Viceroy installed) to hit `/integrations/<id>/…` and fetch HTML from your origin to confirm rewrites are applied.
-
-::: tip Testing Strategy
-For unit tests, prefer exposing helper constructors that accept a stub `shim_src` so your tests can point rewriters at a deterministic URL without touching the Tsjs build artifacts.
-:::
-
-By following these steps you can ship independent integration modules that plug into the Trusted Server runtime without modifying the Fastly entrypoint or HTML processor each time.
-
-## Existing Integrations
-
-Two built-in integrations demonstrate how the framework pieces fit together.
-
-Integrations are loaded in one of two ways:
-
-- **Immediate** (default) — concatenated into the main `tsjs-unified.min.js` bundle, loaded synchronously at `<head>` start.
-- **Deferred** — served as a separate `<script defer>` tag (`tsjs-{id}.min.js`), loaded after HTML parsing completes. Used for large modules that would otherwise block rendering. Integrations opt in by calling `.with_deferred_js()` on their registration builder.
-
-### Testlight
-
-**Loading**: Immediate
-
-**Purpose**: Sample partner stub showing request proxying, attribute rewrites, and asset injection.
-
-**Key files**:
-
-- `crates/trusted-server-core/src/integrations/testlight.rs` - Rust implementation
-- `crates/trusted-server-js/lib/src/integrations/testlight/index.ts` - TypeScript shim
-
-### Prebid
-
-**Loading**: External first-party bundle (`/integrations/prebid/bundle.js`)
-
-**Purpose**: Production Prebid Server bridge that owns `/auction`, injects Prebid client configuration, removes publisher-supplied Prebid scripts, and loads a publisher-specific generated Prebid bundle through a same-origin first-party route.
-
-**Key files**:
-
-- `crates/trusted-server-core/src/integrations/prebid.rs` - Rust implementation
-- `crates/trusted-server-js/lib/src/integrations/prebid/index.ts` - TypeScript NPM integration
-
-#### Prebid Integration Details
-
-Prebid applies the same steps outlined above with a few notable patterns:
-
-**1. Typed Configuration**
-
-`PrebidIntegrationConfig` lives alongside the integration module (`crates/trusted-server-core/src/integrations/prebid.rs`), implements `IntegrationConfig + Validate`, and exposes an `enabled` flag so operators can toggle it without code changes. Configuration lives under `[integrations.prebid]`:
+Operators must explicitly accept the possible delivery cost:
 
 ```toml
-[integrations.prebid]
-enabled = true
-timeout_ms = 1200
-client_side_bidders = ["example-browser"]
-external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
-# external_bundle_sha256 = "..."
-# external_bundle_sri = "sha384-..."
-# script_patterns = ["/static/prebid/*"]
-
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
-endpoint = "https://prebid.example.com/openrtb2/auction"
-routing = "explicit"
-
-[auction.bidders.example-server]
-provider = "pbs-main"
-
-[proxy]
-allowed_domains = ["assets.example.com"]
+[publisher]
+allow_async_html_finish = true
+html_finalization_timeout_ms = 5000
 ```
 
-The `proxy.allowed_domains` entry is required for `external_bundle_url` and must
-cover the bundle host plus any HTTPS redirect targets used by that host.
+Permission defaults to false. Enabling an integration requiring async completion
+without permission produces a configuration error naming the integration and the
+setting. Work is not silently omitted. Permission alone, with no async factories,
+keeps ordinary processing unchanged.
 
-Browser integration tests can inject `[integrations.prebid]` settings with the
-same registry helper as other integrations. Server provider and bidder behavior
-must be constructed from the compiled auction plan rather than integration-owned
-endpoint or bidder fields.
+Chunk callbacks remain synchronous. At EOF, core validates/drains the decoder and
+finishes the HTML parser, sending ready bytes through downstream processors as
+ordinary chunks. It then completes each processor in registration order: synchronous
+EOF, optional awaited finish, accepted output passed downstream, then downstream EOF.
+The auction and encoder finish afterward. Ready bytes are released before optional
+I/O; a callback is never run inside a parser handler.
 
-**2. Routes Owned by the Integration**
+`StreamFinishInput` supplies actual `response_status`, borrowed `output`, `services`,
+`deadline` and a separate bounded `replacement` writer. The output is the un-emitted
+synchronous tail of this stage. It is the complete retained output only when the
+factory explicitly requests `buffer_output_until_eof()`. Return `StreamFinish::Unchanged`
+to retain it, or write a complete candidate and return `Replace`. To append a tail,
+write the existing `output` followed by the new bytes. Empty replacement is intentional.
+The session and future may be non-`Send`; start I/O inside the returned future.
 
-`IntegrationProxy::routes` declares `/integrations/prebid/bundle.js` for first-party Prebid bundle delivery and script-pattern routes that return empty JavaScript for intercepted publisher Prebid URLs. Auctions continue to use the shared `/auction` endpoint.
+Core buffers a stage's output only when its factory explicitly requests retention.
+The holder and replacement candidate each use `max_buffered_body_bytes` as their cap.
+These caps apply per holder; simultaneous holders and codec/adapter buffers can
+use more memory in total. On collection overflow, core releases prefix/crossing/later output exactly once and
+skips that stage's optional I/O, while still completing its synchronous EOF. It cannot
+bound arbitrary private allocations inside an integration. Streaming stages cannot
+replace bytes already delivered; EOF append does not imply safe insertion into an
+already emitted head or before an earlier body close.
 
-**3. HTML Rewrites Through the Registry**
+Callback errors, poisoned candidates, invalid assembly-marker multiplicity and timeout
+discard the candidate and retain current stage output. Previously accepted stages stay
+accepted. One absolute deadline covers every callback, starting after decoder/parser
+EOF. On expiry, core drops the callback, skips later optional I/O, and still completes
+all downstream synchronous EOF calls. Origin, parser, synchronous processing, codec and
+sink errors remain fatal. Callback panics propagate. Cancellation does not undo remote
+writes or guarantee that transport work is cancelled.
 
-When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. Trusted Server injects `window.__tsjs_prebid` plus a same-origin `<script defer src="/integrations/prebid/bundle.js">` tag, so dropping publisher assets prevents duplicate downloads while configuration is available before the external bundle initializes.
+Axum, Workers and Spin provide cooperative timers. Fastly has none because its host
+calls block; bound those calls with `deadline.remaining()` and transport timeouts.
+A timer cannot preempt CPU work or blocking host calls. Avoid logging HTML, lookup URLs
+or external response contents.
 
-**4. External Bundle Assets & Testing**
+The latency contract depends on the adapter and the stage:
 
-The NPM integration lives in `crates/trusted-server-js/lib/src/integrations/prebid/index.ts` and is built with `crates/trusted-server-js/lib/build-prebid-external.mjs`, outside the embedded Cargo TSJS build. Tests typically assert that publisher references disappear and the first-party `/integrations/prebid/bundle.js` tag is present.
+- Without async factories, delivery and auction timing keep their existing path.
+- On Fastly, a non-retaining stage releases ready HTML before optional EOF I/O.
+  With an auction seam, the body-close and following tail wait for all hooks before
+  auction assembly; initial bytes can arrive promptly while page completion waits.
+- A retaining stage delays first HTML delivery until EOF or overflow release.
+- Axum, Workers and Spin currently buffer publisher responses. Enabled EOF I/O can
+  add to TTFB there even without stage retention. This feature does not add streaming
+  support to those adapters.
 
-**5. Hybrid EID forwarding**
+Use `stream_publisher_body_async`, `buffer_publisher_response_async`, or
+`publisher_response_into_streaming_response` for opted-in HTML. The synchronous
+pipeline and `stream_publisher_body` reject async processing before input/output
+effects. The raw partial-HTML copy path performs no callback; the synchronous helper
+leaves pending auction ownership with its caller, so pending auctions still require
+an async entry point. Async cancellation retains the auction guard's warning; error
+paths that can await emit abandonment telemetry.
 
-For Prebid-routed auctions, Trusted Server now forwards identity using a hybrid model:
+Opted-in HTML bypasses shared-template reads/reservations/stores and receives
+`Cache-Control: no-store, private`, including unchanged, failed and overflow-bypassed
+work. Raw-origin readthrough remains independent. Cacheable asynchronous output needs
+separate rules for output identity, external-data freshness, expiry, invalidation,
+failure caching and callback execution on hits; this is tracked in
+[#1397](https://github.com/IABTechLab/trusted-server/issues/1397).
 
-- TSJS reads current-request EIDs from `pbjs.getUserIdsAsEids()` and includes them in the `/auction` payload.
-- The edge resolves additional EIDs from the EC/KV identity graph.
-- The auction handler merges and deduplicates both sets.
-- The Prebid provider forwards the merged result to Prebid Server as `user.ext.eids`.
-- The `ts-eids` cookie is still ingested after the response so future requests can benefit from those IDs even without fresh browser-side resolution.
+When async factories are registered, HTML with 206 or any `Content-Range` bypasses
+rewriting and EOF I/O while preserving encoded bytes, framing, validators and origin
+cache policy. Independent cookie/diagnostics privacy still applies. HEAD, bodiless,
+non-HTML and unsupported encodings run no callbacks. Complete error HTML is eligible;
+inspect `response_status` to decide whether the integration applies. Without async
+factories, existing partial-response handling continues.
 
-Reusing these patterns makes it straightforward to convert additional legacy flows (for example, Next.js rewrites) into first-class integrations.
+Callers of `handle_publisher_request` supply the same enabled registry in
+`AuctionDispatch::integration_registry` and response processing. This required field
+allows cache admission to see async capabilities before lookup.
 
-## Future Improvements
+Replacement output passes through later stream processors, but is not parsed again.
+Preserve CSP, Next.js/RSC semantics and opaque assembly markers. Core checks marker
+multiplicity including split boundaries, not HTML structure. Each real consumer must
+verify winning-auction placement after its changes and preserve the structural body
+end; neighboring bytes alone cannot establish a marker's parsing context.
 
-We plan to expand integration capabilities in several areas:
+A fictional HTTP processor is available only with `test-utils`. See
+[HTML EOF runtime checks](/guide/testing#html-eof-runtime-checks) for the runtime
+harness, runtime/tooling prerequisites and CI coverage.
 
-1. **Declarative Routing & Middleware** - Richer endpoints (path params, shared middleware, structured context) beyond simple method/path matching.
-2. **Granular HTML Hooks** - Ordered selectors, head/body injection points, and DOM-aware helpers so multiple integrations can safely collaborate.
-3. **Integration Manifest** - Schema describing required bundles, routes, config validation, and feature flags to keep registration data-driven.
-4. **Shared Request Utilities** - Reusable building blocks for EC ID injection, consent enforcement, and OpenRTB shaping.
-5. **tsjs Tooling** - Auto-generated integration bundles, scaffolding for TS shims/tests, and metadata surfaced back to Rust.
-6. **Testing & Observability Hooks** - Integration-focused mocks, local harnesses, and telemetry emitters for easier validation and monitoring.
+## Browser and script guards
 
-Contributions toward these enhancements are welcome.
+Add a browser module only when browser state is required. Immediate modules
+join the hashed unified bundle; deferred and standalone delivery are explicit
+registry decisions. Dynamic script interception must register with the shared
+DOM insertion dispatcher, remain idempotent, and leave unmatched elements
+untouched. See [Trusted Server JavaScript](/guide/tsjs) and
+[GPT's guarded handoff](/guide/integrations/gpt#server-slot-handoff).
 
-## Next Steps
+## Registration checklist
 
-- Learn about [Request Signing](/guide/request-signing) for secure communication
-- Review [Architecture](/guide/architecture) for system design
-- Set up [Testing](/guide/testing) for your integration
+1. Add typed settings with validation and a disabled default unless the
+   integration is intentionally universal.
+2. Register the exact capability predicates and route methods.
+3. Add source and behavior parity records.
+4. Add positive, negative, body-bound, header, and adapter-capability tests.
+5. Document configuration, failure behavior, and runtime limitations.
+6. Run the target aliases from [Testing](/guide/testing).

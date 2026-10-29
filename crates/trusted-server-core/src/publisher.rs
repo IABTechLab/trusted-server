@@ -18,11 +18,13 @@
 //! into any [`Write`] (a `Vec<u8>` for buffered routes, a streaming writer for
 //! the streaming route). It is not a content-rewriting concern.
 
+mod html_finalization;
+
 use std::borrow::Cow;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use brotli::Decompressor;
 use brotli::enc::BrotliEncoderParams;
@@ -34,6 +36,8 @@ use flate2::read::ZlibDecoder;
 use flate2::write::{GzEncoder, ZlibEncoder};
 use futures::StreamExt as _;
 use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
+use sha2::Digest as _;
+use web_time::Instant;
 
 use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
@@ -51,29 +55,34 @@ use crate::auction::telemetry::{
 use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
+use crate::bounded_buffer::reserve_bounded;
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
-use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
+use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
-use crate::creative_opportunities::{AssemblyMode, CreativeOpportunitiesConfig};
-use crate::ec::EcContext;
+use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
+use crate::creative_opportunities::{
+    AdStackGateInput, AssemblyMode, CreativeOpportunitiesConfig, RuntimeAdStackExpected,
+    evaluate_ad_stack_gate,
+};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::registry::PartnerRegistry;
+use crate::ec::{EcContext, EidSyncSource};
 use crate::error::TrustedServerError;
-use crate::html_processor::BodyCloseInjection;
+use crate::html_processor::{
+    BodyCloseInjection, HtmlProcessorConfig, create_html_processor_with_document_state,
+};
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
-use crate::integrations::IntegrationRegistry;
+use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
 use crate::platform::{
-    GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, VarySpec,
-    contains_publisher_esi_directive,
+    GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices,
+    TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, VarySpec, contains_publisher_esi_directive,
+    reader_url_surrogate_key,
 };
 use crate::price_bucket::{PriceGranularity, price_bucket};
-use crate::publisher_late_binding::{
-    BidPlaceholder, HtmlInjectionTracker, PlaceholderLateBinder, PlaceholderScan,
-    SSAT_HELD_TAIL_CAP_BYTES,
-};
+use crate::response_header_rewrite::{OriginHeaderRewrite, rewrite_origin_urls_in_headers};
 use crate::response_privacy::{
     apply_inactive_ad_stack_browser_cache_policy, cache_control_forbids_shared_storage,
     enforce_synthesized_html_cache_privacy, enforce_terminal_private_cache_privacy,
@@ -88,6 +97,9 @@ use crate::streaming_processor::{
     STREAM_CHUNK_SIZE, StreamProcessor, StreamingPipeline,
 };
 use crate::streaming_replacer::create_url_replacer;
+use html_finalization::HtmlEofDriver;
+
+include!(concat!(env!("OUT_DIR"), "/template_build_digest.rs"));
 
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -307,27 +319,6 @@ fn restrict_accept_encoding(req: &mut Request<EdgeBody>) {
     );
 }
 
-fn ensure_vary_accept_encoding(headers: &mut http::HeaderMap) {
-    let already_varies = headers.get_all(header::VARY).iter().any(|value| {
-        value.to_str().ok().is_some_and(|value| {
-            value.split(',').any(|token| {
-                let token = token.trim();
-                token == "*" || token.eq_ignore_ascii_case("accept-encoding")
-            })
-        })
-    });
-    if !already_varies {
-        headers.append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
-    }
-}
-
-fn apply_ssat_compression_offload_headers(headers: &mut http::HeaderMap) {
-    headers.remove(header::CONTENT_ENCODING);
-    headers.remove(header::CONTENT_LENGTH);
-    headers.insert(HEADER_X_COMPRESS_HINT, HeaderValue::from_static("on"));
-    ensure_vary_accept_encoding(headers);
-}
-
 fn select_supported_accept_encoding(client_accept_encoding: &str) -> String {
     let supported_subset = SUPPORTED_ENCODING_VALUES
         .into_iter()
@@ -505,9 +496,9 @@ fn set_response_compression(response: &mut Response<EdgeBody>, compression: Comp
         .iter()
         .any(|value| {
             value.to_str().is_ok_and(|value| {
-                value
-                    .split(',')
-                    .any(|name| name.trim().eq_ignore_ascii_case("accept-encoding"))
+                value.split(',').any(|name| {
+                    name.trim() == "*" || name.trim().eq_ignore_ascii_case("accept-encoding")
+                })
             })
         });
     if !varies_on_encoding {
@@ -516,6 +507,31 @@ fn set_response_compression(response: &mut Response<EdgeBody>, compression: Comp
             .append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     }
     response.headers_mut().remove(header::CONTENT_LENGTH);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DynamicDeliveryCompression;
+
+fn enable_delivery_compression(response: &mut Response<EdgeBody>) {
+    response.extensions_mut().insert(DynamicDeliveryCompression);
+    enforce_delivery_compression(response);
+}
+
+/// Restores the selected delivery-compression contract after late header effects.
+///
+/// No-op for responses that did not select adapter compression. Fastly calls this
+/// immediately before headers commit, for both streaming and buffered delivery.
+pub fn enforce_delivery_compression(response: &mut Response<EdgeBody>) {
+    if response
+        .extensions()
+        .get::<DynamicDeliveryCompression>()
+        .is_some()
+    {
+        set_response_compression(response, Compression::None);
+        response
+            .headers_mut()
+            .insert("x-compress-hint", HeaderValue::from_static("on"));
+    }
 }
 
 fn response_compression(response: &Response<EdgeBody>) -> Compression {
@@ -633,13 +649,14 @@ fn parse_single_module_filename(filename: &str) -> Option<&'static str> {
         .and_then(|s| s.strip_suffix(".min.js").or_else(|| s.strip_suffix(".js")))?;
 
     trusted_server_js::all_module_ids()
-        .into_iter()
+        .iter()
+        .copied()
         .find(|&id| id == stem)
 }
 
 /// Parameters for processing response streaming.
 struct ProcessResponseParams<'a> {
-    input_compression: Compression,
+    content_encoding: &'a str,
     origin_host: &'a str,
     origin_url: &'a str,
     request_host: &'a str,
@@ -663,14 +680,26 @@ struct PublisherBodyProcessor {
 }
 
 impl PublisherBodyProcessor {
+    /// Build the body processor, returning any deferred inline seam token it
+    /// installed alongside it.
+    ///
+    /// The token is returned rather than stored so a caller that has no seam
+    /// controller has to discard it visibly. Dropping it silently would ship the
+    /// raw marker comment to the browser and inject no bids.
     fn new(
         params: &OwnedProcessResponseParams,
         settings: &Settings,
         integration_registry: &IntegrationRegistry,
-    ) -> Result<Self, Report<TrustedServerError>> {
+    ) -> Result<(Self, Option<Vec<u8>>), Report<TrustedServerError>> {
         let is_html = is_html_content_type(&params.content_type);
         let is_rsc_flight =
             content_type_contains_ascii_case_insensitive(&params.content_type, "text/x-component");
+        let inline_seam_token = deferred_inline_seam_token(
+            settings,
+            params.template_cache_key.is_some(),
+            params.ad_slots_script.is_some(),
+            is_html && params.dispatched_auction.is_some(),
+        );
         let inner: Box<dyn StreamProcessor> = if is_html {
             Box::new(create_html_stream_processor(HtmlStreamProcessorParams {
                 origin_host: &params.origin_host,
@@ -684,6 +713,9 @@ impl PublisherBodyProcessor {
                 gpt_diagnostics: params.gpt_diagnostics.clone(),
                 shared_template_authorized: params.template_cache_key.is_some(),
                 csp_nonce_observed: params.csp_nonce_observed.clone(),
+                deferred_inline_marker: inline_seam_token
+                    .as_ref()
+                    .map(|token| String::from_utf8_lossy(token).into_owned()),
             })?)
         } else if is_rsc_flight {
             Box::new(RscFlightUrlRewriter::new(
@@ -701,11 +733,14 @@ impl PublisherBodyProcessor {
             ))
         };
 
-        Ok(Self { inner })
+        Ok((Self { inner }, inline_seam_token))
     }
 }
 
 impl StreamProcessor for PublisherBodyProcessor {
+    fn requires_async_finish(&self) -> bool {
+        self.inner.requires_async_finish()
+    }
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, std::io::Error> {
         self.inner.process_chunk(chunk, is_last)
     }
@@ -731,15 +766,16 @@ fn process_response_streaming<W: Write>(
     let is_rsc_flight =
         content_type_contains_ascii_case_insensitive(params.content_type, "text/x-component");
     log::debug!(
-        "process_response_streaming: content_type={}, input_compression={:?}, is_html={}, is_rsc_flight={}",
+        "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}",
         params.content_type,
-        params.input_compression,
+        params.content_encoding,
         is_html,
         is_rsc_flight
     );
 
+    let compression = Compression::from_content_encoding(params.content_encoding);
     let config = PipelineConfig {
-        input_compression: params.input_compression,
+        input_compression: compression,
         output_compression,
         chunk_size: 8192,
     };
@@ -764,6 +800,7 @@ fn process_response_streaming<W: Write>(
             gpt_diagnostics: params.gpt_diagnostics.cloned(),
             shared_template_authorized: params.shared_template_authorized,
             csp_nonce_observed: params.csp_nonce_observed.cloned(),
+            deferred_inline_marker: None,
         })?;
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
@@ -803,20 +840,28 @@ async fn process_response_streaming_async<W: Write>(
     integration_registry: &IntegrationRegistry,
 ) -> Result<(), Report<TrustedServerError>> {
     log::debug!(
-        "process_response_streaming_async: content_type={}, input_compression={:?}",
+        "process_response_streaming_async: content_type={}, content_encoding={}",
         params.content_type,
-        params.input_compression
+        params.content_encoding
     );
 
-    let input_compression = params.input_compression;
+    let input_compression = Compression::from_content_encoding(&params.content_encoding);
     // A template-cache response is always identity bytes. Decode during the transform instead of
     // recompressing and immediately decoding the entire buffered result afterwards.
-    let output_compression = if params.template_cache_key.is_some() {
-        Compression::None
-    } else {
-        params.output_compression
-    };
-    let mut processor = PublisherBodyProcessor::new(params, settings, integration_registry)?;
+    let output_compression = params.transform_compression();
+    // This path has no seam controller, so it must never be reached with a
+    // pending auction; `deferred_inline_seam_token` returns `None` for it.
+    let (mut processor, inline_seam_token) =
+        PublisherBodyProcessor::new(params, settings, integration_registry)?;
+    if inline_seam_token.is_some() {
+        // A `debug_assert!` would be compiled out of the release wasm builds that
+        // actually ship, which is exactly where an unresolved token would reach a
+        // browser as a raw marker comment with no bids injected.
+        log::error!(
+            "publisher body-close seam token minted on a path with no seam controller; dropping it"
+        );
+    }
+    drop(inline_seam_token);
     process_body_chunks_async(
         body,
         output,
@@ -991,15 +1036,19 @@ impl Drop for DispatchedAuctionGuard {
 
 /// Mutable auction-hold state threaded through the streaming hold pipeline.
 struct AuctionHoldState {
-    hold: Option<BodyCloseHoldBuffer>,
+    hold: Option<InlineBodyCloseSeam>,
     dispatched: DispatchedAuctionGuard,
     telemetry: AuctionTelemetryCarry,
 }
 
 impl AuctionHoldState {
-    fn new(dispatched: DispatchedAuctionGuard, telemetry: AuctionTelemetryCarry) -> Self {
+    fn new(
+        dispatched: DispatchedAuctionGuard,
+        telemetry: AuctionTelemetryCarry,
+        seam_token: Option<Vec<u8>>,
+    ) -> Self {
         Self {
-            hold: Some(BodyCloseHoldBuffer::new()),
+            hold: seam_token.map(InlineBodyCloseSeam::new),
             dispatched,
             telemetry,
         }
@@ -1028,13 +1077,13 @@ async fn abandon_hold_auction(
     }
 }
 
-/// Output of a single close-body hold step, split at the auction-collection
+/// Output of one parser-confirmed seam step, split at the auction-collection
 /// barrier.
 ///
 /// `ready` is the prefix the caller must emit *before* collecting the auction,
 /// so a small page whose `</body>` lands in the first source chunk still
 /// streams its document prefix immediately instead of stalling behind the
-/// auction. `close_found` signals that `</body` was seen: the caller emits
+/// auction. `close_found` signals that the parser marker was seen: the caller emits
 /// `ready`, then awaits [`hold_collect_close_tail`] to collect the auction and
 /// emit the held closing tail.
 struct HoldStepSegments {
@@ -1042,15 +1091,15 @@ struct HoldStepSegments {
     close_found: bool,
 }
 
-/// Feed one decoded chunk through the close-body hold and processor.
+/// Process one decoded chunk, then scan its output for the parser marker.
 ///
 /// Returns the ready prefix for the caller to emit — written to a client stream
 /// by [`body_close_hold_loop_stream`], yielded from the lazy body by
 /// [`publisher_response_into_streaming_response`]. Both async hold paths share
 /// this function so their behavior cannot drift apart.
 ///
-/// This step never awaits auction collection: it processes only the bytes the
-/// hold buffer releases as ready and reports whether `</body` was seen. Holding
+/// This step never awaits auction collection: it processes the bytes the
+/// parser emits and reports whether its structural body marker was seen. Holding
 /// the collection out of this step is what lets callers emit the prefix before
 /// the auction resolves. On processing failure the pending auction is abandoned
 /// before the error is returned.
@@ -1061,38 +1110,59 @@ async fn hold_step_decoded_chunk<P: StreamProcessor>(
     state: &mut AuctionHoldState,
     collect_refs: &AuctionCollectDeps<'_>,
 ) -> Result<HoldStepSegments, Report<TrustedServerError>> {
-    let mut ready = Vec::new();
-    let bytes: Cow<'_, [u8]> = match state.hold.as_mut() {
-        // Once the hold has been released the chunk streams straight through,
-        // borrowed rather than copied.
-        None => Cow::Borrowed(chunk),
-        Some(hold_buffer) => Cow::Owned(hold_buffer.push(chunk)),
-    };
-    match process_and_encode_chunk(processor, encoder, &bytes, false, "Failed to process chunk") {
-        Ok(Some(encoded)) => ready.push(encoded),
-        Ok(None) => {}
-        Err(err) => {
-            abandon_hold_auction(state, collect_refs.services, "stream_process_error").await;
-            return Err(err);
+    let processed =
+        match processor
+            .process_chunk(chunk, false)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to process chunk".to_string(),
+            }) {
+            Ok(processed) => processed,
+            Err(err) => {
+                abandon_hold_auction(state, collect_refs.services, "stream_process_error").await;
+                return Err(err);
+            }
+        };
+    match encode_processed_html(encoder, processed, state) {
+        Ok(step) => Ok(step),
+        Err(error) => {
+            abandon_hold_auction(state, collect_refs.services, "stream_encode_error").await;
+            Err(error)
         }
     }
-    let close_found = state
-        .hold
-        .as_ref()
-        .is_some_and(BodyCloseHoldBuffer::found_close);
+}
+
+fn encode_processed_html(
+    encoder: &mut BodyStreamEncoder,
+    processed: Vec<u8>,
+    state: &mut AuctionHoldState,
+) -> Result<HoldStepSegments, Report<TrustedServerError>> {
+    let bytes = match state.hold.as_mut() {
+        Some(seam) => seam.push(&processed),
+        None => processed,
+    };
+    let close_found = state.hold.as_ref().is_some_and(InlineBodyCloseSeam::found);
+    let encoded = encoder
+        .encode_chunk(bytes)
+        .change_context(TrustedServerError::Proxy {
+            message: "Failed to encode processed chunk".to_string(),
+        })?;
+    let ready = if encoded.is_empty() {
+        Vec::new()
+    } else {
+        vec![bytes::Bytes::from(encoded)]
+    };
     Ok(HoldStepSegments { ready, close_found })
 }
 
-/// Collect the dispatched auction and process the held `</body>` tail.
+/// Collect the dispatched auction and emit bids before the parsed closing tail.
 ///
 /// Call only after [`hold_step_decoded_chunk`] (or
 /// [`hold_finish_ready_segments`]) reports `close_found` and the ready prefix
 /// has already been emitted:
 /// collecting here — after the prefix streams — is what keeps the auction
-/// riding alongside transfer instead of blocking it. Collection runs before the
-/// tail is processed so `lol_html` sees live bids at the injection point.
-async fn hold_collect_close_tail<P: StreamProcessor>(
-    processor: &mut P,
+/// riding alongside transfer instead of blocking it. The parser has already
+/// transformed the tail; replace its marker with the collected bids before encoding.
+async fn hold_collect_close_tail(
     encoder: &mut BodyStreamEncoder,
     state: &mut AuctionHoldState,
     collect_refs: &AuctionCollectDeps<'_>,
@@ -1107,24 +1177,25 @@ async fn hold_collect_close_tail<P: StreamProcessor>(
     // collect await above was still pending is reported.
     state.dispatched.disarm();
 
+    let bids = inline_bids_script(collect_refs.ad_bids_state);
+    let encoded = encoder.encode_chunk(bids.into_bytes())?;
+    if !encoded.is_empty() {
+        segments.push(bytes::Bytes::from(encoded));
+    }
+
     let held = state
         .hold
         .take()
-        .expect("should have close-body hold buffer")
+        .expect("should have inline body seam")
         .finish();
-    if let Some(encoded) = process_and_encode_chunk(
-        processor,
-        encoder,
-        &held,
-        false,
-        "Failed to process held body close",
-    )? {
-        segments.push(encoded);
+    let encoded = encoder.encode_chunk(held)?;
+    if !encoded.is_empty() {
+        segments.push(bytes::Bytes::from(encoded));
     }
     Ok(segments)
 }
 
-/// Pull and decode the next chunk of the close-body hold pipeline, feeding it
+/// Pull, decode, process, and scan the next chunk of the inline seam pipeline.
 /// through [`hold_step_decoded_chunk`].
 ///
 /// Returns `Ok(None)` when the source is exhausted; the caller must then emit
@@ -1184,7 +1255,7 @@ async fn hold_finish_ready_segments<P: StreamProcessor>(
     encoder: &mut BodyStreamEncoder,
     state: &mut AuctionHoldState,
     collect_refs: &AuctionCollectDeps<'_>,
-) -> Result<Vec<bytes::Bytes>, Report<TrustedServerError>> {
+) -> Result<HoldStepSegments, Report<TrustedServerError>> {
     let decoded_tail = match decoder.finish() {
         Ok(decoded_tail) => decoded_tail,
         Err(err) => {
@@ -1192,42 +1263,77 @@ async fn hold_finish_ready_segments<P: StreamProcessor>(
             return Err(err);
         }
     };
-    if decoded_tail.is_empty() {
-        return Ok(Vec::new());
-    }
-    let step =
+    let mut step =
         hold_step_decoded_chunk(processor, encoder, &decoded_tail, state, collect_refs).await?;
-    Ok(step.ready)
+
+    let final_processed =
+        match processor
+            .process_chunk(&[], true)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to finalize processor".to_string(),
+            }) {
+            Ok(processed) => processed,
+            Err(err) => {
+                abandon_hold_auction(state, collect_refs.services, "stream_process_error").await;
+                return Err(err);
+            }
+        };
+    let final_ready = match state.hold.as_mut() {
+        Some(seam) => seam.push(&final_processed),
+        None => final_processed,
+    };
+    let encoded = match encoder.encode_chunk(final_ready) {
+        Ok(encoded) => encoded,
+        Err(err) => {
+            abandon_hold_auction(state, collect_refs.services, "stream_encode_error").await;
+            return Err(err.change_context(TrustedServerError::Proxy {
+                message: "Failed to encode finalized HTML".to_string(),
+            }));
+        }
+    };
+    if !encoded.is_empty() {
+        step.ready.push(bytes::Bytes::from(encoded));
+    }
+    step.close_found = state.hold.as_ref().is_some_and(InlineBodyCloseSeam::found);
+
+    if !step.close_found
+        && let Some(seam) = state.hold.take()
+    {
+        let encoded = match encoder.encode_chunk(seam.finish()) {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                abandon_hold_auction(state, collect_refs.services, "stream_encode_error").await;
+                return Err(err);
+            }
+        };
+        if !encoded.is_empty() {
+            step.ready.push(bytes::Bytes::from(encoded));
+        }
+    }
+    Ok(step)
 }
 
-/// Finalize the close-body hold pipeline after [`hold_finish_ready_segments`].
+/// Finalize the inline seam pipeline after [`hold_finish_ready_segments`].
 ///
-/// Collects the auction if the close-body tag never streamed, processes the held
-/// tail plus the processor's final chunk, and emits the encoder trailer. Returns
+/// Collects the auction if the body-end marker never streamed, releases any
+/// remaining seam bytes, and emits the encoder trailer. Returns
 /// the encoded segments for the caller to emit.
-async fn hold_finish_tail_segments<P: StreamProcessor>(
-    processor: &mut P,
+async fn hold_finish_tail_segments(
     encoder: &mut BodyStreamEncoder,
     state: &mut AuctionHoldState,
     collect_refs: &AuctionCollectDeps<'_>,
 ) -> Result<Vec<bytes::Bytes>, Report<TrustedServerError>> {
     let mut segments = Vec::new();
 
-    // If the hold is still armed the auction was never collected mid-stream:
-    // `</body>` arrived only in the decoder tail, or the document had none at
-    // all. Collect now and flush the held remainder before finalizing.
-    if state.hold.is_some() {
-        segments.extend(hold_collect_close_tail(processor, encoder, state, collect_refs).await?);
+    if let Some(dispatched) = state.dispatched.take() {
+        collect_stream_auction(dispatched, state.telemetry.take(), collect_refs).await;
+        state.dispatched.disarm();
     }
-
-    if let Some(encoded) = process_and_encode_chunk(
-        processor,
-        encoder,
-        &[],
-        true,
-        "Failed to finalize processor",
-    )? {
-        segments.push(encoded);
+    if let Some(seam) = state.hold.take() {
+        let encoded = encoder.encode_chunk(seam.finish())?;
+        if !encoded.is_empty() {
+            segments.push(bytes::Bytes::from(encoded));
+        }
     }
     let trailer = encoder.finish()?;
     if !trailer.is_empty() {
@@ -1265,6 +1371,8 @@ struct HtmlStreamProcessorParams<'a> {
     shared_template_authorized: bool,
     /// Where the transform records a response-bound CSP nonce, when one matters.
     csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// Request-specific parser marker used by a pending inline auction.
+    deferred_inline_marker: Option<String>,
 }
 
 /// The diagnostics decision the template may carry.
@@ -1408,23 +1516,37 @@ pub(crate) fn body_close_injection(
     }
 }
 
-struct HtmlLateBindingOptions<'a> {
-    placeholder: &'a BidPlaceholder,
-    tracker: Arc<HtmlInjectionTracker>,
+fn deferred_inline_seam_token(
+    settings: &Settings,
+    shared_template_authorized: bool,
+    head_script_present: bool,
+    auction_pending: bool,
+) -> Option<Vec<u8>> {
+    (auction_pending
+        && head_script_present
+        && matches!(
+            effective_assembly_mode(settings, shared_template_authorized),
+            AssemblyMode::Inline
+        ))
+    .then(|| {
+        format!(
+            "<!--ts-inline-body-close-{}-->",
+            uuid::Uuid::new_v4().simple()
+        )
+        .into_bytes()
+    })
 }
 
 fn create_html_stream_processor(
     params: HtmlStreamProcessorParams<'_>,
 ) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
-    create_html_stream_processor_with_late_binding(params, None)
+    create_html_stream_processor_with_document_state(params, &IntegrationDocumentState::default())
 }
 
-fn create_html_stream_processor_with_late_binding<'a>(
-    params: HtmlStreamProcessorParams<'a>,
-    late_binding: Option<HtmlLateBindingOptions<'a>>,
-) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
-    use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
-
+fn create_html_stream_processor_with_document_state(
+    params: HtmlStreamProcessorParams<'_>,
+    document_state: &IntegrationDocumentState,
+) -> Result<crate::html_processor::HtmlWithStreamingProcessors, Report<TrustedServerError>> {
     let config = HtmlProcessorConfig::from_settings(
         params.settings,
         params.integration_registry,
@@ -1434,10 +1556,11 @@ fn create_html_stream_processor_with_late_binding<'a>(
     );
 
     let assembly_mode = effective_assembly_mode(params.settings, params.shared_template_authorized);
-    let body_close = if late_binding.is_some() {
-        BodyCloseInjection::None
-    } else {
-        body_close_injection(assembly_mode, params.ad_slots_script.is_some())
+    let body_close = match (assembly_mode, params.deferred_inline_marker) {
+        (AssemblyMode::Inline, Some(marker)) if params.ad_slots_script.is_some() => {
+            BodyCloseInjection::DeferredInlineMarker(marker)
+        }
+        _ => body_close_injection(assembly_mode, params.ad_slots_script.is_some()),
     };
 
     let gpt_diagnostics = template_gpt_diagnostics(assembly_mode, params.gpt_diagnostics);
@@ -1449,21 +1572,20 @@ fn create_html_stream_processor_with_late_binding<'a>(
         .then_some(params.csp_nonce_observed)
         .flatten();
 
-    let mut config = config
+    let config = config
         .with_ad_state(params.ad_slots_script, params.ad_bids_state)
         .with_gpt_diagnostics(gpt_diagnostics)
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed)
         .with_datadome_client_tag_suppression(params.suppress_datadome_client_side_tag);
 
-    if let Some(late_binding) = late_binding {
-        config = config.with_bid_placeholder(
-            late_binding.placeholder.as_html().to_owned(),
-            late_binding.tracker,
-        );
-    }
-
-    Ok(create_html_processor(config))
+    let processor = create_html_processor_with_document_state(config, document_state);
+    processor
+        .validate_capabilities()
+        .change_context(TrustedServerError::Configuration {
+            message: "HTML processor EOF capabilities are inconsistent".to_string(),
+        })?;
+    Ok(processor)
 }
 
 /// Result of publisher request handling, indicating whether the response body
@@ -1506,7 +1628,7 @@ pub enum PublisherResponse {
     /// byte, which measured ~100x worse TTFB than doing nothing. The finalizer owns the
     /// `Arc`s a `'static` stream needs.
     ///
-    /// Spike-only, for the #1009 ESI validation.
+    /// Used only by the shared-template assembly modes, which are opt-in per deployment.
     AssembleTemplate {
         /// Response with every header already set. `Content-Length` must stay absent:
         /// the assembled length is unknown until bids resolve.
@@ -1626,7 +1748,7 @@ pub struct OwnedProcessResponseParams {
     /// presence *is* the decision — there is no second place that could disagree with
     /// the gate, and no way to reach the store without having passed it.
     ///
-    /// Spike-only, for the #1009 ESI validation.
+    /// Used only by the shared-template assembly modes, which are opt-in per deployment.
     pub(crate) template_cache_key: Option<AuthorizedTemplateStore>,
     /// Slot definitions for the `</body>` seam under a shared mode, as JSON.
     ///
@@ -1634,13 +1756,18 @@ pub struct OwnedProcessResponseParams {
     pub(crate) seam_ad_slots: Option<String>,
     /// Origin policy headers to store with the template and replay on a hit.
     pub(crate) policy_headers: Vec<(String, String)>,
-    pub(crate) input_compression: Compression,
-    pub(crate) output_compression: Compression,
+    pub(crate) content_encoding: String,
+    /// Delivery override independent of the origin decoder.
+    pub(crate) output_compression: Option<Compression>,
     pub(crate) origin_host: String,
     pub(crate) origin_url: String,
     pub(crate) request_host: String,
     pub(crate) request_scheme: String,
     pub(crate) content_type: String,
+    /// Authoritative origin status exposed to terminal integrations.
+    pub(crate) response_status: StatusCode,
+    /// Whether status or headers identify a range-associated representation.
+    pub(crate) range_associated: bool,
     pub(crate) ad_slots_script: Option<String>,
     pub(crate) ad_bids_state: AdBidsState,
     /// Observation context for the in-flight auction.
@@ -1664,6 +1791,21 @@ pub struct OwnedProcessResponseParams {
     /// rescanned from the output, which cannot tell a `nonce` attribute from the same
     /// word inside a script.
     pub(crate) csp_nonce_observed: Option<Arc<AtomicBool>>,
+}
+
+impl OwnedProcessResponseParams {
+    fn transform_compression(&self) -> Compression {
+        if self.template_cache_key.is_some() {
+            Compression::None
+        } else {
+            self.output_compression
+                .unwrap_or_else(|| Compression::from_content_encoding(&self.content_encoding))
+        }
+    }
+
+    fn is_range_associated(&self) -> bool {
+        self.range_associated || self.response_status == StatusCode::PARTIAL_CONTENT
+    }
 }
 
 /// Response-authorized template cache insert inputs. The key is built before origin lookup; the
@@ -1704,20 +1846,28 @@ enum TemplateStoreOutcome {
 /// # Errors
 ///
 /// Returns an error if the streaming pipeline fails to process the response
-/// body, or if the processed body exceeds the configured buffer cap.
+/// body, if the processed body exceeds the configured buffer cap, or if async
+/// HTML completion lacks operator permission or has inconsistent factory/session
+/// capabilities.
 ///
 /// # Panics
 ///
 /// Panics if the `ad_bids_state` mutex is poisoned, which requires a prior panic while
 /// it was held. Every holder is a short, infallible read or write of an `Option<String>`.
 pub async fn buffer_publisher_response_async(
-    publisher_response: PublisherResponse,
+    mut publisher_response: PublisherResponse,
     method: &Method,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
     orchestrator: &AuctionOrchestrator,
     services: &RuntimeServices,
 ) -> Result<Response<EdgeBody>, Report<crate::error::TrustedServerError>> {
+    if let Err(error) = integration_registry.ensure_async_html_finish_allowed(settings) {
+        if let PublisherResponse::Stream { params, .. } = &mut publisher_response {
+            abandon_response_auction(params, services, "processor_init_error").await;
+        }
+        return Err(error);
+    }
     match publisher_response {
         PublisherResponse::Buffered(mut response) => {
             // A buffered-unmodified response can carry an origin body (a stream
@@ -1757,6 +1907,21 @@ pub async fn buffer_publisher_response_async(
                 }
                 return Ok(response);
             }
+            params.response_status = response.status();
+            params.range_associated = response_is_range_associated(&response);
+            if params.is_range_associated()
+                && is_html_content_type(&params.content_type)
+                && integration_registry.has_async_html_finish()
+            {
+                abandon_response_auction(&mut params, services, "partial_response").await;
+                *response.body_mut() = body;
+                return Ok(response);
+            }
+            if is_html_content_type(&params.content_type)
+                && integration_registry.has_async_html_finish()
+            {
+                enforce_synthesized_html_cache_privacy(&mut response);
+            }
             let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
             stream_publisher_body_async(
                 body,
@@ -1768,16 +1933,15 @@ pub async fn buffer_publisher_response_async(
                 services,
             )
             .await?;
-            // Authorized template cache transforms are emitted as identity by
-            // `process_response_streaming_async`; inline transforms retain the origin
-            // coding. This avoids recompressing and immediately decoding a full document.
+            // Authorized template transforms stay identity before storage. Other
+            // transforms use the independently selected delivery encoding.
             let bytes = output.into_inner();
-            // Cache taxonomy for this path: C1 is the raw origin/read-through cache,
-            // the template cache stores processed reader-neutral HTML, and C3 would be
-            // a forbidden cache of the final per-user assembled response.
+            // The origin readthrough cache holds raw origin bytes; the template cache
+            // stores processed reader-neutral HTML. Caching the final per-user
+            // assembled response is forbidden.
             // Store first, assemble second — never the reverse. The stored bytes are
             // shared between visitors; the assembled ones carry this visitor's bids.
-            // Swapping these two lines would create the forbidden C3 leak.
+            // Swapping these two lines would leak an assembled response into the cache.
             // Read before the store: `store_template_if_authorized` *takes* the key so a
             // request cannot store twice, which would leave nothing for assembly to gate
             // on.
@@ -1998,30 +2162,37 @@ fn assemble_if_shared(
     Ok((out, Some(AssemblyResponseState::ByteSeamFallback)))
 }
 
-/// Fingerprint of every configuration input plus the compiled browser bundle.
+/// Fingerprint of settings, browser bundles, and the core implementation.
 ///
 /// This intentionally over-invalidates. Trying to maintain a hand-written list already
 /// omitted publisher origin identity and creative-opportunity shaping fields. A digest of
 /// the complete typed settings cannot expose secret values and makes future config fields
 /// safe by default: a change misses until someone proves it irrelevant, never cross-serves
-/// an old template under new behavior.
+/// an old template under new behavior. The build digest additionally covers core source
+/// files (including embedded head scripts), build logic, manifests, and the workspace
+/// lockfile when present, so implementation edits automatically invalidate templates.
 ///
 /// # Panics
 ///
 /// Does not panic: serializing the already-deserialized typed settings to a JSON value is
 /// infallible for this schema.
 fn template_fingerprint(settings: &Settings) -> String {
-    use sha2::Digest as _;
+    template_fingerprint_with_build_digest(settings, TEMPLATE_BUILD_DIGEST)
+}
 
+fn template_fingerprint_with_build_digest(settings: &Settings, build_digest: &str) -> String {
     let mut hasher = sha2::Sha256::new();
+    hasher.update(build_digest.as_bytes());
     hasher.update(
-        trusted_server_js::concatenated_hash(&trusted_server_js::all_module_ids()).as_bytes(),
+        trusted_server_js::concatenated_hash(trusted_server_js::all_module_ids()).as_bytes(),
     );
-    // `serde_json::Value` uses a sorted object map without `preserve_order`, making
-    // independently deserialized HashMaps canonical before they are serialized again.
+    // EdgeZero's canonical form sorts object keys itself, so independently deserialized
+    // HashMaps hash identically even when a dependency enables `serde_json/preserve_order`.
+    // Array order is preserved: set-valued settings must serialize deterministically
+    // themselves (for example, `allowed_context_keys` uses a `BTreeSet`).
     let canonical = serde_json::to_value(settings)
-        .and_then(|value| serde_json::to_vec(&value))
-        .expect("serializing typed settings should be infallible");
+        .map(|value| edgezero_core::canonical_form::canonical_data_sha256(&value))
+        .expect("should serialize typed settings infallibly");
     hasher.update(canonical);
     hex::encode(hasher.finalize())
 }
@@ -2068,13 +2239,15 @@ fn build_template_assembly_params(
     ad_bids_state: AdBidsState,
 ) -> OwnedProcessResponseParams {
     OwnedProcessResponseParams {
+        output_compression: None,
+        response_status: StatusCode::OK,
+        range_associated: false,
         csp_nonce_observed: None,
         // Already stored; storing again on a hit would be pointless work.
         template_cache_key: None,
         seam_ad_slots: None,
         policy_headers: Vec::new(),
-        input_compression: Compression::from_content_encoding(&entry.metadata.content_encoding),
-        output_compression: Compression::None,
+        content_encoding: entry.metadata.content_encoding.clone(),
         origin_host: String::new(),
         origin_url: settings.publisher.origin_url.clone(),
         request_host: request_host.to_string(),
@@ -2200,7 +2373,7 @@ impl core::error::Error for SeamError {}
 /// the publisher path stamps `private, no-store` and strips validators. Omitting it
 /// here does not fall back to a safe default — it emits HTML with no `Cache-Control` at
 /// all, which is heuristically cacheable by browsers and intermediaries. That is a
-/// forbidden C3 cache of a final per-user assembled response.
+/// forbidden cache of a final per-user assembled response.
 ///
 /// Asserting the absence of `public`/`s-maxage`/`Surrogate-Control` would not have
 /// caught it. Nothing was present to forbid.
@@ -2210,7 +2383,7 @@ impl core::error::Error for SeamError {}
 /// Returns an error if the stored metadata cannot be rendered as header values, which
 /// would mean a corrupt entry.
 ///
-/// Spike-only, for the #1009 ESI validation.
+/// Used only by the shared-template assembly modes, which are opt-in per deployment.
 fn build_cached_template_response(
     entry: &crate::platform::TemplateEntry,
     reader_compression: Compression,
@@ -2264,7 +2437,7 @@ fn build_cached_template_response(
 /// service, not a broken one, and the whole point of the template cache is that the response is
 /// reproducible without it.
 ///
-/// Spike-only, for the #1009 ESI validation.
+/// Used only by the shared-template assembly modes, which are opt-in per deployment.
 async fn store_template_if_authorized(
     params: &mut OwnedProcessResponseParams,
     bytes: &[u8],
@@ -2318,8 +2491,9 @@ async fn store_template_if_authorized(
 ///
 /// # Errors
 ///
-/// Returns an error if processor construction fails before the streaming body
-/// is created; a dispatched auction is abandoned with `processor_init_error`
+/// Returns an error if async HTML completion lacks operator permission, has
+/// inconsistent factory/session capabilities, or processor construction fails
+/// before the streaming body is created; a dispatched auction is abandoned with `processor_init_error`
 /// telemetry first, matching the buffered finalizer.
 ///
 /// # Panics
@@ -2327,13 +2501,19 @@ async fn store_template_if_authorized(
 /// Panics if the `ad_bids_state` mutex is poisoned, which requires a prior panic while
 /// it was held. Every holder is a short, infallible read or write of an `Option<String>`.
 pub async fn publisher_response_into_streaming_response(
-    publisher_response: PublisherResponse,
+    mut publisher_response: PublisherResponse,
     method: &Method,
     settings: Arc<Settings>,
     integration_registry: &IntegrationRegistry,
     orchestrator: Arc<AuctionOrchestrator>,
     services: RuntimeServices,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    if let Err(error) = integration_registry.ensure_async_html_finish_allowed(&settings) {
+        if let PublisherResponse::Stream { params, .. } = &mut publisher_response {
+            abandon_response_auction(params, &services, "processor_init_error").await;
+        }
+        return Err(error);
+    }
     // A template can only be stored once the transform has produced every byte, and
     // streaming hands bytes to the client as they are produced rather than collecting
     // them. Shared modes therefore take the buffered finalizer, which already
@@ -2342,23 +2522,26 @@ pub async fn publisher_response_into_streaming_response(
     // Deliberately keyed on the store authorization rather than on the assembly mode:
     // a shared-mode response the gate rejected has nothing to store, so it keeps
     // streaming. `Inline` — the shipped path — never reaches this branch at all, which
-    // is the point. The spike cannot regress production latency by construction.
+    // is the point: the shared-template path cannot regress the default by construction.
     //
     // The cost is that a template cache *miss* buffers. That is the right trade: misses are already
-    // paying an origin fetch and a full transform, and what the spike measures is the
+    // paying an origin fetch and a full transform, and the case that matters is the
     // hit, where there is no origin fetch to stream from in the first place.
     if matches!(
         &publisher_response,
         PublisherResponse::Stream { params, .. } if params.template_cache_key.is_some()
     ) {
-        return buffer_publisher_response_async(
+        // This already-buffered cache miss can nest large codec futures.
+        // Keep its future off the WASI call stack; ordinary inline streaming
+        // never takes this branch.
+        return Box::pin(buffer_publisher_response_async(
             publisher_response,
             method,
             &settings,
             integration_registry,
             &orchestrator,
             &services,
-        )
+        ))
         .await;
     }
 
@@ -2495,11 +2678,68 @@ pub async fn publisher_response_into_streaming_response(
                 return Ok(response);
             }
 
+            params.response_status = response.status();
+            params.range_associated = response_is_range_associated(&response);
+            if params.is_range_associated()
+                && is_html_content_type(&params.content_type)
+                && integration_registry.has_async_html_finish()
+            {
+                abandon_response_auction(&mut params, &services, "partial_response").await;
+                *response.body_mut() = body;
+                return Ok(response);
+            }
             response.headers_mut().remove(header::CONTENT_LENGTH);
             let mut params = *params;
-            let mut processor =
+            if is_html_content_type(&params.content_type)
+                && integration_registry.has_async_html_finish()
+            {
+                enforce_synthesized_html_cache_privacy(&mut response);
+                let mut driver = Box::pin(build_html_eof_driver(
+                    body,
+                    &mut params,
+                    &settings,
+                    integration_registry,
+                    &services,
+                ))
+                .await?;
+                let stream = async_stream::try_stream! {
+                    let deps = AuctionCollectDeps {
+                        price_granularity: params.price_granularity,
+                        ad_bids_state: &params.ad_bids_state,
+                        orchestrator: &orchestrator,
+                        services: &services,
+                        settings: &settings,
+                        request_origin: request_origin(
+                            &params.request_scheme,
+                            &params.request_host,
+                        ),
+                    };
+                    while let Some(step) = driver
+                        .next_step(&deps)
+                        .await
+                        .map_err(publisher_stream_error)?
+                    {
+                        for segment in step.ready {
+                            yield segment;
+                        }
+                        if step.close_found {
+                            for segment in driver
+                                .collect_close(&deps)
+                                .await
+                                .map_err(publisher_stream_error)?
+                            {
+                                yield segment;
+                            }
+                        }
+                    }
+                };
+                *response.body_mut() = EdgeBody::from_stream::<_, std::io::Error>(stream);
+                return Ok(response);
+            }
+
+            let (mut processor, inline_seam_token) =
                 match PublisherBodyProcessor::new(&params, &settings, integration_registry) {
-                    Ok(processor) => processor,
+                    Ok(built) => built,
                     Err(err) => {
                         // Parity with the buffered finalizer: a processor
                         // construction failure abandons the dispatched auction
@@ -2527,13 +2767,14 @@ pub async fn publisher_response_into_streaming_response(
                 (DispatchedAuctionGuard::new(dispatched), telemetry)
             });
             let stream = async_stream::try_stream! {
+                let compression = Compression::from_content_encoding(&params.content_encoding);
                 let max_body_bytes = settings.publisher.max_buffered_body_bytes;
-                let mut decoder = BodyStreamDecoder::new(params.input_compression, max_body_bytes);
-                let mut encoder = BodyStreamEncoder::new(params.output_compression);
+                let mut decoder = BodyStreamDecoder::new(compression, max_body_bytes);
+                let mut encoder = BodyStreamEncoder::new(params.transform_compression());
                 let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE)
                     .with_max_bytes(max_body_bytes);
 
-                // HTML rides the close-body hold so bids land before `</body>`;
+                // HTML rides the parser-confirmed seam so bids land before `</body>`;
                 // non-HTML has no injection point, so its auction is collected
                 // before any byte streams (matching the buffered finalizer).
                 let mut hold_auction = None;
@@ -2558,7 +2799,11 @@ pub async fn publisher_response_into_streaming_response(
                 }
 
                 if let Some((guard, telemetry)) = hold_auction {
-                    let mut state = AuctionHoldState::new(guard, telemetry);
+                    let mut state = AuctionHoldState::new(
+                        guard,
+                        telemetry,
+                        inline_seam_token,
+                    );
                     let collect_refs = AuctionCollectDeps {
                         price_granularity: params.price_granularity,
                         ad_bids_state: &params.ad_bids_state,
@@ -2590,7 +2835,6 @@ pub async fn publisher_response_into_streaming_response(
                         }
                         if step.close_found {
                             for encoded in hold_collect_close_tail(
-                                &mut processor,
                                 &mut encoder,
                                 &mut state,
                                 &collect_refs,
@@ -2607,7 +2851,7 @@ pub async fn publisher_response_into_streaming_response(
                     // before collection, for the same reason as the mid-stream
                     // prefix above: a small compressed page can surface its
                     // whole document here.
-                    for encoded in hold_finish_ready_segments(
+                    let final_step = hold_finish_ready_segments(
                         &mut processor,
                         &mut decoder,
                         &mut encoder,
@@ -2615,12 +2859,23 @@ pub async fn publisher_response_into_streaming_response(
                         &collect_refs,
                     )
                     .await
-                    .map_err(publisher_stream_error)?
-                    {
+                    .map_err(publisher_stream_error)?;
+                    for encoded in final_step.ready {
                         yield encoded;
                     }
+                    if final_step.close_found {
+                        for encoded in hold_collect_close_tail(
+                            &mut encoder,
+                            &mut state,
+                            &collect_refs,
+                        )
+                        .await
+                        .map_err(publisher_stream_error)?
+                        {
+                            yield encoded;
+                        }
+                    }
                     for encoded in hold_finish_tail_segments(
-                        &mut processor,
                         &mut encoder,
                         &mut state,
                         &collect_refs,
@@ -2695,6 +2950,11 @@ fn response_carries_body(method: &Method, status: StatusCode) -> bool {
         && status != StatusCode::NO_CONTENT
         && status != StatusCode::RESET_CONTENT
         && status != StatusCode::NOT_MODIFIED
+}
+
+fn response_is_range_associated(response: &Response<EdgeBody>) -> bool {
+    response.status() == StatusCode::PARTIAL_CONTENT
+        || response.headers().contains_key(header::CONTENT_RANGE)
 }
 
 /// Prevent shared caches from replaying tag-suppressed HTML to other clients.
@@ -2805,6 +3065,17 @@ impl Write for BoundedWriter {
 /// I/O happened upstream in [`handle_publisher_request`]. Writes processed
 /// chunks directly to `output`.
 ///
+/// This helper performs synchronous transformations only. Registered HTML
+/// finalizers require [`stream_publisher_body_async`],
+/// [`buffer_publisher_response_async`], or
+/// [`publisher_response_into_streaming_response`]. Adapters use those async
+/// entry points when terminal integrations are enabled.
+///
+/// Callers with a pending auction must use an async entry point so it can be
+/// collected or abandoned. This helper borrows `params` and leaves auction
+/// ownership with the caller, including when range-associated HTML bypasses
+/// processing.
+///
 /// # Errors
 ///
 /// Returns an error if processing fails mid-stream. Since headers are already
@@ -2817,8 +3088,26 @@ pub fn stream_publisher_body<W: Write>(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
 ) -> Result<(), Report<TrustedServerError>> {
+    if params.is_range_associated()
+        && is_html_content_type(&params.content_type)
+        && integration_registry.has_async_html_finish()
+    {
+        let mut input = body_as_reader(body)?;
+        std::io::copy(&mut input, output).change_context(TrustedServerError::Proxy {
+            message: "Failed to copy range-associated HTML".to_string(),
+        })?;
+        return output.flush().change_context(TrustedServerError::Proxy {
+            message: "Failed to flush range-associated HTML".to_string(),
+        });
+    }
+    if is_html_content_type(&params.content_type) && integration_registry.has_async_html_finish() {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: "Registered HTML processors require an asynchronous publisher entry point"
+                .to_string(),
+        }));
+    }
     let borrowed = ProcessResponseParams {
-        input_compression: params.input_compression,
+        content_encoding: &params.content_encoding,
         origin_host: &params.origin_host,
         origin_url: &params.origin_url,
         request_host: &params.request_host,
@@ -2833,35 +3122,128 @@ pub fn stream_publisher_body<W: Write>(
         shared_template_authorized: params.template_cache_key.is_some(),
         csp_nonce_observed: params.csp_nonce_observed.as_ref(),
     };
-    let output_compression = if params.template_cache_key.is_some() {
-        Compression::None
-    } else {
-        params.output_compression
-    };
+    let output_compression = params.transform_compression();
     process_response_streaming(body, output, &borrowed, output_compression)
 }
 
-/// Stream publisher body with a `</body` tail hold for live bid injection.
+async fn abandon_response_auction(
+    params: &mut OwnedProcessResponseParams,
+    services: &RuntimeServices,
+    reason: &'static str,
+) {
+    if let Some(dispatched) = params.dispatched_auction.take() {
+        emit_abandoned_auction(
+            services,
+            params.auction_observation.take(),
+            dispatched,
+            reason,
+        )
+        .await;
+    }
+}
+
+async fn build_html_eof_driver(
+    body: EdgeBody,
+    params: &mut OwnedProcessResponseParams,
+    settings: &Settings,
+    registry: &IntegrationRegistry,
+    services: &RuntimeServices,
+) -> Result<Box<HtmlEofDriver>, Report<TrustedServerError>> {
+    match HtmlEofDriver::new(body, params, settings, registry) {
+        Ok(driver) => Ok(Box::new(driver)),
+        Err(error) => {
+            if let Some(dispatched) = params.dispatched_auction.take() {
+                emit_abandoned_auction(
+                    services,
+                    params.auction_observation.take(),
+                    dispatched,
+                    "processor_init_error",
+                )
+                .await;
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn stream_html_eof<W: Write>(
+    body: EdgeBody,
+    output: &mut W,
+    params: &mut OwnedProcessResponseParams,
+    settings: &Settings,
+    registry: &IntegrationRegistry,
+    orchestrator: &AuctionOrchestrator,
+    services: &RuntimeServices,
+) -> Result<(), Report<TrustedServerError>> {
+    let mut driver = build_html_eof_driver(body, params, settings, registry, services).await?;
+    let deps = AuctionCollectDeps {
+        price_granularity: params.price_granularity,
+        ad_bids_state: &params.ad_bids_state,
+        orchestrator,
+        services,
+        settings,
+        request_origin: request_origin(&params.request_scheme, &params.request_host),
+    };
+    while let Some(step) = driver.next_step(&deps).await? {
+        for segment in step.ready {
+            if let Err(error) = output.write_all(&segment) {
+                driver.abandon(&deps, "stream_write_error").await;
+                return Err(
+                    Report::new(error).change_context(TrustedServerError::Proxy {
+                        message: "Failed to write finalized HTML".to_string(),
+                    }),
+                );
+            }
+        }
+        if (step.close_found || driver.at_finish_barrier())
+            && let Err(error) = output.flush()
+        {
+            driver.abandon(&deps, "stream_write_error").await;
+            return Err(
+                Report::new(error).change_context(TrustedServerError::Proxy {
+                    message: "Failed to flush finalized HTML".to_string(),
+                }),
+            );
+        }
+        if step.close_found {
+            for segment in driver.collect_close(&deps).await? {
+                if let Err(error) = output.write_all(&segment) {
+                    driver.abandon(&deps, "stream_write_error").await;
+                    return Err(
+                        Report::new(error).change_context(TrustedServerError::Proxy {
+                            message: "Failed to write HTML auction tail".to_string(),
+                        }),
+                    );
+                }
+            }
+        }
+    }
+    output.flush().change_context(TrustedServerError::Proxy {
+        message: "Failed to flush finalized HTML".to_string(),
+    })
+}
+
+/// Stream publisher body with parser-confirmed live bid injection.
 ///
-/// Drives the origin body through the HTML pipeline one chunk at a time, using a
-/// small buffer that holds the first raw `</body` tail. When the origin body is
-/// exhausted (`read` returns `Ok(0)`):
+/// Drives the origin body through the HTML pipeline one chunk at a time. The
+/// parser inserts a request-specific marker at the structural body end, and a
+/// small exact-token scanner holds only the output after that marker.
 ///
 /// 1. [`collect_dispatched_auction`](AuctionOrchestrator::collect_dispatched_auction)
 ///    is awaited with the remaining deadline.
 /// 2. Winning bids are written to `ad_bids_state`.
-/// 3. The held tail is fed through the pipeline so `lol_html` fires its
-///    `</body>` handler with bids now in state.
+/// 3. The generated marker is replaced with the collected bid script.
 ///
 /// For non-HTML content types the auction is collected before any body bytes
-/// are written (no `</body>` to inject).  If `params.dispatched_auction` is
-/// `None` the function falls back to the synchronous
-/// [`stream_publisher_body`] path.
+/// are written (no `</body>` to inject). Opted-in HTML always uses the ordered
+/// EOF driver, including when no auction was dispatched. Other responses without
+/// `params.dispatched_auction` use the synchronous [`stream_publisher_body`] path.
 ///
 /// # Errors
 ///
-/// Returns an error if processing fails mid-stream. Headers are already
-/// committed at that point; the caller logs and drops the `StreamingBody`.
+/// Returns an error for missing async HTML operator permission or inconsistent
+/// factory/session capabilities, or if processing fails mid-stream. If headers
+/// are already committed, the caller logs the error and drops the body.
 pub async fn stream_publisher_body_async<W: Write>(
     body: EdgeBody,
     output: &mut W,
@@ -2871,6 +3253,39 @@ pub async fn stream_publisher_body_async<W: Write>(
     orchestrator: &AuctionOrchestrator,
     services: &RuntimeServices,
 ) -> Result<(), Report<TrustedServerError>> {
+    if let Err(error) = integration_registry.ensure_async_html_finish_allowed(settings) {
+        abandon_response_auction(params, services, "processor_init_error").await;
+        return Err(error);
+    }
+    if params.is_range_associated()
+        && is_html_content_type(&params.content_type)
+        && integration_registry.has_async_html_finish()
+    {
+        abandon_response_auction(params, services, "partial_response").await;
+        let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE);
+        while let Some(bytes) = source.next_chunk().await? {
+            output
+                .write_all(&bytes)
+                .change_context(TrustedServerError::Proxy {
+                    message: "Failed to copy range-associated HTML".to_string(),
+                })?;
+        }
+        return output.flush().change_context(TrustedServerError::Proxy {
+            message: "Failed to flush range-associated HTML".to_string(),
+        });
+    }
+    if is_html_content_type(&params.content_type) && integration_registry.has_async_html_finish() {
+        return Box::pin(stream_html_eof(
+            body,
+            output,
+            params,
+            settings,
+            integration_registry,
+            orchestrator,
+            services,
+        ))
+        .await;
+    }
     let Some(dispatched) = params.dispatched_auction.take() else {
         if body.is_stream() {
             return process_response_streaming_async(
@@ -2918,13 +3333,14 @@ pub async fn stream_publisher_body_async<W: Write>(
         return stream_publisher_body(body, output, params, settings, integration_registry);
     }
 
-    // HTML: build the processor once and drive it chunk by chunk. When slots
-    // matched, use an opaque placeholder emitted by the HTML parser rather than
-    // scanning origin bytes for a `</body>` sequence.
-    let parser_safe_late_binding = params.ad_slots_script.is_some() && !body.is_stream();
-    let placeholder = parser_safe_late_binding.then(BidPlaceholder::new);
-    let tracker = parser_safe_late_binding.then(|| Arc::new(HtmlInjectionTracker::default()));
-    let processor_params = HtmlStreamProcessorParams {
+    // HTML: let lol_html mark the structural body end for the auction seam.
+    let inline_seam_token = deferred_inline_seam_token(
+        settings,
+        params.template_cache_key.is_some(),
+        params.ad_slots_script.is_some(),
+        true,
+    );
+    let mut processor = match create_html_stream_processor(HtmlStreamProcessorParams {
         origin_host: &params.origin_host,
         request_host: &params.request_host,
         request_scheme: &params.request_scheme,
@@ -2936,67 +3352,44 @@ pub async fn stream_publisher_body_async<W: Write>(
         gpt_diagnostics: params.gpt_diagnostics.clone(),
         shared_template_authorized: params.template_cache_key.is_some(),
         csp_nonce_observed: params.csp_nonce_observed.clone(),
+        deferred_inline_marker: inline_seam_token
+            .as_ref()
+            .map(|token| String::from_utf8_lossy(token).into_owned()),
+    }) {
+        Ok(processor) => processor,
+        Err(err) => {
+            emit_abandoned_auction(
+                services,
+                telemetry.observation,
+                dispatched,
+                "processor_init_error",
+            )
+            .await;
+            return Err(err);
+        }
     };
-    let late_binding = placeholder
-        .as_ref()
-        .zip(tracker.as_ref())
-        .map(|(placeholder, tracker)| HtmlLateBindingOptions {
-            placeholder,
-            tracker: Arc::clone(tracker),
-        });
-    let mut processor =
-        match create_html_stream_processor_with_late_binding(processor_params, late_binding) {
-            Ok(processor) => processor,
-            Err(err) => {
-                emit_abandoned_auction(
-                    services,
-                    telemetry.observation,
-                    dispatched,
-                    "processor_init_error",
-                )
-                .await;
-                return Err(err);
-            }
-        };
 
-    let input_compression = params.input_compression;
-    let output_compression = if params.template_cache_key.is_some() {
-        Compression::None
-    } else {
-        params.output_compression
-    };
-    let collect_ctx = AuctionCollectCtx {
-        dispatched,
-        telemetry,
-        deps: AuctionCollectDeps {
-            price_granularity: params.price_granularity,
-            ad_bids_state: &params.ad_bids_state,
-            orchestrator,
-            services,
-            settings,
-            request_origin: request_origin(&params.request_scheme, &params.request_host),
-        },
-    };
-    if let Some(placeholder) = placeholder.as_ref() {
-        return stream_html_with_placeholder_late_binding(
-            body,
-            output,
-            &mut processor,
-            input_compression,
-            output_compression,
-            collect_ctx,
-            placeholder,
-        )
-        .await;
-    }
-
+    let input_compression = Compression::from_content_encoding(&params.content_encoding);
+    let output_compression = params.transform_compression();
     stream_html_with_auction_hold(
         body,
         output,
         &mut processor,
+        inline_seam_token,
         input_compression,
         output_compression,
-        collect_ctx,
+        AuctionCollectCtx {
+            dispatched,
+            telemetry,
+            deps: AuctionCollectDeps {
+                price_granularity: params.price_granularity,
+                ad_bids_state: &params.ad_bids_state,
+                orchestrator,
+                services,
+                settings,
+                request_origin: request_origin(&params.request_scheme, &params.request_host),
+            },
+        },
     )
     .await
 }
@@ -3025,13 +3418,25 @@ fn request_head_snapshot(req: &Request<EdgeBody>) -> Request<EdgeBody> {
     snapshot
 }
 
-fn should_preload_ec_snapshot(
+#[derive(Clone, Copy)]
+struct EcSnapshotPreloadInput {
     is_navigation: bool,
     is_get: bool,
     has_ec_id: bool,
     has_kv: bool,
-) -> bool {
-    is_navigation && is_get && has_ec_id && has_kv
+    marker_valid: bool,
+    auction_needs_row: bool,
+    eid_cookie_may_need_persistence: bool,
+    privacy_needs_row: bool,
+}
+
+fn should_preload_ec_snapshot(input: &EcSnapshotPreloadInput) -> bool {
+    let eligible = input.is_navigation && input.is_get && input.has_ec_id && input.has_kv;
+    let marker_can_skip = input.marker_valid
+        && !input.auction_needs_row
+        && !input.eid_cookie_may_need_persistence
+        && !input.privacy_needs_row;
+    eligible && !marker_can_skip
 }
 
 /// Rewrites a downstream request into an outbound publisher-origin request.
@@ -3125,15 +3530,12 @@ pub(crate) fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
     header("sec-purpose") || header("purpose")
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ServerSideAdStackConfig {
-    /// Dedicated `[creative_opportunities].enabled` switch.
-    ad_templates_enabled: bool,
-    /// Global `[auction].enabled` gate used by publisher/page-bids flows.
-    auction_enabled: bool,
-}
-
 /// Returns whether request-scoped signals permit an ad-eligible navigation.
+///
+/// This is the request half of the shared ad-stack gate: the configuration
+/// halves (`matched_slots`, the kill switches) are deliberately absent, because
+/// the cache policy for a structurally inactive template must distinguish a
+/// page that no request could activate from one this particular request skipped.
 fn is_server_side_ad_eligible_navigation(
     is_get: bool,
     is_navigation: bool,
@@ -3142,29 +3544,6 @@ fn is_server_side_ad_eligible_navigation(
     consent_allows_auction: bool,
 ) -> bool {
     is_get && is_navigation && !is_prefetch && !is_bot && consent_allows_auction
-}
-
-/// Returns true only when the publisher should inject and run server-side ad templates.
-///
-/// This includes auction dispatch plus initial ad-slot injection.
-fn should_run_server_side_ad_stack(
-    is_get: bool,
-    is_navigation: bool,
-    is_prefetch: bool,
-    is_bot: bool,
-    has_matched_slots: bool,
-    consent_allows_auction: bool,
-    config: ServerSideAdStackConfig,
-) -> bool {
-    is_server_side_ad_eligible_navigation(
-        is_get,
-        is_navigation,
-        is_prefetch,
-        is_bot,
-        consent_allows_auction,
-    ) && config.ad_templates_enabled
-        && has_matched_slots
-        && config.auction_enabled
 }
 
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
@@ -3614,12 +3993,13 @@ struct AuctionCollectDeps<'a> {
     request_origin: String,
 }
 
-/// Run the close-body hold loop for HTML bodies, collecting the auction before
-/// the raw `</body` tail is processed so `lol_html` sees live bids.
+/// Run the inline seam loop for HTML bodies, collecting the auction after the
+/// parser emits its request-specific structural marker.
 async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     body: EdgeBody,
     output: &mut W,
     processor: &mut P,
+    inline_seam_token: Option<Vec<u8>>,
     input_compression: Compression,
     output_compression: Compression,
     ctx: AuctionCollectCtx<'_>,
@@ -3634,6 +4014,7 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             output_compression,
             ctx,
             max_body_bytes,
+            inline_seam_token,
         )
         .await;
     }
@@ -3644,100 +4025,20 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     let body = body_as_reader(body)?;
     if output_compression == Compression::None {
         return match input_compression {
-            Compression::None => body_close_hold_loop(body, output, processor, ctx).await,
-            Compression::Gzip => {
-                let decoder = GzipDecodeReader::new(body, max_body_bytes);
-                body_close_hold_loop(decoder, output, processor, ctx).await
-            }
-            Compression::Deflate => {
-                let decoder = ZlibDecoder::new(body);
-                body_close_hold_loop(decoder, output, processor, ctx).await
-            }
-            Compression::Brotli => {
-                let decoder = Decompressor::new(body, STREAM_CHUNK_SIZE);
-                body_close_hold_loop(decoder, output, processor, ctx).await
-            }
-        };
-    }
-
-    debug_assert_eq!(input_compression, output_compression);
-    match input_compression {
-        Compression::None => body_close_hold_loop(body, output, processor, ctx).await,
-        Compression::Gzip => {
-            // `GzipDecodeReader` decodes concatenated gzip members (RFC 1952)
-            // and bounds decoded output, unlike `flate2::read::GzDecoder`, which
-            // silently drops every member after the first — dropping trailing
-            // markup (potentially including `</body>`) on buffered adapters.
-            let decoder = GzipDecodeReader::new(body, max_body_bytes);
-            let mut encoder = GzEncoder::new(&mut *output, flate2::Compression::default());
-            body_close_hold_loop(decoder, &mut encoder, processor, ctx).await?;
-            encoder.finish().change_context(TrustedServerError::Proxy {
-                message: "Failed to finalize gzip encoder".to_string(),
-            })?;
-            Ok(())
-        }
-        Compression::Deflate => {
-            let decoder = ZlibDecoder::new(body);
-            let mut encoder = ZlibEncoder::new(&mut *output, flate2::Compression::default());
-            body_close_hold_loop(decoder, &mut encoder, processor, ctx).await?;
-            encoder.finish().change_context(TrustedServerError::Proxy {
-                message: "Failed to finalize deflate encoder".to_string(),
-            })?;
-            Ok(())
-        }
-        Compression::Brotli => {
-            let decoder = Decompressor::new(body, STREAM_CHUNK_SIZE);
-            let params = BrotliEncoderParams {
-                quality: 4,
-                lgwin: 22,
-                ..Default::default()
-            };
-            let mut encoder =
-                CompressorWriter::with_params(&mut *output, STREAM_CHUNK_SIZE, &params);
-            body_close_hold_loop(decoder, &mut encoder, processor, ctx).await?;
-            let _ = encoder.into_inner();
-            Ok(())
-        }
-    }
-}
-
-struct LateBindingState<'a> {
-    dispatched: Option<DispatchedAuction>,
-    telemetry: AuctionTelemetryCarry,
-    deps: AuctionCollectDeps<'a>,
-    decoded_input_bytes: usize,
-    processed_output_bytes: usize,
-}
-
-/// Run parser-safe placeholder late binding for a buffered HTML body.
-async fn stream_html_with_placeholder_late_binding<W: Write>(
-    body: EdgeBody,
-    output: &mut W,
-    processor: &mut impl StreamProcessor,
-    input_compression: Compression,
-    output_compression: Compression,
-    ctx: AuctionCollectCtx<'_>,
-    placeholder: &BidPlaceholder,
-) -> Result<(), Report<TrustedServerError>> {
-    let max_body_bytes = ctx.deps.settings.publisher.max_buffered_body_bytes;
-    let body = body_as_reader(body)?;
-
-    if output_compression == Compression::None {
-        return match input_compression {
             Compression::None => {
-                placeholder_late_binding_loop(body, output, processor, ctx, placeholder).await
+                body_close_hold_loop(body, output, processor, ctx, inline_seam_token).await
             }
             Compression::Gzip => {
                 let decoder = GzipDecodeReader::new(body, max_body_bytes);
-                placeholder_late_binding_loop(decoder, output, processor, ctx, placeholder).await
+                body_close_hold_loop(decoder, output, processor, ctx, inline_seam_token).await
             }
             Compression::Deflate => {
                 let decoder = ZlibDecoder::new(body);
-                placeholder_late_binding_loop(decoder, output, processor, ctx, placeholder).await
+                body_close_hold_loop(decoder, output, processor, ctx, inline_seam_token).await
             }
             Compression::Brotli => {
                 let decoder = Decompressor::new(body, STREAM_CHUNK_SIZE);
-                placeholder_late_binding_loop(decoder, output, processor, ctx, placeholder).await
+                body_close_hold_loop(decoder, output, processor, ctx, inline_seam_token).await
             }
         };
     }
@@ -3745,13 +4046,16 @@ async fn stream_html_with_placeholder_late_binding<W: Write>(
     debug_assert_eq!(input_compression, output_compression);
     match input_compression {
         Compression::None => {
-            placeholder_late_binding_loop(body, output, processor, ctx, placeholder).await
+            body_close_hold_loop(body, output, processor, ctx, inline_seam_token).await
         }
         Compression::Gzip => {
+            // `GzipDecodeReader` decodes concatenated gzip members (RFC 1952)
+            // and bounds decoded output, unlike `flate2::read::GzDecoder`, which
+            // silently drops every member after the first — dropping trailing
+            // markup (potentially including `</body>`) on buffered adapters.
             let decoder = GzipDecodeReader::new(body, max_body_bytes);
             let mut encoder = GzEncoder::new(&mut *output, flate2::Compression::default());
-            placeholder_late_binding_loop(decoder, &mut encoder, processor, ctx, placeholder)
-                .await?;
+            body_close_hold_loop(decoder, &mut encoder, processor, ctx, inline_seam_token).await?;
             encoder.finish().change_context(TrustedServerError::Proxy {
                 message: "Failed to finalize gzip encoder".to_string(),
             })?;
@@ -3760,8 +4064,7 @@ async fn stream_html_with_placeholder_late_binding<W: Write>(
         Compression::Deflate => {
             let decoder = ZlibDecoder::new(body);
             let mut encoder = ZlibEncoder::new(&mut *output, flate2::Compression::default());
-            placeholder_late_binding_loop(decoder, &mut encoder, processor, ctx, placeholder)
-                .await?;
+            body_close_hold_loop(decoder, &mut encoder, processor, ctx, inline_seam_token).await?;
             encoder.finish().change_context(TrustedServerError::Proxy {
                 message: "Failed to finalize deflate encoder".to_string(),
             })?;
@@ -3776,199 +4079,11 @@ async fn stream_html_with_placeholder_late_binding<W: Write>(
             };
             let mut encoder =
                 CompressorWriter::with_params(&mut *output, STREAM_CHUNK_SIZE, &params);
-            placeholder_late_binding_loop(decoder, &mut encoder, processor, ctx, placeholder)
-                .await?;
+            body_close_hold_loop(decoder, &mut encoder, processor, ctx, inline_seam_token).await?;
             let _ = encoder.into_inner();
             Ok(())
         }
     }
-}
-
-/// Process buffered HTML output while replacing the parser-owned placeholder.
-async fn placeholder_late_binding_loop<R: Read, W: Write>(
-    mut reader: R,
-    writer: &mut W,
-    processor: &mut impl StreamProcessor,
-    ctx: AuctionCollectCtx<'_>,
-    placeholder: &BidPlaceholder,
-) -> Result<(), Report<TrustedServerError>> {
-    let AuctionCollectCtx {
-        dispatched,
-        telemetry,
-        deps,
-    } = ctx;
-    let mut state = LateBindingState {
-        dispatched: Some(dispatched),
-        telemetry,
-        deps,
-        decoded_input_bytes: 0,
-        processed_output_bytes: 0,
-    };
-    let held_tail_cap =
-        SSAT_HELD_TAIL_CAP_BYTES.min(state.deps.settings.publisher.max_buffered_body_bytes);
-    let mut binder = PlaceholderLateBinder::new(placeholder, held_tail_cap);
-    let mut buffer = vec![0_u8; STREAM_CHUNK_SIZE];
-
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => {
-                let final_output =
-                    processor
-                        .process_chunk(&[], true)
-                        .change_context(TrustedServerError::Proxy {
-                            message: "Failed to finalize processor".to_string(),
-                        });
-                let final_output = match final_output {
-                    Ok(output) => output,
-                    Err(err) => {
-                        abandon_late_binding_auction(&mut state, "stream_finalize_error").await;
-                        return Err(err);
-                    }
-                };
-                write_late_bound_output(writer, &mut binder, &final_output, &mut state).await?;
-
-                let found_placeholder = binder.replaced();
-                let remainder = binder.finish();
-                write_checked_late_bound_output(
-                    writer,
-                    &remainder,
-                    &mut state,
-                    "processed_output_error",
-                )
-                .await?;
-                if !found_placeholder {
-                    log::warn!(
-                        "publisher HTML had no parser-confirmed bid insertion point; skipping EOF bid fallback"
-                    );
-                    abandon_late_binding_auction(&mut state, "unsafe_eof_insertion").await;
-                }
-                break;
-            }
-            Ok(n) => {
-                state.decoded_input_bytes = state.decoded_input_bytes.saturating_add(n);
-                if state.decoded_input_bytes > state.deps.settings.publisher.max_buffered_body_bytes
-                {
-                    abandon_late_binding_auction(&mut state, "decoded_input_cap_exceeded").await;
-                    return Err(Report::new(TrustedServerError::Proxy {
-                        message: "publisher decoded input exceeded maximum streaming size"
-                            .to_string(),
-                    }));
-                }
-                let processed = processor.process_chunk(&buffer[..n], false).change_context(
-                    TrustedServerError::Proxy {
-                        message: "Failed to process publisher chunk".to_string(),
-                    },
-                );
-                let processed = match processed {
-                    Ok(output) => output,
-                    Err(err) => {
-                        abandon_late_binding_auction(&mut state, "stream_process_error").await;
-                        return Err(err);
-                    }
-                };
-                write_late_bound_output(writer, &mut binder, &processed, &mut state).await?;
-            }
-            Err(err) => {
-                abandon_late_binding_auction(&mut state, "stream_read_error").await;
-                return Err(Report::new(TrustedServerError::Proxy {
-                    message: format!("Failed to read origin body: {err}"),
-                }));
-            }
-        }
-    }
-
-    writer.flush().change_context(TrustedServerError::Proxy {
-        message: "Failed to flush output".to_string(),
-    })?;
-    Ok(())
-}
-
-async fn write_late_bound_output<W: Write>(
-    writer: &mut W,
-    binder: &mut PlaceholderLateBinder,
-    processed: &[u8],
-    state: &mut LateBindingState<'_>,
-) -> Result<(), Report<TrustedServerError>> {
-    let scan = match binder.push(processed) {
-        Ok(scan) => scan,
-        Err(err) => {
-            abandon_late_binding_auction(state, "placeholder_scan_error").await;
-            return Err(err);
-        }
-    };
-    match scan {
-        PlaceholderScan::Emit(bytes) => {
-            write_checked_late_bound_output(writer, &bytes, state, "processed_output_error").await
-        }
-        PlaceholderScan::Found { before, after } => {
-            write_checked_late_bound_output(writer, &before, state, "processed_output_error")
-                .await?;
-            resolve_late_binding_auction(state).await;
-            let replacement = current_late_binding_bids_script(state);
-            write_checked_late_bound_output(
-                writer,
-                replacement.as_bytes(),
-                state,
-                "processed_output_error",
-            )
-            .await?;
-            write_checked_late_bound_output(writer, &after, state, "processed_output_error").await
-        }
-    }
-}
-
-async fn resolve_late_binding_auction(state: &mut LateBindingState<'_>) {
-    let Some(dispatched) = state.dispatched.take() else {
-        return;
-    };
-    collect_stream_auction(dispatched, state.telemetry.take(), &state.deps).await;
-}
-
-async fn abandon_late_binding_auction(state: &mut LateBindingState<'_>, reason: &'static str) {
-    let Some(dispatched) = state.dispatched.take() else {
-        return;
-    };
-    emit_abandoned_auction(
-        state.deps.services,
-        state.telemetry.observation.take(),
-        dispatched,
-        reason,
-    )
-    .await;
-}
-
-async fn write_checked_late_bound_output<W: Write>(
-    writer: &mut W,
-    bytes: &[u8],
-    state: &mut LateBindingState<'_>,
-    reason: &'static str,
-) -> Result<(), Report<TrustedServerError>> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    state.processed_output_bytes = state.processed_output_bytes.saturating_add(bytes.len());
-    if state.processed_output_bytes > state.deps.settings.publisher.max_buffered_body_bytes {
-        abandon_late_binding_auction(state, reason).await;
-        return Err(Report::new(TrustedServerError::Proxy {
-            message: "publisher processed output exceeded maximum streaming size".to_string(),
-        }));
-    }
-    writer
-        .write_all(bytes)
-        .change_context(TrustedServerError::Proxy {
-            message: "Failed to write processed publisher output".to_string(),
-        })
-}
-
-fn current_late_binding_bids_script(state: &LateBindingState<'_>) -> String {
-    state
-        .deps
-        .ad_bids_state
-        .script_cell()
-        .lock()
-        .expect("should lock bid state")
-        .clone()
-        .unwrap_or_else(build_empty_bids_script)
 }
 
 /// Async-pull variant of [`body_close_hold_loop`] for live origin streams.
@@ -3982,6 +4097,10 @@ fn current_late_binding_bids_script(state: &LateBindingState<'_>) -> String {
 /// Cloudflare, Spin) never produce `Body::Stream` because the publisher fetch
 /// is gated on `supports_streaming_responses()`. It is groundwork for those
 /// adapters' streaming cutover; Fastly uses the lazy stream instead.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "stream state remains explicit across the shared adapter driver"
+)]
 async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
     body: EdgeBody,
     writer: &mut W,
@@ -3990,6 +4109,7 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
     output_compression: Compression,
     ctx: AuctionCollectCtx<'_>,
     max_body_bytes: usize,
+    inline_seam_token: Option<Vec<u8>>,
 ) -> Result<(), Report<TrustedServerError>> {
     let AuctionCollectCtx {
         dispatched,
@@ -3999,84 +4119,107 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
     let mut decoder = BodyStreamDecoder::new(input_compression, max_body_bytes);
     let mut encoder = BodyStreamEncoder::new(output_compression);
     let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE).with_max_bytes(max_body_bytes);
-    let mut state = AuctionHoldState::new(DispatchedAuctionGuard::new(dispatched), telemetry);
+    let mut state = AuctionHoldState::new(
+        DispatchedAuctionGuard::new(dispatched),
+        telemetry,
+        inline_seam_token,
+    );
 
-    while let Some(step) = hold_step_next_chunk(
-        &mut source,
-        &mut decoder,
-        &mut encoder,
-        processor,
-        &mut state,
-        &collect_refs,
-    )
-    .await?
-    {
-        // Write the ready prefix before collecting the auction, matching the
-        // lazy Fastly stream: only the held `</body>` tail waits on collection.
-        for encoded in step.ready {
+    let result = async {
+        while let Some(step) = hold_step_next_chunk(
+            &mut source,
+            &mut decoder,
+            &mut encoder,
+            processor,
+            &mut state,
+            &collect_refs,
+        )
+        .await?
+        {
+            // Write the ready prefix before collecting the auction, matching the
+            // lazy Fastly stream: only the held `</body>` tail waits on collection.
+            for encoded in step.ready {
+                write_encoded_segment(writer, &encoded)?;
+            }
+            if step.close_found {
+                writer.flush().change_context(TrustedServerError::Proxy {
+                    message: "Failed to flush output before auction collection".to_string(),
+                })?;
+                for encoded in
+                    hold_collect_close_tail(&mut encoder, &mut state, &collect_refs).await?
+                {
+                    write_encoded_segment(writer, &encoded)?;
+                }
+            }
+        }
+
+        // Write the decoder-finalized prefix before collection, matching the lazy
+        // Fastly stream: only the held `</body>` tail waits on the auction.
+        let final_step = hold_finish_ready_segments(
+            processor,
+            &mut decoder,
+            &mut encoder,
+            &mut state,
+            &collect_refs,
+        )
+        .await?;
+        for encoded in final_step.ready {
             write_encoded_segment(writer, &encoded)?;
         }
-        if step.close_found {
-            for encoded in
-                hold_collect_close_tail(processor, &mut encoder, &mut state, &collect_refs).await?
-            {
+        writer.flush().change_context(TrustedServerError::Proxy {
+            message: "Failed to flush output before auction collection".to_string(),
+        })?;
+        if final_step.close_found {
+            for encoded in hold_collect_close_tail(&mut encoder, &mut state, &collect_refs).await? {
                 write_encoded_segment(writer, &encoded)?;
             }
         }
+        for encoded in hold_finish_tail_segments(&mut encoder, &mut state, &collect_refs).await? {
+            write_encoded_segment(writer, &encoded)?;
+        }
+        writer.flush().change_context(TrustedServerError::Proxy {
+            message: "Failed to flush output".to_string(),
+        })?;
+        Ok(())
     }
-
-    // Write the decoder-finalized prefix before collection, matching the lazy
-    // Fastly stream: only the held `</body>` tail waits on the auction.
-    for encoded in hold_finish_ready_segments(
-        processor,
-        &mut decoder,
-        &mut encoder,
-        &mut state,
-        &collect_refs,
-    )
-    .await?
-    {
-        write_encoded_segment(writer, &encoded)?;
+    .await;
+    if result.is_err() {
+        abandon_hold_auction(&mut state, collect_refs.services, "stream_write_error").await;
     }
-    for encoded in
-        hold_finish_tail_segments(processor, &mut encoder, &mut state, &collect_refs).await?
-    {
-        write_encoded_segment(writer, &encoded)?;
-    }
-    writer.flush().change_context(TrustedServerError::Proxy {
-        message: "Failed to flush output".to_string(),
-    })?;
-    Ok(())
+    result
 }
 
-const BODY_CLOSE_PREFIX: &[u8] = b"</body";
-
-struct BodyCloseHoldBuffer {
+struct InlineBodyCloseSeam {
+    token: Vec<u8>,
     buffered: Vec<u8>,
-    found_close: bool,
+    found: bool,
 }
 
-impl BodyCloseHoldBuffer {
-    fn new() -> Self {
+impl InlineBodyCloseSeam {
+    fn new(token: Vec<u8>) -> Self {
+        debug_assert!(!token.is_empty());
         Self {
+            token,
             buffered: Vec::new(),
-            found_close: false,
+            found: false,
         }
     }
 
     fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.buffered.extend_from_slice(chunk);
 
-        if self.found_close {
+        if self.found {
             return Vec::new();
         }
 
-        if let Some(pos) = find_ascii_case_insensitive(&self.buffered, BODY_CLOSE_PREFIX) {
-            self.found_close = true;
-            return self.buffered.drain(..pos).collect();
+        if let Some(pos) = find_bytes(&self.buffered, &self.token) {
+            self.found = true;
+            let ready = self.buffered.drain(..pos).collect();
+            self.buffered.drain(..self.token.len());
+            return ready;
         }
 
-        let keep_len = BODY_CLOSE_PREFIX.len().saturating_sub(1);
+        let keep_len = longest_suffix_prefix(&self.buffered, &self.token);
         if self.buffered.len() <= keep_len {
             return Vec::new();
         }
@@ -4085,8 +4228,68 @@ impl BodyCloseHoldBuffer {
         self.buffered.drain(..split_at).collect()
     }
 
-    fn found_close(&self) -> bool {
-        self.found_close
+    fn push_bounded(&mut self, chunk: &[u8], limit: usize) -> std::io::Result<Vec<u8>> {
+        let overflow = || std::io::Error::other("HTML auction suffix exceeds retained-byte limit");
+        if self.found {
+            reserve_bounded(&mut self.buffered, chunk.len(), limit).ok_or_else(overflow)?;
+            self.buffered.extend_from_slice(chunk);
+            return Ok(Vec::new());
+        }
+        let mut boundary = self.buffered.clone();
+        boundary.extend_from_slice(&chunk[..chunk.len().min(self.token.len().saturating_sub(1))]);
+        let crossing =
+            find_bytes(&boundary, &self.token).filter(|position| *position < self.buffered.len());
+        let inside = find_bytes(chunk, &self.token);
+        if let Some((old_prefix, chunk_prefix, suffix_start)) = crossing
+            .map(|position| {
+                (
+                    position,
+                    0,
+                    position + self.token.len() - self.buffered.len(),
+                )
+            })
+            .or_else(|| {
+                inside.map(|position| (self.buffered.len(), position, position + self.token.len()))
+            })
+        {
+            let suffix = &chunk[suffix_start..];
+            if suffix.len() > limit {
+                return Err(overflow());
+            }
+            let mut ready = self.buffered[..old_prefix].to_vec();
+            ready.extend_from_slice(&chunk[..chunk_prefix]);
+            self.buffered = Vec::new();
+            self.buffered.reserve_exact(suffix.len());
+            self.buffered.extend_from_slice(suffix);
+            self.found = true;
+            return Ok(ready);
+        }
+        let tail = if chunk.len() >= self.token.len().saturating_sub(1) {
+            chunk[chunk.len() - self.token.len().saturating_sub(1)..].to_vec()
+        } else {
+            let mut tail = self.buffered.clone();
+            tail.extend_from_slice(chunk);
+            tail
+        };
+        let keep = longest_suffix_prefix(&tail, &self.token);
+        if keep > limit {
+            return Err(overflow());
+        }
+        let old_ready = self
+            .buffered
+            .len()
+            .saturating_sub(keep.saturating_sub(chunk.len()));
+        let chunk_ready = chunk.len().saturating_sub(keep);
+        let mut ready = self.buffered[..old_ready].to_vec();
+        ready.extend_from_slice(&chunk[..chunk_ready]);
+        self.buffered = Vec::new();
+        self.buffered.reserve_exact(keep);
+        self.buffered.extend_from_slice(&tail[tail.len() - keep..]);
+        Ok(ready)
+    }
+
+    fn found(&self) -> bool {
+        self.found
     }
 
     fn finish(self) -> Vec<u8> {
@@ -4094,26 +4297,40 @@ impl BodyCloseHoldBuffer {
     }
 }
 
-fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| {
-        window
-            .iter()
-            .zip(needle)
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
-    })
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    (!needle.is_empty())
+        .then(|| {
+            haystack
+                .windows(needle.len())
+                .position(|window| window == needle)
+        })
+        .flatten()
 }
 
-/// Core close-body hold loop.
-///
-/// Streams processed output until the first case-insensitive `</body` prefix is
-/// seen, then collects the auction, writes bids, and processes the held tail
-/// before reading post-body chunks. If no close-body tag is found, collection
-/// happens at EOF before finalization.
+fn longest_suffix_prefix(bytes: &[u8], pattern: &[u8]) -> usize {
+    let maximum = bytes.len().min(pattern.len().saturating_sub(1));
+    (1..=maximum)
+        .rev()
+        .find(|length| bytes.ends_with(&pattern[..*length]))
+        .unwrap_or(0)
+}
+
+fn inline_bids_script(ad_bids_state: &AdBidsState) -> String {
+    ad_bids_state
+        .script_cell()
+        .lock()
+        .expect("should lock bid state")
+        .clone()
+        .unwrap_or_else(build_empty_bids_script)
+}
+
+/// Core parser-confirmed inline-seam loop for reader-backed bodies.
 async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
     mut reader: R,
     writer: &mut W,
     processor: &mut P,
     ctx: AuctionCollectCtx<'_>,
+    inline_seam_token: Option<Vec<u8>>,
 ) -> Result<(), Report<TrustedServerError>> {
     let AuctionCollectCtx {
         dispatched,
@@ -4121,94 +4338,180 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
         deps,
     } = ctx;
     let mut buffer = vec![0u8; STREAM_CHUNK_SIZE];
-    let mut hold = Some(BodyCloseHoldBuffer::new());
+    let mut hold = inline_seam_token.map(InlineBodyCloseSeam::new);
     let mut dispatched = Some(dispatched);
 
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => {
-                if let Some(hold) = hold.take() {
+                let final_out = match processor.process_chunk(&[], true).change_context(
+                    TrustedServerError::Proxy {
+                        message: "Failed to finalize processor".to_string(),
+                    },
+                ) {
+                    Ok(output) => output,
+                    Err(err) => {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_process_error",
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                };
+                let ready = match hold.as_mut() {
+                    Some(seam) => seam.push(&final_out),
+                    None => final_out,
+                };
+                if let Err(err) =
+                    writer
+                        .write_all(&ready)
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write finalized output".to_string(),
+                        })
+                {
+                    abandon_reader_auction(
+                        &mut dispatched,
+                        &mut telemetry,
+                        deps.services,
+                        "stream_write_error",
+                    )
+                    .await;
+                    return Err(err);
+                }
+
+                if hold.as_ref().is_some_and(InlineBodyCloseSeam::found) {
+                    if let Err(err) = writer.flush().change_context(TrustedServerError::Proxy {
+                        message: "Failed to flush output before auction collection".to_string(),
+                    }) {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_write_error",
+                        )
+                        .await;
+                        return Err(err);
+                    }
                     let dispatched = dispatched
                         .take()
                         .expect("should have dispatched auction to collect");
                     collect_stream_auction(dispatched, telemetry.take(), &deps).await;
-
-                    let held = hold.finish();
-                    write_processed_chunk(
-                        writer,
-                        processor,
-                        &held,
-                        false,
-                        "Failed to process held body close",
-                        "Failed to write held body close",
-                    )?;
-                }
-                // Signal EOF to lol_html (fires end() which flushes remaining state).
-                let final_out = processor.process_chunk(&[], true).change_context(
-                    TrustedServerError::Proxy {
-                        message: "Failed to finalize processor".to_string(),
-                    },
-                )?;
-                if !final_out.is_empty() {
                     writer
-                        .write_all(&final_out)
+                        .write_all(inline_bids_script(deps.ad_bids_state).as_bytes())
                         .change_context(TrustedServerError::Proxy {
-                            message: "Failed to write finalized output".to_string(),
+                            message: "Failed to write inline bids".to_string(),
                         })?;
+                    writer
+                        .write_all(&hold.take().expect("should have inline body seam").finish())
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write held body tail".to_string(),
+                        })?;
+                } else {
+                    if let Some(seam) = hold.take()
+                        && let Err(err) = writer.write_all(&seam.finish()).change_context(
+                            TrustedServerError::Proxy {
+                                message: "Failed to write terminal HTML output".to_string(),
+                            },
+                        )
+                    {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_write_error",
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                    if let Err(err) = writer.flush().change_context(TrustedServerError::Proxy {
+                        message: "Failed to flush output before auction collection".to_string(),
+                    }) {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_write_error",
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                    if let Some(pending) = dispatched.take() {
+                        collect_stream_auction(pending, telemetry.take(), &deps).await;
+                    }
                 }
                 break;
             }
             Ok(n) => {
-                if let Some(hold_buffer) = hold.as_mut() {
-                    let ready = hold_buffer.push(&buffer[..n]);
-                    if let Err(err) = write_processed_chunk(
-                        writer,
-                        processor,
-                        &ready,
-                        false,
-                        "Failed to process chunk",
-                        "Failed to write chunk",
-                    ) {
-                        if let Some(dispatched) = dispatched.take() {
+                let processed = match processor.process_chunk(&buffer[..n], false).change_context(
+                    TrustedServerError::Proxy {
+                        message: "Failed to process chunk".to_string(),
+                    },
+                ) {
+                    Ok(processed) => processed,
+                    Err(err) => {
+                        if let Some(pending) = dispatched.take() {
                             emit_abandoned_auction(
                                 deps.services,
                                 telemetry.observation.take(),
-                                dispatched,
+                                pending,
                                 "stream_process_error",
                             )
                             .await;
                         }
                         return Err(err);
                     }
+                };
+                let ready = match hold.as_mut() {
+                    Some(seam) => seam.push(&processed),
+                    None => processed,
+                };
+                if let Err(err) =
+                    writer
+                        .write_all(&ready)
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write processed chunk".to_string(),
+                        })
+                {
+                    abandon_reader_auction(
+                        &mut dispatched,
+                        &mut telemetry,
+                        deps.services,
+                        "stream_write_error",
+                    )
+                    .await;
+                    return Err(err);
+                }
 
-                    if hold_buffer.found_close() {
-                        let dispatched = dispatched
-                            .take()
-                            .expect("should have dispatched auction to collect");
-                        collect_stream_auction(dispatched, telemetry.take(), &deps).await;
-
-                        let held = hold
-                            .take()
-                            .expect("should have close-body hold buffer")
-                            .finish();
-                        write_processed_chunk(
-                            writer,
-                            processor,
-                            &held,
-                            false,
-                            "Failed to process held body close",
-                            "Failed to write held body close",
-                        )?;
+                if hold.as_ref().is_some_and(InlineBodyCloseSeam::found) {
+                    if let Err(err) = writer.flush().change_context(TrustedServerError::Proxy {
+                        message: "Failed to flush output before auction collection".to_string(),
+                    }) {
+                        abandon_reader_auction(
+                            &mut dispatched,
+                            &mut telemetry,
+                            deps.services,
+                            "stream_write_error",
+                        )
+                        .await;
+                        return Err(err);
                     }
-                } else {
-                    write_processed_chunk(
-                        writer,
-                        processor,
-                        &buffer[..n],
-                        false,
-                        "Failed to process chunk",
-                        "Failed to write chunk",
-                    )?;
+                    let pending = dispatched
+                        .take()
+                        .expect("should have dispatched auction to collect");
+                    collect_stream_auction(pending, telemetry.take(), &deps).await;
+                    writer
+                        .write_all(inline_bids_script(deps.ad_bids_state).as_bytes())
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write inline bids".to_string(),
+                        })?;
+                    writer
+                        .write_all(&hold.take().expect("should have inline body seam").finish())
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write held body tail".to_string(),
+                        })?;
                 }
             }
             Err(e) => {
@@ -4232,6 +4535,17 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
         message: "Failed to flush output".to_string(),
     })?;
     Ok(())
+}
+
+async fn abandon_reader_auction(
+    dispatched: &mut Option<DispatchedAuction>,
+    telemetry: &mut AuctionTelemetryCarry,
+    services: &RuntimeServices,
+    reason: &'static str,
+) {
+    if let Some(pending) = dispatched.take() {
+        emit_abandoned_auction(services, telemetry.observation.take(), pending, reason).await;
+    }
 }
 
 async fn emit_abandoned_auction(
@@ -4373,70 +4687,6 @@ async fn collect_stream_auction(
     }
 }
 
-fn write_processed_chunk<W: Write, P: StreamProcessor>(
-    writer: &mut W,
-    processor: &mut P,
-    chunk: &[u8],
-    is_last: bool,
-    process_error: &str,
-    write_error: &str,
-) -> Result<(), Report<TrustedServerError>> {
-    if chunk.is_empty() && !is_last {
-        return Ok(());
-    }
-
-    let out =
-        processor
-            .process_chunk(chunk, is_last)
-            .change_context(TrustedServerError::Proxy {
-                message: process_error.to_string(),
-            })?;
-    if !out.is_empty() {
-        writer
-            .write_all(&out)
-            .change_context(TrustedServerError::Proxy {
-                message: write_error.to_string(),
-            })?;
-    }
-
-    Ok(())
-}
-
-/// Delivery-compression behavior explicitly supported by an adapter.
-///
-/// This capability is independent of [`EdgeCacheHeader`]. Adapters must declare
-/// it directly so cache-header selection cannot accidentally enable Fastly-only
-/// response delivery behavior.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum DeliveryCompressionCapability {
-    /// Fastly dynamic compression honors `X-Compress-Hint: on` at delivery.
-    FastlyDynamic,
-    /// The adapter has no compatible delivery-compression facility.
-    Unavailable,
-}
-
-/// Adapter-specific publisher response behavior.
-///
-/// Bundles cache-header selection with an explicit delivery-compression
-/// capability while keeping those independent platform concerns visible.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct PublisherAdapterOptions {
-    /// Shared-cache header family emitted by publisher cache policies.
-    pub edge_cache_header: EdgeCacheHeader,
-    /// Delivery-compression facility available on the current adapter.
-    pub delivery_compression: DeliveryCompressionCapability,
-}
-
-fn should_offload_ssat_compression(
-    settings: &Settings,
-    adapter_options: PublisherAdapterOptions,
-    should_run_ad_stack: bool,
-) -> bool {
-    settings.publisher.ssat_compression_offload_enabled
-        && adapter_options.delivery_compression == DeliveryCompressionCapability::FastlyDynamic
-        && should_run_ad_stack
-}
-
 /// Auction dispatch context passed to [`handle_publisher_request`].
 pub struct AuctionDispatch<'a> {
     /// Orchestrator that dispatches and collects SSP bid requests.
@@ -4445,6 +4695,140 @@ pub struct AuctionDispatch<'a> {
     pub slots: &'a [crate::creative_opportunities::CreativeOpportunitySlot],
     /// Partner registry for KV-backed EID resolution. `None` skips KV enrichment.
     pub registry: Option<&'a PartnerRegistry>,
+    /// Enabled integration registry used before origin and shared-cache decisions.
+    ///
+    /// Pass the same registry to response finalization so request admission and
+    /// document processing use the same enabled integration set.
+    pub integration_registry: &'a IntegrationRegistry,
+}
+
+/// Request-side conditions that decide whether this request's origin response may be
+/// shared between readers.
+///
+/// Necessary for both the origin readthrough cache and the template cache, which is why it
+/// is one type rather than two parallel expressions that must be kept in step. Keeping the
+/// template-only conditions out of it is deliberate: the assembly mode and the reader's
+/// encoding support say whether *this pipeline* can assemble a shared template, not whether
+/// the origin's bytes may be shared at all.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SharedRequestInputs {
+    /// The method admits a shared representation. Only `GET` does.
+    pub(crate) method_is_cacheable: bool,
+    /// A request host was resolved. The post-processed output is host-dependent.
+    pub(crate) host_present: bool,
+    /// The request carried an `Authorization` value that did not pass edge auth unchanged.
+    pub(crate) authorization_disqualifies: bool,
+    /// Cookie policy refuses this cache's key. Readthrough additionally refuses
+    /// configured cookie dimensions that only the template key can represent.
+    pub(crate) cookie_disqualifies: bool,
+    /// Request cache semantics, diagnostics, or an integration require a fresh origin
+    /// response for this reader specifically.
+    pub(crate) request_requires_origin: bool,
+}
+
+/// Whether this request's origin response may be shared between readers at all.
+pub(crate) fn origin_response_is_shareable(inputs: SharedRequestInputs) -> bool {
+    inputs.method_is_cacheable
+        && inputs.host_present
+        && !inputs.authorization_disqualifies
+        && !inputs.cookie_disqualifies
+        && !inputs.request_requires_origin
+}
+
+/// Apply the origin fetch's cache intent.
+///
+/// Both publisher-origin fetch paths call this rather than deciding for themselves. They
+/// are alternatives for the same fetch — one inside the EC-preload fan-out, one in the
+/// branch taken when that did not fire — so a condition written twice could drift and make
+/// readthrough eligibility depend on whether EC preload happened, which is not a property
+/// of the origin response at all.
+fn apply_origin_cache_intent(
+    request: PlatformHttpRequest,
+    readthrough_enabled: bool,
+    origin_response_is_shareable: bool,
+    should_run_ad_stack: bool,
+    request_is_document: bool,
+    reader_url: &str,
+) -> PlatformHttpRequest {
+    // With the opt-in disabled, preserve the existing policy: ad-serving requests
+    // bypass and other publisher requests use the platform default. Enabling the flag
+    // replaces that policy with request shareability, both widening eligible ad traffic
+    // and tightening non-ad *document* traffic that carries disqualifying reader state.
+    //
+    // Documents only. Subresources keep the platform default, because the readthrough
+    // gate answers a question about pages: whether the origin's HTML may be shared
+    // between readers. Judging them on it would bypass the edge cache for every
+    // cookie-bearing or conditional asset request — browsers send first-party cookies on
+    // subresources, so that is most repeat-visitor asset traffic — and would tag every
+    // cached asset with `ts-template`, turning the template rollback lever into an
+    // origin-wide asset flush.
+    let readthrough_applies = readthrough_enabled && request_is_document;
+    let bypass = if readthrough_applies {
+        !origin_response_is_shareable
+    } else {
+        should_run_ad_stack
+    };
+    if bypass {
+        request.with_cache_bypass()
+    } else if readthrough_applies {
+        // The same reader-facing key and all-scope key used by the purge endpoint.
+        // Fastly accepts multiple space-separated surrogate keys without changing TTL.
+        request.with_shared_cache(format!(
+            "{TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY} {}",
+            reader_url_surrogate_key(reader_url),
+        ))
+    } else {
+        request
+    }
+}
+
+/// Whether this request may additionally use a shared *template*.
+///
+/// The extra conditions say whether this pipeline can assemble one, and whether this
+/// reader may be served one — not whether the origin's bytes may be shared, which is
+/// [`origin_response_is_shareable`].
+///
+/// `reader_requires_origin` is read from the request *before* conditional and range
+/// headers are stripped. A reader who asked for a range or a revalidation must reach the
+/// origin, whatever is subsequently asked on their behalf; stripping changes what the
+/// origin is asked, not what the reader wanted.
+pub(crate) fn request_can_use_shared_template(
+    inputs: SharedRequestInputs,
+    assembly_mode_is_esi: bool,
+    reader_supports_assembly: bool,
+    reader_requires_origin: bool,
+) -> bool {
+    origin_response_is_shareable(inputs)
+        && assembly_mode_is_esi
+        && reader_supports_assembly
+        && !reader_requires_origin
+}
+
+/// Adapter capabilities used by publisher response processing.
+#[derive(Clone, Copy, Debug)]
+pub struct PublisherAdapterOptions {
+    /// Header family used for edge-cache policy.
+    pub cache_header: EdgeCacheHeader,
+    /// Whether the adapter can compress identity output at delivery.
+    pub delivery_compression: DeliveryCompression,
+}
+
+/// Downstream compression supplied by the adapter rather than the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryCompression {
+    /// Retain in-guest response encoding.
+    Unavailable,
+    /// Delivery supports reader-negotiated gzip and Brotli.
+    Dynamic,
+}
+
+impl From<EdgeCacheHeader> for PublisherAdapterOptions {
+    fn from(cache_header: EdgeCacheHeader) -> Self {
+        Self {
+            cache_header,
+            delivery_compression: DeliveryCompression::Unavailable,
+        }
+    }
 }
 
 /// Proxies requests to the publisher's origin server.
@@ -4459,8 +4843,8 @@ pub struct AuctionDispatch<'a> {
 ///
 /// # Errors
 ///
-/// Returns a [`TrustedServerError`] if the proxy request fails or the
-/// origin backend is unreachable.
+/// Returns a [`TrustedServerError`] if the request host is malformed, the proxy
+/// request fails, or the origin backend is unreachable.
 pub async fn handle_publisher_request(
     settings: &Settings,
     services: &RuntimeServices,
@@ -4468,10 +4852,15 @@ pub async fn handle_publisher_request(
     ec_context: &mut EcContext,
     auction: AuctionDispatch<'_>,
     mut req: Request<EdgeBody>,
-    adapter_options: PublisherAdapterOptions,
+    options: impl Into<PublisherAdapterOptions>,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
+    let options = options.into();
+    let edge_header = options.cache_header;
+    auction
+        .integration_registry
+        .ensure_async_html_finish_allowed(settings)?;
     log::debug!("Proxying request to publisher_origin");
-    let edge_header = adapter_options.edge_cache_header;
+    let async_html_finish_present = auction.integration_registry.has_async_html_finish();
 
     // Adapter fallbacks prepare this before EC/cookie handling. Keep this
     // idempotent call as a direct-handler safety net and for focused tests.
@@ -4481,17 +4870,21 @@ pub async fn handle_publisher_request(
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
-    // Extract request host and scheme (uses Host header and TLS detection after edge sanitization)
-    let request_info = RequestInfo::from_request(&req, services.client_info());
+    // Validate request host before it can enter HTML or Flight rewrite output.
+    let request_info = RequestInfo::from_request(&req, services.client_info())?;
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;
 
     log::debug!(
-        "Request info: host={}, scheme={} (X-Forwarded-Host: {:?}, Host: {:?}, X-Forwarded-Proto: {:?})",
+        "Request info: host={}, scheme={} (X-Forwarded-Host: {:?}, Host: {:?}, URI host: {:?}, URI port: {:?}, X-Forwarded-Proto: {:?})",
         request_host,
         request_scheme,
         req.headers().get("x-forwarded-host"),
         req.headers().get(header::HOST),
+        req.uri().authority().map(http::uri::Authority::host),
+        req.uri()
+            .authority()
+            .and_then(http::uri::Authority::port_u16),
         req.headers().get("x-forwarded-proto"),
     );
 
@@ -4523,6 +4916,9 @@ pub async fn handle_publisher_request(
     let ec_id_owned = active_ec_id_owned.clone().filter(|_| ec_allowed);
     let ec_id = ec_id_owned.as_deref();
     let cookie_jar = handle_request_cookies(&req)?;
+    if let Some(registry) = auction.registry {
+        ec_context.validate_pull_sync_marker(settings, registry);
+    }
     let geo = ec_context.geo_info().cloned();
 
     let parsed_origin = url::Url::parse(&settings.publisher.origin_url).change_context(
@@ -4558,6 +4954,7 @@ pub async fn handle_publisher_request(
         .path_and_query()
         .map(http::uri::PathAndQuery::as_str)
         .unwrap_or("/");
+    let request_path_and_query = origin_path_and_query.to_string();
     let target_uri = format!("{origin_scheme}://{origin_host}{origin_path_and_query}")
         .parse::<Uri>()
         .change_context(TrustedServerError::Proxy {
@@ -4568,6 +4965,7 @@ pub async fn handle_publisher_request(
 
     let request_path = req.uri().path().to_string();
     let is_get = req.method() == http::Method::GET;
+    let is_get_or_head = is_get || req.method() == http::Method::HEAD;
 
     let is_prefetch = is_prefetch_request(&req);
     let is_bot = is_bot_user_agent(&req);
@@ -4588,21 +4986,19 @@ pub async fn handle_publisher_request(
     // (storage/access) before firing. Known non-GDPR jurisdictions are free.
     let consent_allows_auction = consent_allows_server_side_auction(&consent_context);
 
-    let should_run_ad_stack = should_run_server_side_ad_stack(
-        is_get,
-        is_navigation,
-        is_prefetch,
-        is_bot,
-        !matched_slots.is_empty(),
-        consent_allows_auction,
-        ServerSideAdStackConfig {
-            ad_templates_enabled,
-            auction_enabled: auction.orchestrator.is_enabled(),
-        },
-    );
+    let should_run_ad_stack = evaluate_ad_stack_gate(AdStackGateInput {
+        method_get: is_get,
+        navigation: is_navigation,
+        prefetch: is_prefetch,
+        bot: is_bot,
+        matched_slots: !matched_slots.is_empty(),
+        consent_allows_auction: Some(consent_allows_auction),
+        auction_enabled: auction.orchestrator.is_enabled(),
+        ad_templates_enabled,
+    })
+    .expected
+        == RuntimeAdStackExpected::Yes;
     let should_run_auction = should_run_ad_stack;
-    let compression_offload_active =
-        should_offload_ssat_compression(settings, adapter_options, should_run_ad_stack);
     // Diagnostic: shows which gate suppresses the server-side auction. Pair with
     // the `EC context: ... jurisdiction=...` line from EC-context construction
     // when `consent_allows_auction=false`.
@@ -4661,20 +5057,33 @@ pub async fn handle_publisher_request(
             .is_none_or(|marker| !marker.matches(req.headers())),
         _ => true,
     };
-    let request_had_cookie = req.headers().contains_key(header::COOKIE);
-    // Whether carrying a cookie is itself disqualifying. Computed once and used for both
-    // the lookup and the store, so the two cannot drift apart.
-    //
-    // The conservative default disqualifies every cookie-bearing request, which is very
-    // nearly a disable switch — TS sets its own identity cookie, so essentially every
-    // repeat visitor carries one. An operator who knows their origin ignores cookies can
-    // say so; the `Vary: Cookie` drift guard still refuses the response if the origin
-    // ever contradicts them.
-    let cookie_disqualifies = request_had_cookie
-        && !settings
-            .creative_opportunities
-            .as_ref()
-            .is_some_and(CreativeOpportunitiesConfig::origin_is_cookie_independent);
+    // Classify cookies once before the origin consumes the request. The same decision
+    // governs lookup and storage, so a bypass cookie can never read a warm template.
+    let (key_cookie_names, bypass_cookie_names, cookie_independent) = settings
+        .creative_opportunities
+        .as_ref()
+        .map_or((&[][..], &[][..], false), |config| {
+            (
+                config.template_cache_key_cookies(),
+                config.template_cache_bypass_cookies(),
+                config.origin_is_cookie_independent(),
+            )
+        });
+    let (cookie_disqualifies, cookie_values) = match evaluate_cookie_policy(
+        req.headers(),
+        key_cookie_names,
+        bypass_cookie_names,
+        cookie_independent,
+    ) {
+        TemplateCookieDecision::Bypass => (true, Vec::new()),
+        TemplateCookieDecision::Eligible(values) => (false, values),
+    };
+    if cookie_disqualifies && matches!(assembly_mode, AssemblyMode::Esi) {
+        log::debug!(
+            "template_cache bypass: {}",
+            TemplateCacheBypassReason::CookiePolicy
+        );
+    }
     let suppress_datadome_client_side_tag = req
         .extensions()
         .get::<crate::integrations::datadome::DataDomeClientTagSuppressed>()
@@ -4685,35 +5094,85 @@ pub async fn handle_publisher_request(
     let datadome_suppression_requires_origin = suppress_datadome_client_side_tag;
     let datadome_suppression_requires_full_body =
         suppress_datadome_client_side_tag && is_html_document_request(&req);
-    let request_requires_origin = request_bypasses_template_cache(req.headers())
+    // The reader's own request semantics, read before any stripping. A reader who asked
+    // for a range or a conditional response must not be handed a full document
+    // synthesized from a template shared with other readers, whatever the origin is then
+    // asked for on their behalf.
+    let reader_requires_origin = request_bypasses_template_cache(req.headers())
         || gpt_diagnostics.requires_private_no_store()
         || datadome_suppression_requires_origin;
     let reader_compression = negotiate_reader_compression(req.headers());
     let reader_supports_assembly = reader_compression.is_ok();
+    let delivery_offload_eligible = options.delivery_compression == DeliveryCompression::Dynamic
+        && should_run_ad_stack
+        && matches!(
+            reader_compression,
+            Ok(Compression::None | Compression::Gzip | Compression::Brotli)
+        );
     // A failed negotiation bypasses template cache below, so this value is used only on an
     // admitted path. Keeping an identity fallback avoids making that relationship
     // a panic-prone invariant in the public request handler.
-    let reader_compression = if compression_offload_active {
-        Compression::None
-    } else {
-        reader_compression.unwrap_or(Compression::None)
-    };
+    let reader_compression = reader_compression.unwrap_or(Compression::None);
 
-    if should_run_ad_stack || datadome_suppression_requires_full_body {
+    if should_run_ad_stack
+        || datadome_suppression_requires_full_body
+        || (async_html_finish_present
+            && req.method() == Method::GET
+            && is_html_document_request(&req))
+    {
         // HTML document contexts whose output may be synthesized must not
         // receive a cached 304 or partial 206. Non-document subresources contain
         // no executable injected tag, so retain their validators and ranges.
         strip_conditional_and_range_headers(&mut req);
     }
 
+    // Computed *after* the strip above, deliberately. These conditions ask whether the
+    // origin's response can be shared, and the origin only ever sees the request as it
+    // stands here. Judging the pre-strip headers marked a repeat visitor's `If-None-Match`
+    // navigation unshareable even though the origin was about to be asked an
+    // unconditional question and return a full document — losing readthrough for exactly
+    // the repeat-visit population this work targets, with nothing gained.
+    //
+    // The strip removes four headers; this predicate tests six plus `Cache-Control`
+    // request directives, so `If-Match`, `If-Unmodified-Since` and a `no-store` reader
+    // still disqualify, stripped or not.
+    let request_requires_origin = request_bypasses_template_cache(req.headers())
+        || gpt_diagnostics.requires_private_no_store()
+        || datadome_suppression_requires_origin;
+
     let method_is_cacheable = req.method() == Method::GET;
-    let request_can_use_shared_template = method_is_cacheable
-        && matches!(assembly_mode, AssemblyMode::Esi)
-        && !request_host.is_empty()
-        && !authorization_disqualifies
-        && !cookie_disqualifies
-        && !request_requires_origin
-        && reader_supports_assembly;
+    // Read while the request is still in hand: the readthrough policy below applies to
+    // documents only, and the origin send consumes these headers.
+    let request_is_document = is_html_document_request(&req);
+    let shared_request_inputs = SharedRequestInputs {
+        method_is_cacheable,
+        host_present: !request_host.is_empty(),
+        authorization_disqualifies,
+        cookie_disqualifies,
+        request_requires_origin,
+    };
+    // Cookie variants belong to the template key only. The platform readthrough key
+    // cannot distinguish them, including an absent configured cookie, so these
+    // deployments must fetch origin bytes while retaining per-variant templates.
+    let origin_response_is_shareable = origin_response_is_shareable(SharedRequestInputs {
+        cookie_disqualifies: cookie_disqualifies || !key_cookie_names.is_empty(),
+        ..shared_request_inputs
+    });
+    // Readthrough is off unless an operator turns it on. Unlike the cookie flag, which
+    // only ever applies to cookie-bearing requests, this gate would otherwise admit every
+    // cookieless request the moment this code deploys — and cookieless first-time visitors
+    // are exactly the readers an origin issues a session cookie to.
+    let origin_readthrough_enabled = settings
+        .creative_opportunities
+        .as_ref()
+        .is_some_and(CreativeOpportunitiesConfig::origin_readthrough_enabled);
+    let request_can_use_shared_template = !async_html_finish_present
+        && request_can_use_shared_template(
+            shared_request_inputs,
+            matches!(assembly_mode, AssemblyMode::Esi),
+            reader_supports_assembly,
+            reader_requires_origin,
+        );
 
     // Only advertise encodings the rewrite pipeline can decode and re-encode. This
     // remains unconditional when template cache negotiation fails: that request bypasses shared
@@ -4749,14 +5208,26 @@ pub async fn handle_publisher_request(
             req.method()
         );
     }
-    if request_requires_origin && matches!(assembly_mode, AssemblyMode::Esi) {
+    if reader_requires_origin && matches!(assembly_mode, AssemblyMode::Esi) {
         log::debug!("template_cache bypass: request cache semantics or diagnostics require origin");
     }
+    // Capture the reader URL before origin rewriting, including its query. Inline
+    // assembly has no template key, but readthrough still needs both purge scopes.
+    let readthrough_reader_url =
+        if origin_readthrough_enabled && origin_response_is_shareable && request_is_document {
+            format!("{request_scheme}://{request_host}{request_path_and_query}")
+        } else {
+            String::new()
+        };
     let template_cache_key =
         request_can_use_shared_template.then(|| crate::platform::TemplateCacheKey {
             url: target_uri.to_string(),
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
+            // Captured before `rewrite_origin_request` below replaces the URI with the
+            // origin target. Path *and* query: a different query is a different page, and
+            // a purge caller types the whole address.
+            request_path: request_path_and_query.clone(),
             origin_identity: format!("{}\0{}", settings.publisher.origin_url, origin_host_header),
             assembly_mode,
             vary_values: settings
@@ -4765,6 +5236,7 @@ pub async fn handle_publisher_request(
                 .map(CreativeOpportunitiesConfig::template_cache_vary)
                 .unwrap_or_else(|| VarySpec::new([]))
                 .values_from(req.headers()),
+            cookie_values,
             template_fingerprint: template_fingerprint(settings),
             schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         });
@@ -4774,8 +5246,26 @@ pub async fn handle_publisher_request(
 
     let request_method = req.method().clone();
     let mut origin_request = Some(req);
-    let should_preload_ec =
-        should_preload_ec_snapshot(is_navigation, is_get, active_ec_id.is_some(), kv.is_some());
+    let eid_cookie_may_need_persistence = cookie_jar
+        .as_ref()
+        .is_some_and(|jar| jar.get(COOKIE_TS_EIDS).is_some() || jar.get(COOKIE_SHAREDID).is_some());
+    // This decision also gates the concurrent origin send below. A marker skip
+    // cannot currently delay the origin behind an auction because marker
+    // validation requires a non-empty registry, and every such auction sets
+    // `auction_needs_row` and retains the preload.
+    let should_preload_ec = should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+        is_navigation,
+        is_get,
+        has_ec_id: active_ec_id.is_some(),
+        has_kv: kv.is_some(),
+        marker_valid: ec_context.pull_sync_marker().is_valid(),
+        auction_needs_row: should_run_auction
+            && auction
+                .registry
+                .is_some_and(|registry| !registry.is_empty()),
+        eid_cookie_may_need_persistence,
+        privacy_needs_row: crate::ec::consent::ec_consent_withdrawn(&consent_context),
+    });
     let mut pending_origin = None;
     // A shared-template hit skips the origin entirely, and an in-flight request
     // cannot be recalled — so when this request is eligible for one, the origin
@@ -4796,9 +5286,16 @@ pub async fn handle_publisher_request(
         })?;
         let mut platform_request =
             PlatformHttpRequest::new(origin_req, backend_name.clone()).with_stream_response();
-        if should_run_ad_stack {
-            platform_request = platform_request.with_cache_bypass();
-        }
+        // Apply the opt-in shareability policy, or preserve the existing ad-stack
+        // bypass policy when readthrough is disabled.
+        platform_request = apply_origin_cache_intent(
+            platform_request,
+            origin_readthrough_enabled,
+            origin_response_is_shareable,
+            should_run_ad_stack,
+            request_is_document,
+            &readthrough_reader_url,
+        );
         pending_origin = Some(
             services
                 .http_client()
@@ -4843,7 +5340,7 @@ pub async fn handle_publisher_request(
             .headers()
             .get("user-agent")
             .and_then(|value| value.to_str().ok());
-        let observation = AuctionObservationContext::from_parts(
+        let mut observation = AuctionObservationContext::from_parts(
             AuctionSource::InitialNavigation,
             &settings.publisher.domain,
             &request_path,
@@ -4851,6 +5348,9 @@ pub async fn handle_publisher_request(
             user_agent,
             ec_context,
         );
+        // Written on the value, before it is moved into `auction_observation` below. Sites
+        // after that move reach it through `auction_observation.as_mut()` instead.
+        observation.set_origin_cache_shareable(origin_response_is_shareable && request_is_document);
 
         if should_run_auction {
             let slots_ctx = MatchedSlotsContext {
@@ -5012,8 +5512,8 @@ pub async fn handle_publisher_request(
                 // failure could only truncate the response mid-body. Failing here falls
                 // back to the origin instead, which is a slower correct page.
                 //
-                // `schema_version` should make either failure unreachable, so reaching
-                // it means the transform changed without the version moving.
+                // The build fingerprint and schema version isolate incompatible
+                // templates. Keep this check as a defense against unusable entries.
                 //
                 // Asked of the mode, not of every template. The key covers
                 // `assembly_mode`, so a hit was stored by this same mode.
@@ -5023,7 +5523,7 @@ pub async fn handle_publisher_request(
                 if let Some(err) = seam_check {
                     log::error!(
                         "template_cache hit is unusable ({err}); treating as a miss. \
-                         The transform changed without TEMPLATE_SCHEMA_VERSION moving."
+                         The cached template violates the assembly marker contract."
                     );
                     if let Err(purge_err) = services.template_cache().purge_url(key).await {
                         log::warn!(
@@ -5041,8 +5541,8 @@ pub async fn handle_publisher_request(
                     // Headers are constructed rather than replayed, so no origin header
                     // can reach a second reader through the cache.
                     let mut response = build_cached_template_response(&entry, reader_compression)?;
-                    if compression_offload_active {
-                        apply_ssat_compression_offload_headers(response.headers_mut());
+                    if delivery_offload_eligible {
+                        enable_delivery_compression(&mut response);
                     }
                     let mut params = build_template_assembly_params(
                         &entry,
@@ -5100,9 +5600,16 @@ pub async fn handle_publisher_request(
         if services.http_client().supports_streaming_responses() {
             platform_request = platform_request.with_stream_response();
         }
-        if should_run_ad_stack {
-            platform_request = platform_request.with_cache_bypass();
-        }
+        // Apply the opt-in shareability policy, or preserve the existing ad-stack
+        // bypass policy when readthrough is disabled.
+        platform_request = apply_origin_cache_intent(
+            platform_request,
+            origin_readthrough_enabled,
+            origin_response_is_shareable,
+            should_run_ad_stack,
+            request_is_document,
+            &readthrough_reader_url,
+        );
         services.http_client().send(platform_request).await
     };
     let mut response = match origin_result {
@@ -5152,6 +5659,23 @@ pub async fn handle_publisher_request(
         enforce_terminal_private_cache_privacy(&mut response);
         return Ok(PublisherResponse::Buffered(response));
     }
+
+    // Map origin URLs in navigation, preload, and CSP headers to the serving host,
+    // matching the body rewrite, on every route. Runs before the template-cache gate
+    // so a stored template replays the rewritten policy headers; the cache key is
+    // already scoped to the request host.
+    rewrite_origin_urls_in_headers(
+        response.headers_mut(),
+        &OriginHeaderRewrite {
+            origin_host: &origin_host,
+            origin_host_header: &origin_host_header,
+            request_host,
+            request_scheme,
+            origin_scheme: &origin_scheme,
+            request_path_and_query: &request_path_and_query,
+            request_is_get_or_head: is_get_or_head,
+        },
+    );
 
     let template_cache_policy = TemplateCachePolicy::from_settings(settings);
     let gate_content_type = response
@@ -5265,7 +5789,12 @@ pub async fn handle_publisher_request(
     // caching directives, letting a downstream cache serve it to a later eligible reader.
     let assembled_response_must_be_private = template_cache_key.is_some();
     let is_not_modified = response.status() == StatusCode::NOT_MODIFIED;
-    if is_html_content_type(&origin_content_type) || is_not_modified {
+    let range_associated_html_bypass = async_html_finish_present
+        && is_html_content_type(&origin_content_type)
+        && response_is_range_associated(&response);
+    if !range_associated_html_bypass
+        && (is_html_content_type(&origin_content_type) || is_not_modified)
+    {
         if should_run_ad_stack || assembled_response_must_be_private {
             enforce_synthesized_html_cache_privacy(&mut response);
         } else if is_server_side_ad_eligible_navigation(
@@ -5286,12 +5815,14 @@ pub async fn handle_publisher_request(
             }
         }
     }
-    apply_datadome_client_tag_cache_privacy(
-        &mut response,
-        &request_method,
-        suppress_datadome_client_side_tag,
-        &origin_content_type,
-    );
+    if !range_associated_html_bypass {
+        apply_datadome_client_tag_cache_privacy(
+            &mut response,
+            &request_method,
+            suppress_datadome_client_side_tag,
+            &origin_content_type,
+        );
+    }
     apply_publisher_asset_cache_policy(
         settings,
         &request_path,
@@ -5318,9 +5849,29 @@ pub async fn handle_publisher_request(
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    let route = classify_response_route(status, &content_type, &content_encoding, request_host);
+    let route = if range_associated_html_bypass {
+        ResponseRoute::BufferedUnmodified
+    } else {
+        classify_response_route(status, &content_type, &content_encoding, request_host)
+    };
+    if async_html_finish_present
+        && route == ResponseRoute::Stream
+        && is_html_content_type(&content_type)
+        && response_carries_body(&request_method, status)
+    {
+        enforce_synthesized_html_cache_privacy(&mut response);
+    }
     if template_cache_key.is_some() {
         set_response_compression(&mut response, reader_compression);
+    }
+    let offload_delivery = delivery_offload_eligible
+        && route == ResponseRoute::Stream
+        && status.is_success()
+        && !response_is_range_associated(&response)
+        && response_carries_body(&request_method, status)
+        && is_html_content_type(&content_type);
+    if offload_delivery {
+        enable_delivery_compression(&mut response);
     }
 
     match route {
@@ -5383,7 +5934,11 @@ pub async fn handle_publisher_request(
                     services,
                     auction_observation.take(),
                     dispatched,
-                    "buffered_unmodified_response",
+                    if range_associated_html_bypass {
+                        "partial_response"
+                    } else {
+                        "buffered_unmodified_response"
+                    },
                 )
                 .await;
             }
@@ -5396,23 +5951,15 @@ pub async fn handle_publisher_request(
                 content_encoding
             );
 
-            let offload_stream = compression_offload_active && is_html_content_type(&content_type);
-            let input_compression = Compression::from_content_encoding(&content_encoding);
-            let output_compression = if offload_stream {
-                Compression::None
-            } else {
-                input_compression
-            };
             let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
             response.headers_mut().remove(header::CONTENT_LENGTH);
-            if offload_stream {
-                apply_ssat_compression_offload_headers(response.headers_mut());
-            }
 
             Ok(PublisherResponse::Stream {
                 response,
                 body,
                 params: Box::new(OwnedProcessResponseParams {
+                    response_status: status,
+                    range_associated: false,
                     // The transform writes here; the post-transform gate reads it. Always
                     // present on the live path so no future caller has to remember to
                     // supply it — the handlers themselves stay gated on authorization.
@@ -5420,8 +5967,8 @@ pub async fn handle_publisher_request(
                     template_cache_key,
                     seam_ad_slots,
                     policy_headers,
-                    input_compression,
-                    output_compression,
+                    output_compression: offload_delivery.then_some(Compression::None),
+                    content_encoding,
                     origin_host,
                     origin_url: settings.publisher.origin_url.clone(),
                     request_host: request_host.to_string(),
@@ -6067,7 +6614,7 @@ fn match_renderable_slots(
 /// rejects nothing on its own. Every safety condition is the caller's to enforce,
 /// so they are enumerated here rather than left implicit.
 ///
-/// Spike-only, for the #1009 ESI validation.
+/// Used only by the shared-template assembly modes, which are opt-in per deployment.
 #[derive(Debug, Clone, PartialEq, Eq, derive_more::Display)]
 pub(crate) enum TemplateCacheBypassReason {
     /// Not a shared-template mode; there is no template cache object to write.
@@ -6109,15 +6656,12 @@ pub(crate) enum TemplateCacheBypassReason {
     /// `Content-Encoding` while returning the untouched bytes on the fallback route.
     #[display("origin content encoding is not supported by the template transform")]
     UnsupportedContentEncoding,
-    /// The request carried a `Cookie`, which TS forwards to origin unchanged — there
-    /// is no `Cookie` strip on the publisher path. Cookie-personalized HTML is
-    /// therefore cross-servable unless the origin declares `Vary: Cookie` or marks
-    /// those responses private, and a response can be personalized without carrying
-    /// `Set-Cookie` itself when the session was established earlier. Named in §4 of
-    /// the design doc; disqualifying until the origin's `Vary` is verified to cover
-    /// it.
-    #[display("request carried Cookie and the origin's Vary does not cover it")]
-    CookieForwarded,
+    /// The prepared request's cookies are disqualified by the configured policy.
+    ///
+    /// Named bypass cookies, unlisted cookies without an independence assertion,
+    /// or ambiguous input under a named policy prohibit both lookup and storage.
+    #[display("request cookies disqualified by template cache policy")]
+    CookiePolicy,
     /// The origin varies on a header the cache key does not cover.
     ///
     /// The key is built *before* the fetch from a configured [`VarySpec`], because a
@@ -6256,8 +6800,8 @@ impl TemplateCachePolicy {
 /// the most serious one that applies.
 ///
 /// See `docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md`
-/// §6.6 for why the C1 raw-origin/read-through cache, the reader-neutral template cache, and
-/// the forbidden C3 final assembled-response cache are distinct.
+/// §6.6 for why the raw origin readthrough cache, the reader-neutral template cache, and
+/// the forbidden final assembled-response cache are distinct.
 #[cfg(test)]
 pub(crate) fn template_cache_bypass_reason(
     mode: AssemblyMode,
@@ -6368,7 +6912,7 @@ fn surrogate_control_freshness(
             match name.as_str() {
                 // Deliberately not `cache_policy::cache_control_headers_are_private_or_no_store`:
                 // this gate additionally treats `no-cache` as non-shareable, because "revalidate
-                // before reuse" is correct for an HTTP cache and too permissive for a spike-owned
+                // before reuse" is correct for an HTTP cache and too permissive for a TS-owned
                 // one. Consolidating the two would loosen this gate rather than tidy it.
                 "private" | "no-store" | "no-cache" => {
                     return Err(TemplateCacheBypassReason::OriginNotShareable);
@@ -6416,7 +6960,9 @@ fn origin_shared_ttl(
     headers: &edgezero_core::http::HeaderMap,
     max_age: Duration,
 ) -> Result<Duration, TemplateCacheBypassReason> {
-    origin_shared_ttl_at(headers, SystemTime::now(), max_age)
+    // `httpdate` parses `Date`/`Expires` into `std::time::SystemTime`, so take
+    // the wasm-safe std value rather than calling `SystemTime::now()`.
+    origin_shared_ttl_at(headers, crate::ec::std_system_time_now(), max_age)
 }
 
 fn origin_shared_ttl_at(
@@ -6541,7 +7087,7 @@ fn template_cache_ttl(
         return Err(TemplateCacheBypassReason::AuthorizedRequest);
     }
     if cookie_disqualifies {
-        return Err(TemplateCacheBypassReason::CookieForwarded);
+        return Err(TemplateCacheBypassReason::CookiePolicy);
     }
     if response_headers.contains_key(header::SET_COOKIE) {
         return Err(TemplateCacheBypassReason::OriginSetCookie);
@@ -6828,7 +7374,8 @@ fn normalize_page_bids_path(raw: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError`] if cookie parsing or EC ID generation fails.
+/// Returns [`TrustedServerError`] if the request host is malformed, cookie
+/// parsing fails, or EC ID generation fails.
 pub async fn handle_page_bids(
     settings: &Settings,
     services: &RuntimeServices,
@@ -6850,6 +7397,7 @@ pub async fn handle_page_bids(
         );
         return Ok(page_bids_preflight_denied());
     }
+    ec_context.set_eid_sync_source(EidSyncSource::PageBids);
 
     // Deprecation signal for the transition alias. Evaluated after the
     // cross-site gate, so the count reflects genuine SPA clients still running a
@@ -6902,7 +7450,7 @@ pub async fn handle_page_bids(
     // Trusted request origin for absolute inline creative URLs — derived from the
     // origin the visitor is actually on (scheme, host, port), not the configured
     // publisher domain, which cannot carry a port and may differ by subdomain.
-    let request_info = RequestInfo::from_request(&req, services.client_info());
+    let request_info = RequestInfo::from_request(&req, services.client_info())?;
     let page_bids_request_origin = request_origin(&request_info.scheme, &request_info.host);
 
     let path_param = req
@@ -6934,7 +7482,6 @@ pub async fn handle_page_bids(
         Vec::new()
     };
 
-    let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
     // Owned so the identity-graph snapshot can be stored back on `ec_context`
     // below without holding a borrow of it across the mutation.
     let ec_id = ec_context
@@ -7200,7 +7747,7 @@ fn mark_deprecated_alias(response: &mut Response<EdgeBody>, is_legacy_alias: boo
 #[cfg(test)]
 mod tests {
     use std::future::Future as _;
-    use std::io::{self, Read as _, Write as _};
+    use std::io::{self, Read as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use brotli::Decompressor;
@@ -7213,6 +7760,145 @@ mod tests {
     use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
     use crate::auction::types::AuctionResponse;
     use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
+    use crate::platform::PlatformCacheIntent;
+
+    /// Every shared condition passing, as the base for single-condition negations.
+    fn all_shareable() -> SharedRequestInputs {
+        SharedRequestInputs {
+            method_is_cacheable: true,
+            host_present: true,
+            authorization_disqualifies: false,
+            cookie_disqualifies: false,
+            request_requires_origin: false,
+        }
+    }
+
+    #[test]
+    fn template_eligibility_implies_origin_shareability() {
+        for bits in 0u16..256 {
+            let inputs = SharedRequestInputs {
+                method_is_cacheable: bits & 1 != 0,
+                host_present: bits & 2 != 0,
+                authorization_disqualifies: bits & 4 != 0,
+                cookie_disqualifies: bits & 8 != 0,
+                request_requires_origin: bits & 16 != 0,
+            };
+            let is_esi = bits & 32 != 0;
+            let reader_supports_assembly = bits & 64 != 0;
+            let reader_requires_origin = bits & 128 != 0;
+
+            let shareable = origin_response_is_shareable(inputs);
+            let template = request_can_use_shared_template(
+                inputs,
+                is_esi,
+                reader_supports_assembly,
+                reader_requires_origin,
+            );
+
+            assert!(
+                !template || shareable,
+                "template eligibility must imply origin shareability, input bits {bits}"
+            );
+            assert_eq!(
+                template,
+                shareable && is_esi && reader_supports_assembly && !reader_requires_origin,
+                "template eligibility must be the shared base plus the three template \
+                 conditions, input bits {bits}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_shared_input_is_necessary_for_shareability() {
+        assert!(
+            origin_response_is_shareable(all_shareable()),
+            "should be shareable when every condition passes"
+        );
+
+        for (label, broken) in [
+            (
+                "method",
+                SharedRequestInputs {
+                    method_is_cacheable: false,
+                    ..all_shareable()
+                },
+            ),
+            (
+                "host",
+                SharedRequestInputs {
+                    host_present: false,
+                    ..all_shareable()
+                },
+            ),
+            (
+                "authorization",
+                SharedRequestInputs {
+                    authorization_disqualifies: true,
+                    ..all_shareable()
+                },
+            ),
+            (
+                "cookie",
+                SharedRequestInputs {
+                    cookie_disqualifies: true,
+                    ..all_shareable()
+                },
+            ),
+            (
+                "requires-origin",
+                SharedRequestInputs {
+                    request_requires_origin: true,
+                    ..all_shareable()
+                },
+            ),
+        ] {
+            assert!(
+                !origin_response_is_shareable(broken),
+                "dropping the {label} condition must make the request unshareable"
+            );
+        }
+    }
+
+    /// The two conditions that make template caching stricter than plain shareability.
+    ///
+    /// Pinned against hardcoded expectations rather than against the predicate's own
+    /// formula. `template_eligibility_implies_origin_shareability` compares the function
+    /// with a restatement of its body, so it catches a wrong combinator but would not
+    /// notice either of these terms being dropped — both sides of that equality would drop
+    /// it together.
+    #[test]
+    fn esi_mode_and_reader_support_are_each_necessary_for_template_eligibility() {
+        assert!(
+            request_can_use_shared_template(all_shareable(), true, true, false),
+            "should be eligible when every condition passes"
+        );
+
+        assert!(
+            !request_can_use_shared_template(all_shareable(), false, true, false),
+            "a shared template is assembled by ESI, so a non-ESI request must not read one"
+        );
+        assert!(
+            !request_can_use_shared_template(all_shareable(), true, false, false),
+            "a reader that cannot assemble the seam must not be served an unassembled template"
+        );
+        assert!(
+            !request_can_use_shared_template(
+                SharedRequestInputs {
+                    cookie_disqualifies: true,
+                    ..all_shareable()
+                },
+                true,
+                true,
+                false
+            ),
+            "template eligibility must never outlive origin shareability"
+        );
+        assert!(
+            !request_can_use_shared_template(all_shareable(), true, true, true),
+            "a reader who asked for a range or a revalidation must reach the origin, not be \
+             served a document synthesized from a template shared with other readers"
+        );
+    }
 
     #[test]
     fn request_head_snapshot_preserves_downstream_shape_without_body() {
@@ -7238,11 +7924,60 @@ mod tests {
 
     #[test]
     fn ec_snapshot_preload_requires_navigation_get_ec_and_kv() {
-        assert!(should_preload_ec_snapshot(true, true, true, true));
-        assert!(!should_preload_ec_snapshot(false, true, true, true));
-        assert!(!should_preload_ec_snapshot(true, false, true, true));
-        assert!(!should_preload_ec_snapshot(true, true, false, true));
-        assert!(!should_preload_ec_snapshot(true, true, true, false));
+        let baseline = EcSnapshotPreloadInput {
+            is_navigation: true,
+            is_get: true,
+            has_ec_id: true,
+            has_kv: true,
+            marker_valid: false,
+            auction_needs_row: false,
+            eid_cookie_may_need_persistence: false,
+            privacy_needs_row: false,
+        };
+        assert!(should_preload_ec_snapshot(&baseline));
+        assert!(!should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            is_navigation: false,
+            ..baseline
+        }));
+        assert!(!should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            is_get: false,
+            ..baseline
+        }));
+        assert!(!should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            has_ec_id: false,
+            ..baseline
+        }));
+        assert!(!should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            has_kv: false,
+            ..baseline
+        }));
+    }
+
+    #[test]
+    fn valid_marker_skips_only_when_no_other_consumer_needs_snapshot() {
+        let marker_only = EcSnapshotPreloadInput {
+            is_navigation: true,
+            is_get: true,
+            has_ec_id: true,
+            has_kv: true,
+            marker_valid: true,
+            auction_needs_row: false,
+            eid_cookie_may_need_persistence: false,
+            privacy_needs_row: false,
+        };
+        assert!(!should_preload_ec_snapshot(&marker_only));
+        assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            auction_needs_row: true,
+            ..marker_only
+        }));
+        assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            eid_cookie_may_need_persistence: true,
+            ..marker_only
+        }));
+        assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            privacy_needs_row: true,
+            ..marker_only
+        }));
     }
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::consent::ConsentContext;
@@ -7345,7 +8080,7 @@ mod tests {
         lookups: usize,
         http_calls_at_lookup: usize,
         stream_flags: Vec<bool>,
-        cache_bypass_flags: Vec<bool>,
+        cache_intents: Vec<PlatformCacheIntent>,
         body_is_stream: bool,
         request_rewritten: bool,
         response_is_private: bool,
@@ -7377,12 +8112,12 @@ mod tests {
         ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
             self.inner.insert(key, write)
         }
-        fn count_keys_with_prefix(
+        fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
-        ) -> Result<u32, Report<TrustedServerError>> {
-            self.inner.count_keys_with_prefix(prefix, limit)
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit)
         }
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
             self.inner.delete(key)
@@ -7513,15 +8248,13 @@ mod tests {
             Some(&graph),
             &mut ec_context,
             AuctionDispatch {
+                integration_registry: &IntegrationRegistry::empty_for_tests(),
                 orchestrator: &orchestrator,
                 slots: &slots,
                 registry: None,
             },
             navigation_request(),
-            PublisherAdapterOptions {
-                edge_cache_header: EdgeCacheHeader::SurrogateControl,
-                delivery_compression: DeliveryCompressionCapability::Unavailable,
-            },
+            EdgeCacheHeader::SurrogateControl,
         )
         .await;
 
@@ -7605,7 +8338,7 @@ mod tests {
             lookups: lookups.load(Ordering::SeqCst),
             http_calls_at_lookup: http_calls_at_lookup.load(Ordering::SeqCst),
             stream_flags: http.recorded_stream_response_flags(),
-            cache_bypass_flags: http.recorded_cache_bypass_flags(),
+            cache_intents: http.recorded_cache_intents(),
             body_is_stream,
             request_rewritten,
             response_is_private,
@@ -7614,6 +8347,170 @@ mod tests {
             datadome_tag_suppressed,
             ok,
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum MarkerProbe {
+        Valid,
+        Malformed,
+        WrongEc,
+        Expired,
+        PartnerSetMismatch,
+    }
+
+    fn marker_partner(source_domain: &str) -> crate::settings::EcPartner {
+        crate::settings::EcPartner {
+            name: format!("Marker partner {source_domain}"),
+            source_domain: source_domain.to_owned(),
+            openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
+            bidstream_enabled: true,
+            api_token: Some(crate::redacted::Redacted::new(format!(
+                "marker-{source_domain}-api-token-32-bytes-minimum"
+            ))),
+            batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: true,
+            pull_sync_url: Some(format!("https://sync.{source_domain}/pull")),
+            pull_sync_allowed_domains: vec![format!("sync.{source_domain}")],
+            pull_sync_ttl_sec: crate::settings::EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: crate::settings::EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: Some(crate::redacted::Redacted::new("pull-token".to_owned())),
+        }
+    }
+
+    async fn run_marker_lookup_probe(
+        probe: MarkerProbe,
+        has_eid_cookie: bool,
+        has_matched_auction_slot: bool,
+    ) -> usize {
+        let mut settings = if has_matched_auction_slot {
+            scheduling_settings()
+        } else {
+            create_test_settings()
+        };
+        settings.ec.partners = vec![marker_partner("ssp.example.com")];
+        let registry = PartnerRegistry::from_config(&settings.ec.partners)
+            .expect("should build pull partner registry");
+        let http = Arc::new(StubHttpClient::new());
+        http.set_concurrent_fanout(true);
+        http.push_response(200, b"<html><body>ok</body></html>".to_vec());
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let graph = KvIdentityGraph::new(OrderRecordingKv {
+            inner: InMemoryEcKv::new("marker-store"),
+            http: Arc::clone(&http),
+            http_calls_at_lookup: Arc::new(AtomicUsize::new(0)),
+            lookups: Arc::clone(&lookups),
+        });
+        let services = build_services_with_http_client(
+            Arc::clone(&http) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let ec_id = format!("{}.CkId01", "b".repeat(64));
+        let marker = match probe {
+            MarkerProbe::Valid => {
+                crate::ec::pull_sync_marker::create_marker_for_test(&settings, &registry, &ec_id)
+            }
+            MarkerProbe::Malformed => "not-a-marker".to_owned(),
+            MarkerProbe::WrongEc => crate::ec::pull_sync_marker::create_marker_for_test(
+                &settings,
+                &registry,
+                &format!("{}.Other1", "c".repeat(64)),
+            ),
+            MarkerProbe::Expired => {
+                crate::ec::pull_sync_marker::create_marker_for_test_with_expiry(
+                    &settings,
+                    &registry,
+                    &ec_id,
+                    crate::ec::current_timestamp().saturating_sub(1),
+                )
+            }
+            MarkerProbe::PartnerSetMismatch => {
+                let other_registry =
+                    PartnerRegistry::from_config(&[marker_partner("other.example.com")])
+                        .expect("should build alternate registry");
+                crate::ec::pull_sync_marker::create_marker_for_test(
+                    &settings,
+                    &other_registry,
+                    &ec_id,
+                )
+            }
+        };
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            Some(ec_id),
+            scheduling_consent(),
+            Some("203.0.113.7".to_owned()),
+        );
+        ec_context.set_pull_sync_marker_for_test(
+            crate::ec::pull_sync_marker::PullSyncMarkerState::from_cookie(Some(marker)),
+        );
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let slots = has_matched_auction_slot
+            .then(scheduling_slot)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut request = navigation_request();
+        if has_eid_cookie {
+            request
+                .headers_mut()
+                .insert(header::COOKIE, HeaderValue::from_static("ts-eids=present"));
+        }
+
+        let result = handle_publisher_request(
+            &settings,
+            &services,
+            Some(&graph),
+            &mut ec_context,
+            AuctionDispatch {
+                integration_registry: &IntegrationRegistry::empty_for_tests(),
+                orchestrator: &orchestrator,
+                slots: &slots,
+                registry: Some(&registry),
+            },
+            request,
+            EdgeCacheHeader::SurrogateControl,
+        )
+        .await;
+
+        assert!(result.is_ok(), "should proxy the origin response");
+        lookups.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn valid_completeness_marker_skips_pull_only_snapshot_lookup() {
+        assert_eq!(
+            run_marker_lookup_probe(MarkerProbe::Valid, false, false).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_markers_fall_back_to_snapshot_lookup() {
+        for probe in [
+            MarkerProbe::Malformed,
+            MarkerProbe::WrongEc,
+            MarkerProbe::Expired,
+            MarkerProbe::PartnerSetMismatch,
+        ] {
+            assert_eq!(
+                run_marker_lookup_probe(probe, false, false).await,
+                1,
+                "invalid marker should retain the normal preload"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_marker_does_not_skip_eid_cookie_persistence_lookup() {
+        assert_eq!(
+            run_marker_lookup_probe(MarkerProbe::Valid, true, false).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_marker_does_not_skip_auction_snapshot_lookup() {
+        assert_eq!(
+            run_marker_lookup_probe(MarkerProbe::Valid, false, true).await,
+            1
+        );
     }
 
     #[tokio::test]
@@ -7628,8 +8525,8 @@ mod tests {
         );
         assert_eq!(outcome.stream_flags, vec![true]);
         assert_eq!(
-            outcome.cache_bypass_flags,
-            vec![true],
+            outcome.cache_intents,
+            vec![PlatformCacheIntent::Bypass],
             "pending publisher origin request should bypass platform caching"
         );
         assert!(
@@ -8511,7 +9408,7 @@ mod tests {
 
     impl StreamProcessor for RecordingProcessor {
         fn process_chunk(&mut self, chunk: &[u8], _is_last: bool) -> Result<Vec<u8>, io::Error> {
-            if find_ascii_case_insensitive(chunk, BODY_CLOSE_PREFIX).is_some() {
+            if find_bytes(chunk, b"</body").is_some() {
                 self.body_close_processed_at
                     .store(self.read_count.load(Ordering::SeqCst), Ordering::SeqCst);
             }
@@ -8571,582 +9468,19 @@ mod tests {
         output
     }
 
-    fn ssat_compression_test_settings(enabled: bool) -> Settings {
-        let mut settings = Settings::from_toml(&format!(
-            r#"{}
-
-            [auction]
-            enabled = true
-
-            [creative_opportunities]
-            enabled = true
-            gam_network_id = "12345"
-
-            [[creative_opportunities.slot]]
-            id = "article-slot"
-            page_patterns = ["/article"]
-            formats = [{{ width = 300, height = 250 }}]
-            "#,
-            crate_test_settings_str()
-                .replace("https://assets.example/", "https://assets.example.com/")
-        ))
-        .expect("should parse SSAT compression test settings");
-        settings.publisher.ssat_compression_offload_enabled = enabled;
-        settings.publisher.domain = "publisher.example.com".to_string();
-        settings.publisher.origin_url = "https://origin.example.com".to_string();
-        settings.proxy.allowed_domains = vec!["*.example.com".to_string()];
-        settings
-    }
-
-    async fn run_ssat_compression_request(
-        settings: &Settings,
-        adapter_options: PublisherAdapterOptions,
-        origin_body: Vec<u8>,
-        origin_status: u16,
-        origin_content_type: &str,
-        origin_content_encoding: Option<&str>,
-    ) -> (
-        PublisherResponse,
-        Arc<StubHttpClient>,
-        RuntimeServices,
-        AuctionOrchestrator,
-    ) {
-        let stub = Arc::new(StubHttpClient::new());
-        let mut origin_headers = vec![
-            (
-                header::CONTENT_TYPE.as_str().to_string(),
-                origin_content_type.to_string(),
-            ),
-            (
-                header::CONTENT_LENGTH.as_str().to_string(),
-                "9999".to_string(),
-            ),
-            (header::VARY.as_str().to_string(), "Origin".to_string()),
-            (
-                header::VARY.as_str().to_string(),
-                "Accept-Language".to_string(),
-            ),
-        ];
-        if let Some(origin_content_encoding) = origin_content_encoding {
-            origin_headers.push((
-                header::CONTENT_ENCODING.as_str().to_string(),
-                origin_content_encoding.to_string(),
-            ));
-        }
-        stub.push_response_with_headers(origin_status, origin_body, origin_headers);
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
-        let consent = crate::consent::ConsentContext {
-            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
-            ..Default::default()
-        };
-        let mut ec_context = EcContext::new_for_test_with_ip(None, consent, None);
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-        let req = HttpRequest::builder()
-            .method(Method::GET)
-            .uri("https://publisher.example.com/article?edition=morning&view=full")
-            .header(header::HOST, "publisher.example.com")
-            .header(header::ACCEPT_ENCODING, "gzip, br, identity;q=0")
-            .header("sec-fetch-dest", "document")
-            .body(EdgeBody::empty())
-            .expect("should build SSAT compression request");
-
-        let publisher_response = handle_publisher_request(
-            settings,
-            &services,
-            None,
-            &mut ec_context,
-            AuctionDispatch {
-                orchestrator: &orchestrator,
-                slots: settings.creative_opportunity_slots(),
-                registry: None,
-            },
-            req,
-            adapter_options,
-        )
-        .await
-        .expect("should proxy SSAT compression request");
-
-        (publisher_response, stub, services, orchestrator)
-    }
-
-    #[test]
-    fn ssat_compression_offload_requires_setting_capability_and_ad_stack() {
-        let mut settings = create_test_settings();
-        let fastly_options = PublisherAdapterOptions {
-            edge_cache_header: EdgeCacheHeader::SurrogateControl,
-            delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
-        };
-        let unavailable_options = PublisherAdapterOptions {
-            edge_cache_header: EdgeCacheHeader::SMaxageFallback,
-            delivery_compression: DeliveryCompressionCapability::Unavailable,
-        };
-
-        assert!(
-            !should_offload_ssat_compression(&settings, fastly_options, true),
-            "disabled setting should retain in-guest compression"
-        );
-        settings.publisher.ssat_compression_offload_enabled = true;
-        assert!(
-            !should_offload_ssat_compression(&settings, unavailable_options, true),
-            "adapters without Fastly dynamic compression should retain in-guest compression"
-        );
-        assert!(
-            !should_offload_ssat_compression(&settings, fastly_options, false),
-            "requests outside the server-side ad stack should retain in-guest compression"
-        );
-        assert!(
-            should_offload_ssat_compression(&settings, fastly_options, true),
-            "enabled Fastly server-side ad stack should offload compression"
-        );
-    }
-
-    #[test]
-    fn ensure_vary_accept_encoding_preserves_wildcard() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(header::VARY, HeaderValue::from_static("*"));
-
-        ensure_vary_accept_encoding(&mut headers);
-
-        assert_eq!(
-            headers
-                .get_all(header::VARY)
-                .iter()
-                .filter_map(|value| value.to_str().ok())
-                .collect::<Vec<_>>(),
-            vec!["*"],
-            "wildcard Vary should not receive a redundant Accept-Encoding field"
-        );
-    }
-
-    #[tokio::test]
-    async fn fastly_ssat_compression_offload_preserves_origin_negotiation_and_emits_identity() {
-        let settings = ssat_compression_test_settings(true);
-        let html = b"<html><body><p>Origin HTML</p></body></html>";
-        let (publisher_response, stub, services, orchestrator) = run_ssat_compression_request(
-            &settings,
-            PublisherAdapterOptions {
-                edge_cache_header: EdgeCacheHeader::SurrogateControl,
-                delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
-            },
-            html.to_vec(),
-            200,
-            "text/html; charset=utf-8",
-            None,
-        )
-        .await;
-
-        assert_eq!(
-            stub.recorded_request_uris(),
-            vec!["https://origin.example.com/article?edition=morning&view=full"],
-            "offload must preserve the publisher request path and query"
-        );
-        let request_headers = stub.recorded_request_headers();
-        assert!(
-            request_headers[0].iter().any(|(name, value)| {
-                name.eq_ignore_ascii_case(header::ACCEPT_ENCODING.as_str()) && value == "gzip, br"
-            }),
-            "Fastly SSAT offload must retain supported origin negotiation"
-        );
-
-        let PublisherResponse::Stream {
-            response, params, ..
-        } = &publisher_response
-        else {
-            panic!("processable SSAT HTML should use the stream route");
-        };
-        assert_eq!(params.input_compression, Compression::None);
-        assert_eq!(params.output_compression, Compression::None);
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok()),
-            Some("no-store, private"),
-            "compression offload must preserve SSAT browser privacy"
-        );
-        assert!(
-            response.headers().get("surrogate-control").is_none(),
-            "compression offload must not restore shared cacheability"
-        );
-        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
-        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
-        assert_eq!(
-            response
-                .headers()
-                .get(HEADER_X_COMPRESS_HINT)
-                .and_then(|value| value.to_str().ok()),
-            Some("on")
-        );
-        let vary = response
-            .headers()
-            .get_all(header::VARY)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            vary,
-            vec!["Origin", "Accept-Language", "Accept-Encoding"],
-            "offload must preserve existing Vary fields and add Accept-Encoding once"
-        );
-
-        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let response = buffer_publisher_response_async(
-            publisher_response,
-            &Method::GET,
-            &settings,
-            &registry,
-            &orchestrator,
-            &services,
-        )
-        .await
-        .expect("should buffer identity SSAT output");
-        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
-        let body = response
-            .into_body()
-            .into_bytes()
-            .expect("should read identity SSAT output");
-        let body = String::from_utf8(body.to_vec()).expect("should decode identity SSAT output");
-        assert!(body.contains("Origin HTML"), "should preserve origin HTML");
-        assert!(body.contains("tsjs"), "should still process SSAT HTML");
-    }
-
-    #[tokio::test]
-    async fn fastly_ssat_compression_offload_preserves_non_html_error_compression() {
-        let settings = ssat_compression_test_settings(true);
-        let json = br#"{"message":"Negotiated JSON"}"#;
-        let (publisher_response, stub, services, orchestrator) = run_ssat_compression_request(
-            &settings,
-            PublisherAdapterOptions {
-                edge_cache_header: EdgeCacheHeader::SurrogateControl,
-                delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
-            },
-            gzip_encode(json),
-            502,
-            "application/json",
-            Some("gzip"),
-        )
-        .await;
-
-        let request_headers = stub.recorded_request_headers();
-        assert!(
-            request_headers[0].iter().any(|(name, value)| {
-                name.eq_ignore_ascii_case(header::ACCEPT_ENCODING.as_str()) && value == "gzip, br"
-            }),
-            "offload must preserve supported origin negotiation for non-HTML responses"
-        );
-
-        let PublisherResponse::Stream {
-            response, params, ..
-        } = &publisher_response
-        else {
-            panic!("processable JSON should use the stream route");
-        };
-        assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
-        assert_eq!(params.input_compression, Compression::Gzip);
-        assert_eq!(params.output_compression, Compression::Gzip);
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CONTENT_ENCODING)
-                .and_then(|value| value.to_str().ok()),
-            Some("gzip")
-        );
-        assert!(response.headers().get(HEADER_X_COMPRESS_HINT).is_none());
-
-        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let response = buffer_publisher_response_async(
-            publisher_response,
-            &Method::GET,
-            &settings,
-            &registry,
-            &orchestrator,
-            &services,
-        )
-        .await
-        .expect("should buffer mirrored non-HTML output");
-        let body = response
-            .into_body()
-            .into_bytes()
-            .expect("should read mirrored non-HTML output");
-        let decoded = gzip_decode(&body);
-        assert!(
-            String::from_utf8(decoded)
-                .expect("should decode mirrored non-HTML gzip")
-                .contains("Negotiated JSON"),
-            "non-HTML output must remain valid gzip"
-        );
-    }
-
-    #[tokio::test]
-    async fn fastly_ssat_compression_offload_decodes_supported_origin_encodings() {
-        let settings = ssat_compression_test_settings(true);
-        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let html = b"<html><body><p>Compressed origin HTML</p></body></html>";
-        let cases = [
-            ("gzip", gzip_encode(html)),
-            ("deflate", deflate_encode(html)),
-            ("br", brotli_encode(html)),
-        ];
-
-        for (origin_content_encoding, origin_body) in cases {
-            let (publisher_response, _stub, services, orchestrator) = run_ssat_compression_request(
-                &settings,
-                PublisherAdapterOptions {
-                    edge_cache_header: EdgeCacheHeader::SurrogateControl,
-                    delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
-                },
-                origin_body,
-                200,
-                "text/html; charset=utf-8",
-                Some(origin_content_encoding),
-            )
-            .await;
-
-            let PublisherResponse::Stream {
-                response, params, ..
-            } = &publisher_response
-            else {
-                panic!("supported compressed SSAT HTML should use the stream route");
-            };
-            assert_eq!(
-                params.input_compression,
-                Compression::from_content_encoding(origin_content_encoding),
-                "should decode the origin's actual content encoding"
-            );
-            assert_eq!(params.output_compression, Compression::None);
-            assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
-            assert_eq!(
-                response
-                    .headers()
-                    .get(HEADER_X_COMPRESS_HINT)
-                    .and_then(|value| value.to_str().ok()),
-                Some("on")
-            );
-
-            let response = buffer_publisher_response_async(
-                publisher_response,
-                &Method::GET,
-                &settings,
-                &registry,
-                &orchestrator,
-                &services,
-            )
-            .await
-            .expect("should buffer decoded SSAT output");
-            let body = response
-                .into_body()
-                .into_bytes()
-                .expect("should read decoded SSAT output");
-            let body =
-                String::from_utf8(body.to_vec()).expect("should decode identity SSAT output");
-            assert!(
-                body.contains("Compressed origin HTML"),
-                "should decode {origin_content_encoding} origin HTML"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn fastly_ssat_compression_offload_keeps_lazy_stream_output_identity() {
-        let settings = Arc::new(ssat_compression_test_settings(true));
-        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let html = b"<html><head></head><body><p>Streamed origin HTML</p></body></html>";
-
-        for (encoding, bytes) in [
-            ("gzip", gzip_encode(html)),
-            ("deflate", deflate_encode(html)),
-            ("br", brotli_encode(html)),
-        ] {
-            let (publisher_response, _stub, services, orchestrator) = run_ssat_compression_request(
-                &settings,
-                PublisherAdapterOptions {
-                    edge_cache_header: EdgeCacheHeader::SurrogateControl,
-                    delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
-                },
-                bytes,
-                200,
-                "text/html; charset=utf-8",
-                Some(encoding),
-            )
-            .await;
-            let PublisherResponse::Stream {
-                response,
-                body,
-                params,
-            } = publisher_response
-            else {
-                panic!("processable SSAT HTML should use the stream route");
-            };
-            let bytes = body.into_bytes().expect("should read compressed fixture");
-            let body = EdgeBody::stream(futures::stream::iter(
-                bytes
-                    .chunks(7)
-                    .map(bytes::Bytes::copy_from_slice)
-                    .collect::<Vec<_>>(),
-            ));
-            let response = publisher_response_into_streaming_response(
-                PublisherResponse::Stream {
-                    response,
-                    body,
-                    params,
-                },
-                &Method::GET,
-                Arc::clone(&settings),
-                &registry,
-                Arc::new(orchestrator),
-                services,
-            )
-            .await
-            .expect("should finalize lazy SSAT output");
-
-            assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
-            assert_eq!(response.headers()[HEADER_X_COMPRESS_HINT], "on");
-            assert_eq!(
-                response.headers()[header::CACHE_CONTROL],
-                "no-store, private"
-            );
-            assert!(response.body().is_stream(), "should retain lazy output");
-            let bytes = response
-                .into_body()
-                .into_bytes_bounded(settings.publisher.max_buffered_body_bytes)
-                .await
-                .expect("should drain lazy SSAT output");
-            let html = String::from_utf8(bytes.to_vec()).expect("should decode identity HTML");
-            assert!(
-                html.contains("Streamed origin HTML"),
-                "should decode {encoding}"
-            );
-            assert!(html.contains("tsjs"), "should process streamed HTML");
-        }
-    }
-
-    #[tokio::test]
-    async fn unavailable_delivery_compression_keeps_mirrored_gzip_behavior() {
-        let settings = ssat_compression_test_settings(true);
-        let html = b"<html><body><p>Portable adapter</p></body></html>";
-        let (publisher_response, stub, services, orchestrator) = run_ssat_compression_request(
-            &settings,
-            PublisherAdapterOptions {
-                edge_cache_header: EdgeCacheHeader::SMaxageFallback,
-                delivery_compression: DeliveryCompressionCapability::Unavailable,
-            },
-            gzip_encode(html),
-            200,
-            "text/html; charset=utf-8",
-            Some("gzip"),
-        )
-        .await;
-
-        let request_headers = stub.recorded_request_headers();
-        assert!(
-            request_headers[0].iter().any(|(name, value)| {
-                name.eq_ignore_ascii_case(header::ACCEPT_ENCODING.as_str()) && value == "gzip, br"
-            }),
-            "non-Fastly adapters must retain supported client encodings"
-        );
-        let PublisherResponse::Stream {
-            response, params, ..
-        } = &publisher_response
-        else {
-            panic!("processable SSAT HTML should use the stream route");
-        };
-        assert_eq!(params.input_compression, Compression::Gzip);
-        assert_eq!(params.output_compression, Compression::Gzip);
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CONTENT_ENCODING)
-                .and_then(|value| value.to_str().ok()),
-            Some("gzip")
-        );
-        assert!(response.headers().get(HEADER_X_COMPRESS_HINT).is_none());
-        assert_eq!(
-            response
-                .headers()
-                .get_all(header::VARY)
-                .iter()
-                .filter_map(|value| value.to_str().ok())
-                .collect::<Vec<_>>(),
-            vec!["Origin", "Accept-Language"],
-            "non-Fastly adapters must not mutate Vary"
-        );
-
-        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let response = buffer_publisher_response_async(
-            publisher_response,
-            &Method::GET,
-            &settings,
-            &registry,
-            &orchestrator,
-            &services,
-        )
-        .await
-        .expect("should buffer mirrored gzip output");
-        let body = response
-            .into_body()
-            .into_bytes()
-            .expect("should read mirrored gzip output");
-        let decoded = gzip_decode(&body);
-        assert!(
-            String::from_utf8(decoded)
-                .expect("should decode mirrored gzip")
-                .contains("Portable adapter"),
-            "non-Fastly output must remain valid gzip"
-        );
-    }
-
-    #[tokio::test]
-    async fn disabled_offload_keeps_default_mirrored_compression() {
-        let settings = ssat_compression_test_settings(false);
-        let html = b"<html><body><p>Default behavior</p></body></html>";
-        let (publisher_response, stub, _services, _orchestrator) = run_ssat_compression_request(
-            &settings,
-            PublisherAdapterOptions {
-                edge_cache_header: EdgeCacheHeader::SurrogateControl,
-                delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
-            },
-            gzip_encode(html),
-            200,
-            "text/html; charset=utf-8",
-            Some("gzip"),
-        )
-        .await;
-
-        let request_headers = stub.recorded_request_headers();
-        assert!(request_headers[0].iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case(header::ACCEPT_ENCODING.as_str()) && value == "gzip, br"
-        }));
-        let PublisherResponse::Stream {
-            response, params, ..
-        } = publisher_response
-        else {
-            panic!("processable SSAT HTML should use the stream route");
-        };
-        assert_eq!(params.input_compression, Compression::Gzip);
-        assert_eq!(params.output_compression, Compression::Gzip);
-        assert!(response.headers().get(HEADER_X_COMPRESS_HINT).is_none());
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CONTENT_ENCODING)
-                .and_then(|value| value.to_str().ok()),
-            Some("gzip")
-        );
-    }
-
     fn make_stream_params(
         settings: &Settings,
         content_encoding: &str,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            output_compression: None,
+            response_status: StatusCode::OK,
+            range_associated: false,
             csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
-            input_compression: Compression::from_content_encoding(content_encoding),
-            output_compression: Compression::from_content_encoding(content_encoding),
+            content_encoding: content_encoding.to_owned(),
             origin_host: settings.publisher.origin_host(),
             origin_url: settings.publisher.origin_url.clone(),
             request_host: settings.publisher.domain.clone(),
@@ -9372,15 +9706,13 @@ mod tests {
             None,
             &mut ec_context,
             AuctionDispatch {
+                integration_registry: &IntegrationRegistry::empty_for_tests(),
                 orchestrator: &orchestrator,
                 slots: &[],
                 registry: None,
             },
             req,
-            PublisherAdapterOptions {
-                edge_cache_header: EdgeCacheHeader::SurrogateControl,
-                delivery_compression: DeliveryCompressionCapability::Unavailable,
-            },
+            EdgeCacheHeader::SurrogateControl,
         )
         .await
         .expect("should proxy publisher request")
@@ -9454,9 +9786,6 @@ mod tests {
                 gpt_diagnostics,
                 body_close,
                 suppress_datadome_client_side_tag: false,
-                bid_injection_mode: crate::html_processor::BidInjectionMode::DirectState,
-                post_processing_mode: crate::html_processor::HtmlPostProcessingMode::Enabled,
-                document_state: crate::integrations::IntegrationDocumentState::default(),
             };
 
             let mut processor = create_html_processor(config);
@@ -9486,8 +9815,10 @@ mod tests {
         fn shared_template_ad_seam_is_readable_and_versioned() {
             assert_eq!(
                 (crate::platform::TEMPLATE_SCHEMA_VERSION, AD_ASSEMBLY_SEAM,),
-                (4, "<!--ts-ad-seam-->"),
-                "the readable seam and its cache schema must move together"
+                (5, "<!--ts-ad-seam-->"),
+                "the core build digest in the template fingerprint isolates seam changes, \
+                 so updating the seam needs no schema bump; the schema moves only for \
+                 compatibility changes outside that digest (see TEMPLATE_SCHEMA_VERSION)"
             );
             assert_eq!(
                 body_close_injection(AssemblyMode::Esi, false),
@@ -9600,6 +9931,43 @@ mod tests {
         }
 
         #[test]
+        fn production_fingerprint_uses_the_generated_build_digest() {
+            let settings = settings_with_prebid(true, 1000);
+            assert_eq!(
+                TEMPLATE_BUILD_DIGEST.len(),
+                64,
+                "should generate a SHA-256 digest"
+            );
+            assert!(
+                TEMPLATE_BUILD_DIGEST
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+                "should encode the build digest as hexadecimal"
+            );
+            assert_eq!(
+                template_fingerprint(&settings),
+                template_fingerprint_with_build_digest(&settings, TEMPLATE_BUILD_DIGEST),
+                "should use the generated digest in production"
+            );
+            assert_ne!(
+                template_fingerprint(&settings),
+                template_fingerprint_with_build_digest(&settings, ""),
+                "should not omit the build digest in production"
+            );
+        }
+
+        #[test]
+        fn changing_only_the_build_digest_changes_the_fingerprint() {
+            let settings = settings_with_prebid(true, 1000);
+
+            assert_ne!(
+                template_fingerprint_with_build_digest(&settings, "build-before-head-edit"),
+                template_fingerprint_with_build_digest(&settings, "build-after-head-edit"),
+                "should select a new template when only compiled head code changes"
+            );
+        }
+
+        #[test]
         fn disabling_an_integration_changes_the_fingerprint() {
             // The fingerprint was `concatenated_hash(all_module_ids())` — every module
             // compiled into the binary, so a constant for that binary. Turning an
@@ -9645,6 +10013,26 @@ mod tests {
                 first,
                 "two equal configurations must fingerprint identically"
             );
+        }
+
+        #[test]
+        fn a_context_key_allowlist_fingerprints_identically_across_parses() {
+            let source = format!(
+                "{}\n[auction]\nallowed_context_keys = [\"zeta\", \"alpha\", \"gamma\", \"beta\", \"epsilon\", \"delta\"]\n",
+                crate_test_settings_str()
+            );
+            let first = Settings::from_toml(&source).expect("should parse context allowlist");
+            let expected = template_fingerprint(&first);
+
+            for _ in 0..32 {
+                let settings =
+                    Settings::from_toml(&source).expect("should reparse context allowlist");
+                assert_eq!(
+                    template_fingerprint(&settings),
+                    expected,
+                    "should fingerprint independently parsed allowlists identically"
+                );
+            }
         }
 
         #[test]
@@ -9735,7 +10123,7 @@ mod tests {
 
     mod page_bids_format_tests {
         //! Page-bids is a JSON API. The old executable fragment was part of the removed
-        //! parser-based spike and must not remain as an accidental public surface.
+        //! parser-based path and must not remain as an accidental public surface.
 
         use super::*;
 
@@ -9844,6 +10232,13 @@ mod tests {
                 Ok(())
             }
 
+            async fn purge_url_surrogate_key(
+                &self,
+                _key: &str,
+            ) -> Result<(), crate::platform::TemplateCacheError> {
+                Ok(())
+            }
+
             async fn purge_all(&self) -> Result<(), crate::platform::TemplateCacheError> {
                 Ok(())
             }
@@ -9863,9 +10258,11 @@ mod tests {
                 url: "https://example.com/page".to_string(),
                 request_host: "example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/page".to_string(),
                 origin_identity: "https://origin.example.com\0origin.example.com".to_string(),
                 assembly_mode: AssemblyMode::Esi,
                 vary_values: vec![],
+                cookie_values: Vec::new(),
                 template_fingerprint: "fp".to_string(),
                 schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
             }
@@ -9881,6 +10278,39 @@ mod tests {
                 )),
                 expires_at: Instant::now() + Duration::from_secs(30),
             }
+        }
+
+        #[test]
+        fn async_eof_rejects_template_authorization_before_input() {
+            let settings = crate::publisher::allow_eof_test_settings(create_test_settings());
+            let cache = RecordingCache::default();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                AsyncTailFactory(Arc::clone(&calls)),
+            )]);
+            let mut params = html_stream_params("gzip", None);
+            params.template_cache_key = Some(authorization(&cache));
+            let error = super::super::html_finalization::HtmlEofDriver::new(
+                EdgeBody::empty(),
+                &mut params,
+                &settings,
+                &registry,
+            )
+            .err()
+            .expect("should reject shared-template authorization for async HTML");
+            assert!(
+                format!("{error:?}").contains("template"),
+                "should explain the registry mismatch"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "should not invoke optional work"
+            );
+            assert!(
+                cache.recorded().is_empty(),
+                "should not publish async output as a template"
+            );
         }
 
         #[tokio::test]
@@ -9960,6 +10390,11 @@ mod tests {
         //! the cache without touching the origin. Everything else in this file tests a
         //! link; this tests that they connect.
 
+        mod delivery_compression_tests {
+            use super::*;
+            include!("publisher/delivery_compression_tests.rs");
+        }
+
         use super::*;
         use crate::platform::ClientInfo;
         use crate::platform::test_support::{
@@ -9989,6 +10424,10 @@ mod tests {
             /// Force the lookup transaction to fail, for the fail-open + telemetry
             /// contract. A backend outage must never become a publisher outage.
             fail_lookup: AtomicBool,
+            /// Surrogate keys a purge asked for. This double stores by cache key, so it
+            /// cannot resolve a surrogate key to entries the way the platform does —
+            /// recording the request is what a test can assert on.
+            purged_surrogate_keys: Arc<Mutex<Vec<String>>>,
         }
 
         struct MemoryTemplateReservation {
@@ -10174,6 +10613,21 @@ mod tests {
                 Ok(())
             }
 
+            /// Records the key so a test can assert what a purge asked for.
+            ///
+            /// This double stores by cache key, not by surrogate key, so it cannot
+            /// resolve one to the other the way the platform does.
+            async fn purge_url_surrogate_key(
+                &self,
+                key: &str,
+            ) -> Result<(), crate::platform::TemplateCacheError> {
+                self.purged_surrogate_keys
+                    .lock()
+                    .expect("should lock purged surrogate keys")
+                    .push(key.to_owned());
+                Ok(())
+            }
+
             async fn purge_all(&self) -> Result<(), crate::platform::TemplateCacheError> {
                 self.entries.lock().expect("should lock entries").clear();
                 Ok(())
@@ -10205,6 +10659,20 @@ mod tests {
             // without it.
             settings.proxy.allowed_domains =
                 vec!["*.example".to_string(), "*.example.com".to_string()];
+            settings
+        }
+
+        /// Settings with the readthrough opt-in turned on.
+        ///
+        /// A separate helper rather than a default, because the flag being off by default
+        /// is the property that keeps this change inert until an operator asks for it.
+        fn settings_with_readthrough_enabled(mode: &str) -> Settings {
+            let mut settings = settings_with_mode(mode);
+            settings
+                .creative_opportunities
+                .as_mut()
+                .expect("settings_with_mode should configure creative opportunities")
+                .origin_readthrough_enabled = Some(true);
             settings
         }
 
@@ -10240,6 +10708,55 @@ mod tests {
             assembler: Arc<RecordingTemplateAssembler>,
         ) -> RuntimeServices {
             services(http_client, cache).with_template_assembler(assembler)
+        }
+
+        /// A template cache **and** a telemetry sink.
+        ///
+        /// Neither existing builder wires both — `services` above sets the cache and no
+        /// sink, and `services_with_telemetry` in the SSAT module sets the sink and no
+        /// cache. Cache-outcome telemetry cannot be asserted end to end without both.
+        fn services_with_cache_and_telemetry(
+            http_client: Arc<StubHttpClient>,
+            cache: Arc<MemoryTemplateCache>,
+            telemetry_sink: Arc<RecordingTelemetrySink>,
+        ) -> RuntimeServices {
+            let telemetry_sink: Arc<dyn crate::auction::telemetry::AuctionTelemetrySink> =
+                telemetry_sink;
+            RuntimeServices::builder()
+                .config_store(Arc::new(NoopConfigStore))
+                .secret_store(Arc::new(NoopSecretStore))
+                .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+                .backend(Arc::new(StubBackend))
+                .http_client(http_client)
+                .geo(Arc::new(NoopGeo))
+                .client_info(ClientInfo::default())
+                .template_cache(cache)
+                .auction_telemetry_sink(telemetry_sink)
+                .build()
+        }
+
+        /// The most recent `summary` row the sink recorded.
+        ///
+        /// `RecordingTelemetrySink` exposes no accessor, so this reads the field directly.
+        fn last_summary_row(
+            sink: &RecordingTelemetrySink,
+        ) -> Option<crate::auction::telemetry::AuctionEventRow> {
+            sink.batches
+                .lock()
+                .expect("should lock recorded telemetry batches")
+                .iter()
+                .flat_map(crate::auction::telemetry::AuctionEventBatch::rows)
+                .rfind(|row| row.event_kind == "summary")
+                .cloned()
+        }
+
+        fn navigation_request_with_cookie(cookie: &str) -> Request<EdgeBody> {
+            let mut request = navigation_request();
+            request.headers_mut().insert(
+                header::COOKIE,
+                HeaderValue::from_str(cookie).expect("should build a cookie header"),
+            );
+            request
         }
 
         /// Shareable HTML: no `Set-Cookie`, no `Vary`, a public `Cache-Control`. Every
@@ -10320,7 +10837,7 @@ mod tests {
         /// Name of the bidding test double, matched by `[auction].providers`.
         const STUB_BIDDER: &str = "stub-bidder";
 
-        /// The CPM the stub bids. Chosen so its price bucket (`"3.50"`) is a distinctive
+        /// The default CPM the stub bids. Its price bucket (`"3.50"`) is a distinctive
         /// string that cannot appear in the fixture page by accident.
         const STUB_BID_CPM: f64 = 3.5;
 
@@ -10329,7 +10846,9 @@ mod tests {
         /// Every other fixture in this file leaves the orchestrator with no providers, so
         /// every auction resolves to an empty bid map. That is exactly why a defect that
         /// discarded *non-empty* maps survived: no test ever produced one.
-        struct WinningBidProvider;
+        struct WinningBidProvider {
+            price: f64,
+        }
 
         #[async_trait::async_trait(?Send)]
         impl crate::auction::provider::AuctionProvider for WinningBidProvider {
@@ -10372,7 +10891,7 @@ mod tests {
                     STUB_BIDDER,
                     vec![Bid {
                         slot_id: "test-slot".to_string(),
-                        price: Some(STUB_BID_CPM),
+                        price: Some(self.price),
                         currency: "USD".to_string(),
                         creative: None,
                         adomain: None,
@@ -10480,8 +10999,18 @@ mod tests {
             services: &RuntimeServices,
             request: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
+            run_bidding_at_price(settings, services, request, STUB_BID_CPM).await
+        }
+
+        /// [`run_bidding`], with a distinct winning CPM for this request.
+        async fn run_bidding_at_price(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+            price: f64,
+        ) -> Response<EdgeBody> {
             let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(WinningBidProvider));
+            orchestrator.register_provider(Arc::new(WinningBidProvider { price }));
             run_with_orchestrator(
                 settings,
                 services,
@@ -10490,6 +11019,490 @@ mod tests {
                 Finalizer::Streaming,
             )
             .await
+        }
+
+        #[tokio::test]
+        async fn html_finalization_preserves_a_winning_bid_before_the_structural_body_end() {
+            let settings = Arc::new(crate::publisher::allow_eof_test_settings(
+                settings_with_bidder("inline"),
+            ));
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), cache);
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                super::TerminalTestFactory,
+            )]);
+            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            orchestrator.register_provider(Arc::new(WinningBidProvider {
+                price: STUB_BID_CPM,
+            }));
+            let orchestrator = Arc::new(orchestrator);
+            queue_bid_response(&stub);
+            queue_shareable_html(&stub);
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(None, consent);
+            let response = handle_publisher_request(
+                &settings,
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    integration_registry: &registry,
+                    orchestrator: &orchestrator,
+                    slots: &[article_slot()],
+                    registry: None,
+                },
+                navigation_request(),
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should launch the winning auction");
+            let response = publisher_response_into_streaming_response(
+                response,
+                &Method::GET,
+                settings,
+                &registry,
+                orchestrator,
+                services,
+            )
+            .await
+            .expect("should retain terminal and auction phases");
+            let html =
+                String::from_utf8(body_of(response).await).expect("should emit example UTF-8 HTML");
+            let bids = seam_bids(&html);
+            assert_eq!(
+                bids.get("test-slot")
+                    .and_then(|bid| bid.get("hb_pb"))
+                    .and_then(serde_json::Value::as_str),
+                Some("3.50"),
+                "should retain the winning bid after terminal I/O"
+            );
+            assert!(html.contains("origin"), "should preserve the article bytes");
+            assert!(
+                html.ends_with("<!--example-finalized-->"),
+                "should commit the terminal output"
+            );
+            assert_eq!(
+                html.matches("var b=JSON.parse(").count(),
+                1,
+                "should inject bids once"
+            );
+            assert!(
+                html.find("var b=JSON.parse(")
+                    .expect("should find the bids")
+                    < html
+                        .find("</body>")
+                        .expect("should retain the structural body end"),
+                "should assemble bids before the parsed closing tag"
+            );
+            assert!(
+                !html.contains("ts-inline-body-close-"),
+                "should consume the parser seam token"
+            );
+        }
+
+        #[tokio::test]
+        async fn html_finalization_range_bypass_preserves_origin_policy_with_live_or_suppressed_ads()
+         {
+            for (live, suppressed) in [(true, false), (false, false), (false, true)] {
+                for (status, content_range) in [(206, false), (200, true), (416, true)] {
+                    let mut settings =
+                        crate::publisher::allow_eof_test_settings(settings_with_bidder("inline"));
+                    settings.auction.enabled = live;
+                    let settings = Arc::new(settings);
+                    let stub = Arc::new(StubHttpClient::new());
+                    let sink = Arc::new(RecordingTelemetrySink::default());
+                    let services = services_with_cache_and_telemetry(
+                        Arc::clone(&stub),
+                        Arc::new(MemoryTemplateCache::default()),
+                        Arc::clone(&sink),
+                    );
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let registry =
+                        IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                            super::CountingTerminalFactory(Arc::clone(&calls)),
+                        )]);
+                    let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+                    orchestrator.register_provider(Arc::new(WinningBidProvider {
+                        price: STUB_BID_CPM,
+                    }));
+                    if live {
+                        queue_bid_response(&stub);
+                    }
+                    let raw = b"<p>Example partial article</p>";
+                    let mut headers = vec![
+                        ("content-type", "text/html"),
+                        ("content-length", "30"),
+                        ("cache-control", "public, max-age=60"),
+                        ("etag", "example-origin-tag"),
+                        ("last-modified", "Mon, 01 Jan 2024 00:00:00 GMT"),
+                        ("surrogate-control", "max-age=60"),
+                    ];
+                    if content_range {
+                        headers.push(("content-range", "bytes 0-29/100"));
+                    }
+                    stub.push_response_with_headers(status, raw.to_vec(), headers);
+                    let consent = crate::consent::ConsentContext {
+                        jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                        ..Default::default()
+                    };
+                    let mut ec_context = EcContext::new_for_test(None, consent);
+                    let mut request = navigation_request();
+                    if suppressed {
+                        request
+                            .extensions_mut()
+                            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+                    }
+                    let publisher = handle_publisher_request(
+                        &settings,
+                        &services,
+                        None,
+                        &mut ec_context,
+                        AuctionDispatch {
+                            integration_registry: &registry,
+                            orchestrator: &orchestrator,
+                            slots: &[article_slot()],
+                            registry: None,
+                        },
+                        request,
+                        EdgeCacheHeader::SMaxageFallback,
+                    )
+                    .await
+                    .expect("should classify partial HTML before synthesized policy");
+                    let response = publisher_response_into_streaming_response(
+                        publisher,
+                        &Method::GET,
+                        settings,
+                        &registry,
+                        Arc::new(orchestrator),
+                        services,
+                    )
+                    .await
+                    .expect("should preserve partial origin delivery");
+                    for (name, expected) in [
+                        (header::CONTENT_LENGTH, "30"),
+                        (header::CACHE_CONTROL, "public, max-age=60"),
+                        (header::ETAG, "example-origin-tag"),
+                        (header::LAST_MODIFIED, "Mon, 01 Jan 2024 00:00:00 GMT"),
+                    ] {
+                        assert_eq!(
+                            response
+                                .headers()
+                                .get(name)
+                                .and_then(|value| value.to_str().ok()),
+                            Some(expected),
+                            "should preserve origin policy for live={live}, suppressed={suppressed}, status={status}"
+                        );
+                    }
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get("surrogate-control")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("max-age=60"),
+                        "should preserve origin edge cache policy"
+                    );
+                    assert_eq!(
+                        body_of(response).await,
+                        raw,
+                        "should preserve partial article bytes"
+                    );
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        0,
+                        "should perform no terminal I/O"
+                    );
+                    let batches = sink.batches.lock().expect("should inspect range telemetry");
+                    let summaries: Vec<_> = batches
+                        .iter()
+                        .flat_map(crate::auction::telemetry::AuctionEventBatch::rows)
+                        .filter(|row| row.event_kind == "summary")
+                        .collect();
+                    assert_eq!(
+                        summaries.len(),
+                        1,
+                        "should record one terminal auction outcome"
+                    );
+                    assert_eq!(
+                        summaries[0].terminal_status.as_deref(),
+                        Some(if live { "abandoned" } else { "skipped" }),
+                        "should abandon dispatched bids once and preserve ordinary skipped telemetry"
+                    );
+                    if live {
+                        assert_eq!(
+                            summaries[0].terminal_reason.as_deref(),
+                            Some("partial_response"),
+                            "should match direct finalizer range abandonment"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[derive(Default)]
+        struct RawOriginCacheClient {
+            cached: Mutex<Option<Vec<u8>>>,
+            misses: AtomicUsize,
+            hits: AtomicUsize,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl crate::platform::PlatformHttpClient for RawOriginCacheClient {
+            async fn send(
+                &self,
+                request: crate::platform::PlatformHttpRequest,
+            ) -> Result<crate::platform::PlatformResponse, Report<crate::platform::PlatformError>>
+            {
+                assert!(
+                    matches!(
+                        request.cache_intent,
+                        crate::platform::PlatformCacheIntent::Shared { .. }
+                    ),
+                    "should retain raw-origin cache eligibility"
+                );
+                let mut cached = self.cached.lock().expect("should lock raw origin cache");
+                let bytes = if let Some(bytes) = cached.as_ref() {
+                    self.hits.fetch_add(1, Ordering::SeqCst);
+                    bytes.clone()
+                } else {
+                    self.misses.fetch_add(1, Ordering::SeqCst);
+                    let bytes =
+                        b"<html><head></head><body>example raw article</body></html>".to_vec();
+                    *cached = Some(bytes.clone());
+                    bytes
+                };
+                Ok(crate::platform::PlatformResponse::new(
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "text/html")
+                        .header(header::CACHE_CONTROL, "public, max-age=60")
+                        .body(EdgeBody::from(bytes))
+                        .expect("should construct raw origin response"),
+                ))
+            }
+
+            async fn send_async(
+                &self,
+                _: crate::platform::PlatformHttpRequest,
+            ) -> Result<
+                crate::platform::PlatformPendingRequest,
+                Report<crate::platform::PlatformError>,
+            > {
+                panic!("should not dispatch an auction in the raw-origin cache fixture")
+            }
+
+            async fn select(
+                &self,
+                _: Vec<crate::platform::PlatformPendingRequest>,
+            ) -> Result<crate::platform::PlatformSelectResult, Report<crate::platform::PlatformError>>
+            {
+                panic!("should not collect an auction in the raw-origin cache fixture")
+            }
+        }
+
+        #[tokio::test]
+        async fn html_finalization_runs_again_on_a_raw_origin_cache_hit() {
+            let client = Arc::new(RawOriginCacheClient::default());
+            let template_cache = Arc::new(MemoryTemplateCache::default());
+            let mut settings =
+                crate::publisher::allow_eof_test_settings(settings_with_readthrough_enabled("esi"));
+            settings.auction.enabled = false;
+            let settings = Arc::new(settings);
+            let services = RuntimeServices::builder()
+                .config_store(Arc::new(NoopConfigStore))
+                .secret_store(Arc::new(NoopSecretStore))
+                .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+                .backend(Arc::new(StubBackend))
+                .http_client(client.clone())
+                .geo(Arc::new(NoopGeo))
+                .client_info(ClientInfo::default())
+                .template_cache(template_cache.clone())
+                .build();
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                super::TerminalTestFactory,
+            )]);
+            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            for _ in 0..2 {
+                let response = handle_publisher_request(
+                    &settings,
+                    &services,
+                    None,
+                    &mut EcContext::default(),
+                    AuctionDispatch {
+                        integration_registry: &registry,
+                        orchestrator: &orchestrator,
+                        slots: &[],
+                        registry: None,
+                    },
+                    navigation_request(),
+                    EdgeCacheHeader::SMaxageFallback,
+                )
+                .await
+                .expect("should obtain raw origin HTML");
+                let response = publisher_response_into_streaming_response(
+                    response,
+                    &Method::GET,
+                    Arc::clone(&settings),
+                    &registry,
+                    Arc::clone(&orchestrator),
+                    services.clone(),
+                )
+                .await
+                .expect("should finalize cached or uncached raw HTML");
+                assert_eq!(
+                    header_of(&response, header::CACHE_CONTROL),
+                    Some(crate::cache_policy::NO_STORE_PRIVATE_CACHE_CONTROL),
+                    "should keep both synthesized responses private"
+                );
+                let body = body_of(response).await;
+                assert_eq!(
+                    body.windows(b"<!--example-finalized-->".len())
+                        .filter(|bytes| *bytes == b"<!--example-finalized-->")
+                        .count(),
+                    1,
+                    "should run finalization once for each raw response"
+                );
+            }
+            assert_eq!(
+                client.misses.load(Ordering::SeqCst),
+                1,
+                "should fetch origin once"
+            );
+            assert_eq!(
+                client.hits.load(Ordering::SeqCst),
+                1,
+                "should serve a raw cache hit"
+            );
+            assert!(
+                !client
+                    .cached
+                    .lock()
+                    .expect("should lock raw origin cache")
+                    .as_ref()
+                    .expect("should retain raw cached HTML")
+                    .windows(b"example-finalized".len())
+                    .any(|bytes| bytes == b"example-finalized"),
+                "should cache raw bytes without terminal replacements"
+            );
+            assert!(
+                template_cache
+                    .lookups
+                    .lock()
+                    .expect("should lock template lookups")
+                    .is_empty(),
+                "should skip template lookup on both requests"
+            );
+            assert!(
+                template_cache
+                    .stored_keys
+                    .lock()
+                    .expect("should lock template stores")
+                    .is_empty(),
+                "should not store finalized HTML as a shared template"
+            );
+        }
+
+        #[tokio::test]
+        async fn html_finalizers_bypass_warm_and_cold_templates_but_keep_origin_readthrough() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(crate::publisher::allow_eof_test_settings(
+                settings_with_readthrough_enabled("esi"),
+            ));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            let _ = body_of(run(&settings, &services, navigation_request()).await).await;
+            let lookups_before = cache.lookups.lock().expect("should lock lookups").len();
+            let stores_before = cache
+                .stored_keys
+                .lock()
+                .expect("should lock stored keys")
+                .len();
+            assert!(stores_before > 0, "should seed a warm shared template");
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                super::TerminalTestFactory,
+            )]);
+            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            for path in ["/article", "/article-cold"] {
+                queue_shareable_html(&stub);
+                let mut request = navigation_request();
+                *request.uri_mut() = format!("https://ts.example.com{path}")
+                    .parse()
+                    .expect("should parse an example URL");
+                let mut ec_context = EcContext::default();
+                let response = handle_publisher_request(
+                    &settings,
+                    &services,
+                    None,
+                    &mut ec_context,
+                    AuctionDispatch {
+                        integration_registry: &registry,
+                        orchestrator: &orchestrator,
+                        slots: &[],
+                        registry: None,
+                    },
+                    request,
+                    EdgeCacheHeader::SMaxageFallback,
+                )
+                .await
+                .expect("should request raw origin HTML");
+                let PublisherResponse::Stream { params, .. } = &response else {
+                    panic!("should bypass shared templates");
+                };
+                assert!(
+                    params.template_cache_key.is_none(),
+                    "should carry no shared-store authorization"
+                );
+                let response = publisher_response_into_streaming_response(
+                    response,
+                    &Method::GET,
+                    Arc::clone(&settings),
+                    &registry,
+                    Arc::clone(&orchestrator),
+                    services.clone(),
+                )
+                .await
+                .expect("should finalize origin HTML");
+                assert_eq!(
+                    header_of(&response, header::CACHE_CONTROL),
+                    Some(crate::cache_policy::NO_STORE_PRIVATE_CACHE_CONTROL),
+                    "should make terminal output private"
+                );
+                assert!(
+                    body_of(response)
+                        .await
+                        .ends_with(b"<!--example-finalized-->"),
+                    "should finish both warm and cold documents"
+                );
+            }
+            assert_eq!(
+                cache.lookups.lock().expect("should lock lookups").len(),
+                lookups_before,
+                "should skip lookup and reservation entirely"
+            );
+            assert_eq!(
+                cache
+                    .stored_keys
+                    .lock()
+                    .expect("should lock stored keys")
+                    .len(),
+                stores_before,
+                "should never store terminal output"
+            );
+            assert!(
+                stub.recorded_cache_intents().iter().all(|intent| matches!(
+                    intent,
+                    crate::platform::PlatformCacheIntent::Shared { .. }
+                )),
+                "should retain configured raw-origin readthrough"
+            );
+            let _ = body_of(run(&settings, &services, navigation_request()).await).await;
+            assert!(
+                cache.lookups.lock().expect("should lock lookups").len() > lookups_before,
+                "should restore cache eligibility when finalizers are disabled"
+            );
         }
 
         async fn run_with_orchestrator(
@@ -10513,25 +11526,42 @@ mod tests {
                 None,
                 &mut ec_context,
                 AuctionDispatch {
+                    integration_registry: &registry,
                     orchestrator: &orchestrator,
                     slots: &[article_slot()],
                     registry: None,
                 },
                 request,
-                PublisherAdapterOptions {
-                    edge_cache_header: EdgeCacheHeader::SMaxageFallback,
-                    delivery_compression: DeliveryCompressionCapability::Unavailable,
-                },
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request");
 
+            finalize_test_publisher_response(
+                publisher_response,
+                settings,
+                services,
+                &registry,
+                orchestrator,
+                finalizer,
+            )
+            .await
+        }
+
+        async fn finalize_test_publisher_response(
+            publisher_response: PublisherResponse,
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            registry: &IntegrationRegistry,
+            orchestrator: Arc<AuctionOrchestrator>,
+            finalizer: Finalizer,
+        ) -> Response<EdgeBody> {
             match finalizer {
                 Finalizer::Streaming => publisher_response_into_streaming_response(
                     publisher_response,
                     &Method::GET,
                     Arc::clone(settings),
-                    &registry,
+                    registry,
                     orchestrator,
                     services.clone(),
                 )
@@ -10541,7 +11571,7 @@ mod tests {
                     publisher_response,
                     &Method::GET,
                     settings,
-                    &registry,
+                    registry,
                     &orchestrator,
                     services,
                 )
@@ -10568,6 +11598,552 @@ mod tests {
                     .into_bytes()
                     .expect("a non-stream body has its bytes in hand")
                     .to_vec(),
+            }
+        }
+
+        #[tokio::test]
+        async fn harness_emits_a_summary_row_for_an_ad_serving_navigation() {
+            let stub = Arc::new(StubHttpClient::new());
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::clone(&sink),
+            );
+            let settings = Arc::new(settings_with_mode("esi"));
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, navigation_request()).await;
+
+            assert!(
+                last_summary_row(&sink).is_some(),
+                "the harness must emit a summary row, or every assertion built on it is vacuous"
+            );
+        }
+
+        /// Drive `handle_publisher_request` through the **EC-preload** fetch path.
+        ///
+        /// `run_with_orchestrator` passes `kv: None` and no EC id, so
+        /// `should_preload_ec_snapshot` is false for every other test in this file and the
+        /// first of the two origin-fetch call sites is never exercised. Supplying both
+        /// reaches it.
+        async fn run_through_ec_preload(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+        ) {
+            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let kv = crate::ec::kv::KvIdentityGraph::in_memory("test-store");
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(Some("test-ec-id".to_owned()), consent);
+
+            let _ = handle_publisher_request(
+                settings,
+                services,
+                Some(&kv),
+                &mut ec_context,
+                AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
+                    orchestrator: &orchestrator,
+                    slots: &[article_slot()],
+                    registry: None,
+                },
+                request,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy publisher request");
+        }
+
+        #[tokio::test]
+        async fn the_ec_preload_fetch_path_applies_the_same_cache_gate() {
+            // The call site a naive revert missed. Reverting only this one previously
+            // passed all 2,697 tests; this is the behavioral cover for it.
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            stub.set_pending_streaming_responses_supported(true);
+            let settings = Arc::new(settings_with_readthrough_enabled("inline"));
+            queue_shareable_html(&stub);
+
+            run_through_ec_preload(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Shared {
+                    surrogate_key: format!(
+                        "ts-template {}",
+                        crate::platform::reader_url_surrogate_key("http://ts.example.com/article")
+                    ),
+                }],
+                "the EC-preload path must honor the gate, not decide for itself"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_ec_preload_fetch_path_still_bypasses_when_readthrough_is_off() {
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            stub.set_pending_streaming_responses_supported(true);
+            let settings = Arc::new(settings_with_mode("inline"));
+            queue_shareable_html(&stub);
+
+            run_through_ec_preload(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Bypass],
+                "the opt-in must gate both fetch paths, not only the non-preload one"
+            );
+        }
+
+        #[tokio::test]
+        async fn disabled_readthrough_preserves_non_ad_origin_caching() {
+            for without_creative_config in [false, true] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services =
+                    services(Arc::clone(&stub), Arc::new(MemoryTemplateCache::default()));
+                let mut settings = settings_with_mode("inline");
+                if without_creative_config {
+                    settings.creative_opportunities = None;
+                }
+                let settings = Arc::new(settings);
+                stub.push_response_with_headers(
+                    200,
+                    b"body {}".to_vec(),
+                    vec![
+                        ("content-type", "text/css"),
+                        ("cache-control", "public, max-age=300"),
+                    ],
+                );
+                let request = HttpRequest::builder()
+                    .uri("https://ts.example.com/style.css")
+                    .header(header::HOST, "ts.example.com")
+                    .body(EdgeBody::empty())
+                    .expect("should build an asset request");
+
+                let _ = run(&settings, &services, request).await;
+
+                assert_eq!(
+                    stub.recorded_cache_intents(),
+                    vec![PlatformCacheIntent::Default],
+                    "should preserve existing subresource caching with unchanged settings"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn enabled_readthrough_still_preserves_subresource_caching() {
+            // Browsers send first-party cookies on subresources, so judging assets on
+            // shareability would bypass the edge cache for most repeat-visitor asset
+            // traffic — and tag the rest with `ts-template`, so the template rollback
+            // purge would flush every cached asset at once.
+            for cookie in [None, Some("ts-ec=abc")] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services =
+                    services(Arc::clone(&stub), Arc::new(MemoryTemplateCache::default()));
+                let settings = Arc::new(settings_with_readthrough_enabled("inline"));
+                stub.push_response_with_headers(
+                    200,
+                    b"body {}".to_vec(),
+                    vec![
+                        ("content-type", "text/css"),
+                        ("cache-control", "public, max-age=300"),
+                    ],
+                );
+                let mut request = HttpRequest::builder()
+                    .uri("https://ts.example.com/style.css")
+                    .header(header::HOST, "ts.example.com")
+                    .header("sec-fetch-dest", "style")
+                    .body(EdgeBody::empty())
+                    .expect("should build an asset request");
+                if let Some(cookie) = cookie {
+                    request.headers_mut().insert(
+                        header::COOKIE,
+                        HeaderValue::from_str(cookie).expect("should build a cookie header"),
+                    );
+                }
+
+                let _ = run(&settings, &services, request).await;
+
+                assert_eq!(
+                    stub.recorded_cache_intents(),
+                    vec![PlatformCacheIntent::Default],
+                    "the opt-in governs documents; a subresource keeps the platform default \
+                     (cookie={cookie:?})"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn disabled_readthrough_preserves_non_ad_preload_caching() {
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services(Arc::clone(&stub), Arc::new(MemoryTemplateCache::default()));
+            stub.set_pending_streaming_responses_supported(true);
+            let settings = Arc::new(settings_with_mode("inline"));
+            queue_shareable_html(&stub);
+
+            run_through_ec_preload(&settings, &services, prefetch_navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Default],
+                "should preserve existing non-ad caching through EC preload"
+            );
+        }
+
+        #[test]
+        fn cache_intent_matches_the_explicit_opt_in_policy() {
+            let shared = PlatformCacheIntent::Shared {
+                surrogate_key: format!(
+                    "ts-template {}",
+                    reader_url_surrogate_key("https://example.com/article")
+                ),
+            };
+            for (enabled, shareable, ad_stack, document, expected) in [
+                (false, false, false, true, PlatformCacheIntent::Default),
+                (false, false, true, true, PlatformCacheIntent::Bypass),
+                (false, true, false, true, PlatformCacheIntent::Default),
+                (false, true, true, true, PlatformCacheIntent::Bypass),
+                (true, false, false, true, PlatformCacheIntent::Bypass),
+                (true, false, true, true, PlatformCacheIntent::Bypass),
+                (true, true, false, true, shared.clone()),
+                (true, true, true, true, shared),
+                // A subresource keeps the platform default whatever the gate says, so
+                // enabling readthrough never bypasses an asset fetch or tags it for the
+                // template rollback purge.
+                (true, false, false, false, PlatformCacheIntent::Default),
+                (true, true, false, false, PlatformCacheIntent::Default),
+            ] {
+                let request = PlatformHttpRequest::new(
+                    HttpRequest::builder()
+                        .body(EdgeBody::empty())
+                        .expect("should build request"),
+                    "backend",
+                );
+                assert_eq!(
+                    apply_origin_cache_intent(
+                        request,
+                        enabled,
+                        shareable,
+                        ad_stack,
+                        document,
+                        "https://example.com/article"
+                    )
+                    .cache_intent,
+                    expected,
+                    "should honor the explicit policy (enabled={enabled}, shareable={shareable}, ad_stack={ad_stack}, document={document})"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn readthrough_tags_the_reader_url_before_origin_rewriting_in_inline_mode() {
+            for preload in [false, true] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services =
+                    services(Arc::clone(&stub), Arc::new(MemoryTemplateCache::default()));
+                stub.set_pending_streaming_responses_supported(preload);
+                let settings = Arc::new(settings_with_readthrough_enabled("inline"));
+                queue_shareable_html(&stub);
+                let mut request = navigation_request();
+                request
+                    .headers_mut()
+                    .insert("x-forwarded-proto", HeaderValue::from_static("https"));
+                *request.uri_mut() = "https://ts.example.com/article?b=2&a=1"
+                    .parse()
+                    .expect("should parse reader URI");
+                if preload {
+                    run_through_ec_preload(&settings, &services, request).await;
+                } else {
+                    let _ = run(&settings, &services, request).await;
+                }
+                let page_key = crate::platform::reader_url_surrogate_key(
+                    "https://ts.example.com/article?a=1&b=2",
+                );
+                assert_eq!(
+                    stub.recorded_cache_intents(),
+                    vec![PlatformCacheIntent::Shared {
+                        surrogate_key: format!("ts-template {page_key}"),
+                    }],
+                    "should attach the URL-purge and all-purge keys independently of template eligibility (preload={preload})"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_shareable_navigation_no_longer_forces_an_origin_miss() {
+            // The point of issue #852. A cookieless, ad-serving navigation used to set
+            // pass on every origin fetch, so every pageview paid a full origin round
+            // trip.
+            //
+            // This asserts the *intent* recorded on the outbound request, not a cache
+            // hit, because a hit is not observable here. Measured under Viceroy 0.17 with
+            // the gate enabled, the request judged shareable, and an origin responding
+            // `Cache-Control: public, max-age=60` with no `Set-Cookie`: two identical
+            // navigations still produced two origin fetches. Viceroy does not implement
+            // the readthrough cache, so the saving this gate exists for cannot be
+            // demonstrated locally in any form — only the decision that enables it.
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            let settings = Arc::new(settings_with_readthrough_enabled("esi"));
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Shared {
+                    surrogate_key: format!(
+                        "ts-template {}",
+                        crate::platform::reader_url_surrogate_key("http://ts.example.com/article")
+                    ),
+                }],
+                "a shareable navigation must not force a MISS"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_repeat_visitor_revalidating_still_gets_readthrough() {
+            // The conditional headers are stripped before the origin is asked, so it
+            // returns a full document that is shareable like any other. Judging the
+            // pre-strip request marked this unshareable and cost readthrough for exactly
+            // the repeat-visit population the change targets.
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            let settings = Arc::new(settings_with_readthrough_enabled("esi"));
+            queue_shareable_html(&stub);
+
+            let mut request = navigation_request();
+            request.headers_mut().insert(
+                header::IF_NONE_MATCH,
+                HeaderValue::from_static("\"cached\""),
+            );
+
+            let _ = run(&settings, &services, request).await;
+
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Shared {
+                    surrogate_key: format!(
+                        "ts-template {}",
+                        crate::platform::reader_url_surrogate_key("http://ts.example.com/article")
+                    ),
+                }],
+                "a stripped conditional navigation asks the origin an unconditional \
+                 question, so its answer is shareable"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_reader_asking_for_a_range_is_not_served_a_shared_template() {
+            // The other half, and the invariant that caught an over-broad first attempt:
+            // stripping changes what the origin is asked, not what the reader wanted.
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            let settings = Arc::new(settings_with_readthrough_enabled("esi"));
+            queue_shareable_html(&stub);
+            queue_shareable_html(&stub);
+
+            // Warm a template with a plain navigation.
+            let _ = run(&settings, &services, navigation_request()).await;
+
+            let mut request = navigation_request();
+            request
+                .headers_mut()
+                .insert(header::RANGE, HeaderValue::from_static("bytes=0-31"));
+            let _ = run(&settings, &services, request).await;
+
+            assert_eq!(
+                stub.recorded_cache_intents().len(),
+                2,
+                "the range request must reach the origin rather than be answered from the \
+                 warm shared template"
+            );
+        }
+
+        #[tokio::test]
+        async fn unshareable_requests_still_bypass() {
+            // Each of these is a distinct reason the origin response cannot be held in a
+            // shared cache, and each must reach the same decision on its own.
+            for (label, request) in [
+                ("cookie", navigation_request_with_cookie("ts-ec=abc")),
+                ("authorization", {
+                    let mut request = navigation_request();
+                    request.headers_mut().insert(
+                        header::AUTHORIZATION,
+                        HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+                    );
+                    request
+                }),
+                ("non-GET", {
+                    let mut request = navigation_request();
+                    *request.method_mut() = Method::POST;
+                    request
+                }),
+                ("conditional", {
+                    let mut request = navigation_request();
+                    request
+                        .headers_mut()
+                        .insert(header::IF_MATCH, HeaderValue::from_static("\"tag\""));
+                    request
+                }),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::new(MemoryTemplateCache::default()),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                let settings = Arc::new(settings_with_readthrough_enabled("esi"));
+                queue_shareable_html(&stub);
+
+                let _ = run(&settings, &services, request).await;
+
+                assert_eq!(
+                    stub.recorded_cache_intents(),
+                    vec![PlatformCacheIntent::Bypass],
+                    "a {label}-bearing request must bypass the shared cache"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_request_that_skips_the_ad_stack_is_still_judged_on_shareability() {
+            // The tightening half, and the term that left the condition. A prefetch runs
+            // no auction, so it used to skip the bypass; whether an auction runs says
+            // nothing about whether the origin's response may be shared.
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            let settings = Arc::new(settings_with_readthrough_enabled("esi"));
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, {
+                let mut request = prefetch_navigation_request();
+                request
+                    .headers_mut()
+                    .insert(header::COOKIE, HeaderValue::from_static("ts-ec=abc"));
+                request
+            })
+            .await;
+
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Bypass],
+                "an ad-stack opt-out that is also unshareable must still bypass"
+            );
+        }
+
+        #[tokio::test]
+        async fn navigation_records_whether_the_origin_response_was_shareable() {
+            let stub = Arc::new(StubHttpClient::new());
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::clone(&sink),
+            );
+            let settings = Arc::new(settings_with_mode("esi"));
+            queue_shareable_html(&stub);
+
+            let _ = run(
+                &settings,
+                &services,
+                navigation_request_with_cookie("ts-ec=abc"),
+            )
+            .await;
+
+            assert_eq!(
+                last_summary_row(&sink)
+                    .expect("should emit a summary row")
+                    .origin_cache_shareable,
+                Some(0),
+                "a cookie-bearing request must record as not shareable"
+            );
+        }
+
+        #[tokio::test]
+        async fn cookieless_navigation_records_the_origin_response_as_shareable() {
+            let stub = Arc::new(StubHttpClient::new());
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::clone(&sink),
+            );
+            let settings = Arc::new(settings_with_mode("esi"));
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                last_summary_row(&sink)
+                    .expect("should emit a summary row")
+                    .origin_cache_shareable,
+                Some(1),
+                "a cookieless GET navigation is the population the gate is meant to admit"
+            );
+        }
+
+        #[tokio::test]
+        async fn non_document_requests_do_not_count_toward_readthrough_gate_reach() {
+            for fetch_metadata in [true, false] {
+                let stub = Arc::new(StubHttpClient::new());
+                let sink = Arc::new(RecordingTelemetrySink::default());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::new(MemoryTemplateCache::default()),
+                    Arc::clone(&sink),
+                );
+                let settings = Arc::new(settings_with_mode("esi"));
+                queue_shareable_html(&stub);
+                let mut request = navigation_request();
+                if fetch_metadata {
+                    request
+                        .headers_mut()
+                        .insert("sec-fetch-dest", HeaderValue::from_static("empty"));
+                } else {
+                    request.headers_mut().remove("sec-fetch-dest");
+                    request
+                        .headers_mut()
+                        .insert(header::ACCEPT, HeaderValue::from_static("*/*"));
+                }
+
+                let _ = run(&settings, &services, request).await;
+
+                assert_eq!(
+                    last_summary_row(&sink)
+                        .expect("should emit a summary row")
+                        .origin_cache_shareable,
+                    Some(0),
+                    "should exclude non-document requests from the gate's potential reach"
+                );
             }
         }
 
@@ -10808,7 +12384,7 @@ mod tests {
             stub.set_streaming_responses_supported(true);
             stub.set_pending_streaming_responses_supported(true);
             let cache = Arc::new(MemoryTemplateCache::default());
-            let settings = Arc::new(settings_with_mode("esi"));
+            let settings = Arc::new(settings_with_readthrough_enabled("esi"));
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             let lookups = Arc::new(AtomicUsize::new(0));
             let http_calls_at_lookup = Arc::new(AtomicUsize::new(0));
@@ -10836,15 +12412,13 @@ mod tests {
                     Some(&graph),
                     &mut ec_context,
                     AuctionDispatch {
+                        integration_registry: &IntegrationRegistry::empty_for_tests(),
                         orchestrator: &orchestrator,
                         slots: &[article_slot()],
                         registry: None,
                     },
                     navigation_request(),
-                    PublisherAdapterOptions {
-                        edge_cache_header: EdgeCacheHeader::SMaxageFallback,
-                        delivery_compression: DeliveryCompressionCapability::Unavailable,
-                    },
+                    EdgeCacheHeader::SMaxageFallback,
                 )
                 .await
                 .expect("should serve ESI navigation with an active EC");
@@ -10903,9 +12477,15 @@ mod tests {
                 "should preserve streaming on the cold origin fetch"
             );
             assert_eq!(
-                stub.recorded_cache_bypass_flags(),
-                vec![true],
-                "should bypass platform caching for the cold origin fetch"
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Shared {
+                    surrogate_key: format!(
+                        "ts-template {}",
+                        reader_url_surrogate_key("http://ts.example.com/article")
+                    ),
+                }],
+                "a shareable cold fetch must stop forcing a MISS — the origin round \
+                 trip issue #852 exists to take off the hot path"
             );
         }
 
@@ -11483,7 +13063,7 @@ mod tests {
 
         #[test]
         fn parser_validation_does_not_change_the_cached_schema() {
-            assert_eq!(crate::platform::TEMPLATE_SCHEMA_VERSION, 4);
+            assert_eq!(crate::platform::TEMPLATE_SCHEMA_VERSION, 5);
             assert_eq!(AD_ASSEMBLY_SEAM, "<!--ts-ad-seam-->");
             assert!(!contains_publisher_esi_directive(
                 AD_ASSEMBLY_SEAM.as_bytes()
@@ -11682,8 +13262,10 @@ mod tests {
         async fn a_template_written_under_the_previous_schema_version_is_never_read() {
             // v1 put an executable ESI include at the seam. v2 puts an inert comment
             // there and hands slots to the scheduler, so a v1 entry has no marker this
-            // binary can find. `schema_version` is the only thing keeping the two apart
-            // — nothing purges template cache on deploy.
+            // binary can find. A real v1 entry also carries an older build digest, but
+            // this fixture reuses the current fingerprint, so here `schema_version` is
+            // the only thing keeping the two apart. Nothing purges template cache on
+            // deploy.
             assert_ne!(
                 crate::platform::TEMPLATE_SCHEMA_VERSION,
                 ESI_INCLUDE_SCHEMA_VERSION,
@@ -12002,7 +13584,7 @@ mod tests {
         #[tokio::test]
         async fn the_cached_template_holds_the_marker_and_never_the_bids() {
             // Store the reader-neutral template before assembling the final per-user
-            // response, which must never enter the forbidden C3 cache. If
+            // response, which must never enter the forbidden assembled-response cache. If
             // these were swapped, the cache would hold one visitor's bids and serve them
             // to the next — and every test above would still pass, because the served
             // page would look correct.
@@ -12029,6 +13611,89 @@ mod tests {
                 !template.contains("window.tsjs"),
                 "the cached template must not carry a bids script: {template}"
             );
+        }
+
+        #[tokio::test]
+        async fn nextjs_stored_templates_are_identical_across_request_shapes() {
+            let mut settings = settings_with_mode("esi");
+            settings.publisher.origin_url = "https://origin.example.com".to_owned();
+            settings
+                .integrations
+                .insert_config(
+                    "nextjs",
+                    &serde_json::json!({
+                        "enabled": true,
+                        "rewrite_attributes": ["href", "link", "url"],
+                    }),
+                )
+                .expect("should enable Next.js processing");
+            let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+            assert!(
+                !registry.html_stream_processor_factories().is_empty(),
+                "should exercise the Next.js stream processor"
+            );
+            let settings = Arc::new(settings);
+            let html = br#"<html><head></head><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script><div id="test-slot"></div></body></html>"#;
+
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                let mut templates = Vec::new();
+                for request in [navigation_request(), prefetch_navigation_request()] {
+                    // Independent fills force distinct per-request RSC namespaces.
+                    let stub = Arc::new(StubHttpClient::new());
+                    let cache = Arc::new(MemoryTemplateCache::default());
+                    let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                    stub.push_response_with_headers(
+                        200,
+                        html.to_vec(),
+                        vec![
+                            ("content-type", "text/html"),
+                            ("cache-control", "public, max-age=300"),
+                        ],
+                    );
+
+                    let response = run_via(&settings, &services, request, finalizer).await;
+                    let _ = body_of(response).await;
+
+                    let entries = cache.entries.lock().expect("should lock stored templates");
+                    assert_eq!(
+                        entries.len(),
+                        1,
+                        "should store a Next.js template on every fill"
+                    );
+                    let template = entries
+                        .values()
+                        .next()
+                        .expect("should find stored template")
+                        .body
+                        .clone();
+                    let text = core::str::from_utf8(&template).expect("should store UTF-8 HTML");
+                    assert!(
+                        text.contains("ts.example.com/page"),
+                        "should rewrite the RSC URL"
+                    );
+                    assert!(
+                        text.contains(AD_ASSEMBLY_SEAM),
+                        "should store before per-reader assembly"
+                    );
+                    for marker in [
+                        "__ts_rsc_",
+                        ".adSlots",
+                        ".bids=",
+                        "gpt-diagnostics",
+                        "gpt_history",
+                    ] {
+                        assert!(
+                            !text.contains(marker),
+                            "should exclude request-scoped marker {marker}"
+                        );
+                    }
+                    templates.push(template);
+                }
+                assert_eq!(
+                    templates[0], templates[1],
+                    "should store identical bytes across request shapes and RSC namespaces"
+                );
+            }
         }
 
         #[tokio::test]
@@ -12062,15 +13727,13 @@ mod tests {
                 None,
                 &mut ec_context,
                 AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
                     orchestrator: &orchestrator,
                     slots: &[article_slot()],
                     registry: None,
                 },
                 navigation_request(),
-                PublisherAdapterOptions {
-                    edge_cache_header: EdgeCacheHeader::SMaxageFallback,
-                    delivery_compression: DeliveryCompressionCapability::Unavailable,
-                },
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("the request itself should succeed; the cap trips during streaming");
@@ -12233,15 +13896,13 @@ mod tests {
                 None,
                 &mut ec_context,
                 AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
                     orchestrator: &orchestrator,
                     slots: &[article_slot()],
                     registry: None,
                 },
                 navigation_request(),
-                PublisherAdapterOptions {
-                    edge_cache_header: EdgeCacheHeader::SMaxageFallback,
-                    delivery_compression: DeliveryCompressionCapability::Unavailable,
-                },
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request");
@@ -12421,7 +14082,7 @@ mod tests {
             // The converse, and the failure mode a fingerprint fix can introduce:
             // over-invalidating is as total as under-invalidating. A fingerprint that
             // moves between two equal configurations is a cache that never hits, which
-            // the spike would report as "no measurable benefit" rather than as a bug.
+            // this would read as "no measurable benefit" rather than as a bug.
             //
             // The two `Settings` are parsed independently, so their `[integrations]`
             // maps iterate in different orders — which is what exercises the sort.
@@ -12452,6 +14113,42 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn one_context_key_allowlist_keys_one_template() {
+            let mut source = serde_json::to_value(settings_with_mode("esi"))
+                .expect("should serialize cache settings");
+            source["auction"]["allowed_context_keys"] =
+                serde_json::json!(["zeta", "alpha", "gamma", "beta", "epsilon", "delta"]);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+
+            for _ in 0..16 {
+                let settings = Arc::new(
+                    serde_json::from_value(source.clone()).expect("should parse cache settings"),
+                );
+                queue_shareable_html(&stub);
+                let _ = run(&settings, &services, navigation_request()).await;
+            }
+
+            let keys = looked_up_cache_keys(&cache);
+            assert_eq!(keys.len(), 16, "should consult the cache for every request");
+            assert!(
+                keys.iter().all(|key| key == &keys[0]),
+                "should reuse one key across independently parsed allowlists"
+            );
+            assert_eq!(
+                stored_cache_keys(&cache).len(),
+                1,
+                "should store one template"
+            );
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "should fetch the origin only for the first request"
+            );
+        }
+
         fn cookie_navigation_request() -> Request<EdgeBody> {
             HttpRequest::builder()
                 .method(Method::GET)
@@ -12462,6 +14159,1110 @@ mod tests {
                 .header(header::COOKIE, "ts-ec=abc123")
                 .body(EdgeBody::empty())
                 .expect("should build cookie-bearing request")
+        }
+
+        #[tokio::test]
+        async fn readthrough_never_collapses_template_cookie_variants() {
+            let mut settings = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
+            Arc::make_mut(&mut settings)
+                .creative_opportunities
+                .as_mut()
+                .expect("should configure opportunities")
+                .origin_readthrough_enabled = Some(true);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            for arm in ["absent", "A", "B", "empty"] {
+                stub.push_response_with_headers(
+                    200,
+                    format!("<html><head></head><body>arm-{arm}</body></html>").into_bytes(),
+                    vec![
+                        ("content-type", "text/html"),
+                        ("cache-control", "public, max-age=300"),
+                    ],
+                );
+            }
+            for (index, (cookie, arm)) in [
+                (None, "absent"),
+                (Some("ab_bucket=A"), "A"),
+                (Some("ab_bucket=B"), "B"),
+                (Some("ab_bucket="), "empty"),
+                (Some("ab_bucket=A"), "A"),
+                (Some("ab_bucket=B"), "B"),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let fields: Vec<&[u8]> = cookie.iter().map(|value| value.as_bytes()).collect();
+                let response = run(&settings, &services, cookie_policy_request(&fields)).await;
+                assert_eq!(
+                    response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                    if index < 4 { "miss-stored" } else { "hit" },
+                    "should still cache separate templates"
+                );
+                let body = String::from_utf8(body_of(response).await).expect("should decode HTML");
+                assert!(
+                    body.contains(&format!("arm-{arm}")),
+                    "should preserve each cookie variant"
+                );
+            }
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Bypass; 4],
+                "should never cache origin bytes without the template cookie dimensions, even when the key cookie is absent"
+            );
+            assert_eq!(
+                stored_cache_keys(&cache).len(),
+                4,
+                "should store each template variant"
+            );
+        }
+
+        #[tokio::test]
+        async fn readthrough_respects_named_session_bypass_without_disabling_anonymous_sharing() {
+            let mut settings = cookie_policy_settings(None, Some(&["session"]), true);
+            Arc::make_mut(&mut settings)
+                .creative_opportunities
+                .as_mut()
+                .expect("should configure opportunities")
+                .origin_readthrough_enabled = Some(true);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            queue_shareable_html(&stub);
+            let _ = run(&settings, &services, cookie_policy_request(&[])).await;
+            let response = run(&settings, &services, cookie_policy_request(&[b"session="])).await;
+            assert_eq!(
+                response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                "bypass-request",
+                "should not read an anonymous template for a session"
+            );
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![
+                    PlatformCacheIntent::Shared {
+                        surrogate_key: format!(
+                            "ts-template {}",
+                            reader_url_surrogate_key("http://ts.example.com/article")
+                        )
+                    },
+                    PlatformCacheIntent::Bypass,
+                ],
+                "should share anonymous bytes while refusing even an empty named session"
+            );
+        }
+
+        #[tokio::test]
+        async fn readthrough_preload_bypasses_configured_cookie_dimensions() {
+            let mut settings = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
+            let config = Arc::make_mut(&mut settings)
+                .creative_opportunities
+                .as_mut()
+                .expect("should configure opportunities");
+            config.origin_readthrough_enabled = Some(true);
+            config.assembly_mode = Some(AssemblyMode::Inline);
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_pending_streaming_responses_supported(true);
+            let services = services(Arc::clone(&stub), Arc::new(MemoryTemplateCache::default()));
+            queue_shareable_html(&stub);
+            run_through_ec_preload(
+                &settings,
+                &services,
+                cookie_policy_request(&[b"ab_bucket=A"]),
+            )
+            .await;
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Bypass],
+                "should apply the cookie-dimension exclusion on the pending origin path too"
+            );
+        }
+
+        fn cookie_policy_settings(
+            key_names: Option<&[&str]>,
+            bypass_names: Option<&[&str]>,
+            independent: bool,
+        ) -> Arc<Settings> {
+            let mut settings = settings_with_mode("esi");
+            let config = settings
+                .creative_opportunities
+                .as_mut()
+                .expect("should configure opportunities");
+            config.template_cache_key_cookies =
+                key_names.map(|names| names.iter().map(|name| (*name).to_string()).collect());
+            config.template_cache_bypass_cookies =
+                bypass_names.map(|names| names.iter().map(|name| (*name).to_string()).collect());
+            config.origin_is_cookie_independent = Some(independent);
+            config
+                .validate_runtime()
+                .expect("should validate cookie policy fixture");
+            Arc::new(settings)
+        }
+
+        fn cookie_policy_request(fields: &[&[u8]]) -> Request<EdgeBody> {
+            let mut request = navigation_request();
+            for field in fields {
+                request.headers_mut().append(
+                    header::COOKIE,
+                    HeaderValue::from_bytes(field).expect("should build cookie field"),
+                );
+            }
+            request
+        }
+
+        // Exercise raw fields at the prepared-request boundary. Ordinary diagnostics
+        // preparation removes invalid fields/empty pairs before generic cookie handling.
+        fn prepared_cookie_policy_request(fields: &[&[u8]]) -> Request<EdgeBody> {
+            let mut request = cookie_policy_request(fields);
+            request.extensions_mut().insert(
+                crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision::default(),
+            );
+            request
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_key_only_admits_listed_cookies() {
+            for unused in [None, Some([].as_slice())] {
+                let settings = cookie_policy_settings(Some(&["ab_bucket"]), unused, false);
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                queue_shareable_html(&stub);
+                queue_shareable_html(&stub);
+                for _ in 0..2 {
+                    let _ = body_of(
+                        run(
+                            &settings,
+                            &services,
+                            cookie_policy_request(&[b"ab_bucket=A"]),
+                        )
+                        .await,
+                    )
+                    .await;
+                }
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    1,
+                    "should share a listed-only variant even with independence false"
+                );
+                assert_eq!(
+                    stored_cache_keys(&cache).len(),
+                    1,
+                    "should store one variant"
+                );
+                let lookups = looked_up_cache_keys(&cache).len();
+                let _ = body_of(
+                    run(
+                        &settings,
+                        &services,
+                        cookie_policy_request(&[b"ab_bucket=A; unknown=1"]),
+                    )
+                    .await,
+                )
+                .await;
+                assert_eq!(
+                    looked_up_cache_keys(&cache).len(),
+                    lookups,
+                    "should bypass for any unlisted cookie"
+                );
+                assert_eq!(
+                    stored_cache_keys(&cache).len(),
+                    1,
+                    "should not store an unlisted-cookie response"
+                );
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    2,
+                    "should fetch unlisted-cookie origin HTML"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_session_bypasses_warm_and_cold_cache() {
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                for unused in [None, Some([].as_slice()), Some(["ab_bucket"].as_slice())] {
+                    for warm in [false, true] {
+                        let settings = cookie_policy_settings(unused, Some(&["session"]), true);
+                        let stub = Arc::new(StubHttpClient::new());
+                        let cache = Arc::new(MemoryTemplateCache::default());
+                        let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                        if warm {
+                            queue_shareable_html(&stub);
+                            let _ = body_of(
+                                run_via(
+                                    &settings,
+                                    &services,
+                                    cookie_policy_request(&[b"ab_bucket=A; ts-ec=reader"]),
+                                    finalizer,
+                                )
+                                .await,
+                            )
+                            .await;
+                            assert_eq!(
+                                stored_cache_keys(&cache).len(),
+                                1,
+                                "should warm an anonymous template first"
+                            );
+                        }
+                        let lookups = looked_up_cache_keys(&cache).len();
+                        let stores = stored_cache_keys(&cache).len();
+                        for session in [b"session=".as_slice(), b"session=token".as_slice()] {
+                            stub.push_response_with_headers(
+                                200,
+                                b"<html><head></head><body>personal-account</body></html>".to_vec(),
+                                vec![
+                                    ("content-type", "text/html"),
+                                    ("cache-control", "public, max-age=300"),
+                                ],
+                            );
+                            let response = run_via(
+                                &settings,
+                                &services,
+                                cookie_policy_request(&[b"ab_bucket=A; ts-ec=reader", session]),
+                                finalizer,
+                            )
+                            .await;
+                            assert_eq!(
+                                response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                                "bypass-request",
+                                "should report request bypass"
+                            );
+                            assert!(
+                                !response.headers().contains_key(HEADER_X_TS_ASSEMBLY),
+                                "should omit shared-assembly diagnostics on inline responses"
+                            );
+                            assert!(
+                                String::from_utf8(body_of(response).await)
+                                    .expect("should decode HTML")
+                                    .contains("personal-account"),
+                                "should render this request's origin HTML"
+                            );
+                        }
+                        assert_eq!(
+                            looked_up_cache_keys(&cache).len(),
+                            lookups,
+                            "should never look up or reserve for session requests"
+                        );
+                        assert_eq!(
+                            stored_cache_keys(&cache).len(),
+                            stores,
+                            "should never store session HTML"
+                        );
+                        assert_eq!(
+                            stub.recorded_request_uris().len(),
+                            usize::from(warm) + 2,
+                            "should fetch every session request"
+                        );
+                        assert!(
+                            cache
+                                .entries
+                                .lock()
+                                .expect("should lock templates")
+                                .values()
+                                .all(|entry| !String::from_utf8_lossy(&entry.body)
+                                    .contains("personal-account")),
+                            "should keep personal bytes out of templates"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_downstream_variants_remain_separate() {
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                let mut settings =
+                    cookie_policy_settings(Some(&["ab_bucket"]), Some(&["session"]), true);
+                Arc::make_mut(&mut settings)
+                    .creative_opportunities
+                    .as_mut()
+                    .expect("should configure opportunities")
+                    .template_cache_vary = Some(vec!["x-exp-variant".to_string()]);
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                for arm in ["A", "B"] {
+                    stub.push_response_with_headers(
+                        200,
+                        format!("<html><head></head><body>arm-{arm}</body></html>").into_bytes(),
+                        vec![
+                            ("content-type", "text/html"),
+                            ("cache-control", "public, max-age=300"),
+                            ("vary", "X-Exp-Variant"),
+                        ],
+                    );
+                }
+                for (index, arm) in ["A", "B", "A", "B"].iter().enumerate() {
+                    let cookies = format!(
+                        "ab_bucket={arm}; ts-ec=reader{index}; ignored=scope{index}; ignored=other{index}"
+                    );
+                    let request = cookie_policy_request(&[cookies.as_bytes()]);
+                    assert!(
+                        !request.headers().contains_key("x-exp-variant"),
+                        "should reproduce downstream-only header topology"
+                    );
+                    let response = run_via(&settings, &services, request, finalizer).await;
+                    assert_eq!(
+                        response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                        if index < 2 { "miss-stored" } else { "hit" },
+                        "should share within each arm"
+                    );
+                    assert!(
+                        response.headers()[header::CACHE_CONTROL]
+                            .to_str()
+                            .expect("should read cache control")
+                            .contains("private"),
+                        "should keep assembled output private"
+                    );
+                    let html =
+                        String::from_utf8(body_of(response).await).expect("should decode HTML");
+                    assert!(
+                        html.contains(&format!("arm-{arm}")),
+                        "should render the correct experiment arm"
+                    );
+                    assert!(
+                        !html.contains(if *arm == "A" { "arm-B" } else { "arm-A" }),
+                        "should never cross-serve arms"
+                    );
+                }
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    2,
+                    "should skip origin on both warm arms"
+                );
+                let stored = stored_cache_keys(&cache);
+                assert_eq!(stored.len(), 2, "should store two variants");
+                assert_ne!(stored[0], stored[1], "should distinguish arms in the key");
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_absent_and_empty_are_separate() {
+            let settings = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            for variant in ["absent", "empty"] {
+                stub.push_response_with_headers(
+                    200,
+                    format!("<html><head></head><body>variant-{variant}</body></html>")
+                        .into_bytes(),
+                    vec![
+                        ("content-type", "text/html"),
+                        ("cache-control", "public, max-age=300"),
+                    ],
+                );
+            }
+            for (field, expected) in [
+                (b"ts-ec=reader1".as_slice(), "absent"),
+                (b"ab_bucket=".as_slice(), "empty"),
+                (b"ts-ec=reader2".as_slice(), "absent"),
+                (b"ab_bucket=; ts-ec=reader3".as_slice(), "empty"),
+            ] {
+                let html = String::from_utf8(
+                    body_of(run(&settings, &services, cookie_policy_request(&[field])).await).await,
+                )
+                .expect("should decode HTML");
+                assert!(
+                    html.contains(&format!("variant-{expected}")),
+                    "should preserve absent versus empty variants"
+                );
+            }
+            assert_eq!(
+                stored_cache_keys(&cache).len(),
+                2,
+                "should store both presence variants"
+            );
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "should hit both variants without origin"
+            );
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_response_guards_remain_effective() {
+            for guard in [
+                vec![("vary", "Cookie")],
+                vec![("vary", "X-Exp-Variant"), ("vary", "cOoKiE")],
+                vec![("vary", "X-Exp-Variant, Cookie")],
+                vec![("vary", "*")],
+                vec![("vary", "uncovered-header")],
+                vec![("set-cookie", "origin=value")],
+            ] {
+                let mut settings =
+                    cookie_policy_settings(Some(&["ab_bucket"]), Some(&["session"]), true);
+                Arc::make_mut(&mut settings)
+                    .creative_opportunities
+                    .as_mut()
+                    .expect("should configure opportunities")
+                    .template_cache_vary = Some(vec!["x-exp-variant".to_string()]);
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                let mut response_headers = vec![
+                    ("content-type", "text/html"),
+                    ("cache-control", "public, max-age=300"),
+                ];
+                response_headers.extend(guard);
+                for _ in 0..2 {
+                    stub.push_response_with_headers(
+                        200,
+                        b"<html><head></head><body>origin</body></html>".to_vec(),
+                        response_headers.clone(),
+                    );
+                    let response = run(
+                        &settings,
+                        &services,
+                        cookie_policy_request(&[b"ab_bucket=A"]),
+                    )
+                    .await;
+                    assert_eq!(
+                        response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                        "bypass-response",
+                        "should preserve origin response restrictions"
+                    );
+                    let _ = body_of(response).await;
+                }
+                assert!(
+                    stored_cache_keys(&cache).is_empty(),
+                    "should never store a disqualified response"
+                );
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    2,
+                    "should fetch each disqualified response"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_malformed_later_fields_and_duplicates_bypass() {
+            for fields in [
+                vec![b"ab_bucket=A".as_slice(), b"unknown=\xff".as_slice()],
+                vec![b"ab_bucket=A".as_slice(), b"ab_bucket=B".as_slice()],
+                vec![b"ab_bucket=A; ab_bucket=A".as_slice()],
+                vec![b"ab_bucket=A; broken".as_slice()],
+                vec![b"ab_bucket=A;".as_slice()],
+                vec![b"ab_bucket=A".as_slice(), b"".as_slice()],
+            ] {
+                for warm in [false, true] {
+                    let settings = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
+                    let stub = Arc::new(StubHttpClient::new());
+                    let cache = Arc::new(MemoryTemplateCache::default());
+                    let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                    if warm {
+                        queue_shareable_html(&stub);
+                        let _ = body_of(
+                            run(
+                                &settings,
+                                &services,
+                                cookie_policy_request(&[b"ab_bucket=A"]),
+                            )
+                            .await,
+                        )
+                        .await;
+                        assert_eq!(
+                            stored_cache_keys(&cache).len(),
+                            1,
+                            "should warm cache before malformed input"
+                        );
+                    }
+                    let lookups = looked_up_cache_keys(&cache).len();
+                    let stores = stored_cache_keys(&cache).len();
+                    queue_shareable_html(&stub);
+                    let response = run(
+                        &settings,
+                        &services,
+                        prepared_cookie_policy_request(&fields),
+                    )
+                    .await;
+                    assert_eq!(
+                        response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                        "bypass-request",
+                        "should bypass malformed fields reaching the evaluator"
+                    );
+                    let _ = body_of(response).await;
+                    assert_eq!(
+                        looked_up_cache_keys(&cache).len(),
+                        lookups,
+                        "should never look up ambiguous input"
+                    );
+                    assert_eq!(
+                        stored_cache_keys(&cache).len(),
+                        stores,
+                        "should never store ambiguous input"
+                    );
+                    assert_eq!(
+                        stub.recorded_request_uris().len(),
+                        usize::from(warm) + 1,
+                        "should forward requests accepted by earlier validation"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_selected_invalid_header_keeps_existing_error() {
+            let settings = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut ec_context =
+                EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+            let error = handle_publisher_request(
+                &settings,
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
+                    orchestrator: &orchestrator,
+                    slots: &[article_slot()],
+                    registry: None,
+                },
+                prepared_cookie_policy_request(&[b"ab_bucket=\xff"]),
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .err()
+            .expect("should retain the existing selected-header error");
+            assert!(
+                matches!(
+                    error.current_context(),
+                    TrustedServerError::InvalidHeaderValue { .. }
+                ),
+                "should preserve the existing error type"
+            );
+            assert!(
+                looked_up_cache_keys(&cache).is_empty(),
+                "should not reach shared lookup"
+            );
+            assert!(
+                stored_cache_keys(&cache).is_empty(),
+                "should not store invalid requests"
+            );
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "should retain earlier rejection before origin"
+            );
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_ignores_json_without_changing_origin_cookies() {
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                let settings =
+                    cookie_policy_settings(Some(&["ab_bucket"]), Some(&["session"]), true);
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                let cold_cookie = r#"ab_bucket=A; g_state={"enabled":true,"count":1}"#;
+                queue_shareable_html(&stub);
+                for (cookie, state) in [
+                    (cold_cookie, "miss-stored"),
+                    (r#"ab_bucket=A; g_state={"enabled":false,"count":2}"#, "hit"),
+                ] {
+                    let response = run_via(
+                        &settings,
+                        &services,
+                        cookie_policy_request(&[cookie.as_bytes()]),
+                        finalizer,
+                    )
+                    .await;
+                    assert_eq!(
+                        response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                        state,
+                        "should share the template despite unrelated JSON cookie changes"
+                    );
+                    let _ = body_of(response).await;
+                }
+                let forwarded = stub.recorded_request_headers();
+                assert_eq!(
+                    forwarded.len(),
+                    1,
+                    "should fetch origin only for the cold request"
+                );
+                assert_eq!(
+                    forwarded[0]
+                        .iter()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case(header::COOKIE.as_str()))
+                        .map(|(_, value)| value.as_str())
+                        .collect::<Vec<_>>(),
+                    [cold_cookie],
+                    "should preserve the ignored cookie when forwarding to origin"
+                );
+                let lookups = looked_up_cache_keys(&cache).len();
+                queue_shareable_html(&stub);
+                let response = run_via(
+                    &settings,
+                    &services,
+                    cookie_policy_request(&[br#"ab_bucket=A; g_state={"enabled":true}; session="#]),
+                    finalizer,
+                )
+                .await;
+                assert_eq!(
+                    response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                    "bypass-request",
+                    "should honor bypass cookie presence alongside ignored JSON"
+                );
+                let _ = body_of(response).await;
+                assert_eq!(
+                    looked_up_cache_keys(&cache).len(),
+                    lookups,
+                    "should skip shared lookup for session requests"
+                );
+                assert_eq!(
+                    stored_cache_keys(&cache).len(),
+                    1,
+                    "should not store session responses"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_uses_cookies_after_existing_preparation() {
+            let settings = cookie_policy_settings(Some(&["ab_bucket"]), None, false);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            // Normal preparation strips invalid fields and empty pairs before origin
+            // forwarding. Preserve it; the cache policy sees the prepared request.
+            let cold = run(
+                &settings,
+                &services,
+                cookie_policy_request(&[b"ab_bucket=A;", b"unknown=\xff"]),
+            )
+            .await;
+            assert_eq!(
+                cold.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                "miss-stored",
+                "should classify the cookies actually forwarded"
+            );
+            let _ = body_of(cold).await;
+            let warm = run(
+                &settings,
+                &services,
+                cookie_policy_request(&[b"ab_bucket=A"]),
+            )
+            .await;
+            assert_eq!(
+                warm.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                "hit",
+                "should share identical prepared origin inputs"
+            );
+            let _ = body_of(warm).await;
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "should preserve existing request preparation"
+            );
+            let forwarded = stub.recorded_request_headers();
+            assert_eq!(forwarded.len(), 1, "should record one origin request");
+            let forwarded_cookies = forwarded[0]
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(header::COOKIE.as_str()))
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                forwarded_cookies,
+                ["ab_bucket=A"],
+                "should forward exactly the prepared cookie represented by the cache key"
+            );
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_empty_lists_keep_legacy_behavior() {
+            for independent in [false, true] {
+                let settings = cookie_policy_settings(Some(&[]), Some(&[]), independent);
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                for _ in 0..2 {
+                    queue_shareable_html(&stub);
+                    let _ =
+                        body_of(run(&settings, &services, cookie_navigation_request()).await).await;
+                }
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    if independent { 1 } else { 2 },
+                    "should retain legacy boolean eligibility"
+                );
+                assert_eq!(
+                    stored_cache_keys(&cache).len(),
+                    usize::from(independent),
+                    "should preserve legacy storage"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_policy_changes_invalidate_templates() {
+            let first = cookie_policy_settings(None, None, true);
+            let second = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
+            let third = cookie_policy_settings(Some(&["ab_bucket"]), Some(&["session"]), true);
+            assert_ne!(
+                template_fingerprint(&first),
+                template_fingerprint(&second),
+                "should fingerprint the key policy"
+            );
+            assert_ne!(
+                template_fingerprint(&second),
+                template_fingerprint(&third),
+                "should fingerprint the bypass policy"
+            );
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            for settings in [&first, &second, &third] {
+                queue_shareable_html(&stub);
+                let _ = body_of(
+                    run(
+                        settings,
+                        &services,
+                        cookie_policy_request(&[b"ab_bucket=A"]),
+                    )
+                    .await,
+                )
+                .await;
+            }
+            let keys = stored_cache_keys(&cache);
+            assert_eq!(
+                keys.len(),
+                3,
+                "should store a fresh entry under each policy"
+            );
+            assert_ne!(keys[0], keys[1], "should not reuse pre-policy templates");
+            assert_ne!(
+                keys[1], keys[2],
+                "should not reuse entries admitted under another bypass policy"
+            );
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                3,
+                "should fetch after each policy change"
+            );
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_warm_variant_runs_fresh_reader_assembly() {
+            let mut raw = settings_with_bidder("esi");
+            let config = raw
+                .creative_opportunities
+                .as_mut()
+                .expect("should configure opportunities");
+            config.template_cache_key_cookies = Some(vec!["ab_bucket".to_string()]);
+            config.origin_is_cookie_independent = Some(true);
+            let settings = Arc::new(raw);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            for (index, field) in [
+                b"ab_bucket=A; ts-ec=reader1".as_slice(),
+                b"ab_bucket=A; ts-ec=reader2".as_slice(),
+            ]
+            .iter()
+            .enumerate()
+            {
+                queue_bid_response(&stub);
+                if index == 0 {
+                    queue_shareable_html(&stub);
+                }
+                let response = run_bidding_at_price(
+                    &settings,
+                    &services,
+                    cookie_policy_request(&[field]),
+                    if index == 0 { 3.5 } else { 7.5 },
+                )
+                .await;
+                assert_eq!(
+                    response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                    if index == 0 { "miss-stored" } else { "hit" },
+                    "should serve the second reader from the shared template"
+                );
+                assert!(
+                    response.headers()[header::CACHE_CONTROL]
+                        .to_str()
+                        .expect("should read cache policy")
+                        .contains("private"),
+                    "should keep reader output private"
+                );
+                let document =
+                    String::from_utf8(body_of(response).await).expect("should decode document");
+                assert_eq!(
+                    seam_bids(&document)
+                        .get("test-slot")
+                        .and_then(|bid| bid.get("hb_pb"))
+                        .and_then(serde_json::Value::as_str),
+                    Some(if index == 0 { "3.50" } else { "7.50" }),
+                    "should assemble this request's winning bid"
+                );
+            }
+            let requests = stub.recorded_request_uris();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|uri| uri.contains("/article"))
+                    .count(),
+                1,
+                "should fetch one shared origin template"
+            );
+            assert_eq!(
+                requests.len(),
+                3,
+                "should run a fresh auction on each reader request"
+            );
+            let entries = cache.entries.lock().expect("should lock templates");
+            assert_eq!(entries.len(), 1, "should share within a variant");
+            let stored = String::from_utf8_lossy(
+                &entries
+                    .values()
+                    .next()
+                    .expect("should store a template")
+                    .body,
+            );
+            assert!(
+                stored.contains(AD_ASSEMBLY_SEAM),
+                "should keep the unresolved reader assembly marker"
+            );
+            for reader_bytes in ["reader1", "reader2", "window.tsjs", "hb_pb"] {
+                assert!(
+                    !stored.contains(reader_bytes),
+                    "should exclude per-reader state from stored bytes"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn template_cookie_publisher_warm_variant_finalizes_ec_withdrawal() {
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                let mut settings = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
+                Arc::make_mut(&mut settings).auction.providers =
+                    crate::auction_config_types::AuctionConfig::legacy_provider_map(&[
+                        SCHEDULING_PROVIDER,
+                    ]);
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                let graph = KvIdentityGraph::in_memory("cookie-withdrawal-store");
+                let identities = [
+                    format!("{}.Read01", "a".repeat(64)),
+                    format!("{}.Read02", "b".repeat(64)),
+                ];
+                for (index, identity) in identities.iter().enumerate() {
+                    assert!(
+                        crate::ec::generation::is_valid_ec_id(identity),
+                        "should use valid EC identities in the fixture"
+                    );
+                    graph
+                        .create(
+                            identity,
+                            &crate::ec::kv_types::KvEntry::minimal(
+                                "example.com",
+                                &format!("partner-reader-{index}"),
+                                crate::ec::current_timestamp(),
+                            ),
+                        )
+                        .expect("should seed a live reader identity");
+                }
+                let registry = IntegrationRegistry::new(&settings)
+                    .expect("should create integration registry");
+                let partner = serde_json::from_value(serde_json::json!({
+                    "name": "Example partner",
+                    "source_domain": "example.com",
+                    "bidstream_enabled": true
+                }))
+                .expect("should deserialize fixture partner");
+                let partners = PartnerRegistry::from_config(&[partner])
+                    .expect("should create partner registry");
+                // Only the cold request has an origin response available.
+                queue_shareable_html(&stub);
+
+                for (index, (identity, withdrawn)) in [
+                    (&identities[0], false),
+                    (&identities[1], false),
+                    (&identities[1], true),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let consent = if withdrawn {
+                        ConsentContext {
+                            jurisdiction: crate::consent::jurisdiction::Jurisdiction::UsState(
+                                "CA".to_owned(),
+                            ),
+                            gpc: true,
+                            ..Default::default()
+                        }
+                    } else {
+                        scheduling_consent()
+                    };
+                    let mut ec_context = EcContext::new_for_test(Some(identity.clone()), consent);
+                    assert_eq!(
+                        ec_context.ec_allowed(),
+                        !withdrawn,
+                        "should apply reader consent"
+                    );
+                    let captured = Arc::new(Mutex::new(None));
+                    let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+                    orchestrator.register_provider(Arc::new(SchedulingCaptureProvider {
+                        captured: Arc::clone(&captured),
+                        http: Arc::clone(&stub),
+                        lookups: Arc::new(AtomicUsize::new(0)),
+                    }));
+                    let orchestrator = Arc::new(orchestrator);
+                    let cookies = format!("ab_bucket=A; ts-ec={identity}");
+                    let response = handle_publisher_request(
+                        &settings,
+                        &services,
+                        Some(&graph),
+                        &mut ec_context,
+                        AuctionDispatch {
+                            integration_registry: &IntegrationRegistry::empty_for_tests(),
+                            orchestrator: &orchestrator,
+                            slots: &[article_slot()],
+                            registry: Some(&partners),
+                        },
+                        cookie_policy_request(&[cookies.as_bytes()]),
+                        EdgeCacheHeader::SMaxageFallback,
+                    )
+                    .await
+                    .expect("should serve a reader with an existing EC");
+                    assert!(
+                        ec_context.kv_snapshot().entry_for(identity).is_some(),
+                        "should preload this reader's identity even during withdrawal on a hit"
+                    );
+                    let mut response = finalize_test_publisher_response(
+                        response,
+                        &settings,
+                        &services,
+                        &registry,
+                        orchestrator,
+                        finalizer,
+                    )
+                    .await;
+                    crate::ec::finalize::ec_finalize_response(
+                        &settings,
+                        &mut ec_context,
+                        Some(&graph),
+                        &partners,
+                        None,
+                        None,
+                        &mut response,
+                    );
+                    assert_eq!(
+                        response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                        if index == 0 { "miss-stored" } else { "hit" },
+                        "should share one variant across identities and withdrawal"
+                    );
+                    let cache_control = response.headers()[header::CACHE_CONTROL]
+                        .to_str()
+                        .expect("should decode cache policy");
+                    for directive in ["private", "no-store"] {
+                        assert!(
+                            cache_control
+                                .split(',')
+                                .any(|value| value.trim() == directive),
+                            "should keep finalized reader responses private and uncacheable"
+                        );
+                    }
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get_all(header::SET_COOKIE)
+                            .iter()
+                            .any(|value| {
+                                let value = value.to_str().expect("should decode response cookie");
+                                value.starts_with("ts-ec=") && value.contains("Max-Age=0")
+                            }),
+                        withdrawn,
+                        "should expire the EC cookie only for the withdrawing reader"
+                    );
+                    let body = body_of(response).await;
+                    assert!(!body.is_empty(), "should render a complete reader response");
+                    let captured = captured.lock().expect("should lock captured auction");
+                    let auction = captured.as_ref().expect("should dispatch a reader auction");
+                    assert_eq!(
+                        auction.request.user.id.as_deref(),
+                        if withdrawn {
+                            None
+                        } else {
+                            Some(identity.as_str())
+                        },
+                        "should use this reader's identity and suppress it after withdrawal"
+                    );
+                    if withdrawn {
+                        assert!(
+                            auction.request.user.eids.is_none(),
+                            "should suppress withdrawn EIDs"
+                        );
+                    } else {
+                        let eids = auction
+                            .request
+                            .user
+                            .eids
+                            .as_ref()
+                            .expect("should include consenting reader EIDs");
+                        assert_eq!(eids.len(), 1, "should expose only the configured partner");
+                        assert_eq!(
+                            eids[0].source, "example.com",
+                            "should use the registered source"
+                        );
+                        assert_eq!(
+                            eids[0].uids[0].id,
+                            format!("partner-reader-{index}"),
+                            "should use this reader's partner identity on cold and warm requests"
+                        );
+                    }
+                }
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    1,
+                    "should fetch origin only once"
+                );
+                assert_eq!(
+                    looked_up_cache_keys(&cache).len(),
+                    3,
+                    "should look up every reader"
+                );
+                assert_eq!(
+                    stored_cache_keys(&cache).len(),
+                    1,
+                    "should store only the cold template"
+                );
+                for (index, identity) in identities.iter().enumerate() {
+                    let (entry, _) = graph
+                        .get(identity)
+                        .expect("should read reader identity")
+                        .expect("should retain the live row or its tombstone");
+                    assert_eq!(
+                        entry.consent.ok,
+                        index == 0,
+                        "should revoke only the second reader"
+                    );
+                    assert_eq!(
+                        entry.ids.is_empty(),
+                        index == 1,
+                        "should clear only revoked partner IDs"
+                    );
+                }
+                let entries = cache.entries.lock().expect("should lock cached templates");
+                let stored = &entries
+                    .values()
+                    .next()
+                    .expect("should retain shared template")
+                    .body;
+                let stored = String::from_utf8_lossy(stored);
+                for identity in &identities {
+                    assert!(
+                        !stored.contains(identity),
+                        "should keep reader identities out of cached bytes"
+                    );
+                }
+            }
         }
 
         #[tokio::test]
@@ -12496,7 +15297,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_declared_cookie_independent_origin_lets_repeat_visitors_share() {
-            // The opt-in. Without it the spike can only ever measure first-ever page
+            // The opt-in. Without it the cache can only ever serve first-ever page
             // views, which is not the population the issue cares about.
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
@@ -12968,6 +15769,62 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_cache_hit_replays_policy_headers_rewritten_to_the_serving_host() {
+            // The header rewrite runs before the template-cache gate captures policy
+            // metadata, so a hit replays the serving-host CSP and Link rather than the
+            // origin-only values that would block or bypass the rewritten page.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            stub.push_response_with_headers(
+                200,
+                b"<html><head></head><body>origin</body></html>".to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                    (
+                        "content-security-policy",
+                        "img-src https://origin.test-publisher.com",
+                    ),
+                    (
+                        "link",
+                        "<https://origin.test-publisher.com/app.css>; rel=preload; as=style",
+                    ),
+                ],
+            );
+
+            let cold = run(&settings, &services, navigation_request()).await;
+            let warm = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "should serve the second navigation from the template cache"
+            );
+            let value = |response: &Response<EdgeBody>, name: header::HeaderName| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+                    .expect("should carry the policy header")
+            };
+            for name in [header::CONTENT_SECURITY_POLICY, header::LINK] {
+                let replayed = value(&warm, name.clone());
+                assert!(
+                    replayed.contains("://ts.example.com"),
+                    "should replay `{name}` rewritten to the serving host: {replayed}"
+                );
+                assert_eq!(
+                    replayed,
+                    value(&cold, name.clone()),
+                    "should replay the same `{name}` the miss delivered"
+                );
+            }
+        }
+
+        #[tokio::test]
         async fn a_cache_hit_preserves_every_repeated_policy_header_in_order() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
@@ -13300,15 +16157,13 @@ mod tests {
                 None,
                 &mut ec_context,
                 AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
                     orchestrator: &orchestrator,
                     slots: &[article_slot()],
                     registry: None,
                 },
                 authenticated,
-                PublisherAdapterOptions {
-                    edge_cache_header: EdgeCacheHeader::SMaxageFallback,
-                    delivery_compression: DeliveryCompressionCapability::Unavailable,
-                },
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request");
@@ -14047,7 +16902,7 @@ mod tests {
         }
 
         #[test]
-        fn a_forwarded_request_cookie_disqualifies_even_without_set_cookie() {
+        fn cookie_policy_disqualifies_even_without_set_cookie() {
             // The dangerous case: session established on an earlier request, so this
             // response carries no Set-Cookie, has no Cache-Control at all, is a 200,
             // and is HTML — yet is personalized because TS forwarded the Cookie to
@@ -14063,7 +16918,7 @@ mod tests {
                     &no_cache_control,
                     &nothing_covered(),
                 ),
-                Some(TemplateCacheBypassReason::CookieForwarded),
+                Some(TemplateCacheBypassReason::CookiePolicy),
                 "cookie-personalized HTML must not become a shared template"
             );
         }
@@ -14266,7 +17121,10 @@ mod tests {
                 assembly_mode: None,
                 template_cache_vary: None,
                 template_cache_max_age_seconds: None,
+                template_cache_key_cookies: None,
+                template_cache_bypass_cookies: None,
                 origin_is_cookie_independent: None,
+                origin_readthrough_enabled: None,
                 section_segment: None,
                 slot: vec![slot()],
             });
@@ -14393,6 +17251,233 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("max-age=31536000"),
             "matched publisher asset should receive Fastly edge policy"
+        );
+    }
+
+    fn proxy_response_headers(response: &PublisherResponse) -> &header::HeaderMap {
+        match response {
+            PublisherResponse::PassThrough { response, .. }
+            | PublisherResponse::Stream { response, .. }
+            | PublisherResponse::AssembleTemplate { response, .. }
+            | PublisherResponse::Buffered(response) => response.headers(),
+        }
+    }
+
+    fn publisher_page_request() -> Request<EdgeBody> {
+        HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/redirect")
+            .header(header::HOST, "publisher.example")
+            .header("fastly-ssl", "1")
+            .body(EdgeBody::empty())
+            .expect("should build request")
+    }
+
+    #[tokio::test]
+    async fn transformed_page_headers_map_origin_urls_to_serving_host() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            302,
+            b"<html><body><a href=\"https://origin.test-publisher.com/landing.html\">go</a></body></html>"
+                .to_vec(),
+            vec![
+                (header::CONTENT_TYPE.as_str(), "text/html; charset=utf-8"),
+                (
+                    header::LOCATION.as_str(),
+                    "https://origin.test-publisher.com/landing.html",
+                ),
+                (
+                    header::REFRESH.as_str(),
+                    "0; url=https://origin.test-publisher.com/refreshed.html",
+                ),
+                (
+                    header::LINK.as_str(),
+                    "<https://origin.test-publisher.com/preload.css>; rel=preload; as=style",
+                ),
+                (
+                    header::CONTENT_SECURITY_POLICY.as_str(),
+                    "default-src https://origin.test-publisher.com 'unsafe-inline'",
+                ),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+
+        let response = run_publisher_proxy(&settings, &services, publisher_page_request()).await;
+
+        assert!(
+            matches!(response, PublisherResponse::Stream { .. }),
+            "should stream the redirect HTML body through the rewriter"
+        );
+        let headers = proxy_response_headers(&response);
+        let value = |name: header::HeaderName| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            value(header::LOCATION).as_deref(),
+            Some("https://publisher.example/landing.html"),
+            "should keep the redirect on the serving host"
+        );
+        assert_eq!(
+            value(header::REFRESH).as_deref(),
+            Some("0; url=https://publisher.example/refreshed.html"),
+            "should keep the refresh navigation on the serving host"
+        );
+        assert_eq!(
+            value(header::LINK).as_deref(),
+            Some("<https://publisher.example/preload.css>; rel=preload; as=style"),
+            "should preload through the serving host"
+        );
+        assert_eq!(
+            value(header::CONTENT_SECURITY_POLICY).as_deref(),
+            Some(
+                "default-src https://origin.test-publisher.com https://publisher.example 'unsafe-inline'"
+            ),
+            "should permit the serving host alongside the origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn bodiless_redirect_location_maps_origin_url_to_serving_host() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            301,
+            Vec::new(),
+            vec![(
+                header::LOCATION.as_str(),
+                "http://origin.test-publisher.com/moved?x=1",
+            )],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+
+        let response = run_publisher_proxy(&settings, &services, publisher_page_request()).await;
+
+        assert!(
+            matches!(response, PublisherResponse::Buffered(_)),
+            "should return the bodiless redirect unmodified"
+        );
+        assert_eq!(
+            proxy_response_headers(&response)
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://publisher.example/moved?x=1"),
+            "should rewrite the redirect target even without a transformed body"
+        );
+    }
+
+    async fn redirect_location_for_current_url(
+        origin_url: &str,
+        method: Method,
+        location: &str,
+    ) -> String {
+        let mut settings = create_test_settings();
+        settings.publisher.origin_url = origin_url.to_string();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            303,
+            Vec::new(),
+            vec![(header::LOCATION.as_str(), location)],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let mut request = publisher_page_request();
+        *request.method_mut() = method;
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+
+        proxy_response_headers(&response)
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("should keep a Location header")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn scheme_upgrade_redirect_to_current_url_is_not_rewritten_into_a_loop() {
+        let location = redirect_location_for_current_url(
+            "http://origin.test-publisher.com",
+            Method::GET,
+            "https://origin.test-publisher.com/redirect",
+        )
+        .await;
+
+        assert_eq!(
+            location, "https://origin.test-publisher.com/redirect",
+            "should not redirect the browser back to the URL it requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_scheme_redirect_to_current_url_stays_on_serving_host() {
+        let location = redirect_location_for_current_url(
+            "https://origin.test-publisher.com",
+            Method::POST,
+            "https://origin.test-publisher.com/redirect",
+        )
+        .await;
+
+        assert_eq!(
+            location, "https://publisher.example/redirect",
+            "should rewrite a POST-redirect-GET to the same URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn cookieless_get_redirect_to_current_url_is_not_rewritten_into_a_loop() {
+        // A canonical-host redirect triggered by `origin_host_header_override`
+        // answers the retry through Trusted Server the same way, so it must leave.
+        for method in [Method::GET, Method::HEAD] {
+            let location = redirect_location_for_current_url(
+                "https://origin.test-publisher.com",
+                method.clone(),
+                "https://origin.test-publisher.com/redirect",
+            )
+            .await;
+
+            assert_eq!(
+                location, "https://origin.test-publisher.com/redirect",
+                "should not redirect a cookieless {method} back to the URL it requested"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn overridden_host_redirect_with_cookie_is_not_rewritten_into_a_loop() {
+        let mut settings = create_test_settings();
+        settings.publisher.origin_host_header_override = Some("publisher.example".to_string());
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            301,
+            Vec::new(),
+            vec![
+                (
+                    header::LOCATION.as_str(),
+                    "https://origin.test-publisher.com/redirect",
+                ),
+                (header::SET_COOKIE.as_str(), "AWSALB=abc123; Path=/"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+
+        let response = run_publisher_proxy(&settings, &services, publisher_page_request()).await;
+
+        assert_eq!(
+            proxy_response_headers(&response)
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://origin.test-publisher.com/redirect"),
+            "should not send a host-change redirect back to the URL it requested"
         );
     }
 
@@ -14851,15 +17936,13 @@ mod tests {
                 None,
                 &mut ec_context,
                 AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
                     orchestrator,
                     slots,
                     registry: None,
                 },
                 req,
-                PublisherAdapterOptions {
-                    edge_cache_header: EdgeCacheHeader::SMaxageFallback,
-                    delivery_compression: DeliveryCompressionCapability::Unavailable,
-                },
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request")
@@ -14915,15 +17998,13 @@ mod tests {
                 Some(&graph),
                 &mut ec_context,
                 AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
                     orchestrator: &orchestrator,
                     slots: &slots,
                     registry: None,
                 },
                 conditional_navigation_request(),
-                PublisherAdapterOptions {
-                    edge_cache_header: EdgeCacheHeader::SurrogateControl,
-                    delivery_compression: DeliveryCompressionCapability::Unavailable,
-                },
+                EdgeCacheHeader::SurrogateControl,
             )
             .await
             {
@@ -14989,15 +18070,13 @@ mod tests {
                 Some(&graph),
                 &mut ec_context,
                 AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
                     orchestrator: &orchestrator,
                     slots: &slots,
                     registry: None,
                 },
                 conditional_navigation_request(),
-                PublisherAdapterOptions {
-                    edge_cache_header: EdgeCacheHeader::SurrogateControl,
-                    delivery_compression: DeliveryCompressionCapability::Unavailable,
-                },
+                EdgeCacheHeader::SurrogateControl,
             )
             .await;
 
@@ -15075,8 +18154,8 @@ mod tests {
 
             // Assert
             assert_eq!(
-                stub.recorded_cache_bypass_flags(),
-                vec![true],
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Bypass],
                 "eligible publisher navigation should bypass the platform cache"
             );
             let recorded_requests = stub.recorded_request_headers();
@@ -15175,9 +18254,9 @@ mod tests {
 
             // Assert
             assert_eq!(
-                stub.recorded_cache_bypass_flags(),
-                vec![false],
-                "publisher navigation without matched slots should use the default cache mode"
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Default],
+                "should preserve platform caching for non-ad requests while readthrough is disabled",
             );
             let recorded_requests = stub.recorded_request_headers();
             let outbound_headers = recorded_requests
@@ -15280,9 +18359,9 @@ mod tests {
 
             // Assert
             assert_eq!(
-                stub.recorded_cache_bypass_flags(),
-                vec![false],
-                "disabled server-side ad templates should not bypass the origin cache"
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Default],
+                "should preserve platform caching with disabled ad templates and readthrough"
             );
             assert_eq!(
                 response_head
@@ -15814,9 +18893,9 @@ mod tests {
                 );
             }
             assert_eq!(
-                stub.recorded_cache_bypass_flags(),
-                vec![false],
-                "noneligible publisher navigation should use the default cache mode"
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Default],
+                "should preserve platform revalidation for non-ad requests with readthrough disabled"
             );
             let recorded_requests = stub.recorded_request_headers();
             let outbound_headers = recorded_requests
@@ -16148,15 +19227,13 @@ mod tests {
             None,
             &mut ec_context,
             AuctionDispatch {
+                integration_registry: &IntegrationRegistry::empty_for_tests(),
                 orchestrator: &orchestrator,
                 slots: &[],
                 registry: None,
             },
             req,
-            PublisherAdapterOptions {
-                edge_cache_header: EdgeCacheHeader::SMaxageFallback,
-                delivery_compression: DeliveryCompressionCapability::Unavailable,
-            },
+            EdgeCacheHeader::SMaxageFallback,
         )
         .await
         .expect("should proxy publisher request");
@@ -16521,84 +19598,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn server_side_ad_stack_runs_only_when_all_auction_gates_pass() {
-        let enabled_config = ServerSideAdStackConfig {
-            ad_templates_enabled: true,
-            auction_enabled: true,
-        };
-        assert!(
-            should_run_server_side_ad_stack(true, true, false, false, true, true, enabled_config,),
-            "GET, real navigation, enabled templates, matched slots, and consent should run TS ad stack"
-        );
-
-        assert!(
-            !should_run_server_side_ad_stack(false, true, false, false, true, true, enabled_config,),
-            "non-GET requests should skip TS ad stack"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(true, false, false, false, true, true, enabled_config,),
-            "non-document requests should skip TS ad stack"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(true, true, true, false, true, true, enabled_config,),
-            "prefetch requests should skip TS ad stack and injection"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(true, true, false, true, true, true, enabled_config,),
-            "bot requests should skip TS ad stack and injection"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, false, true, enabled_config,),
-            "requests with no matching slots should skip TS ad stack"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, false, enabled_config,),
-            "requests without required consent should skip TS ad stack and injection"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(
-                true,
-                true,
-                false,
-                false,
-                true,
-                true,
-                ServerSideAdStackConfig {
-                    ad_templates_enabled: true,
-                    auction_enabled: false,
-                },
-            ),
-            "disabled [auction].enabled kill switch should skip TS ad stack and injection"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(
-                true,
-                true,
-                false,
-                false,
-                true,
-                true,
-                ServerSideAdStackConfig {
-                    ad_templates_enabled: false,
-                    auction_enabled: true,
-                },
-            ),
-            "disabled [creative_opportunities].enabled switch should skip TS ad stack and injection"
-        );
-    }
-
     #[tokio::test]
-    async fn body_close_hold_loop_processes_close_tail_before_reading_post_body_chunks() {
+    async fn parser_seam_loop_collects_before_writing_post_body_chunks() {
         let settings = create_test_settings();
         let services = noop_services();
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
         let dispatched = DispatchedAuction::empty_for_test(test_auction_request(), 500);
         let read_count = Arc::new(AtomicUsize::new(0));
         let body_close_processed_at = Arc::new(AtomicUsize::new(0));
+        let token = b"<!--ts-inline-body-close-test-->";
         let reader = ChunkedReader::new(
             &[
-                b"<html><body>painted</body>",
+                b"<html><body>painted<!--ts-inline-body-close-test--></body>",
                 b"<script>late()</script>",
                 b"</html>",
             ],
@@ -16626,20 +19637,219 @@ mod tests {
         };
         let mut output = Vec::new();
 
-        body_close_hold_loop(reader, &mut output, &mut processor, ctx)
-            .await
-            .expect("should stream body with auction hold");
+        body_close_hold_loop(
+            reader,
+            &mut output,
+            &mut processor,
+            ctx,
+            Some(token.to_vec()),
+        )
+        .await
+        .expect("should stream body with auction hold");
 
         assert_eq!(
             body_close_processed_at.load(Ordering::SeqCst),
             1,
             "close-body tail should be processed as soon as it is found, before later chunks are read"
         );
-        assert_eq!(
-            std::str::from_utf8(&output).expect("should be utf8"),
-            "<html><body>painted</body><script>late()</script></html>",
-            "post-body chunks should still stream in order"
+        let output = std::str::from_utf8(&output).expect("should be utf8");
+        let painted = output
+            .find("painted")
+            .expect("should preserve body content");
+        let bids = output
+            .find("var b=JSON.parse(")
+            .expect("should inject collected bids");
+        let close = output.find("</body>").expect("should preserve body close");
+        let late = output
+            .find("late()")
+            .expect("should preserve trailing script");
+        assert!(
+            painted < bids && bids < close && close < late,
+            "output order: {output}"
         );
+    }
+
+    #[tokio::test]
+    async fn parser_seam_write_failure_abandons_auction_once() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected write failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let settings = create_test_settings();
+        let sink = Arc::new(RecordingTelemetrySink::default());
+        let services = noop_services_with_telemetry_sink(Arc::clone(&sink) as _);
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let ad_bids_state = AdBidsState::default();
+        let ec_context = EcContext::new_for_test(None, ConsentContext::default());
+        let ctx = AuctionCollectCtx {
+            dispatched: DispatchedAuction::empty_for_test(test_auction_request(), 500),
+            telemetry: AuctionTelemetryCarry {
+                observation: Some(AuctionObservationContext::from_parts(
+                    AuctionSource::InitialNavigation,
+                    "proxy.example.com",
+                    "/article",
+                    1,
+                    None,
+                    &ec_context,
+                )),
+                auction_request: None,
+            },
+            deps: AuctionCollectDeps {
+                price_granularity: PriceGranularity::default(),
+                ad_bids_state: &ad_bids_state,
+                orchestrator: &orchestrator,
+                services: &services,
+                settings: &settings,
+                request_origin: String::new(),
+            },
+        };
+        let mut processor = RecordingProcessor {
+            read_count: Arc::new(AtomicUsize::new(0)),
+            body_close_processed_at: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let error = body_close_hold_loop(
+            std::io::Cursor::new(b"<html><body>ready"),
+            &mut FailingWriter,
+            &mut processor,
+            ctx,
+            Some(b"<!--ts-inline-body-close-test-->".to_vec()),
+        )
+        .await
+        .expect_err("injected writer failure should surface");
+        assert!(format!("{error:?}").contains("Failed to write processed chunk"));
+
+        let batches = sink.batches.lock().expect("should lock telemetry batches");
+        let summaries: Vec<_> = batches
+            .iter()
+            .flat_map(crate::auction::telemetry::AuctionEventBatch::rows)
+            .filter(|row| row.event_kind == "summary")
+            .collect();
+        assert_eq!(summaries.len(), 1, "should emit one terminal summary");
+        assert_eq!(summaries[0].terminal_status.as_deref(), Some("abandoned"));
+        assert_eq!(
+            summaries[0].terminal_reason.as_deref(),
+            Some("stream_write_error")
+        );
+    }
+
+    #[tokio::test]
+    async fn parser_seam_async_sink_failures_abandon_auction_once() {
+        struct FailingWriter {
+            fail_flush: bool,
+        }
+
+        impl Write for FailingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.fail_flush {
+                    Ok(buf.len())
+                } else {
+                    Err(io::Error::other("injected write failure"))
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("injected flush failure"))
+            }
+        }
+
+        for fail_flush in [false, true] {
+            for with_close in [false, true] {
+                let settings = create_test_settings();
+                let sink = Arc::new(RecordingTelemetrySink::default());
+                let services = noop_services_with_telemetry_sink(Arc::clone(&sink) as _);
+                let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+                let ad_bids_state = AdBidsState::default();
+                let ec_context = EcContext::new_for_test(None, ConsentContext::default());
+                let ctx = AuctionCollectCtx {
+                    dispatched: DispatchedAuction::empty_for_test(test_auction_request(), 500),
+                    telemetry: AuctionTelemetryCarry {
+                        observation: Some(AuctionObservationContext::from_parts(
+                            AuctionSource::InitialNavigation,
+                            "proxy.example.com",
+                            "/article",
+                            1,
+                            None,
+                            &ec_context,
+                        )),
+                        auction_request: None,
+                    },
+                    deps: AuctionCollectDeps {
+                        price_granularity: PriceGranularity::default(),
+                        ad_bids_state: &ad_bids_state,
+                        orchestrator: &orchestrator,
+                        services: &services,
+                        settings: &settings,
+                        request_origin: String::new(),
+                    },
+                };
+                let mut processor = RecordingProcessor {
+                    read_count: Arc::new(AtomicUsize::new(0)),
+                    body_close_processed_at: Arc::new(AtomicUsize::new(0)),
+                };
+                let html = if with_close {
+                    "<html><body>ready<!--ts-inline-body-close-test--></body></html>"
+                } else {
+                    "<html><body>ready"
+                };
+                let body =
+                    EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+                        html.as_bytes(),
+                    )]));
+
+                let error = body_close_hold_loop_stream(
+                    body,
+                    &mut FailingWriter { fail_flush },
+                    &mut processor,
+                    Compression::None,
+                    Compression::None,
+                    ctx,
+                    settings.publisher.max_buffered_body_bytes,
+                    Some(b"<!--ts-inline-body-close-test-->".to_vec()),
+                )
+                .await
+                .expect_err("should propagate the sink failure before collecting");
+                let expected_error = if fail_flush {
+                    "Failed to flush output before auction collection"
+                } else {
+                    "Failed to write encoded chunk"
+                };
+                assert!(
+                    format!("{error:?}").contains(expected_error),
+                    "should preserve the sink error: {error:?}"
+                );
+
+                let batches = sink.batches.lock().expect("should lock telemetry batches");
+                let summaries: Vec<_> = batches
+                    .iter()
+                    .flat_map(crate::auction::telemetry::AuctionEventBatch::rows)
+                    .filter(|row| row.event_kind == "summary")
+                    .collect();
+                assert_eq!(
+                    summaries.len(),
+                    1,
+                    "should emit one terminal summary for fail_flush={fail_flush}, with_close={with_close}"
+                );
+                assert_eq!(
+                    summaries[0].terminal_status.as_deref(),
+                    Some("abandoned"),
+                    "should abandon the uncollected auction"
+                );
+                assert_eq!(
+                    summaries[0].terminal_reason.as_deref(),
+                    Some("stream_write_error"),
+                    "should classify write and flush failures consistently"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -16654,6 +19864,7 @@ mod tests {
         let services = noop_services();
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
         let ad_bids_state = AdBidsState::default();
+        let token = b"<!--ts-inline-body-close-test-->";
         let mut state = AuctionHoldState::new(
             DispatchedAuctionGuard::new(DispatchedAuction::empty_for_test(
                 test_auction_request(),
@@ -16663,6 +19874,7 @@ mod tests {
                 observation: None,
                 auction_request: None,
             },
+            Some(token.to_vec()),
         );
         let collect_refs = AuctionCollectDeps {
             price_granularity: PriceGranularity::default(),
@@ -16683,7 +19895,7 @@ mod tests {
         let step = hold_step_decoded_chunk(
             &mut processor,
             &mut encoder,
-            b"<html><body>painted</body></html>",
+            b"<html><body>painted<!--ts-inline-body-close-test--></body></html>",
             &mut state,
             &collect_refs,
         )
@@ -16692,7 +19904,7 @@ mod tests {
 
         assert!(
             step.close_found,
-            "</body> in the first chunk must be detected"
+            "parser marker in the first chunk must be detected"
         );
         let ready: Vec<u8> = step.ready.iter().flat_map(|b| b.to_vec()).collect();
         assert_eq!(
@@ -16709,14 +19921,14 @@ mod tests {
             "auction must not be collected while the ready prefix is emitted"
         );
 
-        let tail = hold_collect_close_tail(&mut processor, &mut encoder, &mut state, &collect_refs)
+        let tail = hold_collect_close_tail(&mut encoder, &mut state, &collect_refs)
             .await
             .expect("collect should succeed");
         let tail_bytes: Vec<u8> = tail.iter().flat_map(|b| b.to_vec()).collect();
-        assert_eq!(
-            std::str::from_utf8(&tail_bytes).expect("held tail should be utf8"),
-            "</body></html>",
-            "the held close tail must be emitted after collection"
+        let tail = std::str::from_utf8(&tail_bytes).expect("held tail should be utf8");
+        assert!(
+            tail.contains("var b=JSON.parse(") && tail.ends_with("</body></html>"),
+            "collected bids and the held close tail must be emitted together: {tail}"
         );
         assert!(
             ad_bids_state
@@ -16729,10 +19941,11 @@ mod tests {
     }
 
     #[test]
-    fn body_close_hold_buffer_holds_close_body_tail_in_single_chunk() {
-        let mut hold = BodyCloseHoldBuffer::new();
+    fn inline_body_close_seam_holds_tail_in_single_chunk() {
+        let token = b"<!--ts-inline-body-close-test-->";
+        let mut hold = InlineBodyCloseSeam::new(token.to_vec());
 
-        let ready = hold.push(b"<html><body>painted</body></html>");
+        let ready = hold.push(b"<html><body>painted<!--ts-inline-body-close-test--></body></html>");
         let held = hold.finish();
 
         assert_eq!(
@@ -16748,11 +19961,12 @@ mod tests {
     }
 
     #[test]
-    fn body_close_hold_buffer_holds_close_body_tail_across_chunks() {
-        let mut hold = BodyCloseHoldBuffer::new();
+    fn inline_body_close_seam_holds_tail_across_chunks() {
+        let token = b"<!--ts-inline-body-close-test-->";
+        let mut hold = InlineBodyCloseSeam::new(token.to_vec());
 
-        let first = hold.push(b"<html><body>painted</bo");
-        let second = hold.push(b"dy></html>");
+        let first = hold.push(b"<html><body>painted<!--ts-inline-body-");
+        let second = hold.push(b"close-test--></body></html>");
         let held = hold.finish();
 
         let streamed = [first, second].concat();
@@ -16766,6 +19980,29 @@ mod tests {
             "</body></html>",
             "split close-body tag should be held intact"
         );
+    }
+
+    #[test]
+    fn inline_body_close_seam_matches_every_token_split_and_ignores_other_tokens() {
+        let token = b"<!--ts-inline-body-close-00000000000000000000000000000001-->";
+        for split in 0..=token.len() {
+            let mut seam = InlineBodyCloseSeam::new(token.to_vec());
+            let mut ready = seam.push(b"<script>const x='</body>';</script>");
+            ready.extend(seam.push(&token[..split]));
+            ready.extend(seam.push(&token[split..]));
+            assert!(seam.found(), "should match token split at {split}");
+            assert_eq!(
+                ready, b"<script>const x='</body>';</script>",
+                "should release all bytes before split {split}"
+            );
+            assert!(seam.finish().is_empty());
+        }
+
+        let other = b"<!--ts-inline-body-close-00000000000000000000000000000002-->";
+        let mut seam = InlineBodyCloseSeam::new(token.to_vec());
+        let ready = seam.push(other);
+        assert!(!seam.found());
+        assert_eq!([ready, seam.finish()].concat(), other);
     }
 
     #[test]
@@ -17510,6 +20747,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publisher_request_rewrites_html_using_uri_authority() {
+        for version in [http::Version::HTTP_11, http::Version::HTTP_2] {
+            for (uri, empty_host) in [
+                ("https://publisher.example.com:8443/page", false),
+                ("https://user:pass@publisher.example.com:8443/page", false),
+                ("https://publisher.example.com:8443/page", true),
+            ] {
+                let mut settings = create_test_settings();
+                settings.publisher.origin_url = "https://origin.example.com".to_owned();
+                let registry = IntegrationRegistry::new(&settings)
+                    .expect("should create integration registry");
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response_with_headers(
+                    200,
+                    b"<html><head></head><body><a href=\"https://origin.example.com/article\">Article</a></body></html>".to_vec(),
+                    vec![("content-type", "text/html; charset=utf-8")],
+                );
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+                let mut req = HttpRequest::builder()
+                    .version(version)
+                    .uri(uri)
+                    .header("x-forwarded-proto", "https")
+                    .header("sec-fetch-dest", "document")
+                    .body(EdgeBody::empty())
+                    .expect("should build authority-only publisher request");
+                if empty_host {
+                    req.headers_mut()
+                        .insert(header::HOST, HeaderValue::from_static(""));
+                }
+                for name in ["forwarded", "x-forwarded-host"] {
+                    assert!(
+                        !req.headers().contains_key(name),
+                        "should have no {name} header"
+                    );
+                }
+
+                assert!(
+                    req.headers()
+                        .get(header::HOST)
+                        .is_none_or(HeaderValue::is_empty),
+                    "should have no nonempty Host header"
+                );
+
+                let publisher_response = run_publisher_proxy(&settings, &services, req).await;
+                let response = buffer_publisher_response_async(
+                    publisher_response,
+                    &Method::GET,
+                    &settings,
+                    &registry,
+                    &AuctionOrchestrator::new(settings.auction.clone()),
+                    &services,
+                )
+                .await
+                .expect("should buffer processed publisher response");
+                let html = response_body_string(response);
+                let case = format!("{version:?} {uri} (empty Host: {empty_host})");
+
+                assert!(
+                    html.contains("href=\"https://publisher.example.com:8443/article\""),
+                    "should rewrite origin links using URI authority for {case}: {html}"
+                );
+                assert!(
+                    !html.contains("user:pass@"),
+                    "should omit URI userinfo from rewritten HTML for {case}: {html}"
+                );
+                assert!(
+                    html.contains("id=\"trustedserver-js\""),
+                    "should inject the Trusted Server script for {case}: {html}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn publisher_request_sends_configured_host_header_override() {
         let mut settings = create_test_settings();
         settings.publisher.origin_host_header_override = Some("www.example.com".to_string());
@@ -17570,12 +20883,14 @@ mod tests {
 
         let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
+            output_compression: None,
+            response_status: StatusCode::OK,
+            range_associated: false,
             csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
-            input_compression: Compression::Gzip,
-            output_compression: Compression::Gzip,
+            content_encoding: "gzip".to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -17630,12 +20945,14 @@ mod tests {
         .expect("should create integration registry");
 
         let params = OwnedProcessResponseParams {
+            output_compression: None,
+            response_status: StatusCode::OK,
+            range_associated: false,
             csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
-            input_compression: Compression::None,
-            output_compression: Compression::None,
+            content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -17679,12 +20996,14 @@ mod tests {
         )
         .expect("should create integration registry");
         let params = OwnedProcessResponseParams {
+            output_compression: None,
+            response_status: StatusCode::OK,
+            range_associated: false,
             csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
-            input_compression: Compression::None,
-            output_compression: Compression::None,
+            content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -17806,12 +21125,14 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
+                response_status: StatusCode::OK,
+                range_associated: false,
                 csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
-                input_compression: Compression::None,
-                output_compression: Compression::None,
+                content_encoding: String::new(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
@@ -17871,12 +21192,14 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
+                response_status: StatusCode::OK,
+                range_associated: false,
                 csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
-                input_compression: Compression::Gzip,
-                output_compression: Compression::Gzip,
+                content_encoding: "gzip".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
@@ -17939,12 +21262,14 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
+                response_status: StatusCode::OK,
+                range_associated: false,
                 csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
-                input_compression: Compression::Deflate,
-                output_compression: Compression::Deflate,
+                content_encoding: "deflate".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
@@ -18007,12 +21332,14 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
+                response_status: StatusCode::OK,
+                range_associated: false,
                 csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
-                input_compression: Compression::Brotli,
-                output_compression: Compression::Brotli,
+                content_encoding: "br".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
@@ -18075,12 +21402,14 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
+                response_status: StatusCode::OK,
+                range_associated: false,
                 csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
-                input_compression: Compression::Brotli,
-                output_compression: Compression::Brotli,
+                content_encoding: "br".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
@@ -18125,12 +21454,14 @@ mod tests {
 
     fn non_html_stream_params(content_encoding: &str) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            output_compression: None,
+            response_status: StatusCode::OK,
+            range_associated: false,
             csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
-            input_compression: Compression::from_content_encoding(content_encoding),
-            output_compression: Compression::from_content_encoding(content_encoding),
+            content_encoding: content_encoding.to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -18328,198 +21659,6 @@ mod tests {
     }
 
     #[test]
-    fn buffered_missing_body_close_preserves_open_textarea_without_bid_fallback() {
-        futures::executor::block_on(async {
-            let settings = create_test_settings();
-            let registry = IntegrationRegistry::with_plan(
-                &settings,
-                Arc::new(
-                    crate::auction::compile_auction_plan(&settings)
-                        .expect("should compile auction plan"),
-                ),
-            )
-            .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            let services = noop_services();
-            let mut params = html_stream_params(
-                "",
-                Some(DispatchedAuction::empty_for_test(
-                    test_auction_request(),
-                    10,
-                )),
-            );
-            let body = EdgeBody::from(b"<html><head></head><body><textarea>draft".to_vec());
-            let mut output = Vec::new();
-
-            stream_publisher_body_async(
-                body,
-                &mut output,
-                &mut params,
-                &settings,
-                &registry,
-                &orchestrator,
-                &services,
-            )
-            .await
-            .expect("buffered malformed HTML should process");
-
-            let html = String::from_utf8(output).expect("should be valid UTF-8");
-            let document = scraper::Html::parse_document(&html);
-            let textarea_selector =
-                scraper::Selector::parse("textarea").expect("should parse textarea selector");
-            let textarea = document
-                .select(&textarea_selector)
-                .next()
-                .expect("output should retain textarea");
-            assert_eq!(
-                textarea.text().collect::<String>(),
-                "draft",
-                "missing body close must not add publisher textarea content. Got: {html}"
-            );
-            let script_selector =
-                scraper::Selector::parse("script").expect("should parse script selector");
-            assert!(
-                !document
-                    .select(&script_selector)
-                    .any(|script| script.inner_html().contains("var b=JSON.parse(")),
-                "missing body close must not synthesize a bids script. Got: {html}"
-            );
-        });
-    }
-
-    #[test]
-    fn buffered_missing_body_close_preserves_content_without_bid_fallback() {
-        futures::executor::block_on(async {
-            let settings = create_test_settings();
-            let registry = IntegrationRegistry::with_plan(
-                &settings,
-                Arc::new(
-                    crate::auction::compile_auction_plan(&settings)
-                        .expect("should compile auction plan"),
-                ),
-            )
-            .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            let services = noop_services();
-            let mut params = html_stream_params(
-                "",
-                Some(DispatchedAuction::empty_for_test(
-                    test_auction_request(),
-                    10,
-                )),
-            );
-            let body = EdgeBody::from(b"<html><head></head><body><p>draft".to_vec());
-            let mut output = Vec::new();
-
-            stream_publisher_body_async(
-                body,
-                &mut output,
-                &mut params,
-                &settings,
-                &registry,
-                &orchestrator,
-                &services,
-            )
-            .await
-            .expect("buffered unclosed body should process");
-
-            let html = String::from_utf8(output).expect("should be valid UTF-8");
-            let document = scraper::Html::parse_document(&html);
-            let paragraph_selector =
-                scraper::Selector::parse("p").expect("should parse paragraph selector");
-            let paragraph = document
-                .select(&paragraph_selector)
-                .next()
-                .expect("output should retain paragraph");
-            assert_eq!(paragraph.text().collect::<String>(), "draft");
-            let script_selector =
-                scraper::Selector::parse("script").expect("should parse script selector");
-            assert!(
-                !document
-                    .select(&script_selector)
-                    .any(|script| script.inner_html().contains("var b=JSON.parse(")),
-                "missing parser-confirmed body close must skip bid fallback. Got: {html}"
-            );
-        });
-    }
-
-    #[test]
-    fn streaming_missing_body_close_preserves_open_textarea_without_bid_fallback() {
-        let params = html_stream_params(
-            "",
-            Some(DispatchedAuction::empty_for_test(
-                test_auction_request(),
-                10,
-            )),
-        );
-        let body = streaming_finalize_response(
-            params,
-            EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
-                b"<html><head></head><body><textarea>draft",
-            )])),
-        );
-        let output = futures::executor::block_on(body.into_bytes_bounded(16 * 1024 * 1024))
-            .expect("streaming malformed HTML should drain");
-        let html = String::from_utf8(output.to_vec()).expect("should be valid UTF-8");
-        let document = scraper::Html::parse_document(&html);
-        let textarea_selector =
-            scraper::Selector::parse("textarea").expect("should parse textarea selector");
-        let textarea = document
-            .select(&textarea_selector)
-            .next()
-            .expect("output should retain textarea");
-        assert_eq!(
-            textarea.text().collect::<String>(),
-            "draft",
-            "streaming EOF handling must preserve publisher textarea content. Got: {html}"
-        );
-        let script_selector =
-            scraper::Selector::parse("script").expect("should parse script selector");
-        assert!(
-            !document
-                .select(&script_selector)
-                .any(|script| script.inner_html().contains("var b=JSON.parse(")),
-            "streaming EOF handling must not synthesize a bids script. Got: {html}"
-        );
-    }
-
-    #[test]
-    fn streaming_missing_body_close_preserves_content_without_bid_fallback() {
-        let params = html_stream_params(
-            "",
-            Some(DispatchedAuction::empty_for_test(
-                test_auction_request(),
-                10,
-            )),
-        );
-        let body = streaming_finalize_response(
-            params,
-            EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
-                b"<html><head></head><body><p>draft",
-            )])),
-        );
-        let output = futures::executor::block_on(body.into_bytes_bounded(16 * 1024 * 1024))
-            .expect("streaming unclosed body should drain");
-        let html = String::from_utf8(output.to_vec()).expect("should be valid UTF-8");
-        let document = scraper::Html::parse_document(&html);
-        let paragraph_selector =
-            scraper::Selector::parse("p").expect("should parse paragraph selector");
-        let paragraph = document
-            .select(&paragraph_selector)
-            .next()
-            .expect("output should retain paragraph");
-        assert_eq!(paragraph.text().collect::<String>(), "draft");
-        let script_selector =
-            scraper::Selector::parse("script").expect("should parse script selector");
-        assert!(
-            !document
-                .select(&script_selector)
-                .any(|script| script.inner_html().contains("var b=JSON.parse(")),
-            "streaming EOF without a parser-confirmed body close must skip bid fallback. Got: {html}"
-        );
-    }
-
-    #[test]
     fn stream_publisher_body_async_processes_stream_with_auction_hold() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
@@ -18535,12 +21674,14 @@ mod tests {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
+                response_status: StatusCode::OK,
+                range_associated: false,
                 csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
-                input_compression: Compression::None,
-                output_compression: Compression::None,
+                content_encoding: String::new(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
@@ -18611,12 +21752,14 @@ mod tests {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
+                response_status: StatusCode::OK,
+                range_associated: false,
                 csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
-                input_compression: Compression::Gzip,
-                output_compression: Compression::Gzip,
+                content_encoding: "gzip".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
@@ -18689,12 +21832,14 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
+                response_status: StatusCode::OK,
+                range_associated: false,
                 csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
-                input_compression: Compression::None,
-                output_compression: Compression::None,
+                content_encoding: String::new(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
@@ -18761,12 +21906,14 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build response");
         let params = OwnedProcessResponseParams {
+            output_compression: None,
+            response_status: StatusCode::OK,
+            range_associated: false,
             csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
-            input_compression: Compression::from_content_encoding(content_encoding),
-            output_compression: Compression::from_content_encoding(content_encoding),
+            content_encoding: content_encoding.to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -18866,8 +22013,1777 @@ mod tests {
         }
     }
 
+    struct AsyncTailFactory(Arc<AtomicUsize>);
+    struct AsyncTailProcessor(Arc<AtomicUsize>);
+
+    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for AsyncTailFactory {
+        fn integration_id(&self) -> &'static str {
+            "example_async_tail"
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn create(
+            &self,
+            _: crate::integrations::IntegrationHtmlStreamContext,
+        ) -> Box<dyn StreamProcessor> {
+            Box::new(AsyncTailProcessor(Arc::clone(&self.0)))
+        }
+    }
+
+    impl StreamProcessor for AsyncTailProcessor {
+        fn process_chunk(&mut self, chunk: &[u8], _: bool) -> std::io::Result<Vec<u8>> {
+            Ok(chunk.to_vec())
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn async_finish<'a>(
+            &'a mut self,
+            _: crate::streaming_processor::finish::StreamFinishInput<'a>,
+        ) -> Option<
+            futures::future::LocalBoxFuture<
+                'a,
+                Result<
+                    crate::streaming_processor::finish::StreamFinish,
+                    Report<crate::streaming_processor::finish::StreamFinishError>,
+                >,
+            >,
+        > {
+            Some(Box::pin(async move {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                futures::future::pending().await
+            }))
+        }
+    }
+
+    struct UndeclaredAsyncFactory(Arc<AtomicUsize>);
+    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for UndeclaredAsyncFactory {
+        fn integration_id(&self) -> &'static str {
+            "example_inconsistent_factory"
+        }
+        fn create(
+            &self,
+            _: crate::integrations::IntegrationHtmlStreamContext,
+        ) -> Box<dyn StreamProcessor> {
+            Box::new(AsyncTailProcessor(Arc::clone(&self.0)))
+        }
+    }
+
+    #[test]
+    fn async_eof_factory_mismatch_rejects_before_stream_reads() {
+        let settings = create_test_settings();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+            UndeclaredAsyncFactory(Arc::clone(&calls)),
+        )]);
+        let observed_reads = Arc::clone(&reads);
+        let body = EdgeBody::stream(futures::stream::poll_fn(move |_| {
+            observed_reads.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Ready(Some(bytes::Bytes::from_static(b"<p>Example</p>")))
+        }));
+        let mut output = Vec::new();
+        let mut params = html_stream_params("", None);
+        let _ = futures::executor::block_on(stream_publisher_body_async(
+            body,
+            &mut output,
+            &mut params,
+            &settings,
+            &registry,
+            &AuctionOrchestrator::new(settings.auction.clone()),
+            &noop_services(),
+        ))
+        .expect_err("should reject inconsistent EOF declarations before input effects");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "should not consume a stream before capability validation"
+        );
+        assert!(
+            output.is_empty(),
+            "should not commit output for inconsistent declarations"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "should not start undeclared EOF I/O"
+        );
+    }
+
+    #[test]
+    fn async_eof_writer_flushes_before_non_retaining_callback() {
+        struct FlushRecorder {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            flushed: Arc<AtomicUsize>,
+        }
+        impl Write for FlushRecorder {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes
+                    .lock()
+                    .expect("should lock")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushed.store(
+                    self.bytes.lock().expect("should lock").len(),
+                    Ordering::SeqCst,
+                );
+                Ok(())
+            }
+        }
+        let settings = crate::publisher::allow_eof_test_settings(create_test_settings());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+            AsyncTailFactory(Arc::clone(&calls)),
+        )]);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let flushed = Arc::new(AtomicUsize::new(0));
+        let mut writer = FlushRecorder {
+            bytes: Arc::clone(&bytes),
+            flushed: Arc::clone(&flushed),
+        };
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let mut params = html_stream_params("", None);
+        let services = noop_services();
+        let mut work = Box::pin(stream_publisher_body_async(
+            EdgeBody::from(&b"<html><head></head><body>Example probe</body></html>"[..]),
+            &mut writer,
+            &mut params,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        ));
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(
+            work.as_mut().poll(&mut context).is_pending(),
+            "should pend on the callback"
+        );
+        drop(work);
+        let written = bytes.lock().expect("should lock").len();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "should start the callback");
+        assert!(written > 0, "should write the page");
+        assert_eq!(
+            flushed.load(Ordering::SeqCst),
+            written,
+            "should flush every written byte before awaiting the callback"
+        );
+    }
+
+    #[test]
+    fn inline_body_close_seam_rejects_partial_token_larger_than_limit() {
+        let _ = InlineBodyCloseSeam::new(b"TOKEN".to_vec())
+            .push_bounded(b"pageTOK", 2)
+            .expect_err("should reject a partial token that exceeds the retained limit");
+    }
+
+    #[test]
+    fn async_eof_lazy_input_enforces_raw_and_decoded_limits_for_every_body_kind() {
+        for streamed in [false, true] {
+            for encoding in ["", "gzip", "deflate", "br"] {
+                let mut settings =
+                    crate::publisher::allow_eof_test_settings(create_test_settings());
+                settings.publisher.max_buffered_body_bytes = 256 * 1024;
+                let settings = Arc::new(settings);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                    AsyncTailFactory(Arc::clone(&calls)),
+                )]);
+                let html = format!(
+                    "<html><head></head><body>{}</body></html>",
+                    "x".repeat(4 * 1024 * 1024)
+                );
+                let encoded = match encoding {
+                    "gzip" => gzip_encode(html.as_bytes()),
+                    "deflate" => deflate_encode(html.as_bytes()),
+                    "br" => brotli_encode(html.as_bytes()),
+                    _ => html.into_bytes(),
+                };
+                let body = if streamed {
+                    EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from(encoded)]))
+                } else {
+                    EdgeBody::from(encoded)
+                };
+                let publisher = PublisherResponse::Stream {
+                    response: Response::builder()
+                        .header(header::CONTENT_TYPE, "text/html")
+                        .body(EdgeBody::empty())
+                        .expect("should build limited HTML response"),
+                    body,
+                    params: Box::new(html_stream_params(encoding, None)),
+                };
+                let response =
+                    futures::executor::block_on(publisher_response_into_streaming_response(
+                        publisher,
+                        &Method::GET,
+                        Arc::clone(&settings),
+                        &registry,
+                        Arc::new(AuctionOrchestrator::new(settings.auction.clone())),
+                        noop_services(),
+                    ))
+                    .expect("should create lazy limited response");
+                let EdgeBody::Stream(mut stream) = response.into_body() else {
+                    panic!("should return lazy output")
+                };
+                let mut failed = false;
+                // A broken decoder can reach the deliberately pending callback. Poll
+                // explicitly so the regression reports failure instead of hanging.
+                let waker = futures::task::noop_waker();
+                let mut context = std::task::Context::from_waker(&waker);
+                loop {
+                    let mut next = Box::pin(stream.next());
+                    match core::future::Future::poll(next.as_mut(), &mut context) {
+                        std::task::Poll::Ready(Some(Err(_))) => {
+                            failed = true;
+                            break;
+                        }
+                        std::task::Poll::Ready(Some(Ok(_))) => {}
+                        _ => break,
+                    }
+                }
+                assert!(
+                    failed,
+                    "should reject oversized {encoding:?} input (streamed={streamed})"
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "should reject input before optional work"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn async_eof_lazy_delivery_releases_page_before_pending_io() {
+        for streamed in [false, true] {
+            let settings = Arc::new(crate::publisher::allow_eof_test_settings(
+                create_test_settings(),
+            ));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                AsyncTailFactory(Arc::clone(&calls)),
+            )]);
+            let html = b"<html><head></head><body><p>Example renderable page</p></body></html>";
+            let body = if streamed {
+                EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::copy_from_slice(
+                    html,
+                )]))
+            } else {
+                EdgeBody::from(html.to_vec())
+            };
+            let publisher = PublisherResponse::Stream {
+                response: Response::builder()
+                    .status(200)
+                    .header(header::CONTENT_TYPE, "text/html")
+                    .body(EdgeBody::empty())
+                    .expect("should build example response"),
+                body,
+                params: Box::new(html_stream_params("", None)),
+            };
+            let response = futures::executor::block_on(publisher_response_into_streaming_response(
+                publisher,
+                &Method::GET,
+                Arc::clone(&settings),
+                &registry,
+                Arc::new(AuctionOrchestrator::new(settings.auction.clone())),
+                noop_services(),
+            ))
+            .expect("should prepare lazy EOF output");
+            let EdgeBody::Stream(mut stream) = response.into_body() else {
+                panic!("should return a lazy body");
+            };
+            let first = futures::executor::block_on(stream.next())
+                .expect("should yield ready HTML")
+                .expect("should deliver prefix");
+            assert!(
+                String::from_utf8_lossy(&first).contains("Example renderable page"),
+                "should release the page before optional EOF I/O"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "should not start the callback before ready bytes are yielded"
+            );
+            let waker = futures::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            let mut pending = false;
+            for _ in 0..16 {
+                let mut next = Box::pin(stream.next());
+                match core::future::Future::poll(next.as_mut(), &mut context) {
+                    std::task::Poll::Pending => {
+                        pending = true;
+                        break;
+                    }
+                    std::task::Poll::Ready(Some(Ok(_))) => {}
+                    _ => panic!("should reach pending optional EOF work after delivering the page"),
+                }
+            }
+            assert!(pending, "should wait only after ready output is delivered");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "should start EOF I/O once");
+        }
+    }
+
+    #[test]
+    fn html_finalization_applies_privacy_and_full_body_policy_without_an_auction() {
+        let settings = crate::publisher::allow_eof_test_settings(create_test_settings());
+        let registry =
+            IntegrationRegistry::from_html_stream_processors(vec![Arc::new(TerminalTestFactory)]);
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response_with_headers(
+            404,
+            b"<html><body>Example missing article</body></html>".to_vec(),
+            vec![
+                ("content-type", "text/html"),
+                ("cache-control", "public, max-age=60"),
+                ("etag", "example-tag"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&http) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://proxy.example.com/article")
+            .header(header::HOST, "proxy.example.com")
+            .header(header::ACCEPT, "text/html")
+            .header(header::IF_NONE_MATCH, "example-tag")
+            .header(header::IF_MODIFIED_SINCE, "Mon, 01 Jan 2024 00:00:00 GMT")
+            .header(header::RANGE, "bytes=0-10")
+            .header(header::IF_RANGE, "example-tag")
+            .header(header::IF_MATCH, "example-precondition")
+            .body(EdgeBody::empty())
+            .expect("should build a navigation");
+        let result = futures::executor::block_on(handle_publisher_request(
+            &settings,
+            &services,
+            None,
+            &mut EcContext::default(),
+            AuctionDispatch {
+                orchestrator: &orchestrator,
+                slots: &[],
+                registry: None,
+                integration_registry: &registry,
+            },
+            request,
+            EdgeCacheHeader::SurrogateControl,
+        ))
+        .expect("should fetch the origin");
+        let PublisherResponse::Stream { response, .. } = result else {
+            panic!("should select processable HTML");
+        };
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "should preserve non-2xx status"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some(crate::cache_policy::NO_STORE_PRIVATE_CACHE_CONTROL),
+            "should make finalized HTML private even without ads"
+        );
+        assert!(
+            !response.headers().contains_key(header::ETAG),
+            "should strip origin validators"
+        );
+        let requests = http.recorded_request_headers();
+        let forwarded = &requests[0];
+        for name in ["if-none-match", "if-modified-since", "range", "if-range"] {
+            assert!(
+                !forwarded.iter().any(|(header, _)| header == name),
+                "should request complete HTML"
+            );
+        }
+        assert!(
+            forwarded.iter().any(|(header, _)| header == "if-match"),
+            "should preserve mutation preconditions"
+        );
+    }
+
+    struct CountingTerminalFactory(Arc<AtomicUsize>);
+    struct CountingTerminalSession(Arc<AtomicUsize>);
+
+    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for CountingTerminalFactory {
+        fn integration_id(&self) -> &'static str {
+            "example_counter"
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn buffer_output_until_eof(&self) -> bool {
+            true
+        }
+        fn create(
+            &self,
+            _: crate::integrations::IntegrationHtmlStreamContext,
+        ) -> Box<dyn StreamProcessor> {
+            Box::new(CountingTerminalSession(Arc::clone(&self.0)))
+        }
+    }
+    impl StreamProcessor for CountingTerminalSession {
+        fn process_chunk(&mut self, chunk: &[u8], _: bool) -> std::io::Result<Vec<u8>> {
+            Ok(chunk.to_vec())
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn async_finish<'a>(
+            &'a mut self,
+            input: crate::streaming_processor::finish::StreamFinishInput<'a>,
+        ) -> Option<
+            futures::future::LocalBoxFuture<
+                'a,
+                Result<
+                    crate::streaming_processor::finish::StreamFinish,
+                    Report<crate::streaming_processor::finish::StreamFinishError>,
+                >,
+            >,
+        > {
+            Some(Box::pin(async move {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                input.replacement.append(b"discarded candidate")?;
+                Ok(crate::streaming_processor::finish::StreamFinish::Unchanged)
+            }))
+        }
+    }
+
+    #[test]
+    fn html_finalization_preserves_range_associated_responses_on_both_sinks() {
+        for (status, content_range) in [(206, true), (206, false), (200, true), (416, true)] {
+            for streamed in [false, true] {
+                for buffered in [false, true] {
+                    for encoding in ["", "gzip"] {
+                        for auction in [false, true] {
+                            let settings = Arc::new(crate::publisher::allow_eof_test_settings(
+                                create_test_settings(),
+                            ));
+                            let calls = Arc::new(AtomicUsize::new(0));
+                            let registry =
+                                IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                                    CountingTerminalFactory(Arc::clone(&calls)),
+                                )]);
+                            let raw = b"<p>Example range fragment</p>";
+                            let encoded = if encoding == "gzip" {
+                                gzip_encode(raw)
+                            } else {
+                                raw.to_vec()
+                            };
+                            let body = if streamed {
+                                EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from(
+                                    encoded.clone(),
+                                )]))
+                            } else {
+                                EdgeBody::from(encoded.clone())
+                            };
+                            let mut builder = Response::builder()
+                                .status(status)
+                                .header(header::CONTENT_TYPE, "text/html")
+                                .header(header::CONTENT_ENCODING, encoding)
+                                .header(header::CONTENT_LENGTH, encoded.len())
+                                .header(header::ETAG, "example-range-tag")
+                                .header(header::CACHE_CONTROL, "public, max-age=60");
+                            if content_range {
+                                builder = builder.header(header::CONTENT_RANGE, "bytes 0-29/100");
+                            }
+                            let response = builder
+                                .body(EdgeBody::empty())
+                                .expect("should build range metadata");
+                            let headers = response.headers().clone();
+                            let mut params = html_stream_params(
+                                encoding,
+                                auction.then(|| {
+                                    DispatchedAuction::empty_for_test(test_auction_request(), 500)
+                                }),
+                            );
+                            let sink = Arc::new(RecordingTelemetrySink::default());
+                            let services =
+                                noop_services_with_telemetry_sink(Arc::clone(&sink) as _);
+                            if auction {
+                                params.auction_observation =
+                                    Some(AuctionObservationContext::from_parts(
+                                        AuctionSource::InitialNavigation,
+                                        "proxy.example.com",
+                                        "/article",
+                                        1,
+                                        None,
+                                        &EcContext::default(),
+                                    ));
+                            }
+                            let publisher = PublisherResponse::Stream {
+                                response,
+                                body,
+                                params: Box::new(params),
+                            };
+                            let orchestrator =
+                                Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+                            let response = if buffered {
+                                futures::executor::block_on(buffer_publisher_response_async(
+                                    publisher,
+                                    &Method::GET,
+                                    &settings,
+                                    &registry,
+                                    &orchestrator,
+                                    &services,
+                                ))
+                            } else {
+                                futures::executor::block_on(
+                                    publisher_response_into_streaming_response(
+                                        publisher,
+                                        &Method::GET,
+                                        settings,
+                                        &registry,
+                                        orchestrator,
+                                        services,
+                                    ),
+                                )
+                            }
+                            .expect("should preserve range-associated HTML");
+                            assert_eq!(
+                                response.status().as_u16(),
+                                status,
+                                "should preserve range status"
+                            );
+                            assert_eq!(
+                                response.headers(),
+                                &headers,
+                                "should preserve range framing and policy"
+                            );
+                            let actual = futures::executor::block_on(
+                                response.into_body().into_bytes_bounded(1024),
+                            )
+                            .expect("should drain the original range bytes");
+                            assert_eq!(
+                                actual.as_ref(),
+                                encoded.as_slice(),
+                                "should preserve encoded range bytes"
+                            );
+                            assert_eq!(
+                                calls.load(Ordering::SeqCst),
+                                0,
+                                "should never finalize a range-associated response"
+                            );
+                            let batches = sink.batches.lock().expect("should lock range telemetry");
+                            let summaries: Vec<_> = batches
+                                .iter()
+                                .flat_map(crate::auction::telemetry::AuctionEventBatch::rows)
+                                .filter(|row| row.event_kind == "summary")
+                                .collect();
+                            assert_eq!(
+                                summaries.len(),
+                                usize::from(auction),
+                                "should abandon a dispatched auction exactly once"
+                            );
+                            if auction {
+                                assert_eq!(
+                                    summaries[0].terminal_status.as_deref(),
+                                    Some("abandoned"),
+                                    "should report range bypass abandonment"
+                                );
+                                assert_eq!(
+                                    summaries[0].terminal_reason.as_deref(),
+                                    Some("partial_response"),
+                                    "should classify range abandonment consistently"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn html_finalization_bypasses_ranged_fetches_and_unsolicited_partial_origins() {
+        for destination in ["empty", "document"] {
+            for (status, content_range) in [(206, false), (206, true), (200, true), (416, true)] {
+                let settings = Arc::new(crate::publisher::allow_eof_test_settings(
+                    create_test_settings(),
+                ));
+                let calls = Arc::new(AtomicUsize::new(0));
+                let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                    CountingTerminalFactory(Arc::clone(&calls)),
+                )]);
+                let http = Arc::new(StubHttpClient::new());
+                let raw = b"<p>Example fragment</p>";
+                let mut headers = vec![("content-type", "text/html")];
+                if content_range {
+                    headers.push(("content-range", "bytes 0-22/100"));
+                }
+                http.push_response_with_headers(status, raw.to_vec(), headers);
+                let services = build_services_with_http_client(http.clone());
+                let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+                let request = Request::builder()
+                    .method(Method::GET)
+                    .uri("https://proxy.example.com/article")
+                    .header(header::HOST, "proxy.example.com")
+                    .header(header::ACCEPT, "text/html")
+                    .header("sec-fetch-dest", destination)
+                    .header(header::RANGE, "bytes=0-22")
+                    .body(EdgeBody::empty())
+                    .expect("should build a ranged fetch");
+                let publisher = futures::executor::block_on(handle_publisher_request(
+                    &settings,
+                    &services,
+                    None,
+                    &mut EcContext::default(),
+                    AuctionDispatch {
+                        integration_registry: &registry,
+                        orchestrator: &orchestrator,
+                        slots: &[],
+                        registry: None,
+                    },
+                    request,
+                    EdgeCacheHeader::SurrogateControl,
+                ))
+                .expect("should fetch a range-associated response");
+                let response =
+                    futures::executor::block_on(publisher_response_into_streaming_response(
+                        publisher,
+                        &Method::GET,
+                        settings,
+                        &registry,
+                        orchestrator,
+                        services,
+                    ))
+                    .expect("should bypass terminal work on partial origin HTML");
+                let actual =
+                    futures::executor::block_on(response.into_body().into_bytes_bounded(1024))
+                        .expect("should drain the range fragment");
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "should skip optional I/O on partial origin HTML"
+                );
+                assert_eq!(actual.as_ref(), raw, "should preserve the origin fragment");
+                assert_eq!(
+                    http.recorded_request_headers()[0]
+                        .iter()
+                        .any(|(name, _)| name == "range"),
+                    destination == "empty",
+                    "should preserve non-document range semantics"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn html_finalization_direct_helpers_copy_encoded_ranges_without_optional_work() {
+        for streamed in [false, true] {
+            let mut settings = crate::publisher::allow_eof_test_settings(create_test_settings());
+            settings.publisher.max_buffered_body_bytes = 4;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                CountingTerminalFactory(Arc::clone(&calls)),
+            )]);
+            let encoded = gzip_encode(b"<p>Example partial response</p>");
+            assert!(
+                encoded.len() > settings.publisher.max_buffered_body_bytes,
+                "should exercise pass-through beyond the retained-body limit"
+            );
+            let body = if streamed {
+                let chunks: Vec<_> = encoded
+                    .chunks(4)
+                    .map(bytes::Bytes::copy_from_slice)
+                    .collect();
+                EdgeBody::stream(futures::stream::iter(chunks))
+            } else {
+                EdgeBody::from(encoded.clone())
+            };
+            let mut params = html_stream_params("gzip", None);
+            params.response_status = if streamed {
+                StatusCode::OK
+            } else {
+                StatusCode::PARTIAL_CONTENT
+            };
+            params.range_associated = streamed;
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut output = Vec::new();
+            futures::executor::block_on(stream_publisher_body_async(
+                body,
+                &mut output,
+                &mut params,
+                &settings,
+                &registry,
+                &orchestrator,
+                &noop_services(),
+            ))
+            .expect("should copy an encoded partial representation");
+            assert_eq!(
+                output, encoded,
+                "should avoid decoding or rewriting range bytes"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "should skip terminal I/O on direct range delivery"
+            );
+            if !streamed {
+                output.clear();
+                stream_publisher_body(
+                    EdgeBody::from(encoded.clone()),
+                    &mut output,
+                    &params,
+                    &settings,
+                    &registry,
+                )
+                .expect("should copy an encoded range on the synchronous helper");
+                assert_eq!(
+                    output, encoded,
+                    "should preserve the direct synchronous range bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn html_finalization_flushes_at_the_terminal_barrier_instead_of_each_replay_chunk() {
+        struct FlushCounter {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+        impl Write for FlushCounter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        let settings = crate::publisher::allow_eof_test_settings(create_test_settings());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+            CountingTerminalFactory(Arc::clone(&calls)),
+        )]);
+        let mut source = b"<html><head></head><body><p>".to_vec();
+        source.extend(vec![b'x'; 5 * STREAM_CHUNK_SIZE]);
+        source.extend_from_slice(b"</p></body></html>");
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let mut output = FlushCounter {
+            bytes: Vec::new(),
+            flushes: 0,
+        };
+        futures::executor::block_on(stream_publisher_body_async(
+            EdgeBody::from(source),
+            &mut output,
+            &mut html_stream_params("", None),
+            &settings,
+            &registry,
+            &orchestrator,
+            &noop_services(),
+        ))
+        .expect("should replay a complete large HTML document");
+        assert!(
+            output.bytes.len() > 5 * STREAM_CHUNK_SIZE,
+            "should replay multiple bounded chunks"
+        );
+        assert_eq!(
+            output.flushes, 2,
+            "should flush the EOF barrier and final output, not every replay chunk"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "should retain one terminal callback"
+        );
+    }
+
+    #[test]
+    fn html_finalization_flushes_all_ready_prefix_before_a_pending_auction() {
+        struct FlushProbe {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            flushed_bytes: Arc<AtomicUsize>,
+            flushes: Arc<AtomicUsize>,
+        }
+        impl Write for FlushProbe {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes
+                    .lock()
+                    .expect("should record ready bytes")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushed_bytes.store(
+                    self.bytes
+                        .lock()
+                        .expect("should inspect flushed bytes")
+                        .len(),
+                    Ordering::SeqCst,
+                );
+                self.flushes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        for closed in [false, true] {
+            let mut settings = crate::publisher::allow_eof_test_settings(create_test_settings());
+            settings.auction.enabled = true;
+            settings.auction.providers =
+                crate::auction::AuctionConfig::legacy_provider_map(&["seam-test"]);
+            settings.auction.timeout_ms = 60_000;
+            settings.auction.mediator = None;
+            let client = Arc::new(GatedAuctionHttpClient {
+                inner: StubHttpClient::new(),
+                released: AtomicBool::new(false),
+                collections: AtomicUsize::new(0),
+            });
+            client.inner.push_response(200, Vec::new());
+            let services = build_services_with_http_client(client.clone());
+            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            orchestrator.register_provider(Arc::new(GatedAuctionProvider));
+            let request = Request::new(EdgeBody::empty());
+            let dispatched = futures::executor::block_on(orchestrator.dispatch_auction(
+                &test_auction_request(),
+                &AuctionContext {
+                    settings: &settings,
+                    request: &request,
+                    timeout_ms: 60_000,
+                    transport_timeout_ms: 60_000,
+                    provider_responses: None,
+                    services: &services,
+                },
+            ));
+            let DispatchAuctionOutcome::Dispatched(dispatched) = dispatched else {
+                panic!("should dispatch a controlled pending auction");
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                CountingTerminalFactory(Arc::clone(&calls)),
+            )]);
+            let mut source = b"<html><head></head><body>".to_vec();
+            source.extend(vec![b'x'; 5 * STREAM_CHUNK_SIZE]);
+            source.extend_from_slice(b"Example barrier end");
+            if closed {
+                source.extend_from_slice(b"</body></html>");
+            }
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let flushed = Arc::new(AtomicUsize::new(0));
+            let flushes = Arc::new(AtomicUsize::new(0));
+            let mut writer = FlushProbe {
+                bytes: Arc::clone(&bytes),
+                flushed_bytes: Arc::clone(&flushed),
+                flushes: Arc::clone(&flushes),
+            };
+            let mut params = html_stream_params("", Some(dispatched));
+            let mut work = Box::pin(stream_publisher_body_async(
+                EdgeBody::from(source),
+                &mut writer,
+                &mut params,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            ));
+            let waker = futures::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(
+                work.as_mut().poll(&mut context).is_pending(),
+                "should await the controlled auction"
+            );
+            let prefix = bytes
+                .lock()
+                .expect("should inspect the delivered prefix")
+                .clone();
+            assert!(
+                prefix
+                    .windows(b"Example barrier end".len())
+                    .any(|window| window == b"Example barrier end"),
+                "should deliver the whole ready prefix before collection"
+            );
+            assert_eq!(
+                flushed.load(Ordering::SeqCst),
+                prefix.len(),
+                "should flush every ready prefix byte before collection"
+            );
+            assert_eq!(
+                flushes.load(Ordering::SeqCst),
+                1,
+                "should use one pre-auction flush barrier"
+            );
+            assert_eq!(
+                client.collections.load(Ordering::SeqCst),
+                1,
+                "should poll the pending auction once"
+            );
+            client.released.store(true, Ordering::SeqCst);
+            futures::executor::block_on(work)
+                .expect("should complete once the auction is released");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "should finish HTML before auction collection"
+            );
+        }
+    }
+
+    struct StatusTerminalFactory(Arc<Mutex<Vec<StatusCode>>>);
+    struct StatusTerminalSession(Arc<Mutex<Vec<StatusCode>>>);
+
+    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for StatusTerminalFactory {
+        fn integration_id(&self) -> &'static str {
+            "example_status"
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn buffer_output_until_eof(&self) -> bool {
+            true
+        }
+
+        fn create(
+            &self,
+            _: crate::integrations::IntegrationHtmlStreamContext,
+        ) -> Box<dyn StreamProcessor> {
+            Box::new(StatusTerminalSession(Arc::clone(&self.0)))
+        }
+    }
+
+    impl StreamProcessor for StatusTerminalSession {
+        fn process_chunk(&mut self, chunk: &[u8], _: bool) -> std::io::Result<Vec<u8>> {
+            Ok(chunk.to_vec())
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn async_finish<'a>(
+            &'a mut self,
+            input: crate::streaming_processor::finish::StreamFinishInput<'a>,
+        ) -> Option<
+            futures::future::LocalBoxFuture<
+                'a,
+                Result<
+                    crate::streaming_processor::finish::StreamFinish,
+                    Report<crate::streaming_processor::finish::StreamFinishError>,
+                >,
+            >,
+        > {
+            Some(Box::pin(async move {
+                self.0
+                    .lock()
+                    .expect("should record the response status")
+                    .push(input.response_status);
+                Ok(crate::streaming_processor::finish::StreamFinish::Unchanged)
+            }))
+        }
+    }
+
+    #[test]
+    fn html_finalization_exposes_actual_success_and_error_status_on_both_sinks() {
+        for buffered in [false, true] {
+            let statuses = Arc::new(Mutex::new(Vec::new()));
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                StatusTerminalFactory(Arc::clone(&statuses)),
+            )]);
+            for status in [200, 404, 500] {
+                let settings = Arc::new(crate::publisher::allow_eof_test_settings(
+                    create_test_settings(),
+                ));
+                let http = Arc::new(StubHttpClient::new());
+                http.push_response_with_headers(
+                    status,
+                    b"<html><head></head><body>Example complete response</body></html>".to_vec(),
+                    vec![("content-type", "text/html")],
+                );
+                let services = build_services_with_http_client(http);
+                let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+                let request = Request::builder()
+                    .uri("https://proxy.example.com/article")
+                    .header(header::HOST, "proxy.example.com")
+                    .header(header::ACCEPT, "text/html")
+                    .body(EdgeBody::empty())
+                    .expect("should build a complete document request");
+                let mut publisher = futures::executor::block_on(handle_publisher_request(
+                    &settings,
+                    &services,
+                    None,
+                    &mut EcContext::default(),
+                    AuctionDispatch {
+                        integration_registry: &registry,
+                        orchestrator: &orchestrator,
+                        slots: &[],
+                        registry: None,
+                    },
+                    request,
+                    EdgeCacheHeader::SurrogateControl,
+                ))
+                .expect("should fetch complete success or error HTML");
+                if let PublisherResponse::Stream { response, .. } = &mut publisher {
+                    response.headers_mut().remove(header::CACHE_CONTROL);
+                }
+                let response = if buffered {
+                    futures::executor::block_on(buffer_publisher_response_async(
+                        publisher,
+                        &Method::GET,
+                        &settings,
+                        &registry,
+                        &orchestrator,
+                        &services,
+                    ))
+                } else {
+                    futures::executor::block_on(publisher_response_into_streaming_response(
+                        publisher,
+                        &Method::GET,
+                        settings,
+                        &registry,
+                        orchestrator,
+                        services,
+                    ))
+                }
+                .expect("should finalize complete success or error HTML");
+                assert_eq!(
+                    response.status().as_u16(),
+                    status,
+                    "should retain the origin status"
+                );
+                assert_eq!(
+                    response.headers()[header::CACHE_CONTROL],
+                    "no-store, private",
+                    "should apply privacy in the finalizer for direct callers"
+                );
+                let _ = futures::executor::block_on(
+                    response.into_body().into_bytes_bounded(1024 * 1024),
+                )
+                .expect("should drive the complete terminal response");
+            }
+            assert_eq!(
+                *statuses.lock().expect("should inspect observed statuses"),
+                [
+                    StatusCode::OK,
+                    StatusCode::NOT_FOUND,
+                    StatusCode::INTERNAL_SERVER_ERROR
+                ],
+                "should expose status without excluding complete error documents"
+            );
+        }
+    }
+
+    #[test]
+    fn html_finalization_handles_eligible_and_excluded_responses() {
+        for (method, status, content_type, encoding) in [
+            (Method::GET, 200, "text/html", ""),
+            (Method::HEAD, 200, "text/html", ""),
+            (Method::GET, 204, "text/html", ""),
+            (Method::GET, 205, "text/html", ""),
+            (Method::GET, 304, "text/html", ""),
+            (Method::GET, 200, "text/plain", ""),
+            (Method::GET, 200, "text/html", "example-unsupported"),
+        ] {
+            let settings = Arc::new(crate::publisher::allow_eof_test_settings(
+                create_test_settings(),
+            ));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                CountingTerminalFactory(Arc::clone(&calls)),
+            )]);
+            let http = Arc::new(StubHttpClient::new());
+            http.push_response_with_headers(
+                status,
+                b"Example body".to_vec(),
+                vec![
+                    ("content-type", content_type),
+                    ("content-encoding", encoding),
+                ],
+            );
+            let services = build_services_with_http_client(http);
+            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let request = Request::builder()
+                .method(method.clone())
+                .uri("https://proxy.example.com/article")
+                .header(header::HOST, "proxy.example.com")
+                .header(header::ACCEPT, "text/html")
+                .body(EdgeBody::empty())
+                .expect("should build a fixture request");
+            let response = futures::executor::block_on(handle_publisher_request(
+                &settings,
+                &services,
+                None,
+                &mut EcContext::default(),
+                AuctionDispatch {
+                    integration_registry: &registry,
+                    orchestrator: &orchestrator,
+                    slots: &[],
+                    registry: None,
+                },
+                request,
+                EdgeCacheHeader::SurrogateControl,
+            ))
+            .expect("should classify the origin response");
+            let response = futures::executor::block_on(publisher_response_into_streaming_response(
+                response,
+                &method,
+                Arc::clone(&settings),
+                &registry,
+                orchestrator,
+                services,
+            ))
+            .expect("should preserve excluded response behavior");
+            let _ =
+                futures::executor::block_on(response.into_body().into_bytes_bounded(1024 * 1024))
+                    .expect("should drain excluded output");
+            let eligible = method == Method::GET
+                && status == 200
+                && content_type == "text/html"
+                && encoding.is_empty();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(eligible),
+                "should invoke only eligible callbacks: method={method}, status={status}, type={content_type}, encoding={encoding}"
+            );
+        }
+    }
+
+    #[test]
+    fn html_finalization_collection_overflow_replays_rewritten_expansion_and_stays_private() {
+        let mut settings = crate::publisher::allow_eof_test_settings(create_test_settings());
+        settings.publisher.max_buffered_body_bytes = 128;
+        let settings = Arc::new(settings);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+            CountingTerminalFactory(Arc::clone(&calls)),
+        )]);
+        let source = b"<html><head></head><body>Example</body></html>";
+        let response = PublisherResponse::Stream {
+            response: Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "text/html")
+                .body(EdgeBody::empty())
+                .expect("should build overflow output"),
+            body: EdgeBody::stream(futures::stream::iter(
+                source
+                    .chunks(7)
+                    .map(bytes::Bytes::copy_from_slice)
+                    .collect::<Vec<_>>(),
+            )),
+            params: Box::new(html_stream_params("", None)),
+        };
+        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let response = futures::executor::block_on(publisher_response_into_streaming_response(
+            response,
+            &Method::GET,
+            Arc::clone(&settings),
+            &registry,
+            orchestrator,
+            noop_services(),
+        ))
+        .expect("should create lazy overflow output");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .expect("should retain privacy"),
+            crate::cache_policy::NO_STORE_PRIVATE_CACHE_CONTROL,
+            "should prevent caching even when collection bypasses I/O"
+        );
+        let body =
+            futures::executor::block_on(response.into_body().into_bytes_bounded(1024 * 1024))
+                .expect("should replay overflow output");
+        let control_registry = IntegrationRegistry::from_html_stream_processors(Vec::new());
+        let mut processor = create_html_stream_processor(HtmlStreamProcessorParams {
+            origin_host: "origin.example.com",
+            request_host: "proxy.example.com",
+            request_scheme: "https",
+            settings: &settings,
+            integration_registry: &control_registry,
+            ad_slots_script: html_stream_params("", None).ad_slots_script,
+            ad_bids_state: Arc::new(Mutex::new(None)),
+            suppress_datadome_client_side_tag: false,
+            gpt_diagnostics: None,
+            shared_template_authorized: false,
+            csp_nonce_observed: None,
+            deferred_inline_marker: None,
+        })
+        .expect("should build a synchronous control");
+        let mut expected = Vec::new();
+        for chunk in source.chunks(7) {
+            expected.extend(
+                processor
+                    .process_chunk(chunk, false)
+                    .expect("should process the control chunk"),
+            );
+        }
+        expected.extend(
+            processor
+                .process_chunk(&[], true)
+                .expect("should finish the control"),
+        );
+        assert_eq!(
+            body.as_ref(),
+            expected,
+            "should emit every transformed byte exactly once after bypass"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "should skip terminal I/O after retention overflow"
+        );
+    }
+
+    #[test]
+    fn html_finalization_rejects_corrupt_codecs_without_starting_optional_io() {
+        let page = b"<html><head></head><body>Example</body></html>";
+        for encoding in ["gzip", "deflate", "br"] {
+            let mut encoded = match encoding {
+                "gzip" => gzip_encode(page),
+                "deflate" => deflate_encode(page),
+                _ => brotli_encode(page),
+            };
+            encoded.truncate(encoded.len() / 2);
+            for streamed in [false, true] {
+                let settings = Arc::new(crate::publisher::allow_eof_test_settings(
+                    create_test_settings(),
+                ));
+                let calls = Arc::new(AtomicUsize::new(0));
+                let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                    CountingTerminalFactory(Arc::clone(&calls)),
+                )]);
+                let body = if streamed {
+                    EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from(
+                        encoded.clone(),
+                    )]))
+                } else {
+                    EdgeBody::from(encoded.clone())
+                };
+                let response = PublisherResponse::Stream {
+                    response: Response::builder()
+                        .status(200)
+                        .header(header::CONTENT_TYPE, "text/html")
+                        .body(EdgeBody::empty())
+                        .expect("should build corrupt-codec response"),
+                    body,
+                    params: Box::new(html_stream_params(encoding, None)),
+                };
+                let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+                let response =
+                    futures::executor::block_on(publisher_response_into_streaming_response(
+                        response,
+                        &Method::GET,
+                        settings,
+                        &registry,
+                        orchestrator,
+                        noop_services(),
+                    ))
+                    .expect("should create a lazy decode path");
+                let _ = futures::executor::block_on(
+                    response.into_body().into_bytes_bounded(1024 * 1024),
+                )
+                .expect_err("should fail corrupt input before terminal EOF");
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "should validate {encoding} before outside work: streamed={streamed}"
+                );
+            }
+        }
+    }
+
+    struct HungTerminalFactory {
+        started: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+    }
+    struct HungTerminalSession {
+        started: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+    }
+    struct TerminalDropProbe(Arc<AtomicUsize>);
+    impl Drop for TerminalDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for HungTerminalFactory {
+        fn integration_id(&self) -> &'static str {
+            "example_hung"
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn buffer_output_until_eof(&self) -> bool {
+            true
+        }
+        fn create(
+            &self,
+            _: crate::integrations::IntegrationHtmlStreamContext,
+        ) -> Box<dyn StreamProcessor> {
+            Box::new(HungTerminalSession {
+                started: Arc::clone(&self.started),
+                dropped: Arc::clone(&self.dropped),
+            })
+        }
+    }
+    impl StreamProcessor for HungTerminalSession {
+        fn process_chunk(&mut self, chunk: &[u8], _: bool) -> std::io::Result<Vec<u8>> {
+            Ok(chunk.to_vec())
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn async_finish<'a>(
+            &'a mut self,
+            input: crate::streaming_processor::finish::StreamFinishInput<'a>,
+        ) -> Option<
+            futures::future::LocalBoxFuture<
+                'a,
+                Result<
+                    crate::streaming_processor::finish::StreamFinish,
+                    Report<crate::streaming_processor::finish::StreamFinishError>,
+                >,
+            >,
+        > {
+            Some(Box::pin(async move {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                let _probe = TerminalDropProbe(Arc::clone(&self.dropped));
+                input.replacement.append(b"partial example candidate")?;
+                futures::future::pending().await
+            }))
+        }
+    }
+
+    #[test]
+    fn html_finalization_client_cancellation_drops_work_and_warns_for_auction_once() {
+        let warnings = crate::test_support::logging::WarningCapture::start();
+        let settings = Arc::new(crate::publisher::allow_eof_test_settings(
+            create_test_settings(),
+        ));
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let registry =
+            IntegrationRegistry::from_html_stream_processors(vec![Arc::new(HungTerminalFactory {
+                started: Arc::clone(&started),
+                dropped: Arc::clone(&dropped),
+            })]);
+        let response = PublisherResponse::Stream {
+            response: Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "text/html")
+                .body(EdgeBody::empty())
+                .expect("should build the cancellation response"),
+            body: EdgeBody::from(&b"<html><head></head><body>Example</body></html>"[..]),
+            params: Box::new(html_stream_params(
+                "",
+                Some(DispatchedAuction::empty_for_test(
+                    test_auction_request(),
+                    500,
+                )),
+            )),
+        };
+        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let response = futures::executor::block_on(publisher_response_into_streaming_response(
+            response,
+            &Method::GET,
+            settings,
+            &registry,
+            orchestrator,
+            noop_services(),
+        ))
+        .expect("should create a lazy terminal body");
+        let mut stream = response
+            .into_body()
+            .into_stream()
+            .expect("should retain lazy output");
+        {
+            let work = futures::StreamExt::next(&mut stream);
+            futures::pin_mut!(work);
+            let waker = futures::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(
+                work.as_mut().poll(&mut context).is_pending(),
+                "should await terminal work with the auction still owned"
+            );
+        }
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "should start the callback once"
+        );
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "should keep its candidate alive while pending"
+        );
+        drop(stream);
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "should drop the callback when the reader disconnects"
+        );
+        let cancellation_warnings = warnings
+            .take()
+            .into_iter()
+            .filter(|warning| {
+                warning
+                    .message
+                    .starts_with("Dispatched server-side auction dropped without collection")
+            })
+            .count();
+        assert_eq!(
+            cancellation_warnings, 1,
+            "should preserve exactly one existing auction cancellation warning"
+        );
+    }
+
+    #[test]
+    fn html_finalization_fatal_read_decode_and_sink_failures_abandon_auction_once() {
+        struct TestWriter {
+            write_fails: bool,
+            flush_fails: bool,
+        }
+        impl Write for TestWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.write_fails {
+                    Err(io::Error::other("example write failure"))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.flush_fails {
+                    Err(io::Error::other("example flush failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for failure in ["read", "decode", "write", "flush"] {
+            let settings = crate::publisher::allow_eof_test_settings(create_test_settings());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                CountingTerminalFactory(Arc::clone(&calls)),
+            )]);
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = noop_services_with_telemetry_sink(Arc::clone(&sink) as _);
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let encoding = if failure == "decode" { "gzip" } else { "" };
+            let mut params = html_stream_params(
+                encoding,
+                Some(DispatchedAuction::empty_for_test(
+                    test_auction_request(),
+                    500,
+                )),
+            );
+            params.auction_observation = Some(AuctionObservationContext::from_parts(
+                AuctionSource::InitialNavigation,
+                "proxy.example.com",
+                "/article",
+                1,
+                None,
+                &EcContext::default(),
+            ));
+            let source = b"<html><head></head><body>Example</body></html>";
+            let body = match failure {
+                "read" => {
+                    EdgeBody::from_stream(futures::stream::iter(vec![Err::<bytes::Bytes, _>(
+                        io::Error::other("example origin read failure"),
+                    )]))
+                }
+                "decode" => {
+                    let mut encoded = gzip_encode(source);
+                    encoded.truncate(encoded.len() / 2);
+                    EdgeBody::from(encoded)
+                }
+                _ => EdgeBody::from(&source[..]),
+            };
+            let mut writer = TestWriter {
+                write_fails: failure == "write",
+                flush_fails: failure == "flush",
+            };
+            let _ = futures::executor::block_on(stream_publisher_body_async(
+                body,
+                &mut writer,
+                &mut params,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            ))
+            .expect_err("should preserve fatal pipeline errors");
+            let batches = sink.batches.lock().expect("should lock terminal telemetry");
+            let summaries: Vec<_> = batches
+                .iter()
+                .flat_map(crate::auction::telemetry::AuctionEventBatch::rows)
+                .filter(|row| row.event_kind == "summary")
+                .collect();
+            assert_eq!(
+                summaries.len(),
+                1,
+                "should abandon exactly once after {failure} failure"
+            );
+            assert_eq!(
+                summaries[0].terminal_status.as_deref(),
+                Some("abandoned"),
+                "should retain fatal-error abandonment semantics"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(matches!(failure, "write" | "flush")),
+                "should start I/O only after valid input EOF"
+            );
+        }
+    }
+
+    #[test]
+    fn async_eof_fatal_auction_suffix_overflow_abandons_once() {
+        let mut settings = crate::publisher::allow_eof_test_settings(create_test_settings());
+        settings.publisher.max_buffered_body_bytes = 256;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+            AsyncTailFactory(Arc::clone(&calls)),
+        )]);
+        let sink = Arc::new(RecordingTelemetrySink::default());
+        let services = noop_services_with_telemetry_sink(Arc::clone(&sink) as _);
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let mut params = html_stream_params(
+            "",
+            Some(DispatchedAuction::empty_for_test(
+                test_auction_request(),
+                500,
+            )),
+        );
+        params.auction_observation = Some(AuctionObservationContext::from_parts(
+            AuctionSource::InitialNavigation,
+            "proxy.example.com",
+            "/article",
+            1,
+            None,
+            &EcContext::default(),
+        ));
+        // URL rewriting expands only the retained suffix beyond the cap while
+        // origin bytes remain below both raw and decoded input limits.
+        params.request_host = format!("{}.example.com", ["example"; 28].join("."));
+        let source = String::from(
+            r#"<html><head></head><body>Example</body><img src="https://origin.example.com/tail.png"></html>"#,
+        );
+        assert!(
+            source.len() < settings.publisher.max_buffered_body_bytes,
+            "should reach suffix growth before the raw input cap"
+        );
+        let mut output = Vec::new();
+        let error = futures::executor::block_on(stream_publisher_body_async(
+            EdgeBody::from(source.into_bytes()),
+            &mut output,
+            &mut params,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        ))
+        .expect_err("should preserve fatal suffix overflow");
+        assert!(
+            format!("{error:?}").contains("HTML auction suffix exceeds its retained-byte limit"),
+            "should fail at the auction holder rather than optional replacement"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "should not start EOF I/O after fatal suffix overflow"
+        );
+        let batches = sink
+            .batches
+            .lock()
+            .expect("should inspect abandonment telemetry");
+        let summaries: Vec<_> = batches
+            .iter()
+            .flat_map(crate::auction::telemetry::AuctionEventBatch::rows)
+            .filter(|row| row.event_kind == "summary")
+            .collect();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "should abandon the dispatched auction exactly once"
+        );
+        assert_eq!(
+            summaries[0].terminal_status.as_deref(),
+            Some("abandoned"),
+            "should record fatal body abandonment"
+        );
+        assert_eq!(
+            summaries[0].terminal_reason.as_deref(),
+            Some("auction_suffix_overflow"),
+            "should distinguish suffix bounds from encoder failures"
+        );
+        assert!(
+            params.dispatched_auction.is_none(),
+            "should transfer auction ownership to the failing driver"
+        );
+    }
+
+    struct TerminalTestFactory;
+
+    struct TerminalTestSession;
+
+    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for TerminalTestFactory {
+        fn integration_id(&self) -> &'static str {
+            "example_terminal"
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn buffer_output_until_eof(&self) -> bool {
+            true
+        }
+        fn create(
+            &self,
+            _context: crate::integrations::IntegrationHtmlStreamContext,
+        ) -> Box<dyn StreamProcessor> {
+            Box::new(TerminalTestSession)
+        }
+    }
+
+    impl StreamProcessor for TerminalTestSession {
+        fn process_chunk(&mut self, chunk: &[u8], _: bool) -> std::io::Result<Vec<u8>> {
+            Ok(chunk.to_vec())
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn async_finish<'a>(
+            &'a mut self,
+            input: crate::streaming_processor::finish::StreamFinishInput<'a>,
+        ) -> Option<
+            futures::future::LocalBoxFuture<
+                'a,
+                Result<
+                    crate::streaming_processor::finish::StreamFinish,
+                    Report<crate::streaming_processor::finish::StreamFinishError>,
+                >,
+            >,
+        > {
+            Some(Box::pin(async move {
+                let mut yielded = false;
+                futures::future::poll_fn(|context| {
+                    if yielded {
+                        std::task::Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        context.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                input.replacement.append(input.output)?;
+                input.replacement.append(b"<!--example-finalized-->")?;
+                Ok(crate::streaming_processor::finish::StreamFinish::Replace)
+            }))
+        }
+    }
+
+    #[test]
+    fn html_finalization_runs_on_materialized_and_streamed_publishers() {
+        for source in [
+            &b"<html><head></head><body><p>Example article</p></body></html>"[..],
+            &b"<html><head></head><body><p>Example article</p>"[..],
+            "<html><head></head><body>Example café</body></html>".as_bytes(),
+            &b""[..],
+        ] {
+            for encoding in ["", "gzip", "deflate", "br"] {
+                let encoded = match encoding {
+                    "gzip" => {
+                        let middle = source.len() / 2;
+                        let mut members = gzip_encode(&source[..middle]);
+                        members.extend(gzip_encode(&source[middle..]));
+                        members
+                    }
+                    "deflate" => deflate_encode(source),
+                    "br" => brotli_encode(source),
+                    _ => source.to_vec(),
+                };
+                for auction in [false, true] {
+                    for lazy in [false, true] {
+                        for streamed in [false, true] {
+                            let settings = Arc::new(crate::publisher::allow_eof_test_settings(
+                                create_test_settings(),
+                            ));
+                            let registry =
+                                IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                                    TerminalTestFactory,
+                                )]);
+                            let orchestrator =
+                                Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+                            let body = if streamed {
+                                let chunks: Vec<_> = encoded
+                                    .chunks(7)
+                                    .map(|chunk| {
+                                        Ok::<_, io::Error>(bytes::Bytes::copy_from_slice(chunk))
+                                    })
+                                    .collect();
+                                EdgeBody::from_stream(futures::stream::iter(chunks))
+                            } else {
+                                EdgeBody::from(encoded.clone())
+                            };
+                            let dispatched = auction.then(|| {
+                                DispatchedAuction::empty_for_test(test_auction_request(), 10)
+                            });
+                            let response = PublisherResponse::Stream {
+                                response: Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(header::CONTENT_TYPE, "text/html")
+                                    .body(EdgeBody::empty())
+                                    .expect("should build response"),
+                                body,
+                                params: Box::new(html_stream_params(encoding, dispatched)),
+                            };
+                            let response = if lazy {
+                                futures::executor::block_on(
+                                    publisher_response_into_streaming_response(
+                                        response,
+                                        &Method::GET,
+                                        Arc::clone(&settings),
+                                        &registry,
+                                        Arc::clone(&orchestrator),
+                                        noop_services(),
+                                    ),
+                                )
+                                .expect("should build lazy response")
+                            } else {
+                                futures::executor::block_on(buffer_publisher_response_async(
+                                    response,
+                                    &Method::GET,
+                                    &settings,
+                                    &registry,
+                                    &orchestrator,
+                                    &noop_services(),
+                                ))
+                                .expect("should build buffered response")
+                            };
+                            let body = futures::executor::block_on(
+                                response.into_body().into_bytes_bounded(1024 * 1024),
+                            )
+                            .expect("should drain body");
+                            let decoded = match encoding {
+                                "gzip" => gzip_decode(&body),
+                                "deflate" => deflate_decode(&body),
+                                "br" => brotli_decode(&body),
+                                _ => body.to_vec(),
+                            };
+                            assert!(
+                                decoded.ends_with(b"<!--example-finalized-->"),
+                                "should await finalization: encoding={encoding}, auction={auction}, lazy={lazy}, streamed={streamed}"
+                            );
+                            assert!(
+                                !String::from_utf8_lossy(&decoded)
+                                    .contains("ts-inline-body-close-"),
+                                "should remove the parser seam after finalization"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn streaming_finalize_response(params: OwnedProcessResponseParams, body: EdgeBody) -> EdgeBody {
-        streaming_finalize_response_with_settings(params, body, create_test_settings())
+        streaming_finalize_response_with_settings(
+            params,
+            body,
+            crate::publisher::allow_eof_test_settings(create_test_settings()),
+        )
     }
 
     fn streaming_finalize_response_with_settings(
@@ -18915,12 +23831,14 @@ mod tests {
         dispatched_auction: Option<DispatchedAuction>,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            output_compression: None,
+            response_status: StatusCode::OK,
+            range_associated: false,
             csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
-            input_compression: Compression::from_content_encoding(content_encoding),
-            output_compression: Compression::from_content_encoding(content_encoding),
+            content_encoding: content_encoding.to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -19016,11 +23934,20 @@ mod tests {
 
     #[test]
     fn streaming_finalize_auction_hold_emits_prefix_before_origin_eof() {
-        // The auction-hold path must stream the document prefix (up to the held
-        // `</body>` tail) before the origin finishes and before the auction is
-        // collected — otherwise the hold reintroduces the FCP regression. The
-        // origin sends the head/body prefix (no `</body>`) then stays Pending.
-        let page = b"<html><head></head><body><p>hello</p><p>more streamed content here</p>";
+        // A body-close literal in script data must not stop streaming. Only the
+        // request token emitted by lol_html at the structural end is a seam.
+        let page = br#"<html><head></head><body><script>self.__next_f.push([1,'{"href":"https://origin.example.com/app","text":"</body>"}'])</script><article>still streaming</article>"#;
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &serde_json::json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should enable Next.js");
         let params = html_stream_params(
             "",
             Some(DispatchedAuction::empty_for_test(
@@ -19028,16 +23955,21 @@ mod tests {
                 10,
             )),
         );
-        let body = streaming_finalize_response(
+        let body = streaming_finalize_response_with_settings(
             params,
             origin_chunk_then_pending(bytes::Bytes::from(&page[..])),
+            settings,
         );
 
         let first = first_lazy_body_chunk(body);
         let html = String::from_utf8(first.to_vec()).expect("should be valid UTF-8");
         assert!(
-            html.contains("hello"),
-            "auction-hold path must stream the prefix before EOF. Got: {html}"
+            html.contains("</body>") && html.contains("still streaming"),
+            "RSC script data and later article bytes must stream before EOF. Got: {html}"
+        );
+        assert!(
+            html.contains("proxy.example.com/app") && !html.contains("origin.example.com/app"),
+            "Next.js rewriting must complete before the parser seam: {html}"
         );
         assert!(
             html.contains(".adSlots=JSON.parse"),
@@ -19089,6 +24021,270 @@ mod tests {
             !decoded.contains("var b=JSON.parse("),
             "bids inject only at </body> after collection, which the first poll must not wait for. Got: {decoded}"
         );
+    }
+
+    struct GatedAuctionHttpClient {
+        inner: StubHttpClient,
+        released: std::sync::atomic::AtomicBool,
+        collections: AtomicUsize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::platform::PlatformHttpClient for GatedAuctionHttpClient {
+        async fn send(
+            &self,
+            request: crate::platform::PlatformHttpRequest,
+        ) -> Result<crate::platform::PlatformResponse, Report<crate::platform::PlatformError>>
+        {
+            self.inner.send(request).await
+        }
+
+        async fn send_async(
+            &self,
+            request: crate::platform::PlatformHttpRequest,
+        ) -> Result<crate::platform::PlatformPendingRequest, Report<crate::platform::PlatformError>>
+        {
+            self.inner.send_async(request).await
+        }
+
+        async fn select(
+            &self,
+            pending: Vec<crate::platform::PlatformPendingRequest>,
+        ) -> Result<crate::platform::PlatformSelectResult, Report<crate::platform::PlatformError>>
+        {
+            self.collections.fetch_add(1, Ordering::SeqCst);
+            futures::future::poll_fn(|_| {
+                if self.released.load(Ordering::SeqCst) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            self.inner.select(pending).await
+        }
+    }
+
+    struct GatedAuctionProvider;
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for GatedAuctionProvider {
+        fn provider_name(&self) -> &'static str {
+            "seam-test"
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            context
+                .services
+                .http_client()
+                .send_async(crate::platform::PlatformHttpRequest::new(
+                    Request::builder()
+                        .uri("https://bidder.example.com/bid")
+                        .body(EdgeBody::empty())
+                        .expect("should build test bid request"),
+                    "seam-test",
+                ))
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "Failed to dispatch test auction".to_string(),
+                })
+                .map(ProviderRequestOutcome::pending)
+        }
+
+        async fn parse_response(
+            &self,
+            _response: crate::platform::PlatformResponse,
+            response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Ok(AuctionResponse::success(
+                "seam-test",
+                Vec::new(),
+                response_time_ms,
+            ))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            60_000
+        }
+    }
+
+    #[test]
+    fn parser_confirmed_auction_seam_streams_nextjs_for_every_encoding() {
+        for encoding in ["", "gzip", "deflate", "br"] {
+            let mut settings = create_test_settings();
+            settings.auction.enabled = true;
+            settings.auction.providers =
+                crate::auction::AuctionConfig::legacy_provider_map(&["seam-test"]);
+            settings.auction.timeout_ms = 60_000;
+            settings.auction.mediator = None;
+            settings
+                .integrations
+                .insert_config(
+                    "nextjs",
+                    &serde_json::json!({
+                        "enabled": true,
+                        "rewrite_attributes": ["href", "link", "url"],
+                    }),
+                )
+                .expect("should enable Next.js");
+            let client = Arc::new(GatedAuctionHttpClient {
+                inner: StubHttpClient::new(),
+                released: std::sync::atomic::AtomicBool::new(false),
+                collections: AtomicUsize::new(0),
+            });
+            client.inner.push_response(200, Vec::new());
+            let services = build_services_with_http_client(Arc::clone(&client) as _);
+            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            orchestrator.register_provider(Arc::new(GatedAuctionProvider));
+            let request = Request::new(EdgeBody::empty());
+            let dispatched = futures::executor::block_on(orchestrator.dispatch_auction(
+                &test_auction_request(),
+                &AuctionContext {
+                    settings: &settings,
+                    request: &request,
+                    timeout_ms: 60_000,
+                    transport_timeout_ms: 60_000,
+                    provider_responses: None,
+                    services: &services,
+                },
+            ));
+            let crate::auction::orchestrator::DispatchAuctionOutcome::Dispatched(dispatched) =
+                dispatched
+            else {
+                panic!("should dispatch a pending auction");
+            };
+            let payload = r#"{"url":"https://origin.example.com/path","text":"</body>"}"#;
+            let split = payload.find("/path").expect("should find payload split");
+            let first_payload = format!("1:T{:x},{}", payload.len(), &payload[..split]);
+            let first_script =
+                serde_json::to_string(&first_payload).expect("should encode first payload");
+            let second_script =
+                serde_json::to_string(&payload[split..]).expect("should encode second payload");
+            let prefix = format!(
+                "<html><head></head><body><p>before RSC</p><script>self.__next_f.push([1,{first_script}])</script><span>between scripts</span><script>self.__next_f.push([1,{second_script}])</script><article>still streaming</article>"
+            );
+            let page = format!("{prefix}</body></html>");
+            let encoded = match encoding {
+                "gzip" => [
+                    gzip_encode(prefix.as_bytes()),
+                    gzip_encode(b"</body></html>"),
+                ]
+                .concat(),
+                "deflate" => deflate_encode(page.as_bytes()),
+                "br" => brotli_encode(page.as_bytes()),
+                _ => page.as_bytes().to_vec(),
+            };
+            let params = html_stream_params(encoding, Some(dispatched));
+            let state = params.ad_bids_state.clone();
+            let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+            let response = Response::builder()
+                .header(header::CONTENT_TYPE, "text/html")
+                .body(EdgeBody::empty())
+                .expect("should build response");
+            let response = futures::executor::block_on(publisher_response_into_streaming_response(
+                PublisherResponse::Stream {
+                    response,
+                    body: EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from(
+                        encoded,
+                    )])),
+                    params: Box::new(params),
+                },
+                &Method::GET,
+                Arc::new(settings),
+                &registry,
+                Arc::new(orchestrator),
+                services,
+            ))
+            .expect("should create lazy response");
+            let mut stream = response
+                .into_body()
+                .into_stream()
+                .expect("should retain lazy body");
+            let waker = futures::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            let mut output = Vec::new();
+            loop {
+                match futures::Stream::poll_next(stream.as_mut(), &mut context) {
+                    std::task::Poll::Ready(Some(Ok(chunk))) => output.extend_from_slice(&chunk),
+                    std::task::Poll::Pending => break,
+                    other => {
+                        panic!("should wait on the unresolved auction for {encoding}: {other:?}")
+                    }
+                }
+            }
+            let mut decoder =
+                BodyStreamDecoder::new(Compression::from_content_encoding(encoding), 1024 * 1024);
+            let decoded = decoder
+                .decode_chunk(bytes::Bytes::from(output.clone()))
+                .expect("should decode flushed prefix");
+            let prefix = String::from_utf8(decoded.to_vec()).expect("should decode UTF-8 prefix");
+            assert!(
+                prefix.contains("still streaming") && prefix.contains("</body>"),
+                "should emit false literal and later article before auction completes for {encoding}: {prefix}"
+            );
+            assert!(
+                prefix.contains("proxy.example.com") && !prefix.contains("origin.example.com"),
+                "should rewrite the split RSC group for {encoding}: {prefix}"
+            );
+            assert!(
+                !prefix.contains("var b=JSON.parse("),
+                "should hold bids until auction completes"
+            );
+            assert_eq!(
+                client.collections.load(Ordering::SeqCst),
+                1,
+                "should begin collection at the real seam"
+            );
+            assert!(
+                state
+                    .script_cell()
+                    .lock()
+                    .expect("should lock bids")
+                    .is_none(),
+                "should keep auction unresolved at seam"
+            );
+            client.released.store(true, Ordering::SeqCst);
+            futures::executor::block_on(async {
+                while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                    output.extend_from_slice(&chunk.expect("should stream completed auction"));
+                }
+            });
+            let decoded = match encoding {
+                "gzip" => gzip_decode(&output),
+                "deflate" => deflate_decode(&output),
+                "br" => brotli_decode(&output),
+                _ => output,
+            };
+            let html = String::from_utf8(decoded).expect("should emit UTF-8 HTML");
+            let bids = html
+                .find("var b=JSON.parse(")
+                .expect("should inject collected bids");
+            let close = html
+                .rfind("</body>")
+                .expect("should retain real body close");
+            assert!(
+                html.find("still streaming").expect("should retain article") < bids && bids < close,
+                "should inject bids only before the real close for {encoding}"
+            );
+            assert_eq!(
+                html.matches("var b=JSON.parse(").count(),
+                1,
+                "should inject once"
+            );
+            assert!(
+                !html.contains("ts-inline-body-close-") && !html.contains("__ts_rsc_"),
+                "should remove internal markers for {encoding}: {html}"
+            );
+            assert_eq!(
+                client.collections.load(Ordering::SeqCst),
+                1,
+                "should collect once"
+            );
+        }
     }
 
     // (method, status, expected Content-Length, expected Transfer-Encoding)
@@ -19319,12 +24515,14 @@ mod tests {
             let ec_context =
                 EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
             OwnedProcessResponseParams {
+                output_compression: None,
+                response_status: StatusCode::OK,
+                range_associated: false,
                 csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
-                input_compression: Compression::None,
-                output_compression: Compression::None,
+                content_encoding: String::new(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
@@ -19515,12 +24713,14 @@ mod tests {
             .map(bytes::Bytes::copy_from_slice)
             .collect();
         let params = OwnedProcessResponseParams {
+            output_compression: None,
+            response_status: StatusCode::OK,
+            range_associated: false,
             csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
-            input_compression: Compression::Gzip,
-            output_compression: Compression::Gzip,
+            content_encoding: "gzip".to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -19597,12 +24797,14 @@ mod tests {
             r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{}");</script>"#;
         let state = AdBidsState::with_script(bids_script);
         let params = OwnedProcessResponseParams {
+            output_compression: None,
+            response_status: StatusCode::OK,
+            range_associated: false,
             csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
-            input_compression: Compression::None,
-            output_compression: Compression::None,
+            content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -19662,12 +24864,14 @@ mod tests {
         // Claim gzip encoding but feed non-gzip bytes. The GzDecoder will
         // error as soon as it tries to read the gzip header.
         let params = OwnedProcessResponseParams {
+            output_compression: None,
+            response_status: StatusCode::OK,
+            range_associated: false,
             csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
-            input_compression: Compression::Gzip,
-            output_compression: Compression::Gzip,
+            content_encoding: "gzip".to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -19734,12 +24938,11 @@ mod tests {
         );
     }
 
-    /// Streaming dispatch contract: HTML with a registered post-processor still
-    /// routes through `Stream`, and the shared processor pipeline still applies
-    /// the post-processor rewrite.
+    /// Streaming dispatch contract: HTML with a registered stream processor
+    /// routes through `Stream`, and the shared processor pipeline applies it.
     #[test]
-    fn streaming_html_with_post_processors_rewrites_body() {
-        // Configure nextjs so a post-processor is registered.
+    fn streaming_html_with_stream_processors_rewrites_body() {
+        // Configure nextjs so a stream processor is registered.
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -19762,8 +24965,8 @@ mod tests {
         .expect("should create integration registry");
 
         assert!(
-            registry.has_html_post_processors(),
-            "nextjs integration must register an HTML post-processor"
+            !registry.html_stream_processor_factories().is_empty(),
+            "nextjs integration must register an HTML stream processor"
         );
         assert_eq!(
             classify_response_route(
@@ -19773,7 +24976,7 @@ mod tests {
                 "proxy.example.com",
             ),
             ResponseRoute::Stream,
-            "HTML with post-processors must route to Stream"
+            "HTML with stream processors must route to Stream"
         );
 
         // Feed a small HTML body through the same pipeline the Stream arm uses.
@@ -19782,12 +24985,14 @@ mod tests {
         let body = EdgeBody::from(html.to_vec());
 
         let params = OwnedProcessResponseParams {
+            output_compression: None,
+            response_status: StatusCode::OK,
+            range_associated: false,
             csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
-            input_compression: Compression::None,
-            output_compression: Compression::None,
+            content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -19821,13 +25026,12 @@ mod tests {
         );
     }
 
-    /// Document-state survives from the streaming pass into the post-processor.
+    /// Document-state survives from the parser pass into the stream processor.
     /// `NextJsRscPlaceholderRewriter` writes into `IntegrationDocumentState`
-    /// during streaming; `NextJsHtmlPostProcessor` reads it and substitutes.
-    /// Regression test: with post-processors registered, placeholders must
-    /// be inserted during streaming and substituted out of the final output.
+    /// during parsing; the request-local stream processor reads it and substitutes.
+    /// Regression test: placeholders must be inserted and removed from final output.
     #[test]
-    fn document_state_placeholders_substitute_through_accumulating_path() {
+    fn document_state_placeholders_substitute_through_streaming_path() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -19851,12 +25055,14 @@ mod tests {
         // Small, single-fragment RSC script — placeholder path (not fallback).
         let html = br#"<html><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script></body></html>"#;
         let params = OwnedProcessResponseParams {
+            output_compression: None,
+            response_status: StatusCode::OK,
+            range_associated: false,
             csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
-            input_compression: Compression::None,
-            output_compression: Compression::None,
+            content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -19931,7 +25137,10 @@ mod tests {
                 assembly_mode: None,
                 template_cache_vary: None,
                 template_cache_max_age_seconds: None,
+                template_cache_key_cookies: None,
+                template_cache_bypass_cookies: None,
                 origin_is_cookie_independent: None,
+                origin_readthrough_enabled: None,
                 section_segment: None,
                 slot: Vec::new(),
             }
@@ -20722,6 +25931,50 @@ mod tests {
             assert!(
                 !adm.contains("/static/tsjs="),
                 "should not inject the tsjs bundle into a foreign-origin creative iframe, got: {adm}"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_keeps_inline_anchors_raw_when_clicks_are_off() {
+            let mut settings = test_settings();
+            settings.auction.rewrite_creatives = true;
+            settings.auction.rewrite_clicks = Some(false);
+            settings.publisher.domain = "example.com".to_string();
+
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "examplessp",
+                "abc123",
+                "https://ssp.example.com/win",
+                "https://ssp.example.com/bill",
+            );
+            bid.creative = Some(
+                "<html><body><a href=\"https://landing.example.com/page\"><img src=\"https://cdn.example.com/pixel.png\"></a></body></html>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("adm"))
+                .and_then(|v| v.as_str())
+                .expect("should include a rewritten adm");
+
+            assert!(
+                adm.contains("https://example.com/first-party/proxy?tsurl="),
+                "should still proxy the image with an absolute URL, got: {adm}"
+            );
+            assert!(
+                adm.contains("href=\"https://landing.example.com/page\""),
+                "should leave the landing link raw, got: {adm}"
+            );
+            assert!(
+                !adm.contains("data-tsclick") && !adm.contains("/first-party/click"),
+                "should not wrap the landing link, got: {adm}"
             );
         }
 
@@ -21794,6 +27047,7 @@ mod tests {
                 &services,
                 None,
                 AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
                     orchestrator,
                     slots,
                     registry: None,
@@ -21849,6 +27103,7 @@ mod tests {
                 &winning_services,
                 None,
                 AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
                     orchestrator: &winning_orchestrator,
                     slots: &slots,
                     registry: None,
@@ -21904,6 +27159,7 @@ mod tests {
                 &no_winner_services,
                 None,
                 AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
                     orchestrator: &no_winner_orchestrator,
                     slots: &slots,
                     registry: None,
@@ -21956,6 +27212,7 @@ mod tests {
                     &services,
                     None,
                     AuctionDispatch {
+                        integration_registry: &IntegrationRegistry::empty_for_tests(),
                         orchestrator: &orchestrator,
                         slots: &slots,
                         registry: None,
@@ -22471,7 +27728,7 @@ mod tests {
             // When consent denies the server-side auction (here: Jurisdiction
             // Unknown fails closed), the endpoint must return no slots so the SPA
             // hook does not create GPT slots client-side — matching the publisher
-            // navigation path's `should_run_server_side_ad_stack` gate.
+            // navigation path's shared `evaluate_ad_stack_gate` gate.
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let slots = article_slot();
@@ -22812,15 +28069,13 @@ mod tests {
                 None,
                 &mut ec_context,
                 AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
                     orchestrator: &orchestrator,
                     slots: &article_slot(),
                     registry: None,
                 },
                 req,
-                PublisherAdapterOptions {
-                    edge_cache_header: EdgeCacheHeader::SMaxageFallback,
-                    delivery_compression: DeliveryCompressionCapability::Unavailable,
-                },
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request");
@@ -22857,6 +28112,7 @@ mod tests {
                 &services,
                 None,
                 AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
                     orchestrator: &orchestrator,
                     slots: &article_slot(),
                     registry: None,
@@ -22899,15 +28155,13 @@ mod tests {
                 None,
                 &mut ec_context,
                 AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
                     orchestrator: &orchestrator,
                     slots: &slots,
                     registry: None,
                 },
                 req,
-                PublisherAdapterOptions {
-                    edge_cache_header: EdgeCacheHeader::SMaxageFallback,
-                    delivery_compression: DeliveryCompressionCapability::Unavailable,
-                },
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request");
@@ -22946,6 +28200,7 @@ mod tests {
                 &services,
                 None,
                 AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
                     orchestrator: &orchestrator,
                     slots: &slots,
                     registry: None,
@@ -22959,4 +28214,105 @@ mod tests {
             assert_only_renderable_slot_was_auctioned(&captured);
         }
     }
+}
+
+#[cfg(test)]
+mod async_eof_seam_tests {
+    use super::*;
+
+    #[test]
+    fn async_eof_seam_caps_suffix_before_growth() {
+        let mut seam = InlineBodyCloseSeam::new(b"TOKEN".to_vec());
+        assert_eq!(
+            seam.push_bounded(b"prefixTOKEN1234", 4)
+                .expect("should release the prefix and hold exact cap"),
+            b"prefix",
+            "should release ordinary HTML"
+        );
+        assert_eq!(
+            seam.buffered, b"1234",
+            "should retain only the closing suffix"
+        );
+        seam.push_bounded(b"!", 4)
+            .expect_err("should reject held suffix cap crossing");
+        assert_eq!(
+            seam.buffered, b"1234",
+            "should reject before growing retained bytes"
+        );
+    }
+
+    #[test]
+    fn async_eof_seam_splits_large_ready_prefix_before_retention() {
+        let mut seam = InlineBodyCloseSeam::new(b"TOKEN".to_vec());
+        let mut input = vec![b'x'; 100_000];
+        input.extend_from_slice(b"TOKENtail");
+        let ready = seam
+            .push_bounded(&input, 4)
+            .expect("should not count ready prefix against held cap");
+        assert_eq!(ready.len(), 100_000, "should release the full ready prefix");
+        assert_eq!(
+            seam.buffered, b"tail",
+            "should retain only bounded tail bytes"
+        );
+        assert!(
+            seam.buffered.capacity() <= 4,
+            "should not allocate the whole ready prefix in the holder"
+        );
+    }
+
+    #[test]
+    fn async_eof_seam_grows_suffix_amortized_without_exceeding_non_power_of_two_cap() {
+        let limit = 1031;
+        let mut seam = InlineBodyCloseSeam::new(b"TOKEN".to_vec());
+        seam.push_bounded(b"TOKEN", limit)
+            .expect("should locate the marker before collecting its suffix");
+        let mut capacity_changes = 0;
+        for _ in 0..limit {
+            let previous_capacity = seam.buffered.capacity();
+            assert!(
+                seam.push_bounded(b"x", limit)
+                    .expect("should retain the suffix within its cap")
+                    .is_empty(),
+                "should withhold suffix output until auction assembly"
+            );
+            capacity_changes += usize::from(seam.buffered.capacity() != previous_capacity);
+            assert!(
+                seam.buffered.capacity() <= limit,
+                "should cap allocation even when the byte cap is not a power of two"
+            );
+        }
+        assert!(
+            capacity_changes < 32,
+            "should avoid a capacity increase for every small suffix chunk"
+        );
+        assert_eq!(
+            seam.finish(),
+            vec![b'x'; limit],
+            "should retain the exact-cap suffix without losing bytes"
+        );
+    }
+
+    #[test]
+    fn async_eof_seam_handles_split_tokens_under_the_cap() {
+        let mut seam = InlineBodyCloseSeam::new(b"TOKEN".to_vec());
+        assert_eq!(
+            seam.push_bounded(b"pageTOK", 4)
+                .expect("should retain a possible split marker"),
+            b"page",
+            "should stream the prefix"
+        );
+        assert!(
+            seam.push_bounded(b"ENtail", 4)
+                .expect("should finish split marker")
+                .is_empty(),
+            "should hold the closing suffix"
+        );
+        assert_eq!(seam.finish(), b"tail", "should remove the marker once");
+    }
+}
+
+#[cfg(test)]
+fn allow_eof_test_settings(mut settings: Settings) -> Settings {
+    settings.publisher.allow_async_html_finish = true;
+    settings
 }

@@ -36,7 +36,7 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, DeliveryCompressionCapability, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
+    AuctionDispatch, DeliveryCompression, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
     PublisherAdapterOptions, PublisherResponse, buffer_publisher_response_async, handle_page_bids,
     handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
 };
@@ -67,6 +67,7 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    services: Option<RuntimeServices>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -123,6 +124,13 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_services(settings, None)
+}
+
+fn build_state_with_services(
+    settings: Settings,
+    services: Option<RuntimeServices>,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
@@ -132,7 +140,16 @@ fn build_state_with_settings(
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        services,
     }))
+}
+
+impl AppState {
+    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+        self.services
+            .clone()
+            .unwrap_or_else(|| build_runtime_services(ctx))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +221,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 16] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -213,6 +230,7 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 16] {
         ("/_ts/admin/ec", &[Method::GET]),
         ("/_ts/admin/ec/{id}", &[Method::GET]),
         ("/_ts/admin/eids", &[Method::GET]),
+        ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
@@ -412,6 +430,20 @@ fn build_ec_context(settings: &Settings, services: &RuntimeServices, req: &Reque
         })
 }
 
+fn cache_purge_not_supported() -> Response {
+    let body = edgezero_core::body::Body::from(
+        "Template cache purge is not supported on Spin.\n\
+         Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
 fn admin_key_management_not_supported() -> Response {
     let body = edgezero_core::body::Body::from(
         "Admin key management is not supported on Fermyon Spin.\n\
@@ -548,6 +580,30 @@ impl TrustedServerApp {
         let state = build_state_with_settings(settings)?;
         Ok(build_router(&state))
     }
+
+    /// Build the full router with explicit settings and runtime services.
+    ///
+    /// Each request receives a clone of the supplied services, allowing callers
+    /// to exercise production routes with deterministic platform dependencies.
+    /// The supplied client metadata applies to every request to this router.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or integration registry
+    /// cannot be initialized.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let router = TrustedServerApp::routes_with_settings_and_services(settings, services)?;
+    /// ```
+    pub fn routes_with_settings_and_services(
+        settings: Settings,
+        services: RuntimeServices,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_services(settings, Some(services))?;
+        Ok(build_router(&state))
+    }
 }
 
 fn build_router(state: &Arc<AppState>) -> RouterService {
@@ -559,7 +615,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let discovery_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = s.services_for_request(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_trusted_server_discovery(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -571,7 +627,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let verify_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = s.services_for_request(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_verify_signature(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -581,6 +637,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let admin_not_supported_handler = |_ctx: RequestContext| async {
             Ok::<Response, EdgeError>(admin_key_management_not_supported())
         };
+
+        let cache_purge_unsupported_handler =
+            |_ctx: RequestContext| async { Ok::<Response, EdgeError>(cache_purge_not_supported()) };
 
         let admin_ec_not_supported_handler = |_ctx: RequestContext| async {
             Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
@@ -604,7 +663,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let auction_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = s.services_for_request(&ctx);
                 // Request normalization (forwarded-header stripping, trusted
                 // Host/scheme/client-IP derivation) is applied centrally by
                 // `NormalizeMiddleware` before this handler runs, so the signed
@@ -642,7 +701,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let page_bids_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = s.services_for_request(&ctx);
                 let mut req = ctx.into_request();
                 if let Err(error) =
                     trusted_server_core::integrations::gpt_diagnostics::prepare_request(
@@ -654,6 +713,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 }
                 let mut ec_context = build_ec_context(&s.settings, &services, &req);
                 let auction = AuctionDispatch {
+                    integration_registry: &s.registry,
                     orchestrator: &s.orchestrator,
                     slots: s.settings.creative_opportunity_slots(),
                     registry: None,
@@ -677,7 +737,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_proxy_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = s.services_for_request(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy(&s.settings, &services, req)
                     .await
@@ -690,7 +750,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_click_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = s.services_for_request(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_click(&s.settings, &services, req)
                     .await
@@ -703,7 +763,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_sign_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = s.services_for_request(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
@@ -720,7 +780,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_rebuild_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_runtime_services(&ctx);
+                let services = s.services_for_request(&ctx);
                 let req = ctx.into_request();
                 Ok(
                     handle_first_party_proxy_rebuild(&s.settings, &services, req)
@@ -736,7 +796,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             state: Arc<AppState>,
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
-            let services = build_runtime_services(&ctx);
+            let services = state.services_for_request(&ctx);
             let mut req = ctx.into_request();
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
@@ -777,6 +837,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             } else {
                 let mut ec_context = build_ec_context(&state.settings, &services, &req);
                 let auction = AuctionDispatch {
+                    integration_registry: &state.registry,
                     orchestrator: &state.orchestrator,
                     slots: state.settings.creative_opportunity_slots(),
                     registry: None,
@@ -789,8 +850,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     auction,
                     req,
                     PublisherAdapterOptions {
-                        edge_cache_header: EdgeCacheHeader::SMaxageFallback,
-                        delivery_compression: DeliveryCompressionCapability::Unavailable,
+                        cache_header: EdgeCacheHeader::SMaxageFallback,
+                        delivery_compression: DeliveryCompression::Unavailable,
                     },
                 )
                 .await
@@ -883,6 +944,14 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/first-party/sign", fp_sign_post_handler)
             .get("/first-party/proxy-rebuild", fp_rebuild_handler)
             .post("/first-party/proxy-rebuild", fp_rebuild_post_handler);
+
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            builder = builder.route(
+                "/_ts/admin/cache/purge",
+                method.clone(),
+                cache_purge_unsupported_handler,
+            );
+        }
 
         for method in LEGACY_ADMIN_DENY_METHODS {
             builder = builder.route("/admin/keys/rotate", method.clone(), legacy_admin_deny);
@@ -1328,6 +1397,13 @@ mod tests {
             resp.status().as_u16(),
             200,
             "GET /health must return 200 from the startup fallback"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-ts-version")
+                .and_then(|v| v.to_str().ok()),
+            trusted_server_core::constants::TS_GIT_VERSION,
+            "startup-fallback /health should report the compiled-in git version"
         );
         let body = resp.into_body().into_bytes().unwrap_or_default();
         assert_eq!(

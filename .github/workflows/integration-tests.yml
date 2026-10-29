@@ -90,11 +90,6 @@ jobs:
       - name: Load integration test Docker images
         run: docker load --input "$DOCKER_ARTIFACT_PATH"
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ steps.shared-setup.outputs.node-version }}
-
       - name: Install wrangler
         run: npm install -g wrangler
 
@@ -155,7 +150,13 @@ jobs:
   browser-tests:
     name: browser integration tests
     needs: prepare-artifacts
-    runs-on: ubuntu-latest
+    # Pinned rather than floating on ubuntu-latest, which moved to 26.04 and
+    # fails at `playwright install` with "Playwright does not support chromium
+    # on ubuntu26.04-x64". Every browser test then fails in milliseconds because
+    # no browser was installed. Other jobs are unaffected: the Axum job obtains
+    # Chrome through browser-actions/setup-chrome, which works on 26.04. Unpin
+    # once the pinned Playwright version supports the newer image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -192,7 +193,7 @@ jobs:
         run: |
           npm ci
           npm run build
-          npm run build:prebid-external
+          npm run build:prebid-external -- --modules-json '{"bidder":["rubiconBidAdapter"]}'
 
       - name: Install Playwright
         working-directory: crates/trusted-server-integration-tests/browser
@@ -200,7 +201,26 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium
 
+      - name: Test initial render fixture escaping
+        working-directory: crates/trusted-server-integration-tests/browser
+        run: node --test initial-render/pages.test.cjs
+
+      - name: Test initial render ownership
+        working-directory: crates/trusted-server-integration-tests/browser
+        # Let the runner build its Rubicon + Shared ID artifact; the bidder-only
+        # artifact above belongs to the existing Playwright tests.
+        run: node initial-render/run.cjs --out "$RUNNER_TEMP/initial-render-evidence"
+
+      - name: Upload initial render evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: initial-render-evidence
+          path: ${{ runner.temp }}/initial-render-evidence/
+          retention-days: 7
+
       - name: Run browser tests (Next.js)
+        if: always()
         working-directory: crates/trusted-server-integration-tests/browser
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
