@@ -997,11 +997,11 @@ mod tests {
     #[test]
     fn header_sanitation_preserves_every_origin_field() {
         let expected = [
-            "https://www.example-publisher.com:8443",
+            "https://www.publisher.example.com:8443",
             "null",
             "https://foreign.example.com",
         ];
-        let mut headers = browser_headers("www.example-publisher.com:8443", &expected);
+        let mut headers = browser_headers("www.publisher.example.com:8443", &expected);
         headers.insert(
             hyper::header::CONNECTION,
             HeaderValue::from_static("Origin"),
