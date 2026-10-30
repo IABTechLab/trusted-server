@@ -19,8 +19,8 @@ use trusted_server_core::settings::Settings;
 ///
 /// Must stay the first middleware registered in [`crate::app`]. Registering
 /// another middleware ahead of it would re-expose the shared-secret
-/// authentication header to request handling. Only the Fastly adapter consumes
-/// these headers for client-IP resolution; every other adapter removes them so
+/// authentication header to request handling. Trace metadata consumes these
+/// headers in the pre-dispatch hook; ordinary request handling removes them so
 /// a shared configuration cannot leak the secret into publisher or integration
 /// request handling.
 pub struct SanitizeRequestMiddleware {

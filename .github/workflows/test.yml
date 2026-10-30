@@ -58,6 +58,11 @@ jobs:
       - name: Run Fastly absolute deadline slow-network tests
         run: node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"
 
+      - name: Run trace emitted-script regressions
+        run: |
+          cargo test -p trusted-server-core --target x86_64-unknown-linux-gnu --lib trace_document_skipped_emitted_script_leaves_ad_state_untouched -- --ignored
+          cargo test -p trusted-server-core --target x86_64-unknown-linux-gnu --lib trace_document_emitted_script_deep_freezes_owned_context_in_node -- --ignored
+
       - name: Run tests (reusable-sandbox feature)
         run: cargo test-fastly-reuse
 
@@ -148,6 +153,14 @@ jobs:
 
       - name: Build Axum adapter
         run: cargo build -p trusted-server-adapter-axum
+
+      - name: Verify prebuilt trace source digest parity
+        shell: bash
+        run: |
+          bundle_dir="$(mktemp -d)"
+          trap 'rm -rf "$bundle_dir"' EXIT
+          node crates/trusted-server-js/lib/build-all.mjs --out-dir "$bundle_dir"
+          TSJS_PREBUILT_DIR="$bundle_dir" cargo check-axum --locked
 
       - name: Run Axum adapter tests
         run: cargo test-axum

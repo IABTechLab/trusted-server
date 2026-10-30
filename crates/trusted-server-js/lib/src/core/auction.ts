@@ -3,6 +3,11 @@
 // and the Prebid.js trustedServer adapter.
 
 import { parseApsRendererDescriptor } from '../integrations/aps/render';
+import {
+  prepareTraceAuctionRequest,
+  observeTraceApiResponse,
+  observeTraceApiFailure,
+} from '../trace/runtime';
 
 import { log } from './log';
 import type { ApsRendererV1 } from './types';
@@ -13,6 +18,8 @@ import type { ApsRendererV1 } from './types';
 
 /** A single ad unit in the AdRequest payload sent to POST /auction. */
 export interface AdRequestUnit {
+  /** Optional namespaced request-scoped diagnostic slot reference. */
+  ext?: Record<string, unknown>;
   code: string;
   mediaTypes: {
     banner?: { sizes: number[][] };
@@ -173,7 +180,10 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
  * Returns an empty array on network or parse errors (non-throwing).
  */
 export async function sendAuction(endpoint: string, request: AdRequest): Promise<AuctionBid[]> {
+  const trace = prepareTraceAuctionRequest(request);
+  const outgoing = trace?.request ?? request;
   if (typeof fetch !== 'function') {
+    observeTraceApiFailure(trace);
     log.warn('auction: fetch not available');
     return [];
   }
@@ -185,18 +195,20 @@ export async function sendAuction(endpoint: string, request: AdRequest): Promise
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       credentials: 'same-origin',
-      body: JSON.stringify(request),
+      body: JSON.stringify(outgoing),
       keepalive: true,
     });
 
     const contentType = response.headers.get('content-type') || '';
     if (response.ok && contentType.includes('application/json')) {
       const data: unknown = await response.json();
+      observeTraceApiResponse(trace, data);
       const bids = parseAuctionResponse(data);
       log.info('auction: received bids', { count: bids.length });
       return bids;
     }
 
+    observeTraceApiFailure(trace);
     log.warn('auction: unexpected response', {
       ok: response.ok,
       status: response.status,
@@ -204,6 +216,7 @@ export async function sendAuction(endpoint: string, request: AdRequest): Promise
     });
     return [];
   } catch (error) {
+    observeTraceApiFailure(trace);
     log.warn('auction: request failed', error);
     return [];
   }

@@ -4,6 +4,7 @@
 )]
 
 pub mod bundle;
+pub mod trace_assets;
 
 // Build-script helpers, compiled here only so their unit tests run with the crate's.
 #[cfg(test)]

@@ -142,7 +142,7 @@ impl Rewrite {
 ```rust
 /// Normalizes a creative URL to an absolute HTTP(S) [`url::Url`].
 ///
-/// Trims surrounding whitespace, resolves a protocol-relative `//host/...`
+/// Trims surrounding whitespace, resolves a protocol-relative `//cdn.example.com/...`
 /// against `https:`, and accepts only `http://` and `https://` input (ASCII
 /// case-insensitive). Returns `None` for empty, relative, non-network-scheme or
 /// unparseable input. Applies no host policy; see
@@ -287,7 +287,7 @@ The `creative.rs` test module's `use super::{...}` list gains `normalize_creativ
 CHANGELOG: the shared step adds this entry as the first item under `## [Unreleased]` › `### Fixed` (create the heading if absent), in the same commit as the code:
 
 ```markdown
-- `rewrite.exclude_domains` matching is now case-insensitive and ignores surrounding whitespace. Entries written with uppercase letters previously never matched and now take effect, so those hosts stop being proxied and click-wrapped, and `/first-party/sign` now rejects them with `502`; it used to sign them, or return `403` when the host was also outside `proxy.allowed_domains`. Empty and bare `"*"` `exclude_domains` entries, which never matched a host, are dropped at load with a warning. Absolute `http(s)` creative URLs that cannot be parsed (for example, a host containing a space) are now left untouched; previously the trimmed value was written back re-quoted (with `https:` prepended to `//` input, so `src=" //exa mple.example/x "` became `https://exa mple.example/x`), an unparseable quoted URL in `<style>` or `style=` was re-quoted through `cssparser::serialize_string`, and a link also gained `data-tsclick`. `/first-party/sign` now answers malformed input and non-http(s) schemes with `unsupported url` instead of `invalid url` / `unsupported scheme`; both still map to `502`. Audit `exclude_domains` for mixed-case entries before upgrading.
+- `rewrite.exclude_domains` matching is now case-insensitive and ignores surrounding whitespace. Entries written with uppercase letters previously never matched and now take effect, so those hosts stop being proxied and click-wrapped, and `/first-party/sign` now rejects them with `502`; it used to sign them, or return `403` when the host was also outside `proxy.allowed_domains`. Empty and bare `"*"` `exclude_domains` entries, which never matched a host, are dropped at load with a warning. Absolute `http(s)` creative URLs that cannot be parsed (for example, a host containing a space) are now left untouched; previously the trimmed value was written back re-quoted (with `https:` prepended to `//` input, so `src=" //example.com invalid/x "` became `https://example.com invalid/x`), an unparseable quoted URL in `<style>` or `style=` was re-quoted through `cssparser::serialize_string`, and a link also gained `data-tsclick`. `/first-party/sign` now answers malformed input and non-http(s) schemes with `unsupported url` instead of `invalid url` / `unsupported scheme`; both still map to `502`. Audit `exclude_domains` for mixed-case entries before upgrading.
 ```
 
 ---
@@ -463,7 +463,7 @@ Replace `to_abs_conversions` and `to_abs_preserves_port_in_protocol_relative` wi
             ("blob:xyz", None),
             ("tel:+123", None),
             ("about:blank", None),
-            ("https://exa mple.example/x", None),
+            ("https://example.com invalid/x", None),
         ] {
             assert_eq!(
                 normalized(raw).as_deref(),
@@ -482,14 +482,14 @@ Delete `to_abs_additional_cases`; its cases are in the table above. Replace `to_
         let mut settings = crate::test_support::tests::create_test_settings();
         settings.rewrite.exclude_domains = vec![
             "trusted-cdn.example.com".to_owned(),
-            "*.example.org".to_owned(),
+            "*.publisher.example.org".to_owned(),
         ];
 
         for excluded in [
             "https://trusted-cdn.example.com/lib.js",
             "//trusted-cdn.example.com/lib.js",
-            "https://example.org/cdn.js",
-            "//cdnjs.example.org/lib.js",
+            "https://publisher.example.org/cdn.js",
+            "//cdnjs.publisher.example.org/lib.js",
         ] {
             assert_eq!(
                 proxy_if_abs(&settings, excluded, ""),
@@ -500,7 +500,7 @@ Delete `to_abs_additional_cases`; its cases are in the table above. Replace `to_
         for proxied in [
             "https://other-cdn.example.com/lib.js",
             "//other-cdn.example.com/lib.js",
-            "https://notexample.org/lib.js",
+            "https://notpublisher.example.org/lib.js",
         ] {
             assert!(
                 proxy_if_abs(&settings, proxied, "")
@@ -513,7 +513,7 @@ Delete `to_abs_additional_cases`; its cases are in the table above. Replace `to_
     #[test]
     fn unparseable_absolute_url_is_left_byte_identical() {
         let settings = crate::test_support::tests::create_test_settings();
-        let html = "<img src='https://exa mple.example/x'>";
+        let html = "<img src='https://example.com invalid/x'>";
 
         let out = rewrite_creative_html(&settings, html);
 
@@ -526,7 +526,7 @@ Delete `to_abs_additional_cases`; its cases are in the table above. Replace `to_
     #[test]
     fn unparseable_absolute_click_url_is_left_byte_identical() {
         let settings = crate::test_support::tests::create_test_settings();
-        let html = "<a href='https://exa mple.example/x'>x</a>";
+        let html = "<a href='https://example.com invalid/x'>x</a>";
 
         let out = rewrite_creative_html(&settings, html);
 
@@ -640,8 +640,8 @@ Expected: compile errors, including `error[E0432]: unresolved import super::norm
 
 Five tests use only existing APIs, but once Steps 1–3 switch the test import to `normalize_creative_url` the whole core test binary no longer compiles, so their runtime failures cannot be watched here. Watch them first: before Step 1, add these five tests to the unmodified code with the old `use super::{…}` import, run each alone as described in the environment notes, confirm it panics as below, then continue with Steps 1–3. Each panics:
 
-- `unparseable_absolute_url_is_left_byte_identical`: the output re-quotes the value as `<img src="https://exa mple.example/x">`.
-- `unparseable_absolute_click_url_is_left_byte_identical`: the output is `<a href="https://exa mple.example/x" data-tsclick="https://exa mple.example/x">`.
+- `unparseable_absolute_url_is_left_byte_identical`: the output re-quotes the value as `<img src="https://example.com invalid/x">`.
+- `unparseable_absolute_click_url_is_left_byte_identical`: the output is `<a href="https://example.com invalid/x" data-tsclick="https://example.com invalid/x">`.
 - `exclude_domains_match_case_insensitively_in_the_rewrite_pass`: the link is wrapped in `/first-party/click`.
 - `proxy_sign_rejects_excluded_urls_case_insensitively`: sign returns `Response { status: 200 ... }`.
 - `settings_load_normalizes_rewrite_exclude_domains`: the loaded list is not normalized.

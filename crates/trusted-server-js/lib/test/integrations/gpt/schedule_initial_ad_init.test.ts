@@ -4,6 +4,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { TsjsApi } from '../../../src/core/types';
 import { GPT_BOOTSTRAP_PATH } from '../../fixtures/paths';
+import { installTraceRuntime } from '../../../src/trace/runtime';
+import { AUCTION_TOKEN, SLOT_TOKEN } from '../../trace/fixtures';
 
 type TestWindow = Window & {
   googletag?: unknown;
@@ -83,6 +85,7 @@ describe('scheduleInitialAdInit', () => {
   });
 
   afterEach(() => {
+    delete window.__tsjs_trace_active;
     history.pushState = originalPushState;
     history.replaceState = originalReplaceState;
     // Reset jsdom location back to root for the next test.
@@ -97,6 +100,126 @@ describe('scheduleInitialAdInit', () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
+
+  it('records owned initial evidence after the final generation guard and before adInit', async () => {
+    readyState = 'complete';
+    await importGptModule();
+    window.__tsjs_trace_active = true;
+    const ts = (window as TestWindow).tsjs!;
+    installTraceRuntime(ts);
+    const evidence = {
+      schema_version: 1,
+      diagnostic_auction_id: AUCTION_TOKEN,
+      source: 'initial_navigation_ssat',
+      terminal_status: 'completed',
+      provider_calls: [],
+      slots: [
+        {
+          slot_number: 1,
+          slot_ref: SLOT_TOKEN,
+          requested_sizes: [[300, 250]],
+          candidate: 'no_candidate',
+          returned_bid_count: 0,
+        },
+      ],
+      truncation: { omitted_provider_calls: 0, omitted_slots: 0, omitted_nested_values: 0 },
+      coverage: { provider_to_slot_no_bid: 'unavailable' },
+    };
+    const slots = [
+      {
+        id: 'example',
+        gam_unit_path: '/example/ad',
+        div_id: 'example',
+        formats: [[300, 250]] as Array<[number, number]>,
+        ext: { trusted_server: { trace_slot_ref: SLOT_TOKEN } },
+      },
+    ];
+    const bids = { example: { hb_pb: '1.00' } };
+    ts.adInit = vi.fn(() => {
+      expect(ts.traceEvidence!.snapshot().value?.serverAuctions).toEqual([evidence]);
+      expect(ts.adSlots).toBe(slots);
+      expect(ts.bids).toBe(bids);
+    });
+    ts.scheduleInitialAdInit!(bids, slots, { schema_version: 1, evidence });
+    expect(ts.traceEvidence!.snapshot().value?.serverAuctions).toEqual([]);
+    flushFrame();
+    flushFrame();
+    expect(ts.adInit).toHaveBeenCalledOnce();
+    expect(ts.traceEvidence!.snapshot().value?.serverAuctions).toEqual([evidence]);
+  });
+
+  it('does not capture an initial transport abandoned before hydration', async () => {
+    readyState = 'complete';
+    await importGptModule();
+    window.__tsjs_trace_active = true;
+    const ts = (window as TestWindow).tsjs!;
+    installTraceRuntime(ts);
+    ts.adInit = vi.fn();
+    ts.scheduleInitialAdInit!(undefined, [], {
+      schema_version: 1,
+      unavailable_reason: 'evidence_projection_failed',
+    });
+    ts.navGeneration = 1;
+    flushFrame();
+    flushFrame();
+    expect(ts.traceEvidence!.snapshot().value?.serverAuctions).toEqual([]);
+    expect(ts.adInit).not.toHaveBeenCalled();
+  });
+
+  it.each(['absent', 'malformed', 'throwing-bridge', 'inactive'] as const)(
+    'preserves ordinary adInit for an %s optional trace seam',
+    async (kind) => {
+      readyState = 'complete';
+      await importGptModule();
+      const ts = (window as TestWindow).tsjs!;
+      window.__tsjs_trace_active = true;
+      installTraceRuntime(ts);
+      const observe = vi.fn(() => {
+        throw new Error('private-bridge');
+      });
+      if (kind === 'throwing-bridge' || kind === 'inactive')
+        ts.traceGpt = { ...ts.traceGpt!, observeTransport: observe };
+      if (kind === 'inactive') window.__tsjs_trace_active = 'true';
+      ts.adInit = vi.fn();
+      ts.scheduleInitialAdInit!(
+        undefined,
+        [],
+        kind === 'absent' ? undefined : { schema_version: 1 }
+      );
+      flushFrame();
+      flushFrame();
+      expect(ts.adInit).toHaveBeenCalledOnce();
+      expect(ts.traceEvidence!.snapshot().value?.issues).toEqual(
+        kind === 'malformed' ? ['evidence_validation_failed'] : []
+      );
+      if (kind === 'inactive') expect(observe).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['bootstrap', 'bootstrap-to-bundle'] as const)(
+    'captures the first scheduler claim through the shared bridge (%s)',
+    async (mode) => {
+      readyState = 'complete';
+      runBootstrap();
+      window.__tsjs_trace_active = true;
+      const ts = (window as TestWindow).tsjs!;
+      installTraceRuntime(ts);
+      ts.adInit = vi.fn();
+      ts.scheduleInitialAdInit!(undefined, [], {
+        schema_version: 1,
+        unavailable_reason: 'evidence_projection_failed',
+      });
+      if (mode === 'bootstrap-to-bundle') {
+        await importGptModule();
+        ts.adInit = vi.fn();
+        ts.scheduleInitialAdInit!(undefined, [], { schema_version: 1 });
+      }
+      flushFrame();
+      flushFrame();
+      expect(ts.adInit).toHaveBeenCalledOnce();
+      expect(ts.traceEvidence!.snapshot().value?.issues).toEqual(['evidence_projection_failed']);
+    }
+  );
 
   it('applies the SSR payload and defers adInit until window load plus two animation frames', async () => {
     await importGptModule();
