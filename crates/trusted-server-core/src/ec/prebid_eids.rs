@@ -294,10 +294,7 @@ fn structured_cookie_eids_to_openrtb(entries: Vec<StructuredCookieEid>) -> Vec<E
             continue;
         }
 
-        eids.push(Eid {
-            source: entry.source,
-            uids,
-        });
+        eids.push(Eid::new(entry.source, uids));
     }
 
     eids
@@ -325,13 +322,15 @@ fn legacy_cookie_eids_to_openrtb(entries: Vec<LegacyCookieEid>) -> Vec<Eid> {
     entries
         .into_iter()
         .filter(|entry| !entry.source.is_empty() && !entry.id.is_empty())
-        .map(|entry| Eid {
-            source: entry.source,
-            uids: vec![Uid {
-                id: entry.id,
-                atype: (entry.atype >= 0).then_some(entry.atype),
-                ext: None,
-            }],
+        .map(|entry| {
+            Eid::new(
+                entry.source,
+                vec![Uid {
+                    id: entry.id,
+                    atype: (entry.atype >= 0).then_some(entry.atype),
+                    ext: None,
+                }],
+            )
         })
         .collect()
 }
@@ -636,22 +635,22 @@ mod tests {
             {"source": "id5-sync.com", "uids": [{"id": "ID5_stale", "atype": 1}]}
         ]));
         let body_eids = vec![
-            Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![Uid {
+            Eid::new(
+                "id5-sync.com".to_owned(),
+                vec![Uid {
                     id: "ID5_fresh".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
-            },
-            Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![Uid {
+            ),
+            Eid::new(
+                "liveramp.com".to_owned(),
+                vec![Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
-            },
+            ),
         ];
 
         let updates = collect_eid_updates(Some(&eids_cookie), None, Some(&body_eids), &registry);

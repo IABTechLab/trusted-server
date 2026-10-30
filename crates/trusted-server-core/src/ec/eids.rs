@@ -10,7 +10,8 @@ use error_stack::{Report, ResultExt as _};
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 
-use super::kv_types::KvEntry;
+use super::eid_types::{RawJson, UnixSeconds};
+use super::kv_types::{KvEid, KvEntry, KvPartnerId};
 use super::registry::PartnerRegistry;
 
 /// Maximum size (in bytes) for the base64-encoded `x-ts-eids` header value.
@@ -64,15 +65,118 @@ pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<R
 pub fn to_eids(resolved: &[ResolvedPartnerId]) -> Vec<Eid> {
     resolved
         .iter()
-        .map(|item| Eid {
-            source: item.source_domain.clone(),
-            uids: vec![Uid {
-                id: item.uid.clone(),
-                atype: Some(item.openrtb_atype),
-                ext: None,
-            }],
+        .map(|item| {
+            Eid::new(
+                item.source_domain.clone(),
+                vec![Uid {
+                    id: item.uid.clone(),
+                    atype: Some(item.openrtb_atype),
+                    ext: None,
+                }],
+            )
         })
         .collect()
+}
+
+/// A borrowed EID entry: a single legacy UID or a full-fidelity provider entry.
+#[derive(Debug, Clone, Copy)]
+pub enum EidView<'row> {
+    /// A record holding one UID and no EID-level fields.
+    Single {
+        /// Source domain.
+        source: &'row str,
+        /// The UID.
+        uid: &'row str,
+        /// The partner's configured agent type.
+        atype: i32,
+    },
+    /// A provider-written entry; only live UIDs are emitted.
+    Full {
+        /// Source domain.
+        source: &'row str,
+        /// The stored entry.
+        eid: &'row KvEid,
+        /// Request time used to filter UIDs.
+        now: UnixSeconds,
+    },
+}
+
+impl From<EidView<'_>> for Eid {
+    fn from(view: EidView<'_>) -> Self {
+        match view {
+            EidView::Single { source, uid, atype } => Eid::new(
+                source,
+                vec![Uid {
+                    id: uid.to_owned(),
+                    atype: Some(atype),
+                    ext: None,
+                }],
+            ),
+            EidView::Full { source, eid, now } => {
+                let fields = eid.fields();
+                let uids = eid
+                    .uids()
+                    .iter()
+                    .filter(|uid| uid.is_live(now))
+                    .map(|uid| Uid {
+                        id: uid.id().as_str().to_owned(),
+                        atype: Some(uid.atype().get()),
+                        ext: uid.ext().map(RawJson::to_value),
+                    })
+                    .collect();
+                Eid {
+                    inserter: fields.inserter.as_deref().map(str::to_owned),
+                    matcher: fields.matcher.as_deref().map(str::to_owned),
+                    mm: fields.mm.map(i32::from),
+                    ext: fields.ext.as_ref().map(RawJson::to_value),
+                    ..Eid::new(source, uids)
+                }
+            }
+        }
+    }
+}
+
+/// Yields the live views of one stored record.
+///
+/// Legacy records yield one [`EidView::Single`]; provider records yield one
+/// [`EidView::Full`] per entry that still has a live UID.
+pub fn source_views<'row>(
+    source: &'row str,
+    record: &'row KvPartnerId,
+    default_atype: i32,
+    now: UnixSeconds,
+) -> impl Iterator<Item = EidView<'row>> + 'row {
+    let single =
+        (!record.is_provider_written() && !record.uid.is_empty()).then_some(EidView::Single {
+            source,
+            uid: record.uid.as_str(),
+            atype: default_atype,
+        });
+    let full = record
+        .eids()
+        .iter()
+        .filter(move |eid| eid.uids().iter().any(|uid| uid.is_live(now)))
+        .map(move |eid| EidView::Full { source, eid, now });
+    single.into_iter().chain(full)
+}
+
+impl KvEntry {
+    /// Iterates live entries for registered, `bidstream_enabled` sources in
+    /// source order, borrowing from the row.
+    pub fn live_eids<'row>(
+        &'row self,
+        registry: &'row PartnerRegistry,
+        now: UnixSeconds,
+    ) -> impl Iterator<Item = EidView<'row>> + 'row {
+        self.ids.iter().flat_map(move |(source, record)| {
+            let partner = registry
+                .get(source)
+                .filter(|partner| partner.bidstream_enabled);
+            partner
+                .into_iter()
+                .flat_map(move |partner| source_views(source, record, partner.openrtb_atype, now))
+        })
+    }
 }
 
 /// Builds a base64-encoded EID header value, truncating if needed.
@@ -145,6 +249,8 @@ pub fn encode_eids_header(eids: &[Eid]) -> Result<(String, bool), Report<Trusted
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue, UnixSeconds};
+    use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
 
@@ -179,15 +285,11 @@ mod tests {
         entry.consent.ok = true;
         entry.ids.insert(
             "zeta.example.com".to_owned(),
-            super::super::kv_types::KvPartnerId {
-                uid: "uid-z".to_owned(),
-            },
+            super::super::kv_types::KvPartnerId::single("uid-z".to_owned()),
         );
         entry.ids.insert(
             "alpha.example.com".to_owned(),
-            super::super::kv_types::KvPartnerId {
-                uid: "uid-a".to_owned(),
-            },
+            super::super::kv_types::KvPartnerId::single("uid-a".to_owned()),
         );
 
         let resolved = resolve_partner_ids(&registry, &entry);
@@ -275,5 +377,88 @@ mod tests {
 
         assert!(!truncated, "should not truncate small payload");
         assert!(!encoded.is_empty(), "should produce non-empty value");
+    }
+
+    fn registry_with(source: &str, bidstream: bool) -> PartnerRegistry {
+        let mut partner = make_test_partner(source);
+        partner.bidstream_enabled = bidstream;
+        PartnerRegistry::from_config(&[partner]).expect("should build registry")
+    }
+
+    fn provider_record(ids: &[(&str, Expiry)]) -> KvPartnerId {
+        let uids = ids
+            .iter()
+            .map(|(id, expiry)| {
+                KvUid::new(
+                    UidValue::try_from(*id).expect("should build uid"),
+                    AgentType::try_from(1).expect("should build atype"),
+                    None,
+                    Some(ProviderId::new("example-provider")),
+                    *expiry,
+                )
+            })
+            .collect();
+        let fields = EidFields {
+            inserter: Some("inserter.example.com".into()),
+            ..EidFields::default()
+        };
+        KvPartnerId::from_eids(vec![KvEid::new(fields, uids)], UnixSeconds::new(0))
+            .expect("should build record")
+    }
+
+    #[test]
+    fn live_eids_skip_expired_uids_and_keep_eid_fields() {
+        let registry = registry_with("ids.example.com", true);
+        let mut entry = KvEntry::minimal("ids.example.com", "placeholder", 1);
+        entry.ids.insert(
+            "ids.example.com".to_owned(),
+            provider_record(&[
+                ("old", Expiry::At(UnixSeconds::new(10))),
+                ("new", Expiry::Never),
+            ]),
+        );
+
+        let eids: Vec<Eid> = entry
+            .live_eids(&registry, UnixSeconds::new(20))
+            .map(Eid::from)
+            .collect();
+
+        assert_eq!(eids.len(), 1, "should emit one entry");
+        assert_eq!(
+            eids[0].inserter.as_deref(),
+            Some("inserter.example.com"),
+            "should keep inserter"
+        );
+        let ids: Vec<&str> = eids[0].uids.iter().map(|uid| uid.id.as_str()).collect();
+        assert_eq!(ids, vec!["new"], "should drop expired uid");
+    }
+
+    #[test]
+    fn live_eids_respect_bidstream_flag() {
+        let registry = registry_with("ids.example.com", false);
+        let mut entry = KvEntry::minimal("ids.example.com", "v", 1);
+        entry
+            .ids
+            .insert("ids.example.com".to_owned(), KvPartnerId::single("v"));
+        assert_eq!(
+            entry.live_eids(&registry, UnixSeconds::new(0)).count(),
+            0,
+            "should hide non-bidstream source"
+        );
+    }
+
+    #[test]
+    fn live_eids_emit_legacy_single_uid() {
+        let registry = registry_with("ids.example.com", true);
+        let mut entry = KvEntry::minimal("ids.example.com", "v", 1);
+        entry
+            .ids
+            .insert("ids.example.com".to_owned(), KvPartnerId::single("v"));
+        let eids: Vec<Eid> = entry
+            .live_eids(&registry, UnixSeconds::new(0))
+            .map(Eid::from)
+            .collect();
+        assert_eq!(eids[0].uids[0].id, "v", "should emit legacy uid");
+        assert_eq!(eids[0].uids[0].atype, Some(3), "should use partner atype");
     }
 }

@@ -21,7 +21,7 @@ use crate::error::TrustedServerError;
 
 use super::generation::ec_hash;
 use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
-use super::kv_types::{KvEntry, KvMetadata, KvNetwork};
+use super::kv_types::{KvEntry, KvMetadata, KvNetwork, MAX_ENTRY_BYTES};
 use super::{EcKvSnapshot, checked_current_timestamp, current_timestamp, log_id};
 
 /// Maximum number of CAS retry attempts before giving up.
@@ -157,9 +157,7 @@ fn apply_cookie_partner_id_updates(
 
         entry.ids.insert(
             partner_id.to_owned(),
-            super::kv_types::KvPartnerId {
-                uid: uid.to_owned(),
-            },
+            super::kv_types::KvPartnerId::single(uid.to_owned()),
         );
         changed = true;
     }
@@ -205,9 +203,7 @@ pub(crate) fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerId
 
         entry.ids.insert(
             partner_id.to_owned(),
-            super::kv_types::KvPartnerId {
-                uid: uid.to_owned(),
-            },
+            super::kv_types::KvPartnerId::single(uid.to_owned()),
         );
         changed = true;
     }
@@ -284,6 +280,15 @@ impl KvIdentityGraph {
             store_name: store_name.to_owned(),
             message: "Failed to serialize KV entry body".to_owned(),
         })?;
+        if body.len() > MAX_ENTRY_BYTES {
+            return Err(Report::new(TrustedServerError::KvStore {
+                store_name: store_name.to_owned(),
+                message: format!(
+                    "Refusing to write KV entry of {} bytes (limit {MAX_ENTRY_BYTES})",
+                    body.len()
+                ),
+            }));
+        }
         let meta = KvMetadata::from_entry(entry);
         let meta_str =
             serde_json::to_string(&meta).change_context(TrustedServerError::KvStore {
@@ -920,9 +925,7 @@ impl KvIdentityGraph {
 
             entry.ids.insert(
                 partner_id.to_owned(),
-                super::kv_types::KvPartnerId {
-                    uid: uid.to_owned(),
-                },
+                super::kv_types::KvPartnerId::single(uid.to_owned()),
             );
 
             let (body, meta_str) = Self::serialize_entry(&entry, self.store_name())?;
@@ -992,9 +995,7 @@ impl KvIdentityGraph {
 
             entry.ids.insert(
                 partner_id.to_owned(),
-                super::kv_types::KvPartnerId {
-                    uid: uid.to_owned(),
-                },
+                super::kv_types::KvPartnerId::single(uid.to_owned()),
             );
 
             let (body, meta_str) = Self::serialize_entry(&entry, self.store_name())?;
@@ -1618,7 +1619,9 @@ impl KvIdentityGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue, UnixSeconds};
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
+    use crate::ec::kv_types::{KvEid, KvUid};
 
     /// [`EcKvStore`] wrapper whose first CAS write both fails the precondition
     /// and deletes the key, simulating a concurrent withdrawal that removes the
@@ -1737,9 +1740,9 @@ mod tests {
         let mut entry = KvEntry::tombstone(1000);
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
-            },
+            crate::ec::kv_types::KvPartnerId::single(
+                "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
+            ),
         );
         let body = serde_json::to_vec(&entry).expect("should serialize invalid entry payload");
 
@@ -1772,9 +1775,9 @@ mod tests {
         let mut entry = KvEntry::tombstone(1000);
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
-            },
+            crate::ec::kv_types::KvPartnerId::single(
+                "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
+            ),
         );
 
         let err = KvIdentityGraph::serialize_entry(&entry, "test-store")
@@ -1783,6 +1786,48 @@ mod tests {
         assert!(
             err_text.contains("Refusing to serialize invalid KV entry"),
             "should fail closed before serializing invalid KV writes"
+        );
+    }
+
+    #[test]
+    fn create_refuses_oversized_provider_entry_before_write() {
+        let graph = KvIdentityGraph::in_memory("test-store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let uids = (0..40)
+            .map(|index| {
+                let id = format!("{index:03}{}", "x".repeat(480));
+                KvUid::new(
+                    UidValue::try_from(id).expect("should build uid"),
+                    AgentType::try_from(1).expect("should build atype"),
+                    None,
+                    Some(ProviderId::new("example-provider")),
+                    Expiry::Never,
+                )
+            })
+            .collect();
+        let record = crate::ec::kv_types::KvPartnerId::from_eids(
+            vec![KvEid::new(EidFields::default(), uids)],
+            UnixSeconds::new(0),
+        )
+        .expect("should build record");
+        let mut entry = live_entry();
+        entry.ids.insert("ids.example.com".to_owned(), record);
+        assert!(
+            entry.validate().is_ok(),
+            "should be a valid entry apart from its size"
+        );
+
+        let err = graph
+            .create(&ec_id, &entry)
+            .expect_err("should refuse oversized entry");
+
+        assert!(
+            format!("{err}").contains("Refusing to write KV entry"),
+            "should report the size limit"
+        );
+        assert!(
+            graph.get(&ec_id).expect("should read store").is_none(),
+            "should not write the oversized entry"
         );
     }
 
@@ -1796,9 +1841,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "concurrent.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "concurrent-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::single("concurrent-uid".to_owned()),
         );
         entry
     }
@@ -2131,9 +2174,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "uid-1".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::single("uid-1".to_owned()),
         );
         let updates = vec![PartnerIdUpdate::new("ssp_x", "uid-1")];
 
@@ -2159,9 +2200,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "old-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::single("old-uid".to_owned()),
         );
         let updates = vec![PartnerIdUpdate::new("ssp_x", "new-uid")];
 
@@ -2191,9 +2230,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "original".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::single("original".to_owned()),
         );
         let updates = vec![
             PartnerIdUpdate::new("ssp_x", "intermediate"),
@@ -2215,9 +2252,7 @@ mod tests {
         let mut concurrent = live_entry();
         concurrent.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "desired-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::single("desired-uid".to_owned()),
         );
         let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2333,9 +2368,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "latest-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::single("latest-uid".to_owned()),
         );
         let updates = [
             PartnerIdUpdate::new("ssp_x", "older-uid"),
@@ -2354,9 +2387,7 @@ mod tests {
         let mut concurrent = live_entry();
         concurrent.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "concurrent-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::single("concurrent-uid".to_owned()),
         );
         let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2439,9 +2470,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "protected-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::single("protected-uid".to_owned()),
         );
         graph.create(&ec_id, &entry).expect("should seed entry");
 
@@ -2466,9 +2495,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "protected-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::single("protected-uid".to_owned()),
         );
         graph.create(&ec_id, &entry).expect("should seed entry");
 

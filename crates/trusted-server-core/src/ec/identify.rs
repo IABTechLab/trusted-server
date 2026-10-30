@@ -12,13 +12,15 @@ use url::Url;
 use super::auth::authenticate_bearer;
 use super::consent::ec_consent_granted;
 use crate::error::TrustedServerError;
-use crate::openrtb::{Eid, Uid};
+use crate::openrtb::Eid;
 use crate::settings::Settings;
 
-use super::EcContext;
+use super::eid_types::UnixSeconds;
+use super::eids::source_views;
 use super::kv::KvIdentityGraph;
 use super::log_id;
 use super::registry::PartnerRegistry;
+use super::{EcContext, current_timestamp};
 
 /// Handles `GET /_ts/api/v1/identify`.
 ///
@@ -84,7 +86,7 @@ pub fn handle_identify(
     };
 
     let mut degraded = false;
-    let mut uid: Option<String> = None;
+    let mut eid: Option<Eid> = None;
     let mut cluster_size: Option<u32> = None;
 
     match kv.get(ec_id) {
@@ -95,12 +97,16 @@ pub fn handle_identify(
                 // write back with the live-entry TTL.
                 log::trace!("Identify found tombstone for '{}'", log_id(ec_id));
             } else {
-                // Extract only this partner's UID.
-                if let Some(partner_uid) = entry.ids.get(&partner.source_domain)
-                    && !partner_uid.uid.is_empty()
-                {
-                    uid = Some(partner_uid.uid.clone());
-                }
+                // Extract only this partner's first live entry.
+                let now = UnixSeconds::new(current_timestamp());
+                eid = entry
+                    .ids
+                    .get(&partner.source_domain)
+                    .and_then(|record| {
+                        source_views(&partner.source_domain, record, partner.openrtb_atype, now)
+                            .next()
+                    })
+                    .map(Eid::from);
 
                 // Evaluate cluster size lazily for identify responses. Existing
                 // stored cluster_size values are reused without a prefix-list call.
@@ -124,14 +130,10 @@ pub fn handle_identify(
         }
     }
 
-    let eid = uid.as_ref().map(|u| Eid {
-        source: partner.source_domain.clone(),
-        uids: vec![Uid {
-            id: u.clone(),
-            atype: Some(partner.openrtb_atype),
-            ext: None,
-        }],
-    });
+    let uid = eid
+        .as_ref()
+        .and_then(|eid| eid.uids.first())
+        .map(|uid| uid.id.clone());
 
     let body = IdentifyResponse {
         ec: ec_id.to_owned(),
@@ -334,6 +336,8 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue, UnixSeconds};
+    use crate::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvUid};
     use crate::ec::registry::PartnerRegistry;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
@@ -754,6 +758,79 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("Origin, Authorization"),
             "should vary on identity request inputs for preflight"
+        );
+    }
+
+    fn provider_record(id: &str, expiry: Expiry) -> KvPartnerId {
+        let uid = KvUid::new(
+            UidValue::try_from(id).expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            expiry,
+        );
+        let fields = EidFields {
+            inserter: Some("inserter.example.com".into()),
+            ..EidFields::default()
+        };
+        KvPartnerId::from_eids(vec![KvEid::new(fields, vec![uid])], UnixSeconds::new(0))
+            .expect("should build record")
+    }
+
+    fn identify_body_for_record(record: KvPartnerId) -> serde_json::Value {
+        let settings = create_test_settings();
+        let kv = KvIdentityGraph::in_memory("identify_store");
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = KvEntry::minimal("other.example.com", "other-uid", 1);
+        entry.ids.insert("ssp.example.com".to_owned(), record);
+        kv.create(&ec_id, &entry).expect("should seed KV entry");
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://edge.test-publisher.com/identify")
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+
+        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .expect("should construct identify response");
+
+        assert_eq!(response.status(), StatusCode::OK, "should return 200");
+        serde_json::from_slice::<serde_json::Value>(
+            &response.into_body().into_bytes().unwrap_or_default(),
+        )
+        .expect("should decode identify response JSON")
+    }
+
+    #[test]
+    fn handle_identify_omits_expired_provider_uid() {
+        let body =
+            identify_body_for_record(provider_record("old", Expiry::At(UnixSeconds::new(1))));
+
+        assert!(
+            body.get("uid").is_none(),
+            "should omit expired provider uid"
+        );
+        assert!(
+            body.get("eid").is_none(),
+            "should omit eid without a live uid"
+        );
+    }
+
+    #[test]
+    fn handle_identify_returns_live_provider_eid_with_eid_fields() {
+        let body = identify_body_for_record(provider_record("live", Expiry::Never));
+
+        assert_eq!(body["uid"], "live", "should return live provider uid");
+        assert_eq!(
+            body["eid"]["inserter"], "inserter.example.com",
+            "should keep provider EID-level fields"
+        );
+        assert_eq!(
+            body["eid"]["uids"][0]["atype"], 1,
+            "should use the provider atype"
         );
     }
 }

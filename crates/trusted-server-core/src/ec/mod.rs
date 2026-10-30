@@ -26,6 +26,7 @@
 //! - [`rate_limiter`] — Rate limiting abstraction (implemented by adapters)
 //! - [`identify`] — Identity read endpoint (`GET /_ts/api/v1/identify`)
 //! - [`eids`] — Shared EID resolution and formatting helpers
+//! - [`eid_types`] — Value types for full-fidelity provider EIDs
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
 //! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
 
@@ -36,6 +37,7 @@ pub mod batch_sync;
 pub mod consent;
 pub mod cookies;
 pub mod device;
+pub mod eid_types;
 pub mod eids;
 pub mod finalize;
 pub mod generation;
