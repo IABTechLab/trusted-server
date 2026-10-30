@@ -462,7 +462,7 @@ hand-written slot fields will be discarded appears before the question. The
 preview, warning, and prompt all go to stderr, so stdout carries only the final
 `Wrote ...` line. Page-supplied text in the preview is shown with control and
 bidirectional-override characters escaped, so they cannot reorder or hide lines
-of the diff you are approving. When the candidate introduces a `{section}`
+of the diff you are approving. When the candidate uses a `{section}`
 template, the preview warns before the question that a template-aware binary
 must be deployed before the config is pushed. The note saying the config now
 uses a template is printed only once such a config is written, previewed with

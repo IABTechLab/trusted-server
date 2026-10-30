@@ -1090,10 +1090,10 @@ pub(crate) fn run_update_slots(
     notes.extend(validate::check_candidate(&updated, &existing)?);
 
     emit_notes(err, &mut notes)?;
-    // The deploy-order note describes the config as written, so it is held
-    // back until the candidate is the config (or is only being previewed);
-    // a declined or refused write must not tell the operator to roll out a
-    // template-aware binary for a file that did not change.
+    // The "now uses" deploy-order note describes the config as written, so it
+    // is held back until the candidate is the config (or is only being
+    // previewed); a changed candidate's preview carries a conditionally worded
+    // warning instead (see `PREVIEW_TEMPLATE_NOTE`).
     let uses_template = policy.is_some();
 
     let old_managed = managed_creative_projection(&existing)?;
@@ -1206,7 +1206,7 @@ fn ensure_config_unchanged(config_path: &Path, existing: &str) -> CliResult<()> 
 
 /// Deploy-order warning shown in the preview of a `{section}` candidate,
 /// worded for a write that has not happened yet.
-const PREVIEW_TEMPLATE_NOTE: &str = "note: applying this introduces a {section} ad-unit \
+const PREVIEW_TEMPLATE_NOTE: &str = "note: this candidate uses a {section} ad-unit \
      template; deploy a template-aware binary BEFORE pushing the config.";
 
 /// Previews a changed candidate on `err` and requires approval to write it.
@@ -4753,6 +4753,11 @@ mod tests {
             run.stdout.contains("Wrote 1 slot(s)"),
             "should report the write on stdout, got {:?}",
             run.stdout
+        );
+        assert!(
+            !run.stderr.contains("{section} ad-unit template"),
+            "a literal-path candidate must not carry a template deploy note, got {:?}",
+            run.stderr
         );
     }
 
