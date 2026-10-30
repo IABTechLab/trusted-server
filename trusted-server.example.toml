@@ -153,7 +153,7 @@ pull_sync_concurrency = 3
 # Forwarded host/proto need a matching secret and stay publisher-domain bounded.
 # shared_secret is a key in trusted_server_secrets, not the credential itself.
 # Configure the forwarder to send the actual secret in auth_header.
-# The current ts dev proxy does not inject a forwarding credential.
+# With x-ts-forwarder-auth, use ts dev proxy --forwarder-secret-file.
 # [trusted_forwarder]
 # auth_header = "x-ts-forwarder-auth"
 # shared_secret = "trusted_forwarder_shared_secret"

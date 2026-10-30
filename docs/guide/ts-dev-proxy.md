@@ -62,11 +62,10 @@ ts dev proxy \
 
 `--rewrite-host` sends the upstream `Host: <TO>` so upstreams that reject the
 default `Host: <FROM>` — most dev and staging services, which aren't configured
-for the production hostname — still serve a page. Trade-off: against a real
-Trusted Server adapter, first-party URLs then render on the upstream host, not the
-production domain. To keep them on the production domain, point at an upstream that
-accepts `Host: <FROM>` and omit `--rewrite-host` — see
-[Host header behavior](#host-header-behavior).
+for the production hostname — still serve a page. To keep first-party URLs and
+trace authorization on the browser's production origin, configure authenticated
+forwarding on the Trusted Server upstream and supply `--forwarder-secret-file`.
+See [authenticated forwarding](#authenticated-forwarding).
 
 Run `ts dev proxy --help` to list every flag.
 
@@ -85,7 +84,7 @@ invocation with explicit options but no complete rewrite rule fails with a
 `no rewrite rule` error before touching system proxy state.
 
 Connection options — `--rewrite-host`, `--basic-auth`/`--basic-auth-file`,
-`--insecure`, and `--upstream-plaintext` — apply to every mapping, not per-rule.
+`--forwarder-secret-file`, `--insecure`, and `--upstream-plaintext` — apply to every mapping, not per-rule.
 
 ### Explicit rule and browser launch
 
@@ -286,21 +285,22 @@ certificate is imported until the subject check succeeds.
 
 ## Host header behavior
 
-The proxy always sends `X-Forwarded-Host: <FROM>` (the production hostname) and
-`X-Forwarded-Proto: https` (the browser-facing scheme). Trusted Server accepts
-these fields for first-party URL rewriting only when the upstream configures
-[`[trusted_forwarder]`](./configuration.md#trusted-forwarder) and the forwarder
-sends its matching credential. The forwarded hostname must also match
-`publisher.domain` or one of its subdomains. Every adapter strips raw `Forwarded`,
+The proxy sends the validated inbound browser authority as `X-Forwarded-Host`,
+including any explicit browser port, and `X-Forwarded-Proto: https` because the
+browser leg uses TLS. Trusted Server accepts these fields for public URLs and
+trace Origin checks only when the upstream configures
+[`[trusted_forwarder]`](./configuration.md#trusted-forwarder) and the proxy is
+given the matching token through `--forwarder-secret-file`. The forwarded
+hostname must also match `publisher.domain` or one of its subdomains. The upstream
+routing `Host` remains a separate choice. Every adapter strips raw `Forwarded`,
 `X-Forwarded-Host` and `X-Forwarded-Proto` fields before routing; unauthenticated
 fields do not influence the public origin.
 
-This version of `ts dev proxy` does not inject a trusted-forwarder credential.
-First-party URLs therefore use the upstream's runtime or transport host and
-scheme. An Axum upstream reached over plain HTTP emits `http://` first-party URLs
-even though the browser-to-proxy connection uses HTTPS. Configuring
-`[trusted_forwarder]` alone does not change that; an authenticated forwarder must
-also supply the credential.
+Without authenticated forwarding, first-party URLs use the upstream's runtime or
+transport host and scheme. An Axum upstream reached over plain HTTP emits
+`http://` first-party URLs even though the browser-to-proxy connection uses HTTPS.
+Configuring `[trusted_forwarder]` alone does not change that; the proxy must also
+supply the matching credential.
 
 The selected host is syntax-validated before publisher processing, including
 requests for assets that never reach a script rewriter. A malformed selected host
@@ -331,16 +331,19 @@ ts dev proxy \
 The proxy dials `192.0.2.10` while the SNI stays `ts.example-publisher.com` and
 the default `Host` stays `www.example-publisher.com`. The upstream must accept
 that production Host; `X-Forwarded-Host` alone does not establish trust for URL
-rewriting. This keeps the tool self-contained — no
-`/etc/hosts` edit. (Pointing `--to` at a bare IP instead would make the SNI an IP,
+rewriting. With authenticated forwarding configured, Trusted Server uses the
+browser's production origin for first-party URLs. This keeps the tool
+self-contained — no `/etc/hosts` edit. (Pointing `--to` at a bare IP instead would make the SNI an IP,
 which sends no SNI extension at all, so a host-routed endpoint serves its default
 vhost.) Add `--insecure` if the endpoint serves a certificate that doesn't match
 the hostname.
 
 **Sending `Host: TO`.** If your upstream routes or validates on its _own_
 hostname (e.g. a Fastly Deliver service that rejects an unconfigured `Host`), pass
-`--rewrite-host` to send `Host: <TO>`. The proxy still stamps
-`X-Forwarded-Host: <FROM>`, but Trusted Server ignores that unauthenticated hint.
+`--rewrite-host` to send `Host: <TO>`. The proxy preserves every browser `Origin`
+value on all routes, including trace Enable/End, publisher requests, and vendor
+integration requests. Trusted Server validates the browser Origin against the
+authenticated public origin when forwarding is configured.
 
 > **Trusted Server upstreams.** Fastly, Axum, Cloudflare and Spin all use their
 > runtime or transport origin without authenticated forwarding. With
@@ -351,14 +354,77 @@ hostname (e.g. a Fastly Deliver service that rejects an unconfigured `Host`), pa
 
 The TLS SNI is always the `TO` host either way:
 
-| Form             | `Host` header | `X-Forwarded-Host` | TLS SNI   |
-| ---------------- | ------------- | ------------------ | --------- |
-| _(omitted)_      | `FROM`        | `FROM`             | `TO` host |
-| `--rewrite-host` | `TO` host     | `FROM`             | `TO` host |
+| Form             | `Host` header | `X-Forwarded-Host`               | TLS SNI   |
+| ---------------- | ------------- | -------------------------------- | --------- |
+| _(omitted)_      | `FROM`        | Browser authority, port included | `TO` host |
+| `--rewrite-host` | `TO` host     | Browser authority, port included | `TO` host |
 
 **Port handling:** with `--rewrite-host` and a non-default `TO` port (e.g.
 `localhost:3000`), the port is included in the `Host` header but never in the SNI
 (a bare hostname; a port in SNI is invalid).
+
+## Authenticated forwarding
+
+This feature requires a Trusted Server upstream with authenticated forwarder
+support enabled. Provision the same secret in the server's trusted-forwarder
+configuration and in a local file, using the authentication header
+`x-ts-forwarder-auth`. The publisher hostname must be allowed by the server's
+publisher domain configuration. The server consumes the credential before
+routing or forwarding to publishers and vendors.
+
+Configure the upstream application with this optional section:
+
+```toml
+[trusted_forwarder]
+auth_header = "x-ts-forwarder-auth"
+shared_secret = "trusted_forwarder_shared_secret"
+```
+
+`shared_secret` names a server secret-store key; provision that key with the
+actual token bytes from the local file, excluding its line terminator. The publisher domain or its subdomains must
+cover every mapped browser hostname. Omitting the section keeps the server's
+default transport-origin behavior.
+
+Generate a cryptographically random local token file, provision its token in the server secret store,
+and pass only the file path to the proxy:
+
+```bash
+umask 077
+openssl rand -hex 32 > ./forwarder-token.txt
+
+ts dev proxy \
+  --map www.publisher.example.com=trusted-server.example.com \
+  --rewrite-host \
+  --forwarder-secret-file ./forwarder-token.txt \
+  --launch chrome
+```
+
+The file must contain at least 32 ASCII graphic bytes on one line, with an
+optional single LF or CRLF terminator. Spaces, blank or extra lines, and non-ASCII
+bytes are rejected. It is read once at startup. The token is redacted in debug
+output and marked sensitive in the HTTP header value.
+
+The token is sent to every mapped upstream, including mappings that are not
+Trusted Server. Use only upstreams that should receive this credential. The proxy
+warns at startup when the token can cross a plaintext or unverified TLS connection
+to a destination not known to be loopback. Loopback IP literals and loopback
+`--resolve` pins are exempt; an unpinned DNS name is not assumed to be loopback.
+The warning leaves local container and other deliberate development mappings
+available. Use verified upstream TLS when the connection leaves the machine.
+
+The proxy removes incoming `x-ts-forwarder-auth` fields on mapped MITM requests,
+including trailer declarations and streamed trailer fields, even when no
+credential is configured. With the option enabled it stamps the
+validated token after hop-by-hop sanitation, alongside the actual browser
+`X-Forwarded-Host` and `X-Forwarded-Proto: https`. A missing, duplicate, malformed,
+or conflicting Host/absolute-URI authority receives `400`; the proxy never
+signs a guessed CONNECT host. Each request must match its own mapping.
+Unmatched blind tunnels and plain HTTP forwarding keep their existing behavior.
+
+Without the server opt-in, forwarded metadata does not establish a trusted
+public origin. In particular, rewriting Host can change the origin Trusted Server
+uses for public URLs and can make browser trace actions fail Origin validation.
+Keep the credential file outside version control.
 
 ## Non-loopback listen
 
@@ -374,7 +440,8 @@ ts dev proxy \
 
 Even with `--allow-non-loopback`, unmatched `CONNECT` authorities are refused
 (`403`) rather than blind-tunneled, so the proxy cannot act as an open CONNECT
-proxy on the LAN.
+proxy on the LAN. Injected forwarding credentials and Basic auth require a
+loopback listener, even with `--allow-non-loopback`.
 
 ## All options
 
@@ -422,14 +489,15 @@ logging enabled, a clean shutdown prints an aggregate, redacted proxy metrics
 summary that can help distinguish DNS, connection, TLS, and pool wait latency;
 it never includes request URLs, headers, credentials, or certificate contents.
 
-| Symptom                                        | Cause                                                                                                                                                                                       | Fix                                                                                                                                                                                                                                                  |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| "unknown domain" or `404` from upstream        | The upstream service does not accept `Host: <FROM>` (the default). A domain can be active on only one Fastly service at a time, so you cannot add the production hostname to a dev service. | Use a Trusted Server Compute upstream (routes by SNI, not `Host`), or pass `--rewrite-host` to send `Host: <TO>`.                                                                                                                                    |
-| Upstream returns `401`                         | Upstream is behind Basic auth.                                                                                                                                                              | Pass `--basic-auth user:pass` or `--basic-auth-file ./creds.txt`.                                                                                                                                                                                    |
-| Upstream unreachable (`502` / `503`)           | Upstream service is down or the domain is not provisioned.                                                                                                                                  | Verify the upstream URL and its Fastly service health.                                                                                                                                                                                               |
-| Browser shows an untrusted-certificate warning | The dev CA is not trusted in the browser.                                                                                                                                                   | Run `ts dev proxy ca install` for Chrome and Safari. For Firefox, use `--launch firefox` (auto-imports when `certutil` is installed — `brew install nss`) or run `certutil` manually (see above). After `ca regenerate`, re-trust with `ca install`. |
-| Listen address already in use                  | Another process holds port 18080.                                                                                                                                                           | Pass `--listen 127.0.0.1:18081` (or another free port).                                                                                                                                                                                              |
-| `--listen` rejected as non-loopback            | A non-loopback address was given without the required flag.                                                                                                                                 | Add `--allow-non-loopback`.                                                                                                                                                                                                                          |
+| Symptom                                                    | Cause                                                                                                                                                                                       | Fix                                                                                                                                                                                                                                                  |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| "unknown domain" or `404` from upstream                    | The upstream service does not accept `Host: <FROM>` (the default). A domain can be active on only one Fastly service at a time, so you cannot add the production hostname to a dev service. | Use a Trusted Server Compute upstream (routes by SNI, not `Host`), or pass `--rewrite-host` to send `Host: <TO>`.                                                                                                                                    |
+| Trace **Enable** / **End** returns `403` through the proxy | The upstream compares browser `Origin` with a transport origin changed by `--rewrite-host` or `--upstream-plaintext`, or the forwarding credential does not match.                          | Configure `[trusted_forwarder]` with `auth_header = "x-ts-forwarder-auth"` on the upstream and pass the matching `--forwarder-secret-file`; see [Authenticated forwarding](#authenticated-forwarding).                                               |
+| Upstream returns `401`                                     | Upstream is behind Basic auth.                                                                                                                                                              | Pass `--basic-auth user:pass` or `--basic-auth-file ./creds.txt`.                                                                                                                                                                                    |
+| Upstream unreachable (`502` / `503`)                       | Upstream service is down or the domain is not provisioned.                                                                                                                                  | Verify the upstream URL and its Fastly service health.                                                                                                                                                                                               |
+| Browser shows an untrusted-certificate warning             | The dev CA is not trusted in the browser.                                                                                                                                                   | Run `ts dev proxy ca install` for Chrome and Safari. For Firefox, use `--launch firefox` (auto-imports when `certutil` is installed — `brew install nss`) or run `certutil` manually (see above). After `ca regenerate`, re-trust with `ca install`. |
+| Listen address already in use                              | Another process holds port 18080.                                                                                                                                                           | Pass `--listen 127.0.0.1:18081` (or another free port).                                                                                                                                                                                              |
+| `--listen` rejected as non-loopback                        | A non-loopback address was given without the required flag.                                                                                                                                 | Add `--allow-non-loopback`.                                                                                                                                                                                                                          |
 
 ## Isolated Linux browser proof
 

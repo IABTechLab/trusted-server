@@ -132,6 +132,10 @@ pub struct ProxyArgs {
     #[arg(long, value_name = "PATH")]
     pub basic_auth_file: Option<String>,
 
+    /// Read the Trusted Server forwarding token from a file (loopback only).
+    #[arg(long, value_name = "PATH")]
+    pub forwarder_secret_file: Option<String>,
+
     /// Skip upstream certificate verification.
     #[arg(long)]
     pub insecure: bool,
@@ -250,6 +254,8 @@ pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<Pro
     // validates arguments (and reads `--basic-auth-file`); it neither reads
     // nor changes system proxy state, so it is safe to run first.
     let mut cfg = config::resolve(args).change_context(ProxyError::Config)?;
+
+    crate::tls::install_crypto_provider();
 
     // Non-interactive so an unrelated startup never blocks on a sudo password
     // prompt.
