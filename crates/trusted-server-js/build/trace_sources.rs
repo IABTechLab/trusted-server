@@ -42,25 +42,6 @@ pub(crate) fn trace_source_digest(ts_dir: &Path) -> String {
             &fs::read(ts_dir.join(&source)).expect("should read trace build input"),
         );
     }
-    let versions = fs::read_to_string(
-        ts_dir.join(
-            inputs["node_version_file"]
-                .as_str()
-                .expect("should name the Node pin file"),
-        ),
-    )
-    .expect("should read pinned tool versions");
-    let node = versions
-        .lines()
-        .find_map(|line| {
-            let mut words = line.split_whitespace();
-            (words.next() == Some("nodejs"))
-                .then(|| words.next())
-                .flatten()
-        })
-        .expect("should pin the Node build version");
-    add(&mut hash, "nodejs", node.as_bytes());
-
     let lock = read_json(&ts_dir.join("package-lock.json"));
     let packages = lock["packages"]
         .as_object()
@@ -76,7 +57,7 @@ pub(crate) fn trace_source_digest(ts_dir: &Path) -> String {
         }
         let entry = packages
             .get(&location)
-            .expect("should resolve locked trace build package");
+            .unwrap_or_else(|| panic!("should resolve locked trace build package {location}"));
         for field in ["dependencies", "optionalDependencies"] {
             if let Some(dependencies) = entry[field].as_object() {
                 for name in dependencies.keys() {
@@ -95,7 +76,7 @@ pub(crate) fn trace_source_digest(ts_dir: &Path) -> String {
                     };
                     assert!(
                         packages.contains_key(&resolved),
-                        "should resolve locked trace dependency"
+                        "should resolve locked trace dependency {name} at {resolved}"
                     );
                     pending.push(resolved);
                 }

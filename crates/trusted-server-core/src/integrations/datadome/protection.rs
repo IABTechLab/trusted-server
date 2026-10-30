@@ -264,7 +264,7 @@ impl DataDomeIntegration {
         let req = &*input.request;
         let client_info = input.services.client_info();
         let public_info = crate::forwarder::public_origin(req)
-            .map(|_| RequestInfo::from_request(req, client_info));
+            .and_then(|_| RequestInfo::from_request(req, client_info).ok());
         let request_host = public_info
             .as_ref()
             .map_or_else(|| request_host(req), |info| info.host.clone());

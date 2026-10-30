@@ -30,6 +30,8 @@ const WORKSPACE_INPUTS: [&str; 3] = ["Cargo.toml", "Cargo.lock", "edgezero.toml"
 ///
 /// The resolved value is re-emitted under the same name, so `option_env!` reads
 /// the validated value rather than the raw pipeline input.
+/// Keep this build input in `settings.rs`'s `BUILD_ENVIRONMENT_VARIABLES` list
+/// so the legacy test loader does not treat it as a settings override.
 const OVERRIDE_ENV: &str = "TRUSTED_SERVER__GIT_VERSION";
 
 /// Runs `git` in the crate directory; `None` if git is missing or fails.

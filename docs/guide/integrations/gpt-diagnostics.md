@@ -244,12 +244,14 @@ no wall-clock timeout, memory-allocation guarantee or earlier raw-header access.
 Unsupported metadata and request-relative server milestones display **Unavailable**.
 There is no historical recovery or server-side report store.
 
-The masked client IP follows each adapter's established `ClientInfo` source.
-`trusted_client_ip` header resolution is Fastly-only. Axum uses the transport peer,
-Cloudflare uses its runtime client-IP header, and Spin uses its runtime client
-address. Behind a forwarder these adapters may therefore report the forwarder's
-masked address. Authenticated public-origin forwarding does not change client-IP
-trust or enable header-based IP resolution on those adapters.
+Both the setup page and traced publisher document prefer the reader IP resolved
+from authenticated `trusted_client_ip` headers at the request boundary, before
+header sanitation. Missing, duplicate, malformed or unauthenticated values fall
+back to the adapter's runtime address. Runtime geolocation is omitted whenever
+that address differs from the authenticated reader. Fastly applies trusted client
+IP resolution throughout request handling; Axum, Cloudflare and Spin use it only
+for these trace surfaces. Public-origin forwarding has separate authentication
+and does not itself establish client-IP trust.
 
 ### Release acceptance
 
@@ -285,9 +287,14 @@ Until these checks are complete, physical mobile acceptance remains pending.
 ### Maintaining versioned assets
 
 The committed trace asset manifest covers the dedicated trace build settings,
-trace sources, pinned Node version and resolved Vite build-tool dependency graph.
+trace sources and resolved Vite build-tool dependency graph.
 Rust and JavaScript read the same `trace-build-inputs.json` definition. Changes to
-unrelated publisher build settings or dependencies do not invalidate trace assets.
+publisher-only build settings or dependencies do not invalidate trace assets.
+The Node pin is excluded. Shared Vite toolchain changes update source provenance,
+but normal builds compare rebuilt bytes with committed assets instead of rejecting
+source-digest drift. `TSJS_PREBUILT_DIR` builds cannot rebuild, so they require an
+exact `source_sha256` match as well as the committed asset digests. Trace builds
+disable ambient PostCSS configuration discovery.
 
 While version one is unpublished, use the repository-pinned Node version and run:
 
@@ -301,10 +308,12 @@ npm test
 
 `build:trace-assets` rebuilds only the trace viewer, copies its exact JS/CSS bytes
 into `trace-assets/`, and refreshes the source and per-asset digests together.
-Review and commit both the bytes and manifest. Ordinary builds verify these
-records and never refresh committed assets automatically. Unchanged bytes keep
+Review and commit both the bytes and manifest. Ordinary builds verify the rebuilt bytes and never refresh committed assets
+automatically. Unchanged bytes keep
 their existing digest. Once an asset URL is published, add a new asset version
-instead of replacing bytes at that URL.
+instead of replacing bytes at that URL. The current tooling supports only v1;
+the [asset versioning follow-up](https://github.com/IABTechLab/trusted-server/blob/main/docs/superpowers/plans/2026-10-22-trace-asset-versioning-follow-up.md)
+must be completed before introducing v2.
 
 ## What the Console Shows
 
@@ -437,6 +446,32 @@ A matched creative attempt can report these safe, non-terminal categories:
 Failures are deduplicated and retain first-observed order. Detailed URLs, cache IDs,
 payloads, markup, and error objects remain only in existing operational logging and do
 not enter diagnostics.
+
+### APS render failures
+
+An APS bid that wins targeting is served as a 1x1 universal creative that resizes
+itself only once the creative draws, so Ad Manager reports a non-empty render whether
+or not anything was drawn. These categories name the guard that stopped the render, so
+a blank slot is distinguishable from a delivered one.
+
+They are relayed diagnostics rather than bridge failures: the sandboxed renderer
+document or the Universal Creative source observes the failure and reports it, the
+reason is validated against a fixed allowlist, and the sender is authenticated against
+the slot the capability was served to. A reason never carries creative or descriptor
+content.
+
+| Failure                      | Observed by               | Meaning                                                                                                                                                                                                       |
+| ---------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `aps_bad_hash`               | Renderer document         | The frame loaded without a usable nonce fragment, so no descriptor was accepted.                                                                                                                              |
+| `aps_nonce_mismatch`         | Renderer document         | A descriptor arrived bearing a nonce other than the one the frame was opened with.                                                                                                                            |
+| `aps_descriptor_keys`        | Renderer document         | The descriptor's key set did not match either accepted shape.                                                                                                                                                 |
+| `aps_descriptor_fields`      | Renderer document         | A descriptor field was absent, the wrong type, or over its size limit.                                                                                                                                        |
+| `aps_descriptor_envelope`    | Renderer document         | The encoded bid envelope failed to decode or disagreed with the descriptor.                                                                                                                                   |
+| `aps_runner_script_error`    | Renderer document         | Amazon's `prebid-creative.js` failed to load, so the creative was never rendered.                                                                                                                             |
+| `aps_frame_timeout`          | Universal Creative source | The renderer frame never acknowledged within its timeout. A missing or erroring renderer route also surfaces here, because an iframe does not raise a load error for an HTTP status.                          |
+| `aps_frame_load_error`       | Universal Creative source | The renderer frame raised a load error. Rare; see the timeout row.                                                                                                                                            |
+| `aps_frame_reported_failure` | Universal Creative source | The frame reported a failure without naming a category.                                                                                                                                                       |
+| `aps_unknown`                | Universal Creative source | The frame reported an empty reason. A reason the top window does not recognize, which can happen when the renderer document and the script bundle are on different versions, is dropped rather than recorded. |
 
 ### Source-neutral GAM facts
 

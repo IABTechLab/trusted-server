@@ -3,7 +3,7 @@
 use core::fmt;
 
 use edgezero_core::body::Body as EdgeBody;
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use http::{HeaderValue, Response, header};
 use sha2::{Digest as _, Sha256};
 

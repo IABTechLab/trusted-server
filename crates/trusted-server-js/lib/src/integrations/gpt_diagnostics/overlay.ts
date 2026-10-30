@@ -190,6 +190,26 @@ function creativeFailureFact(
       return 'Creative bridge failure: invalid cache payload';
     case 'response_post_failed':
       return 'Creative bridge failure: response post failed';
+    case 'aps_bad_hash':
+      return 'APS render failure: renderer frame received no nonce';
+    case 'aps_nonce_mismatch':
+      return 'APS render failure: renderer nonce mismatch';
+    case 'aps_descriptor_keys':
+      return 'APS render failure: descriptor key set rejected';
+    case 'aps_descriptor_fields':
+      return 'APS render failure: descriptor fields rejected';
+    case 'aps_descriptor_envelope':
+      return 'APS render failure: descriptor envelope rejected';
+    case 'aps_runner_script_error':
+      return 'APS render failure: Amazon runner script failed to load';
+    case 'aps_frame_timeout':
+      return 'APS render failure: renderer frame never acknowledged';
+    case 'aps_frame_load_error':
+      return 'APS render failure: renderer frame raised a load error (rare; an HTTP error on the renderer route reports a timeout instead)';
+    case 'aps_frame_reported_failure':
+      return 'APS render failure: renderer frame reported an unlabelled failure';
+    case 'aps_unknown':
+      return 'APS render failure: unknown';
   }
 }
 

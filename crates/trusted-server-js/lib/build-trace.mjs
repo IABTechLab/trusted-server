@@ -10,6 +10,7 @@ export async function buildTraceAssets(outDir) {
   await build({
     configFile: false,
     root: library,
+    css: { postcss: {} },
     build: {
       emptyOutDir: false,
       outDir,

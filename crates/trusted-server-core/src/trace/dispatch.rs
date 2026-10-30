@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
-use edgezero_core::request::RequestIngress;
+use edgezero_core::ingress::RequestIngress;
 use edgezero_core::router::PreDispatchHook;
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use trusted_server_js::trace_assets::trace_asset;
@@ -21,14 +21,27 @@ use crate::integrations::gpt_diagnostics::{
 use crate::platform::{ClientInfo, GeoInfo};
 use crate::settings::{Settings, TrustedClientIpConfig};
 
-/// Immutable incoming-cookie gate captured before ordinary request preparation.
+/// Immutable trace state captured before ordinary request preparation.
 #[derive(Clone, Copy, Debug)]
 pub struct TraceCaptureGate {
     cookies: TraceCookies,
     base_active: bool,
+    client_ip: Option<IpAddr>,
 }
 
 impl TraceCaptureGate {
+    /// Return the authenticated reader address frozen before header sanitation.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let reader = gate.client_ip().or(runtime_client_ip);
+    /// ```
+    #[must_use]
+    pub fn client_ip(&self) -> Option<IpAddr> {
+        self.client_ip
+    }
+
     /// Return cookie health frozen at the runtime-visible request boundary.
     ///
     /// # Examples
@@ -136,6 +149,7 @@ impl TracePreDispatchHook {
                     );
                     request.extensions_mut().insert(TraceCaptureGate {
                         base_active: cookies.observed_active(),
+                        client_ip: forwarded_client_ip,
                         cookies,
                     });
                 }
@@ -594,7 +608,7 @@ mod tests {
         let metadata = Arc::new(AtomicUsize::new(0));
         let handler_calls = Arc::clone(&ordinary);
         let router = RouterService::builder()
-            .pre_dispatch_hook(Arc::new(hook(true, Arc::clone(&metadata))))
+            .pre_dispatch_hook_arc(Arc::new(hook(true, Arc::clone(&metadata))))
             .middleware(OrdinaryLifecycleCounter(Arc::clone(&ordinary)))
             .route("/{*rest}", Method::GET, move |_context: RequestContext| {
                 let handler_calls = Arc::clone(&handler_calls);

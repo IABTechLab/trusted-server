@@ -1,6 +1,6 @@
 //! Read-only health inspection of runtime-visible Cookie fields.
 
-use edgezero_core::request::{Preservation, RequestIngress};
+use edgezero_core::ingress::{Preservation, RequestIngress};
 use http::{HeaderMap, header};
 
 use crate::ec::generation::is_valid_ec_id;
@@ -161,7 +161,7 @@ mod tests {
     use super::*;
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use edgezero_core::request::{
+    use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, Preservation, RequestIngress, TargetUnavailable,
     };
     use http::{HeaderMap, HeaderValue, header};
@@ -197,8 +197,8 @@ mod tests {
             CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
             None,
             common,
-            overrides,
         )
+        .with_header_overrides(overrides)
         .expect("should construct distinct field fidelity overrides")
     }
 

@@ -37,6 +37,8 @@ use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 #[cfg(test)]
 const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
+    #[cfg(feature = "test-utils")]
+    crate::test_support::async_html_finalization::ID,
     "prebid",
     "aps",
     "adserver_mock",
@@ -339,6 +341,11 @@ fn validate_enabled_integrations(
     validate_prebid(settings, plan)?;
     validate_integration::<ApsConfig>(settings, "aps")?;
     validate_integration::<AdServerMockConfig>(settings, "adserver_mock")?;
+    #[cfg(feature = "test-utils")]
+    validate_integration::<crate::test_support::async_html_finalization::FixtureConfig>(
+        settings,
+        crate::test_support::async_html_finalization::ID,
+    )?;
     validate_integration::<TestlightConfig>(settings, "testlight")?;
     validate_integration::<NextJsIntegrationConfig>(settings, "nextjs")?;
     validate_integration::<PermutiveConfig>(settings, "permutive")?;

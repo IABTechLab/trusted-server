@@ -7,7 +7,7 @@ use crate::auction::telemetry::{AuctionTelemetrySink, NoopAuctionTelemetrySink};
 
 use super::{
     PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
-    PlatformSecretStore,
+    PlatformSecretStore, PlatformTimer,
 };
 
 /// Geographic information extracted from a request.
@@ -188,6 +188,8 @@ pub struct RuntimeServices {
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
+    /// Optional cooperative timer; absent on blocking host runtimes.
+    pub(crate) timer: Option<Arc<dyn PlatformTimer>>,
 }
 
 impl RuntimeServices {
@@ -213,6 +215,12 @@ impl RuntimeServices {
     #[must_use]
     pub fn builder() -> RuntimeServicesBuilder {
         RuntimeServicesBuilder::new()
+    }
+
+    /// Return the request's optional cooperative timer.
+    #[must_use]
+    pub fn timer(&self) -> Option<&dyn PlatformTimer> {
+        self.timer.as_deref()
     }
 
     /// Returns the config store service.
@@ -340,6 +348,7 @@ pub struct RuntimeServicesBuilder {
     geo: Option<Arc<dyn PlatformGeo>>,
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
+    timer: Option<Arc<dyn PlatformTimer>>,
 }
 
 impl RuntimeServicesBuilder {
@@ -355,7 +364,15 @@ impl RuntimeServicesBuilder {
             geo: None,
             auction_telemetry_sink: None,
             client_info: None,
+            timer: None,
         }
+    }
+
+    /// Set the cooperative timer for request-time yielding work.
+    #[must_use]
+    pub fn timer(mut self, timer: Arc<dyn PlatformTimer>) -> Self {
+        self.timer = Some(timer);
+        self
     }
 
     /// Set the config store implementation.
@@ -442,6 +459,7 @@ impl RuntimeServicesBuilder {
     #[must_use]
     pub fn build(self) -> RuntimeServices {
         RuntimeServices {
+            timer: self.timer,
             config_store: self
                 .config_store
                 .expect("should set config_store before building RuntimeServices"),

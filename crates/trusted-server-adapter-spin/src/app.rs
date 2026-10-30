@@ -10,7 +10,7 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
-use edgezero_core::request::{InboundOrigin, OriginSource};
+use edgezero_core::ingress::{InboundOrigin, OriginSource};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -714,6 +714,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 }
                 let mut ec_context = build_ec_context(&s.settings, &services, &req);
                 let auction = AuctionDispatch {
+                    integration_registry: &s.registry,
                     orchestrator: &s.orchestrator,
                     slots: s.settings.creative_opportunity_slots(),
                     registry: None,
@@ -837,6 +838,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             } else {
                 let mut ec_context = build_ec_context(&state.settings, &services, &req);
                 let auction = AuctionDispatch {
+                    integration_registry: &state.registry,
                     orchestrator: &state.orchestrator,
                     slots: state.settings.creative_opportunity_slots(),
                     registry: None,
@@ -883,7 +885,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
         let trace_state = Arc::clone(&state);
         let mut builder = RouterService::builder()
-            .pre_dispatch_hook(Arc::new(TracePreDispatchHook::new(
+            .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
                 Arc::clone(&state.settings),
                 Arc::new(move |request| trace_metadata(&trace_state, request)),
             )))
@@ -1156,7 +1158,8 @@ mod tests {
     fn normalize_spin_request_rejects_invalid_last_runtime_origin() {
         for value in [
             "ftp://publisher.example.com/article",
-            "https://publisher.example.com:invalid/article",
+            // Deliberately malformed port exercises runtime-origin rejection.
+            "https://publisher.example.com:invalid/article", // allow-domain: publisher.example.com:invalid
         ] {
             let mut req = request_with(&[
                 (
@@ -1234,17 +1237,14 @@ mod tests {
             ("host", "client-supplied.example.com"),
             ("x-forwarded-proto", "http"),
         ]);
-        req.extensions_mut().insert(
-            edgezero_core::request::RequestIngress::new(
-                edgezero_core::request::CapturedTarget::Unavailable(
-                    edgezero_core::request::TargetUnavailable::NotExposed,
+        req.extensions_mut()
+            .insert(edgezero_core::ingress::RequestIngress::new(
+                edgezero_core::ingress::CapturedTarget::Unavailable(
+                    edgezero_core::ingress::TargetUnavailable::NotExposed,
                 ),
                 None,
-                edgezero_core::request::HeaderFidelity::default(),
-                Vec::new(),
-            )
-            .expect("should freeze path-only runtime ingress"),
-        );
+                edgezero_core::ingress::HeaderFidelity::default(),
+            ));
 
         normalize_spin_request(&mut req);
         trusted_server_core::forwarder::prepare_trusted_forwarder(
@@ -1255,7 +1255,8 @@ mod tests {
         let info = trusted_server_core::http_util::RequestInfo::from_request(
             &req,
             &trusted_server_core::platform::ClientInfo::default(),
-        );
+        )
+        .expect("should accept trusted Spin request metadata");
         assert_eq!(
             info.scheme, "https",
             "should retain trusted Spin HTTPS scheme after forwarding sanitation"
@@ -1266,7 +1267,7 @@ mod tests {
         );
         assert!(
             req.extensions()
-                .get::<edgezero_core::request::RequestIngress>()
+                .get::<edgezero_core::ingress::RequestIngress>()
                 .expect("should retain original ingress")
                 .origin()
                 .is_none(),
@@ -1360,7 +1361,9 @@ mod tests {
             trusted_server_core::http_util::RequestInfo::from_request(
                 &req,
                 &ClientInfo::default(),
-            ).scheme,
+            )
+            .expect("should accept trusted Spin request metadata")
+            .scheme,
             "https",
             "should retain trusted runtime scheme"
         );

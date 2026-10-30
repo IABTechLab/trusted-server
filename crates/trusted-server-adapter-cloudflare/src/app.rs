@@ -556,6 +556,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             } else {
                 let mut ec_context = build_ec_context(&state.settings, &services, &req);
                 let auction = AuctionDispatch {
+                    integration_registry: &state.registry,
                     orchestrator: &state.orchestrator,
                     slots: state.settings.creative_opportunity_slots(),
                     registry: None,
@@ -599,7 +600,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
         let trace_state = Arc::clone(&state);
         let mut router = RouterService::builder()
-            .pre_dispatch_hook(Arc::new(TracePreDispatchHook::new(
+            .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
                 Arc::clone(&state.settings),
                 Arc::new(move |request| trace_metadata(&trace_state, request)),
             )))
@@ -730,6 +731,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let page_bids = make_handler(Arc::clone(&state), |s, services, req| async move {
             let mut ec_context = build_ec_context(&s.settings, &services, &req);
             let auction = AuctionDispatch {
+                integration_registry: &s.registry,
                 orchestrator: &s.orchestrator,
                 slots: s.settings.creative_opportunity_slots(),
                 registry: None,
@@ -1271,6 +1273,9 @@ mod trace_dispatch_tests {
                 request
                     .headers_mut()
                     .insert("cf-connecting-ip", HeaderValue::from_static("192.0.2.99"));
+                request
+                    .headers_mut()
+                    .insert("cf-ipcountry", HeaderValue::from_static("EX"));
                 let response =
                     block_on(router.oneshot(request)).expect("should render trace setup");
                 assert_eq!(
@@ -1286,6 +1291,11 @@ mod trace_dispatch_tests {
                 assert!(
                     html.contains(expected),
                     "should mask resolved client IP for {ip_header} with {forwarded_ip} and duplicate {duplicate:?}"
+                );
+                assert_eq!(
+                    html.contains("&quot;country&quot;:&quot;EX&quot;"),
+                    expected == "192.0.2.0/24",
+                    "should omit runtime country when the authenticated reader differs"
                 );
                 assert!(
                     !html.contains("fictional-client-secret"),

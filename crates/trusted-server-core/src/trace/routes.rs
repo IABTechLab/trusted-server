@@ -116,7 +116,7 @@ impl TraceDispatch {
         }
         // Private assets also retain their byte-derived validator. The shared
         // privacy helper removes validators from dynamic responses first.
-        let etag = format!("\"{:x}\"", Sha256::digest(bytes));
+        let etag = format!("\"{}\"", hex::encode(Sha256::digest(bytes)));
         response.headers_mut().insert(
             header::ETAG,
             HeaderValue::from_str(&etag).expect("should encode an ASCII SHA-256 ETag"),
@@ -204,7 +204,9 @@ fn reject(mut response: Response<EdgeBody>, head: bool) -> TracePreflight {
 
 /// Return whether the visible pathname is reserved for local trace handling.
 ///
-/// Encoded aliases are reserved for rejection and never become supported routes.
+/// Aliases still visible at dispatch are reserved for rejection. Runtime URL
+/// normalization may collapse aliases before this check; Cloudflare's WHATWG
+/// parsing can expose an exact route where Fastly retains a rejectable alias.
 /// No original-target metadata participates in this decision.
 ///
 /// # Examples
@@ -401,16 +403,14 @@ fn classify_path(path: &str) -> Classification {
 mod tests {
     use super::*;
 
-    use std::sync::{Mutex, Once};
-
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use http::{HeaderValue, header};
-    use log::{LevelFilter, Log, Metadata, Record};
     use serde_json::json;
 
     use crate::auth::EdgeTerminatedAuthorization;
     use crate::cache_policy::EDGE_CACHE_HEADER_NAMES;
     use crate::settings::Handler;
+    use crate::test_support::logging::WarningCapture;
     use crate::test_support::tests::create_test_settings;
     use crate::trace::TraceTerminalResponse;
 
@@ -770,36 +770,9 @@ mod tests {
         }
     }
 
-    struct CapturedLogs(Mutex<Vec<String>>);
-
-    impl Log for CapturedLogs {
-        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
-            true
-        }
-        fn log(&self, record: &Record<'_>) {
-            let message = record.args().to_string();
-            if message == "trace_auth_failed"
-                || message.contains("fictional-secret-sentinel")
-                || message == "Basic auth failed for path: /ordinary-example-sentinel"
-            {
-                let mut logs = self.0.lock().expect("should capture log messages");
-                if logs.len() < 3 && !logs.contains(&message) {
-                    logs.push(message);
-                }
-            }
-        }
-        fn flush(&self) {}
-    }
-
-    static LOGS: CapturedLogs = CapturedLogs(Mutex::new(Vec::new()));
-    static LOG_INIT: Once = Once::new();
-
     #[test]
     fn trace_auth_failure_logs_a_fixed_category_without_the_path() {
-        LOG_INIT.call_once(|| {
-            log::set_logger(&LOGS).expect("should install the test logger");
-            log::set_max_level(LevelFilter::Warn);
-        });
+        let warnings = WarningCapture::start();
         let mut request = request(Method::GET, "/_ts/trace/fictional-secret-sentinel", false);
         request.headers_mut().insert(
             header::AUTHORIZATION,
@@ -815,7 +788,11 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "should authenticate before reporting the reserved path error"
         );
-        let logs = LOGS.0.lock().expect("should inspect captured messages");
+        let logs: Vec<String> = warnings
+            .take()
+            .into_iter()
+            .map(|warning| warning.message)
+            .collect();
         assert!(
             logs.iter().any(|message| message == "trace_auth_failed"),
             "should emit only a fixed diagnostic category"
@@ -825,7 +802,6 @@ mod tests {
                 .all(|message| !message.contains("fictional-secret-sentinel")),
             "should not log the confidential trace path"
         );
-        drop(logs);
         let mut ordinary = self::request(Method::GET, "/ordinary-example-sentinel", false);
         ordinary.headers_mut().insert(
             header::AUTHORIZATION,
@@ -838,11 +814,8 @@ mod tests {
             "should retain ordinary credential rejection"
         );
         assert!(
-            LOGS.0
-                .lock()
-                .expect("should inspect ordinary auth messages")
-                .iter()
-                .any(|message| message == "Basic auth failed for path: /ordinary-example-sentinel"),
+            warnings.take().iter().any(|warning| warning.message
+                == "Basic auth failed for path: /ordinary-example-sentinel"),
             "should retain ordinary path logging outside trace"
         );
         let body = response

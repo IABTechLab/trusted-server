@@ -36,7 +36,8 @@ jobs:
       - name: Generate integration Viceroy configs
         run: |
           ./scripts/generate-integration-viceroy-configs.sh
-          INTEGRATION_APP_CONFIG_PATH=crates/trusted-server-integration-tests/fixtures/configs/trusted-server.trace.toml INTEGRATION_BIDDER_ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" ARTIFACTS_DIR="$ARTIFACTS_DIR/trace" ./scripts/generate-integration-viceroy-configs.sh
+          trace_bidder_origin=http://127.0.0.1
+          INTEGRATION_APP_CONFIG_PATH=crates/trusted-server-integration-tests/fixtures/configs/trusted-server.trace.toml INTEGRATION_BIDDER_ORIGIN_URL="$trace_bidder_origin:$ORIGIN_PORT" ARTIFACTS_DIR="$ARTIFACTS_DIR/trace" ./scripts/generate-integration-viceroy-configs.sh
           INTEGRATION_APP_CONFIG_PATH=crates/trusted-server-integration-tests/fixtures/configs/trusted-server.trace-auth.toml ARTIFACTS_DIR="$ARTIFACTS_DIR/trace-auth" ./scripts/generate-integration-viceroy-configs.sh
         env:
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
@@ -92,11 +93,6 @@ jobs:
 
       - name: Load integration test Docker images
         run: docker load --input "$DOCKER_ARTIFACT_PATH"
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ steps.shared-setup.outputs.node-version }}
 
       - name: Install wrangler
         run: npm install -g wrangler
@@ -159,7 +155,9 @@ jobs:
   trace-runtime-tests:
     name: trace runtime and browser acceptance
     needs: prepare-artifacts
-    runs-on: ubuntu-latest
+    # Pinned for the same reason as the browser integration tests job below:
+    # Playwright cannot install chromium on the ubuntu-latest 26.04 image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -206,11 +204,22 @@ jobs:
 
       - name: Install the verified Spin runtime
         run: |
+          spin_version=$(awk '$1 == "spin" { print $2; exit }' .tool-versions)
+          case "$spin_version" in
+            4.1.0) spin_sha256=aeeb892f94cf861f5302546faa0bdaa82cc4be30539621299746a6dc011f3b5a ;;
+            *) echo "::error::No verified Spin checksum for pin '$spin_version'; update the installer with .tool-versions"; exit 1 ;;
+          esac
           trace_spin_dir="$RUNNER_TEMP/trace-spin"
           mkdir -p "$trace_spin_dir"
-          curl --fail --location --silent --show-error https://github.com/spinframework/spin/releases/download/v4.0.0/spin-v4.0.0-linux-amd64.tar.gz --output "$trace_spin_dir/spin.tar.gz"
-          echo "e705c9bfd9484a9175f392a116856680862a40f31d1a85618bed331f34ffccfa  $trace_spin_dir/spin.tar.gz" | sha256sum --check --strict
+          curl --fail --location --silent --show-error "https://github.com/spinframework/spin/releases/download/v${spin_version}/spin-v${spin_version}-linux-amd64.tar.gz" --output "$trace_spin_dir/spin.tar.gz"
+          echo "$spin_sha256  $trace_spin_dir/spin.tar.gz" | sha256sum --check --strict
           tar -xzf "$trace_spin_dir/spin.tar.gz" -C "$trace_spin_dir" spin
+          installed_version=$("$trace_spin_dir/spin" --version)
+          if [[ "$installed_version" != "spin $spin_version "* ]]; then
+            echo "::error::Expected Spin $spin_version from .tool-versions; found $installed_version"
+            exit 1
+          fi
+          echo "$installed_version"
           echo "$trace_spin_dir" >> "$GITHUB_PATH"
 
       - name: Build the production Spin component
@@ -237,7 +246,13 @@ jobs:
   browser-tests:
     name: browser integration tests
     needs: prepare-artifacts
-    runs-on: ubuntu-latest
+    # Pinned rather than floating on ubuntu-latest, which moved to 26.04 and
+    # fails at `playwright install` with "Playwright does not support chromium
+    # on ubuntu26.04-x64". Every browser test then fails in milliseconds because
+    # no browser was installed. Other jobs are unaffected: the Axum job obtains
+    # Chrome through browser-actions/setup-chrome, which works on 26.04. Unpin
+    # once the pinned Playwright version supports the newer image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

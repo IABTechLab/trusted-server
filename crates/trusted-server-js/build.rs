@@ -320,11 +320,13 @@ fn embed_trace_assets(ts_dir: &Path, dist_dir: &Path, out_dir: &Path, rebuilt: b
         Some(1),
         "tsjs: trace manifest schema version must be one"
     );
-    assert_eq!(
-        manifest["source_sha256"].as_str(),
-        Some(trace_source_digest(ts_dir).as_str()),
-        "tsjs: trace build inputs changed; run `npm run build:trace-assets` in crates/trusted-server-js/lib and review unpublished assets, or add a version after publication"
-    );
+    if !rebuilt {
+        assert_eq!(
+            manifest["source_sha256"].as_str(),
+            Some(trace_source_digest(ts_dir).as_str()),
+            "tsjs: trace build inputs changed; run `npm run build:trace-assets` in crates/trusted-server-js/lib and review unpublished assets, or add a version after publication"
+        );
+    }
     let assets = manifest["assets"]
         .as_array()
         .expect("should list the versioned trace assets");

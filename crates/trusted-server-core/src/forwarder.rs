@@ -170,7 +170,7 @@ pub(crate) fn public_origin<B>(request: &Request<B>) -> Option<&PublicOrigin> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use edgezero_core::request::{
+    use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
         TargetUnavailable,
     };
@@ -212,7 +212,8 @@ mod tests {
         let original_uri = request.uri().clone();
         prepare_trusted_forwarder(&mut request, &settings());
 
-        let info = RequestInfo::from_request(&request, &ClientInfo::default());
+        let info = RequestInfo::from_request(&request, &ClientInfo::default())
+            .expect("should accept request metadata");
         assert_eq!(
             info.host, "publisher.example.com:8443",
             "should retain the public port"
@@ -341,7 +342,8 @@ mod tests {
                 !request.headers().contains_key(FORWARDER_AUTH_HEADER),
                 "should strip credentials on rejection"
             );
-            let info = RequestInfo::from_request(&request, &ClientInfo::default());
+            let info = RequestInfo::from_request(&request, &ClientInfo::default())
+                .expect("should accept request metadata");
             assert_eq!(
                 info.host, "upstream.example.com",
                 "should fall back to received Host"
@@ -394,7 +396,8 @@ mod tests {
             !request.headers().contains_key(FORWARDER_AUTH_HEADER),
             "should remove the known credential header even when disabled"
         );
-        let info = RequestInfo::from_request(&request, &ClientInfo::default());
+        let info = RequestInfo::from_request(&request, &ClientInfo::default())
+            .expect("should accept request metadata");
         assert_eq!(
             info.host, "upstream.example.com",
             "should ignore spoofed forwarding"
@@ -439,9 +442,7 @@ mod tests {
                         .expect("should construct immutable transport origin"),
                 ),
                 HeaderFidelity::default(),
-                vec![],
-            )
-            .expect("should retain unavailable target and fidelity");
+            );
             let original_fidelity = ingress.header_fidelity(&header::COOKIE);
             request.extensions_mut().insert(ingress);
             request.headers_mut().insert(
@@ -493,7 +494,8 @@ mod tests {
                 !health.observed_active(),
                 "should never treat folded cookies as a verified session"
             );
-            let info = RequestInfo::from_request(&request, &ClientInfo::default());
+            let info = RequestInfo::from_request(&request, &ClientInfo::default())
+                .expect("should accept request metadata");
             assert_eq!(
                 info.host,
                 if accepted {

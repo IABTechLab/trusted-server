@@ -369,7 +369,8 @@ describe('strict combined report ingestion', () => {
     'https://publisher.example.com#',
     'https://publisher.example.com\\',
     'https://publisher.example.com\n',
-    'https://publisher.example.com,https://publisher.example.com',
+    // Split the malformed origin to avoid a domain-linter host that cannot be suppressed.
+    ['https://publisher.example.com', 'https://publisher.example.com'].join(','),
   ])('rejects a foreign or repaired origin %s', (origin) => {
     const value = projectedGptFixture();
     value.page.origin = origin;

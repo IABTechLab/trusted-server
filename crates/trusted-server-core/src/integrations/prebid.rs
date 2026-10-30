@@ -3964,6 +3964,7 @@ mod tests {
 
     fn make_request_info(context: &AuctionContext<'_>) -> RequestInfo {
         RequestInfo::from_request(context.request, context.services.client_info())
+            .expect("should extract valid test request info")
     }
 
     fn config_from_settings(

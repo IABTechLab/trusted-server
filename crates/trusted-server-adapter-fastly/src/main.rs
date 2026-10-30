@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
-use edgezero_adapter_fastly::request::{capture_request_ingress, into_core_request_with_ingress};
+use edgezero_adapter_fastly::request::into_core_request;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
@@ -169,9 +169,8 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
     // The framework counts the callback before invoking it, including early
     // returns, so this is already this request's 1-based ordinal.
     let ordinal = sandbox.requests();
-    // Captured before any native mutation, and before the health probe, so
-    // trace-path decisions and ingress facts describe the request as received.
-    let ingress = capture_request_ingress(&req);
+    // Classified before any native mutation, and before the health probe, so
+    // trace-path decisions describe the request as received.
     let trace_path = is_trace_path(req.get_path());
 
     // Health probe bypasses logging, settings, and app construction as a cheap liveness signal.
@@ -204,7 +203,7 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{}-{ordinal}", instance_id()));
 
-    edgezero_main(req, sandbox, ordinal, &request_id, ingress, trace_path);
+    edgezero_main(req, sandbox, ordinal, &request_id, trace_path);
 }
 
 /// Builds the counters snapshot response.
@@ -332,7 +331,6 @@ fn edgezero_main(
     sandbox: &mut Sandbox,
     ordinal: u64,
     request_id: &str,
-    ingress: edgezero_core::request::RequestIngress,
     trace_path: bool,
 ) {
     let runtime_stores = RuntimeStoreConfig::logical();
@@ -483,7 +481,7 @@ fn edgezero_main(
     // Dispatch directly through the EdgeZero router without an intermediate
     // fastly::Response conversion. That preserves duplicate header values such
     // as multiple Set-Cookie headers.
-    let mut response = match into_core_request_with_ingress(req, ingress) {
+    let mut response = match into_core_request(req) {
         Ok(mut core_req) => {
             if let Some(forwarder) = forwarder {
                 core_req.extensions_mut().insert(forwarder);
@@ -907,7 +905,7 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder;
     use edgezero_core::http::{HeaderValue, Method, StatusCode};
-    use edgezero_core::request::{
+    use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
         TargetUnavailable,
     };
@@ -1092,22 +1090,18 @@ mod tests {
                     "x-ts-trace-action",
                     HeaderValue::from_str(action).expect("should encode fixed action"),
                 );
-                request.extensions_mut().insert(
-                    RequestIngress::new(
-                        CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
-                        Some(
-                            InboundOrigin::parse(
-                                "https",
-                                "publisher.example.com",
-                                OriginSource::RuntimeUri,
-                            )
-                            .expect("should validate fictional runtime origin"),
-                        ),
-                        HeaderFidelity::default(),
-                        vec![],
-                    )
-                    .expect("should freeze trusted runtime origin"),
-                );
+                request.extensions_mut().insert(RequestIngress::new(
+                    CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                    Some(
+                        InboundOrigin::parse(
+                            "https",
+                            "publisher.example.com",
+                            OriginSource::RuntimeUri,
+                        )
+                        .expect("should validate fictional runtime origin"),
+                    ),
+                    HeaderFidelity::default(),
+                ));
             }
             let mut response = futures::executor::block_on(
                 edgezero_core::router::PreDispatchHook::handle(&hook, &mut request),
@@ -1193,9 +1187,7 @@ mod tests {
         ] {
             let req = FastlyRequest::get(url);
             let native = is_trace_path(req.get_path());
-            let ingress = capture_request_ingress(&req);
-            let core = into_core_request_with_ingress(req, ingress)
-                .expect("should convert the native request");
+            let core = into_core_request(req).expect("should convert the native request");
 
             assert_eq!(
                 is_trace_path(core.uri().path()),

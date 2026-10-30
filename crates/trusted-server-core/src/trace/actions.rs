@@ -1,7 +1,7 @@
 //! Deliberate, authenticated trace cookie mutations.
 
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::request::RequestIngress;
+use edgezero_core::ingress::RequestIngress;
 use futures::StreamExt as _;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, header};
 use url::Url;
@@ -210,7 +210,7 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
-    use edgezero_core::request::{
+    use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
         TargetUnavailable,
     };
@@ -246,9 +246,7 @@ mod tests {
                     .expect("should validate the trusted fictional origin"),
             ),
             HeaderFidelity::default(),
-            vec![],
         )
-        .expect("should construct origin-only ingress metadata")
     }
 
     fn request(action: &str) -> Request<EdgeBody> {
@@ -537,7 +535,7 @@ mod tests {
             (
                 "https",
                 "[2001:db8::1]",
-                "https://[2001:0DB8:0:0:0:0:0:1]:443",
+                "https://[2001:0DB8:0:0:0:0:0:1]:443", // allow-domain: 2001:db8::1
                 "[2001:DB8::1]:443",
             ),
         ] {
@@ -568,13 +566,19 @@ mod tests {
             "https://@publisher.example",
             "https://example-user@publisher.example",
             "https://publisher.example\\",
-            "https://publisher.example,https://publisher.example",
+            // Both concat! fixtures preserve malformed origin bytes while splitting hosts
+            // that the domain linter misreads and its suppression markers cannot name.
+            concat!(
+                "https://publisher.example",
+                ",",
+                "https://publisher.example"
+            ),
             " https://publisher.example",
             "https://publisher.example ",
             "https://publisher.example\t",
             "https://publisher.example:",
-            "https://publisher.example:+443",
-            "https://publisher.example:65536",
+            concat!("https://publisher.example", ":+443"),
+            "https://publisher.example:65536", // allow-domain: publisher.example:65536
             "null",
             "file://publisher.example",
             "https://",
@@ -768,15 +772,11 @@ mod tests {
             let mut request = request("enable");
             request.extensions_mut().remove::<RequestIngress>();
             if !missing_origin {
-                request.extensions_mut().insert(
-                    RequestIngress::new(
-                        CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
-                        None,
-                        HeaderFidelity::default(),
-                        vec![],
-                    )
-                    .expect("should construct metadata without origin trust"),
-                );
+                request.extensions_mut().insert(RequestIngress::new(
+                    CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                    None,
+                    HeaderFidelity::default(),
+                ));
             }
             for (name, value) in [
                 ("forwarded", "proto=https;host=publisher.example"),

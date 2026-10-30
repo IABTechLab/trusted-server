@@ -33,12 +33,13 @@ Supporting files: `edgezero.toml`, `fastly.toml`,
 
 | Tool        | Version / Target                         |
 | ----------- | ---------------------------------------- |
-| Rust        | 1.95.0 (pinned in `rust-toolchain.toml`) |
+| Rust        | 1.98.1 (pinned in `rust-toolchain.toml`) |
 | WASM target | `wasm32-wasip1`                          |
-| Node        | 24.12.0 (from `.tool-versions`)          |
-| Fastly CLI  | 15.1.0 (from `.tool-versions`)           |
-| Viceroy     | 0.17.0 (from `.tool-versions`)           |
-| Wasmtime    | 44.0.1 (from `.tool-versions`)           |
+| Node        | 24.20.0 (from `.tool-versions`)          |
+| Fastly CLI  | 16.0.0 (from `.tool-versions`)           |
+| Viceroy     | 0.21.0 (from `.tool-versions`)           |
+| Wasmtime    | 48.0.1 (from `.tool-versions`)           |
+| Spin        | 4.1.0 (from `.tool-versions`)            |
 | AWS CLI     | 2.36.45 (from `.tool-versions`)          |
 | Terraform   | 1.16.2 (from `.tool-versions`)           |
 
@@ -158,7 +159,7 @@ cd crates/trusted-server-js/lib && node build-all.mjs
 ### Install prerequisites
 
 ```bash
-cargo install viceroy --version 0.17.0 --locked --force
+cargo install viceroy --version 0.21.0 --locked --force
 ```
 
 ---
@@ -289,10 +290,17 @@ impl core::error::Error for MyError {}
 ## Other guidelines
 
 - Use only example or fictional information in comments, tests, docs, examples,
-  and similar non-runtime materials. (eg. for urls use: example.com domains only)
+  and similar non-runtime materials. (e.g. use example.com for URLs by default)
 - Do not write or commit real domains, customer names, credentials,
   configuration values, or other potentially sensitive real-world information in
   comments, tests, docs, or examples.
+- The one exception is hosts. A real host may appear when the URL-host
+  allowlist in `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
+  covers it or the line carries an `allow-domain: <host>` suppression comment.
+  Use the file's comment syntax: `//`, `#`, `<!-- -->`, or `*` followed by
+  whitespace. New allowlist entries need a justification comment and review
+  under the [allowlist maintenance policy](docs/superpowers/specs/2026-05-18-check-domains-design.md#allowlist-maintenance-policy).
+  Per-line suppressions also need review.
 
 ---
 
@@ -345,7 +353,7 @@ IntegrationRegistration::builder(ID)
 | `fastly.toml`                 | Fastly service configuration and build settings                                                   |
 | `trusted-server.example.toml` | Source-controlled Trusted Server app-config template                                              |
 | `trusted-server.toml`         | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
-| `rust-toolchain.toml`         | Pins Rust version to 1.95.0                                                                       |
+| `rust-toolchain.toml`         | Pins Rust version to 1.98.1                                                                       |
 | `.env.dev`                    | Local development environment variables                                                           |
 
 ---
@@ -364,6 +372,16 @@ Every PR must pass:
 8. Markdown format outside `docs/` (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"`; fix with `--write` in place of `--check`
 9. Native core build-digest test and lint (`cargo test -p trusted-server-core --test template_build_digest` and `cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings`)
 10. Wasm clock lint: `scripts/lint-wasm-clock.sh` (crates built into the Cloudflare Worker must use `web_time`, not the `std::time::{Instant,SystemTime}` `now`/`elapsed` methods, which panic there)
+11. Documentation proposal scripts: `shellcheck scripts/docs-proposal/*.sh && node --test scripts/docs-proposal/hunks.test.mjs && scripts/docs-proposal/test.sh`
+12. URL-host linter on lines the PR adds (`lint-domains` job, PRs only); run it locally with `cargo run --manifest-path crates/trusted-server-cli/Cargo.toml --target <host-triple> --bin ts -- dev lint domains --changed-vs origin/main`, using the PR's base branch in place of `main` when it targets another branch
+13. CI Node pin guard: `node --test scripts/check-ci-node-pin.test.mjs && node scripts/check-ci-node-pin.mjs` with the `.tool-versions` Node (every CI job that compiles Rust sets up the `.tool-versions` Node before its first cargo step)
+
+CI also runs these HTML EOF checks. Run them locally only when changing EOF
+finalization, publisher or HTML-processor code:
+
+- Native Rust HTML EOF harness configuration, timing and cleanup: `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime` and `cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime -- -D warnings`
+- Actual Axum EOF/auction controls: `./scripts/async-html-finalization-local-test.sh axum --auction`
+- Actual Fastly EOF/auction controls with repository-pinned Viceroy (the fixture requires 0.19+): `./scripts/async-html-finalization-local-test.sh fastly --release --auction`. The auction control checks empty-bid assembly with a deliberately unreachable bidder. See `scripts/README.md` for retained diagnostics and other runtimes.
 
 ---
 
