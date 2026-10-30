@@ -46,7 +46,7 @@ See [Prebid integration](./prebid) and [GDPR compliance](/guide/gdpr-compliance)
 | Lockr                                                           | Omits Cookie; forwards selected standard headers and client `x-*` headers except TS-internal names; the SDK supplies selected identity data in its `firstPartyCookies` body |
 | Permutive                                                       | Copies selected standard headers and client `x-*` headers except TS-internal names; excludes Cookie                                                                         |
 | Didomi, DataDome SDK and browser API proxy                      | Copy curated request headers that exclude Cookie                                                                                                                            |
-| GTM, GPT, Testlight, generic third-party proxy, and asset proxy | Default forwarded-header sets exclude Cookie                                                                                                                                |
+| GTM, GPT, Testlight, `/first-party/proxy`, JS and asset proxies | Forward fixed header allowlists that exclude Cookie                                                                                                                         |
 | Sourcepoint                                                     | Uses its own partner-specific allowlist, described below                                                                                                                    |
 | Ad server mock mediator and EC partner pull sync                | Construct fresh requests without copying the browser Cookie header                                                                                                          |
 | Publisher origin                                                | Preserves browser cookies for the publisher application                                                                                                                     |
@@ -55,9 +55,10 @@ See [Prebid integration](./prebid) and [GDPR compliance](/guide/gdpr-compliance)
 
 The table describes raw `Cookie` headers. Some upstream contracts also carry selected identity values separately:
 
-- The generic proxy adds the resolved EC ID as a `ts-ec` query parameter by default; routes can disable this with `forward_ec_id`.
-- Click redirects add the resolved EC ID as a `ts-ec` query parameter on the target URL.
-- Testlight puts the resolved EC ID into its rewritten request body and disables the generic proxy's EC query parameter.
+- The `/first-party/proxy` creative proxy adds the request's EC ID, read from the `x-ts-ec` header or else the `ts-ec` cookie, as a `ts-ec` query parameter. GTM, GPT, Testlight, the JS asset proxy, and the Prebid bundle fetch turn this off in code; it is not an operator setting.
+- Click redirects add the request's EC ID as a `ts-ec` query parameter on the target URL.
+- Testlight puts the `ts-ec` cookie value into its rewritten request body as `user.id`.
+- EC partner pull sync sends the EC ID to the partner as an `ec_id` query parameter.
 
 These selected-value contracts are independent of the PBS cookie allowlist; excluding an identity cookie from a raw header does not remove its other uses.
 
@@ -81,7 +82,7 @@ Operators can additionally configure one custom Sourcepoint authentication cooki
 
 ### DataDome Protection
 
-The server-side DataDome protection request extracts the `datadome` cookie as a client identifier when an explicit client-ID header is absent. It also sends the total inbound Cookie header length as `CookiesLen`. It does not send the full browser Cookie header or unrelated cookie values through those fields.
+The server-side DataDome protection request extracts the `datadome` cookie as a client identifier when an explicit client-ID header is absent. It also sends the length of the selected inbound Cookie header value as `CookiesLen`. It does not send the full browser Cookie header or unrelated cookie values through those fields.
 
 ### Publisher Origin and Browser Requests
 

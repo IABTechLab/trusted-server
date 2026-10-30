@@ -142,15 +142,6 @@ pub enum ConsentForwardingMode {
 }
 
 impl ConsentForwardingMode {
-    /// Whether consent cookies should be stripped from forwarded requests.
-    ///
-    /// Returns `true` for [`OpenrtbOnly`](Self::OpenrtbOnly) since consent
-    /// travels exclusively through the request body in that mode.
-    #[must_use]
-    pub const fn strips_consent_cookies(self) -> bool {
-        matches!(self, Self::OpenrtbOnly)
-    }
-
     /// Whether consent fields should be included in the request body.
     ///
     /// Returns `true` for [`OpenrtbOnly`](Self::OpenrtbOnly) and
@@ -421,24 +412,6 @@ mod tests {
         let config: ConsentConfig =
             serde_json::from_str(r#"{"mode": "proxy"}"#).expect("should deserialize proxy mode");
         assert_eq!(config.mode, ConsentMode::Proxy, "should parse proxy mode");
-    }
-
-    #[test]
-    fn consent_forwarding_mode_strips_cookies_only_for_openrtb() {
-        use super::ConsentForwardingMode;
-
-        assert!(
-            ConsentForwardingMode::OpenrtbOnly.strips_consent_cookies(),
-            "openrtb_only should strip consent cookies"
-        );
-        assert!(
-            !ConsentForwardingMode::CookiesOnly.strips_consent_cookies(),
-            "cookies_only should not strip consent cookies"
-        );
-        assert!(
-            !ConsentForwardingMode::Both.strips_consent_cookies(),
-            "both should not strip consent cookies"
-        );
     }
 
     #[test]

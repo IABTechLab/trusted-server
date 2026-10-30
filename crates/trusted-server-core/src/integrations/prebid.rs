@@ -2028,7 +2028,7 @@ fn copy_request_headers(
     client_ip: Option<std::net::IpAddr>,
 ) {
     apply_prebid_header_values(
-        from.headers().get(header::COOKIE),
+        &PrebidConsentCookies::from_header(from.headers().get(header::COOKIE)),
         from.headers().get(header::USER_AGENT),
         from.headers().get(header::REFERER),
         from.headers().get(header::ACCEPT_LANGUAGE),
@@ -2046,7 +2046,7 @@ pub(crate) fn apply_prebid_transport_headers(
     client_ip: Option<std::net::IpAddr>,
 ) {
     apply_prebid_header_values(
-        from.cookie(),
+        from.consent_cookies(),
         from.user_agent(),
         from.referer(),
         from.accept_language(),
@@ -2058,10 +2058,10 @@ pub(crate) fn apply_prebid_transport_headers(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the helper preserves four independently optional raw headers plus transport policy"
+    reason = "the helper preserves selected consent cookies, three independently optional raw headers, and transport policy"
 )]
 fn apply_prebid_header_values(
-    cookie: Option<&HeaderValue>,
+    consent_cookies: &PrebidConsentCookies,
     user_agent: Option<&HeaderValue>,
     referer: Option<&HeaderValue>,
     accept_language: Option<&HeaderValue>,
@@ -2091,8 +2091,8 @@ fn apply_prebid_header_values(
     if consent_forwarding == ConsentForwardingMode::OpenrtbOnly {
         return;
     }
-    if let Some(value) = PrebidConsentCookies::from_header(cookie).header {
-        to.headers_mut().insert(header::COOKIE, value);
+    if let Some(value) = consent_cookies.header() {
+        to.headers_mut().insert(header::COOKIE, value.clone());
     }
 }
 
@@ -2100,8 +2100,9 @@ fn apply_prebid_header_values(
 ///
 /// Unsafe values remain available only through the JSON body fallback. No raw
 /// cookie bytes are forwarded on a parsing or framing failure.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct PrebidConsentCookies {
-    pub(crate) header: Option<HeaderValue>,
+    header: Option<HeaderValue>,
     unsafe_tc: bool,
     unsafe_gpp: bool,
     unsafe_us_privacy: bool,
@@ -2109,16 +2110,14 @@ pub(crate) struct PrebidConsentCookies {
 
 impl PrebidConsentCookies {
     pub(crate) fn from_header(header: Option<&HeaderValue>) -> Self {
-        let mut result = Self {
-            header: None,
-            unsafe_tc: false,
-            unsafe_gpp: false,
-            unsafe_us_privacy: false,
+        let mut result = Self::default();
+        let Some(header) = header else {
+            return result;
         };
-        let Some(header) = header.and_then(|value| value.to_str().ok()) else {
-            result.unsafe_tc = header.is_some();
-            result.unsafe_gpp = header.is_some();
-            result.unsafe_us_privacy = header.is_some();
+        let Ok(header) = header.to_str() else {
+            result.unsafe_tc = true;
+            result.unsafe_gpp = true;
+            result.unsafe_us_privacy = true;
             return result;
         };
         let jar = parse_cookies_to_jar(header);
@@ -2154,6 +2153,11 @@ impl PrebidConsentCookies {
             }
         }
         result
+    }
+
+    /// The allowlisted consent `Cookie` header, if any consent cookie is safe to forward.
+    pub(crate) fn header(&self) -> Option<&HeaderValue> {
+        self.header.as_ref()
     }
 
     fn requires_body(&self) -> bool {
@@ -10089,6 +10093,45 @@ set = { networkId = 42 }
                 selected.requires_body(),
                 requires_body,
                 "should retain unrepresentable consent in the body for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prebid_cookie_fallback_carries_gdpr_applicability_only_with_tc_or_gpp() {
+        let context = crate::consent::ConsentContext {
+            raw_tc_string: Some("fictional-tcf".to_string()),
+            raw_gpp_string: Some("fictional-gpp".to_string()),
+            gpp_section_ids: Some(vec![2]),
+            raw_us_privacy: Some("1YNN".to_string()),
+            gdpr_applies: true,
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
+            source: crate::consent::ConsentSource::Cookie,
+            ..Default::default()
+        };
+        for (input, carries_gdpr) in [
+            ("euconsent-v2=bad\\value; __gpp=GPP; us_privacy=1YNN", true),
+            ("euconsent-v2=TC; __gpp=bad\\value; us_privacy=1YNN", true),
+            ("euconsent-v2=TC; __gpp_sid=2,; us_privacy=1YNN", true),
+            ("euconsent-v2=TC; __gpp=GPP; us_privacy=bad\\value", false),
+        ] {
+            let header = HeaderValue::from_str(input).expect("should build cookie header");
+            let selected = PrebidConsentCookies::from_header(Some(&header))
+                .body_consent(Some(&context), ConsentForwardingMode::CookiesOnly)
+                .expect("should fall back for the unsafe signal");
+
+            assert_eq!(
+                selected.gdpr_applies, carries_gdpr,
+                "should carry GDPR applicability only with TC or GPP for {input:?}"
+            );
+            assert_eq!(
+                selected.jurisdiction,
+                if carries_gdpr {
+                    crate::consent::jurisdiction::Jurisdiction::Gdpr
+                } else {
+                    crate::consent::jurisdiction::Jurisdiction::Unknown
+                },
+                "should carry jurisdiction only with TC or GPP for {input:?}"
             );
         }
     }

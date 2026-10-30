@@ -18,7 +18,6 @@ use super::routing::{
 };
 use super::types::{AdFormat, AdSlot, AuctionResponse, Bid};
 use crate::error::TrustedServerError;
-use crate::integrations::prebid::PrebidConsentCookies;
 use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs,
     RegsExt, Site, ToExt as _, TrustedServerExt, User, UserExt, to_openrtb_i32,
@@ -348,10 +347,10 @@ fn build_common_request(
     };
     let consent = common.user.consent.as_ref();
     let selected_consent = match policy {
-        ProfilePolicy::Prebid(plan) => {
-            PrebidConsentCookies::from_header(routed.prebid_transport_headers().cookie())
-                .body_consent(consent, plan.consent_forwarding)
-        }
+        ProfilePolicy::Prebid(plan) => routed
+            .prebid_transport_headers()
+            .consent_cookies()
+            .body_consent(consent, plan.consent_forwarding),
         _ => consent.map(std::borrow::Cow::Borrowed),
     };
     let body_consent = selected_consent.as_deref();
