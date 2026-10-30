@@ -939,6 +939,8 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nextjs_gtm_rejects_malformed_request_hosts() {
+    // A hostile `Host` is rejected. Unauthenticated forwarded fields are
+    // stripped before routing, so their hostile values never reach rewriting.
     for header in ["host", "x-forwarded-host", "forwarded"] {
         let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
             &nextjs_auction::script_composition_html(),
@@ -973,17 +975,18 @@ async fn nextjs_gtm_rejects_malformed_request_hosts() {
             .call(request)
             .await
             .expect("should respond to hostile host request");
+        let expected_status = if header == "host" { 400 } else { 200 };
         assert_eq!(
             response.status().as_u16(),
-            400,
-            "should reject malformed {header} rather than rewrite script source"
+            expected_status,
+            "should reject malformed Host and ignore unauthenticated {header}"
         );
-        let body = axum::body::to_bytes(response.into_body(), 1024)
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .expect("should consume host rejection response");
+            .expect("should consume hostile host response");
         assert!(
             !String::from_utf8_lossy(&body).contains(hostile_host),
-            "should not reflect the rejected host in the response"
+            "should not emit hostile {header} bytes in the response"
         );
     }
 }

@@ -11,6 +11,10 @@ use crate::settings::Settings;
 
 const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 
+/// Requests a fixed auth-failure category instead of logging a trace path.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TraceAuthLogPolicy;
+
 /// Marks the single `Authorization` value Trusted Server validated.
 ///
 /// The shared template cache may exempt this value from its normal authorization
@@ -119,7 +123,11 @@ pub fn enforce_basic_auth(
             .insert(EdgeTerminatedAuthorization(authorization_digest));
         Ok(None)
     } else {
-        log::warn!("Basic auth failed for path: {}", req.uri().path());
+        if req.extensions().get::<TraceAuthLogPolicy>().is_some() {
+            log::warn!("trace_auth_failed");
+        } else {
+            log::warn!("Basic auth failed for path: {}", req.uri().path());
+        }
         Ok(Some(unauthorized_response()))
     }
 }

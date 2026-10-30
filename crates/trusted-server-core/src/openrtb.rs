@@ -186,9 +186,22 @@ pub struct BidTrustedServerExt<'a> {
 #[derive(Debug, Serialize)]
 pub struct ResponseExt {
     pub orchestrator: OrchestratorExt,
+    /// Optional request-scoped trace transport under its own namespace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted_server: Option<TraceResponseExt>,
 }
 
 impl ToExt for ResponseExt {}
+
+/// Request-scoped trace data beside ordinary orchestration metadata.
+///
+/// The closed [`crate::trace::TraceAuctionTransportV1`] contains bounded evidence
+/// or its exclusive unavailable marker; provider payloads never use this type.
+#[derive(Debug, Serialize)]
+pub struct TraceResponseExt {
+    /// Checked evidence or its fixed projection-failure transport envelope.
+    pub trace_auction: crate::trace::TraceAuctionTransportV1,
+}
 
 #[cfg(test)]
 mod tests {
@@ -216,6 +229,7 @@ mod tests {
         };
 
         let ext = ResponseExt {
+            trusted_server: None,
             orchestrator: OrchestratorExt {
                 strategy: "parallel_only".to_owned(),
                 providers: 2,

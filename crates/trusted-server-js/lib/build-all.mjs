@@ -23,6 +23,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'vite';
 
+import { buildTraceAssets } from './build-trace.mjs';
 import { moduleBuildOptions } from './build-module-options.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -83,6 +84,8 @@ await buildModule('core', path.join(srcDir, 'core', 'index.ts'));
 await Promise.all(
   integrationModules.map((name) => buildModule(name, path.join(integrationsDir, name, 'index.ts')))
 );
+
+await buildTraceAssets(distDir);
 
 // List all built files
 const builtFiles = fs
