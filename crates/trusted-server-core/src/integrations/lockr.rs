@@ -487,13 +487,11 @@ mod tests {
             );
 
             assert_sdk_url_rewrite(integration.as_ref(), &case, "/integrations/lockr/sdk");
-            if matches {
-                assert_sdk_html_attribute_rewrite(
-                    integration.as_ref(),
-                    &case,
-                    "/integrations/lockr/sdk",
-                );
-            }
+            assert_sdk_html_attribute_rewrite(
+                integration.as_ref(),
+                &case,
+                "/integrations/lockr/sdk",
+            );
         }
     }
 

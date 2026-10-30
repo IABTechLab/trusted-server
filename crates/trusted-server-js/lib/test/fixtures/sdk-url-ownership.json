@@ -404,7 +404,8 @@
   {
     "name": "Lockr BOM whitespace",
     "url": "\ufeffhttps://aim.loc.kr/identity-lockr.js",
-    "owner": null
+    "owner": null,
+    "serverHtmlOwner": "lockr"
   },
   {
     "name": "Permutive NEL whitespace",

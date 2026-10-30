@@ -513,13 +513,11 @@ mod tests {
             );
 
             assert_sdk_url_rewrite(integration.as_ref(), &case, "/integrations/permutive/sdk");
-            if matches {
-                assert_sdk_html_attribute_rewrite(
-                    integration.as_ref(),
-                    &case,
-                    "/integrations/permutive/sdk",
-                );
-            }
+            assert_sdk_html_attribute_rewrite(
+                integration.as_ref(),
+                &case,
+                "/integrations/permutive/sdk",
+            );
         }
     }
 

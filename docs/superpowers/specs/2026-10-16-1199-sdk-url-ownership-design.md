@@ -51,12 +51,27 @@ guards.
 ### Input forms
 
 - Reject literal NULs in raw matcher inputs: HTML replaces them with U+FFFD,
-  unlike direct URL-property assignment, which can trim them. This prevents raw
-  HTML recognition from claiming a URL that the browser would not load as an SDK.
+  unlike direct URL-property assignment, which can trim them. A leading NUL
+  makes the markup URL a publisher-relative path, so rejecting it matches the
+  browser. A NUL after the authority can leave the vendor hostname and SDK
+  pathname intact: markup `//aim.loc.kr/<NUL>identity-lockr.js` loads
+  `https://aim.loc.kr/%EF%BF%BDidentity-lockr.js` from the vendor, while server
+  matching leaves it unowned. That fail-open case is accepted.
 - Before checking the prefix, apply the browser URL preprocessing rules: trim
   leading/trailing C0 controls and space (U+0001–U+0020), then remove tab, LF, and
   CR throughout the input. Do not trim Unicode whitespace such as U+FEFF or
   U+0085. These boundary cases remain in the shared corpus.
+- Server matching reads the attribute text lol_html returns, which differs from
+  what a browser resolves. Character references stay encoded, so
+  `https:&#x2F;&#x2F;aim.loc.kr&#x2F;identity-lockr.js` (mustache.js escapes `/`
+  this way) is not recognized and the browser loads the vendor SDK directly,
+  while `https://static.example.com&quest;@aim.loc.kr/identity-lockr.js` is
+  claimed although the browser loads another host. A leading U+FEFF is dropped,
+  so the "Lockr BOM whitespace" input is claimed in served HTML although a
+  browser resolves it as a publisher path. Reading decoded attribute values
+  belongs in the HTML processor, for every attribute rewriter, and is out of
+  scope here. Follow-up [#1480](https://github.com/IABTechLab/trusted-server/issues/1480)
+  tracks character-reference decoding and the leading-BOM discrepancy.
 - Require an explicit HTTP(S) scheme followed by two authority separators, or
   two separators for a protocol-relative URL. Each separator may be `/` or `\`,
   matching browser HTTP(S) backslash handling. Scheme matching is case-insensitive.
@@ -141,7 +156,9 @@ resolve them to absolute vendor URLs before insertion. On an `https:` publisher
 page, the same inputs resolve to publisher paths and remain unowned.
 Rust tests and raw browser claimant tests use `owner`; DOM insertion tests use
 `insertionOwner` when present. This distinguishes parser input policy from the
-browser's existing attribute-resolution behavior.
+browser's existing attribute-resolution behavior. An optional `serverHtmlOwner`
+records a different expectation once lol_html has read the attribute from
+markup; the Rust HTML tests use it when present.
 Use fictional publisher/customer data. Public vendor hosts are necessary here
 to test the actual hard-coded ownership rules, not illustrative customer URLs.
 Import the same fixture in Vitest and Rust's inline test modules using the
@@ -177,9 +194,10 @@ owner equals that integration. Run the corresponding JS guards against the
 same input URL so parser decisions cannot drift behind duplicated case lists.
 Also assert server attribute rewrite actions for matching and nonmatching cases,
 including `src` and `href`, while retaining disabled-rewrite coverage. Check
-attribute-routing eligibility before calling the rewriter. For owned corpus
-cases, also tokenize actual script/link markup with lol_html and assert the
-rewritten attributes in the output.
+attribute-routing eligibility before calling the rewriter. For every corpus
+case, also tokenize actual script/link markup with lol_html and assert the
+output: the SDK route when the case's server HTML owner is that integration,
+and the unchanged markup otherwise.
 
 ### All-guard ownership and insertion tests
 
@@ -262,20 +280,18 @@ common preprocessing policy. The shared corpus now contains 106 cases, including
 23 normalization positives and negatives. The all-guard test expands them into
 1,390 ownership and insertion checks across both handler orders and DOM paths.
 
-| Check                                                          | Result                                                                                                                                              |
-| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Full JS suite, `npx vitest run --maxWorkers=4`                 | Passed, 2,640 tests across 52 files; scoped Vitest type assertions pass                                                                             |
-| JS `npm run lint`, `npm run format`, `npm run build`           | Passed                                                                                                                                              |
-| Native Lockr and Permutive inline test modules                 | Passed, 11 and 9 tests, including the shared corpus and attribute rewriting                                                                         |
-| `cargo test-axum`, `cargo test-cloudflare`, `cargo test-spin`  | Passed; existing ignored tests remain ignored                                                                                                       |
-| `cargo test-fastly`, `cargo test-fastly-reuse`                 | Local reruns blocked before test execution: installed Viceroy 0.17.0 lacks `fastly_http_req::pending_req_header_insert`; the repository pins 0.21.0 |
-| Package-wide `npx tsc --noEmit -p .`                           | Still fails on pre-existing errors; comparison with the unchanged branch confirms the test-only `replaceAll` error was removed                      |
-| All eight target-specific clippy aliases listed in `AGENTS.md` | Passed                                                                                                                                              |
-| Integration parity test                                        | Passed                                                                                                                                              |
-| Native template build-digest tests and clippy                  | Passed                                                                                                                                              |
-| `cargo fmt --all -- --check`, wasm clock lint                  | Passed                                                                                                                                              |
-| Docs and repository Markdown formatting                        | Passed                                                                                                                                              |
-| URL-host lint on added lines                                   | Passed                                                                                                                                              |
+| Check                                                                                                         | Result                                                                                           |
+| ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Full JS suite, `npx vitest run --maxWorkers=4`                                                                | Passed, 2,640 tests across 52 files; scoped Vitest type assertions pass                          |
+| JS `npm run lint`, `npm run format`, `npm run build`                                                          | Passed                                                                                           |
+| Native Lockr and Permutive inline test modules                                                                | Passed, 11 and 9 tests, including the shared corpus and attribute rewriting                      |
+| `cargo test-fastly`, `cargo test-fastly-reuse`, `cargo test-axum`, `cargo test-cloudflare`, `cargo test-spin` | Passed (the Fastly aliases in CI with the pinned Viceroy); existing ignored tests remain ignored |
+| All eight target-specific clippy aliases listed in `AGENTS.md`                                                | Passed                                                                                           |
+| Integration parity test                                                                                       | Passed                                                                                           |
+| Native template build-digest tests and clippy                                                                 | Passed                                                                                           |
+| `cargo fmt --all -- --check`, wasm clock lint                                                                 | Passed                                                                                           |
+| Docs and repository Markdown formatting                                                                       | Passed                                                                                           |
+| URL-host lint on added lines                                                                                  | Passed                                                                                           |
 
 No live vendor SDK fetch or production deployment smoke test was performed.
 
