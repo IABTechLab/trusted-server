@@ -130,9 +130,9 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, handle_page_bids,
-    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
-    publisher_response_into_streaming_response,
+    AuctionDispatch, DeliveryCompression, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
+    PublisherAdapterOptions, handle_page_bids, handle_publisher_request, handle_tsjs_dynamic,
+    page_bids_preflight_denied, publisher_response_into_streaming_response,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -882,7 +882,10 @@ async fn dispatch_fallback(
                     &mut ec.ec_context,
                     auction,
                     req,
-                    EdgeCacheHeader::SurrogateControl,
+                    PublisherAdapterOptions {
+                        cache_header: EdgeCacheHeader::SurrogateControl,
+                        delivery_compression: DeliveryCompression::Dynamic,
+                    },
                 )
                 .await
                 {

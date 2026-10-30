@@ -501,9 +501,9 @@ fn set_response_compression(response: &mut Response<EdgeBody>, compression: Comp
         .iter()
         .any(|value| {
             value.to_str().is_ok_and(|value| {
-                value
-                    .split(',')
-                    .any(|name| name.trim().eq_ignore_ascii_case("accept-encoding"))
+                value.split(',').any(|name| {
+                    name.trim() == "*" || name.trim().eq_ignore_ascii_case("accept-encoding")
+                })
             })
         });
     if !varies_on_encoding {
@@ -512,6 +512,31 @@ fn set_response_compression(response: &mut Response<EdgeBody>, compression: Comp
             .append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     }
     response.headers_mut().remove(header::CONTENT_LENGTH);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DynamicDeliveryCompression;
+
+fn enable_delivery_compression(response: &mut Response<EdgeBody>) {
+    response.extensions_mut().insert(DynamicDeliveryCompression);
+    enforce_delivery_compression(response);
+}
+
+/// Restores the selected delivery-compression contract after late header effects.
+///
+/// No-op for responses that did not select adapter compression. Fastly calls this
+/// immediately before headers commit, for both streaming and buffered delivery.
+pub fn enforce_delivery_compression(response: &mut Response<EdgeBody>) {
+    if response
+        .extensions()
+        .get::<DynamicDeliveryCompression>()
+        .is_some()
+    {
+        set_response_compression(response, Compression::None);
+        response
+            .headers_mut()
+            .insert("x-compress-hint", HeaderValue::from_static("on"));
+    }
 }
 
 fn response_compression(response: &Response<EdgeBody>) -> Compression {
@@ -831,11 +856,7 @@ async fn process_response_streaming_async<W: Write>(
     let input_compression = Compression::from_content_encoding(&params.content_encoding);
     // A template-cache response is always identity bytes. Decode during the transform instead of
     // recompressing and immediately decoding the entire buffered result afterwards.
-    let output_compression = if params.template_cache_key.is_some() {
-        Compression::None
-    } else {
-        input_compression
-    };
+    let output_compression = params.transform_compression();
     // This path has no seam controller, so it must never be reached with a
     // pending auction; `deferred_inline_seam_token` returns `None` for it.
     let (mut processor, inline_seam_token) =
@@ -1762,6 +1783,8 @@ pub struct OwnedProcessResponseParams {
     /// Origin policy headers to store with the template and replay on a hit.
     pub(crate) policy_headers: Vec<(String, String)>,
     pub(crate) content_encoding: String,
+    /// Delivery override independent of the origin decoder.
+    pub(crate) output_compression: Option<Compression>,
     pub(crate) origin_host: String,
     pub(crate) origin_url: String,
     pub(crate) request_host: String,
@@ -1799,6 +1822,15 @@ pub struct OwnedProcessResponseParams {
 }
 
 impl OwnedProcessResponseParams {
+    fn transform_compression(&self) -> Compression {
+        if self.template_cache_key.is_some() {
+            Compression::None
+        } else {
+            self.output_compression
+                .unwrap_or_else(|| Compression::from_content_encoding(&self.content_encoding))
+        }
+    }
+
     fn is_range_associated(&self) -> bool {
         self.range_associated || self.response_status == StatusCode::PARTIAL_CONTENT
     }
@@ -1929,9 +1961,8 @@ pub async fn buffer_publisher_response_async(
                 services,
             )
             .await?;
-            // Authorized template cache transforms are emitted as identity by
-            // `process_response_streaming_async`; inline transforms retain the origin
-            // coding. This avoids recompressing and immediately decoding a full document.
+            // Authorized template transforms stay identity before storage. Other
+            // transforms use the independently selected delivery encoding.
             let bytes = output.into_inner();
             // The origin readthrough cache holds raw origin bytes; the template cache
             // stores processed reader-neutral HTML. Caching the final per-user
@@ -2236,6 +2267,7 @@ fn build_template_assembly_params(
     ad_bids_state: AdBidsState,
 ) -> OwnedProcessResponseParams {
     OwnedProcessResponseParams {
+        output_compression: None,
         response_status: StatusCode::OK,
         range_associated: false,
         csp_nonce_observed: None,
@@ -2767,7 +2799,7 @@ pub async fn publisher_response_into_streaming_response(
                 let compression = Compression::from_content_encoding(&params.content_encoding);
                 let max_body_bytes = settings.publisher.max_buffered_body_bytes;
                 let mut decoder = BodyStreamDecoder::new(compression, max_body_bytes);
-                let mut encoder = BodyStreamEncoder::new(compression);
+                let mut encoder = BodyStreamEncoder::new(params.transform_compression());
                 let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE)
                     .with_max_bytes(max_body_bytes);
 
@@ -3120,12 +3152,7 @@ pub fn stream_publisher_body<W: Write>(
         shared_template_authorized: params.template_cache_key.is_some(),
         csp_nonce_observed: params.csp_nonce_observed.as_ref(),
     };
-    let input_compression = Compression::from_content_encoding(&params.content_encoding);
-    let output_compression = if params.template_cache_key.is_some() {
-        Compression::None
-    } else {
-        input_compression
-    };
+    let output_compression = params.transform_compression();
     process_response_streaming(body, output, &borrowed, output_compression)
 }
 
@@ -3374,11 +3401,7 @@ pub async fn stream_publisher_body_async<W: Write>(
     };
 
     let input_compression = Compression::from_content_encoding(&params.content_encoding);
-    let output_compression = if params.template_cache_key.is_some() {
-        Compression::None
-    } else {
-        input_compression
-    };
+    let output_compression = params.transform_compression();
     stream_html_with_auction_hold(
         body,
         output,
@@ -4875,6 +4898,33 @@ pub(crate) fn request_can_use_shared_template(
         && !reader_requires_origin
 }
 
+/// Adapter capabilities used by publisher response processing.
+#[derive(Clone, Copy, Debug)]
+pub struct PublisherAdapterOptions {
+    /// Header family used for edge-cache policy.
+    pub cache_header: EdgeCacheHeader,
+    /// Whether the adapter can compress identity output at delivery.
+    pub delivery_compression: DeliveryCompression,
+}
+
+/// Downstream compression supplied by the adapter rather than the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryCompression {
+    /// Retain in-guest response encoding.
+    Unavailable,
+    /// Delivery supports reader-negotiated gzip and Brotli.
+    Dynamic,
+}
+
+impl From<EdgeCacheHeader> for PublisherAdapterOptions {
+    fn from(cache_header: EdgeCacheHeader) -> Self {
+        Self {
+            cache_header,
+            delivery_compression: DeliveryCompression::Unavailable,
+        }
+    }
+}
+
 /// Proxies requests to the publisher's origin server.
 ///
 /// Returns a [`PublisherResponse`] indicating how the response should be sent:
@@ -4896,8 +4946,10 @@ pub async fn handle_publisher_request(
     ec_context: &mut EcContext,
     auction: AuctionDispatch<'_>,
     mut req: Request<EdgeBody>,
-    edge_header: EdgeCacheHeader,
+    options: impl Into<PublisherAdapterOptions>,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
+    let options = options.into();
+    let edge_header = options.cache_header;
     auction
         .integration_registry
         .ensure_async_html_finish_allowed(settings)?;
@@ -5148,6 +5200,12 @@ pub async fn handle_publisher_request(
         || datadome_suppression_requires_origin;
     let reader_compression = negotiate_reader_compression(req.headers());
     let reader_supports_assembly = reader_compression.is_ok();
+    let delivery_offload_eligible = options.delivery_compression == DeliveryCompression::Dynamic
+        && should_run_ad_stack
+        && matches!(
+            reader_compression,
+            Ok(Compression::None | Compression::Gzip | Compression::Brotli)
+        );
     // A failed negotiation bypasses template cache below, so this value is used only on an
     // admitted path. Keeping an identity fallback avoids making that relationship
     // a panic-prone invariant in the public request handler.
@@ -5625,7 +5683,10 @@ pub async fn handle_publisher_request(
                     //
                     // Headers are constructed rather than replayed, so no origin header
                     // can reach a second reader through the cache.
-                    let response = build_cached_template_response(&entry, reader_compression)?;
+                    let mut response = build_cached_template_response(&entry, reader_compression)?;
+                    if delivery_offload_eligible {
+                        enable_delivery_compression(&mut response);
+                    }
                     let mut params = build_template_assembly_params(
                         &entry,
                         settings,
@@ -5970,6 +6031,15 @@ pub async fn handle_publisher_request(
     if template_cache_key.is_some() {
         set_response_compression(&mut response, reader_compression);
     }
+    let offload_delivery = delivery_offload_eligible
+        && route == ResponseRoute::Stream
+        && status.is_success()
+        && !response_is_range_associated(&response)
+        && response_carries_body(&request_method, status)
+        && is_html_content_type(&content_type);
+    if offload_delivery {
+        enable_delivery_compression(&mut response);
+    }
 
     match route {
         ResponseRoute::PassThrough => {
@@ -6080,6 +6150,7 @@ pub async fn handle_publisher_request(
                     template_cache_key,
                     seam_ad_slots,
                     policy_headers,
+                    output_compression: offload_delivery.then_some(Compression::None),
                     content_encoding,
                     origin_host,
                     origin_url: settings.publisher.origin_url.clone(),
@@ -9927,6 +9998,7 @@ mod tests {
         content_encoding: &str,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            output_compression: None,
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -11528,6 +11600,11 @@ mod tests {
         //! The chain, end to end: a second request for the same URL must be served from
         //! the cache without touching the origin. Everything else in this file tests a
         //! link; this tests that they connect.
+
+        mod delivery_compression_tests {
+            use super::*;
+            include!("publisher/delivery_compression_tests.rs");
+        }
 
         use super::*;
         use crate::platform::ClientInfo;
@@ -23046,6 +23123,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
         let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
+            output_compression: None,
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -23108,6 +23186,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         .expect("should create integration registry");
 
         let params = OwnedProcessResponseParams {
+            output_compression: None,
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -23159,6 +23238,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         )
         .expect("should create integration registry");
         let params = OwnedProcessResponseParams {
+            output_compression: None,
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -23288,6 +23368,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23355,6 +23436,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23425,6 +23507,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23495,6 +23578,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23565,6 +23649,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23617,6 +23702,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
     fn non_html_stream_params(content_encoding: &str) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            output_compression: None,
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -23837,6 +23923,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23915,6 +24002,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23995,6 +24083,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                output_compression: None,
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -24069,6 +24158,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .body(EdgeBody::empty())
             .expect("should build response");
         let params = OwnedProcessResponseParams {
+            output_compression: None,
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -26033,6 +26123,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         dispatched_auction: Option<DispatchedAuction>,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            output_compression: None,
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -26717,6 +26808,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let ec_context =
                 EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
             OwnedProcessResponseParams {
+                output_compression: None,
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -26915,6 +27007,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .map(bytes::Bytes::copy_from_slice)
             .collect();
         let params = OwnedProcessResponseParams {
+            output_compression: None,
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -26999,6 +27092,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{}");</script>"#;
         let state = AdBidsState::with_script(bids_script);
         let params = OwnedProcessResponseParams {
+            output_compression: None,
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -27066,6 +27160,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         // Claim gzip encoding but feed non-gzip bytes. The GzDecoder will
         // error as soon as it tries to read the gzip header.
         let params = OwnedProcessResponseParams {
+            output_compression: None,
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -27187,6 +27282,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         let body = EdgeBody::from(html.to_vec());
 
         let params = OwnedProcessResponseParams {
+            output_compression: None,
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -27257,6 +27353,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         // Small, single-fragment RSC script — placeholder path (not fallback).
         let html = br#"<html><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script></body></html>"#;
         let params = OwnedProcessResponseParams {
+            output_compression: None,
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,

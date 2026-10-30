@@ -772,7 +772,7 @@ fn send_response_to_client(mut response: HttpResponse, counters: Option<&Sandbox
     }
 }
 
-/// Apply every late response mutation, then restore privacy invariants before headers commit.
+/// Apply late mutations, then restore privacy and encoding before headers commit.
 fn apply_terminal_response_effects(
     response: &mut HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
@@ -800,6 +800,7 @@ fn apply_terminal_response_effects(
     // `apply_finalize_headers` and normalized asset policy reapplication ran.
     crate::middleware::enforce_set_cookie_cache_privacy(response);
     crate::middleware::enforce_uncacheable_cache_privacy(response);
+    trusted_server_core::publisher::enforce_delivery_compression(response);
 }
 
 const FALLBACK_UNAVAILABLE: &str = "unavailable";
@@ -910,7 +911,15 @@ mod tests {
         TargetUnavailable,
     };
     use fastly::mime;
-    use trusted_server_core::integrations::HeaderMutation;
+    use trusted_server_core::auction::{build_orchestrator_with_plan, compile_auction_plan};
+    use trusted_server_core::ec::EcContext;
+    use trusted_server_core::integrations::{HeaderMutation, IntegrationRegistry};
+    use trusted_server_core::publisher::{
+        AuctionDispatch, DeliveryCompression, PublisherAdapterOptions,
+        buffer_publisher_response_async, handle_publisher_request,
+        publisher_response_into_streaming_response,
+    };
+    use trusted_server_core::test_support::nextjs_auction;
 
     fn test_settings() -> Settings {
         Settings::from_toml(
@@ -1355,6 +1364,132 @@ mod tests {
         assert!(response.headers().get("surrogate-control").is_none());
         assert!(response.headers().get("cdn-cache-control").is_none());
         assert!(response.headers().get("etag").is_none());
+    }
+
+    #[test]
+    fn late_filter_effects_cannot_change_offloaded_delivery_encoding() {
+        futures::executor::block_on(async {
+            for streaming in [false, true] {
+                let settings = Arc::new(nextjs_auction::settings());
+                let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+                    "<html><head></head><body>Example article</body></html>",
+                    true,
+                    streaming,
+                ));
+                let services = nextjs_auction::services(origin);
+                let plan = Arc::new(
+                    compile_auction_plan(&settings).expect("should compile fixture auction plan"),
+                );
+                let registry = IntegrationRegistry::with_plan(&settings, Arc::clone(&plan))
+                    .expect("should build fixture integration registry");
+                let orchestrator = Arc::new(
+                    build_orchestrator_with_plan(plan, &settings)
+                        .expect("should build fixture orchestrator"),
+                );
+                let request = edgezero_core::http::request_builder()
+                    .uri("https://test-publisher.example.com/article")
+                    .header("host", nextjs_auction::PUBLISHER_HOST)
+                    .header("sec-fetch-dest", "document")
+                    .header("accept-encoding", "gzip, br")
+                    .body(EdgeBody::empty())
+                    .expect("should build eligible navigation");
+                let geo = services
+                    .geo()
+                    .lookup(None)
+                    .expect("should resolve fixture geo");
+                let mut ec_context = EcContext::read_from_request_with_geo(
+                    &settings,
+                    &request,
+                    &services,
+                    geo.as_ref(),
+                )
+                .expect("should read fixture consent context");
+                let publisher = handle_publisher_request(
+                    &settings,
+                    &services,
+                    None,
+                    &mut ec_context,
+                    AuctionDispatch {
+                        integration_registry: &registry,
+                        orchestrator: &orchestrator,
+                        slots: settings.creative_opportunity_slots(),
+                        registry: None,
+                    },
+                    request,
+                    PublisherAdapterOptions {
+                        cache_header:
+                            trusted_server_core::cache_policy::EdgeCacheHeader::SurrogateControl,
+                        delivery_compression: DeliveryCompression::Dynamic,
+                    },
+                )
+                .await
+                .expect("should handle publisher navigation");
+                let mut response = if streaming {
+                    publisher_response_into_streaming_response(
+                        publisher,
+                        &edgezero_core::http::Method::GET,
+                        Arc::clone(&settings),
+                        &registry,
+                        orchestrator,
+                        services,
+                    )
+                    .await
+                    .expect("should finalize streaming response")
+                } else {
+                    buffer_publisher_response_async(
+                        publisher,
+                        &edgezero_core::http::Method::GET,
+                        &settings,
+                        &registry,
+                        &orchestrator,
+                        &services,
+                    )
+                    .await
+                    .expect("should finalize buffered response")
+                };
+                assert_eq!(response.headers()["x-compress-hint"], "on");
+                let effects = RequestFilterEffects {
+                    request_headers: Vec::new(),
+                    response_headers: vec![
+                        HeaderMutation::set("content-encoding", "gzip"),
+                        HeaderMutation::set("content-length", "9999"),
+                        HeaderMutation::set("x-compress-hint", "off"),
+                        HeaderMutation::set("vary", "Origin"),
+                        HeaderMutation::set("cache-control", "public, s-maxage=3600"),
+                    ],
+                };
+
+                apply_terminal_response_effects(&mut response, Some(&effects));
+
+                assert!(response.headers().get("content-encoding").is_none());
+                assert!(response.headers().get("content-length").is_none());
+                assert_eq!(response.headers()["x-compress-hint"], "on");
+                assert!(
+                    response.headers().get_all("vary").iter().any(|value| {
+                        value
+                            .to_str()
+                            .is_ok_and(|value| value.eq_ignore_ascii_case("accept-encoding"))
+                    }),
+                    "should restore delivery variation after late effects"
+                );
+                assert!(
+                    response.headers()["cache-control"]
+                        .to_str()
+                        .expect("should read cache policy")
+                        .contains("private")
+                );
+                let body = response
+                    .into_body()
+                    .into_bytes_bounded(settings.publisher.max_buffered_body_bytes)
+                    .await
+                    .expect("should collect guest identity output");
+                assert!(
+                    std::str::from_utf8(&body)
+                        .expect("should retain identity HTML")
+                        .contains("Example article")
+                );
+            }
+        });
     }
 
     #[test]

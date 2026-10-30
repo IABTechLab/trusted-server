@@ -538,6 +538,25 @@ a zero-byte cap fails every non-empty publisher response.
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 ```
 
+### Fastly SSAT delivery compression
+
+Fastly automatically offloads final compression for eligible, successful SSAT
+HTML responses. Trusted Server keeps its existing origin encoding negotiation,
+decodes supported origin encodings, and emits processed identity HTML with
+`X-Compress-Hint: on`. Fastly negotiates gzip or Brotli delivery using the reader's
+original `Accept-Encoding`. No publisher setting is required.
+
+This applies to eligible inline responses and assembled template misses and
+hits. Requests for which reader negotiation selects deflate or fails retain the
+existing in-guest encoding path. Non-SSAT, non-HTML, unsupported-encoding, error,
+redirect, and bodyless responses keep their existing behavior. Axum, Cloudflare,
+and Spin also retain their current compression behavior.
+
+Offload does not change template storage, cache admission, consent gates, or
+terminal private/no-store policies. It does not request identity from origin or
+change body-size limits. Local tests verify guest output; actual Fastly delivery
+encoding and performance require staging validation.
+
 ## Trusted Client IP Configuration
 
 Use this optional section when a trusted CDN service forwards requests to the
