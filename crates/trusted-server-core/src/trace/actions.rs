@@ -566,6 +566,8 @@ mod tests {
             "https://@publisher.example",
             "https://example-user@publisher.example",
             "https://publisher.example\\",
+            // Both concat! fixtures preserve malformed origin bytes while splitting hosts
+            // that the domain linter misreads and its suppression markers cannot name.
             concat!(
                 "https://publisher.example",
                 ",",
