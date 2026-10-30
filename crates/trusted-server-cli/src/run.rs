@@ -178,7 +178,7 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Origin(command) => {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            crate::commands::origin::run(command, &mut out).map(|()| RunOutcome::Success)
+            crate::commands::origin::run(command, &mut out)
         }
     }
 }

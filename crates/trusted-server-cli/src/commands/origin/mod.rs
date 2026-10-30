@@ -1,11 +1,13 @@
 //! `ts origin` — questions about a publisher origin's behaviour.
 
+pub mod audit_headers;
 pub mod probe;
 pub mod report;
 
 use clap::Subcommand;
 
 use crate::error::CliResult;
+use crate::run::RunOutcome;
 
 /// Subcommands under `ts origin`.
 #[derive(Debug, Subcommand)]
@@ -18,6 +20,16 @@ pub enum OriginCommand {
     /// `TRUSTED_SERVER_PROBE_ADMISSION_COOKIE` to a cookie that gets past a bot wall. Every --url must be HTTPS; plain HTTP is
     /// accepted only for a loopback development origin.
     ProbeShareability(ProbeShareabilityArgs),
+
+    /// Audit origin cache-related response headers per content type.
+    ///
+    /// Fetches the publisher origin directly — explicit `--url`, or discovered
+    /// from the origin root — and grades each response's cache posture for its
+    /// content type. Sits beside `probe-shareability` and follows its
+    /// conventions: URLs arrive through a repeatable `--url`, and every target
+    /// must be HTTPS except on loopback. Exits 1 on a FAIL verdict (or a WARN
+    /// under `--strict`), 0 otherwise, 2 if the audit could not run.
+    AuditHeaders(audit_headers::AuditHeadersArgs),
 }
 
 /// Arguments for `ts origin probe-shareability`.
@@ -76,12 +88,15 @@ pub struct ProbeShareabilityArgs {
 /// Returns an error when an origin cannot be reached, or when the probe's verdict is that
 /// the origin is not shareable — the caller turns that into a non-zero exit so the command
 /// can gate a deploy.
-pub fn run(command: OriginCommand, out: &mut impl std::io::Write) -> CliResult<()> {
+pub fn run(command: OriginCommand, out: &mut impl std::io::Write) -> CliResult<RunOutcome> {
     match command {
         OriginCommand::ProbeShareability(mut args) => {
             load_cookies_from_environment(&mut args);
-            run_probe(&args, out)
+            // A failing verdict returns `Err`, which `main` surfaces as exit 2;
+            // a clean probe is success.
+            run_probe(&args, out).map(|()| RunOutcome::Success)
         }
+        OriginCommand::AuditHeaders(args) => audit_headers::run(&args, out),
     }
 }
 
