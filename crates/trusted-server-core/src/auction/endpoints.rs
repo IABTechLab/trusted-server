@@ -789,10 +789,9 @@ mod tests {
     #[tokio::test]
     async fn auction_endpoint_snapshot_is_reused_by_response_finalization() {
         // `/auction` loads the identity-graph row to resolve server-side EIDs.
-        // Finalization runs afterwards on the same EC context and ingests
-        // `ts-eids`/`sharedId` updates. Both must be served by a single billable
-        // read: before the snapshot was shared, finalization saw `NotRead` and
-        // paid for a second lookup.
+        // Finalization runs afterwards on the same EC context. It must not pay
+        // for a second lookup, and it never writes KV: only the page load's
+        // navigation may write (spec D1).
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
@@ -876,21 +875,17 @@ mod tests {
             .get(&ec_id)
             .expect("should read store")
             .expect("row should exist");
-        assert_eq!(
-            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
-            Some("shared-cookie-id"),
-            "the sharedId update must still be ingested from the shared snapshot"
+        assert!(
+            stored.ids.is_empty(),
+            "an auction request must leave the row unchanged"
         );
     }
 
     #[tokio::test]
-    async fn auction_body_eids_reach_kv_even_when_the_ts_eids_cookie_is_absent() {
-        // Regression test for #1184: `/auction` sends every EID it has in the
-        // request body, but response finalization used to ingest identity
-        // graph updates only from the `ts-eids` cookie — which the browser
-        // caps in size and may not have sent at all. `handle_auction` must
-        // hand its parsed body EIDs to `ec_context` so finalization ingests
-        // them regardless of what the cookie carried.
+    async fn auction_body_eids_reach_context_but_never_kv() {
+        // `handle_auction` hands its parsed body EIDs to `ec_context`, but body
+        // EIDs go to bidders on that request only: finalization of an
+        // `/auction` request never writes them to KV (spec §5.1, D1).
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
@@ -969,10 +964,9 @@ mod tests {
             .get(&ec_id)
             .expect("should read store")
             .expect("row should exist");
-        assert_eq!(
-            stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
-            Some("ID5_from_body"),
-            "the body's EID must be ingested into KV without a ts-eids cookie"
+        assert!(
+            stored.ids.is_empty(),
+            "the body's EIDs must not be persisted from an auction request"
         );
     }
 

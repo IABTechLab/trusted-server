@@ -114,6 +114,7 @@ use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
@@ -850,6 +851,11 @@ async fn dispatch_fallback(
         let is_navigation = is_navigation_request(&req);
         if is_navigation {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Navigation);
+            // The page-load write permit uses the stricter Fetch Metadata test
+            // (spec §3.1); requests without it never write KV.
+            if let Some(permit) = NavigationPermit::classify(&req) {
+                ec.ec_context.set_navigation_permit(permit);
+            }
         }
         let is_publisher_navigation = ec.is_real_browser && is_navigation;
         if is_publisher_navigation
@@ -2576,6 +2582,76 @@ mod tests {
                 "static, analytics, and integration requests must not persist EID cookies"
             );
         }
+    }
+
+    fn navigation_request(path: &str) -> Request {
+        let mut request = browser_request(Method::GET, path, "document");
+        request
+            .headers_mut()
+            .insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+        request
+    }
+
+    fn take_finalize_state(response: &mut Response) -> super::EcFinalizeState {
+        response
+            .extensions_mut()
+            .remove::<super::EcFinalizeState>()
+            .expect("should attach finalize state")
+    }
+
+    #[test]
+    fn publisher_navigation_receives_navigation_permit() {
+        let router = test_router();
+
+        let mut response = route(&router, navigation_request("/article"));
+
+        let mut state = take_finalize_state(&mut response);
+        assert!(
+            state.ec_context.take_navigation_permit_for_test().is_some(),
+            "should issue a permit"
+        );
+    }
+
+    #[test]
+    fn publisher_request_without_fetch_metadata_navigation_gets_no_permit() {
+        let router = test_router();
+        let mut prefetch = navigation_request("/article");
+        prefetch
+            .headers_mut()
+            .insert("sec-purpose", HeaderValue::from_static("prefetch"));
+
+        for request in [
+            browser_request(Method::GET, "/article", "document"),
+            prefetch,
+        ] {
+            let mut response = route(&router, request);
+
+            let mut state = take_finalize_state(&mut response);
+            assert!(
+                state.ec_context.take_navigation_permit_for_test().is_none(),
+                "should not issue a permit without a top-level navigation"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_proxy_never_generates_ec() {
+        let router = test_router();
+
+        let mut response = route(
+            &router,
+            navigation_request("/integrations/prebid/bundle.js"),
+        );
+
+        let mut state = take_finalize_state(&mut response);
+        assert!(
+            !state.ec_context.ec_generated(),
+            "should not mint an EC on an integration proxy"
+        );
+        assert!(
+            state.ec_context.take_navigation_permit_for_test().is_none(),
+            "should not issue a permit to an integration proxy"
+        );
     }
 
     #[test]

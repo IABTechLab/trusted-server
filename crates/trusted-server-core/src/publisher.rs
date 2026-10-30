@@ -16350,6 +16350,9 @@ mod tests {
                         scheduling_consent()
                     };
                     let mut ec_context = EcContext::new_for_test(Some(identity.clone()), consent);
+                    // A publisher page load: only a navigation may write the tombstone.
+                    ec_context
+                        .set_navigation_permit(crate::ec::page_load::NavigationPermit::for_test());
                     assert_eq!(
                         ec_context.ec_allowed(),
                         !withdrawn,

@@ -14,7 +14,6 @@ use crate::ec::EcContext;
 use crate::ec::kv::KvIdentityGraph;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::http_util::is_navigation_request;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use crate::streaming_processor::StreamProcessor;
@@ -1018,7 +1017,8 @@ impl IntegrationRegistry {
     /// Dispatch a proxy request when an integration handles the path.
     ///
     /// This method removes any caller-supplied `x-ts-ec` before proxying.
-    /// Response-side cookie mutation is centralized in EC finalize.
+    /// Response-side cookie mutation is centralized in EC finalize. It never
+    /// mints an EC: only a publisher navigation may create the EC row.
     #[must_use]
     pub async fn handle_proxy(
         &self,
@@ -1028,24 +1028,14 @@ impl IntegrationRegistry {
             method,
             path,
             settings,
-            kv,
-            ec_context,
+            kv: _,
+            ec_context: _,
             services,
             mut req,
         } = input;
         if let Some((proxy, _)) = self.find_route(method, path) {
-            // Organic proxy handler: generate if needed (best effort).
-            // Only generate for document navigations — subresource requests
-            // may lack consent signals such as the Sec-GPC header.
-            if is_navigation_request(&req) {
-                if let Err(err) = ec_context.generate_if_needed(settings, kv) {
-                    log::warn!("EC generation failed for integration proxy: {err:?}");
-                }
-            } else {
-                log::debug!(
-                    "EC generation skipped for integration proxy: non-document request (path={path})",
-                );
-            }
+            // Integration proxies never mint an EC: only the publisher
+            // navigation may create the row (one write per page load).
 
             // Remove any caller-supplied EC header rather than forwarding it.
             req.headers_mut().remove(HEADER_X_TS_EC.clone());

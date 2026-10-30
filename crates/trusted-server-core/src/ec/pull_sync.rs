@@ -560,6 +560,7 @@ mod tests {
             pull_sync_ttl_sec: ttl_sec,
             pull_sync_rate_limit: 20,
             ts_pull_token: Some(Redacted::new("token".to_owned())),
+            provider_owned: false,
         }
     }
 

@@ -186,6 +186,21 @@ impl KvPartnerId {
             .unwrap_or_default();
         *self != before
     }
+
+    /// Removes the last UID of the last entry and resyncs `uid`; used by the
+    /// write planner's size cap.
+    pub(crate) fn drop_last_uid(&mut self) {
+        if let Some(eid) = self.eids.last_mut() {
+            eid.uids.pop();
+        }
+        self.eids.retain(|eid| !eid.uids.is_empty());
+        self.uid = self
+            .eids
+            .first()
+            .and_then(|eid| eid.uids.first())
+            .map(|uid| uid.id().as_str().to_owned())
+            .unwrap_or_default();
+    }
 }
 
 /// One stored EID entry with its EID-level fields.

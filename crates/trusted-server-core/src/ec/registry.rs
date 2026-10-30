@@ -47,6 +47,9 @@ pub struct PartnerConfig {
     pub pull_sync_rate_limit: u32,
     /// Outbound bearer token for pull sync requests.
     pub ts_pull_token: Option<Redacted<String>>,
+    /// Whether an enabled identity provider claims this source. Browser
+    /// ingest skips it and batch sync rejects it.
+    pub provider_owned: bool,
 }
 
 /// In-memory partner registry with O(1) lookups by source domain and API key hash.
@@ -234,6 +237,29 @@ impl PartnerRegistry {
         self.get(domain)
     }
 
+    /// Marks `source` as owned by an enabled identity provider.
+    ///
+    /// Returns `false` when the source has no `[[ec.partners]]` entry.
+    pub fn mark_provider_owned(&mut self, source: &str) -> bool {
+        let Ok(normalized) = normalize_partner_source_domain(source) else {
+            return false;
+        };
+        match self.by_source_domain.get_mut(&normalized) {
+            Some(partner) => {
+                partner.provider_owned = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether an enabled identity provider owns `source`.
+    #[must_use]
+    pub fn is_provider_owned(&self, source: &str) -> bool {
+        self.find_by_source_domain(source)
+            .is_some_and(|partner| partner.provider_owned)
+    }
+
     /// Returns all partners with `pull_sync_enabled = true`.
     #[must_use]
     pub fn pull_enabled_partners(&self) -> Vec<&PartnerConfig> {
@@ -305,6 +331,7 @@ fn build_partner_config(
         pull_sync_ttl_sec: partner.pull_sync_ttl_sec,
         pull_sync_rate_limit: partner.pull_sync_rate_limit,
         ts_pull_token: partner.ts_pull_token.clone(),
+        provider_owned: false,
     }
 }
 
