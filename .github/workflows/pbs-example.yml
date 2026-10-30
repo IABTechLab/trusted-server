@@ -17,13 +17,12 @@ on:
 permissions:
   contents: read
 
-# A newer push to a pull request cancels that PR's superseded run. Each job
-# then joins a per-author queue for that job (its own `concurrency` block), so
-# one person opening many PRs runs one copy of each job at a time and cannot
-# fill the runner pool ahead of everyone else. Queued jobs start in the order they began waiting; GitHub
-# keeps up to 100 pending per queue and cancels arrivals past that. Every job
-# has a timeout so a hung job cannot hold its queue for hours. Bot-authored
-# PRs and non-PR events key on the run ID and never wait on a queue.
+# New pushes cancel older runs for the same pull request. Each job queues by
+# workflow, job, and author, so one author runs one copy of each job at a time.
+# GitHub orders jobs by when they start waiting, but does not guarantee FIFO.
+# Each queue holds up to 100 pending jobs; later arrivals are canceled.
+# Timeouts release queues after hung jobs. Bots and non-PR events use unique
+# run IDs and do not queue together.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true

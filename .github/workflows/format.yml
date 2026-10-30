@@ -8,13 +8,12 @@ on:
 permissions:
   contents: read
 
-# A newer push to a pull request cancels that PR's superseded run. Each job
-# then joins a per-author queue for that job (its own `concurrency` block), so
-# one person opening many PRs runs one copy of each job at a time and cannot
-# fill the runner pool ahead of everyone else. Queued jobs start in the order they began waiting; GitHub
-# keeps up to 100 pending per queue and cancels arrivals past that. Every job
-# has a timeout so a hung job cannot hold its queue for hours. Bot-authored
-# PRs and non-PR events key on the run ID and never wait on a queue.
+# New pushes cancel older runs for the same pull request. Each job queues by
+# workflow, job, and author, so one author runs one copy of each job at a time.
+# GitHub orders jobs by when they start waiting, but does not guarantee FIFO.
+# Each queue holds up to 100 pending jobs; later arrivals are canceled.
+# Timeouts release queues after hung jobs. Bots and non-PR events use unique
+# run IDs and do not queue together.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
@@ -57,8 +56,21 @@ jobs:
   check-ci-node-pin:
     name: CI Node pin guard
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: ${{ github.workflow }}-check-ci-node-pin-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install yq
+        shell: bash
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_amd64 \
+            --output "$RUNNER_TEMP/yq"
+          chmod +x "$RUNNER_TEMP/yq"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       # The guard's tests check the tree before the guard landed; fetch only
       # that commit instead of the full history.
@@ -70,13 +82,19 @@ jobs:
         with:
           node-version-file: .tool-versions
 
-      - name: Test the guard
+      - name: Test the Node pin guard
         run: node --test scripts/check-ci-node-pin.test.mjs
 
       # Every job that compiles trusted-server-core also runs the TSJS build, so
       # it must set up the `.tool-versions` Node first (see issue #1204).
       - name: Verify jobs pin Node before compiling Rust
         run: node scripts/check-ci-node-pin.mjs
+
+      - name: Test the CI concurrency policy guard
+        run: node --test scripts/check-ci-concurrency.test.mjs
+
+      - name: Require per-PR cancellation, per-author job queues and timeouts
+        run: scripts/check-ci-concurrency.sh
 
   format-rust:
     name: cargo fmt
@@ -87,48 +105,6 @@ jobs:
       queue: max
     steps:
       - uses: actions/checkout@v4
-
-      # A hung job, a PR-triggered workflow without per-PR cancellation, or a
-      # job outside its per-author queue brings back the runner pile-up that
-      # the concurrency blocks prevent. Every PR-triggered workflow must carry
-      # test.yml's workflow-level block, and every job must set timeout-minutes
-      # and a per-author queue (keyed on the matrix too, for matrix jobs).
-      # Jobs that call a reusable workflow are skipped: they cannot set these.
-      - name: Require per-PR cancellation, per-author job queues and timeouts
-        shell: bash
-        run: |
-          reference=.github/workflows/test.yml
-          if [ "$(yq '.concurrency."cancel-in-progress" == true and (.concurrency.group // "" | test("pull_request\.number"))' "$reference")" != true ]; then
-            echo "::error file=$reference::test.yml must cancel superseded runs per pull request."
-            exit 1
-          fi
-          expected=$(yq -o=json -I=0 '.concurrency' "$reference")
-          status=0
-          for f in .github/workflows/*.yml .github/workflows/*.yaml; do
-            [ -f "$f" ] || continue
-            on_pr=$(yq '.on | ((tag == "!!map" and has("pull_request")) or (tag == "!!str" and . == "pull_request") or (tag == "!!seq" and ([.[] | select(. == "pull_request")] | length > 0)))' "$f")
-            [ "$on_pr" = true ] || continue
-            if [ "$(yq -o=json -I=0 '.concurrency' "$f")" != "$expected" ]; then
-              echo "::error file=$f::PR-triggered workflows must use the workflow-level concurrency block from test.yml."
-              status=1
-            fi
-            while read -r job; do
-              [ -n "$job" ] || continue
-              echo "::error file=$f::Job '$job' must set timeout-minutes."
-              status=1
-            done < <(yq '.jobs | to_entries[] | select(.value.uses == null and .value["timeout-minutes"] == null) | .key' "$f")
-            while read -r job; do
-              [ -n "$job" ] || continue
-              echo "::error file=$f::Job '$job' must join a per-author queue: concurrency.group keyed on pull_request.user.login and queue: max."
-              status=1
-            done < <(yq '.jobs | to_entries[] | select(.value.uses == null and (.value.concurrency.queue != "max" or (.value.concurrency.group // "" | test("pull_request\.user\.login") | not))) | .key' "$f")
-            while read -r job; do
-              [ -n "$job" ] || continue
-              echo "::error file=$f::Matrix job '$job' must include the matrix in its concurrency group so its legs do not queue behind each other."
-              status=1
-            done < <(yq '.jobs | to_entries[] | select(.value.strategy.matrix != null and (.value.concurrency.group // "" | test("matrix\.") | not)) | .key' "$f")
-          done
-          exit "$status"
 
       # Rust jobs must set up the toolchain through ./.github/actions/setup-rust,
       # which removes the image's stable and only saves caches from main. A
