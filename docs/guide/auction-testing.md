@@ -79,17 +79,14 @@ adapter tests use controlled futures and timers. CI also runs the actual worker
 HTTP clients under local workerd and Spin 4.1, covering eager dispatch, buffered
 bids after a slow origin, delayed headers, and trickling bodies. Run
 `node scripts/test-worker-auction-deadlines.mjs --help` for the same local fixtures.
-Fastly also has Viceroy network fixtures
-for stalled headers, trickling bodies, bodyless responses, and competing bidders;
-run its local origin harness after building the adapter test binary:
+Fastly also has Viceroy network fixtures for stalled headers, trickling bodies,
+bodyless responses, and competing bidders. Its local origin harness builds the
+adapter test binary itself:
 
 ```bash
-cargo test -p trusted-server-adapter-fastly --target wasm32-wasip1 --no-run
-node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs \
-  "$(command -v viceroy)" \
-  target/wasm32-wasip1/debug/deps/trusted_server_adapter_fastly-<hash>.wasm
+node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"
 ```
 
-Use the adapter test artifact printed by Cargo in place of `<hash>`. The harness
-binds a local ephemeral port and runs the five network tests excluded from the
-standard suite; CI runs the harness automatically.
+The harness binds a local ephemeral port and runs the five network tests
+excluded from the standard suite; CI runs the same command. To reuse a prebuilt
+test artifact, pass its `.wasm` path as a second argument.

@@ -387,9 +387,7 @@ fn wait_for_progress(
     if bodies.is_empty() {
         return Ok(());
     }
-    let timeout_ms = u32::try_from(remaining.as_millis())
-        .unwrap_or(u32::MAX)
-        .max(1);
+    let timeout_ms = host_select_timeout_ms(remaining);
     let mut ready_index = 0;
     // SAFETY: bodies is a live slice, and ready_index is writable. A positive
     // timeout is essential: the host interprets zero as an unbounded wait.
@@ -409,12 +407,41 @@ fn wait_for_progress(
     Ok(())
 }
 
+/// Convert a remaining budget into the timed-select hostcall argument.
+///
+/// The host treats a zero timeout as unbounded, so sub-millisecond budgets
+/// round up to one millisecond instead.
+fn host_select_timeout_ms(remaining: std::time::Duration) -> u32 {
+    u32::try_from(remaining.as_millis())
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::super::{FastlyPlatformHttpClient, MAX_PLATFORM_RESPONSE_BODY_BYTES};
-    use super::{DeadlinePending, PendingState};
+    use super::{DeadlinePending, PendingState, host_select_timeout_ms};
+
+    #[test]
+    fn sub_millisecond_budget_never_requests_an_unbounded_host_wait() {
+        assert_eq!(
+            host_select_timeout_ms(Duration::from_micros(500)),
+            1,
+            "should round a sub-millisecond budget up instead of passing 0"
+        );
+        assert_eq!(
+            host_select_timeout_ms(Duration::from_millis(25)),
+            25,
+            "should pass whole-millisecond budgets through unchanged"
+        );
+        assert_eq!(
+            host_select_timeout_ms(Duration::from_secs(u64::MAX)),
+            u32::MAX,
+            "should saturate budgets beyond the hostcall range"
+        );
+    }
     use edgezero_core::body::Body;
     use trusted_server_core::platform::{
         PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,

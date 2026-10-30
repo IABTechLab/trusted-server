@@ -6,8 +6,8 @@ use bytes::Bytes;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::{Report, ResultExt as _};
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use http_body_util::BodyExt as _;
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+use http_body_util::BodyExt;
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec,
     PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformKvStore,
@@ -36,6 +36,34 @@ const MAX_DECOMPRESSED_SIZE: usize = 8 * 1024 * 1024;
 type HeaderPairs = Vec<(String, Vec<u8>)>;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 type BufferedResponseParts = (HeaderPairs, Vec<u8>);
+
+/// Collect an outbound response body, rejecting it once it exceeds
+/// [`MAX_DECOMPRESSED_SIZE`] streamed bytes.
+///
+/// The limit applies frame by frame, so an oversized body fails before it is
+/// fully retained in the component heap.
+///
+/// # Errors
+///
+/// Returns `PlatformError::HttpClient` when the body exceeds the limit or a
+/// frame cannot be read.
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+async fn collect_limited_body<B>(body: B) -> Result<Vec<u8>, Report<PlatformError>>
+where
+    B: BodyExt,
+    B::Data: bytes::Buf,
+    B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
+{
+    let collected = http_body_util::Limited::new(body, MAX_DECOMPRESSED_SIZE)
+        .collect()
+        .await
+        .map_err(|error| {
+            Report::new(PlatformError::HttpClient).attach(format!(
+                "failed to read Spin outbound response body: {error}"
+            ))
+        })?;
+    Ok(collected.to_bytes().to_vec())
+}
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 const SPIN_VARIABLE_HEX: &[u8; 16] = b"0123456789abcdef";
@@ -510,16 +538,7 @@ impl SpinPlatformHttpClient {
             .iter()
             .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
             .collect();
-        let body = http_body_util::Limited::new(spin_response.into_body(), MAX_DECOMPRESSED_SIZE)
-            .collect()
-            .await
-            .map_err(|error| {
-                Report::new(PlatformError::HttpClient).attach(format!(
-                    "failed to read Spin outbound response body: {error}"
-                ))
-            })?
-            .to_bytes()
-            .to_vec();
+        let body = collect_limited_body(spin_response.into_body()).await?;
 
         let (headers, body) = apply_spin_response_policy(&method, status, headers, body)?;
         let mut edge_builder = edgezero_core::http::response_builder().status(status);
@@ -538,8 +557,9 @@ impl SpinPlatformHttpClient {
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for SpinPlatformHttpClient {
     fn supports_concurrent_fanout(&self) -> bool {
-        // Retain the existing auction capability restriction independently of
-        // runtime task scheduling.
+        // Requests start concurrently at dispatch, but `select` and
+        // `select_until` collect only one response, so multi-provider fan-out
+        // stays unsupported.
         false
     }
 
@@ -1426,9 +1446,7 @@ mod deadline_tests {
             super::MAX_DECOMPRESSED_SIZE
                 + 1
         ]));
-        let result = block_on(http_body_util::BodyExt::collect(
-            http_body_util::Limited::new(body, super::MAX_DECOMPRESSED_SIZE),
-        ));
+        let result = block_on(super::collect_limited_body(body));
         assert!(
             result.is_err(),
             "should reject a response exceeding the streamed body cap"
@@ -1439,12 +1457,10 @@ mod deadline_tests {
     fn spin_body_collection_accepts_body_at_limit() {
         let body =
             http_body_util::Full::new(bytes::Bytes::from(vec![0; super::MAX_DECOMPRESSED_SIZE]));
-        let result = block_on(http_body_util::BodyExt::collect(
-            http_body_util::Limited::new(body, super::MAX_DECOMPRESSED_SIZE),
-        ))
-        .expect("should collect a body at the limit");
+        let result = block_on(super::collect_limited_body(body))
+            .expect("should collect a body at the limit");
         assert_eq!(
-            result.to_bytes().len(),
+            result.len(),
             super::MAX_DECOMPRESSED_SIZE,
             "should retain the complete permitted body"
         );

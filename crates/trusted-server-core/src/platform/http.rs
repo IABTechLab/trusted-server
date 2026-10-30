@@ -355,6 +355,12 @@ pub trait PlatformHttpClient: Send + Sync {
     /// while the publisher origin is fetched. Dropping its pending handle
     /// cancels or abandons unfinished work according to the runtime contract.
     ///
+    /// On Cloudflare and Spin the request runs as a task on the runtime
+    /// executor, so [`Self::wait`] and [`Self::select_until`] must be awaited
+    /// on that executor. Driving them through a blocking executor such as
+    /// `futures::executor::block_on` blocks the only thread the task can run
+    /// on and hangs.
+    ///
     /// # Errors
     ///
     /// Returns `PlatformError::HttpClient` when the request cannot be

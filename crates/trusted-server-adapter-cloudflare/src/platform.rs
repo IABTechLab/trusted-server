@@ -455,8 +455,9 @@ impl PlatformHttpClient for CloudflareHttpClient {
     }
 
     fn supports_concurrent_fanout(&self) -> bool {
-        // Retain the existing auction capability restriction independently of
-        // runtime task scheduling.
+        // Requests start concurrently at dispatch, but `select` and
+        // `select_until` collect only one response, so multi-provider fan-out
+        // stays unsupported.
         false
     }
 
@@ -764,8 +765,9 @@ fn extract_client_ip(ctx: &edgezero_core::context::RequestContext) -> Option<IpA
 
 /// Reject multi-provider auction fan-out at the Cloudflare adapter level.
 ///
-/// Pending worker requests execute during collection. This adapter collects
-/// one response future at a time and retains its single-provider contract.
+/// Pending worker requests start in a runtime task at dispatch. Collection
+/// still selects one response future at a time, so the adapter retains its
+/// single-provider contract.
 ///
 /// The primary guard lives in the auction orchestrator, which checks
 /// `supports_concurrent_fanout()` and rejects multi-provider configurations

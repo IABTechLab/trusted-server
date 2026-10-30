@@ -6807,7 +6807,9 @@ mod tests {
         );
         http.push_response(204, Vec::new());
         http.push_select_delay(Duration::ZERO);
-        http.push_select_delay(Duration::from_millis(250));
+        // Shorter than the 10 ms budget, so a collection clock restarted after
+        // the origin wait would collect this 204 instead of timing it out.
+        http.push_select_delay(Duration::from_millis(1));
         let services = build_services_with_backend_and_http_client(
             Arc::new(NamingBackend::new(BackendNamingPolicy::Axum)),
             Arc::clone(&http) as Arc<_>,
@@ -6886,7 +6888,9 @@ mod tests {
     async fn planned_split_collection_uses_dispatch_deadline_after_slow_origin() {
         let http = Arc::new(StubHttpClient::new());
         http.push_response(204, Vec::new());
-        http.push_select_delay(Duration::from_millis(250));
+        // Shorter than the 10 ms budget, so a collection clock restarted after
+        // the origin wait would collect this 204 instead of timing it out.
+        http.push_select_delay(Duration::from_millis(1));
         let services = build_services_with_backend_and_http_client(
             Arc::new(NamingBackend::new(BackendNamingPolicy::Axum)),
             http,
