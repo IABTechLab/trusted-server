@@ -698,7 +698,7 @@ fn is_safe_trailer_field(name: &HeaderName) -> bool {
 
 /// Applies the rewrite outcome: strips inbound hop-by-hop headers, then sets
 /// upstream `Host`, `X-Forwarded-Host`/`X-Orig-Host` (both `FROM`, after
-/// stripping any higher-priority inbound `Forwarded`), an authoritative
+/// stripping inbound `Forwarded`), an authoritative
 /// `X-Forwarded-Proto: https` (the browser leg is always TLS), and (only when
 /// absent) the injected `Authorization`. The request URI is left origin-form,
 /// which is what an HTTP/1.1 upstream expects.
@@ -712,16 +712,11 @@ fn rewrite_headers(
     // headers we stamp below as connection-specific and have them dropped.
     strip_hop_by_hop(headers);
     headers.insert(hyper::header::HOST, outcome.host_header.clone());
-    // Tell the upstream the original first-party host (always `FROM`). Trusted
-    // Server resolves the request host from `Forwarded` → `X-Forwarded-Host` →
-    // `Host`, so a client-supplied `Forwarded` would outrank the value we inject.
-    // Remove it first so the `X-Forwarded-Host` we stamp is the one core reads,
-    // aiming to keep emitted first-party URLs on the production host even when
-    // `--rewrite-host` sends `Host: TO` for routing/validation (spec §8.3). NOTE:
-    // this only holds if the upstream preserves `X-Forwarded-Host` — the real
-    // Fastly/Spin adapter paths strip it before routing, in which case core falls
-    // back to `Host` (`TO`). See the `--rewrite-host` caveat in the user guide.
-    // The `insert`s below already overwrite any inbound `X-Forwarded-Host`/`X-Orig-Host`.
+    // Replace client-supplied host hints with `FROM` and remove competing
+    // `Forwarded` metadata. Trusted Server accepts the forwarded host and scheme
+    // only with a matching `[trusted_forwarder]` credential; this proxy does not
+    // inject one. Every adapter otherwise uses its runtime or transport origin
+    // and strips the raw forwarding fields before routing.
     headers.remove("forwarded");
     headers.insert(
         HeaderName::from_static(X_FORWARDED_HOST),
@@ -731,11 +726,9 @@ fn rewrite_headers(
         HeaderName::from_static(X_ORIG_HOST),
         outcome.orig_host.clone(),
     );
-    // The browser→proxy leg is always TLS, so the original scheme is `https`.
-    // Stamp it authoritatively (overwriting any inbound value) and drop the
-    // spoofable `Fastly-SSL` signal, so a plaintext upstream (`--upstream-plaintext`)
-    // — or a spoofed header — cannot downgrade the first-party scheme Trusted
-    // Server derives for its URL rewriting (spec §8.3).
+    // The browser-to-proxy leg is always TLS. Replace any inbound scheme hint
+    // with `https` and remove the spoofable `Fastly-SSL` signal. Trusted Server
+    // still requires authenticated forwarding to use this scheme hint.
     headers.insert(
         HeaderName::from_static(X_FORWARDED_PROTO),
         HeaderValue::from_static("https"),
@@ -977,9 +970,8 @@ mod tests {
 
     #[test]
     fn rewrite_headers_strips_inbound_forwarded_so_injected_host_wins() {
-        // Trusted Server resolves the request host from `Forwarded` BEFORE
-        // `X-Forwarded-Host`. A client-supplied `Forwarded` must therefore be
-        // dropped, or it would outrank the FROM host the proxy injects.
+        // Remove client-supplied `Forwarded` metadata so the proxy sends only
+        // its own host hints, regardless of the upstream's trust policy.
         let outcome = rewrite_outcome("to.edgecompute.app");
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
@@ -989,7 +981,7 @@ mod tests {
         rewrite_headers(&mut headers, &outcome, None);
         assert!(
             !headers.contains_key("forwarded"),
-            "inbound Forwarded must be stripped so it cannot outrank X-Forwarded-Host"
+            "should strip inbound Forwarded rather than send competing host hints"
         );
         assert_eq!(
             headers.get(X_FORWARDED_HOST).and_then(|v| v.to_str().ok()),

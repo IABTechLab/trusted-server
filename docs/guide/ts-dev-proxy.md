@@ -286,27 +286,30 @@ certificate is imported until the subject check succeeds.
 
 ## Host header behavior
 
-The proxy always sends `X-Forwarded-Host: <FROM>` (the production hostname) — the
-standard "original host" header for a forward proxy. Trusted Server core selects
-its effective host from `Forwarded`'s `host=` parameter, then `X-Forwarded-Host`,
-then nonempty `Host`, then URI authority (excluding userinfo). Without a
-higher-priority `Forwarded` host,
-**first-party URLs stay on the production domain regardless of the `Host` header —
-as long as the upstream preserves `X-Forwarded-Host`**. That decouples routing
-(`Host`) from the first-party host. (Fastly and Spin strip inbound forwarded
-headers; the caveat below covers what that means with `--rewrite-host`.)
+The proxy always sends `X-Forwarded-Host: <FROM>` (the production hostname) and
+`X-Forwarded-Proto: https` (the browser-facing scheme). Trusted Server accepts
+these fields for first-party URL rewriting only when the upstream configures
+[`[trusted_forwarder]`](./configuration.md#trusted-forwarder) and the forwarder
+sends its matching credential. The forwarded hostname must also match
+`publisher.domain` or one of its subdomains. Every adapter strips raw `Forwarded`,
+`X-Forwarded-Host` and `X-Forwarded-Proto` fields before routing; unauthenticated
+fields do not influence the public origin.
+
+This version of `ts dev proxy` does not inject a trusted-forwarder credential.
+First-party URLs therefore use the upstream's runtime or transport host and
+scheme. An Axum upstream reached over plain HTTP emits `http://` first-party URLs
+even though the browser-to-proxy connection uses HTTPS. Configuring
+`[trusted_forwarder]` alone does not change that; an authenticated forwarder must
+also supply the credential.
 
 The selected host is syntax-validated before publisher processing, including
 requests for assets that never reach a script rewriter. A malformed selected host
-or explicitly empty forwarded host returns **400**, without falling back to a
-lower-priority source or reflecting the rejected value. An empty `Host` instead
-uses URI authority, and that fallback host is also validated. A non-text host
-header, including a non-text `Forwarded` value, is also rejected. Requests with no
-host metadata retain
-the existing empty-host behavior. Valid ports, bracketed IPv6, local hostnames,
-and ASCII underscores in host labels are retained. This validation does not
-establish whether a forwarded header came from a trusted proxy; configure that
-trust boundary in the adapter/deployment.
+returns **400**, without falling back to a lower-priority source or reflecting the
+rejected value. An empty `Host` instead uses URI authority (excluding userinfo),
+and that fallback host is also validated. A non-text `Host` header is also
+rejected. Requests with no host metadata retain the existing empty-host behavior.
+Valid ports, bracketed IPv6, local hostnames, and ASCII underscores in host labels
+are retained.
 
 By default `Host: <FROM>` too. Fastly routes by SNI (`= TO`) and passes `Host`
 through unchanged, so `Host: <FROM>` reaches the upstream — but the upstream still
@@ -326,8 +329,9 @@ ts dev proxy \
 ```
 
 The proxy dials `192.0.2.10` while the SNI stays `ts.example-publisher.com` and
-`X-Forwarded-Host` stays `www.example-publisher.com` — so TS rewrites first-party
-URLs onto the production domain. This keeps the tool self-contained — no
+the default `Host` stays `www.example-publisher.com`. The upstream must accept
+that production Host; `X-Forwarded-Host` alone does not establish trust for URL
+rewriting. This keeps the tool self-contained — no
 `/etc/hosts` edit. (Pointing `--to` at a bare IP instead would make the SNI an IP,
 which sends no SNI extension at all, so a host-routed endpoint serves its default
 vhost.) Add `--insecure` if the endpoint serves a certificate that doesn't match
@@ -336,18 +340,14 @@ the hostname.
 **Sending `Host: TO`.** If your upstream routes or validates on its _own_
 hostname (e.g. a Fastly Deliver service that rejects an unconfigured `Host`), pass
 `--rewrite-host` to send `Host: <TO>`. The proxy still stamps
-`X-Forwarded-Host: <FROM>`, so first-party URL rewriting stays anchored to `FROM`
-**as long as the upstream preserves that header**.
+`X-Forwarded-Host: <FROM>`, but Trusted Server ignores that unauthenticated hint.
 
-> **Caveat with real Trusted Server adapters.** The Fastly and Spin adapter
-> request paths strip inbound `X-Forwarded-Host` before routing, so with
-> `--rewrite-host` a real Trusted Server upstream falls back to `Host` (`TO`) and
-> emits first-party URLs on `TO`, not `FROM`. Even so, `--rewrite-host` is the
-> right choice for most upstreams — dev and staging services rarely have the
-> production hostname configured and would reject the plain `Host: <FROM>`. Drop
-> it only when the upstream is configured to accept `Host: <FROM>` and you
-> specifically need first-party URLs anchored to `FROM` — the `--resolve` example
-> above is exactly that case.
+> **Trusted Server upstreams.** Fastly, Axum, Cloudflare and Spin all use their
+> runtime or transport origin without authenticated forwarding. With
+> `--rewrite-host`, this commonly means first-party URLs use `TO`. Use the option
+> when the upstream requires its own Host for routing or validation. Omit it when
+> the upstream accepts `Host: <FROM>` and you need the production hostname; the
+> scheme still follows the upstream transport.
 
 The TLS SNI is always the `TO` host either way:
 
