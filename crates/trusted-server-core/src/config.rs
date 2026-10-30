@@ -121,6 +121,14 @@ impl<'de> Deserialize<'de> for TrustedServerAppConfig {
 
 impl Validate for TrustedServerAppConfig {
     fn validate(&self) -> Result<(), ValidationErrors> {
+        // Deploy-time secret fields hold key names, whose runtime value errors
+        // EdgeZero prunes after this call. Do not gate the warning on them.
+        if self.settings.publisher.public_origin.is_none() {
+            log::warn!(
+                "publisher.public_origin is unset; generated first-party URLs use {}, not the serving page's scheme, host or port. Verify this endpoint before deployment, or configure publisher.public_origin.",
+                self.settings.publisher.effective_public_origin()
+            );
+        }
         let mut errors = self.settings.validate().err().unwrap_or_default();
         if let Err(report) = validate_settings_for_deploy(&self.settings) {
             errors.add(
@@ -377,6 +385,14 @@ fn validate_non_secret_deploy_placeholders(
     if crate::settings::Publisher::is_placeholder_origin_url(&settings.publisher.origin_url) {
         insecure_fields.push("publisher.origin_url");
     }
+    if settings
+        .publisher
+        .public_origin
+        .as_deref()
+        .is_some_and(crate::settings::Publisher::is_placeholder_public_origin)
+    {
+        insecure_fields.push("publisher.public_origin");
+    }
     if let Some(request_signing) = &settings.request_signing {
         if crate::settings::RequestSigning::is_unusable_store_id(&request_signing.config_store_id) {
             insecure_fields.push("request_signing.config_store_id");
@@ -589,7 +605,10 @@ formats = [{ width = 300, height = 250 }]
 
     #[test]
     fn app_config_normalizes_public_origin_before_serializing() {
-        for origin in ["https:ads.example.com", "HTTPS://ADS.EXAMPLE.COM:443"] {
+        for origin in [
+            "https:creative.example.com",
+            "HTTPS://CREATIVE.EXAMPLE.COM:443",
+        ] {
             let mut settings = valid_settings();
             settings.publisher.public_origin = Some(origin.to_owned());
             let constructed = TrustedServerAppConfig::new(settings)
@@ -597,7 +616,7 @@ formats = [{ width = 300, height = 250 }]
             let mut data =
                 serde_json::to_value(&constructed).expect("should serialize constructed config");
             assert_eq!(
-                data["publisher"]["public_origin"], "https://ads.example.com",
+                data["publisher"]["public_origin"], "https://creative.example.com",
                 "should serialize a normalized origin from the constructor"
             );
 
@@ -606,7 +625,7 @@ formats = [{ width = 300, height = 250 }]
                 .expect("should normalize the public origin in deserialized config");
             assert_eq!(
                 deserialized.settings().publisher.effective_public_origin(),
-                "https://ads.example.com",
+                "https://creative.example.com",
                 "should normalize the public origin on both config boundaries"
             );
         }
@@ -1251,6 +1270,79 @@ password = "production-admin-password-32-bytes"
                 && text.contains("publisher.origin_url"),
             "should flag all three example publisher placeholders: {err:?}"
         );
+    }
+
+    #[test]
+    fn deploy_and_runtime_validation_reject_remaining_public_origin_placeholder() {
+        let template = include_str!("../../../trusted-server.example.toml")
+            .replace("domain = \"example.com\"", "domain = \"publisher.example\"")
+            .replace(
+                "cookie_domain = \".example.com\"",
+                "cookie_domain = \".publisher.example\"",
+            )
+            .replace(
+                "https://origin.example.com",
+                "https://origin.publisher.example",
+            )
+            .replace(
+                "passphrase = \"ec_passphrase\"",
+                "passphrase = \"test-passphrase-at-least-32-bytes-long\"",
+            );
+        let settings = Settings::from_toml(&template).expect(
+            "should load the template after replacing the three existing host placeholders",
+        );
+
+        for result in [
+            validate_non_secret_deploy_placeholders(&settings),
+            settings.reject_placeholder_secrets(),
+        ] {
+            let err = result.expect_err("should still reject the public origin placeholder");
+            let TrustedServerError::InsecureDefault { field } = err.current_context() else {
+                panic!("should report insecure defaults: {err:?}");
+            };
+            assert!(
+                field
+                    .split(", ")
+                    .any(|field| field == "publisher.public_origin"),
+                "should identify the remaining public origin placeholder: {field}"
+            );
+            assert!(
+                !field.split(", ").any(|field| matches!(
+                    field,
+                    "publisher.domain" | "publisher.cookie_domain" | "publisher.origin_url"
+                )),
+                "should no longer flag the three edited fields: {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_config_public_origin_errors_include_the_reason() {
+        for (origin, reason) in [
+            (
+                "https://creative.example.com/",
+                "public_origin must not include a trailing slash",
+            ),
+            (
+                "https://creative.example.com/path",
+                "public_origin_has_path",
+            ),
+            (
+                "https://creative.example.com:0",
+                "public_origin_has_invalid_port",
+            ),
+        ] {
+            let mut data =
+                serde_json::to_value(valid_settings()).expect("should serialize settings");
+            data["publisher"]["public_origin"] = serde_json::json!(origin);
+            let err = serde_json::from_value::<TrustedServerAppConfig>(data)
+                .expect_err("should reject the invalid public origin");
+            let message = err.to_string();
+            assert!(
+                message.contains("publisher.public_origin") && message.contains(reason),
+                "should explain the public origin error: {message}"
+            );
+        }
     }
 
     #[test]

@@ -562,10 +562,10 @@ curl -X POST https://edge.example.com/first-party/sign \
 }
 ```
 
-`href` is an absolute signed proxy URL on `publisher.public_origin`, falling
-back to `https://{publisher.domain}`. `base` is the normalized target without
-its query or fragment. Configure the actual browser-facing endpoint as described
-in [Publisher configuration](/guide/configuration#publisher-configuration).
+`href` is an absolute signed proxy URL on
+[`publisher.public_origin`](/guide/configuration#public_origin). See that section
+for the default authority, EC cookie scope, and coordinated upgrade/rollback
+warning. `base` is the normalized target without its query or fragment.
 
 **Error Responses:**
 
@@ -612,7 +612,7 @@ Validation and re-signing depend on `publisher.proxy_secret`.
 
 `tsclick` accepts absolute URLs emitted by the rewriter and existing
 root-relative signed URLs. The rebuilt `href` is absolute on
-`publisher.public_origin`, falling back to `https://{publisher.domain}`.
+[`publisher.public_origin`](/guide/configuration#public_origin).
 
 **Response:**
 
@@ -645,7 +645,7 @@ Navigation form of the same recovery, for creatives rendered in a sandboxed ifra
 | `del`     | No       | URL-encoded JSON array of parameter names to drop |
 
 **Response:** `302` with an absolute rebuilt click URL on
-`publisher.public_origin`, falling back to `https://{publisher.domain}`, in
+[`publisher.public_origin`](/guide/configuration#public_origin), in
 `Location` and `Cache-Control: no-store, private`. The browser follows it to
 `/first-party/click`, which redirects on to the advertiser.
 

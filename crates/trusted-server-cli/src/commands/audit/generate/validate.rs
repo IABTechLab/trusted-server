@@ -77,6 +77,10 @@ mod tests {
                 "https://origin.example.com",
                 "https://origin.publisher.example.com",
             )
+            .replace(
+                "https://ads.example.com",
+                "https://ads.publisher.example.com",
+            )
     }
 
     #[test]

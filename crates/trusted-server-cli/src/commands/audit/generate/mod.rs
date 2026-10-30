@@ -415,6 +415,12 @@ fn build_draft_config_with_generator(
         "origin_url",
         &format!("origin_url = \"{origin}\""),
     )?;
+    draft = replace_key_in_section(
+        &draft,
+        "publisher",
+        "public_origin",
+        &format!("public_origin = \"{origin}\""),
+    )?;
 
     let detected = artifact
         .detected_integrations
@@ -2650,6 +2656,7 @@ mod tests {
         assert!(draft.contains("domain = \"www.publisher.example\""));
         assert!(draft.contains("cookie_domain = \".www.publisher.example\""));
         assert!(draft.contains("origin_url = \"https://www.publisher.example:8443\""));
+        assert!(draft.contains("public_origin = \"https://www.publisher.example:8443\""));
         assert!(draft.contains("[integrations.gpt]\nenabled = true"));
         assert!(draft.contains("[integrations.google_tag_manager]\nenabled = true"));
         assert!(draft.contains("container_id = \"GTM-ABC123\""));
@@ -3816,6 +3823,10 @@ mod tests {
             .replace(
                 "https://origin.example.com",
                 "https://origin.publisher.example.com",
+            )
+            .replace(
+                "https://ads.example.com",
+                "https://ads.publisher.example.com",
             )
     }
 

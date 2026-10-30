@@ -53,6 +53,10 @@ fn push(project: &TempDir, args: &[&str], overrides: &[(&str, &str)]) -> Output 
             "TRUSTED_SERVER__PUBLISHER__ORIGIN_URL",
             "https://upstream.example.com",
         )
+        .env(
+            "TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN",
+            "https://ads.publisher.example.com",
+        )
         .envs(overrides.iter().copied())
         .output()
         .expect("should run a local config push");

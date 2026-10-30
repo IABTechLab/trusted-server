@@ -6134,11 +6134,10 @@ pub(crate) fn build_bid_map_with_auction_id(
 ) -> serde_json::Map<String, serde_json::Value> {
     // Inline creatives render in a foreign origin (PUC's srcdoc under GAM), so
     // their proxy/click URLs must be absolute against the origin the visitor is
-    // actually on — scheme, host, and port. Fall back to the configured publisher
-    // domain only when the request origin is unknown (e.g. an empty host on a
-    // non-navigation path), where no inline render is expected anyway.
+    // actually on — scheme, host, and port. Use the configured public origin
+    // only when the request origin is unknown.
     let base_origin = if request_origin.is_empty() {
-        format!("https://{}", settings.publisher.domain)
+        settings.publisher.effective_public_origin()
     } else {
         request_origin.to_owned()
     };
@@ -25811,30 +25810,35 @@ mod tests {
             );
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
-            let adm = map
-                .get("atf_sidebar_ad")
-                .and_then(|v| v.as_object())
-                .and_then(|o| o.get("adm"))
-                .and_then(|v| v.as_str())
-                .expect("should include a rewritten adm");
+            for public_origin in [None, Some("https://ads.example.com:8443")] {
+                settings.publisher.public_origin = public_origin.map(str::to_owned);
+                let map =
+                    build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
+                let adm = map
+                    .get("atf_sidebar_ad")
+                    .and_then(|v| v.as_object())
+                    .and_then(|o| o.get("adm"))
+                    .and_then(|v| v.as_str())
+                    .expect("should include a rewritten adm");
+                let expected_origin = public_origin.unwrap_or("https://example.com");
 
-            assert!(
-                adm.contains("https://example.com/first-party/proxy?tsurl="),
-                "should emit an absolute first-party proxy URL for the foreign-origin render context, got: {adm}"
-            );
-            assert!(
-                !adm.contains("src=\"/first-party/proxy"),
-                "should not emit a root-relative proxy URL that 404s under GAM's origin, got: {adm}"
-            );
-            assert!(
-                !adm.contains("https://cdn.example.com/pixel.png"),
-                "should proxy the original absolute CDN URL, got: {adm}"
-            );
-            assert!(
-                !adm.contains("/static/tsjs="),
-                "should not inject the tsjs bundle into a foreign-origin creative iframe, got: {adm}"
-            );
+                assert!(
+                    adm.contains(&format!("{expected_origin}/first-party/proxy?tsurl=")),
+                    "should use the configured public origin or domain fallback: {adm}"
+                );
+                assert!(
+                    !adm.contains("src=\"/first-party/proxy"),
+                    "should not emit a root-relative proxy URL under GAM: {adm}"
+                );
+                assert!(
+                    !adm.contains("https://cdn.example.com/pixel.png"),
+                    "should proxy the original absolute CDN URL: {adm}"
+                );
+                assert!(
+                    !adm.contains("/static/tsjs="),
+                    "should not inject the tsjs bundle into the inline creative: {adm}"
+                );
+            }
         }
 
         #[test]
@@ -25885,10 +25889,11 @@ mod tests {
         fn build_bid_map_uses_request_origin_for_inline_urls() {
             // The inline adm's absolute first-party URLs must resolve against the
             // origin the visitor is on (here an HTTP dev host with a port), not the
-            // configured publisher domain.
+            // configured public origin or publisher domain.
             let mut settings = test_settings();
             settings.auction.rewrite_creatives = true;
             settings.publisher.domain = "example.com".to_string();
+            settings.publisher.public_origin = Some("https://ads.example.com:8443".to_string());
 
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(

@@ -82,6 +82,12 @@ Prefer that endpoint origin even when the document or trusted parent stamp has
 a different origin. If no usable script origin exists, use the existing pinned,
 normalized trusted base. An unusable opaque base supplies no endpoint origin.
 Later DOM or base-element mutations must not retarget captured endpoints.
+This captures a value, not an authenticated script identity. An earlier creative
+script can shadow `document.currentScript` before evaluation and retarget
+sign/rebuild endpoints, including GET rebuild navigation, while the parent stamp
+remains pinned. This accepted script-first contract does not promise protection
+against that pre-load spoofing. Browser coverage must distinguish it from later
+mutations and from attempts to overwrite the stamp itself.
 
 Use the endpoint origin for sign/rebuild requests and exact-origin/exact-path
 proxy recognition. Do not mistake another host's `/first-party/proxy` for a
@@ -116,26 +122,29 @@ identifiers or data collection, no wider rewrite host policy, and no change to
 server-side EC forwarding rules. Fetch keeps `credentials: 'same-origin'`.
 Actual cookie attachment can change when a configured endpoint differs from
 the document origin; this feature does not add cross-origin credentials.
-Operators must choose an appropriate browser-reachable endpoint. No CORS
+Use an endpoint within the EC cookie scope as described in
+[public origin configuration](/guide/configuration#public_origin). No CORS
 grants, signing broker, retry framework or dynamic-signing transport redesign;
 #982 remains separate.
 
 ## Compatibility and rollout
 
-Configuration compatibility is not routing compatibility. Previously generated
-root-relative URLs followed the visitor's scheme, host and port. The new absent
-value fallback always uses HTTPS and the configured publisher domain. This may
-change the endpoint for subdomain or local HTTP deployments.
-
-Verify `public_origin`, DNS/TLS, routes and local ports before rollout. When the
-fallback is not the reachable endpoint, activate the new binary with its matching
-configuration blob as a coordinated release. Old binaries deny the new key, so
-do not publish a configured `public_origin` to an old active binary. Rollback must
-restore an old-compatible blob without the key together with the old binary.
-Retain the public endpoint while previously emitted absolute creative URLs may
-still be used. Existing signed relative inputs remain accepted on the new binary.
+Follow the [public origin configuration warning](/guide/configuration#public_origin)
+for default authority changes and coordinated binary/config upgrade and rollback.
+Existing signed relative inputs remain accepted on the new binary.
 
 ## Verification
+
+Creative rewrite tests should configure a distinct `publisher.public_origin`
+and assert the parsed URL origin, not only a `/first-party/...` path substring.
+Cover a deployment origin with a port and direct local development at
+`http://localhost:8080`. Keep old-config deserialization and omitted-field
+fallback tests separate from authority assertions, using the
+[configured fallback contract](/guide/configuration#public_origin).
+Keep manual root-relative proxy and click inputs for compatibility tests;
+rewritten creative output and sign/rebuild responses should be absolute. Test
+the publisher SSAT/page-bids request-origin override separately. Existing TSJS
+source selection and bundle hashes should remain unchanged.
 
 - A regression must first expose malformed-origin emission, then prove TOML and
   JSON loads store and serialize a normalized origin and generated output resolves

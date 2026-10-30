@@ -18,14 +18,10 @@ Routes remain path-based, but URLs emitted into rewritten creatives and
 `/first-party/sign` or `/first-party/proxy-rebuild` responses are absolute on
 `[publisher].public_origin`, for example
 `https://ads.publisher.example/first-party/proxy?...`. Existing root-relative
-signed proxy and click inputs remain accepted. Use the actual browser-facing
-HTTPS endpoint in deployments, or `http://localhost:8080` for a direct local
-server on port 8080. When omitted, the field defaults to
-`https://{publisher.domain}`. This keeps old configs deserializable, not the
-serving page's scheme, host, or port. The publisher SSAT/page-bids path retains
-its explicit request-origin override. See
-[Publisher configuration](/guide/configuration#publisher-configuration) for
-binary/config upgrade and rollback sequencing.
+signed proxy and click inputs remain accepted. The publisher SSAT/page-bids
+path retains its explicit request-origin override. See
+[public origin configuration](/guide/configuration#public_origin) for the default
+authority, EC cookie scope, and coordinated upgrade/rollback warning.
 
 ## How It Works
 

@@ -128,7 +128,14 @@ fn pushed_config_with_env(
         .expect("should contain a blob envelope");
     let envelope: serde_json::Value =
         serde_json::from_str(envelope_json).expect("should parse blob envelope");
-    envelope["data"].clone()
+    let config = envelope["data"].clone();
+    if config["publisher"].get("public_origin").is_none() {
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("publisher.public_origin is unset"),
+            "push should warn before publishing the HTTPS/domain fallback"
+        );
+    }
+    config
 }
 
 #[test]
@@ -158,6 +165,79 @@ fn public_origin_environment_override_is_ignored_without_leaf() {
     assert!(
         config["publisher"].get("public_origin").is_none(),
         "should retain the omitted public origin when the TOML leaf is absent"
+    );
+}
+
+#[test]
+fn public_origin_omission_warns_during_validate_but_explicit_origin_does_not() {
+    let project = migrated_project();
+    let output = validate_with_overlay(&project, "true");
+    assert!(output.status.success(), "should validate the legacy config");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("publisher.public_origin is unset")
+            && stderr.contains("not the serving page's scheme, host or port"),
+        "should explain the omitted-origin routing change: {stderr}"
+    );
+
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read migrated config")
+        .parse::<DocumentMut>()
+        .expect("should parse migrated config");
+    document["publisher"]["public_origin"] = value("http://localhost:7676");
+    fs::write(&project.config_path, document.to_string()).expect("should write explicit origin");
+    let output = validate_with_overlay(&project, "true");
+    assert!(
+        output.status.success(),
+        "should validate the explicit origin"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("publisher.public_origin is unset"),
+        "should not warn about a configured origin"
+    );
+}
+
+#[test]
+fn public_origin_template_placeholder_blocks_validate_and_push() {
+    let project = migrated_project();
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read migrated config")
+        .parse::<DocumentMut>()
+        .expect("should parse migrated config");
+    document["publisher"]["public_origin"] = value("https://ADS.EXAMPLE.COM:443");
+    fs::write(&project.config_path, document.to_string()).expect("should write placeholder origin");
+
+    for command in ["validate", "push"] {
+        let mut process = Command::new(env!("CARGO_BIN_EXE_ts"));
+        process
+            .args(["config", command, "--manifest"])
+            .arg(&project.manifest_path)
+            .arg("--app-config")
+            .arg(&project.config_path)
+            .current_dir(project.directory.path());
+        if command == "push" {
+            process.args(["--adapter", "axum", "--yes", "--no-diff"]);
+        }
+        let output = process
+            .output()
+            .expect("should run the real config command");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "should reject the template origin"
+        );
+        assert!(
+            stderr.contains("publisher.public_origin") && stderr.contains("Insecure default"),
+            "should identify the placeholder during {command}: {stderr}"
+        );
+    }
+    assert!(
+        !project
+            .directory
+            .path()
+            .join(".edgezero/local-config-trusted_server_config.json")
+            .exists(),
+        "should not publish a config with the template public origin"
     );
 }
 

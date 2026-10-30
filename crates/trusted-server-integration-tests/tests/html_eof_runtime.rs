@@ -598,8 +598,9 @@ fn actual_runtime() -> HarnessResult<()> {
     let mut baseline = Vec::new();
     for case in cases {
         harness.cancellation.check()?;
+        let port = available_port()?;
         // Auction controls deliberately use an unreachable bidder and verify empty-bid assembly.
-        let config = config::fixture_config(&template, case, origin.port, available_port()?)?;
+        let config = config::fixture_config(&template, case, origin.port, available_port()?, port)?;
         fs::write(harness.workspace.join("trusted-server.toml"), config)
             .change_context(HarnessError::Io)?;
         fs::write(harness.workspace.join("fastly.toml"), "manifest_version = 3\nname = 'example-finalization'\nlanguage = 'rust'\n[local_server]\n").change_context(HarnessError::Io)?;
@@ -607,7 +608,6 @@ fn actual_runtime() -> HarnessResult<()> {
         if matches!(adapter.as_str(), "fastly" | "spin") {
             harness.push(&adapter)?;
         }
-        let port = available_port()?;
         let log = harness.workspace.join(format!("{case}.log"));
         let output = File::create(&log).change_context(HarnessError::Io)?;
         let mut command = harness.runtime_command(&adapter, &artifact, port)?;

@@ -61,12 +61,10 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 # Actual browser-facing Trusted Server endpoint for rewritten creative URLs.
 # Use HTTPS in deployments, or e.g. http://localhost:8080 for direct local dev.
-# Optional for old-config deserialization. Omission uses https://{domain}, NOT
-# the serving page's scheme, host, or port. This active leaf allows env overlays.
-# Upgrade binary before pushing this field; old binaries reject it. Coordinate
-# binary/config activation if https://{domain} cannot serve the fallback traffic.
-# Rollback: remove this field and its env override, validate and push, then roll
-# back the binary. Coordinate both if the fallback endpoint cannot serve traffic.
+# Use domain or one of its subdomains to stay within the EC cookie scope.
+# Replace this placeholder before deployment. Keep this leaf for env overlays.
+# Review the fallback and coordinated upgrade/rollback warning before deployment:
+# docs/guide/configuration.md#public_origin
 public_origin = "https://ads.example.com"
 # Secret Store key for the HMAC secret used to sign first-party proxy URLs.
 proxy_secret = "publisher_proxy_secret"

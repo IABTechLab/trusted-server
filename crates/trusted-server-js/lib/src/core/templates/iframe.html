@@ -3,12 +3,11 @@
   <head>
     <meta charset="utf-8" />
     <script>
-      // Runs before any creative markup, so this is the only opportunity to fix
-      // the trusted origin. Define it non-writable and non-configurable:
-      // creative markup can carry its own <head> script, whose content executes
-      // ahead of the runtime injected at the top of <body>, and a plain
-      // assignment would let it redirect click and rebuild resolution to an
-      // attacker origin.
+      // Fix the parent-origin base before creative markup can install a <base>
+      // or overwrite the stamp. This pins legacy relative click resolution and
+      // the endpoint fallback. It does not authenticate the higher-priority
+      // runtime script origin: earlier creative script can shadow currentScript
+      // and choose the endpoint origin despite this immutable stamp.
       Object.defineProperty(window, '__tsCreativeOrigin', {
         value: '%TRUSTED_ORIGIN%',
         writable: false,

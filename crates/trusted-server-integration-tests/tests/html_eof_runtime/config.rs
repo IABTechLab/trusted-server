@@ -59,12 +59,14 @@ pub(super) fn fixture_config(
     case: &str,
     origin: u16,
     bid: u16,
+    public_port: u16,
 ) -> HarnessResult<String> {
     let mut value = parse(template)?;
     for (key, replacement) in [
         ("domain", "127.0.0.1".to_owned()),
         ("cookie_domain", "127.0.0.1".to_owned()),
         ("origin_url", format!("http://127.0.0.1:{origin}")),
+        ("public_origin", format!("http://127.0.0.1:{public_port}")),
     ] {
         replace(&mut value, &["publisher", key], Value::String(replacement))?;
     }
@@ -113,7 +115,7 @@ pub(super) fn fixture_config(
         case == "streaming"
     ))?;
     table(&mut value, &["integrations"])?.insert("html_finalization_fixture".to_owned(), fixture);
-    validate_fixture(&value, case, origin, bid)?;
+    validate_fixture(&value, case, origin, bid, public_port)?;
     serialize(&value)
 }
 
@@ -122,6 +124,7 @@ pub(super) fn validate_fixture(
     case: &str,
     origin: u16,
     bid: u16,
+    public_port: u16,
 ) -> HarnessResult<()> {
     let lookup = if matches!(case, "auction" | "streaming") {
         "success"
@@ -140,6 +143,10 @@ pub(super) fn validate_fixture(
         (
             vec!["publisher", "origin_url"],
             Value::String(format!("http://127.0.0.1:{origin}")),
+        ),
+        (
+            vec!["publisher", "public_origin"],
+            Value::String(format!("http://127.0.0.1:{public_port}")),
         ),
         (
             vec!["publisher", "allow_async_html_finish"],
@@ -246,7 +253,7 @@ mod tests {
     #[test]
     fn fixture_config_is_loopback_only_with_explicit_permission() {
         for case in ["disabled", "success", "hung", "auction", "streaming"] {
-            let config = fixture_config(CONFIG, case, 12345, 12346)
+            let config = fixture_config(CONFIG, case, 12345, 12346, 12347)
                 .expect("should generate isolated configuration");
             let parsed: toml::Value = toml::from_str(&config).expect("should parse configuration");
             assert_eq!(
@@ -258,6 +265,11 @@ mod tests {
                 parsed["publisher"]["origin_url"].as_str(),
                 Some("http://127.0.0.1:12345"),
                 "should isolate the origin"
+            );
+            assert_eq!(
+                parsed["publisher"]["public_origin"].as_str(),
+                Some("http://127.0.0.1:12347"),
+                "should use the runtime listener, not the upstream origin"
             );
             assert_eq!(
                 parsed["publisher"]["allow_async_html_finish"].as_bool(),
@@ -279,13 +291,14 @@ mod tests {
             "success",
             12345,
             12346,
+            12347,
         );
         assert!(result.is_err(), "should reject incomplete templates");
     }
 
     #[test]
     fn fixture_validation_rejects_external_endpoints() {
-        let config = fixture_config(CONFIG, "auction", 12345, 12346)
+        let config = fixture_config(CONFIG, "auction", 12345, 12346, 12347)
             .expect("should generate auction configuration");
         let mut value = parse(&config).expect("should parse generated configuration");
         let provider = table(&mut value, &["auction", "providers"])
@@ -301,7 +314,7 @@ mod tests {
         )
         .expect("should change the controlled endpoint");
         assert!(
-            validate_fixture(&value, "auction", 12345, 12346).is_err(),
+            validate_fixture(&value, "auction", 12345, 12346, 12347).is_err(),
             "should reject non-loopback auction endpoints"
         );
     }

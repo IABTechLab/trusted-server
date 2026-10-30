@@ -20,9 +20,9 @@ rejected until replaced.
 
 ```toml
 [publisher]
-domain = "publisher.com"
-cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
+domain = "publisher.example"
+cookie_domain = ".publisher.example"
+origin_url = "https://origin.publisher.example"
 public_origin = "https://ads.publisher.example"
 proxy_secret = "publisher_proxy_secret"
 
@@ -38,8 +38,8 @@ read by the deployed application at request time.
 
 ```bash
 # Format: TRUSTED_SERVER__SECTION__FIELD
-export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
-export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
+export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.example
+export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.example
 # Secret overrides, when needed, are key names—not secret values.
 export TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
 export TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
@@ -329,24 +329,24 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ```toml
 [publisher]
-domain = "publisher.com"
-cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
-# Browser-facing origin for rewritten creative proxy, click, and TSJS URLs.
+domain = "publisher.example"
+cookie_domain = ".publisher.example"
+origin_url = "https://origin.publisher.example"
+# Browser-facing origin within the EC cookie scope .publisher.example.
 public_origin = "https://ads.publisher.example"
 # Optional: connect to origin_url but send this outbound Host header.
-# origin_host_header_override = "www.publisher.com"
+# origin_host_header_override = "www.publisher.example"
 proxy_secret = "publisher_proxy_secret"
 ```
 
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
-TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.com
-TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
+TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.example
+TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.example
+TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.example
 TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=https://ads.publisher.example
-TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
+TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.example
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 TRUSTED_SERVER__PUBLISHER__ALLOW_ASYNC_HTML_FINISH=false
@@ -411,11 +411,20 @@ silently ignored. The example TOML above includes that leaf.
 
 **Port Handling**: Includes port if non-standard (not 80/443).
 
-#### `public_origin`
+#### `public_origin` {#public_origin}
 
 **Purpose**: Browser-facing Trusted Server origin used for first-party URLs emitted into rewritten creatives, including proxy, click, and injected TSJS URLs.
 
 This is distinct from `origin_url`, which is only the backend connection target. Do not derive it from request headers.
+
+Use `publisher.domain` or one of its subdomains for deployed traffic. The EC
+cookie is scoped to `.{publisher.domain}`, independently of `cookie_domain`.
+Proxy and click requests to a host outside that scope carry no EC cookie and
+cannot forward the EC ID. For example, `domain = "publisher.example"` allows
+`public_origin = "https://ads.publisher.example"` within that cookie scope.
+This does not enable cross-origin credentials: runtime fetches still use
+`credentials: 'same-origin'`, so even an in-scope endpoint on a different origin
+does not receive cookies on those fetches. No CORS grants are added.
 
 **Format**: An `http` or `https` origin with a host and optional port, without userinfo, path, query, fragment, or a trailing slash. HTTPS is recommended for deployed publisher traffic; HTTP is supported for direct localhost development.
 
@@ -430,6 +439,7 @@ normalization, not silently discarded.
 Omission keeps old configuration files deserializable, not their previous URL
 authority behavior. Previously root-relative creative URLs followed the serving
 page's scheme, host, and port; the new default does not preserve those values.
+`ts config validate` and `ts config push` warn when this field is omitted.
 Set this field to the actual browser-facing Trusted Server endpoint, including
 its port when needed, rather than the backend `origin_url`. For direct local
 development on port 8080, for example, use `http://localhost:8080`.
@@ -448,7 +458,8 @@ Before rolling back, remove `public_origin` and its environment override, run
 binary. New binaries use the fallback during that interval; coordinate the
 binary and config rollback if that endpoint cannot serve traffic. Old binaries
 resume root-relative output. Omitting the field from a config does not preserve
-an explicit origin's scheme, host, or port.
+an explicit origin's scheme, host, or port. Keep the public endpoint available
+while previously emitted absolute creative URLs may still be used.
 :::
 
 #### `origin_host_header_override`
@@ -2192,8 +2203,8 @@ configs too: whenever either setting is on, a bidder-supplied `<base>` element
 loses its `href`; it keeps a `target` and is removed when it has none (before
 this release the whole element was removed). With `sanitize_creatives = true`,
 the sanitizer removes `<base>` entirely before the rewrite pass. The `POST /auction` path emits
-absolute endpoints on `publisher.public_origin`, falling back to
-`https://{publisher.domain}`, and, when either setting is on, injects the
+absolute endpoints on the [configured public origin](#public_origin) and,
+when either setting is on, injects the
 creative TSJS runtime exactly once, whether or not the bidder supplied a
 `<body>`, since bare fragments are the common `adm` shape. The foreign-origin
 SSAT renderer retains its request-origin override and does not inject that

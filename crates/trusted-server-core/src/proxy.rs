@@ -1928,13 +1928,9 @@ pub async fn handle_first_party_proxy_rebuild(
         rebuild_request_from_pairs(url::form_urlencoded::parse(req_query.as_bytes()))?
     };
 
-    // Input parsing is independent of the configured output origin. Accept old
-    // root-relative clicks and absolute clicks without changing their signatures.
-    if payload.tsclick.starts_with("//") {
-        return Err(Report::new(TrustedServerError::Proxy {
-            message: "invalid tsclick".to_string(),
-        }));
-    }
+    // Input parsing is independent of the configured output origin. The input
+    // authority is discarded: signatures cover only tsurl and its params, and
+    // the rebuilt href always uses the configured public origin.
     let c_url =
         parse_request_target(&payload.tsclick).change_context(TrustedServerError::Proxy {
             message: "invalid tsclick".to_string(),
@@ -3230,7 +3226,16 @@ mod tests {
                 url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>()
             );
 
-            for tsclick in [legacy.clone(), format!("https://alias.example{legacy}")] {
+            for tsclick in [
+                legacy.clone(),
+                format!("https://alias.example{legacy}"),
+                format!("//alias.example{legacy}"),
+                format!(r"\\alias.example{legacy}"),
+                format!(r"/\alias.example{legacy}"),
+                format!(" //alias.example{legacy}"),
+                format!("\t//alias.example{legacy}"),
+                format!("https:/alias.example{legacy}"),
+            ] {
                 let body = serde_json::json!({ "tsclick": tsclick });
                 let req = HttpRequest::builder()
                     .method(Method::POST)
@@ -3273,14 +3278,21 @@ mod tests {
     }
 
     #[test]
-    fn proxy_rebuild_rejects_invalid_click_authorities_and_paths() {
+    fn proxy_rebuild_rejects_invalid_click_schemes_and_paths_with_valid_tokens() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
+            let signed = signed_click_target(&settings);
             for tsclick in [
-                "//edge.example/first-party/click?tsurl=x",
-                "ftp://edge.example/first-party/click?tsurl=x",
-                "https://edge.example/first-party/click-extra?tsurl=x",
-                "not a URL",
+                format!("ftp://edge.example{signed}"),
+                format!("data:{signed}"),
+                format!(
+                    "https://edge.example{}",
+                    signed.replace("/first-party/click", "/first-party/click-extra")
+                ),
+                format!(
+                    "https://edge.example{}",
+                    signed.replace("/first-party/click", "/other-path")
+                ),
             ] {
                 let body = serde_json::json!({ "tsclick": tsclick });
                 let req = HttpRequest::builder()
@@ -3290,11 +3302,12 @@ mod tests {
                         serde_json::to_string(&body).expect("should serialize test JSON"),
                     ))
                     .expect("should build rebuild request");
+                let err = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                    .await
+                    .expect_err("should reject the scheme or path despite a valid token");
                 assert!(
-                    handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
-                        .await
-                        .is_err(),
-                    "should reject {tsclick:?}"
+                    err.to_string().contains("invalid tsclick path"),
+                    "should reject {tsclick:?} before token validation: {err:?}"
                 );
             }
         });

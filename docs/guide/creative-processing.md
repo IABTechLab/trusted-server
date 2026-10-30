@@ -18,17 +18,21 @@ publisher's first-party domain. This provides:
 
 ## Browser-facing first-party origin
 
-Set `[publisher].public_origin` to the actual browser-facing Trusted Server
-endpoint, for example `https://ads.publisher.example` or
-`http://localhost:8080` for direct local development. Rewritten proxy, click,
-CSS, `srcset`, and injected creative TSJS URLs are absolute on that origin.
-Omission keeps old config files deserializable but changes output to
-`https://{publisher.domain}`. Unlike root-relative output, this default does
-not preserve the serving page's scheme, host, or port. Relative creative source
-URLs and excluded third-party URLs remain unchanged. The publisher
-SSAT/page-bids path retains its explicit request-origin override and does not
-inject the creative bundle. See [Publisher configuration](/guide/configuration#publisher-configuration)
-for binary/config upgrade and rollback sequencing.
+Rewritten proxy, click, CSS, `srcset`, and injected creative TSJS URLs are
+absolute on `[publisher].public_origin`. See [public origin configuration](/guide/configuration#public_origin)
+for the default authority, EC cookie scope, and coordinated upgrade/rollback
+warning. Relative creative source URLs and excluded third-party URLs remain
+unchanged. The publisher SSAT/page-bids path retains its explicit request-origin
+override and does not inject the creative bundle.
+
+The runtime captures the injected classic script's origin when it evaluates,
+ahead of the parent stamp, and uses that origin for sign/rebuild endpoints.
+Later DOM or base-element changes cannot retarget those captured endpoints.
+This is not protection against scripts that run before the runtime: an earlier
+creative script can shadow `document.currentScript` and supply a false origin,
+including for GET rebuild navigation, even while the parent stamp remains
+unchanged. The pinned stamp still supplies legacy relative navigation and the
+endpoint fallback when no usable script origin exists.
 
 ## How It Works
 

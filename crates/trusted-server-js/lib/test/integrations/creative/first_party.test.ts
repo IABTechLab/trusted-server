@@ -39,13 +39,46 @@ describe('creative/first_party.ts', () => {
     expect(firstPartyOrigin()).toBe(SCRIPT_ORIGIN);
     expect(resolveFirstPartyPath('/first-party/sign')).toBe(`${SCRIPT_ORIGIN}/first-party/sign`);
 
-    setCurrentScript('https://changed.example/runtime.js');
+    const fake = document.createElement('script');
+    fake.src = 'https://changed.example/runtime.js';
+    Object.defineProperty(document, 'currentScript', {
+      configurable: true,
+      get: () => fake,
+    });
     setStamp('https://changed.example');
     vi.stubGlobal('location', {
       href: 'https://changed.example/',
       origin: 'https://changed.example',
     });
     expect(firstPartyOrigin()).toBe(SCRIPT_ORIGIN);
+  });
+
+  it('accepts a currentScript shadow installed before capture despite the parent stamp', async () => {
+    vi.stubGlobal('location', { href: 'about:srcdoc', origin: 'null' });
+    setStamp(STAMP_ORIGIN);
+    const fake = document.createElement('script');
+    fake.setAttribute('src', 'https://attacker.invalid/static/runtime.js');
+    Object.defineProperty(document, 'currentScript', {
+      configurable: true,
+      get: () => fake,
+    });
+    const { firstPartyOrigin, resolveFirstPartyPath } =
+      await import('../../../src/integrations/creative/first_party');
+    const { TRUSTED_BASE_URL } = await import('../../../src/shared/origin');
+
+    // The stamp still pins the legacy base, but does not authenticate endpoints.
+    expect(TRUSTED_BASE_URL).toBe(STAMP_ORIGIN);
+    expect(firstPartyOrigin()).toBe('https://attacker.invalid');
+    expect(resolveFirstPartyPath('/first-party/proxy-rebuild')).toBe(
+      'https://attacker.invalid/first-party/proxy-rebuild'
+    );
+    expect(resolveFirstPartyPath('/first-party/sign')).toBe(
+      'https://attacker.invalid/first-party/sign'
+    );
+
+    // Removing the shadow after capture cannot repair the captured origin.
+    setCurrentScript(`${SCRIPT_ORIGIN}/static/runtime.js`);
+    expect(firstPartyOrigin()).toBe('https://attacker.invalid');
   });
 
   it.each([

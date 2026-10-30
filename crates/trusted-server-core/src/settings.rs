@@ -155,10 +155,12 @@ impl Default for Publisher {
 impl Publisher {
     pub(crate) fn normalize(&mut self) -> Result<(), Report<TrustedServerError>> {
         if let Some(origin) = &mut self.public_origin {
-            let parsed =
-                parse_public_origin(origin).change_context(TrustedServerError::Configuration {
-                    message: "Invalid publisher.public_origin".to_string(),
-                })?;
+            let parsed = parse_public_origin(origin).map_err(|error| {
+                let reason = error.message.as_deref().unwrap_or(error.code.as_ref());
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Invalid publisher.public_origin {origin:?}: {reason}"),
+                })
+            })?;
             *origin = parsed.origin().ascii_serialization();
         }
         Ok(())
@@ -199,6 +201,7 @@ impl Publisher {
     /// spelling that resolves to the same host (an explicit `:443`, a trailing
     /// slash, a different scheme) cannot slip past the placeholder check.
     const PLACEHOLDER_ORIGIN_HOSTS: &[&str] = &["origin.example.com"];
+    const PLACEHOLDER_PUBLIC_ORIGIN_HOSTS: &[&str] = &["ads.example.com"];
 
     /// Returns `true` if `domain` is the unedited template placeholder
     /// (case-insensitive).
@@ -233,6 +236,19 @@ impl Publisher {
                 Self::PLACEHOLDER_ORIGIN_HOSTS
                     .iter()
                     .any(|p| p.eq_ignore_ascii_case(&host))
+            })
+    }
+
+    /// Returns `true` if `public_origin` resolves to the unedited template host.
+    #[must_use]
+    pub fn is_placeholder_public_origin(public_origin: &str) -> bool {
+        Url::parse(public_origin.trim())
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .is_some_and(|host| {
+                Self::PLACEHOLDER_PUBLIC_ORIGIN_HOSTS
+                    .iter()
+                    .any(|placeholder| placeholder.eq_ignore_ascii_case(&host))
             })
     }
 
@@ -3424,6 +3440,14 @@ impl Settings {
         if Publisher::is_placeholder_origin_url(&self.publisher.origin_url) {
             insecure_fields.push("publisher.origin_url".to_owned());
         }
+        if self
+            .publisher
+            .public_origin
+            .as_deref()
+            .is_some_and(Publisher::is_placeholder_public_origin)
+        {
+            insecure_fields.push("publisher.public_origin".to_owned());
+        }
         // Checked whenever the block is present, not just when it is enabled:
         // the key rotate/deactivate admin routes are registered unconditionally
         // and read these store IDs without consulting `enabled`, so placeholder
@@ -3844,6 +3868,9 @@ fn parse_public_origin(value: &str) -> Result<Url, ValidationError> {
     }
     if parsed.host_str().is_none() {
         return Err(ValidationError::new("missing_public_origin_host"));
+    }
+    if parsed.port() == Some(0) {
+        return Err(ValidationError::new("public_origin_has_invalid_port"));
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(ValidationError::new("public_origin_has_userinfo"));
@@ -5875,6 +5902,7 @@ mod tests {
             "ftp://ads.example.com",
             "https://user@ads.example.com",
             "https://ads.example.com/path",
+            "https://ads.example.com:0",
             "https://ads.example.com?query=1",
             "https://ads.example.com#fragment",
             "https://ads.example.com/",
@@ -5898,6 +5926,57 @@ mod tests {
             assert!(
                 Settings::from_json_value(json).is_err(),
                 "should reject whitespace/control characters in public origin {origin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publisher_public_origin_errors_include_the_reason() {
+        for (origin, reason) in [
+            (
+                "https://ads.example.com/",
+                "public_origin must not include a trailing slash",
+            ),
+            ("https://ads.example.com/path", "public_origin_has_path"),
+            (
+                "https://ads.example.com:0",
+                "public_origin_has_invalid_port",
+            ),
+        ] {
+            let toml = crate_test_settings_str().replace(
+                "[publisher]",
+                &format!("[publisher]\npublic_origin = \"{origin}\""),
+            );
+            let err =
+                Settings::from_toml(&toml).expect_err("should reject the invalid public origin");
+            let message = err.to_string();
+            assert!(
+                message.contains("publisher.public_origin") && message.contains(reason),
+                "should explain the public origin error: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_placeholder_public_origin_matches_the_parsed_template_host() {
+        for origin in [
+            "https://ads.example.com",
+            "http://ADS.EXAMPLE.COM:8443",
+            " https://ads.example.com:443 ",
+        ] {
+            assert!(
+                Publisher::is_placeholder_public_origin(origin),
+                "should recognize the public origin placeholder: {origin}"
+            );
+        }
+        for origin in [
+            "https://creative.example.com",
+            "https://ads.example.com.publisher.example",
+            "not a URL",
+        ] {
+            assert!(
+                !Publisher::is_placeholder_public_origin(origin),
+                "should not classify a different or invalid host as the template: {origin}"
             );
         }
     }

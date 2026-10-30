@@ -3,10 +3,10 @@ import { runtimeUrl } from "../../helpers/state.js";
 
 // Creative iframes are sandboxed WITHOUT `allow-same-origin`, so the creative
 // runtime executes in an opaque origin whose `location.href` is `about:srcdoc`.
-// jsdom cannot reproduce either condition, so the recovery path these tests
-// cover uses the public origin captured from the absolute runtime script,
-// skips the CORS-doomed POST and navigates the signed GET rebuild/click chain.
-// These conditions are only observable in a real browser.
+// jsdom cannot reproduce either condition. In a real browser, clicks skip the
+// CORS-doomed POST and navigate a GET rebuild URL. Without pre-capture spoofing,
+// that URL uses the absolute runtime script's public origin and follows the
+// signed rebuild/click chain. Earlier script can instead spoof that origin.
 const CREATIVE_SANDBOX_TOKENS = [
   "allow-forms",
   "allow-popups",
@@ -15,17 +15,27 @@ const CREATIVE_SANDBOX_TOKENS = [
   "allow-top-navigation-by-user-activation",
 ].join(" ");
 
-// A creative <head> script that tries to redirect click resolution to an
-// attacker origin. It executes before the runtime injected at the top of
-// <body>. The parent stamp must stay immutable, even when its origin differs
-// from the runtime script's public origin.
+// The stamp stays immutable, but currentScript is not authenticated. A creative
+// script running before runtime capture can redirect endpoints by shadowing it.
+// The same attack after capture cannot change the pinned endpoint origin.
+const ATTACKER_ORIGIN = "https://attacker.invalid";
 const HOSTILE_STAMP_OVERWRITE = `<script>
-  try { window.__tsCreativeOrigin = 'https://attacker.invalid'; } catch (e) {}
+  try { window.__tsCreativeOrigin = '${ATTACKER_ORIGIN}'; } catch (e) {}
+  var fake = document.createElement('script');
+  fake.setAttribute('src', '${ATTACKER_ORIGIN}/static/tsjs=x.js');
+  Object.defineProperty(document, 'currentScript', {
+    configurable: true, get: function () { return fake; },
+  });
 </script>`;
 
 test.describe("Sandboxed creative iframe", () => {
-  for (const parent of ["first-party", "foreign"] as const) {
-    test(`recovers a mutated click through the signed GET rebuild chain from a ${parent} parent`, async ({
+  for (const [parent, attack] of [
+    ["first-party", "before capture"],
+    ["first-party", "after capture"],
+    ["foreign", "before capture"],
+    ["foreign", "after capture"],
+  ] as const) {
+    test(`currentScript shadowing ${attack} with a ${parent} parent ${attack === "before capture" ? "retargets endpoints despite the stamp" : "cannot move the signed GET rebuild chain"}`, async ({
       page,
     }) => {
       const origin = new URL(runtimeUrl("/")).origin;
@@ -84,9 +94,18 @@ test.describe("Sandboxed creative iframe", () => {
       }
       expect(await page.evaluate(() => location.origin)).toBe(parentOrigin);
 
-      // The parent stamps its own origin before any creative markup. A foreign
-      // parent's stamp must not override the public origin of the absolute
-      // runtime script and signed click. Hostile markup still tries to move it.
+      // Keep spoofed navigation local to the test. We assert its destination,
+      // not a response from a real attacker or a successful signed click chain.
+      await page.route(`${ATTACKER_ORIGIN}/**`, (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: "text/html",
+          body: "spoofed endpoint",
+        }),
+      );
+
+      // A foreign parent's stamp does not override the runtime script origin.
+      // Nor does the stamp authenticate currentScript against earlier markup.
       const creativeDocument = `<!DOCTYPE html>
 <html>
   <head>
@@ -95,10 +114,11 @@ test.describe("Sandboxed creative iframe", () => {
         value: '${parentOrigin}', writable: false, configurable: false, enumerable: false,
       });
     </script>
+    ${attack === "before capture" ? HOSTILE_STAMP_OVERWRITE : ""}
   </head>
   <body>
-    ${HOSTILE_STAMP_OVERWRITE}
     <script src="${bundleUrl}"></script>
+    ${attack === "after capture" ? HOSTILE_STAMP_OVERWRITE : ""}
     <a id="creative-link" href="${signedClick}" data-tsclick="${signedClick}">ad</a>
   </body>
 </html>`;
@@ -107,12 +127,15 @@ test.describe("Sandboxed creative iframe", () => {
         (response) => response.url().includes("/first-party/proxy-rebuild"),
         { timeout: 15_000 },
       );
-      const clickResponse = page.waitForResponse(
-        (response) =>
-          response.url().includes("/first-party/click") &&
-          response.request().resourceType() === "document",
-        { timeout: 15_000 },
-      );
+      const clickResponse =
+        attack === "after capture"
+          ? page.waitForResponse(
+              (response) =>
+                response.url().includes("/first-party/click") &&
+                response.request().resourceType() === "document",
+              { timeout: 15_000 },
+            )
+          : null;
 
       await page.evaluate(
         ({ sandbox, html }) => {
@@ -129,6 +152,19 @@ test.describe("Sandboxed creative iframe", () => {
       const frame = page.frameLocator("iframe");
       const link = frame.locator("#creative-link");
       await link.waitFor({ state: "attached", timeout: 10_000 });
+      expect(
+        await link.evaluate(() => ({
+          stamp: (window as { __tsCreativeOrigin?: string }).__tsCreativeOrigin,
+          script: document.currentScript?.getAttribute("src"),
+          origin: window.origin,
+          href: location.href,
+        })),
+      ).toEqual({
+        stamp: parentOrigin,
+        script: `${ATTACKER_ORIGIN}/static/tsjs=x.js`,
+        origin: "null",
+        href: "about:srcdoc",
+      });
 
       // The creative mutates its own click target, the shape the click guard
       // exists to repair.
@@ -139,12 +175,24 @@ test.describe("Sandboxed creative iframe", () => {
       await link.click({ force: true });
 
       const rebuild = await rebuildResponse;
-      // Neither the parent origin nor hostile stamp overwrite may move the
-      // rebuild away from the public runtime origin.
-      expect(new URL(rebuild.url()).origin).toBe(origin);
+      expect(rebuild.request().method()).toBe("GET");
+      expect(rebuild.request().resourceType()).toBe("document");
+      const rebuildUrl = new URL(rebuild.url());
+      expect(rebuildUrl.searchParams.get("tsclick")).toBe(signedClick);
+      expect(JSON.parse(rebuildUrl.searchParams.get("add") ?? "{}")).toEqual({
+        bar: "2",
+      });
+      if (attack === "before capture") {
+        // The immutable stamp survives, but the spoofed script wins at capture.
+        expect(rebuildUrl.origin).toBe(ATTACKER_ORIGIN);
+        expect(rebuild.status()).toBe(200);
+        return;
+      }
+      // Only changes after capture are prevented from moving the endpoint.
+      expect(rebuildUrl.origin).toBe(origin);
       expect(rebuild.status(), "GET rebuild should redirect").toBe(302);
 
-      const click = await clickResponse;
+      const click = await clickResponse!;
       expect(new URL(click.url()).origin).toBe(origin);
       expect(click.status(), "re-signed click should redirect").toBe(302);
       // The rebuilt click carries the mutation the creative added.

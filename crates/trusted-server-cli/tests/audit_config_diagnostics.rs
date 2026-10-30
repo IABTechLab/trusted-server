@@ -81,6 +81,10 @@ fn baseline() -> String {
             "https://origin.example.com",
             "https://origin.publisher.example.com",
         )
+        .replace(
+            "https://ads.example.com",
+            "https://ads.publisher.example.com",
+        )
 }
 
 const GPT_PAGE: &str = r#"<!doctype html><html><head><script>

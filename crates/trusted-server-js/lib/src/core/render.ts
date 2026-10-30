@@ -221,13 +221,17 @@ export function createAdIframe(
   return iframe;
 }
 
-// Origin the creative runtime resolves root-relative first-party URLs against.
+// Parent-origin base for legacy relative clicks and the creative endpoint
+// fallback when no usable runtime script origin is available.
 //
 // The srcdoc document has an opaque origin and an `about:srcdoc` location, so it
 // has no usable origin of its own; `document.baseURI` would work but is
-// inherited and honours a publisher `<base>`, i.e. it is not a trustworthy
-// security boundary. This page — first-party, non-opaque — knows the real
-// origin, so it stamps it into the document ahead of any creative markup.
+// inherited and honours a publisher `<base>`. This page knows its own origin,
+// so it stamps that value ahead of any creative markup. The non-writable stamp
+// keeps this base fixed; it does not authenticate the endpoint origin. Endpoints
+// prefer the runtime script origin, which earlier creative script can spoof by
+// shadowing document.currentScript. The iframe sandbox, not origin selection,
+// remains the security boundary.
 //
 // Only an exact `scheme://host[:port]` shape is emitted, so the value cannot
 // break out of the quoted string it is written into.

@@ -674,15 +674,12 @@ merely because their URLs remain in the output.
 
 All three settings apply to winning-bid `adm` in both the shared `POST /auction`
 response converter and the production publisher SSAT/page-bids path. The former
-emits absolute first-party URLs on `publisher.public_origin`, falling back to
-`https://{publisher.domain}`, and injects creative TSJS; the latter retains its
-request-origin override for its foreign-origin renderer and does not inject
-that bundle. Omission preserves old-config deserialization, not the serving
-page's scheme, host, or port. Configure the actual browser-facing endpoint,
-such as `https://ads.publisher.example` or `http://localhost:8080` for direct
-local development. See
-[Publisher configuration](/guide/configuration#publisher-configuration) for
-binary/config upgrade and rollback sequencing. HTML/CSS returned by `/first-party/proxy` continues to be
+emits absolute first-party URLs on `publisher.public_origin` and injects
+creative TSJS; the latter retains its request-origin override for its
+foreign-origin renderer and does not inject that bundle. See
+[public origin configuration](/guide/configuration#public_origin) for the default
+authority, EC cookie scope, and coordinated upgrade/rollback warning.
+HTML/CSS returned by `/first-party/proxy` continues to be
 rewritten independently of `rewrite_creatives`; only an explicit
 `rewrite_clicks` changes its link wrapping. `[debug].inject_adm_for_testing` adds the diagnostic
 `debug_bid` blob and enables a testing-only direct GAM replacement; it does not
