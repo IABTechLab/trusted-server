@@ -8,10 +8,24 @@ on:
 permissions:
   contents: read
 
+# New pushes cancel older runs for the same pull request. Each job queues by
+# workflow, job, and author, so one author runs one copy of each job at a time.
+# GitHub orders jobs by when they start waiting, but does not guarantee FIFO.
+# Each queue holds up to 100 pending jobs; later arrivals are canceled.
+# Timeouts release queues after hung jobs. Bots and non-PR events use unique
+# run IDs and do not queue together.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   check-claude-md-symlink:
     name: CLAUDE.md symlink guard
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: ${{ github.workflow }}-check-claude-md-symlink-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -42,8 +56,21 @@ jobs:
   check-ci-node-pin:
     name: CI Node pin guard
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: ${{ github.workflow }}-check-ci-node-pin-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install yq
+        shell: bash
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_amd64 \
+            --output "$RUNNER_TEMP/yq"
+          chmod +x "$RUNNER_TEMP/yq"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       # The guard's tests check the tree before the guard landed; fetch only
       # that commit instead of the full history.
@@ -55,7 +82,7 @@ jobs:
         with:
           node-version-file: .tool-versions
 
-      - name: Test the guard
+      - name: Test the Node pin guard
         run: node --test scripts/check-ci-node-pin.test.mjs
 
       # Every job that compiles trusted-server-core also runs the TSJS build, so
@@ -63,9 +90,19 @@ jobs:
       - name: Verify jobs pin Node before compiling Rust
         run: node scripts/check-ci-node-pin.mjs
 
+      - name: Test the CI concurrency policy guard
+        run: node --test scripts/check-ci-concurrency.test.mjs
+
+      - name: Require per-PR cancellation, per-author job queues and timeouts
+        run: scripts/check-ci-concurrency.sh
+
   format-rust:
     name: cargo fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: ${{ github.workflow }}-format-rust-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -136,6 +173,10 @@ jobs:
 
   format-typescript:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-format-typescript-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     defaults:
       run:
         working-directory: crates/trusted-server-js/lib
@@ -167,6 +208,10 @@ jobs:
 
   format-docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-format-docs-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     defaults:
       run:
         working-directory: docs
@@ -208,6 +253,10 @@ jobs:
   docs-proposal-scripts:
     name: docs-proposal scripts
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-docs-proposal-scripts-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 

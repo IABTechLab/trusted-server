@@ -8,11 +8,24 @@ on:
     branches: [main]
   pull_request:
 
+# New pushes cancel older runs for the same pull request. Each job queues by
+# workflow, job, and author, so one author runs one copy of each job at a time.
+# GitHub orders jobs by when they start waiting, but does not guarantee FIFO.
+# Each queue holds up to 100 pending jobs; later arrivals are canceled.
+# Timeouts release queues after hung jobs. Bots and non-PR events use unique
+# run IDs and do not queue together.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   test-rust:
     name: cargo test
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    concurrency:
+      group: ${{ github.workflow }}-test-rust-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -76,6 +89,9 @@ jobs:
     name: HTML EOF runtime (Fastly)
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    concurrency:
+      group: ${{ github.workflow }}-test-fastly-eof-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -124,6 +140,10 @@ jobs:
   test-axum:
     name: cargo test (axum native)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: ${{ github.workflow }}-test-axum-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -205,6 +225,10 @@ jobs:
   test-cloudflare:
     name: cargo check (cloudflare native + wasm32-unknown-unknown)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: ${{ github.workflow }}-test-cloudflare-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -239,6 +263,10 @@ jobs:
   test-spin:
     name: cargo check/build/test (spin native + wasm32-wasip1)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: ${{ github.workflow }}-test-spin-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -285,6 +313,10 @@ jobs:
   test-parity:
     name: cargo test (cross-adapter parity)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: ${{ github.workflow }}-test-parity-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -319,6 +351,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    concurrency:
+      group: ${{ github.workflow }}-test-cli-${{ matrix.os }}-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -391,6 +427,10 @@ jobs:
     name: ts dev lint domains (changed lines)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-lint-domains-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       # A PR checkout is GitHub's merge commit; depth 2 also fetches its
       # parents, so `HEAD^1` is the exact base commit the PR merges into.
@@ -425,6 +465,10 @@ jobs:
   test-typescript:
     name: vitest
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-test-typescript-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     defaults:
       run:
         working-directory: crates/trusted-server-js/lib

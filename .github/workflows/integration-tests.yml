@@ -10,6 +10,16 @@ on:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
 
+# New pushes cancel older runs for the same pull request. Each job queues by
+# workflow, job, and author, so one author runs one copy of each job at a time.
+# GitHub orders jobs by when they start waiting, but does not guarantee FIFO.
+# Each queue holds up to 100 pending jobs; later arrivals are canceled.
+# Timeouts release queues after hung jobs. Bots and non-PR events use unique
+# run IDs and do not queue together.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 env:
   ORIGIN_PORT: 8888
   ARTIFACTS_DIR: /tmp/integration-test-artifacts
@@ -23,6 +33,9 @@ jobs:
     name: prepare integration artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    concurrency:
+      group: ${{ github.workflow }}-prepare-artifacts-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -64,6 +77,9 @@ jobs:
     needs: prepare-artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    concurrency:
+      group: ${{ github.workflow }}-integration-tests-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -119,6 +135,9 @@ jobs:
     needs: prepare-artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: ${{ github.workflow }}-integration-tests-fastly-ec-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -254,6 +273,9 @@ jobs:
     # once the pinned Playwright version supports the newer image.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    concurrency:
+      group: ${{ github.workflow }}-browser-tests-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
