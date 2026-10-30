@@ -7,6 +7,7 @@ use super::{AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttr
 
 /// One raw URL and its expected integration owner from the shared corpus.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct SdkUrlCase {
     /// Descriptive case name for assertion failures.
     pub(super) name: String,
@@ -14,6 +15,8 @@ pub(super) struct SdkUrlCase {
     pub(super) url: String,
     /// Expected integration ID, or none for an unowned URL.
     pub(super) owner: Option<String>,
+    /// Owner once `lol_html` has read the attribute, when that differs from `owner`.
+    pub(super) server_html_owner: Option<String>,
 }
 
 /// Load the URL ownership cases used by both Rust and browser tests.
@@ -67,16 +70,18 @@ pub(super) fn assert_sdk_url_rewrite(
     }
 }
 
-/// Assert that a matching SDK URL is rewritten after HTML attribute tokenization.
+/// Assert the SDK rewrite of a corpus URL after `lol_html` reads it from markup.
 ///
 /// # Panics
 ///
-/// Panics if HTML processing fails or the SDK attribute is not replaced.
+/// Panics if HTML processing fails or the output disagrees with the server-side owner.
 pub(super) fn assert_sdk_html_attribute_rewrite(
     integration: &dyn IntegrationAttributeRewriter,
     case: &SdkUrlCase,
     sdk_path: &str,
 ) {
+    let owner = case.server_html_owner.as_ref().or(case.owner.as_ref());
+    let owned = owner.map(String::as_str) == Some(integration.integration_id());
     for (attribute, tag) in [("src", "script"), ("href", "link")] {
         let html = format!(
             "<{tag} {attribute}=\"{}\"></{tag}>",
@@ -96,23 +101,25 @@ pub(super) fn assert_sdk_html_attribute_rewrite(
                     let value = element
                         .get_attribute(attribute)
                         .expect("should read the SDK URL attribute");
-                    assert_eq!(
-                        integration.rewrite(attribute, &value, &context),
-                        AttributeRewriteAction::Replace(sdk_path.to_string()),
-                        "should rewrite HTML {attribute} for {}",
-                        case.name
-                    );
-                    element.set_attribute(attribute, sdk_path)?;
+                    if let AttributeRewriteAction::Replace(next) =
+                        integration.rewrite(attribute, &value, &context)
+                    {
+                        element.set_attribute(attribute, &next)?;
+                    }
                     Ok(())
                 })],
                 ..RewriteStrSettings::default()
             },
         )
         .expect("should process SDK URL markup");
+        let expected = if owned {
+            format!("<{tag} {attribute}=\"{sdk_path}\"></{tag}>")
+        } else {
+            html
+        };
         assert_eq!(
-            output,
-            format!("<{tag} {attribute}=\"{sdk_path}\"></{tag}>"),
-            "should replace the SDK URL in HTML for {}",
+            output, expected,
+            "should apply expected HTML {attribute} rewrite for {}",
             case.name
         );
     }
