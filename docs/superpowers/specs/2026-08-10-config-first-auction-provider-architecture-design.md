@@ -452,17 +452,18 @@ A profile receives only:
 
 A profile does not receive the raw downstream HTTP request or unrestricted runtime services. Browser values needed by OpenRTB are normalized into canonical auction data before profile execution.
 
-Request admission also retains a transport-owned Prebid header snapshot containing exactly the first values selected by the current HTTP header API for `Cookie`, `User-Agent`, `Referer`, and `Accept-Language`. It preserves accepted header bytes without introducing a second truncation rule; the existing inbound request/header limit remains authoritative. The snapshot is not exposed to profiles or other unrestricted runtime code. Common Prebid transport forwards the current `User-Agent`, `Referer`, and `Accept-Language` values and synthesizes `X-Forwarded-For` only from the platform-attested client IP, never from a client-supplied `X-Forwarded-For` value. The Prebid field policy may also use the raw accepted `Referer` for its existing `site.ref` behavior; the canonical `site.page` remains sanitized separately. APS and `standard` do not receive these raw browser headers.
+Request admission also retains a transport-owned Prebid header snapshot containing exactly the first values selected by the current HTTP header API for `User-Agent`, `Referer`, and `Accept-Language`, plus the consent-cookie selection derived from the first `Cookie` value. The raw `Cookie` value is not retained, so later readers cannot reach publisher session or identity cookies. The snapshot preserves accepted `User-Agent`, `Referer`, and `Accept-Language` bytes without introducing a second truncation rule; the existing inbound request/header limit remains authoritative. The snapshot is not exposed to profiles or other unrestricted runtime code. Common Prebid transport forwards the current `User-Agent`, `Referer`, and `Accept-Language` values and synthesizes `X-Forwarded-For` only from the platform-attested client IP, never from a client-supplied `X-Forwarded-For` value. The Prebid field policy may also use the raw accepted `Referer` for its existing `site.ref` behavior; the canonical `site.page` remains sanitized separately. APS and `standard` do not receive these raw browser headers.
 
-To preserve current Prebid consent-forwarding behavior, the compiled Prebid profile selects `openrtb_only`, `cookies_only`, or `both`, and common transport applies the existing behavior to the snapshotted `Cookie` value:
+The compiled Prebid profile selects `openrtb_only`, `cookies_only`, or `both`. The consent-cookie minimization follow-up (#763) supersedes the original raw-header forwarding contract:
 
-- `both` and `cookies_only` forward the complete selected `Cookie` header value unchanged.
-- `openrtb_only` removes the existing allowlisted consent-cookie names and forwards the remaining cookies.
-- When the header cannot be parsed by the existing stripping path, current fallback behavior is preserved, including forwarding the original non-UTF-8 value.
-- If stripping removes every cookie, the upstream `Cookie` header is omitted.
-- Consent originating from KV or policy state remains in the OpenRTB body when no browser consent cookie can carry it, including in `cookies_only` mode.
+- `both` and `cookies_only` forward only `euconsent-v2`, `__gpp`, `__gpp_sid`, and `us_privacy`, using the same cookie parser and last-duplicate selection as consent extraction.
+- `openrtb_only` omits the entire `Cookie` header.
+- Unreadable headers and unsafe cookie values are omitted; raw headers are never forwarded as a fallback.
+- Decimal GPP section IDs are normalized to remove surrounding whitespace in each section.
+- `cookies_only` retains body consent for KV/policy-sourced signals. Cookie-sourced fallback includes only the unsafe affected signal, with the GPP string and section IDs coupled if either GPP cookie cannot be forwarded safely.
+- No other publisher session, authentication, or identity cookie reaches PBS.
 
-No other first-version profile receives a browser `Cookie` header. Reducing Prebid forwarding to consent cookies only, changing malformed-header handling, or otherwise redesigning these modes requires a separate consent-focused specification.
+No other first-version profile receives a browser `Cookie` header. See [Integration Cookie Forwarding](../../guide/integrations/cookie-forwarding.md) for the current consent-focused transport contract.
 
 ## Canonical Auction Model
 
@@ -1020,7 +1021,7 @@ No request with zero eligible impressions should be sent upstream.
 - [ ] Central privacy enforcement defines the maximum permitted data, and profile policies may only omit from that approved view.
 - [ ] The `prebid-server` and `aps` field policies preserve their current request differences, including the complete consent-field matrix.
 - [ ] The `standard` profile uses the documented shared PBS and APS baseline, consent placements, and omissions.
-- [ ] Prebid transport preserves current `User-Agent`, raw `Referer`, `Accept-Language`, platform-attested `X-Forwarded-For`, and exact selected `Cookie` header behavior without exposing the raw request to profiles.
+- [ ] Prebid transport preserves current `User-Agent`, raw `Referer`, `Accept-Language`, platform-attested `X-Forwarded-For`, and the selected-header consent-cookie allowlist without exposing the raw request to profiles.
 - [ ] The common driver preserves existing consent, identity, floor, timeout, currency, and signing wire semantics while intentionally expanding enabled signing coverage to every OpenRTB provider.
 - [ ] Tests prove that standard, Prebid Server, and APS requests receive the version 1.1 signing extension after profile request augmentation when global signing is enabled.
 - [ ] Tests prove that global signing disabled removes all signature-bearing fields, preserves the existing PBS-only host/scheme object, and omits `ext.trusted_server` from APS and `standard`.
@@ -1031,7 +1032,7 @@ No request with zero eligible impressions should be sent upstream.
 - [ ] Client bidder parameters are not assigned an invented generic wire location.
 - [ ] The Prebid profile preserves current bidder parameters, stored requests, cache handling, diagnostics, and notification behavior.
 - [ ] Common notification suppression preserves `nurl` and `burl` by default, supports provider-wide suppression, and matches per-seat suppression against exact returned seat IDs independently of bidder routes.
-- [ ] Prebid parity tests cover the exact existing `openrtb_only`, `cookies_only`, and `both` Cookie-header behavior, including KV/policy-sourced body-consent fallback.
+- [ ] Prebid parity tests cover the `openrtb_only`, `cookies_only`, and `both` consent-cookie allowlist behavior, including KV/policy-sourced body-consent fallback.
 - [ ] The APS profile preserves current account extensions, inventory identity, response validation, renderer, script policy, diagnostics, and deterministic highest-price-per-impression reduction with its bid-ID tie-breaker.
 - [ ] Prebid and APS no longer register singleton auction-provider instances.
 
@@ -1062,7 +1063,7 @@ The following require separate requirements before implementation:
 - New money or currency-conversion models.
 - New signing protocol versions.
 - New privacy or data-sharing controls.
-- Consent-cookie forwarding minimization or changes to existing malformed-header behavior.
+- Further consent-cookie transport changes beyond the #763 follow-up documented above.
 - New diagnostics and telemetry schemas.
 - General endpoint authentication configuration.
 - Arbitrary standard-field mappings.

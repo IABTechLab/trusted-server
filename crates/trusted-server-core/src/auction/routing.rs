@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use super::plan::{AuctionPlan, BidderId, ProviderId, RoutingMode};
 use super::types::{AdSlot, AuctionRequest, MediaType};
+use crate::integrations::prebid::PrebidConsentCookies;
 
 const TRUSTED_SERVER_ENVELOPE: &str = "trustedServer";
 const BIDDER_PARAMS_FIELD: &str = "bidderParams";
@@ -199,19 +200,21 @@ impl ProviderSlotInput {
 
 /// Request headers approved for later Prebid transport forwarding.
 ///
-/// Values remain as raw [`HeaderValue`] instances so non-ASCII bytes retain
-/// the same legacy handling. Client-supplied `X-Forwarded-For` is never read.
+/// The inbound `Cookie` header is reduced to [`PrebidConsentCookies`] when the
+/// snapshot is taken, so publisher session and identity cookies are never
+/// retained for the auction. Other captured headers retain their bytes as
+/// [`HeaderValue`] instances. Client-supplied `X-Forwarded-For` is never read.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PrebidTransportHeaders {
-    cookie: Option<HeaderValue>,
+    consent_cookies: PrebidConsentCookies,
     user_agent: Option<HeaderValue>,
     referer: Option<HeaderValue>,
     accept_language: Option<HeaderValue>,
 }
 
 impl PrebidTransportHeaders {
-    pub(crate) fn cookie(&self) -> Option<&HeaderValue> {
-        self.cookie.as_ref()
+    pub(crate) fn consent_cookies(&self) -> &PrebidConsentCookies {
+        &self.consent_cookies
     }
 
     pub(crate) fn user_agent(&self) -> Option<&HeaderValue> {
@@ -228,7 +231,9 @@ impl PrebidTransportHeaders {
 
     fn snapshot(request: &Request<EdgeBody>) -> Self {
         Self {
-            cookie: request.headers().get(header::COOKIE).cloned(),
+            consent_cookies: PrebidConsentCookies::from_header(
+                request.headers().get(header::COOKIE),
+            ),
             user_agent: request.headers().get(header::USER_AGENT).cloned(),
             referer: request.headers().get(header::REFERER).cloned(),
             accept_language: request.headers().get(header::ACCEPT_LANGUAGE).cloned(),
@@ -1303,12 +1308,15 @@ mod tests {
     #[test]
     fn snapshots_first_headers_retains_raw_bytes_and_ignores_inbound_xff() {
         let mut inbound = inbound();
+        inbound.headers_mut().append(
+            header::COOKIE,
+            HeaderValue::from_static(
+                "session_id=example-session; ts-ec=example-ec; euconsent-v2=TC",
+            ),
+        );
         inbound
             .headers_mut()
-            .append(header::COOKIE, HeaderValue::from_static("first=1"));
-        inbound
-            .headers_mut()
-            .append(header::COOKIE, HeaderValue::from_static("second=2"));
+            .append(header::COOKIE, HeaderValue::from_static("us_privacy=1YNN"));
         inbound.headers_mut().append(
             header::USER_AGENT,
             HeaderValue::from_bytes(b"agent-\x80").expect("should accept raw header"),
@@ -1336,7 +1344,11 @@ mod tests {
             Some(attested),
         );
         let headers = routed.prebid_transport_headers();
-        assert_eq!(headers.cookie(), Some(&HeaderValue::from_static("first=1")));
+        assert_eq!(
+            headers.consent_cookies().header(),
+            Some(&HeaderValue::from_static("euconsent-v2=TC")),
+            "should retain only consent cookies from the first Cookie header"
+        );
         assert_eq!(
             headers.user_agent().expect("should retain UA").as_bytes(),
             b"agent-\x80"
