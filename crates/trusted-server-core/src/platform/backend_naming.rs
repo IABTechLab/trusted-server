@@ -189,7 +189,6 @@ impl AuctionTargetId {
                 naming_policy: BackendNamingPolicy::Fastly,
                 capabilities: AuctionTargetCapabilities {
                     concurrent_provider_fanout: true,
-                    enforceable_total_request_deadline: false,
                 },
             },
             Self::Axum => AuctionTargetDescriptor {
@@ -197,7 +196,6 @@ impl AuctionTargetId {
                 naming_policy: BackendNamingPolicy::Axum,
                 capabilities: AuctionTargetCapabilities {
                     concurrent_provider_fanout: true,
-                    enforceable_total_request_deadline: false,
                 },
             },
             Self::Cloudflare => AuctionTargetDescriptor {
@@ -205,7 +203,6 @@ impl AuctionTargetId {
                 naming_policy: BackendNamingPolicy::Cloudflare,
                 capabilities: AuctionTargetCapabilities {
                     concurrent_provider_fanout: false,
-                    enforceable_total_request_deadline: false,
                 },
             },
             Self::Spin => AuctionTargetDescriptor {
@@ -213,7 +210,6 @@ impl AuctionTargetId {
                 naming_policy: BackendNamingPolicy::Spin,
                 capabilities: AuctionTargetCapabilities {
                     concurrent_provider_fanout: false,
-                    enforceable_total_request_deadline: false,
                 },
             },
         }
@@ -224,7 +220,6 @@ impl AuctionTargetId {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct AuctionTargetCapabilities {
     concurrent_provider_fanout: bool,
-    enforceable_total_request_deadline: bool,
 }
 
 impl AuctionTargetCapabilities {
@@ -232,15 +227,6 @@ impl AuctionTargetCapabilities {
     #[must_use]
     pub const fn supports_concurrent_provider_fanout(self) -> bool {
         self.concurrent_provider_fanout
-    }
-
-    /// Return whether the adapter enforces a total request deadline per provider.
-    ///
-    /// Transport first-byte or between-byte timers do not satisfy this
-    /// capability because they do not cap the complete request lifetime.
-    #[must_use]
-    pub const fn has_enforceable_total_request_deadline(self) -> bool {
-        self.enforceable_total_request_deadline
     }
 }
 
@@ -617,12 +603,6 @@ mod tests {
                 fanout,
                 "should declare fanout accurately for {}",
                 id.adapter_id()
-            );
-            assert!(
-                !descriptor
-                    .capabilities()
-                    .has_enforceable_total_request_deadline(),
-                "no current adapter should claim a total request deadline"
             );
             assert_eq!(AuctionTargetId::from_adapter_id(id.adapter_id()), Some(id));
         }

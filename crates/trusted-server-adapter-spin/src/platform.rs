@@ -6,8 +6,8 @@ use bytes::Bytes;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::{Report, ResultExt as _};
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use http_body_util::BodyExt as _;
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+use http_body_util::BodyExt;
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec,
     PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformKvStore,
@@ -23,12 +23,12 @@ use std::io::Read as _;
 use trusted_server_core::platform::PlatformHttpRequest;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::platform::{
-    PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
+    PlatformPendingRequest, PlatformPendingResponse, PlatformResponse, PlatformSelectResult,
 };
 
-// 8 MiB ceiling: conservative for ad-server responses while leaving headroom in
-// the Spin WASM component heap. Larger responses from misbehaving origins are
-// rejected with a typed error rather than OOMing the component.
+// Limit both streamed bytes and decompressed bytes to 8 MiB to preserve
+// headroom in the Spin WASM component heap. The streaming limit rejects an
+// oversized frame before retaining it in the collected response body.
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 const MAX_DECOMPRESSED_SIZE: usize = 8 * 1024 * 1024;
 
@@ -36,6 +36,34 @@ const MAX_DECOMPRESSED_SIZE: usize = 8 * 1024 * 1024;
 type HeaderPairs = Vec<(String, Vec<u8>)>;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 type BufferedResponseParts = (HeaderPairs, Vec<u8>);
+
+/// Collect an outbound response body, rejecting it once it exceeds
+/// [`MAX_DECOMPRESSED_SIZE`] streamed bytes.
+///
+/// The limit applies frame by frame, so an oversized body fails before it is
+/// fully retained in the component heap.
+///
+/// # Errors
+///
+/// Returns `PlatformError::HttpClient` when the body exceeds the limit or a
+/// frame cannot be read.
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+async fn collect_limited_body<B>(body: B) -> Result<Vec<u8>, Report<PlatformError>>
+where
+    B: BodyExt,
+    B::Data: bytes::Buf,
+    B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
+{
+    let collected = http_body_util::Limited::new(body, MAX_DECOMPRESSED_SIZE)
+        .collect()
+        .await
+        .map_err(|error| {
+            Report::new(PlatformError::HttpClient).attach(format!(
+                "failed to read Spin outbound response body: {error}"
+            ))
+        })?;
+    Ok(collected.to_bytes().to_vec())
+}
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 const SPIN_VARIABLE_HEX: &[u8; 16] = b"0123456789abcdef";
@@ -427,22 +455,13 @@ fn is_wasi_forbidden_outbound_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("proxy-connection")
 }
 
-/// Carries a completed response through `send_async` → `select`.
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-struct SpinPendingResponse {
-    backend_name: String,
-    status: u16,
-    headers: HeaderPairs,
-    body: Vec<u8>,
-}
-
 /// `spin_sdk::http::send`-backed HTTP client for the Spin runtime.
 ///
-/// `send_async` eagerly executes each request before returning, so
-/// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false` and the
-/// auction orchestrator rejects multi-provider configurations before any
-/// request launches. `select` keeps a defense-in-depth rejection for more
-/// than one pending request, matching the Cloudflare adapter behavior.
+/// Auction configuration supports one provider at a time, so
+/// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false`.
+/// Requests start in a runtime task at dispatch, overlapping publisher-origin work.
+/// Deadline selection bounds waiting for the full send and response body collection.
+/// Dropping the pending operation cancels its WASI asynchronous operations.
 ///
 /// Spin's WASI HTTP API sends one request and returns the original response; it
 /// exposes no redirect-follow policy. Each trait call therefore reaches exactly
@@ -451,20 +470,14 @@ struct SpinPendingResponse {
 /// `StubHttpClient` driver records the one-send 3xx behavior while adapter tests
 /// cover request/response policy around that single boundary.
 ///
-/// # Known MVP limits
-///
-/// **No configurable outbound timeout.** `spin_sdk::http::send` does not
-/// expose per-request timeout control, and [`PlatformBackendSpec::first_byte_timeout`]
-/// is ignored by [`NoopBackend`]. A slow or hung origin will block the Spin
-/// invocation for whatever default the Spin runtime imposes. Operators requiring
-/// deterministic timeout behaviour should use the Fastly adapter.
+/// Backend phase timeouts remain unsupported. Callers requiring an absolute
+/// cutoff use [`PlatformHttpClient::select_until`].
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub struct SpinPlatformHttpClient;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 impl SpinPlatformHttpClient {
     async fn execute(
-        &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         reject_unsupported_request_contracts(&request)?;
@@ -525,17 +538,7 @@ impl SpinPlatformHttpClient {
             .iter()
             .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
             .collect();
-        let body = spin_response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|error| {
-                Report::new(PlatformError::HttpClient).attach(format!(
-                    "failed to read Spin outbound response body: {error}"
-                ))
-            })?
-            .to_bytes()
-            .to_vec();
+        let body = collect_limited_body(spin_response.into_body()).await?;
 
         let (headers, body) = apply_spin_response_policy(&method, status, headers, body)?;
         let mut edge_builder = edgezero_core::http::response_builder().status(status);
@@ -554,9 +557,9 @@ impl SpinPlatformHttpClient {
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for SpinPlatformHttpClient {
     fn supports_concurrent_fanout(&self) -> bool {
-        // `send_async` executes each request eagerly, so multiple pending
-        // requests run sequentially. The auction orchestrator checks this
-        // before launching more than one provider request.
+        // Requests start concurrently at dispatch, but `select` and
+        // `select_until` collect only one response, so multi-provider fan-out
+        // stays unsupported.
         false
     }
 
@@ -564,7 +567,7 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        self.execute(request).await
+        Self::execute(request).await
     }
 
     async fn send_async(
@@ -572,29 +575,8 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
         let backend_name = request.backend_name.clone();
-        let response = self.execute(request).await?;
-
-        let status = response.response.status().as_u16();
-        let headers: HeaderPairs = response
-            .response
-            .headers()
-            .iter()
-            .map(|(n, v)| (n.to_string(), v.as_bytes().to_vec()))
-            .collect();
-        let body_bytes = match response.response.into_body() {
-            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            edgezero_core::body::Body::Stream(_) => {
-                return Err(Report::new(PlatformError::HttpClient)
-                    .attach("SpinPlatformHttpClient::execute returned a streaming body"));
-            }
-        };
-
-        let pending = SpinPendingResponse {
-            backend_name: backend_name.clone(),
-            status,
-            headers,
-            body: body_bytes,
-        };
+        let pending =
+            PlatformPendingResponse::start(Self::execute(request), spin_sdk::wasip3::spawn);
         Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
     }
 
@@ -617,27 +599,68 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         }
 
         let ready_platform = pending_requests.remove(0);
-        let pending = ready_platform
-            .downcast::<SpinPendingResponse>()
+        let mut pending = ready_platform
+            .downcast::<PlatformPendingResponse<Result<PlatformResponse, Report<PlatformError>>>>()
             .map_err(|_| {
                 Report::new(PlatformError::HttpClient)
                     .attach("unexpected inner type in SpinPlatformHttpClient::select")
             })?;
 
-        let mut builder = edgezero_core::http::response_builder().status(pending.status);
-        for (name, value) in &pending.headers {
-            builder = builder.header(name.as_str(), value.as_slice());
-        }
-        let edge_resp = builder
-            .body(edgezero_core::body::Body::from(pending.body))
-            .change_context(PlatformError::HttpClient)?;
-
-        let ready = Ok(PlatformResponse::new(edge_resp).with_backend_name(pending.backend_name));
+        let ready = pending.wait().await.unwrap_or_else(|error| {
+            Err(Report::new(PlatformError::HttpClient)
+                .attach(format!("dispatched response task stopped: {error}")))
+        });
         Ok(PlatformSelectResult {
             ready,
             remaining: pending_requests,
             failed_backend_name: None,
         })
+    }
+
+    async fn select_until(
+        &self,
+        mut pending_requests: Vec<PlatformPendingRequest>,
+        deadline: web_time::Instant,
+    ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+        if pending_requests.is_empty() {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("select_until called with an empty pending_requests list"));
+        }
+        if pending_requests.len() > 1 {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("multi-provider fan-out is not supported on this adapter"));
+        }
+        let platform_pending = pending_requests.remove(0);
+        let backend_name = platform_pending.backend_name().map(str::to_owned);
+        let mut pending = platform_pending
+            .downcast::<PlatformPendingResponse<Result<PlatformResponse, Report<PlatformError>>>>()
+            .map_err(|_| {
+                Report::new(PlatformError::HttpClient)
+                    .attach("unexpected pending request type in deadline selection")
+            })?;
+        let result = pending
+            .complete_before_deadline(
+                async {
+                    let remaining = deadline.saturating_duration_since(web_time::Instant::now());
+                    if !remaining.is_zero() {
+                        spin_sdk::time::sleep(remaining).await;
+                    }
+                },
+                deadline,
+                web_time::Instant::now,
+            )
+            .await;
+        Ok(result.map(|result| {
+            let ready = result.unwrap_or_else(|error| {
+                Err(Report::new(PlatformError::HttpClient)
+                    .attach(format!("dispatched response task stopped: {error}")))
+            });
+            PlatformSelectResult {
+                failed_backend_name: ready.as_ref().err().and(backend_name),
+                ready,
+                remaining: pending_requests,
+            }
+        }))
     }
 }
 
@@ -807,10 +830,6 @@ mod tests {
     fn auction_http_capabilities_are_explicit() {
         let capabilities = AuctionTargetId::Spin.descriptor().capabilities();
         assert!(!capabilities.supports_concurrent_provider_fanout());
-        assert!(
-            !capabilities.has_enforceable_total_request_deadline(),
-            "Spin outbound HTTP does not expose an enforceable hard total request deadline"
-        );
     }
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::request_builder;
@@ -1413,5 +1432,37 @@ mod tests {
                 "{header} should be allowed in WASI HTTP outbound requests"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use futures::executor::block_on;
+
+    #[test]
+    fn spin_body_collection_rejects_oversized_stream() {
+        let body = http_body_util::Full::new(bytes::Bytes::from(vec![
+            0;
+            super::MAX_DECOMPRESSED_SIZE
+                + 1
+        ]));
+        let result = block_on(super::collect_limited_body(body));
+        assert!(
+            result.is_err(),
+            "should reject a response exceeding the streamed body cap"
+        );
+    }
+
+    #[test]
+    fn spin_body_collection_accepts_body_at_limit() {
+        let body =
+            http_body_util::Full::new(bytes::Bytes::from(vec![0; super::MAX_DECOMPRESSED_SIZE]));
+        let result = block_on(super::collect_limited_body(body))
+            .expect("should collect a body at the limit");
+        assert_eq!(
+            result.len(),
+            super::MAX_DECOMPRESSED_SIZE,
+            "should retain the complete permitted body"
+        );
     }
 }

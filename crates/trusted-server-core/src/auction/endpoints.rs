@@ -1030,10 +1030,10 @@ mod tests {
             context
                 .services
                 .http_client()
-                .send_async(PlatformHttpRequest::new(
-                    request,
-                    "template-switch-probe-backend",
-                ))
+                .send_async(
+                    PlatformHttpRequest::new(request, "template-switch-probe-backend")
+                        .with_cache_bypass(),
+                )
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: "probe provider launch failed".to_string(),

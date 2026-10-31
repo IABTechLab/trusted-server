@@ -514,7 +514,7 @@ impl AuctionProvider for AdServerMockProvider {
         let pending = context
             .services
             .http_client()
-            .send_async(PlatformHttpRequest::new(req, backend_name))
+            .send_async(PlatformHttpRequest::new(req, backend_name).with_cache_bypass())
             .await
             .change_context(TrustedServerError::Auction {
                 message: "Failed to send mediation request".to_string(),

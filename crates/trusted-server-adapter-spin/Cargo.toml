@@ -33,6 +33,7 @@ flate2 = { workspace = true }
 futures = { workspace = true }
 http-body-util = { workspace = true }
 log = { workspace = true }
+web-time = { workspace = true }
 trusted-server-core = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -42,4 +43,11 @@ spin-sdk = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 base64 = { workspace = true }
 edgezero-core = { workspace = true }
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[example]]
+name = "deadline-runtime"
+path = "tests/runtime/deadline.rs"
+crate-type = ["cdylib"]
+required-features = ["spin"]

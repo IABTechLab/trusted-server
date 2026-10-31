@@ -68,8 +68,11 @@ assets at runtime.
   end-to-end checks.
 - Confirm provider authorization and test inventory with each upstream before
   enabling traffic.
-- Treat provider timeout values as logical budgets; no adapter currently
-  promises an abortable provider-wide wall-clock deadline.
+- Collection stops network waiting at the auction deadline measured from dispatch.
+  Complete responses already available remain eligible; unfinished providers time
+  out and mediation is skipped when no budget remains. Fastly abandons unfinished
+  requests; other adapters cancel owned request tasks. See
+  [Timeout behavior](/guide/auction-orchestration#timeout-behavior).
 
 See also [Creative processing](/guide/creative-processing) and the
 [Integrations overview](/guide/integrations-overview).

@@ -471,6 +471,15 @@ pub mod nextjs_auction {
             Ok(PlatformPendingRequest::new(request).with_backend_name(backend))
         }
 
+        async fn select_until(
+            &self,
+            pending_requests: Vec<PlatformPendingRequest>,
+            _deadline: web_time::Instant,
+        ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+            // All fixture responses are deterministic and already available.
+            self.select(pending_requests).await.map(Some)
+        }
+
         async fn select(
             &self,
             mut pending_requests: Vec<PlatformPendingRequest>,
