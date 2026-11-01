@@ -26,9 +26,6 @@ use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
-use trusted_server_core::ec::pull_sync::{
-    PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
-};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::RequestFilterEffects;
@@ -570,13 +567,12 @@ fn edgezero_main(
                 identity,
                 &mut response,
             ) {
-                Ok(partner_registry) => {
+                Ok(_) => {
                     send_edgezero_response(
                         response,
                         request_filter_effects.as_ref(),
                         counters.as_ref(),
                     );
-                    run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
                     if let Some(state) = app_state.as_deref() {
                         run_after_response_lookups(state, &mut ec_state, after_response);
                     }
@@ -598,16 +594,11 @@ fn edgezero_main(
                         identity,
                         &mut response,
                     ) {
-                        Ok(partner_registry) => {
+                        Ok(_) => {
                             send_edgezero_response(
                                 response,
                                 request_filter_effects.as_ref(),
                                 counters.as_ref(),
-                            );
-                            run_edgezero_pull_sync_after_send(
-                                &settings,
-                                &partner_registry,
-                                &ec_state,
                             );
                             return;
                         }
@@ -720,33 +711,6 @@ fn apply_edgezero_ec_finalize(
     Ok(partner_registry)
 }
 
-fn run_edgezero_pull_sync_after_send(
-    settings: &Settings,
-    partner_registry: &PartnerRegistry,
-    ec_state: &EcFinalizeState,
-) {
-    if !ec_state.is_real_browser {
-        return;
-    }
-
-    let prepared_context = build_pull_sync_context(&ec_state.ec_context, partner_registry);
-    let Some((context, kv)) =
-        prepare_pull_sync_after_send(prepared_context, || require_identity_graph(settings))
-    else {
-        return;
-    };
-
-    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    dispatch_pull_sync(
-        settings,
-        &kv,
-        partner_registry,
-        &limiter,
-        &context,
-        &ec_state.services,
-    );
-}
-
 /// Runs after-response identity lookups and applies their follow-up write.
 ///
 /// Called once the response has been sent, so provider latency never delays
@@ -818,24 +782,6 @@ pub(crate) fn run_after_response_lookups(
         &results,
     );
     log::info!("After-response lookups: write outcome={outcome}");
-}
-
-fn prepare_pull_sync_after_send<F>(
-    context: Option<PullSyncContext>,
-    graph_factory: F,
-) -> Option<(PullSyncContext, KvIdentityGraph)>
-where
-    F: FnOnce() -> Result<KvIdentityGraph, Report<TrustedServerError>>,
-{
-    let context = context?;
-    let kv = match graph_factory() {
-        Ok(kv) => kv,
-        Err(err) => {
-            log::debug!("Pull sync: identity graph unavailable, skipping: {err:?}");
-            return None;
-        }
-    };
-    Some((context, kv))
 }
 
 /// Sends a finalized `EdgeZero` response to the client.
@@ -1278,23 +1224,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn pull_sync_noop_states_skip_post_send_graph_factory() {
-        let calls = std::cell::Cell::new(0);
-        let result = prepare_pull_sync_after_send(None, || {
-            calls.set(calls.get() + 1);
-            Err(Report::new(TrustedServerError::KvStore {
-                store_name: "unexpected".to_owned(),
-                message: "graph factory should not run".to_owned(),
-            }))
-        });
-        assert!(
-            result.is_none(),
-            "a skipped pull-sync plan should return none"
-        );
-        assert_eq!(calls.get(), 0, "should not invoke the graph factory");
     }
 
     #[test]

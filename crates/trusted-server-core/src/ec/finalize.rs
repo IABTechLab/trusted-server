@@ -13,17 +13,17 @@ use http::Response;
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
 use crate::consent::{ConsentContext, allows_eid_persistence};
+use crate::constants::COOKIE_TS_EC_PULL_COMPLETE;
 use crate::settings::Settings;
 
 use super::EcContext;
-use super::cookies::{expire_ec_cookie, set_ec_cookie};
+use super::cookies::{append_cookie, expire_ec_cookie, set_ec_cookie};
 use super::eid_types::UnixSeconds;
 use super::generation::{generate_ec_id, is_valid_ec_id};
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
 use super::kv_types::KvEntry;
 use super::page_load::{PageLoadWrite, RowChange};
 use super::prebid_eids::collect_eid_updates;
-use super::pull_sync_marker::{expire_marker, reconcile_marker};
 use super::registry::PartnerRegistry;
 use super::write_plan::{WritePlanInput, plan_write};
 use super::{EcKvSnapshot, current_timestamp, log_id};
@@ -62,7 +62,39 @@ pub fn ec_finalize_response(
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
 ) {
-    ec_context.validate_pull_sync_marker(settings, registry);
+    finalize_response_inner(
+        settings,
+        ec_context,
+        kv,
+        registry,
+        eids_cookie,
+        sharedid_cookie,
+        response,
+    );
+    expire_retired_pull_marker(ec_context, response);
+}
+
+/// Expires a leftover pull-sync completeness marker; the marker is retired.
+fn expire_retired_pull_marker(ec_context: &EcContext, response: &mut Response<EdgeBody>) {
+    if ec_context.pull_marker_present() {
+        append_cookie(
+            response,
+            &format!(
+                "{COOKIE_TS_EC_PULL_COMPLETE}=; Path=/; Secure; SameSite=Lax; Max-Age=0; HttpOnly"
+            ),
+        );
+    }
+}
+
+fn finalize_response_inner(
+    settings: &Settings,
+    ec_context: &mut EcContext,
+    kv: Option<&KvIdentityGraph>,
+    registry: &PartnerRegistry,
+    eids_cookie: Option<&str>,
+    sharedid_cookie: Option<&str>,
+    response: &mut Response<EdgeBody>,
+) {
     let (permit, after_response) = ec_context
         .take_navigation_permit()
         .and_then(|permit| permit.confirm_with_after_response(response.status()))
@@ -71,12 +103,6 @@ pub fn ec_finalize_response(
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
     if !consent_allows_ec {
-        // Expire the request-local marker independently of the EC cookie: a
-        // withdrawal must stop any pending pull-sync disclosure window.
-        if consent_withdrawn && ec_context.pull_sync_marker().was_present() {
-            expire_marker(ec_context.pull_sync_marker_mut(), response);
-        }
-
         finalize_unusable_consent(
             settings,
             ec_context,
@@ -126,8 +152,6 @@ pub fn ec_finalize_response(
         // mint a browser cookie with no backing identity-graph row.
         log::info!("Skipping generated EC response write because KV graph is unavailable");
     }
-
-    reconcile_pull_sync_marker(settings, registry, ec_context, response);
 }
 
 /// Shared inputs for the navigation's single write.
@@ -279,24 +303,6 @@ fn update_returning(
             false
         }
     }
-}
-
-fn reconcile_pull_sync_marker(
-    settings: &Settings,
-    registry: &PartnerRegistry,
-    ec_context: &mut EcContext,
-    response: &mut Response<EdgeBody>,
-) {
-    let ec_id = ec_context.ec_value().map(str::to_owned);
-    let snapshot = ec_context.kv_snapshot().clone();
-    reconcile_marker(
-        settings,
-        registry,
-        ec_id.as_deref(),
-        &snapshot,
-        ec_context.pull_sync_marker_mut(),
-        response,
-    );
 }
 
 /// Withholds EID-derived KV updates when consent does not allow EID
@@ -1118,59 +1124,6 @@ mod tests {
         assert!(
             !stored.ids.contains_key("id5-sync.com"),
             "denied Purpose 4 EID must not be persisted even on the recovered row"
-        );
-    }
-
-    #[test]
-    fn valid_marker_with_unread_snapshot_defers_orphan_recovery() {
-        let settings = create_test_settings();
-        let orphaned_ec = sample_ec_id("orphn2");
-        let consent = ConsentContext {
-            jurisdiction: Jurisdiction::NonRegulated,
-            source: ConsentSource::Cookie,
-            ..Default::default()
-        };
-        let mut ec_context = EcContext::new_for_test_with_ip(
-            Some(orphaned_ec.clone()),
-            consent,
-            Some("192.0.2.10".to_owned()),
-        );
-        ec_context.set_recovery_eligible(true);
-        ec_context.set_pull_sync_marker_for_test(
-            crate::ec::pull_sync_marker::PullSyncMarkerState::Valid { expires_at: 4_600 },
-        );
-        let mut partner = make_partner("pull.example.com");
-        partner.pull_sync_enabled = true;
-        partner.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
-        partner.pull_sync_allowed_domains = vec!["sync.example.com".to_owned()];
-        partner.ts_pull_token = Some(Redacted::new("pull-token".to_owned()));
-        let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
-        let graph = KvIdentityGraph::in_memory("test_store");
-        ec_context.set_navigation_permit(NavigationPermit::for_test());
-        let mut response = empty_response();
-
-        ec_finalize_response(
-            &settings,
-            &mut ec_context,
-            Some(&graph),
-            &registry,
-            None,
-            None,
-            &mut response,
-        );
-
-        assert_eq!(
-            ec_context.ec_value(),
-            Some(orphaned_ec.as_str()),
-            "an unread snapshot should defer orphan rotation until marker expiry"
-        );
-        assert!(
-            matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead),
-            "a marker-skipped request should leave the snapshot unread"
-        );
-        assert!(
-            response.headers().get(http::header::SET_COOKIE).is_none(),
-            "bounded orphan deferral should not rewrite browser identity state"
         );
     }
 
@@ -2239,9 +2192,7 @@ mod tests {
         };
         let mut ec_context =
             make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent);
-        ec_context.set_pull_sync_marker_for_test(
-            crate::ec::pull_sync_marker::PullSyncMarkerState::Invalid,
-        );
+        ec_context.set_pull_marker_present_for_test(true);
         ec_context.set_navigation_permit(NavigationPermit::for_test());
         let graph = KvIdentityGraph::failing("unavailable-store");
         let mut response = empty_response();
@@ -2276,59 +2227,6 @@ mod tests {
                 cookie.starts_with("ts-ec-pull-complete=;") && cookie.contains("Max-Age=0")
             }),
             "KV failure should not prevent marker deletion"
-        );
-    }
-
-    #[test]
-    fn finalize_sets_marker_for_complete_pull_partner_snapshot() {
-        let settings = create_test_settings();
-        let ec_id = sample_ec_id("compl1");
-        let mut partner = make_partner("ssp.example.com");
-        partner.pull_sync_enabled = true;
-        partner.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
-        partner.pull_sync_allowed_domains = vec!["sync.example.com".to_owned()];
-        partner.ts_pull_token = Some(Redacted::new("pull-token".to_owned()));
-        let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
-        let mut ec_context = make_context(
-            Some(&ec_id),
-            Some(&ec_id),
-            true,
-            false,
-            Jurisdiction::NonRegulated,
-        );
-        let mut entry = live_entry();
-        entry.ids.insert(
-            "ssp.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId::single("partner-uid".to_owned()),
-        );
-        ec_context.set_kv_snapshot(EcKvSnapshot::Present {
-            ec_id,
-            entry: Box::new(entry),
-            generation: Some(1),
-        });
-        let mut response = empty_response();
-
-        ec_finalize_response(
-            &settings,
-            &mut ec_context,
-            None,
-            &registry,
-            None,
-            None,
-            &mut response,
-        );
-
-        let cookies = response
-            .headers()
-            .get_all(http::header::SET_COOKIE)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .collect::<Vec<_>>();
-        assert!(
-            cookies
-                .iter()
-                .any(|cookie| cookie.starts_with("ts-ec-pull-complete=v1.")),
-            "complete snapshot should issue the marker"
         );
     }
 
@@ -2370,9 +2268,7 @@ mod tests {
             ..Default::default()
         };
         let mut ec_context = make_context_with_consent(None, None, false, false, consent);
-        ec_context.set_pull_sync_marker_for_test(
-            crate::ec::pull_sync_marker::PullSyncMarkerState::Invalid,
-        );
+        ec_context.set_pull_marker_present_for_test(true);
         let mut response = empty_response();
 
         ec_finalize_response(

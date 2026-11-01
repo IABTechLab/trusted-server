@@ -373,6 +373,7 @@ pub(crate) struct EcFinalizeState {
     pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid_cookie: Option<String>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) is_real_browser: bool,
     /// Per-request services carried to the entry point so the pull-sync
     /// dispatcher can reuse the same platform HTTP client.
@@ -461,8 +462,9 @@ fn joined_cookie_header(req: &Request) -> String {
 /// Captures the request signals for after-response identity lookups on a
 /// permitted publisher navigation.
 ///
-/// Returns `None` when no after-response provider is enabled, the request has
-/// no EC, or the identity graph is unavailable.
+/// Returns `None` when no after-response provider (including a pull-sync
+/// partner) is enabled, the request has no EC, or the identity graph is
+/// unavailable.
 fn prepare_after_response_lookups(
     state: &AppState,
     req: &Request,
