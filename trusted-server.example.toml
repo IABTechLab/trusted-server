@@ -150,6 +150,19 @@ pull_sync_concurrency = 3
 # token = "example_provider_token"
 # Provider-specific settings, parsed by the provider kind.
 # [ec.identity_providers.settings]
+#
+# ID5 (kind "id5"): anonymous lookup, no secrets. The first source receives
+# the legacy `universal_uid`. Use the endpoint and sources ID5 gives you.
+# [[ec.identity_providers]]
+# id = "id5"
+# kind = "id5"
+# enabled = false
+# endpoint = "https://id5.example.com/g/v2"
+# allowed_domains = ["id5.example.com"]
+# sources = ["id5.example.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# partner_id = 1234
 
 
 # =============================================================================
