@@ -93,6 +93,8 @@ impl PartnerConfig {
 pub struct PartnerRegistry {
     by_source_domain: HashMap<String, PartnerConfig>,
     by_api_key_hash: HashMap<String, String>,
+    /// Normalized source domains in `[[ec.partners]]` order.
+    order: Vec<String>,
 }
 
 impl PartnerRegistry {
@@ -178,6 +180,7 @@ impl PartnerRegistry {
     pub fn from_config(partners: &[EcPartner]) -> Result<Self, Report<TrustedServerError>> {
         let mut by_source_domain = HashMap::with_capacity(partners.len());
         let mut by_api_key_hash = HashMap::with_capacity(partners.len());
+        let mut order = Vec::with_capacity(partners.len());
 
         for partner in partners {
             let normalized_source = normalize_partner_source_domain(&partner.source_domain)
@@ -231,12 +234,14 @@ impl PartnerRegistry {
             if let Some(api_key_hash) = api_key_hash {
                 by_api_key_hash.insert(api_key_hash, normalized_source.clone());
             }
+            order.push(normalized_source.clone());
             by_source_domain.insert(normalized_source, config);
         }
 
         Ok(Self {
             by_source_domain,
             by_api_key_hash,
+            order,
         })
     }
 
@@ -305,6 +310,7 @@ impl PartnerRegistry {
         Self {
             by_source_domain: HashMap::new(),
             by_api_key_hash: HashMap::new(),
+            order: Vec::new(),
         }
     }
 
@@ -389,6 +395,13 @@ impl PartnerRegistry {
             .values()
             .filter(|p| p.pull_sync_enabled)
             .collect()
+    }
+
+    /// Partners in `[[ec.partners]]` order.
+    pub fn in_config_order(&self) -> impl Iterator<Item = &PartnerConfig> {
+        self.order
+            .iter()
+            .filter_map(|source| self.by_source_domain.get(source))
     }
 
     /// Returns an iterator over all configured partners.
@@ -721,6 +734,27 @@ mod tests {
         assert!(
             !plain.is_provider_owned("ids.example.com"),
             "should not claim sources without provider implementations"
+        );
+    }
+
+    #[test]
+    fn in_config_order_preserves_partner_order() {
+        let partners = vec![
+            make_partner("c.example.com", &valid_api_token("token-c")),
+            make_partner("a.example.com", &valid_api_token("token-a")),
+            make_partner("b.example.com", &valid_api_token("token-b")),
+        ];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+
+        let order: Vec<&str> = registry
+            .in_config_order()
+            .map(|partner| partner.source_domain.as_str())
+            .collect();
+
+        assert_eq!(
+            order,
+            ["c.example.com", "a.example.com", "b.example.com"],
+            "should keep config order"
         );
     }
 

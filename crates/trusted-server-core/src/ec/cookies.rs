@@ -22,7 +22,7 @@ use crate::constants::COOKIE_TS_EC;
 use crate::settings::Settings;
 
 /// Maximum age for the EC cookie (1 year in seconds).
-const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60;
+pub(crate) const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60;
 
 fn is_allowed_ec_id_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
