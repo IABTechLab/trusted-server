@@ -468,11 +468,8 @@ pub struct EcPartner {
     /// Allowlist of domains TS may call for this partner's pull sync.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub pull_sync_allowed_domains: Vec<String>,
-    /// Legacy pull-sync refresh interval retained for config compatibility.
-    ///
-    /// EC identity entries no longer store per-partner sync timestamps, so
-    /// this value is not used by the current fill-missing-only pull sync
-    /// behavior.
+    /// Legacy pull-sync refresh interval; retained for config compatibility;
+    /// unused.
     #[serde(
         default = "EcPartner::default_pull_sync_ttl_sec",
         deserialize_with = "from_value_or_str"
@@ -630,6 +627,31 @@ impl IdentityProviderConfig {
         true
     }
 
+    /// Builds an enabled page-phase config with no TCF vendor, no rate limit,
+    /// default secrets and empty provider settings.
+    #[must_use]
+    pub fn new(
+        id: String,
+        kind: String,
+        endpoint: String,
+        allowed_domains: Vec<String>,
+        sources: Vec<String>,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            enabled: true,
+            endpoint,
+            allowed_domains,
+            sources,
+            tcf_vendor_id: None,
+            collect: CollectTiming::default(),
+            rate_limit_per_hour: None,
+            secrets: ProviderSecrets::default(),
+            settings: serde_json::Map::new(),
+        }
+    }
+
     /// The configured implementation kind.
     #[must_use]
     pub fn kind(&self) -> &str {
@@ -678,7 +700,8 @@ pub struct Ec {
     #[serde(default)]
     pub ec_store: Option<String>,
 
-    /// Maximum number of concurrent pull-sync requests.
+    /// Maximum number of concurrent pull-sync requests; retained for config
+    /// compatibility; unused.
     #[serde(default = "Ec::default_pull_sync_concurrency")]
     pub pull_sync_concurrency: usize,
 

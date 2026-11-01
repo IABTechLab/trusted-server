@@ -152,7 +152,9 @@ use trusted_server_core::settings::{CollectTiming, ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
-use trusted_server_identity_providers::{build_coordinator_with, partner_registry};
+use trusted_server_identity_providers::{
+    build_coordinator_with, partner_registry, pull_sync_providers,
+};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -361,6 +363,7 @@ pub(crate) struct EcFinalizeState {
     pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid_cookie: Option<String>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) is_real_browser: bool,
     /// Per-request services carried to the entry point so the pull-sync
     /// dispatcher can reuse the same platform HTTP client.
@@ -435,8 +438,9 @@ impl<'a> ProviderRequestSignals<'a> {
 /// Captures the request signals for after-response identity lookups on a
 /// permitted publisher navigation.
 ///
-/// Returns `None` when no after-response provider is enabled, the request has
-/// no EC, or the identity graph is unavailable.
+/// Returns `None` when no after-response provider (including a pull-sync
+/// partner) is enabled, the request has no EC, or the identity graph is
+/// unavailable.
 fn prepare_after_response_lookups(
     state: &AppState,
     req: &Request,
@@ -447,7 +451,8 @@ fn prepare_after_response_lookups(
         .ec
         .identity_providers
         .iter()
-        .any(|config| config.enabled && config.collect == CollectTiming::AfterResponse);
+        .any(|config| config.enabled && config.collect == CollectTiming::AfterResponse)
+        || pull_sync_providers(&state.settings.ec).next().is_some();
     if !has_after_response_provider {
         return None;
     }
@@ -472,13 +477,15 @@ async fn dispatch_identity_lookups(
     req: &Request,
     ec: &mut EcRequestState,
 ) -> Option<IdentityLookups> {
-    if !state
+    // Pull-sync partners run after the response, so only page providers
+    // count here.
+    let any_provider = state
         .settings
         .ec
         .identity_providers
         .iter()
-        .any(|config| config.enabled)
-    {
+        .any(|config| config.enabled && config.collect == CollectTiming::Page);
+    if !any_provider {
         return None;
     }
     let partners = match state.partner_registry() {

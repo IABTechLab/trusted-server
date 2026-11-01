@@ -174,6 +174,19 @@ pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) 
     }
 }
 
+/// Appends a raw `Set-Cookie` value, skipping values that are not valid
+/// header values.
+pub(crate) fn append_cookie(response: &mut Response<EdgeBody>, value: &str) {
+    match HeaderValue::from_str(value) {
+        Ok(value) => {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+        Err(err) => {
+            log::warn!("Skipping Set-Cookie: invalid header value: {err}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,28 +9,34 @@
 //! Dependencies point one way: this crate depends on core, and core never
 //! depends on it.
 
+pub mod pull_sync;
+
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
 use error_stack::Report;
 use trusted_server_core::ec::coordinator::{ProviderCoordinator, RegisteredProvider};
-use trusted_server_core::ec::provider::{IdentityProvider, ProviderConfigError};
+use trusted_server_core::ec::provider::{
+    IdentityProvider, ProviderConfigError, ProviderKind as _, build_kind,
+};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::settings::{
     CollectTiming, Ec, IdentityProviderConfig, ProviderSecrets, Settings,
 };
 
+use crate::pull_sync::PullSync;
+
 /// Whether `kind` has a registered implementation.
-///
-/// No kinds are registered yet.
 #[must_use]
-pub fn is_registered_kind(_kind: &str) -> bool {
-    false
+pub fn is_registered_kind(kind: &str) -> bool {
+    kind == PullSync::KIND
 }
 
 /// Builds the partner registry, marking only sources claimed by enabled
-/// providers whose kind is registered as provider-owned.
+/// providers whose kind is registered (including pull-sync partners) as
+/// provider-owned.
 ///
 /// # Errors
 ///
@@ -41,19 +47,46 @@ pub fn partner_registry(ec: &Ec) -> Result<PartnerRegistry, Report<TrustedServer
 
 /// Builds the provider for a configured `kind`.
 ///
-/// No kinds are registered yet, so every kind is rejected.
-///
 /// # Errors
 ///
 /// Returns [`ProviderConfigError::UnknownKind`] for an unregistered kind, or
 /// any error from [`trusted_server_core::ec::provider::build_kind`].
 pub fn build(
     config: &IdentityProviderConfig,
-    _secrets: &ProviderSecrets,
+    secrets: &ProviderSecrets,
 ) -> Result<Box<dyn IdentityProvider>, Report<ProviderConfigError>> {
-    let kind = config.kind();
-    Err(Report::new(ProviderConfigError::UnknownKind)
-        .attach(format!("kind `{kind}` is not registered")))
+    match config.kind() {
+        PullSync::KIND => build_kind::<PullSync>(config, secrets),
+        kind => Err(Report::new(ProviderConfigError::UnknownKind)
+            .attach(format!("kind `{kind}` is not registered"))),
+    }
+}
+
+/// One `pull-sync` provider per partner with pull sync enabled, built from the
+/// partner's existing fields with no config change.
+///
+/// Pull sync runs after the response has been sent, as it did before it
+/// became a provider, so a slow partner never delays the page and a new EC
+/// whose row does not exist yet is never pulled. Its hourly rate limit is
+/// the partner's `pull_sync_rate_limit` (`None` when it is 0).
+pub fn pull_sync_providers(ec: &Ec) -> impl Iterator<Item = IdentityProviderConfig> + '_ {
+    ec.partners
+        .iter()
+        .filter(|partner| partner.pull_sync_enabled)
+        .filter_map(|partner| {
+            let endpoint = partner.pull_sync_url.clone()?;
+            let mut config = IdentityProviderConfig::new(
+                format!("pull-sync:{}", partner.source_domain),
+                PullSync::KIND.to_owned(),
+                endpoint,
+                partner.pull_sync_allowed_domains.clone(),
+                vec![partner.source_domain.clone()],
+            );
+            config.secrets.token = partner.ts_pull_token.clone();
+            config.collect = CollectTiming::AfterResponse;
+            config.rate_limit_per_hour = NonZeroU32::new(partner.pull_sync_rate_limit);
+            Some(config)
+        })
 }
 
 /// Builds the coordinator for enabled providers collected before the
@@ -127,17 +160,20 @@ fn build_phase_coordinator(
     // Source ownership across both phases is checked when settings load
     // (`config::validate_identity_providers`), so only this phase's providers
     // are built and checked here.
-    let registered = settings
+    let configured = settings
         .ec
         .identity_providers
         .iter()
-        .filter(|config| {
-            config.enabled && config.collect == timing && is_registered_kind(config.kind())
-        })
+        .filter(|config| config.enabled && is_registered_kind(config.kind()))
+        .cloned();
+    let registered = configured
+        .chain(pull_sync_providers(&settings.ec))
+        .filter(|config| config.collect == timing)
         .map(|config| {
-            build(config, &config.secrets).map(|provider| {
-                let registered = RegisteredProvider::new(config.clone(), provider);
-                match config.rate_limit_per_hour {
+            build(&config, &config.secrets).map(|provider| {
+                let rate_limit = config.rate_limit_per_hour;
+                let registered = RegisteredProvider::new(config, provider);
+                match rate_limit {
                     Some(per_hour) => registered.with_rate_limit(per_hour),
                     None => registered,
                 }
@@ -205,6 +241,39 @@ mod tests {
         let coordinator = build_coordinator(&settings).expect("should skip disabled providers");
 
         assert!(coordinator.is_none(), "should build no coordinator");
+    }
+
+    #[test]
+    fn pull_sync_partner_runs_after_the_response() {
+        let mut settings = create_test_settings();
+        settings.ec.partners = vec![
+            toml::from_str(
+                r#"
+                name = "Pull partner"
+                source_domain = "partner.example.com"
+                pull_sync_enabled = true
+                pull_sync_url = "https://sync.example.com/pull"
+                pull_sync_allowed_domains = ["sync.example.com"]
+                ts_pull_token = "example-pull-token-32-bytes-minimum"
+                "#,
+            )
+            .expect("should parse partner"),
+        ];
+
+        let page = build_coordinator(&settings).expect("should build page providers");
+        let partners = Arc::new(partner_registry(&settings.ec).expect("should build partners"));
+        let after_response = build_after_response_coordinator(&settings, partners)
+            .expect("should build pull-sync providers")
+            .expect("should build an after-response coordinator");
+
+        assert!(
+            page.is_none(),
+            "should not run pull sync before the response"
+        );
+        assert!(
+            !after_response.is_empty(),
+            "should run pull sync after the response"
+        );
     }
 
     #[test]
