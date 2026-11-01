@@ -10,15 +10,16 @@ use http::Response;
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
 use crate::consent::{ConsentContext, allows_eid_persistence};
-use crate::constants::COOKIE_TS_EC_PULL_COMPLETE;
+use crate::constants::{COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR};
 use crate::settings::Settings;
 
 use super::EcContext;
-use super::cookies::{append_cookie, expire_ec_cookie, set_ec_cookie};
+use super::cookies::{COOKIE_MAX_AGE, append_cookie, expire_ec_cookie, set_ec_cookie};
 use super::eid_types::UnixSeconds;
 use super::generation::generate_ec_id;
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
 use super::kv_types::KvEntry;
+use super::mirror::{MirrorCookie, build_mirror, mirror_consent};
 use super::page_load::{Generation, PageLoadWrite, RowChange};
 use super::prebid_eids::collect_eid_updates;
 use super::registry::PartnerRegistry;
@@ -59,7 +60,7 @@ pub fn ec_finalize_response(
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
 ) {
-    finalize_response_inner(
+    let navigation = finalize_response_inner(
         settings,
         ec_context,
         kv,
@@ -68,7 +69,54 @@ pub fn ec_finalize_response(
         sharedid_cookie,
         response,
     );
+    apply_mirror(ec_context, registry, navigation, response);
     expire_retired_pull_marker(ec_context, response);
+}
+
+/// Sets or expires the mirror cookie (spec §10).
+///
+/// Navigations rebuild it from the row as it stands after the page-load
+/// write: the committed row is stored as the `Present` snapshot, so
+/// [`super::EcKvSnapshot::entry_for`] returns it, or the read snapshot when no
+/// write landed. Without EC and EID consent it is expired on navigations and on any
+/// response whose request carried it.
+fn apply_mirror(
+    ec_context: &EcContext,
+    registry: &PartnerRegistry,
+    navigation: bool,
+    response: &mut Response<EdgeBody>,
+) {
+    let decision = if !mirror_consent(ec_context.consent()) {
+        MirrorCookie::Expire
+    } else if navigation {
+        let row = ec_context
+            .ec_value()
+            .and_then(|ec_id| ec_context.kv_snapshot().entry_for(ec_id));
+        build_mirror(
+            row,
+            ec_context.consent(),
+            registry,
+            UnixSeconds::new(current_timestamp()),
+        )
+    } else {
+        return;
+    };
+    match decision {
+        MirrorCookie::Set(value) => append_cookie(
+            response,
+            &format!(
+                "{COOKIE_TS_EIDS_MIRROR}={}; Path=/; Secure; SameSite=Lax; Max-Age={COOKIE_MAX_AGE}",
+                value.as_str()
+            ),
+        ),
+        MirrorCookie::Expire if ec_context.mirror_cookie_present() || navigation => {
+            append_cookie(
+                response,
+                &format!("{COOKIE_TS_EIDS_MIRROR}=; Path=/; Secure; SameSite=Lax; Max-Age=0"),
+            );
+        }
+        MirrorCookie::Expire => {}
+    }
 }
 
 /// Expires a leftover pull-sync completeness marker; the marker is retired.
@@ -91,11 +139,12 @@ fn finalize_response_inner(
     eids_cookie: Option<&str>,
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
-) {
+) -> bool {
     let (permit, after_response) = ec_context
         .take_navigation_permit()
         .and_then(|permit| permit.confirm_with_after_response(response.status()))
         .unzip();
+    let navigation = permit.is_some();
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
@@ -109,7 +158,7 @@ fn finalize_response_inner(
             consent_withdrawn,
             response,
         );
-        return;
+        return navigation;
     }
 
     if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) {
@@ -150,6 +199,7 @@ fn finalize_response_inner(
         // mint a browser cookie with no backing identity-graph row.
         log::info!("Skipping generated EC response write because KV graph is unavailable");
     }
+    navigation
 }
 
 /// Shared inputs for the navigation's single write.
@@ -890,7 +940,7 @@ mod tests {
         );
 
         assert!(
-            get_header(&response, "set-cookie").is_none(),
+            !ec_cookie_emitted(&response),
             "should keep the EC cookie when the tombstone write fails"
         );
         assert!(
@@ -1932,7 +1982,7 @@ mod tests {
         );
 
         assert!(
-            get_header(&response, "set-cookie").is_none(),
+            !ec_cookie_emitted(&response),
             "must not emit a cookie without an authoritative backing row"
         );
     }
@@ -2008,6 +2058,134 @@ mod tests {
     // Orphan-recovery gating and two-ID withdrawal
     // -----------------------------------------------------------------------
 
+    fn mirror_cookies(response: &Response<EdgeBody>) -> Vec<String> {
+        response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter(|cookie| cookie.starts_with("__Host-ts-eids-mirror="))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn provider_found(source: &str) -> LookupResults {
+        let uid = KvUid::new(
+            UidValue::try_from("provider-uid").expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            Expiry::Never,
+        );
+        // Made for the EC ID `run_mirror_navigation` seeds.
+        LookupResults::new(
+            &sample_ec_id("mirr01"),
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::Found {
+                    kept: 1,
+                    dropped: DropCounts::default(),
+                },
+                entries: vec![(
+                    SourceDomain::try_from(source).expect("should build source"),
+                    vec![KvEid::new(EidFields::default(), vec![uid])],
+                )],
+                cleared: Vec::new(),
+            }],
+        )
+    }
+
+    fn run_mirror_navigation(lookups: LookupResults) -> Response<EdgeBody> {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("mirr01");
+        let graph = KvIdentityGraph::in_memory("mirror_store");
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .expect("should seed the live row");
+        let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), true);
+        ec_context.set_lookup_results(lookups);
+        let mut registry = PartnerRegistry::from_config(&[make_partner("ids.example.com")])
+            .expect("should build registry");
+        registry.mark_provider_owned("ids.example.com");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+        response
+    }
+
+    #[test]
+    fn navigation_sets_mirror_from_committed_row() {
+        let response = run_mirror_navigation(provider_found("ids.example.com"));
+
+        let cookies = mirror_cookies(&response);
+        assert_eq!(cookies.len(), 1, "should set one mirror cookie");
+        assert!(
+            !cookies[0].contains("Max-Age=0") && cookies[0].contains("Max-Age="),
+            "should set the mirror with a non-zero Max-Age"
+        );
+        assert!(
+            !cookies[0].contains("HttpOnly") && !cookies[0].contains("Domain="),
+            "should be JS-readable and host-only"
+        );
+    }
+
+    #[test]
+    fn navigation_without_provider_uids_expires_mirror() {
+        let response = run_mirror_navigation(LookupResults::default());
+
+        let cookies = mirror_cookies(&response);
+        assert_eq!(cookies.len(), 1, "should emit one mirror cookie");
+        assert!(
+            cookies[0].contains("Max-Age=0"),
+            "should expire the mirror when no provider UID qualifies"
+        );
+    }
+
+    #[test]
+    fn withdrawn_consent_expires_mirror_on_any_response() {
+        let settings = create_test_settings();
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = make_context_with_consent(None, None, false, false, consent);
+        ec_context.set_mirror_cookie_present_for_test(true);
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            None,
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let cookies = mirror_cookies(&response);
+        assert_eq!(cookies.len(), 1, "should emit one mirror cookie");
+        assert!(
+            cookies[0].contains("Max-Age=0"),
+            "should expire the mirror without a navigation"
+        );
+    }
+
     fn granting_consent() -> ConsentContext {
         ConsentContext {
             jurisdiction: Jurisdiction::NonRegulated,
@@ -2036,6 +2214,17 @@ mod tests {
         ec
     }
 
+    /// Whether the response sets or expires the `ts-ec` cookie; other
+    /// cookies, such as the mirror, are ignored.
+    fn ec_cookie_emitted(response: &Response<EdgeBody>) -> bool {
+        response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|cookie| cookie.starts_with("ts-ec="))
+    }
+
     fn assert_did_not_rotate(ec_context: &EcContext, orphan: &str, response: &Response<EdgeBody>) {
         assert_eq!(
             ec_context.ec_value(),
@@ -2044,7 +2233,7 @@ mod tests {
         );
         assert!(!ec_context.ec_generated(), "must not mark a rotated EC");
         assert!(
-            get_header(response, "set-cookie").is_none(),
+            !ec_cookie_emitted(response),
             "must not emit a replacement cookie"
         );
     }
@@ -2632,7 +2821,7 @@ mod tests {
         );
 
         assert!(
-            get_header(&response, "set-cookie").is_none(),
+            !ec_cookie_emitted(&response),
             "should not issue an EC whose row was not created"
         );
     }

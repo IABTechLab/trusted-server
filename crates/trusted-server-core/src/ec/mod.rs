@@ -33,6 +33,7 @@
 //! - [`write_plan`] — Plans a navigation's single row change
 //! - [`provider`] — Identity provider interface and configuration
 //! - [`coordinator`] — Server-side identity lookup coordination
+//! - [`mirror`] — JS-readable mirror of provider-owned bidstream UIDs
 
 mod auth;
 
@@ -51,6 +52,7 @@ pub mod identify;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
+pub mod mirror;
 pub mod page_load;
 pub mod partner;
 pub mod prebid_eids;
@@ -82,7 +84,7 @@ use error_stack::Report;
 use http::Request;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE};
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
@@ -194,6 +196,8 @@ struct RequestEc {
     cookie_ec: Option<String>,
     /// Whether the retired pull-sync completeness marker is present.
     pull_marker_present: bool,
+    /// Whether the mirror cookie is present.
+    mirror_cookie_present: bool,
     /// The parsed cookie jar (retained for consent pipeline input).
     jar: Option<CookieJar>,
 }
@@ -213,10 +217,14 @@ fn parse_ec_from_request(req: &Request<EdgeBody>) -> Result<RequestEc, Report<Tr
     let pull_marker_present = jar
         .as_ref()
         .is_some_and(|j| j.get(COOKIE_TS_EC_PULL_COMPLETE).is_some());
+    let mirror_cookie_present = jar
+        .as_ref()
+        .is_some_and(|j| j.get(COOKIE_TS_EIDS_MIRROR).is_some());
 
     Ok(RequestEc {
         cookie_ec,
         pull_marker_present,
+        mirror_cookie_present,
         jar,
     })
 }
@@ -310,6 +318,8 @@ pub struct EcContext {
     client_eids: Option<Vec<Eid>>,
     /// Whether the request carried the retired pull-sync marker cookie.
     pull_marker_present: bool,
+    /// Whether the request carried the mirror cookie.
+    mirror_cookie_present: bool,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
     /// Navigation permit issued by the router for page-load navigations.
@@ -402,6 +412,7 @@ impl EcContext {
             recovery_eligible: false,
             client_eids: None,
             pull_marker_present: parsed.pull_marker_present,
+            mirror_cookie_present: parsed.mirror_cookie_present,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
@@ -597,6 +608,18 @@ impl EcContext {
         self.pull_marker_present
     }
 
+    /// Whether the request carried the mirror cookie.
+    #[must_use]
+    pub(crate) fn mirror_cookie_present(&self) -> bool {
+        self.mirror_cookie_present
+    }
+
+    /// Marks the mirror cookie as present, for tests.
+    #[cfg(test)]
+    pub(crate) fn set_mirror_cookie_present_for_test(&mut self, present: bool) {
+        self.mirror_cookie_present = present;
+    }
+
     /// Marks the retired pull-sync marker cookie as present, for tests.
     #[cfg(test)]
     pub(crate) fn set_pull_marker_present_for_test(&mut self, present: bool) {
@@ -707,6 +730,7 @@ impl EcContext {
             recovery_eligible: false,
             client_eids: None,
             pull_marker_present: false,
+            mirror_cookie_present: false,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
@@ -736,6 +760,7 @@ impl EcContext {
             recovery_eligible: false,
             client_eids: None,
             pull_marker_present: false,
+            mirror_cookie_present: false,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
@@ -768,6 +793,7 @@ impl EcContext {
             recovery_eligible: false,
             client_eids: None,
             pull_marker_present: false,
+            mirror_cookie_present: false,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),

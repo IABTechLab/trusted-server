@@ -26,6 +26,7 @@ use crate::ec::EcKvSnapshot;
 use crate::ec::consent::ec_consent_granted;
 use crate::ec::eid_types::{ProviderId, SourceDomain, UnixSeconds};
 use crate::ec::kv_types::KvEntry;
+use crate::ec::mirror::{MirrorCookie, build_mirror};
 use crate::ec::page_load::RowChange;
 use crate::ec::provider::{
     ClientSignals, IdentityProvider, LookupInput, LookupOutcome, OwnedEntries, ProviderConfigError,
@@ -70,6 +71,15 @@ pub trait IdentityCoordinator {
     ///
     /// Returns `None` when the row would not change, so no write is made.
     fn plan_write(&self, input: &WritePlanInput<'_>) -> Option<RowChange>;
+
+    /// Builds the mirror cookie from the row as it stands after this
+    /// navigation: the committed row, or the snapshot when no write landed.
+    fn mirror(
+        &self,
+        row: Option<&KvEntry>,
+        consent: &ConsentContext,
+        now: UnixSeconds,
+    ) -> MirrorCookie;
 }
 
 /// Request-scoped inputs to [`IdentityCoordinator::dispatch`].
@@ -631,6 +641,15 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
 
     fn plan_write(&self, input: &WritePlanInput<'_>) -> Option<RowChange> {
         plan_write(input)
+    }
+
+    fn mirror(
+        &self,
+        row: Option<&KvEntry>,
+        consent: &ConsentContext,
+        now: UnixSeconds,
+    ) -> MirrorCookie {
+        build_mirror(row, consent, &self.partners, now)
     }
 }
 
