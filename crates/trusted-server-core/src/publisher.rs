@@ -3454,9 +3454,15 @@ struct EcSnapshotPreloadInput {
     auction_needs_row: bool,
     eid_cookie_may_need_persistence: bool,
     privacy_needs_row: bool,
+    snapshot_already_read: bool,
 }
 
 fn should_preload_ec_snapshot(input: &EcSnapshotPreloadInput) -> bool {
+    // An earlier step of this request (identity-provider dispatch) already
+    // read the row for an existing EC, so a second read adds nothing.
+    if input.snapshot_already_read {
+        return false;
+    }
     let eligible = input.is_navigation && input.is_get && input.has_ec_id && input.has_kv;
     let marker_can_skip = input.marker_valid
         && !input.auction_needs_row
@@ -5307,6 +5313,10 @@ pub async fn handle_publisher_request(
                 .is_some_and(|registry| !registry.is_empty()),
         eid_cookie_may_need_persistence,
         privacy_needs_row: crate::ec::consent::ec_consent_withdrawn(&consent_context),
+        // A freshly generated EC keeps its refresh read: the Add-confirmed
+        // snapshot may still upgrade to the stored row.
+        snapshot_already_read: !ec_context.ec_generated()
+            && !matches!(ec_context.kv_snapshot(), crate::ec::EcKvSnapshot::NotRead),
     });
     let mut pending_origin = None;
     // A shared-template hit skips the origin entirely, and an in-flight request
@@ -8389,6 +8399,7 @@ mod tests {
             auction_needs_row: false,
             eid_cookie_may_need_persistence: false,
             privacy_needs_row: false,
+            snapshot_already_read: false,
         };
         assert!(should_preload_ec_snapshot(&baseline));
         assert!(!should_preload_ec_snapshot(&EcSnapshotPreloadInput {
@@ -8407,6 +8418,13 @@ mod tests {
             has_kv: false,
             ..baseline
         }));
+        assert!(
+            !should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+                snapshot_already_read: true,
+                ..baseline
+            }),
+            "should skip the preload when the snapshot was already read"
+        );
     }
 
     #[test]
@@ -8420,6 +8438,7 @@ mod tests {
             auction_needs_row: false,
             eid_cookie_may_need_persistence: false,
             privacy_needs_row: false,
+            snapshot_already_read: false,
         };
         assert!(!should_preload_ec_snapshot(&marker_only));
         assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
@@ -8844,8 +8863,8 @@ mod tests {
             create_test_settings()
         };
         settings.ec.partners = vec![marker_partner("ssp.example.com")];
-        let registry = PartnerRegistry::from_config(&settings.ec.partners)
-            .expect("should build pull partner registry");
+        let registry =
+            PartnerRegistry::from_ec(&settings.ec).expect("should build pull partner registry");
         let http = Arc::new(StubHttpClient::new());
         http.set_concurrent_fanout(true);
         http.push_response(200, b"<html><body>ok</body></html>".to_vec());

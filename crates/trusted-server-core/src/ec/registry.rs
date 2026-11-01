@@ -10,7 +10,7 @@ use error_stack::{Report, ResultExt as _};
 
 use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
-use crate::settings::EcPartner;
+use crate::settings::{Ec, EcPartner};
 
 use super::partner::{hash_api_key, normalize_partner_source_domain};
 
@@ -206,6 +206,25 @@ impl PartnerRegistry {
             by_source_domain,
             by_api_key_hash,
         })
+    }
+
+    /// Builds the registry from `[ec]` settings and marks every source claimed
+    /// by an enabled identity provider as provider-owned.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::from_config`].
+    pub fn from_ec(ec: &Ec) -> Result<Self, Report<TrustedServerError>> {
+        let mut registry = Self::from_config(&ec.partners)?;
+        for source in ec
+            .identity_providers
+            .iter()
+            .filter(|provider| provider.enabled)
+            .flat_map(|provider| &provider.sources)
+        {
+            registry.mark_provider_owned(source);
+        }
+        Ok(registry)
     }
 
     /// Returns an empty registry (no partners configured).
@@ -460,6 +479,36 @@ mod tests {
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
             ts_pull_token: None,
         }
+    }
+
+    #[test]
+    fn from_ec_marks_enabled_provider_sources_only() {
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        ec.partners = vec![
+            make_partner("ids.example.com", &valid_api_token("ids-partner")),
+            make_partner("other.example.com", &valid_api_token("other-partner")),
+        ];
+        ec.identity_providers = vec![
+            toml::from_str(
+                "id = \"a\"\nkind = \"k\"\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse enabled provider"),
+            toml::from_str(
+                "id = \"b\"\nkind = \"k\"\nenabled = false\nendpoint = \"https://ids.example.com/\"\nsources = [\"other.example.com\"]",
+            )
+            .expect("should parse disabled provider"),
+        ];
+
+        let registry = PartnerRegistry::from_ec(&ec).expect("should build registry");
+
+        assert!(
+            registry.is_provider_owned("ids.example.com"),
+            "should mark enabled provider source"
+        );
+        assert!(
+            !registry.is_provider_owned("other.example.com"),
+            "should not mark disabled provider source"
+        );
     }
 
     #[test]

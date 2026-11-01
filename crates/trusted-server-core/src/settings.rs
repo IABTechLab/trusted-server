@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU16;
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -579,6 +580,66 @@ impl EcPartner {
     }
 }
 
+/// One `[[ec.identity_providers]]` entry.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityProviderConfig {
+    /// Unique provider ID; recorded as the owner of the UIDs it writes.
+    pub id: String,
+    /// Implementation kind, matched by the provider crate's `build`.
+    kind: String,
+    /// Whether lookups run. A disabled provider owns no sources.
+    #[serde(
+        default = "IdentityProviderConfig::default_enabled",
+        deserialize_with = "from_value_or_str"
+    )]
+    pub enabled: bool,
+    /// Lookup endpoint; must be `https` with a host in `allowed_domains`.
+    pub endpoint: String,
+    /// Exact hosts the coordinator may call for this provider.
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub allowed_domains: Vec<String>,
+    /// Source domains this provider owns; each needs an `[[ec.partners]]` entry.
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub sources: Vec<String>,
+    /// TCF vendor ID that must have vendor consent, when set.
+    #[serde(default)]
+    pub tcf_vendor_id: Option<NonZeroU16>,
+    /// Secret Store key references, resolved at startup.
+    #[serde(default)]
+    pub secrets: ProviderSecrets,
+    /// Provider-specific settings, parsed by the provider kind.
+    ///
+    /// Held as a JSON object because settings travel through the JSON app
+    /// config pipeline.
+    #[serde(default)]
+    pub settings: serde_json::Map<String, JsonValue>,
+}
+
+impl IdentityProviderConfig {
+    const fn default_enabled() -> bool {
+        true
+    }
+
+    /// The configured implementation kind.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+}
+
+/// Secret values for one identity provider.
+///
+/// `EdgeZero` secret paths address fixed field names, so V1 supports one
+/// optional bearer token per provider.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSecrets {
+    /// Secret Store key whose value is the provider's token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<Redacted<String>>,
+}
+
 /// Edge Cookie (EC) configuration.
 ///
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
@@ -616,6 +677,18 @@ pub struct Ec {
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     #[validate(nested)]
     pub partners: Vec<EcPartner>,
+
+    /// Shared time budget, in milliseconds, for all provider lookups on one
+    /// navigation.
+    #[serde(
+        default = "Ec::default_identity_budget_ms",
+        deserialize_with = "from_value_or_str"
+    )]
+    pub identity_budget_ms: u64,
+
+    /// Server-side identity providers.
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub identity_providers: Vec<IdentityProviderConfig>,
 }
 
 impl Ec {
@@ -644,6 +717,12 @@ impl Ec {
     #[must_use]
     pub const fn default_cluster_recheck_secs() -> u64 {
         3600
+    }
+
+    /// Default shared identity lookup budget (200 ms).
+    #[must_use]
+    pub const fn default_identity_budget_ms() -> u64 {
+        200
     }
 
     /// Returns `true` if `passphrase` matches a known placeholder value
@@ -3507,6 +3586,19 @@ impl Settings {
                 insecure_fields.push(format!(
                     "ec.partners[{}].ts_pull_token",
                     partner.source_domain
+                ));
+            }
+        }
+        for provider in &self.ec.identity_providers {
+            if provider
+                .secrets
+                .token
+                .as_ref()
+                .is_some_and(|token| EcPartner::is_placeholder_api_token(token.expose()))
+            {
+                insecure_fields.push(format!(
+                    "ec.identity_providers[{}].secrets.token",
+                    provider.id
                 ));
             }
         }
@@ -6589,6 +6681,31 @@ source_domain = "partner.example.com"
         settings
             .reject_placeholder_secrets()
             .expect("should accept a realistic partner pull token");
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_includes_identity_provider_tokens() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        let mut provider: IdentityProviderConfig = toml::from_str(
+            "id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/\"",
+        )
+        .expect("should parse provider config");
+        provider.secrets.token = Some(Redacted::new(
+            "partner-api-token-32-bytes-minimum".to_owned(),
+        ));
+        settings.ec.identity_providers = vec![provider];
+
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder provider token");
+
+        assert!(
+            format!("{err:?}").contains("ec.identity_providers[example-provider].secrets.token"),
+            "should mention the provider token field"
+        );
     }
 
     #[test]

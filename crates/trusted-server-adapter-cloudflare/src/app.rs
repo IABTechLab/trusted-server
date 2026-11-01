@@ -655,7 +655,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get(
                 "/_ts/admin/eids",
                 make_handler(Arc::clone(&state), |s, _services, req| async move {
-                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
+                    let partner_registry = PartnerRegistry::from_ec(&s.settings.ec)?;
                     handle_admin_eids_lookup(&partner_registry, &req)
                 }),
             )

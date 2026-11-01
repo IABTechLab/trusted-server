@@ -357,8 +357,8 @@ mod tests {
     fn settings_and_registry(domains: &[&str]) -> (Settings, PartnerRegistry) {
         let mut settings = create_test_settings();
         settings.ec.partners = domains.iter().map(|domain| pull_partner(domain)).collect();
-        let registry = PartnerRegistry::from_config(&settings.ec.partners)
-            .expect("should build pull partner registry");
+        let registry =
+            PartnerRegistry::from_ec(&settings.ec).expect("should build pull partner registry");
         (settings, registry)
     }
 

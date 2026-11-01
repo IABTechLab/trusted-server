@@ -13,6 +13,8 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
+use trusted_server_core::ec::coordinator::IdentityCoordinator as _;
+use trusted_server_core::ec::coordinator::transport::PlatformLookupTransport;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -44,8 +46,8 @@ mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp,
-    load_settings_from_config_store,
+    AppState, EcFinalizeState, IdentityLookups, RuntimeStoreConfig, TrustedServerApp,
+    load_settings_from_config_store, take_identity_lookups,
 };
 use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
@@ -491,6 +493,8 @@ fn edgezero_main(
                 core_req.extensions_mut().insert(device_signals);
             }
             core_req.extensions_mut().insert(client_info);
+            // Drop lookups a previous request on this sandbox left behind.
+            drop(take_identity_lookups());
             match futures::executor::block_on(app.router().oneshot(core_req)) {
                 Ok(response) => response,
                 Err(error) => edge_error_response(error),
@@ -517,6 +521,9 @@ fn edgezero_main(
 
     // Pop response extensions before the Fastly conversion, which drops them.
     let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
+    // Identity lookups dispatched on a publisher navigation are collected in
+    // EC finalization, after the router's executor has returned.
+    let identity = take_identity_lookups();
     let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
     let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
 
@@ -544,7 +551,7 @@ fn edgezero_main(
 
     if let Some(mut ec_state) = ec_state {
         if let Some(settings) = settings_snapshot.as_deref() {
-            match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response) {
+            match apply_edgezero_ec_finalize(settings, &mut ec_state, identity, &mut response) {
                 Ok(partner_registry) => {
                     send_edgezero_response(
                         response,
@@ -563,7 +570,12 @@ fn edgezero_main(
         } else {
             match load_settings_from_config_store(&runtime_stores) {
                 Ok(settings) => {
-                    match apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response) {
+                    match apply_edgezero_ec_finalize(
+                        &settings,
+                        &mut ec_state,
+                        identity,
+                        &mut response,
+                    ) {
                         Ok(partner_registry) => {
                             send_edgezero_response(
                                 response,
@@ -636,12 +648,28 @@ fn apply_entry_point_finalize_headers(
     apply_finalize_headers(settings, geo_info.as_ref(), response);
 }
 
+/// Runs EC finalization for a routed response.
+///
+/// Collects `identity` lookups first. This must run outside the router's
+/// `block_on`: collection drives its own executor, and nesting executors
+/// panics.
 fn apply_edgezero_ec_finalize(
     settings: &Settings,
     ec_state: &mut EcFinalizeState,
+    identity: Option<IdentityLookups>,
     response: &mut HttpResponse,
 ) -> Result<PartnerRegistry, Report<TrustedServerError>> {
-    let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
+    if let Some(IdentityLookups {
+        coordinator,
+        pending,
+    }) = identity
+    {
+        let transport =
+            PlatformLookupTransport::new(&ec_state.services, settings.proxy.certificate_check);
+        let results = futures::executor::block_on(coordinator.collect(&transport, pending));
+        ec_state.ec_context.set_lookup_results(results);
+    }
+    let partner_registry = PartnerRegistry::from_ec(&settings.ec)?;
     let finalize_kv_graph = if ec_state.use_finalize_kv {
         maybe_identity_graph(settings)
     } else {

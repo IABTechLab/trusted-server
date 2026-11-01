@@ -59,6 +59,7 @@ publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 - `ec.passphrase`
 - `ec.partners[*].api_token`, when inbound identify or batch sync is used
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
+- `ec.identity_providers[*].secrets.token`, when a provider needs an API token
 - `handlers[*].password`
 - `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
 - `integrations.datadome.server_side_key_secret_name`, when protection is enabled
@@ -756,6 +757,8 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 | `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
 | `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
 | `partners`                | Array          | No       | Static partner registry entries                                         |
+| `identity_budget_ms`      | Integer        | No       | Shared time budget for identity provider lookups (default 200)          |
+| `identity_providers`      | Array          | No       | Server-side identity providers (see below)                              |
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
@@ -787,6 +790,52 @@ bidstream_enabled = true
 TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
 TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 ```
+
+### Identity providers
+
+`[[ec.identity_providers]]` entries look up a visitor's IDs from a provider's
+server on publisher page navigations. Lookups start before the origin fetch,
+share the `identity_budget_ms` budget, and are collected before the response is
+finalized. Results go into the navigation's single EC row write. A lookup that
+times out or fails leaves the row unchanged.
+
+Lookups run only for an existing or newly issued EC, only when consent allows
+EID persistence, and, when `tcf_vendor_id` is set, only with TCF vendor consent
+for that vendor.
+
+| Field             | Type    | Required | Description                                                             |
+| ----------------- | ------- | -------- | ----------------------------------------------------------------------- |
+| `id`              | String  | Yes      | Stable provider ID used in logs, metrics and KV ownership               |
+| `kind`            | String  | Yes      | Provider implementation built into this release                         |
+| `enabled`         | Boolean | No       | Whether the provider runs (default `true`)                              |
+| `endpoint`        | String  | Yes      | HTTPS lookup URL; its host must be in `allowed_domains`                 |
+| `allowed_domains` | Array   | Yes      | Hosts the provider may call                                             |
+| `sources`         | Array   | Yes      | Source domains the provider owns; each needs an `[[ec.partners]]` entry |
+| `tcf_vendor_id`   | Integer | No       | TCF vendor ID that must have vendor consent                             |
+| `secrets.token`   | String  | No       | Key in `trusted_server_secrets` for the provider's API token            |
+| `settings`        | Table   | No       | Provider-specific settings, parsed by the provider kind                 |
+
+**Example**:
+
+```toml
+[ec]
+identity_budget_ms = 200
+
+[[ec.identity_providers]]
+id = "example-provider"
+kind = "example-kind"
+endpoint = "https://ids.example.com/v1/lookup"
+allowed_domains = ["ids.example.com"]
+sources = ["ids.example.com"]
+
+[ec.identity_providers.secrets]
+token = "example_provider_token"
+```
+
+**Validation**: configuration validation fails when an enabled provider's
+`endpoint` is not HTTPS or its host is not in `allowed_domains`, when a source
+has no `[[ec.partners]]` entry, or when two enabled providers claim the same
+source. Deploy validation also rejects an empty `secrets.token` key name.
 
 ### Field Details
 

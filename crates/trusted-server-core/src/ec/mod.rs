@@ -32,6 +32,7 @@
 //! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
 //! - [`page_load`] — Single-use page-load write permit and row changes
 //! - [`write_plan`] — Plans a navigation's single row change
+//! - [`provider`] — Identity provider interface and configuration
 //! - [`coordinator`] — Server-side identity lookup coordination
 
 mod auth;
@@ -53,6 +54,7 @@ pub mod kv_types;
 pub mod page_load;
 pub mod partner;
 pub mod prebid_eids;
+pub mod provider;
 pub mod pull_sync;
 pub(crate) mod pull_sync_marker;
 pub mod rate_limiter;

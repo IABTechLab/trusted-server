@@ -7,6 +7,7 @@ members = [
     "crates/trusted-server-adapter-spin",
     "crates/trusted-server-cli",
     "crates/trusted-server-core",
+    "crates/trusted-server-identity-providers",
     "crates/trusted-server-integration-tests",
     "crates/trusted-server-js",
     "crates/trusted-server-openrtb",
@@ -121,6 +122,7 @@ toml_edit = "0.23.10"
 tower = "0.4"
 tracing = "0.1"
 trusted-server-core = { path = "crates/trusted-server-core" }
+trusted-server-identity-providers = { path = "crates/trusted-server-identity-providers" }
 trusted-server-js = { path = "crates/trusted-server-js" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }
 url = "2.5.8"
