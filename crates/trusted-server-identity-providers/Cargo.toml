@@ -14,9 +14,11 @@ doctest = false
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 bytes = { workspace = true }
 error-stack = { workspace = true }
 http = { workspace = true }
+httpdate = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
