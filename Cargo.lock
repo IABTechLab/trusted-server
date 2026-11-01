@@ -6742,10 +6742,15 @@ dependencies = [
 name = "trusted-server-identity-providers"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "error-stack",
+ "http",
  "log",
+ "serde",
+ "serde_json",
  "toml",
  "trusted-server-core",
+ "url",
 ]
 
 [[package]]
