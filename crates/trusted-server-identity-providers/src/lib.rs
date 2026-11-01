@@ -9,12 +9,17 @@
 //! Dependencies point one way: this crate depends on core, and core never
 //! depends on it.
 
+mod common;
+pub mod id5;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use error_stack::Report;
 use trusted_server_core::ec::coordinator::{ProviderCoordinator, RegisteredProvider};
-use trusted_server_core::ec::provider::{IdentityProvider, ProviderConfigError};
+use trusted_server_core::ec::provider::{
+    IdentityProvider, ProviderConfigError, ProviderKind as _, build_kind,
+};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::settings::{
@@ -23,10 +28,9 @@ use trusted_server_core::settings::{
 
 /// Whether `kind` has a registered implementation.
 ///
-/// No kinds are registered yet.
 #[must_use]
-pub fn is_registered_kind(_kind: &str) -> bool {
-    false
+pub fn is_registered_kind(kind: &str) -> bool {
+    matches!(kind, id5::Id5::KIND)
 }
 
 /// Builds the partner registry, marking the sources claimed by enabled
@@ -42,19 +46,19 @@ pub fn partner_registry(ec: &Ec) -> Result<PartnerRegistry, Report<TrustedServer
 
 /// Builds the provider for a configured `kind`.
 ///
-/// No kinds are registered yet, so every kind is rejected.
-///
 /// # Errors
 ///
 /// Returns [`ProviderConfigError::UnknownKind`] for an unregistered kind, or
 /// any error from [`trusted_server_core::ec::provider::build_kind`].
 pub fn build(
     config: &IdentityProviderConfig,
-    _secrets: &ProviderSecrets,
+    secrets: &ProviderSecrets,
 ) -> Result<Box<dyn IdentityProvider>, Report<ProviderConfigError>> {
-    let kind = config.kind();
-    Err(Report::new(ProviderConfigError::UnknownKind)
-        .attach(format!("kind `{kind}` is not registered")))
+    match config.kind() {
+        id5::Id5::KIND => build_kind::<id5::Id5>(config, secrets),
+        kind => Err(Report::new(ProviderConfigError::UnknownKind)
+            .attach(format!("kind `{kind}` is not registered"))),
+    }
 }
 
 /// Builds the coordinator for enabled providers collected before the
