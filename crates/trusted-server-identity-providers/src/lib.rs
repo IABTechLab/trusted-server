@@ -10,6 +10,7 @@
 
 mod common;
 pub mod id5;
+pub mod liveintent;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +28,7 @@ use trusted_server_core::settings::{Ec, IdentityProviderConfig, ProviderSecrets,
 ///
 #[must_use]
 pub fn is_registered_kind(kind: &str) -> bool {
-    matches!(kind, id5::Id5::KIND)
+    matches!(kind, id5::Id5::KIND | liveintent::LiveIntent::KIND)
 }
 
 /// Builds the partner registry, marking only sources claimed by enabled
@@ -52,6 +53,7 @@ pub fn build(
 ) -> Result<Box<dyn IdentityProvider>, Report<ProviderConfigError>> {
     match config.kind() {
         id5::Id5::KIND => build_kind::<id5::Id5>(config, secrets),
+        liveintent::LiveIntent::KIND => build_kind::<liveintent::LiveIntent>(config, secrets),
         kind => Err(Report::new(ProviderConfigError::UnknownKind)
             .attach(format!("kind `{kind}` is not registered"))),
     }
