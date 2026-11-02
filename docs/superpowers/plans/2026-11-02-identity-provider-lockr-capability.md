@@ -15,6 +15,10 @@
 
 **Own-cookie settings:** every cookie-reading kind takes a `cookie_names` list (UID2's `token_cookie_name` and ConnectID's `cookie_name` are renamed). Lockr names move out of them into `[settings.lockr]`.
 
+## Not ported from the reference provider
+
+- The reference captures proxied Lockr API responses: a `revoke-consent` call opts the visitor out of Lockr's sources, and token replies are mapped to sources with Lockr provenance (`inserter`, `mm`) on ID5. The framework has no response-capture hook or opt-out state, and Lockr's default ID5 key is the same `id5id` cookie Prebid writes, so a Lockr-read ID cannot be told apart for provenance. Neither is ported.
+
 ## Tasks
 
 - [ ] Add `ProviderCommon::id` in core and set it in `build_kind`.

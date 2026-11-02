@@ -25,6 +25,10 @@
 
 `uid2` declares the Lockr capability (see `2026-11-02-identity-provider-lockr-capability.md`). With `[settings.lockr] enabled = true`, the Lockr cookies (default `["__uid2_advertising_token"]`) are read last, after the identity cookie and `cookie_names`, with the raw-token parser. Lockr names already in `cookie_names` are not read twice.
 
+## Not ported from the reference provider
+
+- The reference generates a first token from a hashed email and refreshes it with the refresh token it kept from that call. Generation needs login, and refreshing with the SDK cookie's refresh token would spend the browser's single-use refresh token without a way to write the new `__uid_2` cookie back, so neither is ported.
+
 ## Tasks
 
 - [ ] Add `uid2.rs` and register the kind in `is_registered_kind` and `build`.
