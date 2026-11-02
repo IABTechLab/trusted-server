@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
+import { traceSourceDigest } from '../trace-asset-sources.mjs';
+
 const library = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const traceBuild = path.join(library, '..', 'dist', 'trace');
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -17,6 +19,9 @@ describe('versioned trace assets', () => {
     const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
     expect(manifest.schema_version).toBe(1);
     expect(manifest.source_sha256).toMatch(/^[a-f\d]{64}$/);
+    expect(manifest.source_sha256, 'should match the current trace sources and toolchain').toBe(
+      traceSourceDigest(library)
+    );
     expect(manifest.assets.map((asset) => asset.path)).toEqual([
       '/_ts/trace/assets/v1.js',
       '/_ts/trace/assets/v1.css',
