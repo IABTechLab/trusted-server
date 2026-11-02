@@ -262,9 +262,10 @@ pub(super) fn select_until(
         for index in 0..pending.len() {
             loop {
                 let previous = pending[index].buffered_bytes();
+                let was_headers = matches!(pending[index].state, Some(PendingState::Headers(_)));
                 let result = pending[index].poll();
-                let progressed =
-                    matches!(result, Ok(None)) && pending[index].buffered_bytes() > previous;
+                let progressed = matches!(result, Ok(None))
+                    && snapshot_progressed(was_headers, previous, &pending[index]);
                 match result {
                     Ok(None) if progressed => {}
                     Ok(None) => {
@@ -335,6 +336,16 @@ pub(super) fn select_until(
         }
         wait_for_progress(&pending, deadline)?;
     }
+}
+
+/// Whether a nonblocking poll that returned no response advanced `item`.
+///
+/// Arriving headers move a request into [`PendingState::Body`] without
+/// reading any bytes; that is progress, or a response that fully arrived
+/// before an expired collection would be abandoned unread.
+fn snapshot_progressed(was_headers: bool, previous_bytes: usize, item: &DeadlinePending) -> bool {
+    let entered_body = was_headers && matches!(item.state, Some(PendingState::Body { .. }));
+    entered_body || item.buffered_bytes() > previous_bytes
 }
 
 fn enforce_aggregate_budget(pending: &mut [DeadlinePending], buffered_bytes: &mut usize) {
@@ -540,6 +551,20 @@ mod tests {
             response.backend_name.as_deref(),
             Some("healthy"),
             "should preserve the unaffected provider's bid"
+        );
+    }
+
+    #[test]
+    fn snapshot_counts_arriving_headers_as_progress() {
+        let pending = DeadlinePending::from_platform(buffered_pending(Vec::new(), "example"))
+            .expect("should resume a buffered pending request");
+        assert!(
+            super::snapshot_progressed(true, 0, &pending),
+            "should keep polling a request whose headers just arrived"
+        );
+        assert!(
+            !super::snapshot_progressed(false, 0, &pending),
+            "should stop polling a body that read nothing"
         );
     }
 
