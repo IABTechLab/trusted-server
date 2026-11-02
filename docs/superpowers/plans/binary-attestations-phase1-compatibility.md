@@ -36,7 +36,7 @@ below describe #1262, not current Phase 1 implementation status.
 
 Current tool pins: Rust 1.98.1, Node 24.20.0, Fastly CLI 16.0.0, Viceroy 0.21.0;
 verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer. Rehearsals use GitHub CLI 2.102.0, Fastly CLI 16.0.0 and Viceroy 0.21.0; the carried destination spec/plan still mention GitHub CLI 2.97.0 and Fastly CLI 15.1.0. Those carried versions are unchanged.
-[Rehearsal `.9`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6364827112) passed at exact implementation SHA `149754d357901ec874eab6140e92bce3d8613085` and covers only that source. Later commits changed release inputs: `34e7e9e9f` (release workflow and Axum `main.rs`), `ab6e54936` (release build-fact and gate tests) and the main merge `afdc928a8`, all included in the fork rehearsal `.15` at `68eef902a`; `79b118858` through `5f0139b16` are covered by fork rehearsal `.22`, and the later main merge `029f20467` and the publisher availability-deadline fix are covered by no rehearsal (see [rehearsal coverage](#rehearsal-coverage-of-the-current-head)). Rehearsal `.8` remains historical evidence for its own implementation. Rehearsal `.6` at `39a769c3e` failed after immutable publication despite successful independent verification; `.7` at `7a05940e2` was cancelled before signing/publication because GitHub could not assign a macOS ARM runner. The compatibility audit retains those failed outcomes.
+[Rehearsal `.9`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6364827112) passed at exact implementation SHA `149754d357901ec874eab6140e92bce3d8613085` and covers only that source. Later commits changed release inputs: `34e7e9e9f` (release workflow and Axum `main.rs`), `ab6e54936` (release build-fact and gate tests) and the main merge `afdc928a8`, all included in the fork rehearsal `.15` at `68eef902a`; `79b118858` through `5f0139b16` are covered by fork rehearsal `.22`, and the later main merges (`029f20467` and the one carrying #1406) and the publisher availability-deadline fix are covered by no rehearsal (see [rehearsal coverage](#rehearsal-coverage-of-the-current-head)). Rehearsal `.8` remains historical evidence for its own implementation. Rehearsal `.6` at `39a769c3e` failed after immutable publication despite successful independent verification; `.7` at `7a05940e2` was cancelled before signing/publication because GitHub could not assign a macOS ARM runner. The compatibility audit retains those failed outcomes.
 
 Slice 2.3 immutable build facts are reused from introducing commit
 `bfb697404551a28217af8906024506095bcd9559` and revision
@@ -348,8 +348,10 @@ were first rehearsed by `.22`:
 - `5f0139b16`, a merge of main (CI, adapter, core, CLI and JS sources).
 
 Rehearsal `.22` covers source `5f0139b167cd0619cccd9563e8aadca4436281ae`.
-Subsequent merge `029f20467` changed release binary inputs, including Cargo
-dependencies, adapter implementations, auction deadlines and cookie forwarding.
+Subsequent merges of main changed release binary inputs: `029f20467` (Cargo
+dependencies, adapter implementations, auction deadlines and cookie forwarding)
+and the later merge carrying #1406 (Lockr API routing in the JS bundle compiled
+into the binaries).
 A later review response bounds the publisher's release-attestation availability
 reads, proof fetches and their retries by the 60-second availability deadline
 in `scripts/release/publish.mjs`. The release workflows are unchanged, but `.22`

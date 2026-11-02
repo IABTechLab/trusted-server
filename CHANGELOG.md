@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Attested release binaries report `x-ts-version` as the full 40-character source commit; deploy-pipeline builds keep the tag, branch or short-commit value described below. Axum supports runtime `EDGEZERO__ADAPTER__HOST` and primary `EDGEZERO__ADAPTER__PORT` (legacy `PORT` must agree when both are set) binding with a loopback default, and refuses to start on port `0` or an invalid value instead of falling back.
 - **Breaking:** `ts --version` now prints `ts package=<version> source=<commit> target=<triple> variant=default` instead of `ts <version>`. Update scripts that parse the old output.
+- The Lockr browser module no longer polls for private SDK state or mutates its API host, removing the "Lockr SDK not detected" timeout warning (#1247). Root-relative Lockr XHR API requests and rewritten SDK URLs now stay on the page origin even with an external `<base href>`. Custom or unreplaced legacy SDKs that relied on the removed host rewrite must route their own API calls through `/integrations/lockr/api`; `rewrite_sdk = false` leaves static SDK tags unchanged but does not disable dynamic interception. See the [Lockr migration guide](docs/guide/integrations/lockr.md#migration-from-the-sdk-host-shim).
 - Auction response collection now bounds network waiting by `[auction].timeout_ms`
   measured from dispatch, including delayed headers and trickling bodies on all
   adapters. Complete available responses survive a slow publisher origin;
