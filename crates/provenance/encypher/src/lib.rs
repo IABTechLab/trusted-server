@@ -377,6 +377,56 @@ fn require_claimed_public_host(config: &EncypherConfig) -> Result<(), Report<Tru
     }))
 }
 
+/// Whether `[asset-cache]` selects a module, which then holds reader copies
+/// keyed by the host and scheme the reader asked.
+fn selects_asset_cache(settings: &Settings) -> bool {
+    settings
+        .sections
+        .section(trusted_server_core::asset_cache::MODULE_TYPE)
+        .is_some_and(|modules| !modules.selected().is_empty())
+}
+
+/// With an asset cache selected, requires an `async_prepared` table's
+/// `loopback_url` to be `https://<public_host>`, so a snapshot reads the
+/// cached copy a reader would get, under the host and scheme the cache keys
+/// it by. A trailing `/` and the default port `:443` are the only other
+/// spellings admitted, and the registered origin drops both, so a snapshot
+/// addresses exactly what a reader does. Synchronous mode, and an
+/// `async_prepared` deployment with no asset cache, keep the general origin
+/// rules, including local `http` on a loopback host.
+fn require_public_snapshot_origin(
+    settings: &Settings,
+    config: &mut EncypherConfig,
+) -> Result<(), Report<TrustedServerError>> {
+    if config.execution != preparation::Execution::AsyncPrepared || !selects_asset_cache(settings) {
+        return Ok(());
+    }
+    let Some(preparation) = config.preparation.as_mut() else {
+        return Ok(());
+    };
+    let written = preparation.loopback_url.as_str();
+    let origin = written.strip_suffix('/').unwrap_or(written);
+    let authority = origin.strip_prefix("https://");
+    if authority.is_some_and(|authority| {
+        authority == preparation.public_host
+            || authority.strip_suffix(":443") == Some(preparation.public_host.as_str())
+    }) {
+        preparation
+            .loopback_url
+            .truncate("https://".len() + preparation.public_host.len());
+        return Ok(());
+    }
+    Err(Report::new(TrustedServerError::Settings {
+        message: format!(
+            "[provenance.encypher.preparation] loopback_url must be `https://{}` while \
+             [asset-cache] selects a module: snapshots read through it, and the asset cache \
+             keys each held copy by the host and scheme a reader asked, so any other origin \
+             would prepare content readers are not served",
+            preparation.public_host
+        ),
+    }))
+}
+
 /// What the platform the module registers on can do for a reader's hint,
 /// as its adapter declared before serving.
 #[derive(Debug, Clone, Copy)]
@@ -476,12 +526,13 @@ fn require_scoped_stylesheet_entries(
 
 /// The module's settings when a section selects it.
 fn config(settings: &Settings) -> Result<Option<EncypherConfig>, Report<TrustedServerError>> {
-    let Some(config) = settings.module_config::<EncypherConfig>(MODULE)? else {
+    let Some(mut config) = settings.module_config::<EncypherConfig>(MODULE)? else {
         return Ok(None);
     };
     require_an_entry(settings)?;
     require_scoped_stylesheet_entries(settings)?;
     require_claimed_public_host(&config)?;
+    require_public_snapshot_origin(settings, &mut config)?;
     Ok(Some(config))
 }
 

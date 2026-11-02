@@ -113,20 +113,30 @@ pub struct DocumentItems {
     pub refused: Vec<&'static str>,
 }
 
-/// The text item of `article` in `html`.
+/// The identity of an article, without constructing an owned signing request.
 #[must_use]
-pub(crate) fn text_item(context: &ItemContext<'_>, html: &str, article: &Article) -> TextItem {
-    let title = text::title_from_range(html, article.title_range);
-    let identity = TextIdentity {
+pub(crate) fn text_identity(
+    context: &ItemContext<'_>,
+    article: &Article,
+    document_title: Option<&str>,
+) -> String {
+    TextIdentity {
         credential_context: context.credential_context,
         policy_digest: context.policy_digest,
         page_url: context.page_url,
         variant: context.variant,
         text: &article.text,
-        document_title: title.as_deref(),
+        document_title,
         boundary_selector: &article.boundary.selector,
     }
-    .digest();
+    .digest()
+}
+
+/// The text item of `article` in `html`.
+#[must_use]
+pub(crate) fn text_item(context: &ItemContext<'_>, html: &str, article: &Article) -> TextItem {
+    let title = text::title_from_range(html, article.title_range);
+    let identity = text_identity(context, article, title.as_deref());
     TextItem {
         identity,
         request: TextSignRequest {

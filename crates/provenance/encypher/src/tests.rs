@@ -1819,6 +1819,185 @@ fn async_mode_needs_its_table_a_claimed_public_host_and_a_real_hint_lifetime() {
     );
 }
 
+/// An asset cache module a build links beside this one, under this name.
+const HELD_COPIES: &str = "asset-cache.held-copies";
+
+/// An asset cache that leaves every file to its origin: these tests need
+/// only the registry to take it once `[asset-cache]` selects it.
+struct HeldCopies;
+
+#[async_trait::async_trait(?Send)]
+impl trusted_server_core::asset_cache::AssetCacheModule for HeldCopies {
+    async fn answer(
+        &self,
+        _services: &RuntimeServices,
+        _file: trusted_server_core::asset_cache::AssetFile<'_>,
+    ) -> trusted_server_core::asset_cache::AssetAnswer {
+        trusted_server_core::asset_cache::AssetAnswer::AskOrigin
+    }
+}
+
+fn held_copies_register(
+    _settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    Ok(Some(
+        IntegrationRegistration::builder("held_copies")
+            .with_asset_cache_module(HELD_COPIES, Arc::new(HeldCopies))
+            .build(),
+    ))
+}
+
+fn held_copies_validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    Ok(settings.selects_module(HELD_COPIES))
+}
+
+/// The builders of a deployment that links this module and an asset cache.
+fn linked_with_an_asset_cache() -> [IntegrationBuilder; 2] {
+    [
+        builder(),
+        IntegrationBuilder::new(
+            "held_copies",
+            "held-copies",
+            held_copies_register,
+            held_copies_validate,
+        )
+        .with_module_name(HELD_COPIES),
+    ]
+}
+
+/// A placed deployment in `execution` whose preparation table reads
+/// snapshots from `loopback_url`, with `[asset-cache]` selecting the linked
+/// asset cache when `cached`.
+fn snapshot_origin_settings(
+    execution: &str,
+    public_host: &str,
+    loopback_url: &str,
+    token: &str,
+    cached: bool,
+) -> Settings {
+    let table = format!(
+        "api_base_url = \"https://api.example.com\"\ndomain = \"publisher.example.com\"\n\
+         worker_token = \"{token}\"\nexecution = \"{execution}\"\n\n\
+         [provenance.encypher.preparation]\n\
+         worker_url = \"https://prep.publisher.example.com\"\n\
+         loopback_url = \"{loopback_url}\"\ndeployment_id = \"test\"\n\
+         public_host = \"{public_host}\"\n\
+         signal_secret = \"signal-secret-for-tests\"\n\
+         publication_secret = \"{PUBLICATION}\"\nroutes = [\"/news/\"]\n"
+    );
+    let mut settings = page_settings(&module_settings(&table, true));
+    if cached {
+        settings.select_module("asset-cache", HELD_COPIES);
+    }
+    settings
+}
+
+/// Whether config validation, the module's registration and the registry an
+/// adapter builds at startup each admit `settings`.
+fn admitted_everywhere(settings: &Settings) -> [bool; 3] {
+    [
+        validate(settings).is_ok(),
+        register(settings).is_ok(),
+        IntegrationRegistry::with_registrations(settings, &linked_with_an_asset_cache()).is_ok(),
+    ]
+}
+
+#[test]
+fn with_an_asset_cache_async_snapshots_must_read_the_public_https_origin() {
+    const APEX: &str = "publisher.example.com";
+    const WWW: &str = "www.publisher.example.com";
+    for (public_host, loopback_url) in [
+        (APEX, "https://publisher.example.com"),
+        (APEX, "https://publisher.example.com/"),
+        (APEX, "https://publisher.example.com:443"),
+        (APEX, "https://publisher.example.com:443/"),
+        (WWW, "https://www.publisher.example.com"),
+        (WWW, "https://www.publisher.example.com:443/"),
+    ] {
+        let settings =
+            snapshot_origin_settings("async_prepared", public_host, loopback_url, TOKEN, true);
+        assert_eq!(
+            admitted_everywhere(&settings),
+            [true; 3],
+            "{loopback_url} is the reader origin of {public_host}"
+        );
+        assert!(
+            register(&settings).expect("should register").is_some(),
+            "{loopback_url} should register the module"
+        );
+        let admitted = config(&settings)
+            .expect("should admit the public origin")
+            .expect("should select the module");
+        assert_eq!(
+            admitted
+                .preparation
+                .expect("should retain preparation")
+                .loopback_url,
+            format!("https://{public_host}"),
+            "equivalent origins must normalize to one cache-key authority"
+        );
+    }
+
+    for (public_host, loopback_url) in [
+        (APEX, "http://127.0.0.1:8181"),
+        (APEX, "http://localhost:8181"),
+        (APEX, "http://[::1]:8181"),
+        (APEX, "http://publisher.example.com"),
+        (APEX, "https://publisher.example.com:8443"),
+        (APEX, "https://www.publisher.example.com"),
+        (WWW, "https://publisher.example.com"),
+        (APEX, "https://edge.publisher.example.com"),
+        (APEX, "https://cdn.other.example"),
+        (APEX, "https://user@publisher.example.com"),
+        (APEX, "https://publisher.example.com/news"),
+        (APEX, "https://publisher.example.com/?edition=uk"),
+        (APEX, "https://publisher.example.com#top"),
+    ] {
+        for token in [TOKEN, ""] {
+            let settings =
+                snapshot_origin_settings("async_prepared", public_host, loopback_url, token, true);
+            assert_eq!(
+                admitted_everywhere(&settings),
+                [false; 3],
+                "{loopback_url} would snapshot past the reader cache of {public_host} \
+                 (worker token {token:?})"
+            );
+        }
+    }
+}
+
+#[test]
+fn local_snapshot_origins_still_start_without_an_asset_cache_or_async_preparation() {
+    for (execution, cached) in [
+        ("async_prepared", false),
+        ("synchronous", true),
+        ("synchronous", false),
+    ] {
+        for loopback_url in [
+            "http://127.0.0.1:8181",
+            "http://localhost:8181",
+            "https://edge.publisher.example.com:8443",
+        ] {
+            let settings = snapshot_origin_settings(
+                execution,
+                "publisher.example.com",
+                loopback_url,
+                TOKEN,
+                cached,
+            );
+            assert_eq!(
+                admitted_everywhere(&settings),
+                [true; 3],
+                "{execution} with {loopback_url}, asset cache selected: {cached}"
+            );
+            assert!(
+                register(&settings).expect("should register").is_some(),
+                "{execution} with {loopback_url} should register the module"
+            );
+        }
+    }
+}
+
 fn snapshot_request(capability: Option<&str>) -> Request<EdgeBody> {
     let mut builder = Request::builder()
         .method(Method::GET)

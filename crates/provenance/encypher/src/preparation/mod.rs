@@ -53,7 +53,10 @@ pub struct PreparationConfig {
     #[validate(custom(function = validate_service_url))]
     pub worker_url: String,
     /// The origin the delivery instance reads its own snapshots from: its
-    /// public `https` address, or `http` on a loopback host.
+    /// public `https` address, or `http` on a loopback host. While
+    /// `[asset-cache]` selects a module, exactly `https://<public_host>`, with
+    /// at most a trailing `/` or the default port `:443`, so a snapshot reads
+    /// the copy the asset cache holds for readers.
     #[validate(custom(function = validate_service_url))]
     pub loopback_url: String,
     /// The deployment's identifier, which every message carries.

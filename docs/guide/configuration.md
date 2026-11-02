@@ -2632,7 +2632,7 @@ values = ["uk", "us"]
 | Field                | Default  | Contract                                                                                                                                      |
 | -------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `worker_url`         | Required | Worker origin: `https`, or `http` on `127.0.0.1`, `localhost` or `[::1]`; no path, query or user information. Receives hints and source reads |
-| `loopback_url`       | Required | This deployment's own public origin, same rules. Snapshots are read through it, so they take the reader pipeline                              |
+| `loopback_url`       | Required | Own public origin, same rules, and `https://<public_host>` with an asset cache (below). Snapshots read through it take the reader pipeline    |
 | `deployment_id`      | Required | 1 to 64 lower-case letters, digits or `-`; equal to the worker's                                                                              |
 | `public_host`        | Required | `domain` or its `www.` name. Every identity names it, so a reader on another host finds no result                                             |
 | `signal_secret`      | Required | Secret-store entry name. Its value authorizes reader hints only                                                                               |
@@ -2644,7 +2644,20 @@ values = ["uk", "us"]
 
 `async_prepared` without the table, a `public_host` outside the claim, or
 `reader_trigger = true` on an adapter that offers neither a timer nor an
-after-response lifetime refuses startup. Results and retirement markers live
+after-response lifetime refuses startup.
+
+When `[asset-cache]` selects a module, `loopback_url` must be exactly
+`https://<public_host>`. The asset cache keeps each reader copy under the host
+and scheme the reader asked, so a snapshot read through any other origin
+would miss the copy readers get and prepare content they are not served. A
+trailing `/` or the default port, as in `https://publisher.example.com:443/`,
+is accepted and read as `https://publisher.example.com`. Any other host, `http`,
+another port, user information, a path, a query or a fragment refuses
+`ts config validate` and startup. Synchronous mode, and `async_prepared`
+without an asset cache, keep the general rule above, so local development can
+still read snapshots from `http://127.0.0.1:<port>`.
+
+Results and retirement markers live
 in the runtime KV store as `encypher:prep:v1:result:<identity>` and
 `encypher:prep:v1:retired:<identity>`, so the delivery instance needs runtime
 KV (`TRUSTED_SERVER_KV_PATH` on Axum). The module also serves

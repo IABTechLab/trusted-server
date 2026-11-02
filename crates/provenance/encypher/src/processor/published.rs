@@ -40,7 +40,7 @@ use crate::INTEGRATION_ID;
 use crate::api;
 use crate::media_api::{canonical_media_type, sha256_hex, valid_origin_host};
 use crate::preparation::items::{
-    DocumentKind, EmbeddedItem, ItemContext, embedded_edit, embedded_items, text_item,
+    DocumentKind, EmbeddedItem, ItemContext, embedded_edit, embedded_items, text_identity,
 };
 use crate::preparation::protocol::{
     Carrier, ItemKind, LargeLocator, MediaIdentity, ObservedItem, PREPARATION_PROTOCOL,
@@ -48,6 +48,7 @@ use crate::preparation::protocol::{
     marker_key, result_key,
 };
 use crate::preparation::{Execution, PreparationConfig};
+use crate::text;
 
 /// What one lookup found.
 enum Lookup {
@@ -163,8 +164,9 @@ impl Signer {
             };
             if let Some(policy_digest) = policy_digest {
                 let context = self.item_context(&page_url, &policy_digest, lookup_variant);
-                let item = text_item(&context, document, article);
-                match self.published(kv, &item.identity, work).await {
+                let title = text::title_from_range(document, article.title_range);
+                let identity = text_identity(&context, article, title.as_deref());
+                match self.published(kv, &identity, work).await {
                     Ok(Lookup::Found(PublishedResult::Text {
                         plan,
                         manifest_url,
@@ -192,7 +194,7 @@ impl Signer {
                         log_outcome(false, Reason::NotPrepared);
                         misses.push(ObservedItem {
                             kind: ItemKind::Text,
-                            identity: item.identity,
+                            identity,
                         });
                     }
                     Err(reason) => log_outcome(false, reason),
