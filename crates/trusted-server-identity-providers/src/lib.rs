@@ -9,6 +9,7 @@
 //! depends on it.
 
 mod common;
+pub mod connectid;
 pub mod id5;
 pub mod liveintent;
 pub mod liveramp;
@@ -31,7 +32,10 @@ use trusted_server_core::settings::{Ec, IdentityProviderConfig, ProviderSecrets,
 pub fn is_registered_kind(kind: &str) -> bool {
     matches!(
         kind,
-        id5::Id5::KIND | liveintent::LiveIntent::KIND | liveramp::LiveRamp::KIND
+        id5::Id5::KIND
+            | liveintent::LiveIntent::KIND
+            | liveramp::LiveRamp::KIND
+            | connectid::ConnectId::KIND
     )
 }
 
@@ -59,6 +63,7 @@ pub fn build(
         id5::Id5::KIND => build_kind::<id5::Id5>(config, secrets),
         liveintent::LiveIntent::KIND => build_kind::<liveintent::LiveIntent>(config, secrets),
         liveramp::LiveRamp::KIND => build_kind::<liveramp::LiveRamp>(config, secrets),
+        connectid::ConnectId::KIND => build_kind::<connectid::ConnectId>(config, secrets),
         kind => Err(Report::new(ProviderConfigError::UnknownKind)
             .attach(format!("kind `{kind}` is not registered"))),
     }
