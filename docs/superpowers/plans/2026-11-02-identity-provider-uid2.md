@@ -11,7 +11,7 @@
 ## Cookies
 
 - `identity_cookie_name` (default `__uid_2`): percent-encoded JSON from the UID2 SDK. Only `advertising_token` and `identity_expires` (milliseconds) are deserialized. `refresh_token`, `refresh_from`, `refresh_expires` and `refresh_response_key` are never read, so they are never stored.
-- `token_cookie_name` (default `__uid2_advertising_token`): Prebid's raw token, read only when the identity cookie yields nothing.
+- `cookie_names` (default `["__uid2_advertising_token"]`): cookies holding a raw token, such as Prebid's, read in order only when the identity cookie yields nothing.
 - A missing token or expiry, a blank or opt-out token, or malformed JSON reads as no ID.
 
 ## Stored ID
@@ -23,7 +23,7 @@
 
 ## Lockr
 
-Lockr AIM writes the UID2 token into a cookie named by its own configuration. Set `token_cookie_name` to that name. Lockr-delivered LiveRamp envelopes are handled by the `liveramp` kind's `cookie_names`, so no separate Lockr kind exists. Lockr-delivered ID5 cookies are not read; the `id5` kind resolves ID5 by lookup.
+Lockr AIM writes the UID2 token into a cookie named by its own configuration. List that name in `cookie_names`. Lockr-delivered LiveRamp envelopes are handled by the `liveramp` kind's `cookie_names`, so no separate Lockr kind exists. Lockr-delivered ID5 cookies are not read; the `id5` kind resolves ID5 by lookup.
 
 ## Tasks
 
