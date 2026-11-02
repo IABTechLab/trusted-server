@@ -38,24 +38,27 @@ use trusted_server_core::test_support::nextjs_auction;
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
 fn test_settings() -> Settings {
-    Settings::from_toml(
+    let mut settings: Settings = toml::from_str(
         r#"
             [[handlers]]
             path = "^/_ts/admin"
             username = "admin"
-            password = "admin-pass"
 
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
             origin_url = "https://origin.test-publisher.example.com"
-            proxy_secret = "parity-test-proxy-secret"
 
             [ec]
-            passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
-    .expect("should parse parity test settings")
+    .expect("should parse parity test settings");
+    settings.handlers[0].password = "admin-pass".to_owned().into();
+    settings.publisher.proxy_secret = "parity-test-proxy-secret".to_owned().into();
+    settings.ec.passphrase = "test-secret-key-32-bytes-minimum".to_owned().into();
+    trusted_server_core::test_support::secret_bindings::install_test_bindings(&mut settings)
+        .expect("should load parity credentials through the production compiler");
+    settings
 }
 
 /// Build the Axum adapter router from the shared test settings.

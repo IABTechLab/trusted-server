@@ -341,6 +341,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            api_token_enabled: true,
             api_token: Some(Redacted::new(format!(
                 "token-{source_domain}-32-bytes-minimum-value"
             ))),
@@ -350,15 +351,19 @@ mod tests {
             pull_sync_allowed_domains: vec![format!("sync.{source_domain}")],
             pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
-            ts_pull_token: Some(Redacted::new("pull-token".to_owned())),
+            ts_pull_token: Some(Redacted::new(
+                "fictional-pull-token-with-32-bytes-minimum".to_owned(),
+            )),
         }
     }
 
     fn settings_and_registry(domains: &[&str]) -> (Settings, PartnerRegistry) {
         let mut settings = create_test_settings();
         settings.ec.partners = domains.iter().map(|domain| pull_partner(domain)).collect();
-        let registry = PartnerRegistry::from_config(&settings.ec.partners)
-            .expect("should build pull partner registry");
+        crate::test_support::secret_bindings::install_test_bindings(&mut settings)
+            .expect("should resolve fixture bindings");
+        let registry =
+            PartnerRegistry::from_settings(&settings).expect("should build pull partner registry");
         (settings, registry)
     }
 

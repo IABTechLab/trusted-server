@@ -16,7 +16,9 @@ use http::{HeaderMap, HeaderValue};
 use testcontainers::runners::SyncRunner as _;
 use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
 
-use crate::common::config::integration_app_config_envelope_with_trace;
+use crate::common::config::{
+    app_config_native_fixtures, fixture_settings, integration_app_config_envelope_with_trace,
+};
 use crate::common::runtime::TestError;
 use crate::common::runtime::{
     RuntimeEnvironment as _, RuntimeProcess, RuntimeProcessHandle, origin_port, wasm_binary_path,
@@ -138,7 +140,13 @@ fn exercise_case(runtime: TraceRuntime, enabled: bool, auth_pattern: Option<&str
     let envelope = if let Some(pattern) = auth_pattern {
         let mut envelope: BlobEnvelope =
             serde_json::from_str(&envelope).expect("should parse fixture envelope");
-        envelope.data["handlers"].as_array_mut().expect("should retain handler array").insert(0,serde_json::json!({"path":pattern,"username":"example-user","password":"integration_admin_password"}));
+        envelope.data["handlers"]
+            .as_array_mut()
+            .expect("should retain handler array")
+            .insert(
+                0,
+                serde_json::json!({"path":pattern,"username":"example-user"}),
+            );
         let envelope = BlobEnvelope::new(envelope.data, envelope.generated_at);
         envelope
             .verify()
@@ -173,11 +181,7 @@ fn with_trace_runtime(
                 .expect("should read baseline Wrangler template");
             let binding = serde_json::to_string(&serde_json::json!({CONFIG_BLOB_KEY:envelope}))
                 .expect("should serialize trace binding");
-            let config = template.replace(
-                "TRUSTED_SERVER_CONFIG = \"{}\"",
-                &format!("TRUSTED_SERVER_CONFIG = '''{binding}'''"),
-            );
-            fs::write(fixture.0.join("wrangler.toml"), config)
+            fs::write(fixture.0.join("wrangler.ci.toml"), template)
                 .expect("should write isolated Wrangler config");
             temp_env::with_vars(
                 [
@@ -186,7 +190,10 @@ fn with_trace_runtime(
                 ],
                 || {
                     let process = CloudflareWorkers
-                        .spawn_with_readiness(wait_for_trace_fixture_ready)
+                        .spawn_with_config_json_and_readiness(
+                            &binding,
+                            wait_for_trace_fixture_ready,
+                        )
                         .expect("should spawn isolated Cloudflare trace runtime");
                     check(&process.base_url);
                 },
@@ -194,6 +201,14 @@ fn with_trace_runtime(
         }
         TraceRuntime::Fastly => {
             let template = include_str!("../../fixtures/configs/viceroy-template.toml");
+            let blocks = trusted_server_integration_tests::fastly_fixture_blocks(
+                &fixture_settings(envelope).expect("should parse exact Fastly fixture"),
+            )
+            .expect("should compile exact Fastly native credentials");
+            let template = template.replace(
+                "# Populated by generate-viceroy-config using the production binding compiler.",
+                &blocks,
+            );
             let config=template.replace("        # GENERATED_TRUSTED_SERVER_CONFIG_STORES",&format!("        [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}]\n            format = \"inline-toml\"\n        [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}.contents]\n            {CONFIG_BLOB_KEY} = '''{envelope}'''"));
             let path = fixture.0.join("viceroy.toml");
             fs::write(&path, config).expect("should write isolated Viceroy config");
@@ -218,38 +233,18 @@ fn with_trace_runtime(
             if let Some(origin) = publisher_origin {
                 config.push_str(&format!("allowed_outbound_hosts = [{origin:?}]\n"));
             }
-            let secrets = [
-                (
-                    "integration_admin_password",
-                    "integration-admin-password-32-bytes-ok",
-                ),
-                (
-                    "integration_proxy_secret",
-                    "integration-test-proxy-secret-32-bytes-ok",
-                ),
-                (
-                    "integration_ec_passphrase",
-                    "integration-test-ec-secret-padded-32",
-                ),
-                (
-                    "integration_partner_token_alpha",
-                    "integration-test-token-alpha-32-bytes-ok",
-                ),
-                (
-                    "integration_partner_token_bravo",
-                    "integration-test-token-bravo-32-bytes-ok",
-                ),
-            ];
+            let secrets = app_config_native_fixtures(envelope, "spin")
+                .expect("should compile exact Spin native credentials");
             config.push_str("[variables]\n");
-            for (name, value) in secrets {
+            for secret in &secrets {
                 config.push_str(&format!(
-                    "{} = {{ default = {value:?} }}\n",
-                    spin_secret_variable(name)
+                    "{} = {{ default = {:?} }}\n",
+                    secret.native.native_name, secret.value
                 ));
             }
             config.push_str("[component.trace.variables]\n");
-            for (name, _) in secrets {
-                let variable = spin_secret_variable(name);
+            for secret in &secrets {
+                let variable = &secret.native.native_name;
                 config.push_str(&format!("{variable} = \"{{{{ {variable} }}}}\"\n"));
             }
             let manifest = fixture.0.join("spin.toml");
@@ -511,18 +506,6 @@ fn check_policy_matrix(
             "should not create diagnostics cookies for ordinary native shortcut"
         );
     }
-}
-
-fn spin_secret_variable(key: &str) -> String {
-    let mut output = String::from("v_trusted_x5fserver_x5fsecrets_v_");
-    for byte in key.bytes() {
-        if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
-            output.push(char::from(byte));
-        } else {
-            output.push_str(&format!("_x{byte:02x}"));
-        }
-    }
-    output
 }
 
 fn copy_directory(source: &Path, destination: &Path) {

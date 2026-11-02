@@ -55,27 +55,26 @@ Missing required field: publisher.domain
 
 **Cause:** Required configuration field not provided
 
-**Solution:** Add the missing field to `trusted-server.toml`. The secret below
-is an intentionally rejected placeholder; replace it with `openssl rand -base64 32`
-before validation.
+**Solution:** Add the missing ordinary field to `trusted-server.toml`. Provision
+required app credentials separately through a reviewed plan.
 
 ```toml
 [publisher]
-domain = "your-publisher-domain.com"
-origin_url = "https://origin.your-publisher-domain.com"
-proxy_secret = "publisher_proxy_secret"
+domain = "example.com"
+origin_url = "https://origin.example.com"
 ```
 
-`proxy_secret` names an entry in the Trusted Server secret store. Provision a
-high-entropy value under `publisher_proxy_secret`; do not put that value in the
-TOML file.
+Provision `publisher.proxy` through [the credential workflow](./secrets).
+Do not put a value, reference label, or generated key in app config.
 
 **Required Fields:**
 
 - `publisher.domain`
 - `publisher.origin_url`
-- `publisher.proxy_secret`
-- `ec.passphrase`
+- An admin-covering handler path and username
+
+The implicit `publisher.proxy`, `ec.passphrase`, and each `handler.password`
+binding must also be provisioned. They are not config properties.
 
 ---
 
@@ -149,22 +148,11 @@ Failed to generate EC ID: HMAC error
 
 **Solution:**
 
-1. Ensure `passphrase` names a secret-store entry in `trusted-server.toml`:
-
-```toml
-[ec]
-passphrase = "ec_passphrase"
-```
-
-2. If using a typed CLI environment override, set the key name rather than the
-   passphrase value:
-
-```bash
-TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
-```
-
-3. Provision a high-entropy value of at least 32 characters under
-   `ec_passphrase` in the Trusted Server secret store.
+1. Generate and review the current binding plan.
+2. Provision the implicit `ec.passphrase` role in the mapped native store.
+3. Use a high-entropy value of at least 32 bytes and recreate state.
+4. Do not add a passphrase property or environment overlay. Missing enabled
+   bindings fail closed. See [provisioning troubleshooting](./secrets#checks-rotation-and-troubleshooting).
 
 ---
 
@@ -197,11 +185,11 @@ manually named static Fastly backends.
 Invalid tstoken signature
 ```
 
-**Cause:** URL was modified after signing, or proxy_secret mismatch
+**Cause:** URL was modified after signing, or a proxy credential mismatch
 
 **Solution:**
 
-1. Verify `publisher.proxy_secret` matches across environments
+1. Verify the intended `publisher.proxy` credential is loaded in the selected environment
 2. Don't manually modify signed URLs
 3. Use `/first-party/sign` endpoint to generate new signatures
 4. Check for URL encoding issues

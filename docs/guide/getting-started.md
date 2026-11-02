@@ -63,8 +63,24 @@ ts config push --adapter fastly --local --yes --no-diff
 fastly compute serve
 ```
 
-The local manifest provides public development-only values for the starter
-config's three secret references. Do not reuse them outside local development.
+The local manifest must provide fictional values at the compiler-generated keys
+for the starter config's `handler.password`, `publisher.proxy`, and
+`ec.passphrase` contexts. Legacy key labels no longer work. Use
+`./scripts/smoke-fastly.sh` for the isolated fixture path, and verify the checked-in
+fixtures match your exact handler regex/username before serving. Do not reuse
+local values outside development. Fastly `secrets plan` resolves provider
+resources; it is not an offline Viceroy provisioning command. For local fictional
+fixtures only, an offline Axum plan uses the same core keys:
+
+```bash
+ts secrets plan --adapter axum --app-config trusted-server.toml --no-env --out bindings-local.json
+jq -r '.entries[].compiled.key' bindings-local.json
+```
+
+Use these keys for fictional values in the isolated Viceroy
+`[local_server.secret_stores.trusted_server_secrets]` fixture. An Axum plan does
+not authorize Fastly `set`, resolve Fastly resources, or replace a reviewed
+Fastly plan. Do not copy real credentials into local fixtures.
 The server will be available at `http://localhost:7676`.
 
 ### Option B — Axum dev server
@@ -90,11 +106,16 @@ export TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG="$(
   jq -r '.trusted_server_config' .edgezero/local-config-trusted_server_config.json
 )"
 
-# Populate the three secret references from the starter config for this shell.
-# Use stable values only if you need existing proxy URLs or EC IDs to remain valid.
-export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET="$(openssl rand -base64 32)"
-export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE="$(openssl rand -base64 32)"
-export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD="$(openssl rand -base64 32)"
+# Generate exact names for this config. Review every purpose/context first.
+ts secrets plan --adapter axum --app-config trusted-server.toml --no-env --out bindings-axum.json
+set +x
+while IFS= read -r name; do
+  # Fictional local values only. Use protected input for existing credentials.
+  value="$(openssl rand -base64 32)"
+  export "$name=$value"
+  unset value
+done < <(jq -r '.entries[].native.native_name' bindings-axum.json | sort -u)
+ts secrets check --adapter axum --app-config trusted-server.toml --no-env --plan bindings-axum.json
 
 # Build and start the dev server in the same shell.
 cargo run -p trusted-server-adapter-axum
@@ -108,7 +129,7 @@ The server will be available at `http://localhost:8787`. Set `PORT=<port>` befor
 | Purpose            | Pattern                               | Example                                                               |
 | ------------------ | ------------------------------------- | --------------------------------------------------------------------- |
 | Config store value | `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` | `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG=…` |
-| Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PROXY_KEY=…`            |
+| Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | Generated `native_name` from the Axum plan                            |
 
 The repeated `TRUSTED_SERVER_CONFIG` segments in the example are intentional:
 `TRUSTED_SERVER_CONFIG_` is the adapter prefix, followed by the resolved store
@@ -123,8 +144,8 @@ key. The local JSON filename still uses the logical store ID, even with a
 physical-name override.
 
 The config-store value is the verified app-config blob. Secret-store values are
-looked up by the key names in that blob. Store names and key names are uppercased
-with hyphens, dots, and spaces replaced by underscores. The quick-start exports
+looked up only at context-derived generated identities, never names from the
+blob. The plan renderer supplies the actual native environment names. The quick-start exports
 ephemeral secret-store values only into the current shell; do not put secret
 values in the TOML config, config-store blob, or a source-controlled environment
 file.
@@ -169,7 +190,7 @@ ts audit generate https://publisher.example
 
 The audit command writes `js-assets.toml` plus a draft `trusted-server.toml`.
 The draft includes disabled JS Asset Proxy candidates for detected third-party
-scripts. Review it, replace placeholders with stable secret key names, and enable
+scripts. Review it, keep credential properties absent, provision generated bindings, and enable
 only the asset proxy entries you want to serve or block. Then validate it.
 
 Edit `trusted-server.toml` to configure:
@@ -180,7 +201,7 @@ Edit `trusted-server.toml` to configure:
 - KV store mappings;
 - EC configuration;
 - consent settings (`[gdpr]`); and
-- stable key names for `trusted_server_secrets`.
+- a reviewed generated binding plan for the selected deployment.
 
 Do not put a Prebid Server URL or server bidder list under
 `[integrations.prebid]`, and do not put APS account/endpoint/timeout fields under
@@ -188,7 +209,9 @@ Do not put a Prebid Server URL or server bidder list under
 fields and `profile_config`.
 
 Before the first push, provision the physical store mapped from logical
-`trusted_server_secrets` with the credential values referenced by the config.
+`trusted_server_secrets` with raw values at the generated identities from a
+reviewed plan. Follow [Provision app credentials](./secrets); TS does not create
+recipient-side tokens.
 On Fastly, `ts_secrets` is the documented example physical name. Then validate
 and push:
 
@@ -202,7 +225,8 @@ mandatory target-aware fan-out and backend-name validation at startup. The
 EdgeZero callback needed for target-aware pre-write push validation is not yet
 available in this tree, so startup remains the final target gate.
 
-Restart or redeploy instances after secret rotation. See
+Recreate state after secret rotation. New keys do not revoke retired contexts;
+follow [migration and retirement](./secret-binding-migration). See
 [Configuration](/guide/configuration) and [Trusted Server CLI](/guide/cli) for details.
 
 ## Deploy to Fastly

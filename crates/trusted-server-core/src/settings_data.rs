@@ -1,13 +1,12 @@
 use edgezero_core::env_config::EnvConfig;
-use error_stack::{Report, ResultExt};
+use error_stack::Report;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 pub use crate::config_payload::DEFAULT_CONFIG_STORE_ID;
-use crate::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
+use crate::config_payload::{DEFAULT_SECRET_STORE_ID, LoadedConfig, settings_from_config_blob};
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformConfigStore, PlatformSecretStore, StoreName};
-use crate::settings::Settings;
 
 const FASTLY_CHUNK_POINTER_KIND: &str = "fastly_config_chunks";
 const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
@@ -68,7 +67,7 @@ pub fn default_secret_store_name() -> StoreName {
     StoreName::from(EnvConfig::from_env().store_name("secrets", DEFAULT_SECRET_STORE_ID))
 }
 
-/// Loads [`Settings`] from a platform config store and key.
+/// Loads an atomic [`LoadedConfig`] from a platform config store and key.
 ///
 /// # Errors
 ///
@@ -81,7 +80,7 @@ pub fn get_settings_from_config_store(
     store_name: &StoreName,
     key: &str,
     default_secret_store_name: &StoreName,
-) -> Result<Settings, Report<TrustedServerError>> {
+) -> Result<LoadedConfig, Report<TrustedServerError>> {
     let raw_value = read_config_entry(config_store, store_name, key)?;
     let envelope_json = resolve_fastly_chunk_pointer(config_store, store_name, &raw_value)?;
     settings_from_config_blob(&envelope_json, secret_store, default_secret_store_name)
@@ -92,12 +91,11 @@ fn read_config_entry(
     store_name: &StoreName,
     key: &str,
 ) -> Result<String, Report<TrustedServerError>> {
-    let message = format!(
-        "failed to read Trusted Server app config key `{key}` from config store `{store_name}`"
-    );
-    config_store
-        .get(store_name, key)
-        .change_context(TrustedServerError::Configuration { message })
+    config_store.get(store_name, key).map_err(|_| {
+        Report::new(TrustedServerError::Configuration {
+            message: "trusted_server: config entry unavailable".to_owned(),
+        })
+    })
 }
 
 fn resolve_fastly_chunk_pointer(
@@ -286,6 +284,7 @@ mod tests {
             key,
             &StoreName::from("trusted_server_secrets"),
         )
+        .map(|loaded| loaded.settings().clone())
     }
 
     #[test]
@@ -479,8 +478,9 @@ mod tests {
         .expect_err("should fail when blob is missing");
 
         assert!(
-            err.to_string().contains(CONFIG_BLOB_KEY),
-            "error should mention missing blob key"
+            err.to_string()
+                .contains("trusted_server: config entry unavailable"),
+            "error should expose only the safe schema path and category"
         );
     }
 }

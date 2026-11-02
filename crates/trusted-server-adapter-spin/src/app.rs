@@ -69,6 +69,7 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    partner_registry: PartnerRegistry,
     services: Option<RuntimeServices>,
 }
 
@@ -107,6 +108,7 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
         })?;
     let secret_store = SpinSecretStoreAdapter;
     settings_from_config_blob(&raw_envelope, &secret_store, &default_secret_store_name())
+        .map(|loaded| loaded.settings().clone())
 }
 
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
@@ -137,11 +139,13 @@ fn build_state_with_services(
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+    let partner_registry = PartnerRegistry::from_settings(&settings)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        partner_registry,
         services,
     }))
 }
@@ -503,11 +507,34 @@ fn legacy_admin_alias_denied() -> Response {
 // Startup error fallback
 // ---------------------------------------------------------------------------
 
+fn startup_error_diagnostic(report: &Report<TrustedServerError>) -> String {
+    // Loader contexts contain safe schema/category messages. Never format the
+    // report itself: native errors and values can occur in its source chain.
+    report
+        .current_context()
+        .to_string()
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 /// Returns a [`RouterService`] that responds to every route with a generic
-/// 503 Service Unavailable. The startup error is logged but not echoed in the
-/// response body so that deployment state is not leaked to anonymous callers.
+/// 503 Service Unavailable. The outer startup context goes to operator stderr,
+/// never the response body, so anonymous callers cannot inspect deployment state.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    log::error!("startup failed, serving error fallback: {:?}", e);
+    #[allow(clippy::print_stderr, reason = "Spin startup has no installed logger")]
+    {
+        eprintln!(
+            "startup failed, serving error fallback: {}",
+            startup_error_diagnostic(e)
+        );
+    }
 
     let handler = |_ctx: RequestContext| {
         let body = edgezero_core::body::Body::from("Service Unavailable\n");
@@ -554,10 +581,7 @@ impl Hooks for TrustedServerApp {
     fn routes() -> RouterService {
         let state = match build_state() {
             Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
+            Err(ref e) => return startup_error_router(e),
         };
 
         build_router(&state)
@@ -653,8 +677,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let req = ctx.into_request();
-                let result = PartnerRegistry::from_config(&s.settings.ec.partners)
-                    .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
+                let result = handle_admin_eids_lookup(&s.partner_registry, &req);
                 Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
             }
         };
@@ -1005,6 +1028,122 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
             ..ClientInfo::default()
         },
         geo: None,
+    }
+}
+
+#[cfg(test)]
+mod partner_registry_tests {
+    use super::*;
+    use trusted_server_core::ec::partner::hash_api_key;
+    use trusted_server_core::redacted::Redacted;
+    use trusted_server_core::test_support::secret_bindings::install_test_bindings;
+
+    const ORIGINAL_TOKEN: &str = "fictional-original-partner-token-0123456789";
+    const ROTATED_TOKEN: &str = "fictional-rotated-partner-token-0123456789";
+
+    fn settings() -> Settings {
+        let mut settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "fixture-admin"
+            password = "fictional-admin-password-0123456789"
+
+            [publisher]
+            domain = "publisher.example.com"
+            cookie_domain = ".publisher.example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "fictional-proxy-secret-0123456789"
+
+            [ec]
+            passphrase = "fictional-passphrase-01234567890123456789"
+
+            [[ec.partners]]
+            name = "Fictional partner"
+            source_domain = "partner.example.com"
+            api_token_enabled = true
+
+            [request_signing]
+            enabled = false
+            config_store_id = "fixture-config"
+            secret_store_id = "fixture-secrets"
+            "#,
+        )
+        .expect("should parse partner settings");
+        settings.ec.partners[0].api_token = Some(Redacted::new(ORIGINAL_TOKEN.to_owned()));
+        install_test_bindings(&mut settings).expect("should resolve fictional native bindings");
+        settings
+    }
+
+    #[test]
+    fn reconstructed_state_uses_new_credentials_without_changing_retained_registry() {
+        let retained = build_state_with_settings(settings()).expect("should build retained state");
+        let mut rotated_settings = retained.settings.as_ref().clone();
+        rotated_settings.ec.partners[0].api_token = Some(Redacted::new(ROTATED_TOKEN.to_owned()));
+        install_test_bindings(&mut rotated_settings)
+            .expect("should resolve rotated fictional native bindings");
+        let reconstructed =
+            build_state_with_settings(rotated_settings).expect("should build reconstructed state");
+        let original_hash = hash_api_key(ORIGINAL_TOKEN);
+        let rotated_hash = hash_api_key(ROTATED_TOKEN);
+
+        for (state, accepted_hash, rejected_hash, token) in [
+            (&retained, &original_hash, &rotated_hash, ORIGINAL_TOKEN),
+            (&reconstructed, &rotated_hash, &original_hash, ROTATED_TOKEN),
+        ] {
+            assert_eq!(
+                state
+                    .partner_registry
+                    .find_by_api_key_hash(accepted_hash)
+                    .map(|partner| partner.source_domain.as_str()),
+                Some("partner.example.com"),
+                "should authenticate only the state's own loaded partner credential"
+            );
+            assert!(
+                state
+                    .partner_registry
+                    .find_by_api_key_hash(rejected_hash)
+                    .is_none(),
+                "should not use another state's partner credential"
+            );
+            assert_eq!(
+                state.settings.ec.partners[0]
+                    .api_token
+                    .as_ref()
+                    .expect("should retain the corresponding credential shadow")
+                    .expose(),
+                token,
+                "should retain settings alongside their registry"
+            );
+        }
+    }
+
+    #[test]
+    fn state_construction_rejects_missing_partner_binding() {
+        let mut settings = settings();
+        settings.resolved_bindings = Default::default();
+        let error = match build_state_with_settings(settings) {
+            Ok(_) => panic!("should reject an enabled partner without a loaded binding"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:?}").contains("resolved binding context mismatch"),
+            "should reject the missing loaded partner binding: {error:?}"
+        );
+    }
+
+    #[test]
+    fn state_construction_rejects_retargeted_partner_binding() {
+        let mut settings = settings();
+        settings.ec.partners[0].source_domain = "different-partner.example.com".to_owned();
+        let error = match build_state_with_settings(settings) {
+            Ok(_) => panic!("should reject a binding loaded for another partner"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:?}").contains("resolved binding context mismatch"),
+            "should preserve binding context validation: {error:?}"
+        );
     }
 }
 
@@ -1493,6 +1632,49 @@ mod tests {
             scheme_host_from_spin_url("https://user:pass@www.publisher.example/path"),
             Some(("https".to_string(), "www.publisher.example".to_string())),
             "should strip userinfo and keep only the host authority"
+        );
+    }
+
+    #[test]
+    fn startup_diagnostic_excludes_native_sources_and_keeps_one_line() {
+        let report = Report::new(TrustedServerError::BadRequest {
+            message: "NATIVE_CREDENTIAL_SENTINEL".to_owned(),
+        })
+        .change_context(TrustedServerError::Configuration {
+            message: "safe startup category\nconfiguration unavailable".to_owned(),
+        })
+        .attach("NATIVE_BINDING_NAME_SENTINEL");
+        let diagnostic = startup_error_diagnostic(&report);
+        assert!(diagnostic.contains("safe startup category"));
+        assert!(!diagnostic.contains("NATIVE_CREDENTIAL_SENTINEL"));
+        assert!(!diagnostic.contains("NATIVE_BINDING_NAME_SENTINEL"));
+        assert!(diagnostic.contains("safe startup category configuration unavailable"));
+        assert!(diagnostic.chars().all(|character| !character.is_control()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_error_router_keeps_diagnostic_out_of_response() {
+        let report = Report::new(TrustedServerError::Configuration {
+            message: "trusted_server: native credential unavailable".to_owned(),
+        })
+        .attach("NATIVE_CREDENTIAL_SENTINEL");
+        let req = edgezero_core::http::request_builder()
+            .method("GET")
+            .uri("/")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build a request for the startup-error fallback");
+        let response = startup_error_router(&report)
+            .oneshot(req)
+            .await
+            .expect("should serve the anonymous startup-error response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("should read the startup-error response body")
+                .as_ref(),
+            b"Service Unavailable\n"
         );
     }
 

@@ -341,10 +341,12 @@ async fn send(
     request: Request<Full<Bytes>>,
 ) -> (StatusCode, HeaderMap, Bytes) {
     tokio::time::timeout(Duration::from_secs(5), async {
+        // Collecting a response body does not guarantee the connection driver
+        // has marked the HTTP/1 dispatcher ready for the next request yet.
         browser
             .ready()
             .await
-            .expect("should wait for the browser connection to accept another request");
+            .expect("should wait for the browser connection to accept a request");
         let response = browser
             .send_request(request)
             .await

@@ -52,6 +52,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            api_token_enabled: true,
             api_token: Some(Redacted::new(api_token.to_owned())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
@@ -130,6 +131,7 @@ mod tests {
     fn authenticate_bearer_rejects_token_for_partner_without_api_access() {
         let mut partner = make_test_partner("ssp.example.com", VALID_API_TOKEN);
         partner.api_token = None;
+        partner.api_token_enabled = false;
         let registry =
             PartnerRegistry::from_config(&[partner]).expect("should build registry without token");
         let req = Request::builder()

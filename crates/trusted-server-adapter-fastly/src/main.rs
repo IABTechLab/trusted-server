@@ -543,47 +543,40 @@ fn edgezero_main(
     }
 
     if let Some(mut ec_state) = ec_state {
-        if let Some(settings) = settings_snapshot.as_deref() {
-            match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response) {
-                Ok(partner_registry) => {
-                    send_edgezero_response(
-                        response,
-                        request_filter_effects.as_ref(),
-                        counters.as_ref(),
-                    );
-                    run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
-                    return;
-                }
-                Err(e) => {
-                    log::error!(
-                        "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
-                    );
-                }
-            }
+        if let Some(state) = app_state.as_deref() {
+            apply_edgezero_ec_finalize(
+                &state.settings,
+                &state.partner_registry,
+                &mut ec_state,
+                &mut response,
+            );
+            send_edgezero_response(response, request_filter_effects.as_ref(), counters.as_ref());
+            run_edgezero_pull_sync_after_send(&state.settings, &state.partner_registry, &ec_state);
+            return;
         } else {
             match load_settings_from_config_store(&runtime_stores) {
-                Ok(settings) => {
-                    match apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response) {
-                        Ok(partner_registry) => {
-                            send_edgezero_response(
-                                response,
-                                request_filter_effects.as_ref(),
-                                counters.as_ref(),
-                            );
-                            run_edgezero_pull_sync_after_send(
-                                &settings,
-                                &partner_registry,
-                                &ec_state,
-                            );
-                            return;
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
-                            );
-                        }
+                Ok(settings) => match PartnerRegistry::from_settings(&settings) {
+                    Ok(partner_registry) => {
+                        apply_edgezero_ec_finalize(
+                            &settings,
+                            &partner_registry,
+                            &mut ec_state,
+                            &mut response,
+                        );
+                        send_edgezero_response(
+                            response,
+                            request_filter_effects.as_ref(),
+                            counters.as_ref(),
+                        );
+                        run_edgezero_pull_sync_after_send(&settings, &partner_registry, &ec_state);
+                        return;
                     }
-                }
+                    Err(e) => {
+                        log::error!(
+                            "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
+                        );
+                    }
+                },
                 Err(e) => {
                     log::warn!("EdgeZero EC finalize skipped: failed to reload settings: {e:?}");
                 }
@@ -638,10 +631,10 @@ fn apply_entry_point_finalize_headers(
 
 fn apply_edgezero_ec_finalize(
     settings: &Settings,
+    partner_registry: &PartnerRegistry,
     ec_state: &mut EcFinalizeState,
     response: &mut HttpResponse,
-) -> Result<PartnerRegistry, Report<TrustedServerError>> {
-    let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
+) {
     let finalize_kv_graph = if ec_state.use_finalize_kv {
         maybe_identity_graph(settings)
     } else {
@@ -651,12 +644,11 @@ fn apply_edgezero_ec_finalize(
         settings,
         &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
-        &partner_registry,
+        partner_registry,
         ec_state.eids_cookie.as_deref(),
         ec_state.sharedid_cookie.as_deref(),
         response,
     );
-    Ok(partner_registry)
 }
 
 fn run_edgezero_pull_sync_after_send(

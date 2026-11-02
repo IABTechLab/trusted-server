@@ -188,6 +188,7 @@ pub(crate) struct AppState {
     pub(crate) settings: Arc<Settings>,
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
+    pub(crate) partner_registry: PartnerRegistry,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
 }
@@ -214,6 +215,7 @@ pub(crate) fn load_settings_from_config_store(
         &stores.config_key,
         &stores.secret_store_name,
     )
+    .map(|loaded| loaded.settings().clone())
 }
 
 pub(crate) fn build_state_from_settings(
@@ -225,14 +227,16 @@ pub(crate) fn build_state_from_settings(
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+    let partner_registry = PartnerRegistry::from_settings(&settings)?;
 
-    let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
+    let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings)?;
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        partner_registry,
         default_kv_store,
         auction_telemetry_sink,
     }))
@@ -579,19 +583,20 @@ async fn execute_named(
         handler,
         NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
     ) {
-        let response = PartnerRegistry::from_config(&state.settings.ec.partners)
-            .and_then(|registry| match handler {
-                NamedRouteHandler::AdminEcLookup => {
-                    // Deliberately do not use an EC request-state graph: that
-                    // copy is bot-gated, while operators use curl for this
-                    // authenticated diagnostic.
-                    let kv = crate::maybe_identity_graph(&state.settings);
-                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
-                }
-                NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
-                _ => unreachable!("admin diagnostics should use early dispatch"),
-            })
-            .unwrap_or_else(|error| http_error(&error));
+        let response = match handler {
+            NamedRouteHandler::AdminEcLookup => {
+                // Deliberately do not use an EC request-state graph: that
+                // copy is bot-gated, while operators use curl for this
+                // authenticated diagnostic.
+                let kv = crate::maybe_identity_graph(&state.settings);
+                handle_admin_ec_lookup(kv.as_ref(), &state.partner_registry, &req)
+            }
+            NamedRouteHandler::AdminEidsLookup => {
+                handle_admin_eids_lookup(&state.partner_registry, &req)
+            }
+            _ => unreachable!("admin diagnostics should use early dispatch"),
+        }
+        .unwrap_or_else(|error| http_error(&error));
         return Ok(response);
     }
 
@@ -660,11 +665,10 @@ async fn run_named_route(
                 cors_preflight_identify(&state.settings, &req)
             } else {
                 let kv = crate::require_identity_graph(&state.settings)?;
-                let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
                 handle_identify(
                     &state.settings,
                     &kv,
-                    &partner_registry,
+                    &state.partner_registry,
                     &req,
                     &ec.ec_context,
                 )
@@ -674,11 +678,10 @@ async fn run_named_route(
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Auction => {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Auction);
-            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-            let registry_ref = if partner_registry.is_empty() {
+            let registry_ref = if state.partner_registry.is_empty() {
                 None
             } else {
-                Some(&partner_registry)
+                Some(&state.partner_registry)
             };
             handle_auction(
                 &state.settings,
@@ -698,11 +701,10 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 return Ok(page_bids_preflight_denied());
             }
-            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-            let registry_ref = if partner_registry.is_empty() {
+            let registry_ref = if state.partner_registry.is_empty() {
                 None
             } else {
-                Some(&partner_registry)
+                Some(&state.partner_registry)
             };
             let auction = AuctionDispatch {
                 integration_registry: &state.registry,
@@ -745,9 +747,8 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
-        let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-        handle_batch_sync(&kv, &partner_registry, &limiter, req)
+        handle_batch_sync(&kv, &state.partner_registry, &limiter, req)
     });
 
     let mut response = result.unwrap_or_else(|e| http_error(&e));
@@ -867,44 +868,39 @@ async fn dispatch_fallback(
         // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
         // server-side EIDs, same as the legacy auction.
         let slots = state.settings.creative_opportunity_slots();
-        match PartnerRegistry::from_config(&state.settings.ec.partners) {
-            Ok(partner_registry) => {
-                let auction = AuctionDispatch {
-                    integration_registry: &state.registry,
-                    orchestrator: &state.orchestrator,
-                    slots,
-                    registry: Some(&partner_registry),
-                };
-                match handle_publisher_request(
-                    &state.settings,
-                    services,
-                    ec.kv_graph.as_ref(),
-                    &mut ec.ec_context,
-                    auction,
-                    req,
-                    EdgeCacheHeader::SurrogateControl,
+        let auction = AuctionDispatch {
+            integration_registry: &state.registry,
+            orchestrator: &state.orchestrator,
+            slots,
+            registry: Some(&state.partner_registry),
+        };
+        match handle_publisher_request(
+            &state.settings,
+            services,
+            ec.kv_graph.as_ref(),
+            &mut ec.ec_context,
+            auction,
+            req,
+            EdgeCacheHeader::SurrogateControl,
+        )
+        .await
+        {
+            Ok(pub_response) => {
+                // Origin start succeeded on the sole publisher-page
+                // path. Authorize orphan recovery only for real-browser
+                // document navigations so named routes, integration
+                // proxies, and filter short circuits cannot rotate an
+                // identity.
+                ec.ec_context.set_recovery_eligible(is_publisher_navigation);
+                publisher_response_into_streaming_response(
+                    pub_response,
+                    &method,
+                    Arc::clone(&state.settings),
+                    state.registry.as_ref(),
+                    Arc::clone(&state.orchestrator),
+                    services.clone(),
                 )
                 .await
-                {
-                    Ok(pub_response) => {
-                        // Origin start succeeded on the sole publisher-page
-                        // path. Authorize orphan recovery only for real-browser
-                        // document navigations so named routes, integration
-                        // proxies, and filter short circuits cannot rotate an
-                        // identity.
-                        ec.ec_context.set_recovery_eligible(is_publisher_navigation);
-                        publisher_response_into_streaming_response(
-                            pub_response,
-                            &method,
-                            Arc::clone(&state.settings),
-                            state.registry.as_ref(),
-                            Arc::clone(&state.orchestrator),
-                            services.clone(),
-                        )
-                        .await
-                    }
-                    Err(e) => Err(e),
-                }
             }
             Err(e) => Err(e),
         }
@@ -1392,6 +1388,122 @@ impl Hooks for TrustedServerApp {
 }
 
 #[cfg(test)]
+mod partner_registry_tests {
+    use super::*;
+    use trusted_server_core::ec::partner::hash_api_key;
+    use trusted_server_core::redacted::Redacted;
+    use trusted_server_core::test_support::secret_bindings::install_test_bindings;
+
+    const ORIGINAL_TOKEN: &str = "fictional-original-partner-token-0123456789";
+    const ROTATED_TOKEN: &str = "fictional-rotated-partner-token-0123456789";
+
+    fn settings() -> Settings {
+        let mut settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "fixture-admin"
+            password = "fictional-admin-password-0123456789"
+
+            [publisher]
+            domain = "publisher.example.com"
+            cookie_domain = ".publisher.example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "fictional-proxy-secret-0123456789"
+
+            [ec]
+            passphrase = "fictional-passphrase-01234567890123456789"
+
+            [[ec.partners]]
+            name = "Fictional partner"
+            source_domain = "partner.example.com"
+            api_token_enabled = true
+
+            [request_signing]
+            enabled = false
+            config_store_id = "fixture-config"
+            secret_store_id = "fixture-secrets"
+            "#,
+        )
+        .expect("should parse partner settings");
+        settings.ec.partners[0].api_token = Some(Redacted::new(ORIGINAL_TOKEN.to_owned()));
+        install_test_bindings(&mut settings).expect("should resolve fictional native bindings");
+        settings
+    }
+
+    #[test]
+    fn reconstructed_state_uses_new_credentials_without_changing_retained_registry() {
+        let retained = build_state_from_settings(settings()).expect("should build retained state");
+        let mut rotated_settings = retained.settings.as_ref().clone();
+        rotated_settings.ec.partners[0].api_token = Some(Redacted::new(ROTATED_TOKEN.to_owned()));
+        install_test_bindings(&mut rotated_settings)
+            .expect("should resolve rotated fictional native bindings");
+        let reconstructed =
+            build_state_from_settings(rotated_settings).expect("should build reconstructed state");
+        let original_hash = hash_api_key(ORIGINAL_TOKEN);
+        let rotated_hash = hash_api_key(ROTATED_TOKEN);
+
+        for (state, accepted_hash, rejected_hash, token) in [
+            (&retained, &original_hash, &rotated_hash, ORIGINAL_TOKEN),
+            (&reconstructed, &rotated_hash, &original_hash, ROTATED_TOKEN),
+        ] {
+            assert_eq!(
+                state
+                    .partner_registry
+                    .find_by_api_key_hash(accepted_hash)
+                    .map(|partner| partner.source_domain.as_str()),
+                Some("partner.example.com"),
+                "should authenticate only the state's own loaded partner credential"
+            );
+            assert!(
+                state
+                    .partner_registry
+                    .find_by_api_key_hash(rejected_hash)
+                    .is_none(),
+                "should not use another state's partner credential"
+            );
+            assert_eq!(
+                state.settings.ec.partners[0]
+                    .api_token
+                    .as_ref()
+                    .expect("should retain the corresponding credential shadow")
+                    .expose(),
+                token,
+                "should retain settings alongside their registry"
+            );
+        }
+    }
+
+    #[test]
+    fn state_construction_rejects_missing_partner_binding() {
+        let mut settings = settings();
+        settings.resolved_bindings = Default::default();
+        let error = match build_state_from_settings(settings) {
+            Ok(_) => panic!("should reject an enabled partner without a loaded binding"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:?}").contains("resolved binding context mismatch"),
+            "should reject the missing loaded partner binding: {error:?}"
+        );
+    }
+
+    #[test]
+    fn state_construction_rejects_retargeted_partner_binding() {
+        let mut settings = settings();
+        settings.ec.partners[0].source_domain = "different-partner.example.com".to_owned();
+        let error = match build_state_from_settings(settings) {
+            Ok(_) => panic!("should reject a binding loaded for another partner"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:?}").contains("resolved binding context mismatch"),
+            "should preserve binding context validation: {error:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1605,6 +1717,8 @@ mod tests {
             trusted_server_core::auction::build_orchestrator_with_plan(plan, &settings)
                 .expect("should build orchestrator");
         let registry = IntegrationRegistry::from_request_filters(filters);
+        let partner_registry = super::PartnerRegistry::from_settings(&settings)
+            .expect("should build partner registry");
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
         let state = Arc::new(super::AppState {
@@ -1614,6 +1728,7 @@ mod tests {
             settings: Arc::new(settings),
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
+            partner_registry,
             default_kv_store,
         });
         TrustedServerApp::routes_for_state(&state)

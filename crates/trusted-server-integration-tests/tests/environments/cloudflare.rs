@@ -1,4 +1,4 @@
-use crate::common::config::cloudflare_config_json;
+use crate::common::config::{app_config_native_fixtures, cloudflare_config_json};
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
@@ -36,6 +36,26 @@ fn write_generated_ci_config(wrangler_dir: &Path, config_json: &str) -> TestResu
             template_path.display()
         ))?;
     let generated = inject_cloudflare_config(&template, config_json)?;
+    let mut generated: toml::Value =
+        toml::from_str(&generated).map_err(|_| Report::new(TestError::ConfigGeneration))?;
+    let vars = generated
+        .get_mut("vars")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| Report::new(TestError::ConfigGeneration))?;
+    let binding: serde_json::Value =
+        serde_json::from_str(config_json).map_err(|_| Report::new(TestError::ConfigGeneration))?;
+    let envelope = binding
+        .get(trusted_server_core::config_payload::CONFIG_BLOB_KEY)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Report::new(TestError::ConfigGeneration))?;
+    for fixture in app_config_native_fixtures(envelope, "cloudflare")? {
+        vars.insert(
+            fixture.native.native_name,
+            toml::Value::String(fixture.value),
+        );
+    }
+    let generated =
+        toml::to_string(&generated).map_err(|_| Report::new(TestError::ConfigGeneration))?;
     let output_path = wrangler_dir.join(GENERATED_CI_CONFIG);
     std::fs::write(&output_path, generated)
         .change_context(TestError::RuntimeSpawn)
@@ -89,16 +109,9 @@ impl CloudflareWorkers {
         ready: impl FnOnce(&str) -> TestResult<()>,
     ) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
-        let config = if std::env::var("CI").is_ok() {
-            write_generated_ci_config(&wrangler_dir, &cloudflare_config_json(origin_port())?)?
-        } else {
-            "wrangler.toml".to_string()
-        };
+        let config =
+            write_generated_ci_config(&wrangler_dir, &cloudflare_config_json(origin_port())?)?;
         self.spawn_wrangler(&wrangler_dir, &config, ready)
-    }
-
-    fn health_check_path(&self) -> &str {
-        "/.well-known/trusted-server.json"
     }
 }
 
@@ -115,11 +128,23 @@ impl CloudflareWorkers {
     /// written or `wrangler dev` cannot be started, and
     /// [`TestError::RuntimeNotReady`] if the health check times out.
     pub fn spawn_with_config_json(&self, config_json: &str) -> TestResult<RuntimeProcess> {
-        let wrangler_dir = self.wrangler_dir();
-        let config = write_generated_ci_config(&wrangler_dir, config_json)?;
-        self.spawn_wrangler(&wrangler_dir, &config, |base_url| {
+        self.spawn_with_config_json_and_readiness(config_json, |base_url| {
             super::wait_for_ready(base_url, self.health_check_path(), true)
         })
+    }
+
+    /// Start an exact customized envelope with its generated credentials and probe.
+    ///
+    /// # Errors
+    /// Returns configuration, startup or readiness errors.
+    pub(crate) fn spawn_with_config_json_and_readiness(
+        &self,
+        config_json: &str,
+        ready: impl FnOnce(&str) -> TestResult<()>,
+    ) -> TestResult<RuntimeProcess> {
+        let wrangler_dir = self.wrangler_dir();
+        let config = write_generated_ci_config(&wrangler_dir, config_json)?;
+        self.spawn_wrangler(&wrangler_dir, &config, ready)
     }
 
     fn spawn_wrangler(

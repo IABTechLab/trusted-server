@@ -65,9 +65,6 @@ where
     Ok(collected.to_bytes().to_vec())
 }
 
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-const SPIN_VARIABLE_HEX: &[u8; 16] = b"0123456789abcdef";
-
 // ---------------------------------------------------------------------------
 // Noop stubs — used when a handle is absent (native CI, missing binding)
 // ---------------------------------------------------------------------------
@@ -162,61 +159,12 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
 }
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn spin_variable_name(
-    key: &str,
-    error_context: PlatformError,
-) -> Result<String, Report<PlatformError>> {
-    if key.is_empty() {
-        return Err(Report::new(error_context).attach("Spin variable key must not be empty"));
-    }
-
-    // Spin requires each _-separated word to start with an ASCII letter.
-    // Reject at the encoder boundary so no caller can accidentally produce aliasing
-    // (e.g. "1foo" and "n1foo" both encoding to the same variable name).
-    if !key.starts_with(|c: char| c.is_ascii_lowercase()) {
-        return Err(Report::new(error_context).attach(format!(
-            "Spin variable key `{key}` must start with a lowercase ASCII letter"
-        )));
-    }
-
-    // `v_` prefix + worst-case 4 bytes per char for escape sequences.
-    let mut out = String::with_capacity(key.len() * 4 + 3);
-    out.push_str("v_");
-
-    for ch in key.chars() {
-        match ch {
-            'a'..='z' | '0'..='9' => out.push(ch),
-            'A'..='Z' | '-' | '_' | '.' | ':' => {
-                push_spin_variable_escape(&mut out, ch as u8);
-            }
-            _ => {
-                return Err(Report::new(error_context).attach(format!(
-                    "Spin variable key `{key}` contains unsupported character `{ch}`"
-                )));
-            }
-        }
-    }
-
-    Ok(out)
-}
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn push_spin_variable_escape(out: &mut String, byte: u8) {
-    out.push('_');
-    out.push('x');
-    out.push(SPIN_VARIABLE_HEX[(byte >> 4) as usize] as char);
-    out.push(SPIN_VARIABLE_HEX[(byte & 0x0f) as usize] as char);
-}
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 fn spin_secret_variable_name(
     store_name: &StoreName,
     key: &str,
 ) -> Result<String, Report<PlatformError>> {
-    let store_variable = spin_variable_name(store_name.as_ref(), PlatformError::SecretStore)?;
-    let key_variable = spin_variable_name(key, PlatformError::SecretStore)?;
-
-    Ok(format!("{store_variable}_{key_variable}"))
+    trusted_server_core::secret_bindings::spin_secret_name(store_name.as_ref(), key)
+        .change_context(PlatformError::SecretStore)
 }
 
 /// Bridges edgezero's [`KvHandle`] to [`PlatformKvStore`].
@@ -987,15 +935,16 @@ mod tests {
     }
 
     #[test]
-    fn spin_variable_name_encodes_secret_key_components() {
+    fn spin_secret_name_encodes_secret_key_components() {
         assert_eq!(
-            spin_variable_name("ts-2026-05-25", PlatformError::SecretStore)
+            trusted_server_core::secret_bindings::spin_secret_name("signing_keys", "ts-2026-05-25")
                 .expect("should encode generated kid"),
-            "v_ts_x2d2026_x2d05_x2d25"
+            "v_signing_x5fkeys_v_ts_x2d2026_x2d05_x2d25"
         );
         // Digit-leading keys are rejected at the encoder boundary.
         assert!(
-            spin_variable_name("2026-key", PlatformError::SecretStore).is_err(),
+            trusted_server_core::secret_bindings::spin_secret_name("signing_keys", "2026-key")
+                .is_err(),
             "should reject digit-leading key"
         );
     }
@@ -1006,7 +955,7 @@ mod tests {
         // must never admit a kid the Spin secret-variable encoder rejects — otherwise
         // that kid could be created but its private signing key could not be stored.
         // This pins core >= encoder strictness so the duplicated lowercase-leading
-        // rule in validate_kid and spin_variable_name cannot silently drift.
+        // rule in validate_kid and spin_secret_name cannot silently drift.
         use trusted_server_core::request_signing::kid_is_creatable;
 
         let samples = [
@@ -1030,7 +979,8 @@ mod tests {
         for kid in samples {
             if kid_is_creatable(kid) {
                 assert!(
-                    spin_variable_name(kid, PlatformError::SecretStore).is_ok(),
+                    trusted_server_core::secret_bindings::spin_secret_name("signing_keys", kid)
+                        .is_ok(),
                     "core accepts kid `{kid}` but the Spin encoder rejects it \
                      (portability contract broken)"
                 );
@@ -1048,27 +998,29 @@ mod tests {
     }
 
     #[test]
-    fn spin_variable_name_rejects_unsupported_characters() {
+    fn spin_secret_name_rejects_unsupported_characters() {
         assert!(
-            spin_variable_name("kid/name", PlatformError::SecretStore).is_err(),
+            trusted_server_core::secret_bindings::spin_secret_name("signing_keys", "kid/name")
+                .is_err(),
             "should reject characters outside the supported Spin variable mapping"
         );
     }
 
     #[test]
-    fn spin_variable_name_does_not_collapse_distinct_allowed_kids() {
+    fn spin_secret_name_does_not_collapse_distinct_allowed_kids() {
         let mut names = std::collections::BTreeSet::new();
         // Only lowercase-leading keys are accepted; "KidA" is rejected at the boundary.
         for kid in ["kid-a", "kid.a", "kid:a", "kid_a", "kid_2da", "kida"] {
-            let variable_name = spin_variable_name(kid, PlatformError::ConfigStore)
-                .expect("should encode allowed kid characters");
+            let variable_name =
+                trusted_server_core::secret_bindings::spin_secret_name("signing_keys", kid)
+                    .expect("should encode allowed kid characters");
             assert!(
                 names.insert(variable_name.clone()),
-                "Spin variable mapping must not collide for kid `{kid}` as `{variable_name}`"
+                "Spin variable mapping must not collide for distinct allowed kids"
             );
         }
         assert!(
-            spin_variable_name("KidA", PlatformError::ConfigStore).is_err(),
+            trusted_server_core::secret_bindings::spin_secret_name("signing_keys", "KidA").is_err(),
             "should reject uppercase-leading kid at the encoder boundary"
         );
     }
@@ -1384,10 +1336,10 @@ mod tests {
     }
 
     #[test]
-    fn spin_variable_name_rejects_digit_leading_key() {
+    fn spin_secret_name_rejects_digit_leading_key() {
         // Encoder enforces the lowercase-letter start contract at the boundary so
         // no caller can produce aliasing (e.g. "1foo" and "n1foo" would collide).
-        let result = spin_variable_name("1foo", PlatformError::ConfigStore);
+        let result = trusted_server_core::secret_bindings::spin_secret_name("signing_keys", "1foo");
         assert!(
             result.is_err(),
             "should reject digit-leading key at the encoder boundary"
@@ -1395,8 +1347,8 @@ mod tests {
     }
 
     #[test]
-    fn spin_variable_name_rejects_uppercase_leading_key() {
-        let result = spin_variable_name("Foo", PlatformError::ConfigStore);
+    fn spin_secret_name_rejects_uppercase_leading_key() {
+        let result = trusted_server_core::secret_bindings::spin_secret_name("signing_keys", "Foo");
         assert!(
             result.is_err(),
             "should reject uppercase-leading key at the encoder boundary"

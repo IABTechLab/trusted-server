@@ -64,6 +64,33 @@ fastly profile create
 
 Follow the interactive prompts to paste your API token.
 
+## App credential plans and writes
+
+Use [Provision app credentials](./secrets) and [CI provisioning](./secrets-ci).
+`ts secrets plan`, `check`, and `set` use the existing EdgeZero manifest and
+Fastly adapter manifest. `--manifest` defaults to `EDGEZERO_MANIFEST`, otherwise
+`edgezero.toml`. `fastly.toml` supplies `service_id`; `FASTLY_SERVICE_ID`
+must agree unless using supported explicit `--service-id` selection. Review
+the resolved service and exact resource IDs in the plan.
+
+Managed direct API calls require `FASTLY_API_TOKEN` in the process environment.
+A Fastly CLI profile alone does not supply it. Restrict its access to the reviewed
+resources and verify that config publishers cannot write secrets or change links.
+
+Physical selectors are
+`EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME`,
+`EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME`, and
+`EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME`. They select names, not IDs;
+unset selectors use logical-name defaults. `ts provision --adapter fastly`
+creates/reuses resources; managed application-release deployment links them
+under logical IDs. Neither planning nor secret writes creates links, pushes config,
+deploys, activates a version, or refreshes retained state.
+
+`--staging` alone does not isolate stores. Give each environment distinct
+reviewed physical mappings. Do not add another deployment TOML or create logical
+links by hand. Recreate state after provisioning or rotation, including reusable
+sandboxes. Presence checks do not prove credential bytes or delivery.
+
 ## Domain Configuration
 
 ::: tip
@@ -108,7 +135,6 @@ Prefer header names that nothing else in the fronting service uses:
 [trusted_client_ip]
 ip_header = "x-ts-client-ip"
 auth_header = "x-ts-client-ip-auth"
-shared_secret = "trusted_client_ip_shared_secret"
 ```
 
 `ip_header` may also be
@@ -151,10 +177,10 @@ Attach an edge dictionary named `ts_private_config` to the fronting service and
 store the secret under the key `trusted_client_ip_secret`. Create the dictionary
 as write-only so the value cannot be read back through the API or the web
 interface. Store the identical value in the physical store mapped from
-`trusted_server_secrets`, under the key named by
-`trusted_client_ip.shared_secret` (`trusted_client_ip_shared_secret` above). If
-either key is absent, authentication cannot succeed and Trusted Server falls
-back to the peer address.
+`trusted_server_secrets`, under the generated `clientip.shared` binding from the reviewed plan. Use
+`ts secrets set clientip.shared` with the same plan/config flags as the
+[provisioning tutorial](./secrets). A missing runtime binding fails loading;
+a missing or invalid request authentication header falls back to the peer address.
 
 Four details in that example carry weight:
 
@@ -180,10 +206,10 @@ Four details in that example carry weight:
   different backend. On the ordinary path the host is unchanged and re-running
   writes the same values.
 
-Configure the identical header names and the secret-store key name in Trusted
-Server. Use a cryptographically random value of at least 32 ASCII graphic bytes,
-encoded as hex or base64url with no whitespace, for the two store entries. The
-app-config blob contains only `trusted_client_ip_shared_secret`, not that value.
+Configure identical header names in Trusted Server and provision its implicit
+`clientip.shared` binding. Use a cryptographically random value of at least 32
+ASCII graphic bytes, encoded as hex or base64url without whitespace, for both
+store entries. No credential value or key-name property belongs in app config.
 
 ### What Trusted Server does with the result
 
@@ -394,25 +420,17 @@ Create it:
 fastly kv-store create --name ec_identity_store
 ```
 
-Configure the secret-store key name in `trusted-server.toml`:
+Configure ordinary EC settings in `trusted-server.toml`:
 
 ```toml
 [ec]
-passphrase = "ec_passphrase"
 ec_store = "ec_identity_store"
 ```
 
-Store the high-entropy passphrase under that key in the physical store
-selected for `trusted_server_secrets`. The resolved
-value, rather than the key name, must contain at least 32 characters. Pipe the
-value over standard input so it never appears in the process argument list:
-
-```bash
-openssl rand -hex 32 | tr -d '\n' | fastly secret-store-entry create \
-  --store-id=<ts-secrets-store-id> \
-  --name=ec_passphrase \
-  --stdin
-```
+Provision the implicit `ec.passphrase` binding through a reviewed plan with
+`ts secrets set ec.passphrase`. Its raw value must contain at least 32 bytes.
+Do not add a passphrase property or hand-written native name. Follow
+[Provision app credentials](./secrets) for secure input and required app roles.
 
 Verify stores exist:
 
@@ -443,8 +461,10 @@ overrides, and runs strict validation. It then executes `ts config push
 --adapter fastly --local`, adds all three required entries to
 `[local_server.secret_stores.trusted_server_secrets]`, and starts
 `fastly compute serve`
-through Viceroy. The required keys are `handler_password`,
-`publisher_proxy_secret`, and `ec_passphrase`.
+through Viceroy. Required app roles are `handler.password`, `publisher.proxy`,
+and `ec.passphrase`; native keys must come from the compiler/renderer rather
+than old labels. The smoke fixtures must match this schema before the result
+can count as secret-binding evidence.
 
 The check deliberately proves both halves of startup. With no config entry, it
 requires `/health` to return 200 while the publisher route returns 500 with the
@@ -459,7 +479,7 @@ project before pushing local configuration or adding synthetic secrets. The
 tracked manifests remain untouched, including when smoke runs overlap. Its trap
 stops Viceroy and the stub origin and removes the temporary project. For a
 deployed service, provision and link the stores described above and write the
-three secrets through Fastly's secret-store interface.
+required bindings through the [reviewed Fastly writer](./secrets).
 
 ## Next Steps
 

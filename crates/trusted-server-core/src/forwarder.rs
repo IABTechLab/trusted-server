@@ -184,14 +184,14 @@ mod tests {
     const SECRET: &str = "fictional-forwarder-secret-0123456789";
 
     fn settings() -> Settings {
-        let mut value = serde_json::to_value(create_test_settings())
-            .expect("should serialize example settings");
-        value["publisher"]["domain"] = serde_json::json!("publisher.example.com");
-        value["trusted_forwarder"] = serde_json::json!({
-            "auth_header": FORWARDER_AUTH_HEADER,
-            "shared_secret": SECRET,
+        let mut settings = create_test_settings();
+        settings.publisher.domain = "publisher.example.com".to_owned();
+        settings.trusted_forwarder = Some(crate::settings::TrustedForwarderConfig {
+            auth_header: FORWARDER_AUTH_HEADER.to_owned(),
+            shared_secret: crate::redacted::Redacted::new(SECRET.to_owned()),
         });
-        Settings::from_json_value(value).expect("should parse forwarder configuration")
+        validator::Validate::validate(&settings).expect("should validate forwarder configuration");
+        settings
     }
 
     fn request() -> Request<Body> {

@@ -8,6 +8,33 @@ use crate::common::runtime::{TestError, TestResult};
 const GENERATED_AT: &str = "2026-06-23T00:00:00Z";
 const APP_CONFIG: &str = include_str!("../../fixtures/configs/trusted-server.integration.toml");
 
+/// Recover feature settings from the exact customized runtime envelope.
+///
+/// # Errors
+/// Returns a fixture-generation error for invalid envelopes or feature config.
+pub fn fixture_settings(envelope: &str) -> TestResult<trusted_server_core::settings::Settings> {
+    let envelope: BlobEnvelope =
+        serde_json::from_str(envelope).map_err(|_| Report::new(TestError::ConfigGeneration))?;
+    envelope
+        .verify()
+        .map_err(|_| Report::new(TestError::ConfigGeneration))?;
+    let config: TrustedServerAppConfig = serde_json::from_value(envelope.into_data())
+        .map_err(|_| Report::new(TestError::ConfigGeneration))?;
+    Ok(config.into_settings())
+}
+
+/// Render credentials for this exact envelope, including customized handlers.
+///
+/// # Errors
+/// Returns a fixture-generation error when compilation or rendering fails.
+pub fn app_config_native_fixtures(
+    envelope: &str,
+    adapter: &str,
+) -> TestResult<Vec<trusted_server_integration_tests::NativeFixture>> {
+    trusted_server_integration_tests::native_fixtures(&fixture_settings(envelope)?, adapter)
+        .map_err(|_| Report::new(TestError::ConfigGeneration))
+}
+
 pub fn integration_app_config_envelope(origin_port: u16) -> TestResult<String> {
     app_config_envelope(origin_port, false, |_| Ok(()))
 }
@@ -119,6 +146,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn customized_handlers_get_their_own_native_credentials_on_every_adapter() {
+        let baseline = integration_app_config_envelope(8888).expect("should generate baseline");
+        let customized = app_config_envelope(8888, true, |table| {
+            table
+                .get_mut("handlers")
+                .and_then(toml::Value::as_array_mut)
+                .expect("should retain handler array")
+                .insert(
+                    0,
+                    toml::Value::Table(toml::Table::from_iter([
+                        (
+                            "path".to_owned(),
+                            toml::Value::String("^/_ts/trace".to_owned()),
+                        ),
+                        (
+                            "username".to_owned(),
+                            toml::Value::String("example-user".to_owned()),
+                        ),
+                    ])),
+                );
+            Ok(())
+        })
+        .expect("should generate customized handler features");
+        for adapter in ["axum", "fastly", "cloudflare", "spin"] {
+            let baseline =
+                app_config_native_fixtures(&baseline, adapter).expect("should render baseline");
+            let customized = app_config_native_fixtures(&customized, adapter)
+                .expect("should render exact customized config");
+            assert_eq!(customized.len(), baseline.len() + 1);
+            let added = customized
+                .iter()
+                .filter(|entry| {
+                    !baseline
+                        .iter()
+                        .any(|old| old.native.native_name == entry.native.native_name)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(added.len(), 1);
+            assert_eq!(added[0].descriptor_id, "handler.password");
+            assert_eq!(added[0].value, "integration-admin-password-32-bytes-ok");
+        }
+    }
+
+    #[test]
     fn trace_browser_fixture_keeps_auctions_and_shared_assembly_disabled() {
         let envelope: serde_json::Value = serde_json::from_str(
             &integration_app_config_envelope_with_trace(8888, true)
@@ -195,12 +266,31 @@ mod tests {
             ("fastly.toml", FASTLY_CONFIG),
             ("Viceroy integration template", VICEROY_TEMPLATE),
         ] {
+            let config = if name == "Viceroy integration template" {
+                let app: trusted_server_core::config::TrustedServerAppConfig =
+                    toml::from_str(super::APP_CONFIG)
+                        .expect("should deserialize the integration feature configuration");
+                let blocks =
+                    trusted_server_integration_tests::fastly_fixture_blocks(&app.into_settings())
+                        .expect("should compile the Fastly native fixture blocks");
+                let (before, rest) = config
+                    .split_once("# BEGIN GENERATED APP SECRET FIXTURES")
+                    .expect("should find the generated app-secret section start marker");
+                let (_, after) = rest
+                    .split_once("# END GENERATED APP SECRET FIXTURES")
+                    .expect("should find the generated app-secret section end marker");
+                format!("{before}{blocks}{after}")
+            } else {
+                config.to_owned()
+            };
             let parsed: toml::Value =
-                toml::from_str(config).expect("should parse Fastly configuration");
+                toml::from_str(&config).expect("should parse Fastly configuration");
             let local_server = &parsed["local_server"];
 
             assert!(
-                local_server["secret_stores"][LOGICAL_SECRET_STORE_ID].is_array(),
+                local_server["secret_stores"]
+                    .get(LOGICAL_SECRET_STORE_ID)
+                    .is_some_and(toml::Value::is_array),
                 "{name} should expose the secret store under its logical ID"
             );
             assert!(
@@ -217,22 +307,25 @@ mod tests {
     }
 
     #[test]
-    fn local_fastly_config_defines_starter_secret_references() {
+    fn local_fastly_config_defines_compiled_starter_credentials() {
         let parsed: toml::Value =
             toml::from_str(FASTLY_CONFIG).expect("should parse root fastly.toml");
         let entries = parsed["local_server"]["secret_stores"][LOGICAL_SECRET_STORE_ID]
             .as_array()
             .expect("fastly.toml should define trusted_server_secrets");
 
-        for key in [
-            "publisher_proxy_secret",
-            "ec_passphrase",
-            "handler_password",
-        ] {
+        let config: trusted_server_core::config::TrustedServerAppConfig =
+            toml::from_str(include_str!("../../../../trusted-server.example.toml"))
+                .expect("should deserialize the public example configuration");
+        let fixtures =
+            trusted_server_integration_tests::native_fixtures(&config.into_settings(), "fastly")
+                .expect("should compile native fixtures for the public example");
+        for fixture in fixtures {
+            let key = fixture.native.key;
             assert!(
                 entries
                     .iter()
-                    .any(|entry| entry["key"].as_str() == Some(key)),
+                    .any(|entry| entry["key"].as_str() == Some(key.as_str())),
                 "fastly.toml should define local value for starter secret `{key}`"
             );
         }

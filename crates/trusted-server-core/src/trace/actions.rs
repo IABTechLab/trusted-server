@@ -372,14 +372,17 @@ mod tests {
     }
 
     fn forwarded_settings() -> Settings {
-        let mut value =
-            serde_json::to_value(settings(true, false)).expect("should serialize trace settings");
-        value["publisher"]["domain"] = json!("publisher.example");
-        value["trusted_forwarder"] = json!({
-            "auth_header": "x-ts-forwarder-auth",
-            "shared_secret": "fictional-forwarder-secret-0123456789",
+        let mut settings = settings(true, false);
+        settings.publisher.domain = "publisher.example".to_owned();
+        settings.trusted_forwarder = Some(crate::settings::TrustedForwarderConfig {
+            auth_header: "x-ts-forwarder-auth".to_owned(),
+            shared_secret: crate::redacted::Redacted::new(
+                "fictional-forwarder-secret-0123456789".to_owned(),
+            ),
         });
-        Settings::from_json_value(value).expect("should parse authenticated trace settings")
+        validator::Validate::validate(&settings)
+            .expect("should validate authenticated trace settings");
+        settings
     }
 
     fn forwarded_request(action: &str, scheme: &str, authority: &str) -> Request<EdgeBody> {

@@ -1673,9 +1673,8 @@ impl AuctionOrchestrator {
     ) -> Result<&Arc<dyn AuctionProvider>, Report<TrustedServerError>> {
         self.providers.get(name).ok_or_else(|| {
             log::warn!(
-                "Provider '{}' configured but not registered. Available providers: {:?}",
-                name,
-                self.providers.keys().collect::<Vec<_>>()
+                "Configured provider is not registered. Registered provider count: {}",
+                self.providers.len()
             );
             Report::new(TrustedServerError::Auction {
                 message: format!("Provider '{}' not registered", name),
@@ -1701,8 +1700,7 @@ impl AuctionOrchestrator {
             && !context.services.http_client().supports_concurrent_fanout()
         {
             log::warn!(
-                "{} planned auction providers configured on a runtime without concurrent fanout",
-                self.planned_providers.len()
+                "Multiple planned auction providers configured on a runtime without concurrent fanout"
             );
             return DispatchAuctionOutcome::NotStarted;
         }

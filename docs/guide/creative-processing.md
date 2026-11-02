@@ -1083,7 +1083,7 @@ Content-Security-Policy:
 
 ✅ **Do**:
 
-- Use strong `proxy_secret` (32+ bytes random)
+- Use a strong generated `publisher.proxy` binding value, at least 32 random bytes
 - Exclude trusted first-party domains
 - Set appropriate cache headers
 - Test rewrites before production

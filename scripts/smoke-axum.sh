@@ -6,6 +6,7 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=scripts/smoke-common.sh
 . "$REPO_ROOT/scripts/smoke-common.sh"
+smoke_use_local_store_mappings trusted_server_config
 
 smoke_require_command cargo
 smoke_require_command curl
@@ -36,6 +37,7 @@ fi
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
 ORIGIN_PID=$SMOKE_ORIGIN_PID
 smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT"
+smoke_generate_bindings "$REPO_ROOT" "$WORKSPACE" axum
 sed \
     -e "s|= \"crates/|= \"$REPO_ROOT/crates/|g" \
     -e "s|manifest = \"fastly.toml\"|manifest = \"$REPO_ROOT/fastly.toml\"|" \
@@ -100,16 +102,16 @@ run_case() {
 
 run_case missing-config "$BASE_PORT" "" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 500 \
-    "env var '$SMOKE_CONFIG_ENV' not set"
+    "trusted_server: config entry unavailable"
 run_case missing-handler "$((BASE_PORT + 1))" "$ENVELOPE" \
     "" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 500 \
-    "failed to resolve secret reference at \`handlers[0].password\`"
+    "handlers[0].password: native credential unavailable"
 run_case missing-proxy "$((BASE_PORT + 2))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "" "$SMOKE_EC_VALUE" 500 \
-    "failed to resolve secret reference at \`publisher.proxy_secret\`"
+    "publisher.proxy_secret: native credential unavailable"
 run_case missing-ec "$((BASE_PORT + 3))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "" 500 \
-    "failed to resolve secret reference at \`ec.passphrase\`"
+    "ec.passphrase: native credential unavailable"
 run_case positive "$((BASE_PORT + 4))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 200
 

@@ -17,10 +17,18 @@ Authenticate the Tinybird CLI against the intended workspace, change to this
 directory, run `tb test`, inspect `tb deploy --dry-run`, and deploy with
 `tb deploy`. Do not commit workspace tokens or generated local credentials.
 
-Create an APPEND token scoped to `auction_events_raw`, store its value in the
-platform secret store, and put only its key name in
-`tinybird.auction_token_secret`. The runtime sends directly to the regional
-Events API host configured by `tinybird.api_host`.
+Create an APPEND token restricted to `auction_events_raw` outside Trusted Server.
+Enable Tinybird with its regional DNS `api_host`, optionally including an HTTPS
+`:port`, and exact `auction_dataset`, then
+review a generated plan and provision `tinybird.auction` through secure input.
+Do not add a token-name property to app config. The binding includes the Events
+endpoint and dataset, so a changed destination needs newly approved provisioning.
+`api_host` must not include a scheme, path, userinfo, query, or fragment. Explicit
+port `443` normalizes away; other valid ports remain part of the bound endpoint.
+See [Provision app credentials](../docs/guide/secrets.md) and
+[CI provisioning](../docs/guide/secrets-ci.md). Recreate state after writes and
+verify an actual approved event at the recipient. The Fastly fire-and-forget
+sink does not observe delivery or the response status.
 
 For runtime behavior, limits, privacy properties, and the Fastly-only emission
 boundary, see [Auction Telemetry](../docs/guide/telemetry.md). For exact

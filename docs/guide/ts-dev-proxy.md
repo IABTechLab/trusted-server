@@ -377,11 +377,10 @@ Configure the upstream application with this optional section:
 ```toml
 [trusted_forwarder]
 auth_header = "x-ts-forwarder-auth"
-shared_secret = "trusted_forwarder_shared_secret"
 ```
 
-`shared_secret` names a server secret-store key; provision that key with the
-actual token bytes from the local file, excluding its line terminator. The publisher domain or its subdomains must
+Provision the generated `forwarder.shared` binding from the reviewed
+[`ts secrets plan`](./secrets) with the actual token bytes from the local file, excluding its line terminator. No credential property belongs in app config. The publisher domain or its subdomains must
 cover every mapped browser hostname. Omitting the section keeps the server's
 default transport-origin behavior.
 

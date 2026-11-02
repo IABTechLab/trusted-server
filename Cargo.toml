@@ -56,12 +56,13 @@ cssparser = "0.36"
 derive_more = { version = "2.0", features = ["display", "error"] }
 directories = "5"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
-edgezero-adapter-axum = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.11", default-features = false }
-edgezero-adapter-cloudflare = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.11", default-features = false }
-edgezero-adapter-fastly = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.11", default-features = false }
-edgezero-adapter-spin = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.11", default-features = false }
-edgezero-cli = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.11" }
-edgezero-core = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.11", default-features = false }
+# The implicit-secret companion includes the ingress/pre-dispatch APIs from v0.0.11.
+edgezero-adapter-axum = { git = "https://github.com/IABTechLab/edgezero", rev = "c199355e5893fe58e050ed7bae8c5f8462e2f511", default-features = false }
+edgezero-adapter-cloudflare = { git = "https://github.com/IABTechLab/edgezero", rev = "c199355e5893fe58e050ed7bae8c5f8462e2f511", default-features = false }
+edgezero-adapter-fastly = { git = "https://github.com/IABTechLab/edgezero", rev = "c199355e5893fe58e050ed7bae8c5f8462e2f511", default-features = false }
+edgezero-adapter-spin = { git = "https://github.com/IABTechLab/edgezero", rev = "c199355e5893fe58e050ed7bae8c5f8462e2f511", default-features = false }
+edgezero-cli = { git = "https://github.com/IABTechLab/edgezero", rev = "c199355e5893fe58e050ed7bae8c5f8462e2f511" }
+edgezero-core = { git = "https://github.com/IABTechLab/edgezero", rev = "c199355e5893fe58e050ed7bae8c5f8462e2f511", default-features = false }
 env_logger = "0.11"
 error-stack = "0.6"
 esi = "0.7.2"

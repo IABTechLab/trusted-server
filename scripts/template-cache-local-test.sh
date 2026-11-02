@@ -31,6 +31,10 @@ if [ "$MODE" = "purge" ]; then
   CONFIG_MODE="esi"
 fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/smoke-common.sh
+. "$REPO_ROOT/scripts/smoke-common.sh"
+smoke_use_local_store_mappings trusted_server_config
+smoke_require_command jq
 WORK="$(mktemp -d)"
 ORIGIN_PORT="${ORIGIN_PORT:-9099}"
 BID_PORT="${BID_PORT:-9100}"
@@ -391,24 +395,18 @@ content = content.replace(marker, f"{marker}{backend}\n", 1)
 open(manifest, "w").write(content)
 PYEOF
 
-python3 - "$WORK/fastly.toml" <<'PYEOF'
-import sys
-
-with open(sys.argv[1], "a") as manifest:
-    manifest.write('''
-[[local_server.secret_stores.trusted_server_secrets]]
-key = "publisher_proxy_secret"
-data = "fictional-local-publisher-proxy-secret-value"
-
-[[local_server.secret_stores.trusted_server_secrets]]
-key = "ec_passphrase"
-data = "fictional-local-ec-passphrase-secret-value"
-
-[[local_server.secret_stores.trusted_server_secrets]]
-key = "handler_password"
-data = "fictional-local-handler-password-secret-value"
-''')
-PYEOF
+# Replace only copied app-credential fixtures. Signing/management fixtures and
+# the cache/backend configuration remain unchanged. Keys and native names come
+# from the production compiler/renderer, never a second hash implementation.
+SMOKE_APP_CONFIG="$WORK/app.toml"
+smoke_generate_bindings "$REPO_ROOT" "$WORK" fastly
+awk '
+  /^# BEGIN GENERATED APP SECRET FIXTURES/ { skip = 1; next }
+  /^# END GENERATED APP SECRET FIXTURES/ { skip = 0; next }
+  !skip { print }
+' "$WORK/fastly.toml" >"$WORK/fastly.without-app-secrets.toml"
+mv "$WORK/fastly.without-app-secrets.toml" "$WORK/fastly.toml"
+smoke_append_fastly_bindings "$WORK/fastly.toml"
 
 ln -s "$REPO_ROOT/crates" "$WORK/crates"
 (cd "$WORK" && "$TS" config push --adapter fastly --local \
@@ -794,11 +792,10 @@ fi
 if [ "$MODE" = "purge" ]; then
   info "Purge invalidates the shared template"
 
-  # The config's `password = "handler_password"` is a secret-store *reference*; the basic
-  # auth value is the seeded secret itself. Read it back from the generated manifest so
-  # this cannot drift from the seeding block above.
-  ADMIN_PASSWORD=$(awk -F'"' '/^key = "handler_password"/ { found = 1; next } \
-    found && /^data = / { print $2; exit }' "$WORK/fastly.toml")
+  # Read the public fictional value from the same compiler-generated fixture
+  # output that seeded Viceroy, selecting the role rather than a physical key.
+  ADMIN_PASSWORD=$(jq -er '.[] | select(.descriptor_id == "handler.password") | .value' \
+    "$SMOKE_BINDINGS")
   if [ -z "$ADMIN_PASSWORD" ]; then
     bad "could not read the seeded admin password from the generated manifest"
     ADMIN_PASSWORD="unreadable"

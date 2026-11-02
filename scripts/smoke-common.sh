@@ -178,6 +178,14 @@ smoke_resolve_ts_binary() {
     SMOKE_TS_BIN="$candidate"
 }
 
+# Keep local runs independent of deployment selectors inherited from the shell.
+# The pure fixture renderer uses the logical secret-store name on every adapter.
+smoke_use_local_store_mappings() {
+    export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME="$1"
+    export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY=trusted_server_config
+    export EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=trusted_server_secrets
+}
+
 smoke_initialize_config() {
     local repository="$1"
     local workspace="$2"
@@ -194,9 +202,35 @@ smoke_initialize_config() {
 }
 
 SMOKE_CONFIG_ENV=TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG
-SMOKE_HANDLER_ENV=TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD
-SMOKE_PROXY_ENV=TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET
-SMOKE_EC_ENV=TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE
-SMOKE_HANDLER_VALUE=smoke-admin-password-32-bytes-ok
-SMOKE_PROXY_VALUE=smoke-publisher-proxy-secret-32-bytes
-SMOKE_EC_VALUE=smoke-edge-cookie-passphrase-32-bytes
+
+# This is the existing Rust integration generator, not a second hash/mapping
+# implementation. All values emitted in this mode are public fictional fixtures.
+smoke_generate_bindings() {
+    local repository="$1"
+    local workspace="$2"
+    local adapter="$3"
+    local host
+    host=$(rustc -vV | sed -n 's/^host: //p')
+    SMOKE_GENERATOR="${GENERATOR_BIN:-$repository/crates/trusted-server-integration-tests/target/$host/debug/generate-viceroy-config}"
+    # Cargo checks freshness for the default generator; explicit overrides are caller-owned.
+    if [ -z "${GENERATOR_BIN:-}" ]; then
+        cargo build --manifest-path "$repository/Cargo.toml" \
+            -p trusted-server-integration-tests --bin generate-viceroy-config \
+            --target-dir "$repository/crates/trusted-server-integration-tests/target" --target "$host"
+    fi
+    SMOKE_BINDINGS="$workspace/bindings.json"
+    "$SMOKE_GENERATOR" --bindings-only --adapter "$adapter" \
+        --app-config "$SMOKE_APP_CONFIG" --output "$SMOKE_BINDINGS"
+    SMOKE_HANDLER_ENV=$(jq -er '.[] | select(.descriptor_id == "handler.password") | .native.native_name' "$SMOKE_BINDINGS")
+    SMOKE_PROXY_ENV=$(jq -er '.[] | select(.descriptor_id == "publisher.proxy") | .native.native_name' "$SMOKE_BINDINGS")
+    SMOKE_EC_ENV=$(jq -er '.[] | select(.descriptor_id == "ec.passphrase") | .native.native_name' "$SMOKE_BINDINGS")
+    SMOKE_HANDLER_VALUE=$(jq -er '.[] | select(.descriptor_id == "handler.password") | .value' "$SMOKE_BINDINGS")
+    SMOKE_PROXY_VALUE=$(jq -er '.[] | select(.descriptor_id == "publisher.proxy") | .value' "$SMOKE_BINDINGS")
+    SMOKE_EC_VALUE=$(jq -er '.[] | select(.descriptor_id == "ec.passphrase") | .value' "$SMOKE_BINDINGS")
+}
+
+smoke_append_fastly_bindings() {
+    local destination="$1"
+    jq -r '.[] | "\n[[local_server.secret_stores.trusted_server_secrets]]\nkey = \(.native.native_name | tojson)\ndata = \(.value | tojson)"' \
+        "$SMOKE_BINDINGS" >>"$destination"
+}

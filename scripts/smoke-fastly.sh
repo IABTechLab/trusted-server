@@ -6,10 +6,12 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=scripts/smoke-common.sh
 . "$REPO_ROOT/scripts/smoke-common.sh"
+smoke_use_local_store_mappings trusted_server_config
 
 smoke_require_command cargo
 smoke_require_command curl
 smoke_require_command fastly
+smoke_require_command jq
 smoke_require_command python3
 smoke_require_command pgrep
 
@@ -68,6 +70,7 @@ fi
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
 ORIGIN_PID=$SMOKE_ORIGIN_PID
 smoke_initialize_config "$FASTLY_PROJECT" "$WORKSPACE" "$ORIGIN_PORT"
+smoke_generate_bindings "$REPO_ROOT" "$WORKSPACE" fastly
 
 run_case() {
     local case_name="$1"
@@ -137,7 +140,7 @@ write_without_secret() {
 }
 
 run_case missing-config "$BASE_PORT" 500 \
-    "key 'trusted_server_config' not found in config store 'trusted_server_config'"
+    "trusted_server: config entry unavailable"
 
 (
     cd "$FASTLY_PROJECT"
@@ -149,32 +152,19 @@ run_case missing-config "$BASE_PORT" 500 \
         --yes \
         --no-diff
 )
-cat >>"$FASTLY_MANIFEST" <<EOF
-
-[[local_server.secret_stores.trusted_server_secrets]]
-key = "handler_password"
-data = "$SMOKE_HANDLER_VALUE"
-
-[[local_server.secret_stores.trusted_server_secrets]]
-key = "publisher_proxy_secret"
-data = "$SMOKE_PROXY_VALUE"
-
-[[local_server.secret_stores.trusted_server_secrets]]
-key = "ec_passphrase"
-data = "$SMOKE_EC_VALUE"
-EOF
+smoke_append_fastly_bindings "$FASTLY_MANIFEST"
 CONFIGURED_FASTLY="$WORKSPACE/fastly.toml.configured"
 cp "$FASTLY_MANIFEST" "$CONFIGURED_FASTLY"
 
-write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" handler_password
+write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" "$SMOKE_HANDLER_ENV"
 run_case missing-handler "$((BASE_PORT + 1))" 500 \
-    "failed to resolve secret reference at \`handlers[0].password\`"
-write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" publisher_proxy_secret
+    "handlers[0].password: native credential unavailable"
+write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" "$SMOKE_PROXY_ENV"
 run_case missing-proxy "$((BASE_PORT + 2))" 500 \
-    "failed to resolve secret reference at \`publisher.proxy_secret\`"
-write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" ec_passphrase
+    "publisher.proxy_secret: native credential unavailable"
+write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" "$SMOKE_EC_ENV"
 run_case missing-ec "$((BASE_PORT + 3))" 500 \
-    "failed to resolve secret reference at \`ec.passphrase\`"
+    "ec.passphrase: native credential unavailable"
 
 cp "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST"
 run_case positive "$((BASE_PORT + 4))" 200

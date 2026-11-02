@@ -6,6 +6,7 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=scripts/smoke-common.sh
 . "$REPO_ROOT/scripts/smoke-common.sh"
+smoke_use_local_store_mappings TRUSTED_SERVER_KV
 
 smoke_require_command bash
 smoke_require_command cargo
@@ -45,6 +46,7 @@ fi
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
 ORIGIN_PID=$SMOKE_ORIGIN_PID
 smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT"
+smoke_generate_bindings "$REPO_ROOT" "$WORKSPACE" cloudflare
 
 CLOUDFLARE_WORK="$WORKSPACE/cloudflare"
 mkdir -p "$CLOUDFLARE_WORK"
@@ -88,14 +90,13 @@ write_runtime_config() {
     if [ -n "$config_json" ]; then
         config_line="TRUSTED_SERVER_CONFIG = '''$config_json'''"
     fi
-    CLOUDFLARE_SMOKE_CONFIG_LINE="$config_line" awk \
-        -v missing_key="$missing_key" \
-        -v handler="$SMOKE_HANDLER_VALUE" \
-        -v proxy="$SMOKE_PROXY_VALUE" \
-        -v ec="$SMOKE_EC_VALUE" '
+    CLOUDFLARE_SMOKE_CONFIG_LINE="$config_line" awk '
         BEGIN {
             config_line = ENVIRON["CLOUDFLARE_SMOKE_CONFIG_LINE"]
         }
+        /^# BEGIN GENERATED APP SECRET FIXTURES/ { skip = 1; next }
+        /^# END GENERATED APP SECRET FIXTURES/ { skip = 0; next }
+        skip { next }
         $0 == "TRUSTED_SERVER_CONFIG = \"{}\"" {
             placeholders++
             if (config_line != "") {
@@ -109,17 +110,10 @@ write_runtime_config() {
                 print "Cloudflare smoke template must contain one config placeholder" > "/dev/stderr"
                 exit 1
             }
-            if (missing_key != "handler_password") {
-                print "handler_password = \"" handler "\""
-            }
-            if (missing_key != "publisher_proxy_secret") {
-                print "publisher_proxy_secret = \"" proxy "\""
-            }
-            if (missing_key != "ec_passphrase") {
-                print "ec_passphrase = \"" ec "\""
-            }
         }
     ' "$CLOUDFLARE_WORK/wrangler.ci.toml" >"$destination"
+    jq -r --arg missing "$missing_key" '.[] | select(.native.native_name != $missing) | "\(.native.native_name) = \(.value | tojson)"' \
+        "$SMOKE_BINDINGS" >>"$destination"
 }
 
 run_case() {
@@ -160,7 +154,7 @@ run_case() {
             smoke_die "negative case unexpectedly exposed $missing_binding"
         fi
         if [ "$missing_binding" = "env.TRUSTED_SERVER_CONFIG" ]; then
-            grep --fixed-strings --quiet 'env.handler_password' "$log_path" ||
+            grep --fixed-strings --quiet "env.$SMOKE_HANDLER_ENV" "$log_path" ||
                 smoke_die "missing-config case did not retain the secret control binding"
         else
             grep --fixed-strings --quiet 'env.TRUSTED_SERVER_CONFIG' "$log_path" ||
@@ -178,15 +172,15 @@ run_case() {
 run_case missing-config "$BASE_PORT" "" "" 500 \
     'env.TRUSTED_SERVER_CONFIG' \
     'Cloudflare TRUSTED_SERVER_CONFIG is required'
-run_case missing-handler "$((BASE_PORT + 1))" "$CONFIG_JSON" handler_password 500 \
-    'env.handler_password' \
-    "failed to resolve secret reference at \`handlers[0].password\` from secret store \`trusted_server_secrets\`"
-run_case missing-proxy "$((BASE_PORT + 2))" "$CONFIG_JSON" publisher_proxy_secret 500 \
-    'env.publisher_proxy_secret' \
-    "failed to resolve secret reference at \`publisher.proxy_secret\` from secret store \`trusted_server_secrets\`"
-run_case missing-ec "$((BASE_PORT + 3))" "$CONFIG_JSON" ec_passphrase 500 \
-    'env.ec_passphrase' \
-    "failed to resolve secret reference at \`ec.passphrase\` from secret store \`trusted_server_secrets\`"
+run_case missing-handler "$((BASE_PORT + 1))" "$CONFIG_JSON" "$SMOKE_HANDLER_ENV" 500 \
+    "env.$SMOKE_HANDLER_ENV" \
+    "handlers[0].password: native credential unavailable"
+run_case missing-proxy "$((BASE_PORT + 2))" "$CONFIG_JSON" "$SMOKE_PROXY_ENV" 500 \
+    "env.$SMOKE_PROXY_ENV" \
+    "publisher.proxy_secret: native credential unavailable"
+run_case missing-ec "$((BASE_PORT + 3))" "$CONFIG_JSON" "$SMOKE_EC_ENV" 500 \
+    "env.$SMOKE_EC_ENV" \
+    "ec.passphrase: native credential unavailable"
 run_case positive "$((BASE_PORT + 4))" "$CONFIG_JSON" "" 200 "" ""
 
 echo "Cloudflare first-success smoke passed"

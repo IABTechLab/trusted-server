@@ -37,6 +37,15 @@ sequenceDiagram
 | **Object Store** | Source of truth | Durable, supports range queries, sync endpoint            |
 | **Secret Key**   | Shared salt     | Distributed out-of-band, enables a data sharing agreement |
 
+## App credential boundary
+
+This collective-sync description is not a new secret-binding selector or provider
+writer. For the implemented partner pull flow, `ec.pull` binds the normalized
+partner domain and exact HTTPS endpoint; inbound APIs use separate `ec.inbound`
+authentication with `api_token_enabled = true`. Use [reviewed provisioning](./secrets),
+not a mutable allowlist or shared credential reference, to authorize a target.
+Request-signing/management stores remain separate.
+
 ## Configuration
 
 Add the following to your `trusted-server.toml`:

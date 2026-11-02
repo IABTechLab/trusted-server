@@ -46,9 +46,11 @@ logical store is wired for runtime reads on every target.
 ## Blob and chunk flow
 
 `config push` serializes validated settings into one EdgeZero
-`BlobEnvelope`. Store-backed settings contain secret key names, not secret
-values; the adapter resolves those keys from the logical secret store during
-startup.
+`BlobEnvelope`. App config contains ordinary feature, identity, and destination
+settings, not credential values or references. Core compiles active purposes
+and derives the only allowed native lookups in `trusted_server_secrets` during
+startup. Use a [reviewed binding plan](./secrets) for provisioning; config
+publication does not authorize new targets or write secrets.
 
 When a Fastly envelope exceeds one Config Store entry, the writer stores
 bounded chunks and replaces the root value with a versioned
@@ -63,11 +65,12 @@ store before deletion, especially when using `--store` or `--no-env`.
 
 ## Safe operator sequence
 
-1. Put required secret values in the physical store mapped from
-   `trusted_server_secrets`.
+1. Review ordinary config and a generated credential plan, then provision its
+   native identities in the physical store mapped from `trusted_server_secrets`.
+   Use [secure input](./secrets); no credential properties belong in app config.
 2. Run `ts config validate`.
-3. Review `ts config diff --adapter ADAPTER`; use `--no-diff` when
-   deliberately inline configuration must not appear in logs.
+3. Review `ts config diff --adapter ADAPTER`; use `--no-diff` to suppress the
+   push preview where ordinary deployment metadata must not appear in logs.
 4. Run `ts config push --adapter ADAPTER`.
 5. Start or deploy the adapter and verify a non-health publisher route. A
    healthy endpoint alone may not prove that application configuration loaded.
