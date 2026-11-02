@@ -1,6 +1,14 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::io::Read as _;
+use std::io::Write as _;
+use std::process::Stdio;
+#[cfg(target_os = "linux")]
+use std::sync::mpsc;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 use clap::Parser;
 use edgezero_cli::fastly_secrets::{FastlySecretResponse, FastlySecretTransport};
@@ -8,6 +16,318 @@ use tempfile::TempDir;
 use trusted_server_core::secret_bindings::{axum_secret_name, spin_secret_name};
 
 use super::*;
+
+#[test]
+fn secrets_cli_reports_load_diagnostics_without_removed_values() {
+    for (config, expected) in [
+        (
+            CONFIG.replace(
+                "domain = \"publisher.example.com\"",
+                "domian = \"publisher.example.com\"",
+            ),
+            "domain",
+        ),
+        (
+            CONFIG.replace(
+                "[publisher]",
+                "[publisher]\nproxy_secret = 'fictional-removed-credential'",
+            ),
+            "publisher.proxy_secret",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fs::write(fixture.temp.path().join("trusted-server.toml"), config)
+            .expect("should write invalid config");
+        let (result, output) =
+            fixture.run(&["plan", "--adapter", "fastly"], &mut FakeInput::default());
+        let error = result.expect_err("should retain actionable configuration diagnostics");
+        assert!(error.contains("could not load effective unresolved app configuration:"));
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("fictional-removed-credential"));
+        assert!(output.is_empty());
+        assert!(fixture.transport.methods.borrow().is_empty());
+    }
+}
+
+#[test]
+fn secrets_cli_push_validation_precedes_provider_plan_and_input() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.temp.path().join("trusted-server.toml"),
+        CONFIG.replace(
+            "domain = \"publisher.example.com\"",
+            "domain = \"invalid/domain\"",
+        ),
+    )
+    .expect("should write structurally valid but push-invalid config");
+    for args in [
+        vec!["plan", "--adapter", "fastly"],
+        vec![
+            "check",
+            "--adapter",
+            "fastly",
+            "--plan",
+            "missing-plan.json",
+        ],
+        vec![
+            "set",
+            "publisher.proxy",
+            "--adapter",
+            "fastly",
+            "--plan",
+            "missing-plan.json",
+            "--stdin",
+            "--yes",
+        ],
+    ] {
+        let mut input = FakeInput::default();
+        let (result, output) = fixture.run(&args, &mut input);
+        let error = result.expect_err("should reject before deployment resolution or plan reads");
+        assert!(
+            error.contains("could not validate effective unresolved app configuration:"),
+            "{error}"
+        );
+        assert!(error.contains("domain"), "{error}");
+        assert!(output.is_empty());
+        assert_eq!(input.reads, 0);
+        assert!(fixture.transport.methods.borrow().is_empty());
+    }
+}
+
+#[test]
+fn secrets_cli_fixture_clears_ambient_selectors_but_allows_explicit_environment_tests() {
+    let fixture = Fixture::new();
+    temp_env::with_vars(
+        [
+            ("FASTLY_SERVICE_ID", Some("ConflictingFictionalService")),
+            (
+                "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
+                Some("other-fictional-store"),
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
+                Some("other-fictional-config"),
+            ),
+            (
+                "EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME",
+                Some("other-fictional-kv"),
+            ),
+        ],
+        || {
+            fixture.plan();
+            for adapter in ["axum", "spin"] {
+                let (result, output) =
+                    fixture.run(&["plan", "--adapter", adapter], &mut FakeInput::default());
+                result.expect("should ignore developer selectors");
+                let plan: Value = serde_json::from_str(&output).expect("should render native plan");
+                assert_eq!(plan["resources"]["runtime_secret_store"], SECRET_STORE_ID);
+            }
+        },
+    );
+    let (result, _) = fixture.run_with_env(
+        &["plan", "--adapter", "fastly"],
+        &mut FakeInput::default(),
+        &[("FASTLY_SERVICE_ID", Some("ConflictingFictionalService"))],
+    );
+    assert!(
+        result
+            .expect_err("should still test explicit service environment selection")
+            .contains("conflicts")
+    );
+    let (result, output) = fixture.run_with_env(
+        &["plan", "--adapter", "axum"],
+        &mut FakeInput::default(),
+        &[(
+            "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
+            Some("explicit-fictional-store"),
+        )],
+    );
+    result.expect("should retain explicit store environment selection coverage");
+    let plan: Value = serde_json::from_str(&output).expect("should render selected mapping");
+    assert_eq!(
+        plan["resources"]["runtime_secret_store"],
+        "explicit-fictional-store"
+    );
+}
+
+// Run in a subprocess so Terminal reads real process stdin and /dev/tty without
+// redirecting descriptors or changing terminal state in the parallel test runner.
+#[test]
+#[ignore = "subprocess entry point for real pipe and PTY tests"]
+fn secrets_cli_terminal_subprocess() {
+    let mode = std::env::var("TS_TEST_TERMINAL_MODE").expect("should select fictional input mode");
+    let fixture = Fixture::new();
+    fixture.plan();
+    let plan = fixture.temp.path().join("plan.json").display().to_string();
+    let mut args = vec![
+        "set",
+        "publisher.proxy",
+        "--adapter",
+        "fastly",
+        "--plan",
+        &plan,
+        "--yes",
+    ];
+    if mode != "hidden" {
+        args.push("--stdin");
+    }
+    let (result, output) = fixture.run(&args, &mut Terminal);
+    assert!(!output.contains("fictional terminal credential"));
+    match mode.as_str() {
+        "pipe" | "hidden" => {
+            assert_eq!(
+                result.expect("should accept exact real input"),
+                RunOutcome::Success
+            );
+            assert_eq!(fixture.transport.mutation_paths.borrow().len(), 1);
+            assert_eq!(
+                fixture
+                    .transport
+                    .values
+                    .borrow()
+                    .values()
+                    .next()
+                    .map(String::as_str),
+                Some("ICBmaWN0aW9uYWwgdGVybWluYWwgY3JlZGVudGlhbCAg")
+            );
+        }
+        "line-break" | "terminal" => {
+            let error = result.expect_err("should reject unsafe stdin");
+            assert!(
+                error.contains(if mode == "terminal" {
+                    "requires piped input"
+                } else {
+                    "ends with a line break"
+                }),
+                "{error}"
+            );
+            assert!(!error.contains("fictional terminal credential"));
+            assert!(fixture.transport.mutation_paths.borrow().is_empty());
+            assert!(fixture.transport.values.borrow().is_empty());
+        }
+        _ => panic!("unknown fictional input mode"),
+    }
+}
+
+fn terminal_test_command(mode: &str) -> std::process::Command {
+    let mut command =
+        std::process::Command::new(std::env::current_exe().expect("should find test binary"));
+    command.args([
+        "--ignored",
+        "--exact",
+        "commands::secrets::tests::secrets_cli_terminal_subprocess",
+        "--nocapture",
+    ]);
+    command.env("TS_TEST_TERMINAL_MODE", mode);
+    command
+}
+
+#[test]
+fn secrets_cli_real_pipes_preserve_bytes_and_reject_trailing_line_breaks_without_writes() {
+    for suffix in ["", "\n", "\r", "\r\n"] {
+        let mut child = terminal_test_command(if suffix.is_empty() {
+            "pipe"
+        } else {
+            "line-break"
+        })
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("should start isolated real-input test");
+        write!(
+            child.stdin.take().expect("should have pipe"),
+            "  fictional terminal credential  {suffix}"
+        )
+        .expect("should pipe fictional bytes");
+        let output = child
+            .wait_with_output()
+            .expect("should collect real-input result");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fictional terminal credential"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("fictional terminal credential"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn secrets_cli_real_pty_rejects_stdin_and_keeps_hidden_input_private() {
+    for mode in ["terminal", "hidden"] {
+        let executable = std::env::current_exe().expect("should find test binary");
+        let shell_command = format!(
+            "'{}' --ignored --exact commands::secrets::tests::secrets_cli_terminal_subprocess --nocapture",
+            executable.display().to_string().replace('\'', "'\\''")
+        );
+        let mut child = std::process::Command::new("script")
+            .args([
+                "--quiet",
+                "--return",
+                "--command",
+                &shell_command,
+                "/dev/null",
+            ])
+            .env("TS_TEST_TERMINAL_MODE", mode)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("real PTY tests require util-linux script");
+        let mut stdin = child.stdin.take().expect("should have PTY input pipe");
+        let mut stdout = child.stdout.take().expect("should have PTY output pipe");
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut buffer = [0; 1024];
+            while let Ok(length) = stdout.read(&mut buffer) {
+                if length == 0 || sender.send(buffer[..length].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut output = Vec::new();
+        let mut sent = false;
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(15)) {
+                Ok(bytes) => {
+                    output.extend(bytes);
+                    if mode == "hidden"
+                        && !sent
+                        && String::from_utf8_lossy(&output).contains("Credential, input hidden:")
+                    {
+                        // rpassword prints the prompt before disabling echo. Wait for
+                        // that transition before simulating a person typing.
+                        std::thread::sleep(Duration::from_millis(100));
+                        stdin
+                            .write_all(b"  fictional terminal credential  \n")
+                            .expect("should type fictional hidden input");
+                        stdin.flush().expect("should deliver hidden input");
+                        sent = true;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    child.kill().expect("should stop stalled PTY test");
+                    panic!("real PTY input test timed out");
+                }
+            }
+        }
+        reader.join().expect("should collect PTY reader");
+        let result = child.wait_with_output().expect("should wait for PTY test");
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output).contains("fictional terminal credential"));
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("fictional terminal credential"));
+        assert_eq!(sent, mode == "hidden");
+    }
+}
 
 #[test]
 fn secrets_cli_hidden_input_preserves_permitted_whitespace_and_requires_confirmation() {
@@ -315,8 +635,9 @@ fn secrets_cli_identical_handler_owners_share_physical_declarations() {
     let fixture = Fixture::new();
     fs::write(
         fixture.temp.path().join("trusted-server.toml"),
-        format!("{CONFIG}\n[[handlers]]\npath='^/_ts/admin'\nusername='admin'\n[[handlers]]\npath='^/_ts/admin'\nusername='admin'\n"),
-    ).expect("should configure identical handler owners");
+        format!("{CONFIG}\n[[handlers]]\npath='^/_ts/admin'\nusername='admin'\n"),
+    )
+    .expect("should configure identical handler owners");
     for adapter in ["spin", "cloudflare"] {
         let (result, output) =
             fixture.run(&["plan", "--adapter", adapter], &mut FakeInput::default());
@@ -465,7 +786,7 @@ fn secrets_cli_declaration_coalescing_checks_full_context_store_key_and_renderin
         .iter()
         .filter(|binding| binding.descriptor_id() == "handler.password")
         .collect::<Vec<_>>();
-    assert_eq!(handlers.len(), 2);
+    assert_eq!(handlers.len(), 3);
     let native =
         render_native_with_mapping("spin", SECRET_STORE_ID, handlers[0].key(), SECRET_STORE_ID)
             .expect("should render the first native request");
@@ -523,6 +844,10 @@ origin_url = "https://upstream.publisher.example.com"
 enabled = true
 api_host = "api.example.com"
 auction_dataset = "auction_events"
+
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
 "#;
 
 #[derive(Debug, Parser)]
@@ -694,21 +1019,49 @@ component = "trusted-server"
             .command
     }
 
-    fn run(&self, args: &[&str], input: &mut FakeInput) -> (Result<RunOutcome, String>, String) {
-        let command = self.parse(args);
-        let mut output = Vec::new();
-        let result = execute(
-            &command,
-            &fastly::NativeProvider {
-                transport: Some(&self.transport),
-            },
-            input,
-            &mut output,
-        );
-        (
-            result,
-            String::from_utf8(output).expect("should emit UTF-8 metadata"),
-        )
+    fn run(
+        &self,
+        args: &[&str],
+        input: &mut dyn Interaction,
+    ) -> (Result<RunOutcome, String>, String) {
+        self.run_with_env(args, input, &[])
+    }
+
+    fn run_with_env(
+        &self,
+        args: &[&str],
+        input: &mut dyn Interaction,
+        overrides: &[(&str, Option<&str>)],
+    ) -> (Result<RunOutcome, String>, String) {
+        let mut environment = BTreeMap::from([
+            ("FASTLY_SERVICE_ID", None),
+            (
+                "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
+                None,
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
+                None,
+            ),
+            ("EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME", None),
+        ]);
+        environment.extend(overrides.iter().copied());
+        temp_env::with_vars(environment.into_iter().collect::<Vec<_>>(), || {
+            let command = self.parse(args);
+            let mut output = Vec::new();
+            let result = execute(
+                &command,
+                &fastly::NativeProvider {
+                    transport: Some(&self.transport),
+                },
+                input,
+                &mut output,
+            );
+            (
+                result,
+                String::from_utf8(output).expect("should emit UTF-8 metadata"),
+            )
+        })
     }
 
     fn plan(&self) -> Value {
@@ -742,7 +1095,7 @@ fn secrets_cli_plan_and_stdin_create_replace_use_actual_shared_transport() {
             .as_array()
             .expect("should list implicit roles")
             .len(),
-        3
+        4
     );
     let mut input = FakeInput {
         value: b"fictional-token-123".to_vec(),
@@ -964,7 +1317,7 @@ fn secrets_cli_all_four_native_plans_and_presence_only_checks() {
         result.expect("should render actual native mapping");
         let plan: Value = serde_json::from_str(&output).expect("should emit native plan");
         let entries = plan["entries"].as_array().expect("should have entries");
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 4);
         let name = entries[0]["native"]["native_name"]
             .as_str()
             .expect("should render native identity");
@@ -997,10 +1350,9 @@ fn secrets_cli_all_four_native_plans_and_presence_only_checks() {
         );
         assert!(output.contains("Presence only"));
         if matches!(adapter, "cloudflare" | "spin") {
-            assert!(
-                result
-                    .expect_err("should distinguish unsupported presence check")
-                    .contains("unsupported")
+            assert_eq!(
+                result.expect("should distinguish unsupported presence check"),
+                RunOutcome::Unsupported
             );
         } else {
             assert_eq!(

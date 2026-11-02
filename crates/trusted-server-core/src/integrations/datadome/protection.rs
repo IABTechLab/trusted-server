@@ -963,8 +963,16 @@ mod tests {
                 Vec::new(),
                 vec![("location", "https://unapproved.example/stolen")],
             );
-            let services =
-                build_services_with_secret_and_http_client(NoopSecretStore, http.clone());
+            let backend = Arc::new(crate::platform::test_support::RecordingBackend::default());
+            let services = crate::platform::RuntimeServices::builder()
+                .config_store(Arc::new(crate::platform::test_support::NoopConfigStore))
+                .secret_store(Arc::new(NoopSecretStore))
+                .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+                .backend(backend.clone())
+                .http_client(http.clone())
+                .geo(Arc::new(crate::platform::test_support::NoopGeo))
+                .client_info(crate::platform::ClientInfo::default())
+                .build();
             let settings = Settings::default();
             let mut request = request_for_filter();
             let decision = futures::executor::block_on(integration.filter_protection_request(
@@ -980,6 +988,16 @@ mod tests {
             assert_eq!(
                 http.recorded_request_uris(),
                 vec!["https://protection.example.com/validate-request"]
+            );
+            let specs = backend.specs();
+            assert_eq!(specs.len(), 1, "should create one Protection backend");
+            assert_eq!(
+                specs[0].host, "protection.example.com",
+                "should use the bound host"
+            );
+            assert!(
+                specs[0].certificate_check,
+                "should force certificate verification"
             );
         }
     }

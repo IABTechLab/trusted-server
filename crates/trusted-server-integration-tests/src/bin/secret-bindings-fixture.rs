@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use trusted_server_core::{
     config::TrustedServerAppConfig,
     platform::{BackendNamingPolicy, PlatformBackendSpec},
+    secret_bindings::compile_bindings,
 };
 use trusted_server_integration_tests::native_fixtures;
 
@@ -86,6 +87,31 @@ session_token_enabled = true
             })
         })
         .collect();
+    // Select expectations by the owning route's compiled field, not role order.
+    let plan = compile_bindings(config.settings())
+        .map_err(|error| format!("invalid fixture binding context: {error:?}"))?;
+    let mut s3_routes = serde_json::Map::new();
+    for (index, route) in config.settings().proxy.asset_routes.iter().enumerate() {
+        let mut credentials = serde_json::Map::new();
+        for (name, field) in [
+            ("access_id", "access_key_id"),
+            ("secret", "secret_access_key"),
+            ("session", "session_token"),
+        ] {
+            let path = format!("proxy.asset_routes[{index}].auth.{field}");
+            let entry = plan
+                .entries()
+                .iter()
+                .find(|entry| entry.field_path() == path)
+                .ok_or("missing route credential binding")?;
+            let fixture = native
+                .iter()
+                .find(|fixture| fixture.native.key == entry.key())
+                .ok_or("missing route native credential")?;
+            credentials.insert(name.to_owned(), json!(fixture.value));
+        }
+        s3_routes.insert(route.prefix.clone(), Value::Object(credentials));
+    }
     let data = serde_json::to_value(config)?;
     let round_trip: TrustedServerAppConfig = serde_json::from_value(data.clone())?;
     TrustedServerAppConfig::new(round_trip.into_settings())
@@ -128,7 +154,7 @@ session_token_enabled = true
             .map(|backend| json!({"name": backend.name, "url": format!("https://127.0.0.1:{port}")}))
             .map_err(|error| format!("backend prediction failed: {error:?}"))
     }).collect::<std::result::Result<_, _>>()?;
-    Ok(json!({"bindings": bindings, "cases": cases, "backends": backends}))
+    Ok(json!({"bindings": bindings, "s3_routes": s3_routes, "cases": cases, "backends": backends}))
 }
 
 fn main() -> Result<()> {
@@ -189,6 +215,50 @@ mod tests {
         }
         fn delete(&self, _: &StoreId, _: &str) -> std::result::Result<(), Report<PlatformError>> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn signature_expectations_use_each_routes_compiled_credentials() {
+        for adapter in ["fastly", "cloudflare", "spin"] {
+            let fixture = fixtures(adapter, 12340, 12341, 12342)
+                .expect("should generate route-specific fixtures");
+            let raw = fixture["cases"]["original"]
+                .as_str()
+                .expect("should contain original envelope");
+            let envelope: BlobEnvelope =
+                serde_json::from_str(raw).expect("should parse original envelope");
+            let config: TrustedServerAppConfig =
+                serde_json::from_value(envelope.into_data()).expect("should parse original config");
+            let plan = compile_bindings(config.settings()).expect("should compile original routes");
+            for (name, field) in [
+                ("access_id", "access_key_id"),
+                ("secret", "secret_access_key"),
+                ("session", "session_token"),
+            ] {
+                let mut values = std::collections::BTreeSet::new();
+                for (index, prefix) in ["/assets/", "/sink-control/", "/bad-cert/"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let path = format!("proxy.asset_routes[{index}].auth.{field}");
+                    let entry = plan
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.field_path() == path)
+                        .expect("should find the route's compiled field");
+                    let binding = fixture["bindings"]
+                        .as_array()
+                        .expect("should contain native fixtures")
+                        .iter()
+                        .find(|binding| binding["native"]["key"] == entry.key())
+                        .expect("should find the route's native fixture");
+                    let expected = &fixture["s3_routes"][prefix][name];
+                    assert_eq!(expected, &binding["value"], "should select {prefix} {name}");
+                    values.insert(expected.as_str().expect("should contain credential"));
+                }
+                assert_eq!(values.len(), 3, "should distinguish all routes for {name}");
+            }
         }
     }
 

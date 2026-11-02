@@ -48,9 +48,9 @@ printf '%s' "$TINYBIRD_AUCTION_TOKEN" |
 unset TINYBIRD_AUCTION_TOKEN
 ```
 
-`printf` is a Bash builtin. The value is piped over stdin, not passed to a subprocess on argv. `env -u` removes the source token from the CLI child environment. Never enable `set -x`, use `echo`, or write the value to a temporary artifact. `printf '%s'` does not append a newline. The CLI preserves input bytes and rejects invalid Bearer representation rather than trimming it.
+`printf` is a Bash builtin. The value is piped over stdin, not passed to a subprocess on argv. `env -u` removes the source token from the CLI child environment. Never enable `set -x`, use `echo`, or write the value to a temporary artifact. `printf '%s'` does not append a newline. The CLI never trims input. It rejects piped credentials ending in CR or LF for every role, as well as invalid Bearer representation.
 
-`--stdin` requires `--yes`. This replaces the interactive confirmation, not plan review. All preflight comparison and input validation still apply. A repeated role such as `ec.inbound` or `handler.password` also needs `--binding` with the tool-generated `entry_id` chosen from the reviewed plan. Do not use a raw key, an array position, or an operator-created label.
+`--stdin` requires `--yes` and piped input. It rejects an interactive terminal; omit `--stdin` for hidden terminal input. `--yes` replaces the interactive confirmation, not plan review. All preflight comparison and input validation still apply. A repeated role such as `ec.inbound` or `handler.password` also needs `--binding` with the tool-generated `entry_id` chosen from the reviewed plan. Do not use a raw key, an array position, or an operator-created label.
 
 ## Protected GitHub Actions example
 

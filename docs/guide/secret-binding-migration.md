@@ -30,7 +30,15 @@ Remove these properties everywhere, including disabled features, JSON blobs, com
 
 Both new flags default to `false` and accept booleans only, not strings. Do not forget inbound authentication when removing `api_token`. An enabled role missing its binding fails loading, rather than silently disabling authentication. Disabled roles make no native reads. Existing pull boolean/string activation follows its existing normalization; the string `"false"` does not enable it.
 
-Deprecated Tinybird/DataDome/S3 store selectors remain ignored, deserialize-only inputs; remove them. Tinybird's deprecated `access_token_secret` is still discarded, and `access_enabled = true` is still rejected. It is not a thirteenth role. Trusted-client-IP credentials already came from the native store; the old guide's inline-value description was wrong.
+Deprecated Tinybird/DataDome/S3 store selectors remain ignored, deserialize-only inputs; remove them. Tinybird's deprecated `access_token_secret` is still discarded, and `access_enabled = true` is still rejected. It is not an additional role. Trusted-client-IP credentials already came from the native store; the old guide's inline-value description was wrong.
+
+## Endpoint and credential compatibility
+
+Endpoint syntax is stricter, including on disabled features. Pull `pull_sync_url`, DataDome `protection_api_origin`, and authenticated S3 `origin_url` require HTTPS DNS names without queries, fragments, percent escapes, userinfo, IP literals, trailing dots, or whitespace. Authenticated S3 origins cannot contain a path. Tinybird `api_host` takes only a DNS hostname and optional port, not a scheme or path, and follows the same hostname restrictions. Remove or replace invalid parked endpoints before upgrading.
+
+The old binary preserved pull URL query parameters. Obtain a query-free endpoint from the partner before cutover if yours requires one. A nonempty `pull_sync_allowed_domains` may contain only the endpoint hostname, compared case-insensitively without trailing dots. Remove backup hosts and trailing dots from old allowlists. Pull sync now always verifies certificates, regardless of `proxy.certificate_check`.
+
+Partner-issued pull tokens need nonempty RFC 6750 Bearer representation, not a new 32-byte minimum. Enabled DataDome test-bypass credentials must have at least 32 bytes; a shorter value now fails the whole config load instead of disabling the bypass with a warning.
 
 ## New-schema example
 
@@ -87,7 +95,7 @@ The S3 hostname is fictional; production must use the approved HTTPS S3 origin t
 
    Use `--adapter axum`, `cloudflare`, or `spin` for native rendering. Review all generated names, declarations, service/store IDs, contexts, and versions. Retain the secret-free plan with the release record. Plan checksums detect drift, not approval.
 
-5. Supply existing raw credential bytes securely to the generated bindings using [interactive Fastly provisioning](./secrets#first-fastly-setup-with-tinybird) or [native provisioning](./secrets#axum-native-environment-input). No JSON wrapping is required. Do not copy legacy names into new TOML. If validation rejects a former credential, arrange a recipient-side replacement rather than trimming bytes or weakening validation. Provision each required role, including separate inbound/pull tokens and all active S3 roles.
+5. Supply existing raw credential bytes securely to the generated bindings using [interactive Fastly provisioning](./secrets#first-fastly-setup-with-tinybird) or [native provisioning](./secrets#axum-native-environment-input). No JSON wrapping is required. Do not copy legacy names into new TOML. Fastly secret-store entries and Cloudflare Worker secrets cannot be read back through their management APIs, so obtain each value from its source of record. If an `ec.passphrase` or `publisher.proxy` value is unrecoverable, migration becomes a rotation: passphrase-derived EC IDs change and outstanding encrypted first-party proxy and click URLs stop decoding. Values are no longer trimmed. The previous binary trimmed resolved S3, Tinybird, and DataDome server credentials, so stored surrounding whitespace or a trailing newline that worked before now fails validation or changes the outbound credential. `ts secrets set --stdin` rejects terminal input and trailing CR/LF for every role; use `printf '%s'` for piped input. Native runtime reads still preserve exact bytes. If validation rejects a former credential, arrange a recipient-side replacement rather than trimming bytes or weakening validation. Provision each required role, including separate inbound/pull tokens and all active S3 roles.
 6. Add generated native declarations where required. Spin requires both application and component declarations with protected value sources. Regenerate/review plans after manifest changes. Confirm presence where supported; Cloudflare/Spin TS checks are explicitly unsupported and nonzero. Fastly metadata and Axum environment presence do not prove stored bytes or runtime behavior.
 7. Deploy the matching new binary and config to the isolated version through the existing managed path. Recreate state, then exercise real approved requests and valid-checksum config-only mutations. Require zero unauthorized sends. Verify Tinybird at its approved dataset; do not interpret the fire-and-forget sink as response observation. Verify all four native mappings and config-writer permission separation before production cutover.
 8. Switch traffic only when the release gates pass. Track retained/in-flight old states. Within the owned rollback window, remove legacy raw-name entries and unused declarations/links only after no active, staged, or rollback version depends on them. Revoke at recipients if prior exposure is suspected.
@@ -104,7 +112,7 @@ Axum normally needs a process restart. Fastly needs fresh state/sandboxes, inclu
 
 ## Retire a context
 
-Changing a subject, endpoint, route policy, or binding ABI requires a new reviewed plan and newly provisioned bindings. Reordering entries does not. For each change:
+Changing a subject, endpoint, route policy, or binding ABI requires a new reviewed plan and newly provisioned bindings. Reordering entries keeps every key, so it needs no new bindings. It does change affected entries' `field_path` and entry ID, as well as the effective config fingerprint. `ts secrets check` and `ts secrets set` therefore still require a regenerated, reviewed plan. For each change:
 
 1. Compare old and new plans and approve the new destination/policy.
 2. Provision the new keys/declarations before switching the matching config and recreating state.
@@ -120,4 +128,4 @@ Before any rollback, identify the exact binary, compatible config snapshot, phys
 
 After the rollback deadline, remove legacy bindings. A later rollback then requires a fresh explicit authorization decision and secure reprovisioning; do not restore a raw-name fallback in the new binary. Document that any old-binary downgrade restores the original attack. Prefer a forward fix or disabling exporters, and include post-upgrade withdrawals/retained legacy data in the wider rollback decision.
 
-Request-signing and management credentials remain on their existing separately audited paths. Do not migrate `signing_keys`, `jwks_store`, `current-kid`, or management API identities through this app-credential procedure.
+Request-signing and management credentials remain on their existing separately audited paths. Do not migrate `signing_keys`, `jwks_store`, `current-kid`, or management API identities through this app-credential procedure. Signing reads now reject `current-kid` names in the reserved `ts1_` app-credential namespace before reading a secret, just as signing-key creation already does. This includes aliases under native name normalization. If a legacy signing key uses such a name, migrate it through the existing request-signing rotation procedure and select a nonreserved `current-kid` before upgrading. Deletion and deactivation remain available for legacy key cleanup.

@@ -555,6 +555,58 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_resolved_inbound_tokens_are_rejected() {
+        let token = valid_api_token("shared");
+        let settings = settings_with_test_bindings(&[
+            make_partner("first.example.com", &token),
+            make_partner("second.example.com", &token),
+        ]);
+        let error = PartnerRegistry::from_settings(&settings)
+            .expect_err("should reject equal resolved inbound credentials");
+        assert!(
+            format!("{error:?}").contains("collides"),
+            "should report a token-hash collision"
+        );
+    }
+
+    #[test]
+    fn loaded_pull_bindings_stay_with_their_own_partner() {
+        let pairs = [
+            ("alpha.example.com", "https://alpha-sync.example.com/pull"),
+            ("beta.example.com", "https://beta-sync.example.com/pull"),
+        ];
+        let partners = pairs
+            .iter()
+            .map(|(domain, endpoint)| {
+                let mut partner = make_partner(domain, &valid_api_token(domain));
+                partner.pull_sync_enabled = true;
+                partner.pull_sync_url = Some((*endpoint).to_owned());
+                partner.ts_pull_token =
+                    Some(Redacted::new(valid_api_token(&format!("{domain}-pull"))));
+                partner
+            })
+            .collect::<Vec<_>>();
+        let registry = registry_with_test_bindings(&partners);
+        for (domain, endpoint) in pairs {
+            let binding = registry
+                .get(domain)
+                .and_then(|partner| partner.pull_binding.as_ref())
+                .expect("should load the partner-specific pull binding");
+            assert_eq!(
+                binding.endpoint(),
+                Some(endpoint),
+                "should retain the partner-specific endpoint"
+            );
+            let expected = valid_api_token(&format!("{domain}-pull"));
+            assert_eq!(
+                binding.credential(),
+                expected,
+                "should retain the partner-specific token"
+            );
+        }
+    }
+
+    #[test]
     fn plain_partner_fields_cannot_enable_pull() {
         let mut partner = make_partner("ssp.example.com", &valid_api_token("shadow"));
         partner.api_token_enabled = false;
@@ -725,7 +777,12 @@ mod tests {
         partner.pull_sync_rate_limit = 0;
         partner.ts_pull_token = Some(Redacted::new("outbound-token".to_owned()));
 
-        let result = PartnerRegistry::from_config(&[partner]);
-        assert!(result.is_err(), "should reject zero pull_sync_rate_limit");
+        let settings = settings_with_test_bindings(&[partner]);
+        let error = PartnerRegistry::from_settings(&settings)
+            .expect_err("should reject zero pull_sync_rate_limit in a loaded partner");
+        assert!(
+            format!("{error:?}").contains("pull_sync_rate_limit"),
+            "should reject through rate-limit validation, not missing authority"
+        );
     }
 }

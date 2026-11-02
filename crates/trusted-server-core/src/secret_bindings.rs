@@ -1187,7 +1187,7 @@ fn validate_value(scope: &str, bytes: &[u8], path: &str) -> BindingResult<()> {
     }
     if matches!(
         scope,
-        "ecpass" | "ecin" | "ecpull" | "clientip" | "forwarder" | "ddbypass"
+        "ecpass" | "ecin" | "clientip" | "forwarder" | "ddbypass"
     ) && bytes.len() < 32
     {
         return Err(invalid(path, "credential below minimum length"));

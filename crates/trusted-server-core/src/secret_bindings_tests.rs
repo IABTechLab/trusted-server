@@ -594,7 +594,14 @@ fn bearer_grammar_is_rfc6750_and_never_trims() {
             assert!(validate_credential(scope, value.as_bytes()).is_err());
         }
     }
-    assert!(validate_credential("ecpull", b"short").is_err());
+    assert!(
+        validate_credential("ecpull", b"short").is_ok(),
+        "should accept a short partner-issued bearer token"
+    );
+    assert!(
+        validate_credential("ecin", b"short").is_err(),
+        "should retain the existing inbound-token minimum"
+    );
     assert!(validate_credential("unknown", b"fictional").is_err());
     assert!(validate_credential("clientip", b"  fictional-credential-0123456789-ABCD  ").is_err());
     assert!(validate_credential("ecin", &[b' '; 32]).is_err());

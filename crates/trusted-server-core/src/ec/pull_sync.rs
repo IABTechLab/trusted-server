@@ -664,26 +664,34 @@ mod tests {
     }
 
     #[test]
-    fn validated_pull_sync_url_rejects_http_scheme() {
-        let mut partner = pull_partner(3600);
+    fn pull_endpoint_rejects_http_scheme() {
+        let mut partner = pull_enabled_ec_partner("sync.partner.test");
         partner.pull_sync_url = Some("http://sync.partner.test/pull".to_owned());
-
-        let validated = validated_pull_sync_url(&partner);
+        let error = crate::secret_bindings::normalize_pull_endpoint(
+            &partner,
+            "ec.partners[0].pull_sync_url",
+        )
+        .expect_err("should reject the HTTP endpoint before loading credentials");
         assert!(
-            validated.is_none(),
-            "should reject pull_sync_url with HTTP scheme"
+            error.to_string().contains("invalid credential endpoint"),
+            "should reject endpoint syntax rather than missing loaded authority"
         );
     }
 
     #[test]
-    fn validated_pull_sync_url_rejects_non_allowlisted_host() {
-        let mut partner = pull_partner(3600);
+    fn pull_endpoint_rejects_non_allowlisted_host() {
+        let mut partner = pull_enabled_ec_partner("sync.partner.test");
         partner.pull_sync_url = Some("https://evil.test/pull".to_owned());
-
-        let validated = validated_pull_sync_url(&partner);
+        let error = crate::secret_bindings::normalize_pull_endpoint(
+            &partner,
+            "ec.partners[0].pull_sync_url",
+        )
+        .expect_err("should reject an endpoint outside the hostname assertion");
         assert!(
-            validated.is_none(),
-            "should reject runtime pull_sync_url host outside allowlist"
+            error
+                .to_string()
+                .contains("pull endpoint assertion mismatch"),
+            "should reject the host assertion rather than missing loaded authority"
         );
     }
 
@@ -898,6 +906,11 @@ mod tests {
             assert_eq!(
                 http.recorded_request_uris(),
                 vec![format!("https://sync.example.com/sync?ec_id={ec_id}")]
+            );
+            assert_eq!(
+                http.recorded_request_methods(),
+                vec!["GET".to_owned()],
+                "should send the pull request as GET"
             );
             let specs = backend.specs();
             assert_eq!(specs.len(), 1);

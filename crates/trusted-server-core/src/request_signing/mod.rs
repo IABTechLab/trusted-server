@@ -53,6 +53,14 @@ pub(crate) static JWKS_STORE_NAME: LazyLock<StoreName> =
 pub(crate) static SIGNING_STORE_NAME: LazyLock<StoreName> =
     LazyLock::new(|| StoreName::from(SIGNING_SECRET_STORE_NAME));
 
+// Keep signing reads and writes out of the app-credential namespace, including
+// aliases under the native environment-name normalization.
+fn is_app_credential_kid(kid: &str) -> bool {
+    kid.to_ascii_lowercase()
+        .replace(['-', '.', ' '], "_")
+        .starts_with("ts1_")
+}
+
 fn parse_active_kids(active_kids: &str) -> Vec<String> {
     active_kids
         .split(',')

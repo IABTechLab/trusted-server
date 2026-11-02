@@ -20,9 +20,11 @@ const hmac = (key, value) => createHmac('sha256', key).update(value).digest()
 const quote = JSON.stringify // JSON strings are also TOML basic strings.
 const sentinel = 'FICTIONAL_S3_ASSET'
 
-export function verifyS3(event, bindings) {
-  const value = (role) =>
-    bindings.find((binding) => binding.descriptor_id === role)?.value
+export function verifyS3(event, expected) {
+  assert.ok(
+    expected?.access_id && expected.secret && expected.session,
+    'expected route must provide all S3 credentials'
+  )
   const { headers, method, url } = event
   const match =
     /^AWS4-HMAC-SHA256 Credential=([^/]+)\/(\d{8})\/([^/]+)\/s3\/aws4_request, SignedHeaders=([^,]+), Signature=([a-f0-9]{64})$/.exec(
@@ -30,9 +32,17 @@ export function verifyS3(event, bindings) {
     )
   assert.ok(match, 'missing S3 SigV4 authorization')
   const [, access, date, region, signed, signature] = match
-  assert.equal(access, value('s3.access-id'))
+  assert.equal(
+    access,
+    expected.access_id,
+    'S3 access ID must match expected route'
+  )
   assert.equal(region, 'us-east-1')
-  assert.equal(headers['x-amz-security-token'], value('s3.session'))
+  assert.equal(
+    headers['x-amz-security-token'],
+    expected.session,
+    'S3 session token must match expected route'
+  )
   assert.equal(headers['x-amz-content-sha256'], 'UNSIGNED-PAYLOAD')
   const names = signed.split(';')
   assert.ok(names.includes('host') && names.includes('x-amz-security-token'))
@@ -57,7 +67,7 @@ export function verifyS3(event, bindings) {
     hash(canonical),
   ].join('\n')
   const key = hmac(
-    hmac(hmac(hmac(`AWS4${value('s3.secret')}`, date), region), 's3'),
+    hmac(hmac(hmac(`AWS4${expected.secret}`, date), region), 's3'),
     'aws4_request'
   )
   assert.equal(
@@ -519,7 +529,7 @@ export async function main(adapter) {
               `localhost:${expectedPort}`,
               'preserve signed Host authority including port'
             )
-            verifyS3(event, fixture.bindings)
+            verifyS3(event, fixture.s3_routes[`/${prefix}/`])
             results.push({
               case: `trusted-https-${prefix}`,
               method,
@@ -544,7 +554,7 @@ export async function main(adapter) {
                 prior + 1,
                 'redirect must not contact either sink'
               )
-              verifyS3(events.at(-1), fixture.bindings)
+              verifyS3(events.at(-1), fixture.s3_routes['/assets/'])
               results.push({
                 case: `redirect-${status}-${target}`,
                 method,

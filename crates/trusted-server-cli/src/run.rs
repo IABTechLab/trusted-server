@@ -97,6 +97,8 @@ pub enum RunOutcome {
     Success,
     /// Command ran successfully and found assertion drift.
     AssertionFailed,
+    /// The requested check is unsupported by this adapter.
+    Unsupported,
 }
 
 impl RunOutcome {
@@ -106,6 +108,7 @@ impl RunOutcome {
         match self {
             Self::Success => 0,
             Self::AssertionFailed => 1,
+            Self::Unsupported => 3,
         }
     }
 }
@@ -581,6 +584,7 @@ mod tests {
     fn run_outcomes_use_documented_exit_codes() {
         assert_eq!(RunOutcome::Success.exit_code(), 0);
         assert_eq!(RunOutcome::AssertionFailed.exit_code(), 1);
+        assert_eq!(RunOutcome::Unsupported.exit_code(), 3);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use edgezero_core::canonical_form::canonical_data_sha256;
 use serde::Serialize;
 use serde_json::{Value, json};
+use trusted_server_core::config::TrustedServerAppConfig;
 use trusted_server_core::secret_bindings::{
     BINDING_ABI_VERSION, CompiledBinding, NativeBinding, SECRET_STORE_ID, compile_bindings,
     render_native_with_mapping, validate_credential,
@@ -95,7 +96,7 @@ pub(crate) struct SetArgs {
     /// Tool-generated entry ID from the reviewed plan for a repeated purpose.
     #[arg(long)]
     binding: Option<String>,
-    /// Read exact credential bytes from stdin, without trimming. Requires --yes.
+    /// Read piped credential bytes without trimming; reject trailing CR/LF. Requires --yes.
     #[arg(long, requires = "yes")]
     stdin: bool,
     /// Approve the displayed operation noninteractively; does not authorize a plan.
@@ -161,11 +162,19 @@ impl Interaction for Terminal {
     }
 
     fn stdin(&mut self, max_bytes: usize) -> Result<Vec<u8>, String> {
+        if io::stdin().is_terminal() {
+            return Err("--stdin requires piped input; omit --stdin for hidden input".to_owned());
+        }
         let mut value = Vec::new();
         io::stdin()
             .take(max_bytes.saturating_add(1) as u64)
             .read_to_end(&mut value)
             .map_err(|_| "could not read credential input".to_owned())?;
+        if value.ends_with(b"\n") || value.ends_with(b"\r") {
+            return Err(
+                "credential input ends with a line break; pipe it with printf '%s'".to_owned(),
+            );
+        }
         Ok(value)
     }
 }
@@ -213,11 +222,15 @@ fn prepare(target: &TargetArgs, provider: &dyn Provider) -> Result<Prepared, Str
     if target.adapter != Adapter::Fastly && target.service_id.is_some() {
         return Err("--service-id is supported only with --adapter fastly".to_owned());
     }
-    let loaded = load_settings(&target.config)
-        .map_err(|_| "could not load effective unresolved app configuration".to_owned())?;
-    let bindings = compile_bindings(&loaded.settings)
-        .map_err(|_| "could not compile active credential bindings".to_owned())?;
-    let effective = serde_json::to_value(&loaded.settings)
+    let loaded = load_settings(&target.config).map_err(|error| {
+        format!("could not load effective unresolved app configuration: {error}")
+    })?;
+    let app_config = TrustedServerAppConfig::new(loaded.settings).map_err(|error| {
+        format!("could not validate effective unresolved app configuration: {error}")
+    })?;
+    let bindings = compile_bindings(app_config.settings())
+        .map_err(|error| format!("could not compile active credential bindings: {error}"))?;
+    let effective = serde_json::to_value(app_config.settings())
         .map_err(|_| "could not encode effective unresolved app configuration".to_owned())?;
     let spin_component = fastly::spin_component(target)?;
     let runtime_store = fastly::runtime_secret_store(target)?;
@@ -399,7 +412,9 @@ fn execute(
             writeln!(out, "Presence only. Credential validity, delivery, TLS and retained runtime state were not checked.")
                 .map_err(output_error)?;
             if unsupported {
-                return Err("native presence checks are unsupported for this adapter; generated declarations do not prove provider binding existence".to_owned());
+                writeln!(out, "Native presence checks are unsupported for this adapter; generated declarations do not prove provider binding existence.")
+                    .map_err(output_error)?;
+                return Ok(RunOutcome::Unsupported);
             }
             Ok(if missing {
                 RunOutcome::AssertionFailed

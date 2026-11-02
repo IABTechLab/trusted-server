@@ -48,7 +48,18 @@ routes; their `test-utils` builds use a test-only integration to exercise the
 same core exporter with the real native stores and HTTP clients. This proves
 the native core/adapter contract, not shipping S3 routing on those adapters.
 Cases cover GET/HEAD, redirect sinks, bad certificates, and config-only mutations
-without provisioning the mutated contexts. Runtime tools must match the repository pins.
+without provisioning the mutated contexts. Each S3 route has distinct fictional credentials,
+and signature expectations select that route's compiled bindings.
+
+Fastly's bad-certificate case proves rejection by Viceroy's TLS verifier, not independent
+enforcement of the application's `certificate_check` setting. An isolated mutation that
+removed forced app-side verification still passed all 34 native assertions under Viceroy
+0.21.0, including trusted-HTTPS positive controls and verified/unverified backend declarations.
+The core `s3_secret_bindings_force_tls_and_never_follow_redirects` test catches that mutation
+through its backend-spec assertion. Keep these two evidence claims separate; local Viceroy
+verification does not prove the deployed Fastly setting.
+
+Runtime tools must match the repository pins.
 See [script prerequisites and coverage](scripts/README.md#secret-binding-runtime-checks).
 These local checks do not certify deployed provider permissions or propagation.
 

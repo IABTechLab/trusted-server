@@ -130,9 +130,8 @@ impl<'de> Deserialize<'de> for TrustedServerAppConfig {
         crate::secret_bindings::reject_removed_references(&value)
             .and_then(|()| crate::secret_bindings::validate_original_endpoints(&value))
             .map_err(|error| serde::de::Error::custom(error.to_string()))?;
-        let mut settings: Settings = serde_json::from_value(value).map_err(|_| {
-            serde::de::Error::custom("invalid Trusted Server configuration structure")
-        })?;
+        let mut settings: Settings =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
         settings
             .normalize_deserialized()
             .map_err(|_| serde::de::Error::custom("invalid Trusted Server configuration"))?;
@@ -739,6 +738,24 @@ formats = [{ width = 300, height = 250 }]
             app_config.settings().publisher.domain,
             "test-publisher.com",
             "should load publisher settings"
+        );
+    }
+
+    #[test]
+    fn app_config_preserves_structural_error_details() {
+        let mut value =
+            serde_json::to_value(valid_settings()).expect("should serialize valid settings");
+        value["publisher"]["domian"] = serde_json::json!("publisher.example.com");
+        let error = serde_json::from_value::<TrustedServerAppConfig>(value)
+            .expect_err("should reject a misspelled publisher field");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown field `domian`"),
+            "should identify the misspelled field"
+        );
+        assert!(
+            message.contains("domain"),
+            "should retain expected field details"
         );
     }
 

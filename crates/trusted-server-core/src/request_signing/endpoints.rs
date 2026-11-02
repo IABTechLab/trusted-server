@@ -261,11 +261,7 @@ fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
 
     // Cloudflare has a flat secret namespace. Signing writes must never replace
     // an app credential, including aliases under Axum's case normalization.
-    if kid
-        .to_ascii_lowercase()
-        .replace(['-', '.', ' '], "_")
-        .starts_with("ts1_")
-    {
+    if super::is_app_credential_kid(kid) {
         return Err(Report::new(TrustedServerError::BadRequest {
             message: "kid uses the reserved app-credential namespace".into(),
         }));

@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { createHash, createHmac } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
+
+import { verifyS3 } from './secret-bindings-runtime.mjs'
 
 const runner = fileURLToPath(
   new URL('./secret-bindings-runtime.mjs', import.meta.url)
@@ -20,6 +23,70 @@ async function waitFor(check, description, timeout = 15000) {
   } while (Date.now() < deadline)
   assert.fail(`Timed out waiting for ${description}`)
 }
+
+function signedEvent(credentials, method) {
+  const hash = (value) => createHash('sha256').update(value).digest('hex')
+  const hmac = (key, value) => createHmac('sha256', key).update(value).digest()
+  const headers = {
+    host: 'localhost:12342',
+    'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
+    'x-amz-date': '20261102T120000Z',
+    'x-amz-security-token': credentials.session,
+  }
+  const signed = Object.keys(headers).sort().join(';')
+  const canonical = [
+    method,
+    '/sink-control/success.svg',
+    '',
+    signed
+      .split(';')
+      .map((name) => `${name}:${headers[name]}\n`)
+      .join(''),
+    signed,
+    'UNSIGNED-PAYLOAD',
+  ].join('\n')
+  const scope = '20261102/us-east-1/s3/aws4_request'
+  const toSign = [
+    'AWS4-HMAC-SHA256',
+    headers['x-amz-date'],
+    scope,
+    hash(canonical),
+  ].join('\n')
+  const key = hmac(
+    hmac(
+      hmac(hmac(`AWS4${credentials.secret}`, '20261102'), 'us-east-1'),
+      's3'
+    ),
+    'aws4_request'
+  )
+  headers.authorization = `AWS4-HMAC-SHA256 Credential=${credentials.access_id}/${scope}, SignedHeaders=${signed}, Signature=${hmac(key, toSign).toString('hex')}`
+  return { headers, method, url: '/sink-control/success.svg' }
+}
+
+test('S3 verification rejects every credential from the wrong route', () => {
+  const first = {
+    access_id: 'fictional-route-a-access',
+    secret: 'fictional-route-a-secret',
+    session: 'fictional-route-a-session',
+  }
+  const expected = {
+    access_id: 'fictional-route-b-access',
+    secret: 'fictional-route-b-secret',
+    session: 'fictional-route-b-session',
+  }
+  for (const method of ['GET', 'HEAD']) {
+    verifyS3(signedEvent(expected, method), expected)
+    assert.throws(() => verifyS3(signedEvent(first, method), expected))
+    for (const name of Object.keys(expected)) {
+      const wrong = { ...expected, [name]: first[name] }
+      assert.throws(
+        () => verifyS3(signedEvent(wrong, method), expected),
+        /expected route|signature does not match/,
+        `${method} must reject another route's ${name}`
+      )
+    }
+  }
+})
 
 function groupExists(pid) {
   try {
@@ -57,7 +124,7 @@ test(
     let output = ''
     const readMarker = async () => {
       try {
-        return Number(await readFile(marker, 'utf8'))
+        return JSON.parse(await readFile(marker, 'utf8'))
       } catch (error) {
         if (error.code === 'ENOENT') return undefined
         throw error
@@ -73,8 +140,14 @@ test(
       await writeFile(
         runtime,
         `#!/usr/bin/env node
+import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
-writeFileSync(process.env.SECRET_BINDINGS_RUNTIME_MARKER, String(process.pid));
+const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+// Reap the grandchild after a group signal. Do not kill it on a child-only signal.
+process.on('SIGTERM', () => grandchild.once('exit', () => process.exit(0)));
+grandchild.once('spawn', () => {
+  writeFileSync(process.env.SECRET_BINDINGS_RUNTIME_MARKER, JSON.stringify({ runtimePid: process.pid, grandchildPid: grandchild.pid }));
+});
 // Deliberately never listen. The driver must still own us while ready() waits.
 setInterval(() => {}, 1000);
 `,
@@ -103,7 +176,7 @@ setInterval(() => {}, 1000);
       child.on('exit', (code, signal) => {
         exited = { code, signal }
       })
-      runtimePid = await waitFor(async () => {
+      const markerData = await waitFor(async () => {
         assert.equal(spawnError, undefined, 'driver must spawn successfully')
         assert.equal(
           exited,
@@ -112,6 +185,14 @@ setInterval(() => {}, 1000);
         )
         return readMarker()
       }, 'fake runtime startup marker')
+      runtimePid = markerData.runtimePid
+      assert.ok(
+        Number.isSafeInteger(markerData.grandchildPid) &&
+          markerData.grandchildPid > 1,
+        'marker must identify an owned long-lived grandchild PID'
+      )
+      assert.notEqual(markerData.grandchildPid, runtimePid)
+      process.kill(markerData.grandchildPid, 0)
       assert.ok(
         Number.isSafeInteger(runtimePid) && runtimePid > 1,
         'marker must identify an owned child PID'
@@ -139,7 +220,7 @@ setInterval(() => {}, 1000);
       )
     } finally {
       // Also clean the regression's leaked group when running against broken code.
-      runtimePid ??= await readMarker()
+      runtimePid ??= (await readMarker())?.runtimePid
       killOwnedGroup(runtimePid)
       if (child && !exited) {
         child.kill('SIGKILL')

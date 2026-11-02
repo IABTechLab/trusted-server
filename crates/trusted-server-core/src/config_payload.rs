@@ -309,6 +309,42 @@ mod tests {
     }
 
     #[test]
+    fn short_partner_pull_token_loads_without_changing_its_bytes() {
+        let (data, mut store) = all_roles_fixture();
+        let config: TrustedServerAppConfig =
+            serde_json::from_value(data.clone()).expect("should parse feature configuration");
+        let plan = compile_bindings(config.settings()).expect("should compile the pull binding");
+        let binding = plan
+            .entries()
+            .iter()
+            .find(|entry| entry.descriptor_id() == "ec.pull")
+            .expect("should find the active pull role");
+        store
+            .values
+            .insert(binding.key().to_owned(), b"outbound-token".to_vec());
+        let loaded =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should load a short partner-issued pull token");
+        let registry = PartnerRegistry::from_settings(loaded.settings())
+            .expect("should build a registry from the loaded snapshot");
+        let pull = registry
+            .get("partner.example.com")
+            .and_then(|partner| partner.pull_binding.as_ref())
+            .expect("should retain the partner pull binding");
+        assert_eq!(
+            pull.credential(),
+            "outbound-token",
+            "should preserve the exact partner token"
+        );
+        assert_eq!(
+            pull.bearer_header()
+                .expect("should prepare a bearer header"),
+            "Bearer outbound-token",
+            "should prepare the short token for outbound use"
+        );
+    }
+
+    #[test]
     fn trusted_forwarder_resolves_shared_secret_from_default_store() {
         let (data, store) = all_roles_fixture();
         let loaded =

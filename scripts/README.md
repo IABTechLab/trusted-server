@@ -43,10 +43,17 @@ Cloudflare and Spin currently have no S3 asset-route dispatch, so their
 exporter with real workerd/Spin stores and transports. This is native
 core/adapter contract coverage, not a claim of shipping S3 route support.
 
-All WASM cases use fictional native credentials. They assert GET/HEAD signing,
-no automatic credential-bearing redirects, rejection of bad certificates
-despite the mutable proxy TLS toggle, and no HTTP sends for valid-checksum
-config attacks against the original provisioned bindings.
+All WASM cases use distinct fictional S3 credentials per route and route-specific
+signature expectations. They assert GET/HEAD signing, no automatic
+credential-bearing redirects, rejection of bad certificates despite the mutable
+proxy TLS toggle, and no HTTP sends for valid-checksum config attacks against
+the original provisioned bindings.
+
+Fastly's bad-certificate case proves Viceroy TLS rejection, not independent
+enforcement of the app's forced-verification setting. Viceroy 0.21.0 still rejects
+bad certificates when that app setting is mutated off. The core S3 backend-spec
+regression independently catches that policy mutation. See
+[the evidence boundaries](../TESTING.md#secret-binding-release-evidence).
 
 Install the runtime versions in `.tool-versions`. Cloudflare also needs
 `worker-build` matching `worker` in `Cargo.lock` and its matching `wasm-bindgen`.

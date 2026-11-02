@@ -53,6 +53,7 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    partner_registry: PartnerRegistry,
     services: Option<RuntimeServices>,
 }
 
@@ -95,11 +96,13 @@ fn build_state_with_services(
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+    let partner_registry = PartnerRegistry::from_settings(&settings)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        partner_registry,
         services,
     }))
 }
@@ -499,8 +502,7 @@ fn named_route_handler(
                         Ok(admin_ec_lookup_not_supported())
                     }
                     NamedRouteHandler::AdminEidsLookup => {
-                        let partner_registry = PartnerRegistry::from_settings(&state.settings)?;
-                        handle_admin_eids_lookup(&partner_registry, &req)
+                        handle_admin_eids_lookup(&state.partner_registry, &req)
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::Auction => {
@@ -745,6 +747,123 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
         geo: None,
     }
 }
+
+#[cfg(test)]
+mod partner_registry_tests {
+    use super::*;
+    use trusted_server_core::ec::partner::hash_api_key;
+    use trusted_server_core::redacted::Redacted;
+    use trusted_server_core::test_support::secret_bindings::install_test_bindings;
+
+    const ORIGINAL_TOKEN: &str = "fictional-original-partner-token-0123456789";
+    const ROTATED_TOKEN: &str = "fictional-rotated-partner-token-0123456789";
+
+    fn settings() -> Settings {
+        let mut settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "fixture-admin"
+            password = "fictional-admin-password-0123456789"
+
+            [publisher]
+            domain = "publisher.example.com"
+            cookie_domain = ".publisher.example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "fictional-proxy-secret-0123456789"
+
+            [ec]
+            passphrase = "fictional-passphrase-01234567890123456789"
+
+            [[ec.partners]]
+            name = "Fictional partner"
+            source_domain = "partner.example.com"
+            api_token_enabled = true
+
+            [request_signing]
+            enabled = false
+            config_store_id = "fixture-config"
+            secret_store_id = "fixture-secrets"
+            "#,
+        )
+        .expect("should parse partner settings");
+        settings.ec.partners[0].api_token = Some(Redacted::new(ORIGINAL_TOKEN.to_owned()));
+        install_test_bindings(&mut settings).expect("should resolve fictional native bindings");
+        settings
+    }
+
+    #[test]
+    fn reconstructed_state_uses_new_credentials_without_changing_retained_registry() {
+        let retained = build_state_with_settings(settings()).expect("should build retained state");
+        let mut rotated_settings = retained.settings.as_ref().clone();
+        rotated_settings.ec.partners[0].api_token = Some(Redacted::new(ROTATED_TOKEN.to_owned()));
+        install_test_bindings(&mut rotated_settings)
+            .expect("should resolve rotated fictional native bindings");
+        let reconstructed =
+            build_state_with_settings(rotated_settings).expect("should build reconstructed state");
+        let original_hash = hash_api_key(ORIGINAL_TOKEN);
+        let rotated_hash = hash_api_key(ROTATED_TOKEN);
+
+        for (state, accepted_hash, rejected_hash, token) in [
+            (&retained, &original_hash, &rotated_hash, ORIGINAL_TOKEN),
+            (&reconstructed, &rotated_hash, &original_hash, ROTATED_TOKEN),
+        ] {
+            assert_eq!(
+                state
+                    .partner_registry
+                    .find_by_api_key_hash(accepted_hash)
+                    .map(|partner| partner.source_domain.as_str()),
+                Some("partner.example.com"),
+                "should authenticate only the state's own loaded partner credential"
+            );
+            assert!(
+                state
+                    .partner_registry
+                    .find_by_api_key_hash(rejected_hash)
+                    .is_none(),
+                "should not use another state's partner credential"
+            );
+            assert_eq!(
+                state.settings.ec.partners[0]
+                    .api_token
+                    .as_ref()
+                    .expect("should retain the corresponding credential shadow")
+                    .expose(),
+                token,
+                "should retain settings alongside their registry"
+            );
+        }
+    }
+
+    #[test]
+    fn state_construction_rejects_missing_partner_binding() {
+        let mut settings = settings();
+        settings.resolved_bindings = Default::default();
+        let error = match build_state_with_settings(settings) {
+            Ok(_) => panic!("should reject an enabled partner without a loaded binding"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:?}").contains("resolved binding context mismatch"),
+            "should reject the missing loaded partner binding: {error:?}"
+        );
+    }
+
+    #[test]
+    fn state_construction_rejects_retargeted_partner_binding() {
+        let mut settings = settings();
+        settings.ec.partners[0].source_domain = "different-partner.example.com".to_owned();
+        let error = match build_state_with_settings(settings) {
+            Ok(_) => panic!("should reject a binding loaded for another partner"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:?}").contains("resolved binding context mismatch"),
+            "should preserve binding context validation: {error:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod trace_dispatch_tests {
     use super::*;

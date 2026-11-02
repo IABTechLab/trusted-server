@@ -21,13 +21,19 @@ it. `plan --out` writes secret-free JSON; without it the plan goes to stdout.
 
 `set ROLE` requires `--plan`, accepts an optional generated `--binding`
 entry ID for repeated roles, and uses confirmation followed by hidden input.
-Automation uses `--stdin --yes`; no value argument exists. Unsupported adapter
-writes reject before input. A noninteractive repeated role requires
-`--binding`. Full-plan drift rejects before credential input or mutation.
+Automation uses `--stdin --yes` with piped input, for example
+`printf '%s' "$CREDENTIAL" | ts secrets set ... --stdin --yes`. No value argument
+exists. `--stdin` rejects terminal input and trailing LF or CR instead of trimming
+bytes. Omit `--stdin` for hidden terminal input. Native/runtime reads still preserve
+stored bytes exactly. Unsupported adapter writes reject before input. A
+noninteractive repeated role requires `--binding`. Push-time configuration
+validation and full-plan drift checks run before credential input or mutation.
 
 `check --plan` is presence-only. Fastly uses metadata without reading values,
 Axum checks the current process environment, and Cloudflare/Spin report
-unsupported with a nonzero result. It does not prove credential validity,
+unsupported with exit 3. Exit 0 means all bindings are present, exit 1 means a
+binding is missing, and exit 2 means an operational, provider, or validation error.
+It does not prove credential validity,
 delivery, TLS/no-follow, or state refresh. See [Provision app credentials](./secrets),
 [protected CI](./secrets-ci), and [migration](./secret-binding-migration).
 Native/provider/IAM rehearsals remain release gates.

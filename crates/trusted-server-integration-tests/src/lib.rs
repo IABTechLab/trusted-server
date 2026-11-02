@@ -61,9 +61,9 @@ pub fn native_fixtures(settings: &Settings, adapter: &str) -> Result<Vec<NativeF
                 "forwarder.shared" => "fictional-forwarder-shared-secret-32-bytes".to_owned(),
                 "datadome.server" => "0123456789ABCDEF0123456789ABCDEF".to_owned(),
                 "datadome.bypass" => "fictional-datadome-bypass-32-bytes-ok".to_owned(),
-                "s3.access-id" => "AKIAFICTIONALTESTONLY".to_owned(),
-                "s3.secret" => "fictional-s3-signing-secret-40-bytes-long-ok".to_owned(),
-                "s3.session" => "fictional-s3-session-token-32-bytes-ok".to_owned(),
+                "s3.access-id" => format!("fictional-s3-access-{}", entry.key()),
+                "s3.secret" => format!("fictional-s3-signing-secret-{}", entry.key()),
+                "s3.session" => format!("fictional-s3-session-{}", entry.key()),
                 _ => return Err("unsupported fictional fixture role".to_owned()),
             };
             validate_credential(entry.scope(), value.as_bytes())
@@ -218,6 +218,52 @@ mod tests {
                 coalesce_native_fixtures([(handlers[0], copy()), (handlers[0], conflicting)])
                     .is_err(),
                 "a conflicting {changed} must not coalesce at an equal native name"
+            );
+        }
+    }
+
+    #[test]
+    fn s3_route_values_are_distinct_and_stable_across_adapters_and_reordering() {
+        let config: TrustedServerAppConfig = toml::from_str(include_str!(
+            "../fixtures/configs/secret-bindings.all-roles.toml"
+        ))
+        .expect("should parse the all-role fixture");
+        let mut settings = config.into_settings();
+        let mut second = settings.proxy.asset_routes[0].clone();
+        second.prefix = "/second-route/".to_owned();
+        settings.proxy.asset_routes.push(second);
+        let expected = native_fixtures(&settings, "axum")
+            .expect("should generate valid distinct S3 credentials")
+            .into_iter()
+            .filter(|fixture| fixture.descriptor_id.starts_with("s3."))
+            .map(|fixture| (fixture.native.key, fixture.value))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(expected.len(), 6, "should compile three roles per route");
+        assert_eq!(
+            expected
+                .values()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            6,
+            "every route and role should have a distinct fictional credential"
+        );
+        for (key, value) in &expected {
+            assert!(
+                value.contains(key),
+                "should derive each value from its entry key"
+            );
+        }
+        settings.proxy.asset_routes.reverse();
+        for adapter in ["axum", "fastly", "cloudflare", "spin"] {
+            let actual = native_fixtures(&settings, adapter)
+                .expect("should validate reordered route credentials on every adapter")
+                .into_iter()
+                .filter(|fixture| fixture.descriptor_id.starts_with("s3."))
+                .map(|fixture| (fixture.native.key, fixture.value))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(
+                actual, expected,
+                "should retain key-derived values on {adapter}"
             );
         }
     }

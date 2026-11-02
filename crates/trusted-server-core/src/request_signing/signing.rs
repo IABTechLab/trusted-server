@@ -141,6 +141,12 @@ impl RequestSigner {
                 message: "failed to get current-kid".into(),
             })?;
 
+        if super::is_app_credential_kid(&key_id) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "signing kid uses the reserved app-credential namespace".into(),
+            }));
+        }
+
         let key_bytes = services
             .secret_store()
             .get_bytes(&SIGNING_STORE_NAME, &key_id)
@@ -256,7 +262,16 @@ pub fn verify_signature(
 
 #[cfg(test)]
 mod tests {
-    use crate::platform::test_support::build_request_signing_services;
+    use std::collections::HashMap;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use crate::platform::test_support::{
+        HashMapConfigStore, build_request_signing_services, build_services_with_config_and_secret,
+    };
+    use crate::platform::{PlatformError, PlatformSecretStore, StoreId, StoreName};
 
     use super::*;
 
@@ -267,6 +282,54 @@ mod tests {
             RequestSigner::from_services(&services).expect("should create signer from services");
 
         assert_eq!(signer.kid, "test-kid", "should load kid from config store");
+    }
+
+    #[test]
+    fn reserved_app_credential_kids_are_rejected_before_secret_reads() {
+        struct ReadSpy(Arc<AtomicUsize>);
+        impl PlatformSecretStore for ReadSpy {
+            fn get_bytes(&self, _: &StoreName, _: &str) -> Result<Vec<u8>, Report<PlatformError>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(general_purpose::STANDARD.encode([42_u8; 32]).into_bytes())
+            }
+            fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+                unreachable!("should never write signing fixture secrets")
+            }
+            fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+                unreachable!("should never delete signing fixture secrets")
+            }
+        }
+
+        for kid in [
+            "ts1_fictional",
+            "TS1_fictional",
+            "ts1-fictional",
+            "ts1.fictional",
+            "ts1 fictional",
+        ] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let services = build_services_with_config_and_secret(
+                HashMapConfigStore::new(HashMap::from([(
+                    "current-kid".to_owned(),
+                    kid.to_owned(),
+                )])),
+                ReadSpy(Arc::clone(&reads)),
+            );
+            let error = RequestSigner::from_services(&services)
+                .err()
+                .expect("should reject an application-credential signing kid");
+            assert!(
+                error
+                    .to_string()
+                    .contains("reserved app-credential namespace"),
+                "should report the reserved namespace"
+            );
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                0,
+                "should reject before reading a credential"
+            );
+        }
     }
 
     #[test]
