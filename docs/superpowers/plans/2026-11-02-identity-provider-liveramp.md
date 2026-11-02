@@ -10,9 +10,10 @@
 
 ## Cookie
 
-- Default cookie `_lr_env`; `cookie_names` overrides the list, read in order.
-- The value is base64 or base64url (padded or not, optionally percent-encoded) of a JSON object. Only its string `envelope` field is used, unchanged.
-- A blank or opt-out envelope (`0`, all zeros) and any undecodable value read as no ID.
+- Default cookies `_lr_env` then `idl_env`; `cookie_names` overrides the list, read in order.
+- `_lr_env` (written by ATS) is base64 or base64url (padded or not, optionally percent-encoded) of a JSON object. Only its string `envelope` field is used, unchanged.
+- `idl_env` is where Prebid's `identityLink` ID module stores the envelope it fetched, bare. A value in the base64 alphabet that does not decode to JSON is taken as such a bare envelope, unchanged.
+- A blank or opt-out envelope (`0`, all zeros), a JSON body without a string `envelope`, and any value outside the base64 alphabet read as no ID.
 
 ## Stored ID
 

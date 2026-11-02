@@ -3,6 +3,9 @@
 //!
 //! `LiveRamp`'s ATS script stores the envelope in the `_lr_env` cookie as
 //! base64 (or base64url) of a JSON object whose `envelope` field holds it.
+//! Prebid's `identityLink` ID module stores the envelope it receives bare,
+//! under its configured storage name (commonly `idl_env`); a value that does
+//! not decode to JSON is taken as such a bare envelope.
 //! The envelope is stored unchanged with agent type 3 for
 //! [`ENVELOPE_TTL`]. No server call is made: the refresh contract is not
 //! confirmed, so the browser keeps refreshing the cookie.
@@ -11,8 +14,8 @@
 //! AIM writes the envelope into (default key `_lr_env`) are read after the
 //! own cookies, with the same parser.
 //!
-//! Parsing is lenient: an undecodable cookie, a body without a string
-//! `envelope`, or a blank or opt-out envelope reads as no ID.
+//! Parsing is lenient: a value outside the base64 alphabet, a JSON body
+//! without a string `envelope`, or a blank or opt-out envelope reads as no ID.
 
 use std::borrow::Cow;
 use std::time::Duration;
@@ -53,7 +56,7 @@ pub struct LiveRampSettings {
 
 impl LiveRampSettings {
     fn default_cookie_names() -> Vec<String> {
-        vec!["_lr_env".to_owned()]
+        vec!["_lr_env".to_owned(), "idl_env".to_owned()]
     }
 }
 
@@ -98,15 +101,33 @@ struct EnvelopeCookie {
     envelope: String,
 }
 
-/// Decodes one `_lr_env` value into its envelope.
+/// Decodes one cookie value into its envelope.
+///
+/// A value whose base64 decodes to JSON must carry a usable `envelope`
+/// (the ATS `_lr_env` format); any other base64-alphabet value is a bare
+/// envelope (the Prebid `idl_env` format).
 fn envelope(value: &str) -> Option<String> {
     let value = percent_decoded(value);
     let value = value.trim();
-    let bytes = [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+    let is_base64_alphabet = value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
+    });
+    if !is_base64_alphabet {
+        return None;
+    }
+    let json = [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
         .iter()
-        .find_map(|engine| engine.decode(value).ok())?;
-    let cookie: EnvelopeCookie = serde_json::from_slice(&bytes).ok()?;
-    is_usable_id(&cookie.envelope).then_some(cookie.envelope)
+        .filter_map(|engine| engine.decode(value).ok())
+        .find_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let envelope = match json {
+        Some(body) => {
+            serde_json::from_value::<EnvelopeCookie>(body)
+                .ok()?
+                .envelope
+        }
+        None => value.to_owned(),
+    };
+    is_usable_id(&envelope).then_some(envelope)
 }
 
 impl IdentityProvider for LiveRampProvider {
@@ -200,6 +221,36 @@ mod tests {
     }
 
     #[test]
+    fn reads_a_bare_prebid_idl_env_envelope() {
+        let provider = provider(&json!({}));
+
+        let (id, _) = read(&*provider, "idl_env=AjfowMv4ZHZQJFM8TpiUnYEyA81Vdgg")
+            .expect("should read the bare envelope");
+
+        assert_eq!(
+            id, "AjfowMv4ZHZQJFM8TpiUnYEyA81Vdgg",
+            "should keep the bare envelope"
+        );
+    }
+
+    #[test]
+    fn prefers_lr_env_over_idl_env() {
+        let provider = provider(&json!({}));
+        let value = encoded(&json!({ "envelope": "env-ats" }), &STANDARD);
+
+        let read = read(
+            &*provider,
+            &format!("idl_env=envPrebidExample; _lr_env={value}"),
+        );
+
+        assert_eq!(
+            read.map(|(id, _)| id).as_deref(),
+            Some("env-ats"),
+            "should prefer the ATS cookie"
+        );
+    }
+
+    #[test]
     fn reads_a_configured_cookie_name() {
         let provider = provider(&json!({ "cookie_names": ["example_lockr_env"] }));
         let value = encoded(&json!({ "envelope": "env-example" }), &STANDARD);
@@ -263,6 +314,8 @@ mod tests {
         for header in [
             String::new(),
             "_lr_env=not-base64!".to_owned(),
+            "idl_env=0".to_owned(),
+            "idl_env=".to_owned(),
             format!("_lr_env={}", encoded(&json!({ "other": "x" }), &STANDARD)),
             format!("_lr_env={}", encoded(&json!({ "envelope": 5 }), &STANDARD)),
             format!("_lr_env={}", encoded(&json!({ "envelope": "" }), &STANDARD)),
