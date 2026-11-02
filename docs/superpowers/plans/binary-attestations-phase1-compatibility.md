@@ -9,10 +9,10 @@ lightweight-tag reference at the expected source commit before release creation,
 upload or publication. SPDX completion normalizes fractional creation timestamps
 to whole-second UTC before signing. Release tags must now be strict SemVer
 without build metadata (`vMAJOR.MINOR.PATCH[-pre]`); the earlier tag-validation deferrals in the
-audit table describe its recorded baseline. Rehearsal `.15` remains evidence for
-`68eef902a8bddd9024676cc3806fa5377ed67fee` only; the
-[rehearsal coverage](#rehearsal-coverage-of-the-current-head) section lists every
-later change it does not cover. A fresh rehearsal is required for the current head. Other-tag bundle availability remains a GitHub CLI dependency limit,
+audit table describe its recorded baseline. Fork rehearsal `.22` passed at
+`5f0139b167cd0619cccd9563e8aadca4436281ae`; the
+[rehearsal coverage](#rehearsal-coverage-of-the-current-head) section lists what
+it covers beyond `.15` and the later documentation-only change. Other-tag bundle availability remains a GitHub CLI dependency limit,
 as described in the [operator guide](../../guide/release-verification.md).
 
 Frozen source references below mean:
@@ -22,7 +22,7 @@ Frozen source references below mean:
 - [Cohort](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/release-cohort.json), [tools](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/release-tools.json), [consumer policy](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/release-policy.json).
 - [Index v1 schema](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/docs/superpowers/specs/schemas/release-index-v1.schema.json), [distribution names](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-release/src/distribution.rs#L55), [consumer companion rules](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/src/release/documents.rs#L236), [SPDX joins](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/src/release/evidence/joins.rs#L188).
 
-### Phase 1 review notes — latest passing fork rehearsal `.15`
+### Phase 1 review notes — latest passing fork rehearsal `.22`
 
 Phase 1 is **part of #1235**, pending D7 maintainer settings. These notes supersede
 historical phase applicability, not the retained destination requirements.
@@ -71,7 +71,7 @@ following corrections are implemented in this slice, with verification and
 rehearsal tracked in the PR description at its current commit. Signing and
 immutable publication rehearsal `.9` passed at `149754d357901ec874eab6140e92bce3d8613085`; see the
 [full verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6364827112).
-The latest passing fork rehearsal is `.15` at `68eef902a`; neither covers the current head.
+The latest passing fork rehearsal is `.22` at `5f0139b16`; it covers the current release workflows, scripts and binaries (see [rehearsal coverage](#rehearsal-coverage-of-the-current-head)).
 
 The current correction aligns the local input-free `release-build.yml` signer
 with the `release.yml` caller/publisher, real SPDX 2.3 documents, fourteen
@@ -304,16 +304,19 @@ The immutable `.2`, `.3`, `.4`, `.5`, `.6`, `.8` and `.9` releases remain intact
 - `.14` at that merge failed because GitHub could not acquire a hosted ARM64 macOS runner. Six started builds passed; signing/publication were skipped, and no release or draft was created. Its tag remains untouched. See the [failure record](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6446482013).
 - Fresh lightweight `.15` passed at `68eef902a8bddd9024676cc3806fa5377ed67fee`: [all 16 workflow jobs passed](https://github.com/prk-Jr/trusted-server/actions/runs/40536697334/attempts/1). Independent verification passed all 29 immutable prerelease assets (not Latest), 28 checksum entries, all seven binaries with both predicates and both signer identities online and offline, 14 SPDX comparisons, native CI smokes, macOS 13.0 checks and CLI source identity. See [transcript part 1](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6460657878) and [part 2](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6460658274).
 
-The latest rehearsed Phase 1 implementation is `68eef902a8bddd9024676cc3806fa5377ed67fee` from fork rehearsal `.15`. It does not extend `.12` to later source, and it does not cover the current head (next section). No IAB tags, releases or settings changed. PR #1262 is closed and frozen at `122b78664b1235c717e9208fd200f9a9b0c335df`; PR #1435 carries Phase 1 and is under maintainer review.
+- `.16` to `.21` were further fork attempts; none is release evidence for the current head. `.21` at `79b118858` stopped when a hosted macOS ARM64 build was cancelled.
+- Fresh lightweight `.22` passed at `5f0139b167cd0619cccd9563e8aadca4436281ae` ([fork run](https://github.com/prk-Jr/trusted-server/actions/runs/41403065339), [record](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6571996380)). Attempt 1 lost the macOS Intel build to a `static.rust-lang.org` download error on the hosted runner; signing and publication were skipped. In attempt 2, all seven builds and signing jobs passed, but the draft-create POST returned HTTP 403 and created nothing; as with `.11`, the commit was reachable on the fork only through the new tag. After the fork's feature branch was fast-forwarded to that commit, attempt 3 reran only the publisher on the same artifacts and passed: sparse publisher checkout, checksummed gh 2.102.0, Node 24.20.0, create/upload/publish, immutable readback, release attestation on the first check, all 29 `verify-asset` checks and a byte-identical re-download. Independent verification with gh 2.102.0 ran the published notes block with hand-entered pins and passed release verification, 29 asset checks, 28 provenance/SBOM checks with both signer identities, 7 SBOM comparisons and 28 checksums. The fork returned the release-attestation bundle inline, so the `bundle_url`-only path is covered by fixtures, not by this run.
+
+The latest rehearsed Phase 1 implementation is `5f0139b167cd0619cccd9563e8aadca4436281ae` from fork rehearsal `.22`. No IAB tags, releases or settings changed. PR #1262 is closed and frozen at `122b78664b1235c717e9208fd200f9a9b0c335df`; PR #1435 carries Phase 1 and is under maintainer review.
 
 ### Rehearsal coverage of the current head
 
-Fork rehearsal `.15` covers source `68eef902a8bddd9024676cc3806fa5377ed67fee`
-exactly. That commit contains the original Phase 1 batch rehearsed in `.9`
-(`149754d35`) plus the later implementation commits `34e7e9e9f` (release
-workflow and Axum `main.rs`), `ab6e54936` (release build-fact and gate tests)
-and the main merge `afdc928a8`. The following changes are **not** covered by any
-rehearsal:
+Fork rehearsal `.22` covers source `5f0139b167cd0619cccd9563e8aadca4436281ae`
+exactly. Fork rehearsal `.15` covered `68eef902a8bddd9024676cc3806fa5377ed67fee`,
+which contains the original Phase 1 batch rehearsed in `.9` (`149754d35`) plus
+`34e7e9e9f` (release workflow and Axum `main.rs`), `ab6e54936` (release
+build-fact and gate tests) and the main merge `afdc928a8`. These later changes
+were first rehearsed by `.22`:
 
 - `4940928e8`, a merge of main: changed CLI, core and JS sources compiled into
   the release binaries.
@@ -341,9 +344,11 @@ rehearsal:
   strings and astral characters and audits `#[path]` build helpers; a `cfg` is
   removed from the CLI `build.rs`; and files carried unchanged from #1262 are
   deleted (their frozen copies remain at `122b78664b1235c717e9208fd200f9a9b0c335df`).
+- `5f0139b16`, a merge of main (CI, adapter, core, CLI and JS sources).
 
-A fresh rehearsal at the current head is required before these changes can be
-claimed as rehearsed.
+The only later change is this documentation-only update to the compatibility
+record. Every rehearsal ran in the author's fork; none qualifies the IAB
+repository's own signer identity, settings or immutable-release state.
 
 ### Phase 1 review boundary notes
 
