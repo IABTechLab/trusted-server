@@ -394,29 +394,62 @@ test.describe("GPT runtime diagnostics", () => {
         await page.waitForFunction(() =>
             Boolean(
                 (window as any).__gptDiagnosticsTestRoot?.querySelector(
-                    ".tsgd-badge",
+                    ".tsgd-badge-handle:not([hidden])",
                 ),
             ),
         );
         const badgeIdentity = await page.evaluate(() => {
-            const badge = (
+            const handle = (
                 window as any
             ).__gptDiagnosticsTestRoot.querySelector(
-                ".tsgd-badge",
+                ".tsgd-badge-handle:not([hidden])",
             ) as HTMLButtonElement;
-            badge.focus();
+            const badge = handle.closest(".tsgd-badge") as HTMLElement;
+            const evidence = badge.querySelector(
+                ".tsgd-badge-evidence",
+            ) as HTMLElement;
+            const handleRect = handle.getBoundingClientRect();
+            const creativeRectangles = (window as any).tsjs.gptDiagnostics
+                .snapshot()
+                .slots.flatMap((slot: any) => {
+                    const element = document.getElementById(slot.slotElementId);
+                    return slot.binding.status === "bound" && element
+                        ? [element.getBoundingClientRect()]
+                        : [];
+                });
+            handle.focus();
             return {
-                tagName: badge.tagName,
-                text: badge.textContent,
-                ariaLabel: badge.getAttribute("aria-label"),
+                tagName: handle.tagName,
+                text: handle.textContent,
+                ariaLabel: handle.getAttribute("aria-label"),
+                badgeTagName: badge.tagName,
+                badgePointerEvents: getComputedStyle(badge).pointerEvents,
+                evidencePointerEvents: getComputedStyle(evidence).pointerEvents,
+                handlePointerEvents: getComputedStyle(handle).pointerEvents,
+                evidence: evidence.textContent,
+                overlapsCreative: creativeRectangles.some(
+                    (creative: DOMRect) =>
+                        handleRect.left < creative.right &&
+                        handleRect.right > creative.left &&
+                        handleRect.top < creative.bottom &&
+                        handleRect.bottom > creative.top,
+                ),
                 runtimeSlotNumber: badge.dataset.runtimeSlot,
                 requestNumber: badge.dataset.requestNumber,
             };
         });
         expect(badgeIdentity).toMatchObject({
             tagName: "BUTTON",
-            text: expect.stringMatching(/Ad #\d+ · Request #\d+/),
-            ariaLabel: expect.stringMatching(/Ad #\d+, Request #\d+/),
+            text: expect.stringMatching(/^Ad #\d+$/),
+            ariaLabel: expect.stringMatching(
+                /^Open diagnostics for Ad #\d+, Request #\d+:/,
+            ),
+            badgeTagName: "DIV",
+            badgePointerEvents: "none",
+            evidencePointerEvents: "none",
+            handlePointerEvents: "auto",
+            evidence: expect.stringMatching(/^Request #\d+ · /),
+            overlapsCreative: false,
         });
         await page.keyboard.press("Enter");
         await page.waitForFunction(
