@@ -83,7 +83,7 @@ const MAX_REWRITABLE_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Normalizes a creative URL to an absolute HTTP(S) [`url::Url`].
 ///
-/// Trims surrounding whitespace, resolves a protocol-relative `//host/...`
+/// Trims surrounding whitespace, resolves a protocol-relative `//cdn.example.com/...`
 /// against `https:`, and accepts only `http://` and `https://` input (ASCII
 /// case-insensitive). Returns `None` for empty, relative, non-network-scheme or
 /// unparseable input. Applies no host policy; see
@@ -2066,7 +2066,7 @@ mod tests {
             ("ftp://cdn.example/x", None),
             ("ws://cdn.example/x", None),
             ("file://cdn.example/x", None),
-            ("https://exa mple.example/x", None),
+            ("https://example.com invalid/x", None),
         ] {
             assert_eq!(
                 normalized(raw).as_deref(),
@@ -3775,14 +3775,14 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let mut settings = crate::test_support::tests::create_test_settings();
         settings.rewrite.exclude_domains = vec![
             "trusted-cdn.example.com".to_owned(),
-            "*.example.org".to_owned(),
+            "*.publisher.example.org".to_owned(),
         ];
 
         for excluded in [
             "https://trusted-cdn.example.com/lib.js",
             "//trusted-cdn.example.com/lib.js",
-            "https://example.org/cdn.js",
-            "//cdnjs.example.org/lib.js",
+            "https://publisher.example.org/cdn.js",
+            "//cdnjs.publisher.example.org/lib.js",
         ] {
             assert_eq!(
                 proxy_if_abs(&settings, excluded, ""),
@@ -3793,7 +3793,7 @@ b{background:url(\"https://cdn.example/c.png\")}";
         for proxied in [
             "https://other-cdn.example.com/lib.js",
             "//other-cdn.example.com/lib.js",
-            "https://notexample.org/lib.js",
+            "https://notpublisher.example.org/lib.js",
         ] {
             assert!(
                 proxy_if_abs(&settings, proxied, "")
@@ -3806,7 +3806,7 @@ b{background:url(\"https://cdn.example/c.png\")}";
     #[test]
     fn unparseable_absolute_url_is_left_byte_identical() {
         let settings = crate::test_support::tests::create_test_settings();
-        let html = "<img src='https://exa mple.example/x'>";
+        let html = "<img src='https://example.com invalid/x'>";
 
         let out = rewrite_creative_html(&settings, html);
 
@@ -3819,7 +3819,7 @@ b{background:url(\"https://cdn.example/c.png\")}";
     #[test]
     fn unparseable_absolute_click_url_is_left_byte_identical() {
         let settings = crate::test_support::tests::create_test_settings();
-        let html = "<a href='https://exa mple.example/x'>x</a>";
+        let html = "<a href='https://example.com invalid/x'>x</a>";
 
         let out = rewrite_creative_html(&settings, html);
 

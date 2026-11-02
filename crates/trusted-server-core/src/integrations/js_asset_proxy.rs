@@ -639,6 +639,7 @@ mod tests {
             ad_bids_state: Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            trace_bootstrap: None,
             suppress_datadome_client_side_tag: false,
         });
         let pipeline_config = PipelineConfig {

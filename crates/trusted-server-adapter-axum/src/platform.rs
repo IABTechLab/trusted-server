@@ -446,6 +446,43 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
         Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
     }
 
+    async fn select_until(
+        &self,
+        pending_requests: Vec<PlatformPendingRequest>,
+        deadline: web_time::Instant,
+    ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+        let mut handles = recover_pending_handles(pending_requests)?;
+        if handles.is_empty() {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("select_until called with no pending requests"));
+        }
+        let remaining = deadline.saturating_duration_since(web_time::Instant::now());
+        if !remaining.is_zero() {
+            // Borrow the handles so timer expiry cannot drop completed siblings
+            // before the final nonblocking snapshot inspects them.
+            let selected =
+                tokio::time::timeout(remaining, futures::future::select_all(handles.iter_mut()))
+                    .await;
+            if let Ok(((backend_name, result), index, _)) = selected {
+                drop(handles.swap_remove(index));
+                return Ok(Some(completed_selection(backend_name, result, handles)));
+            }
+        }
+        // Snapshot once: only completed tasks survive into subsequent calls.
+        // An unfinished task is aborted on drop and cannot become a late bid.
+        handles.retain(|pending| pending.handle.is_finished());
+        if handles.is_empty() {
+            return Ok(None);
+        }
+        let ((backend_name, result), _, remaining_handles) =
+            futures::future::select_all(handles).await;
+        Ok(Some(completed_selection(
+            backend_name,
+            result,
+            remaining_handles,
+        )))
+    }
+
     async fn select(
         &self,
         pending_requests: Vec<PlatformPendingRequest>,
@@ -455,15 +492,7 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
                 .attach("select called with an empty pending_requests list"));
         }
 
-        let handles: Vec<AxumPendingHandle> = pending_requests
-            .into_iter()
-            .map(|pr| {
-                pr.downcast::<AxumPendingHandle>().map_err(|_| {
-                    Report::new(PlatformError::HttpClient)
-                        .attach("unexpected inner type in AxumPlatformHttpClient::select")
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let handles = recover_pending_handles(pending_requests)?;
 
         // Each AxumPendingHandle resolves to (backend_name, result), so the
         // remaining handles keep their own backend names — no positional
@@ -472,48 +501,68 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
         let ((backend_name, result), _ready_idx, remaining_handles) =
             futures::future::select_all(handles).await;
 
-        let remaining: Vec<PlatformPendingRequest> = remaining_handles
-            .into_iter()
-            .map(|handle| {
-                let backend_name = handle.backend_name.clone();
-                PlatformPendingRequest::new(handle).with_backend_name(backend_name)
-            })
-            .collect();
-
-        // Map join panics and per-request errors into ready: Err(...) so that the
-        // auction orchestrator can log the failure and continue with remaining providers
-        // rather than treating one bad provider as a fatal select() failure.
-        let ready = result
-            .map_err(|e| {
-                Report::new(PlatformError::HttpClient)
-                    .attach(format!("auction request task panicked: {e}"))
-            })
-            .and_then(|inner| inner)
-            .and_then(|(status, headers, body)| {
-                let mut builder = edgezero_core::http::response_builder().status(status);
-                for (name, value) in &headers {
-                    builder = builder.header(name.as_str(), value.as_slice());
-                }
-                builder
-                    .body(edgezero_core::body::Body::from(body))
-                    .change_context(PlatformError::HttpClient)
-            })
-            .map(|edge_resp| {
-                PlatformResponse::new(edge_resp).with_backend_name(backend_name.clone())
-            });
-
-        // Attribute the failure to its backend so the orchestrator can remove
-        // the provider and record a BidStatus::Error, matching the Fastly
-        // adapter. Without this, a failed provider silently vanishes through
-        // the orchestrator's "backend not identified" branch.
-        let failed_backend_name = ready.as_ref().err().map(|_| backend_name);
-
-        Ok(PlatformSelectResult {
-            ready,
-            remaining,
-            failed_backend_name,
-        })
+        Ok(completed_selection(backend_name, result, remaining_handles))
     }
+}
+
+fn completed_selection(
+    backend_name: String,
+    result: Result<SpawnedRequestResult, tokio::task::JoinError>,
+    remaining_handles: Vec<AxumPendingHandle>,
+) -> PlatformSelectResult {
+    let remaining: Vec<PlatformPendingRequest> = remaining_handles
+        .into_iter()
+        .map(|handle| {
+            let backend_name = handle.backend_name.clone();
+            PlatformPendingRequest::new(handle).with_backend_name(backend_name)
+        })
+        .collect();
+
+    // Map join panics and per-request errors into ready: Err(...) so that the
+    // auction orchestrator can log the failure and continue with remaining providers
+    // rather than treating one bad provider as a fatal select() failure.
+    let ready = result
+        .map_err(|e| {
+            Report::new(PlatformError::HttpClient)
+                .attach(format!("auction request task panicked: {e}"))
+        })
+        .and_then(|inner| inner)
+        .and_then(|(status, headers, body)| {
+            let mut builder = edgezero_core::http::response_builder().status(status);
+            for (name, value) in &headers {
+                builder = builder.header(name.as_str(), value.as_slice());
+            }
+            builder
+                .body(edgezero_core::body::Body::from(body))
+                .change_context(PlatformError::HttpClient)
+        })
+        .map(|edge_resp| PlatformResponse::new(edge_resp).with_backend_name(backend_name.clone()));
+
+    // Attribute the failure to its backend so the orchestrator can remove
+    // the provider and record a BidStatus::Error, matching the Fastly
+    // adapter. Without this, a failed provider silently vanishes through
+    // the orchestrator's "backend not identified" branch.
+    let failed_backend_name = ready.as_ref().err().map(|_| backend_name);
+
+    PlatformSelectResult {
+        ready,
+        remaining,
+        failed_backend_name,
+    }
+}
+
+fn recover_pending_handles(
+    pending_requests: Vec<PlatformPendingRequest>,
+) -> Result<Vec<AxumPendingHandle>, Report<PlatformError>> {
+    pending_requests
+        .into_iter()
+        .map(|pending| {
+            pending.downcast::<AxumPendingHandle>().map_err(|_| {
+                Report::new(PlatformError::HttpClient)
+                    .attach("unexpected pending type in Axum selection")
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -635,11 +684,6 @@ mod tests {
             .capabilities();
         assert!(client.supports_concurrent_fanout());
         assert!(capabilities.supports_concurrent_provider_fanout());
-        assert!(!client.has_enforceable_total_request_deadline());
-        assert!(
-            !capabilities.has_enforceable_total_request_deadline(),
-            "reqwest's transport timeout is not an adapter-enforced auction deadline"
-        );
     }
 
     #[test]
@@ -871,6 +915,275 @@ mod tests {
         assert!(
             result.remaining.is_empty(),
             "no remaining requests expected"
+        );
+    }
+
+    async fn deadline_pending(
+        client: &AxumPlatformHttpClient,
+        url: String,
+        backend: &str,
+    ) -> PlatformPendingRequest {
+        let request = edgezero_core::http::request_builder()
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build deadline request");
+        client
+            .send_async(PlatformHttpRequest::new(request, backend))
+            .await
+            .expect("should dispatch deadline request")
+    }
+
+    async fn serve_slow_response(trickle_body: bool) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind deadline server");
+        let address = listener
+            .local_addr()
+            .expect("should read deadline server address");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("should accept deadline request");
+            let mut request = [0; 1024];
+            let bytes_read = stream
+                .read(&mut request)
+                .await
+                .expect("should read deadline request");
+            assert!(bytes_read > 0, "should receive a deadline request");
+            if trickle_body {
+                if stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                for _ in 0..100 {
+                    if stream.write_all(b"x").await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        (format!("http://{address}/"), task)
+    }
+
+    #[tokio::test]
+    async fn select_until_bounds_delayed_headers_and_trickling_bodies() {
+        let client = AxumPlatformHttpClient::new();
+        for trickle_body in [false, true] {
+            let (url, server) = serve_slow_response(trickle_body).await;
+            let pending = deadline_pending(&client, url, "slow").await;
+            let start = web_time::Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.select_until(vec![pending], start + Duration::from_millis(200)),
+            )
+            .await
+            .expect("should finish before the slow response")
+            .expect("should enforce the deadline");
+            server.abort();
+            assert!(
+                result.is_none(),
+                "should time out before the entire response completes"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "should bound the complete response wait"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn select_until_preserves_fast_success_before_slow_body_expires() {
+        let client = AxumPlatformHttpClient::new();
+        let (slow_url, server) = serve_slow_response(true).await;
+        let fast_url = serve_raw_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let slow = deadline_pending(&client, slow_url, "slow").await;
+        let fast = deadline_pending(&client, fast_url, "fast").await;
+        let deadline = web_time::Instant::now() + Duration::from_millis(500);
+        let result = client
+            .select_until(vec![slow, fast], deadline)
+            .await
+            .expect("should collect fast response")
+            .expect("should complete before the deadline");
+        assert_eq!(
+            result
+                .ready
+                .expect("should succeed")
+                .backend_name
+                .as_deref(),
+            Some("fast"),
+            "should collect the fast complete body first"
+        );
+        assert_eq!(
+            result.remaining.len(),
+            1,
+            "should preserve the slow body handle"
+        );
+        let result = client
+            .select_until(result.remaining, deadline)
+            .await
+            .expect("should bound slow response");
+        server.abort();
+        assert!(result.is_none(), "should expire the remaining slow body");
+    }
+
+    #[tokio::test]
+    async fn select_until_expired_deadline_preserves_buffered_response() {
+        let client = AxumPlatformHttpClient::new();
+        let handle = tokio::spawn(async { Ok((200, Vec::new(), b"ok".to_vec())) });
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let pending = PlatformPendingRequest::new(AxumPendingHandle {
+            backend_name: "ready".to_owned(),
+            handle,
+        });
+        let result = client
+            .select_until(vec![pending], web_time::Instant::now())
+            .await
+            .expect("should recognize expired deadline");
+        assert!(
+            result.is_some(),
+            "should preserve a complete buffered response without waiting after cutoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_snapshot_preserves_finished_siblings_and_aborts_unfinished_task() {
+        let mut tasks = Vec::new();
+        for name in ["ready-a", "ready-b"] {
+            tasks.push(AxumPendingHandle {
+                backend_name: name.to_owned(),
+                handle: tokio::spawn(async { Ok((200, Vec::new(), b"ok".to_vec())) }),
+            });
+        }
+        while tasks.iter().any(|pending| !pending.handle.is_finished()) {
+            tokio::task::yield_now().await;
+        }
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (drop_sender, drop_receiver) = tokio::sync::oneshot::channel::<()>();
+        tasks.push(AxumPendingHandle {
+            backend_name: "unfinished".to_owned(),
+            handle: tokio::spawn(async move {
+                let _drop_signal = drop_sender;
+                started_sender
+                    .send(())
+                    .expect("should signal unfinished task start");
+                futures::future::pending::<SpawnedRequestResult>().await
+            }),
+        });
+        started_receiver
+            .await
+            .expect("should start unfinished task");
+        let pending = tasks
+            .into_iter()
+            .map(|task| {
+                let name = task.backend_name.clone();
+                PlatformPendingRequest::new(task).with_backend_name(name)
+            })
+            .collect();
+        let client = AxumPlatformHttpClient::new();
+        let deadline = web_time::Instant::now();
+        let first = client
+            .select_until(pending, deadline)
+            .await
+            .expect("should snapshot ready responses")
+            .expect("should retain first response");
+        assert!(
+            first.ready.is_ok(),
+            "should preserve first completed result"
+        );
+        assert_eq!(
+            first.remaining.len(),
+            1,
+            "should retain only the other completed response"
+        );
+        let second = client
+            .select_until(first.remaining, deadline)
+            .await
+            .expect("should drain the completed snapshot")
+            .expect("should retain second response");
+        assert!(
+            second.ready.is_ok(),
+            "should preserve the second completed result"
+        );
+        assert!(
+            second.remaining.is_empty(),
+            "should leave no unfinished handles"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), drop_receiver)
+                .await
+                .expect("should promptly abort unfinished work")
+                .is_err(),
+            "should release unfinished task resources"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_until_aborts_task_on_expiration() {
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _drop_signal = dropped_sender;
+            started_sender.send(()).expect("should signal task start");
+            futures::future::pending::<SpawnedRequestResult>().await
+        });
+        started_receiver
+            .await
+            .expect("should start task before selection");
+        let pending = PlatformPendingRequest::new(AxumPendingHandle {
+            backend_name: "slow".to_owned(),
+            handle,
+        });
+        let result = AxumPlatformHttpClient::new()
+            .select_until(
+                vec![pending],
+                web_time::Instant::now() + Duration::from_millis(50),
+            )
+            .await
+            .expect("should expire task");
+        assert!(result.is_none(), "should report deadline expiration");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), dropped_receiver)
+                .await
+                .expect("should promptly drop aborted task state")
+                .is_err(),
+            "should drop task resources on expiration"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_until_preserves_failed_backend_attribution() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind probe");
+        let address = listener.local_addr().expect("should read probe address");
+        drop(listener);
+        let client = AxumPlatformHttpClient::new();
+        let pending = deadline_pending(&client, format!("http://{address}/"), "failed").await;
+        let result = client
+            .select_until(
+                vec![pending],
+                web_time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .expect("should collect transport failure")
+            .expect("should fail before deadline");
+        assert!(result.ready.is_err(), "should preserve transport failure");
+        assert_eq!(
+            result.failed_backend_name.as_deref(),
+            Some("failed"),
+            "should attribute failure to its backend"
         );
     }
 
