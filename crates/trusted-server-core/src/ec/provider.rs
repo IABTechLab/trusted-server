@@ -205,6 +205,9 @@ pub struct LookupInput<'a> {
     pub due_sources: &'a [SourceDomain],
     /// This provider's currently stored entries, borrowed from the row.
     pub current: OwnedEntries<'a>,
+    /// The request's cookies, for a vendor first-party cookie a lookup
+    /// sends as input.
+    pub cookies: RequestCookies<'a>,
     /// Always `None` in V1.
     pub hashed_email: Option<&'a HashedEmail>,
 }
@@ -361,8 +364,8 @@ pub struct ProviderEid<'body> {
     pub matcher: Option<Cow<'body, str>>,
     /// `OpenRTB` `mm`.
     pub mm: Option<i32>,
-    /// EID-level `ext`.
-    pub ext: Option<&'body RawValue>,
+    /// EID-level `ext`, borrowed from the body or built by the provider.
+    pub ext: Option<Cow<'body, RawValue>>,
     /// UIDs of the entry.
     pub uids: Vec<ProviderUid<'body>>,
 }
@@ -374,8 +377,8 @@ pub struct ProviderUid<'body> {
     pub id: Cow<'body, str>,
     /// Agent type; filled from partner config when missing.
     pub atype: Option<i32>,
-    /// UID-level `ext`.
-    pub ext: Option<&'body RawValue>,
+    /// UID-level `ext`, borrowed from the body or built by the provider.
+    pub ext: Option<Cow<'body, RawValue>>,
     /// Expiry as the provider states it.
     pub expiry: ProviderExpiry,
     /// Private refresh state kept with the UID in the row and never served.

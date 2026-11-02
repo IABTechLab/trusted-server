@@ -339,14 +339,14 @@ impl<'body> VendorEid<'body> {
             inserter: self.inserter,
             matcher: self.matcher,
             mm: self.mm,
-            ext: self.ext,
+            ext: self.ext.map(Cow::Borrowed),
             uids: self
                 .uids
                 .into_iter()
                 .map(|uid| ProviderUid {
                     id: uid.id,
                     atype: uid.atype,
-                    ext: uid.ext,
+                    ext: uid.ext.map(Cow::Borrowed),
                     expiry,
                 })
                 .collect(),

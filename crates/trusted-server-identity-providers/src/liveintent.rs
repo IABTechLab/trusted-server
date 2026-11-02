@@ -290,7 +290,9 @@ impl IdentityProvider for LiveIntentProvider {
 mod tests {
     use serde_json::json;
     use trusted_server_core::consent::types::ConsentContext;
-    use trusted_server_core::ec::provider::{ClientSignals, OwnedEntries, build_kind};
+    use trusted_server_core::ec::provider::{
+        ClientSignals, OwnedEntries, RequestCookies, build_kind,
+    };
     use trusted_server_core::settings::{IdentityProviderConfig, ProviderSecrets};
 
     use super::*;
@@ -355,6 +357,7 @@ mod tests {
             publisher_domain: "www.example.com",
             due_sources: &due[..1],
             current: OwnedEntries::new(None, &[]),
+            cookies: RequestCookies::default(),
             hashed_email: None,
         };
 
@@ -495,6 +498,7 @@ mod tests {
             publisher_domain: "www.example.com",
             due_sources: &due,
             current: OwnedEntries::new(None, &[]),
+            cookies: RequestCookies::default(),
             hashed_email: None,
         };
 

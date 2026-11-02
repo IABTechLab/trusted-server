@@ -117,7 +117,7 @@ fn eid_fields(
         inserter: bounded_field(eid.inserter.as_ref())?,
         matcher: bounded_field(eid.matcher.as_ref())?,
         mm: eid.mm.map(MatchMethod::try_from).transpose()?,
-        ext: eid.ext.map(RawJson::try_from).transpose()?,
+        ext: eid.ext.as_deref().map(RawJson::try_from).transpose()?,
     })
 }
 
@@ -128,7 +128,7 @@ fn stored_uid(
 ) -> Result<KvUid, EidValidationError> {
     let id = UidValue::try_from(uid.id.into_owned())?;
     let atype = AgentType::try_from(uid.atype.unwrap_or(default_atype))?;
-    let ext = uid.ext.map(RawJson::try_from).transpose()?;
+    let ext = uid.ext.as_deref().map(RawJson::try_from).transpose()?;
     let expiry = match resolve_expiry(uid.expiry, policy.now) {
         Some(at) => Expiry::At(at),
         None => Expiry::Never,
@@ -326,7 +326,7 @@ mod tests {
         expired.expiry = ProviderExpiry::At(UnixSeconds::new(1000));
         let array_ext = RawValue::from_string("[1]".to_owned()).expect("should build raw");
         let mut bad_ext = uid("u-ext");
-        bad_ext.ext = Some(&array_ext);
+        bad_ext.ext = Some(Cow::Borrowed(&array_ext));
 
         let (entries, dropped) = validate(
             vec![
@@ -432,6 +432,27 @@ mod tests {
             entries[0].1[0].fields().mm,
             Some(MatchMethod::Authenticated),
             "should keep valid mm"
+        );
+    }
+
+    #[test]
+    fn preserves_an_eid_ext_the_provider_built() {
+        let partners = registry();
+        let provider = ProviderId::new("example-provider");
+        let claimed = claimed();
+        let mut built = eid("ids.example.com", vec![uid("a")]);
+        built.ext = Some(Cow::Owned(
+            RawValue::from_string(serde_json::json!({ "segments": ["s1"] }).to_string())
+                .expect("should build raw"),
+        ));
+
+        let (entries, dropped) = validate(vec![built], &policy(&provider, &claimed, &partners));
+
+        assert_eq!(dropped, DropCounts::default(), "should drop nothing");
+        assert_eq!(
+            entries[0].1[0].fields().ext.as_ref().map(RawJson::to_value),
+            Some(serde_json::json!({ "segments": ["s1"] })),
+            "should keep the built ext"
         );
     }
 }
