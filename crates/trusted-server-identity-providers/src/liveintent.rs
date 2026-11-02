@@ -1,18 +1,23 @@
 //! `LiveIntent` identity provider: resolves `LiveIntent`'s IDs server side.
 //!
-//! Calls `LiveIntent`'s identity exchange with consent and network signals
-//! and asks for the attributes the operator configured. Each attribute maps
-//! to one configured `OpenRTB` source. The lookup is anonymous: no hashed
-//! email and no first-party `LiveIntent` cookie are sent.
+//! Calls `LiveIntent`'s identity exchange with the visitor's first-party
+//! `LiveIntent` cookie (`_lc2_fpi` by default, sent as `duid`), consent and
+//! network signals, and asks for the attributes the operator listed in
+//! `resolve`. Each attribute maps to the `OpenRTB` source in
+//! [`ATTRIBUTE_SOURCES`], which must be one of the provider's configured
+//! sources. No hashed email is sent.
 //!
 //! As in Prebid's `LiveIntent` module, every attribute other than `nonId` is
-//! a partner ID and its UID carries `ext.provider` naming `LiveIntent`.
+//! a partner ID and its UID carries `ext.provider` naming `LiveIntent`; the
+//! Trade Desk ID also carries `ext.rtiPartner` and its EID names
+//! `LiveIntent` as `matcher`. `segments` in the reply become the `nonId`
+//! EID's `ext`.
 //!
 //! This kind has no Lockr capability: Lockr AIM is not documented to
 //! deliver `LiveIntent` IDs, so a `lockr` settings table is rejected.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime};
 
@@ -33,6 +38,38 @@ use trusted_server_core::ec::provider::{
 use url::Url;
 
 use crate::common::{bounded_expiry, is_routable_ip, join_section_ids};
+
+/// Each attribute `LiveIntent` resolves and the source it carries.
+pub const ATTRIBUTE_SOURCES: &[(&str, &str)] = &[
+    (NON_ID_ATTRIBUTE, "liveintent.com"),
+    ("bidswitch", "bidswitch.net"),
+    ("medianet", "media.net"),
+    ("magnite", "rubiconproject.com"),
+    ("index", "liveintent.indexexchange.com"),
+    ("openx", "openx.net"),
+    ("pubmatic", "pubmatic.com"),
+    ("sovrn", "liveintent.sovrn.com"),
+    ("sharethrough", "sharethrough.com"),
+    ("sonobi", "liveintent.sonobi.com"),
+    ("triplelift", "liveintent.triplelift.com"),
+    ("zetassp", "zeta-ssp.liveintent.com"),
+    ("vidazoo", "liveintent.vidazoo.com"),
+    ("nexxen", "liveintent.unrulymedia.com"),
+    ("uid2", "uidapi.com"),
+    (TDID_ATTRIBUTE, "adserver.org"),
+];
+
+/// The attribute holding the Trade Desk ID `LiveIntent` resolved.
+const TDID_ATTRIBUTE: &str = "thetradedesk";
+
+/// `matcher` of the Trade Desk ID EID: `LiveIntent` matched it.
+const TDID_MATCHER: &str = "liveintent.com";
+
+/// UID `ext` Prebid puts on the Trade Desk ID that `LiveIntent` resolved.
+const TDID_UID_EXT: &str = r#"{"rtiPartner":"TDID","provider":"liveintent.com"}"#;
+
+/// `LiveIntent`'s default first-party ID cookie on the publisher's domain.
+const FIRST_PARTY_COOKIE: &str = "_lc2_fpi";
 
 /// `atype` `LiveIntent` IDs carry: a person-based ID.
 const LIVEINTENT_ATYPE: i32 = 3;
@@ -63,14 +100,26 @@ pub struct LiveIntentSettings {
     /// publisher has one.
     #[serde(default)]
     pub distributor_id: Option<String>,
-    /// Map of `LiveIntent` attribute name to the source it is stored under.
-    ///
-    /// Every source must be one of the provider's configured `sources`.
-    pub attributes: BTreeMap<String, String>,
+    /// The attributes to resolve, from [`ATTRIBUTE_SOURCES`]. Each one's
+    /// source must be one of the provider's configured `sources`.
+    #[serde(default = "default_resolve")]
+    pub resolve: Vec<String>,
+    /// First-party `LiveIntent` cookies, in order; the first present one is
+    /// sent as `duid`.
+    #[serde(default = "default_cookie_names")]
+    pub cookie_names: Vec<String>,
 }
 
 fn default_publisher_id() -> String {
     "any".to_owned()
+}
+
+fn default_resolve() -> Vec<String> {
+    vec![NON_ID_ATTRIBUTE.to_owned()]
+}
+
+fn default_cookie_names() -> Vec<String> {
+    vec![FIRST_PARTY_COOKIE.to_owned()]
 }
 
 /// A built `LiveIntent` provider.
@@ -80,7 +129,9 @@ pub struct LiveIntentProvider {
     url: Url,
     distributor_id: Option<String>,
     attributes: Box<[(String, SourceDomain)]>,
+    cookie_names: Box<[String]>,
     partner_uid_ext: &'static RawValue,
+    tdid_uid_ext: &'static RawValue,
 }
 
 /// Whether `id` has the `did-` form `LiveIntent` accepts; it answers any
@@ -101,13 +152,20 @@ impl ProviderKind for LiveIntent {
         settings: LiveIntentSettings,
     ) -> Result<LiveIntentProvider, Report<ProviderConfigError>> {
         let attributes = settings
-            .attributes
+            .resolve
             .into_iter()
-            .map(|(attribute, source)| {
+            .map(|attribute| {
+                let (_, source) = ATTRIBUTE_SOURCES
+                    .iter()
+                    .find(|(name, _)| *name == attribute)
+                    .ok_or_else(|| {
+                        Report::new(ProviderConfigError::Invalid)
+                            .attach(format!("unknown LiveIntent attribute `{attribute}`"))
+                    })?;
                 let source = common
                     .sources
                     .iter()
-                    .find(|known| known.as_str() == source)
+                    .find(|known| known.as_str() == *source)
                     .ok_or_else(|| {
                         Report::new(ProviderConfigError::Invalid).attach(format!(
                             "attribute `{attribute}` maps to `{source}`, which is not a configured source"
@@ -130,6 +188,8 @@ impl ProviderKind for LiveIntent {
             )));
         }
         let partner_uid_ext = serde_json::from_str::<&'static RawValue>(PARTNER_UID_EXT)
+            .change_context(ProviderConfigError::Invalid)?;
+        let tdid_uid_ext = serde_json::from_str::<&'static RawValue>(TDID_UID_EXT)
             .change_context(ProviderConfigError::Invalid)?;
         let distributor = settings.distributor_id.as_deref().unwrap_or("prebid");
         let mut url = common
@@ -158,13 +218,15 @@ impl ProviderKind for LiveIntent {
                 shape: EidShape {
                     max_eids,
                     max_uids_per_eid: MAX_UIDS_PER_EID,
-                    eid_level_fields: EidLevelFields::Ignored,
+                    eid_level_fields: EidLevelFields::Preserved,
                 },
             },
             url,
             distributor_id: settings.distributor_id,
             attributes,
+            cookie_names: settings.cookie_names.into_boxed_slice(),
             partner_uid_ext,
+            tdid_uid_ext,
         })
     }
 }
@@ -203,6 +265,13 @@ impl IdentityProvider for LiveIntentProvider {
             let mut query = url.query_pairs_mut();
             if let Some(distributor) = &self.distributor_id {
                 query.append_pair("did", distributor);
+            }
+            if let Some(first_party_id) = self
+                .cookie_names
+                .iter()
+                .find_map(|name| lookup.cookies.get(name))
+            {
+                query.append_pair("duid", first_party_id);
             }
             query.append_pair("gdpr", if consent.gdpr_applies { "1" } else { "0" });
             if let Some(tc_string) = &consent.raw_tc_string {
@@ -255,6 +324,9 @@ impl IdentityProvider for LiveIntentProvider {
         let reply: HashMap<String, &'body RawValue> =
             serde_json::from_slice(response.body).change_context(ProviderError::InvalidResponse)?;
         let expiry = expiry(response.headers);
+        let segments = reply.get("segments").and_then(|segments| {
+            RawValue::from_string(format!(r#"{{"segments":{}}}"#, segments.get())).ok()
+        });
         let eids: Vec<ProviderEid<'body>> = self
             .attributes
             .iter()
@@ -263,16 +335,25 @@ impl IdentityProvider for LiveIntentProvider {
                 let id = Cow::<'body, str>::deserialize(*raw)
                     .ok()
                     .filter(|id| !id.is_empty())?;
+                let (matcher, eid_ext, uid_ext) = match attribute.as_str() {
+                    NON_ID_ATTRIBUTE => (None, segments.clone().map(Cow::Owned), None),
+                    TDID_ATTRIBUTE => (
+                        Some(Cow::Borrowed(TDID_MATCHER)),
+                        None,
+                        Some(self.tdid_uid_ext),
+                    ),
+                    _ => (None, None, Some(self.partner_uid_ext)),
+                };
                 Some(ProviderEid {
                     source: Cow::Owned(source.as_str().to_owned()),
                     inserter: None,
-                    matcher: None,
+                    matcher,
                     mm: None,
-                    ext: None,
+                    ext: eid_ext,
                     uids: vec![ProviderUid {
                         id,
                         atype: Some(LIVEINTENT_ATYPE),
-                        ext: (attribute != NON_ID_ATTRIBUTE).then_some(self.partner_uid_ext),
+                        ext: uid_ext.map(Cow::Borrowed),
                         expiry,
                     }],
                 })
@@ -297,46 +378,85 @@ mod tests {
 
     use super::*;
 
-    fn config(attributes: &serde_json::Value) -> IdentityProviderConfig {
+    const SOURCES: [&str; 3] = ["liveintent.com", "adserver.org", "pubmatic.com"];
+
+    fn config(resolve: &serde_json::Value) -> IdentityProviderConfig {
         serde_json::from_value(json!({
             "id": "liveintent",
             "kind": "liveintent",
             "endpoint": "https://li.example.com/idex",
             "allowed_domains": ["li.example.com"],
-            "sources": ["li.example.com", "li-partner.example.com"],
-            "settings": { "publisher_id": "12345", "attributes": attributes },
+            "sources": SOURCES,
+            "settings": { "publisher_id": "12345", "resolve": resolve },
         }))
         .expect("should parse provider config")
     }
 
     fn provider() -> Box<dyn IdentityProvider> {
         build_kind::<LiveIntent>(
-            &config(&json!({ "nonId": "li.example.com", "partner": "li-partner.example.com" })),
+            &config(&json!(["nonId", "thetradedesk", "pubmatic"])),
             &ProviderSecrets::default(),
         )
         .expect("should build provider")
     }
 
     fn due() -> Vec<SourceDomain> {
-        ["li.example.com", "li-partner.example.com"]
+        SOURCES
             .into_iter()
             .map(|source| SourceDomain::try_from(source).expect("should parse source"))
             .collect()
     }
 
     #[test]
-    fn rejects_an_attribute_mapped_to_an_unconfigured_source() {
-        let error = build_kind::<LiveIntent>(
-            &config(&json!({ "nonId": "other.example.com" })),
-            &ProviderSecrets::default(),
-        )
-        .err()
-        .expect("should reject the config");
+    fn rejects_an_unknown_attribute_or_one_whose_source_is_not_configured() {
+        for resolve in [json!(["unknown"]), json!(["bidswitch"])] {
+            let error = build_kind::<LiveIntent>(&config(&resolve), &ProviderSecrets::default())
+                .err()
+                .expect("should reject the config");
 
-        assert!(
-            matches!(error.current_context(), ProviderConfigError::Invalid),
-            "should report invalid config"
-        );
+            assert!(
+                matches!(error.current_context(), ProviderConfigError::Invalid),
+                "should report invalid config for {resolve}"
+            );
+        }
+    }
+
+    #[test]
+    fn sends_the_first_present_first_party_cookie_as_duid() {
+        let provider = provider();
+        let consent = ConsentContext::default();
+        let due = due();
+        let lookup = |cookies| LookupInput {
+            ec_id: "ec-example",
+            consent: &consent,
+            client: ClientSignals {
+                ip: None,
+                user_agent: None,
+            },
+            publisher_domain: "www.example.com",
+            due_sources: &due,
+            current: OwnedEntries::new(None, &[]),
+            cookies,
+            hashed_email: None,
+        };
+
+        for (header, expected) in [
+            ("other=1; _lc2_fpi=fpi-example", vec!["fpi-example"]),
+            ("other=1; _lc2_fpi=", vec![]),
+            ("", vec![]),
+        ] {
+            let request = provider
+                .build_request(&lookup(RequestCookies::new(header)))
+                .expect("should build request");
+            let duid: Vec<String> = request
+                .url
+                .query_pairs()
+                .filter(|(key, _)| key == "duid")
+                .map(|(_, value)| value.into_owned())
+                .collect();
+
+            assert_eq!(duid, expected, "should send duid for `{header}`");
+        }
     }
 
     #[test]
@@ -418,7 +538,9 @@ mod tests {
         // cannot hold.
         let body = json!({
             "nonId": "li-example",
-            "partner": "partner-example",
+            "segments": ["s1", "s2"],
+            "thetradedesk": "tdid-example",
+            "pubmatic": "pubmatic-example",
             "unknown": "x",
         })
         .to_string()
@@ -436,8 +558,8 @@ mod tests {
             panic!("should find EIDs");
         };
 
-        assert_eq!(eids.len(), 2, "should return each configured attribute");
-        assert_eq!(eids[0].source, "li.example.com", "should map nonId");
+        assert_eq!(eids.len(), 3, "should return each configured attribute");
+        assert_eq!(eids[0].source, "liveintent.com", "should map nonId");
         assert_eq!(eids[0].uids[0].id, "li-example", "should keep the ID");
         assert_eq!(eids[0].uids[0].atype, Some(3), "should set atype 3");
         assert!(
@@ -449,11 +571,29 @@ mod tests {
             "should keep nonId without ext"
         );
         assert_eq!(
-            eids[1].source, "li-partner.example.com",
-            "should map partner"
+            eids[0].ext.as_deref().map(RawValue::get),
+            Some(r#"{"segments":["s1","s2"]}"#),
+            "should keep segments as the nonId EID ext"
+        );
+        assert!(
+            eids[0].matcher.is_none(),
+            "should keep nonId without matcher"
+        );
+        assert_eq!(eids[1].source, "adserver.org", "should map the TDID");
+        assert_eq!(
+            eids[1].matcher.as_deref(),
+            Some("liveintent.com"),
+            "should name LiveIntent as the TDID matcher"
         );
         assert_eq!(
-            eids[1].uids[0].ext.map(RawValue::get),
+            eids[1].uids[0].ext.as_deref().map(RawValue::get),
+            Some(r#"{"rtiPartner":"TDID","provider":"liveintent.com"}"#),
+            "should mark the TDID as LiveIntent-provided"
+        );
+        assert!(eids[1].ext.is_none(), "should keep segments on nonId only");
+        assert_eq!(eids[2].source, "pubmatic.com", "should map a partner ID");
+        assert_eq!(
+            eids[2].uids[0].ext.as_deref().map(RawValue::get),
             Some(r#"{"provider":"liveintent.com"}"#),
             "should name LiveIntent as the provider of a partner ID"
         );
@@ -462,7 +602,7 @@ mod tests {
     #[test]
     fn rejects_a_distributor_id_liveintent_did_not_issue() {
         for distributor_id in ["prebid", "did-", "did-01/2"] {
-            let mut config = config(&json!({ "nonId": "li.example.com" }));
+            let mut config = config(&json!(["nonId"]));
             config
                 .settings
                 .insert("distributor_id".to_owned(), json!(distributor_id));
@@ -480,7 +620,7 @@ mod tests {
 
     #[test]
     fn calls_the_distributor_path_with_a_did_distributor_id() {
-        let mut config = config(&json!({ "nonId": "li.example.com" }));
+        let mut config = config(&json!(["nonId"]));
         config
             .settings
             .insert("distributor_id".to_owned(), json!("did-0123"));
