@@ -1673,9 +1673,8 @@ impl AuctionOrchestrator {
     ) -> Result<&Arc<dyn AuctionProvider>, Report<TrustedServerError>> {
         self.providers.get(name).ok_or_else(|| {
             log::warn!(
-                "Provider '{}' configured but not registered. Available providers: {:?}",
-                name,
-                self.providers.keys().collect::<Vec<_>>()
+                "Configured provider is not registered. Registered provider count: {}",
+                self.providers.len()
             );
             Report::new(TrustedServerError::Auction {
                 message: format!("Provider '{}' not registered", name),

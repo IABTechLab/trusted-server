@@ -1016,7 +1016,7 @@ mod tests {
                     .expect("should encode allowed kid characters");
             assert!(
                 names.insert(variable_name.clone()),
-                "Spin variable mapping must not collide for kid `{kid}` as `{variable_name}`"
+                "Spin variable mapping must not collide for distinct allowed kids"
             );
         }
         assert!(
