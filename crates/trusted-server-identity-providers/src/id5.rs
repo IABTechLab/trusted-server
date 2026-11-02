@@ -11,6 +11,16 @@
 //! `cache_control.max_age_sec` is bounded by [`bounded_expiry`]: a missing
 //! value gets the default TTL and a zero or tiny one the minimum TTL.
 //!
+//! Before any lookup, the provider reads ID5's first-party cookies listed
+//! in `cookie_names` (default `id5id`), in order. Prebid's ID5 module and
+//! Lockr AIM write them: a cookie holding the ID5 fetch response JSON
+//! (plain or percent-encoded) is parsed exactly like a lookup response, and
+//! a bare ID string becomes one UID on the first source with agent type 1
+//! and the default TTL. The response `signature` is never stored. When a
+//! percent-encoded JSON cookie is read, its `ext` objects are dropped,
+//! since they cannot outlive the decoded copy. A cookie that yields no
+//! usable UID is ignored and the lookup runs as usual.
+//!
 //! The request field names for the client IP and user agent follow ID5's
 //! server-to-server integration and should be confirmed with ID5 for each
 //! partner account.
@@ -29,13 +39,15 @@ use trusted_server_core::ec::eid_types::SourceDomain;
 use trusted_server_core::ec::provider::{
     EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities,
     ProviderCommon, ProviderConfigError, ProviderEid, ProviderError, ProviderKind, ProviderRequest,
-    ProviderResponse, ProviderUid, SourceCapability, SourceInput,
+    ProviderResponse, ProviderUid, RequestCookies, SourceCapability, SourceInput,
 };
 use url::Url;
 
 use serde_json::value::RawValue;
 
-use crate::common::{VendorEid, bounded_expiry, is_routable_ip, join_section_ids};
+use crate::common::{
+    VendorEid, bounded_expiry, is_routable_ip, is_usable_id, join_section_ids, percent_decoded,
+};
 
 /// The UID ID5 returns for a visitor who opted out.
 const OPTED_OUT_UID: &str = "0";
@@ -55,6 +67,16 @@ pub struct Id5;
 pub struct Id5Settings {
     /// The ID5 partner number assigned to the publisher.
     pub partner_id: u32,
+    /// First-party cookies read in order before any lookup; the first
+    /// yielding a usable UID wins.
+    #[serde(default = "Id5Settings::default_cookie_names")]
+    pub cookie_names: Vec<String>,
+}
+
+impl Id5Settings {
+    fn default_cookie_names() -> Vec<String> {
+        vec!["id5id".to_owned()]
+    }
 }
 
 /// A built ID5 provider.
@@ -63,6 +85,7 @@ pub struct Id5Provider {
     capabilities: ProviderCapabilities,
     url: Url,
     partner_id: u32,
+    cookie_names: Box<[String]>,
 }
 
 impl ProviderKind for Id5 {
@@ -108,6 +131,7 @@ impl ProviderKind for Id5 {
             },
             url,
             partner_id: settings.partner_id,
+            cookie_names: settings.cookie_names.into_boxed_slice(),
         })
     }
 }
@@ -173,6 +197,93 @@ impl Id5Provider {
             .map(|known| &known.source)
             .find(|known| **known == source)
     }
+
+    /// Parses an ID5 fetch reply into its kept EIDs.
+    fn parse_reply<'body>(
+        &self,
+        body: &'body [u8],
+    ) -> Result<Vec<ProviderEid<'body>>, serde_json::Error> {
+        let reply: FetchReply<'body> = serde_json::from_slice(body)?;
+        let max_age = reply
+            .cache_control
+            .and_then(|raw| serde_json::from_str::<CacheControl>(raw.get()).ok())
+            .and_then(|cache| cache.max_age_sec)
+            .map(Duration::from_secs);
+        let expiry = bounded_expiry(max_age);
+
+        let entries: BTreeMap<String, &'body RawValue> = reply
+            .ids
+            .and_then(|raw| serde_json::from_str(raw.get()).ok())
+            .unwrap_or_default();
+        let mut eids: Vec<ProviderEid<'body>> = entries
+            .into_values()
+            .filter_map(|raw| serde_json::from_str::<Id5Id<'body>>(raw.get()).ok())
+            .filter_map(|id| id.eid)
+            .filter_map(|mut eid| {
+                let source = self.known_source(&eid.source)?;
+                eid.source = Cow::Owned(source.as_str().to_owned());
+                eid.uids.retain(|uid| is_usable_uid(&uid.id));
+                (!eid.uids.is_empty()).then(|| eid.into_provider_eid(expiry))
+            })
+            .collect();
+        let primary = self.primary_source().as_str();
+        let has_primary = eids.iter().any(|eid| eid.source == primary);
+        let universal_uid = reply
+            .universal_uid
+            .and_then(|raw| serde_json::from_str::<Cow<'body, str>>(raw.get()).ok())
+            .filter(|uid| is_usable_uid(uid));
+        if !has_primary && let Some(uid) = universal_uid {
+            eids.push(ProviderEid {
+                source: Cow::Owned(primary.to_owned()),
+                inserter: None,
+                matcher: None,
+                mm: None,
+                ext: None,
+                uids: vec![ProviderUid {
+                    id: uid,
+                    atype: Some(1),
+                    ext: None,
+                    expiry,
+                }],
+            });
+        }
+        Ok(eids)
+    }
+
+    /// Reads one ID5 cookie value: a fetch reply JSON or a bare ID.
+    fn cookie_eids<'cookie>(&self, value: &'cookie str) -> Option<Vec<ProviderEid<'cookie>>> {
+        let eids = match percent_decoded(value) {
+            Cow::Borrowed(value) if value.trim_start().starts_with('{') => {
+                self.parse_reply(value.as_bytes()).ok()?
+            }
+            Cow::Owned(value) if value.trim_start().starts_with('{') => self
+                .parse_reply(value.as_bytes())
+                .ok()?
+                .into_iter()
+                .map(owned_without_ext)
+                .collect(),
+            value => {
+                let id = value.trim();
+                if !is_usable_uid(id) || !is_usable_id(id) {
+                    return None;
+                }
+                vec![ProviderEid {
+                    source: Cow::Owned(self.primary_source().as_str().to_owned()),
+                    inserter: None,
+                    matcher: None,
+                    mm: None,
+                    ext: None,
+                    uids: vec![ProviderUid {
+                        id: Cow::Owned(id.to_owned()),
+                        atype: Some(1),
+                        ext: None,
+                        expiry: bounded_expiry(None),
+                    }],
+                }]
+            }
+        };
+        (!eids.is_empty()).then_some(eids)
+    }
 }
 
 impl IdentityProvider for Id5Provider {
@@ -227,56 +338,46 @@ impl IdentityProvider for Id5Provider {
             return Err(Report::new(ProviderError::InvalidResponse)
                 .attach(format!("ID5 returned status {}", response.status)));
         }
-        let reply: FetchReply<'body> =
-            serde_json::from_slice(response.body).change_context(ProviderError::InvalidResponse)?;
-        let max_age = reply
-            .cache_control
-            .and_then(|raw| serde_json::from_str::<CacheControl>(raw.get()).ok())
-            .and_then(|cache| cache.max_age_sec)
-            .map(Duration::from_secs);
-        let expiry = bounded_expiry(max_age);
-
-        let entries: BTreeMap<String, &'body RawValue> = reply
-            .ids
-            .and_then(|raw| serde_json::from_str(raw.get()).ok())
-            .unwrap_or_default();
-        let mut eids: Vec<ProviderEid<'body>> = entries
-            .into_values()
-            .filter_map(|raw| serde_json::from_str::<Id5Id<'body>>(raw.get()).ok())
-            .filter_map(|id| id.eid)
-            .filter_map(|mut eid| {
-                let source = self.known_source(&eid.source)?;
-                eid.source = Cow::Owned(source.as_str().to_owned());
-                eid.uids.retain(|uid| is_usable_uid(&uid.id));
-                (!eid.uids.is_empty()).then(|| eid.into_provider_eid(expiry))
-            })
-            .collect();
-        let primary = self.primary_source().as_str();
-        let has_primary = eids.iter().any(|eid| eid.source == primary);
-        let universal_uid = reply
-            .universal_uid
-            .and_then(|raw| serde_json::from_str::<Cow<'body, str>>(raw.get()).ok())
-            .filter(|uid| is_usable_uid(uid));
-        if !has_primary && let Some(uid) = universal_uid {
-            eids.push(ProviderEid {
-                source: Cow::Owned(primary.to_owned()),
-                inserter: None,
-                matcher: None,
-                mm: None,
-                ext: None,
-                uids: vec![ProviderUid {
-                    id: uid,
-                    atype: Some(1),
-                    ext: None,
-                    expiry,
-                }],
-            });
-        }
+        let eids = self
+            .parse_reply(response.body)
+            .change_context(ProviderError::InvalidResponse)?;
         Ok(if eids.is_empty() {
             LookupOutcome::NoMatch
         } else {
             LookupOutcome::Found(eids)
         })
+    }
+
+    fn read_request_cookies<'cookie>(
+        &self,
+        cookies: RequestCookies<'cookie>,
+    ) -> Option<Vec<ProviderEid<'cookie>>> {
+        self.cookie_names
+            .iter()
+            .filter_map(|name| cookies.get(name))
+            .find_map(|value| self.cookie_eids(value))
+    }
+}
+
+/// Copies an EID parsed from a temporary string, dropping its `ext`
+/// objects, which cannot be copied out of the borrowed JSON.
+fn owned_without_ext<'any>(eid: ProviderEid<'_>) -> ProviderEid<'any> {
+    ProviderEid {
+        source: Cow::Owned(eid.source.into_owned()),
+        inserter: eid.inserter.map(|value| Cow::Owned(value.into_owned())),
+        matcher: eid.matcher.map(|value| Cow::Owned(value.into_owned())),
+        mm: eid.mm,
+        ext: None,
+        uids: eid
+            .uids
+            .into_iter()
+            .map(|uid| ProviderUid {
+                id: Cow::Owned(uid.id.into_owned()),
+                atype: uid.atype,
+                ext: None,
+                expiry: uid.expiry,
+            })
+            .collect(),
     }
 }
 
@@ -520,6 +621,133 @@ mod tests {
             assert!(
                 matches!(error.current_context(), ProviderError::InvalidResponse),
                 "should report an invalid response"
+            );
+        }
+    }
+
+    /// Source, UID, agent type, whether a UID `ext` is kept, and TTL.
+    type ReadUid = (String, String, Option<i32>, bool, Duration);
+
+    fn read(provider: &dyn IdentityProvider, header: &str) -> Option<Vec<ReadUid>> {
+        provider
+            .read_request_cookies(RequestCookies::new(header))
+            .map(|eids| {
+                eids.into_iter()
+                    .flat_map(|eid| {
+                        let source = eid.source.into_owned();
+                        eid.uids.into_iter().map(move |uid| {
+                            let ProviderExpiry::After(ttl) = uid.expiry else {
+                                panic!("should state a relative expiry");
+                            };
+                            (
+                                source.clone(),
+                                uid.id.into_owned(),
+                                uid.atype,
+                                uid.ext.is_some(),
+                                ttl,
+                            )
+                        })
+                    })
+                    .collect()
+            })
+    }
+
+    fn reply_cookie() -> serde_json::Value {
+        json!({
+            "universal_uid": "legacy-example",
+            "signature": "signature-example",
+            "ids": {
+                "id5": { "eid": { "source": "id5.example.com", "uids": [{ "id": "id5-example", "atype": 1, "ext": { "linkType": 2 } }] } },
+            },
+            "cache_control": { "max_age_sec": 7200 },
+        })
+    }
+
+    #[test]
+    fn reads_a_plain_json_reply_cookie() {
+        let provider = provider();
+        let header = format!("other=1; id5id={}", reply_cookie());
+
+        let uids = read(&*provider, &header).expect("should read the cookie");
+
+        assert_eq!(
+            uids,
+            vec![(
+                "id5.example.com".to_owned(),
+                "id5-example".to_owned(),
+                Some(1),
+                true,
+                Duration::from_secs(7200)
+            )],
+            "should parse the reply like a lookup response and never store the signature"
+        );
+    }
+
+    #[test]
+    fn reads_a_percent_encoded_json_reply_cookie() {
+        let provider = provider();
+        let header = format!("id5id={}", urlencoding::encode(&reply_cookie().to_string()));
+
+        let uids = read(&*provider, &header).expect("should read the cookie");
+
+        assert_eq!(
+            uids,
+            vec![(
+                "id5.example.com".to_owned(),
+                "id5-example".to_owned(),
+                Some(1),
+                false,
+                Duration::from_secs(7200)
+            )],
+            "should decode the reply and drop ext objects"
+        );
+    }
+
+    #[test]
+    fn reads_a_bare_id_cookie_from_a_configured_name() {
+        let config: IdentityProviderConfig = serde_json::from_value(json!({
+            "id": "id5",
+            "kind": "id5",
+            "endpoint": "https://id5.example.com/g/v2",
+            "allowed_domains": ["id5.example.com"],
+            "sources": ["id5.example.com"],
+            "settings": { "partner_id": 1234, "cookie_names": ["example_lockr_id5", "id5id"] },
+        }))
+        .expect("should parse provider config");
+        let provider =
+            build_kind::<Id5>(&config, &ProviderSecrets::default()).expect("should build provider");
+
+        let uids = read(&provider, "id5id=0; example_lockr_id5=bare-example")
+            .expect("should read the bare ID");
+
+        assert_eq!(
+            uids,
+            vec![(
+                "id5.example.com".to_owned(),
+                "bare-example".to_owned(),
+                Some(1),
+                false,
+                crate::common::DEFAULT_TTL
+            )],
+            "should store the bare ID on the first source with the default TTL"
+        );
+    }
+
+    #[test]
+    fn ignores_opted_out_and_malformed_cookies_so_the_lookup_runs() {
+        let provider = provider();
+        let opted_out = json!({ "universal_uid": "0", "ids": {} }).to_string();
+
+        for header in [
+            "id5id=0".to_owned(),
+            format!("id5id={opted_out}"),
+            format!("id5id={}", urlencoding::encode(&opted_out)),
+            "id5id={not json".to_owned(),
+            "other=bare-example".to_owned(),
+        ] {
+            assert!(
+                read(&*provider, &header).is_none(),
+                "should read no ID from {header}"
             );
         }
     }

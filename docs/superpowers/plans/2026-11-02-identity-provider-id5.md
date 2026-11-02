@@ -29,10 +29,20 @@
 - `cache_control.max_age_sec` becomes `ProviderExpiry::After` for every UID.
 - With no EID for the first source, a non-empty, non-`0` `universal_uid` becomes an EID with `atype = 1`.
 
+## First-party cookie
+
+ID5's source is provider-owned, so the browser `ts-eids` copy is dropped. Prebid's ID5 module and Lockr AIM store the ID in a first-party cookie instead, which `read_request_cookies` reads before any lookup.
+
+- Setting `cookie_names` (default `["id5id"]`), tried in order; Lockr's key name is configurable, so operators list it.
+- A value that is JSON after percent-decoding is parsed with the same code as a lookup response (lenient entries, opt-out `0` dropped, normalized sources, `cache_control.max_age_sec` bounded). `ext` objects are dropped when the value was percent-encoded, since they borrow from the decoded copy.
+- Any other value is a bare ID: one UID on the first source with `atype = 1` and the default TTL.
+- `signature` is never stored as a UID. A cookie that yields no usable UID is ignored, and the lookup runs as usual; a kept UID skips the lookup.
+
 ## Tasks
 
 - [ ] Add `common.rs` with `is_routable_ip`, `join_section_ids` and the borrowed `VendorEid`.
 - [ ] Add `id5.rs` and the `build` arm.
 - [ ] Unit tests: request shape, private IP dropped, complete EIDs parsed and unconfigured sources dropped, legacy fallback, opted-out and empty replies are no match, error status and malformed body rejected.
-- [ ] Add a commented `kind = "id5"` example to `trusted-server.example.toml`.
+- [ ] Read `cookie_names` in `read_request_cookies`; tests for plain and percent-encoded reply JSON, a bare ID from a configured name, and opted-out or malformed cookies reading as no ID.
+- [ ] Add a commented `kind = "id5"` example, with `cookie_names`, to `trusted-server.example.toml`.
 - [ ] Run `cargo test-fastly` and `cargo clippy-fastly`.

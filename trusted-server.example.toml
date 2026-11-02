@@ -153,6 +153,9 @@ pull_sync_concurrency = 3
 #
 # ID5 (kind "id5"): anonymous lookup, no secrets. The first source receives
 # the legacy `universal_uid`. Use the endpoint and sources ID5 gives you.
+# Before any lookup it reads the first-party cookies in `cookie_names`, in
+# order (Prebid's ID5 module writes `id5id`; Lockr AIM writes the ID under a
+# key name from its own configuration, so list that name too).
 # [[ec.identity_providers]]
 # id = "id5"
 # kind = "id5"
@@ -163,6 +166,7 @@ pull_sync_concurrency = 3
 # tcf_vendor_id = 9999
 # [ec.identity_providers.settings]
 # partner_id = 1234
+# cookie_names = ["id5id"]
 #
 # LiveIntent (kind "liveintent"): anonymous lookup, no secrets. Each attribute
 # LiveIntent returns is stored under the source it maps to; every mapped
