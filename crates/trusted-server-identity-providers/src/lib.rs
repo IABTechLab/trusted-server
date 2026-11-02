@@ -170,8 +170,8 @@ mod tests {
             (
                 "liveintent",
                 Some("https://li.example.com/idex"),
-                json!(["li.example.com"]),
-                json!({ "attributes": { "nonId": "li.example.com" } }),
+                json!(["liveintent.com"]),
+                json!({ "resolve": ["nonId"] }),
             ),
             ("liveramp", None, json!(["liveramp.example.com"]), json!({})),
             (
