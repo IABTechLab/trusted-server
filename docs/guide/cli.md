@@ -369,7 +369,8 @@ generation. New automation should use `ts audit generate <url>`.
 
 `ts audit ad-templates generate <url>` discovers the publisher's ad slots and
 rewrites the `[creative_opportunities]` slot array in `trusted-server.toml` in
-place, preserving every other section and comment.
+place, preserving every other section and comment. It shows the change and asks
+before writing; see [Confirming the write](#confirming-the-write).
 
 ```bash
 ts audit ad-templates generate https://publisher.example/
@@ -386,7 +387,7 @@ not its catalogue:
 3. Load those pages, recording each slot's div, sizes, and GAM ad-unit path.
 4. Reconcile every slot across the pages it appeared on.
 5. Infer a `{section}` ad-unit template if the evidence proves one.
-6. Verify the result loads, then write it.
+6. Verify the result loads, show the change, and write it once confirmed.
 
 ### What it writes
 
@@ -443,6 +444,55 @@ origin, userinfo, query, or fragment, and there is no flag to suppress it. A
 `--dry-run` that changes nothing says so on stderr too, leaving stdout an empty
 diff.
 
+### Confirming the write
+
+A run that would change the config never writes it silently. After the crawl
+and the load check, the command prints the target path and the same
+managed-field diff that `--dry-run` prints, then asks:
+
+```text
+Apply these changes to trusted-server.toml? [y/N]
+```
+
+Only `y` or `yes` (any case) applies the change. Anything else — an empty line,
+`n`, or end of input — leaves the file untouched and exits with an error, so a
+chained step such as `&& ts config push` does not run against a config that was
+not regenerated. With `--replace`, a warning that unobserved slots and
+hand-written slot fields will be discarded appears before the question. The
+preview, warning, and prompt all go to stderr, so stdout carries only the final
+`Wrote ...` line. Page-supplied text in the preview is shown with control and
+bidirectional-override characters escaped, so they cannot reorder or hide lines
+of the diff you are approving. When the candidate uses a `{section}`
+template, the preview warns before the question that a template-aware binary
+must be deployed before the config is pushed. The note saying the config now
+uses a template is printed only once such a config is written, previewed with
+`--dry-run`, or already in place.
+
+| Situation                                       | Result                                                                                   |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Managed fields unchanged                        | Says so on stderr; no prompt, and the file is not rewritten.                             |
+| `--dry-run`                                     | Prints the diff on stdout; never prompts or writes.                                      |
+| stdin and stderr are terminals                  | Previews the diff and asks; the default answer is no, and a decline exits with an error. |
+| stdin or stderr is not a terminal, no `--yes`   | Previews the diff on stderr, then fails without writing.                                 |
+| `--yes`                                         | Previews the diff on stderr and writes without asking.                                   |
+| The file changed during the crawl or the prompt | Refuses to overwrite it; re-run against the current file.                                |
+
+`--yes` is the opt-in for automation and cannot be combined with `--dry-run`.
+A useful pattern is to review a `--dry-run` first, then apply it:
+
+```bash
+ts audit ad-templates generate https://publisher.example/ --dry-run
+ts audit ad-templates generate https://publisher.example/ --yes
+```
+
+The second run crawls again, so its result can differ from the preview when the
+live site changes in between; its own stderr preview shows what was written.
+
+Unlike the prompt's preview, the `--dry-run` diff on stdout is printed verbatim
+so it stays usable as a diff, and page-supplied control or bidirectional
+characters are not escaped. Review it through a viewer that shows them, such as
+`cat -v`, or rely on the escaped preview at the prompt.
+
 ### Bounding and steering the crawl
 
 ```bash
@@ -462,6 +512,9 @@ ts audit ad-templates generate https://publisher.example/ \
 
 # Preview without writing.
 ts audit ad-templates generate https://publisher.example/ --dry-run
+
+# Apply without the confirmation prompt (CI, scripts).
+ts audit ad-templates generate https://publisher.example/ --yes
 ```
 
 Re-running merges into the existing slots: a slot seen again keeps its
@@ -475,7 +528,8 @@ targeting, or provider settings, a stderr note names the split because the new
 slot does not inherit them. A prefix that does claim several
 discovered divs is named in a stderr note, because the runtime resolves a
 prefix to at most one element. `--replace` discards existing slots instead,
-which also discards any template you wrote by hand.
+which also discards any template you wrote by hand; the confirmation prompt
+warns about this before asking.
 
 `--scroll` performs the same deterministic stepped scroll on every page and
 device profile after the initial settle, then waits for the page to settle again
