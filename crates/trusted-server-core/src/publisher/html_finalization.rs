@@ -106,6 +106,7 @@ impl HtmlEofDriver {
                 ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
                 suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
                 gpt_diagnostics: params.gpt_diagnostics.clone(),
+                trace_bootstrap: params.trace_bootstrap.clone(),
                 shared_template_authorized: false,
                 csp_nonce_observed: None,
                 deferred_inline_marker: marker
