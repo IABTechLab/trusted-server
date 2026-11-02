@@ -24,6 +24,7 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 trusted-server-core = { workspace = true }
 url = { workspace = true }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }
