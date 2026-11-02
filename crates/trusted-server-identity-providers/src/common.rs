@@ -179,6 +179,24 @@ pub(crate) fn cookie_eid<'cookie>(
     }
 }
 
+/// Agent type of the device-based IDs read from browser-ID cookies.
+pub(crate) const DEVICE_ATYPE: i32 = 1;
+
+/// One EID for `source` holding the single device-based UID `id` with
+/// agent type 1.
+#[must_use]
+pub(crate) fn device_eid<'cookie>(
+    source: &SourceDomain,
+    id: Cow<'cookie, str>,
+    expiry: ProviderExpiry,
+) -> ProviderEid<'cookie> {
+    let mut eid = cookie_eid(source, id, expiry);
+    for uid in &mut eid.uids {
+        uid.atype = Some(DEVICE_ATYPE);
+    }
+    eid
+}
+
 /// Percent-decodes a cookie value, keeping it unchanged when it is not
 /// valid percent-encoded UTF-8.
 #[must_use]
