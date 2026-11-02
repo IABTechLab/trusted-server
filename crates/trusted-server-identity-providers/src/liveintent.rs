@@ -96,7 +96,13 @@ impl ProviderKind for LiveIntent {
                 .attach("a liveintent provider needs at least one attribute")
         })?;
         let distributor = settings.distributor_id.as_deref().unwrap_or("prebid");
-        let mut url = common.endpoint.clone();
+        let mut url = common
+            .endpoint
+            .ok_or_else(|| {
+                Report::new(ProviderConfigError::Invalid)
+                    .attach("a liveintent provider needs an endpoint")
+            })?
+            .clone();
         url.path_segments_mut()
             .map_err(|()| {
                 Report::new(ProviderConfigError::Invalid).attach("endpoint cannot hold a path")
