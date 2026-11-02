@@ -2407,11 +2407,15 @@ generated configuration places it in.
 | `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of whatever the origin answers, on `text/plain` and at `/robots.txt` alone                                                                                                                                                                                                                         |
 | `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it                                                                                                                                                            |
 
-Encypher identifies a reusable signing plan by canonical article text, policy
-and credential context. Page URL and title are deliberately not part of that
-identity: the matching service deduplicates equal canonical text, so a reused
-manifest can retain the first canonical source URL. Configure the middleware
-only where that content identity is correct for the publisher.
+In the default synchronous mode, Encypher identifies a reusable signing plan
+by canonical article text, policy and credential context. Page URL and title
+are deliberately not part of that identity: the matching service deduplicates
+equal canonical text, so a reused manifest can retain the first canonical
+source URL. Configure the middleware only where that content identity is
+correct for the publisher. [Prepared signing](#encypher-prepared-signing)
+binds the page URL and admitted variant into every identity instead, so its
+results are page-bound. Prepared text identities also bind the page title;
+changing only that title does not invalidate an unchanged media item.
 
 `max_document_bytes` also bounds the final signed HTML. The module counts
 inserted marker bytes and the escaped manifest meta element before allocating
@@ -2431,9 +2435,10 @@ bounded media signing after this upgrade. The defaults are 5,000,000 bytes per
 item and 8 uncached embedded calls per document. There is no separate bounded
 media off switch; removing the module disables its article signing too.
 Deploy the matching API first and confirm media upload approval, API capacity
-and cold-page latency before upgrading an enabled edge. The complete settings,
-validation bounds and rollout contract are in the
-[module design](../superpowers/specs/2026-10-24-encypher-provenance-module-design#_3-configuration).
+and cold-page latency before upgrading an enabled edge. Repository maintainers
+can find the complete settings, validation bounds and rollout contract in
+`docs/superpowers/specs/2026-10-24-encypher-provenance-module-design.md`,
+section 3. That internal design document is not published on this site.
 
 `article_selector` accepts a single `.class`, exact `[attr=value]` (optionally
 quoted) or tag name, up to 91 characters. Unsupported or malformed syntax
@@ -2454,15 +2459,21 @@ It bounds uncached embedded-media signing calls in each HTML or CSS document.
 Cache hits do not consume the budget. Once exhausted, remaining items stay
 unchanged without a negative cache entry. Raising this value does not increase
 `max_hold_ms`, body limits or API rate limits; verify the complete cold page
-under the deployed adapter before selecting a larger value.
+under the deployed adapter before selecting a larger value. The budget governs
+synchronous signing only; in `async_prepared` mode delivery makes no signing
+calls.
 
 `max_large_media_bytes = 0` keeps prepared large-media signing off by default.
-Enabling it requires the matching prepared API and signed probe, a
-version-pinned source and a runtime timer that bounds the complete hashing and
-signing operation under `max_large_media_ms`. Fastly has no such total timer,
-so it refuses this lane even where the API supports the file. Its first-byte
-and between-byte timeouts are not substitutes. A refused large-media signing
-attempt delivers a fresh origin response without adding provenance.
+In synchronous mode, enabling it requires the matching prepared API and signed
+probe, a version-pinned source and a runtime timer that bounds the complete
+hashing and signing operation under `max_large_media_ms`. Fastly has no such
+total timer, so it refuses this lane even where the API supports the file. Its
+first-byte and between-byte timeouts are not substitutes. A refused large-media
+signing attempt delivers a fresh origin response without adding provenance. In
+`async_prepared` mode the worker hashes outside delivery and delivery only
+looks up the published result, so this timer requirement does not apply to the
+lookup; the source requirements under
+[prepared signing](#encypher-prepared-signing) do.
 
 Coverage follows the delivered bytes through configured publisher and asset
 routes. A page can still load unsigned media directly from a third-party frame
@@ -2487,6 +2498,304 @@ names it.
 
 The sections below give each module's settings, and the integration guides
 describe what each one does.
+
+### Encypher Prepared Signing
+
+**Section**: `execution` in `[provenance.encypher]`, with
+`[provenance.encypher.preparation]`
+
+`execution = "synchronous"` is the default and keeps the behavior above.
+`execution = "async_prepared"` moves signing out of reader delivery into a
+publisher-operated native worker. Delivery looks up a result the worker
+published for the exact text or bytes it is about to send, applies it, and
+sends every other item unsigned. It never signs, prepares, finalizes or
+uploads, and it never falls back to synchronous signing. The worker uses the
+same `cwk_` credential, so the claim, host policy and signing identity are
+those of synchronous mode; only where signing runs changes.
+
+Each identity binds the credential context (`api_base_url`, `domain` and the
+worker token), the current policy digest, the page address
+`https://<public_host><path>` without its query, the admitted variant and the
+exact item: projected article text with its title and boundary selector, or a
+media item's carrier, type and source SHA-256. A changed item, policy or
+credential therefore has a new identity and stays unsigned until the worker
+prepares it. Article lookups use the cached policy digest; media lookups ask
+the policy endpoint live, as synchronous media does, so a revoked credential
+stops every published media result.
+
+```toml
+[provenance.encypher]
+api_base_url = "https://api.example.com"
+domain = "publisher.example.com"
+worker_token = "encypher_worker_token"
+execution = "async_prepared"
+
+[provenance.encypher.preparation]
+worker_url = "https://prep.publisher.example.com"
+loopback_url = "https://publisher.example.com"
+deployment_id = "publisher-preparation"
+public_host = "publisher.example.com"
+signal_secret = "encypher_preparation_signal"
+publication_secret = "encypher_preparation_publication"
+routes = ["/news/", "/media/"]
+reader_trigger = false
+
+[[provenance.encypher.preparation.variants]]
+name = "edition"
+values = ["uk", "us"]
+```
+
+| Field                | Default  | Contract                                                                                                                                      |
+| -------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `worker_url`         | Required | Worker origin: `https`, or `http` on `127.0.0.1`, `localhost` or `[::1]`; no path, query or user information. Receives hints and source reads |
+| `loopback_url`       | Required | This deployment's own public origin, same rules. Snapshots are read through it, so they take the reader pipeline                              |
+| `deployment_id`      | Required | 1 to 64 lower-case letters, digits or `-`; equal to the worker's                                                                              |
+| `public_host`        | Required | `domain` or its `www.` name. Every identity names it, so a reader on another host finds no result                                             |
+| `signal_secret`      | Required | Secret-store entry name. Its value authorizes reader hints only                                                                               |
+| `publication_secret` | Required | Secret-store entry name. Its value authorizes snapshots, result and marker publication, and public source reads                               |
+| `reader_trigger`     | `false`  | Send a bounded hint to the worker for unprepared items                                                                                        |
+| `admission_ms`       | `50`     | `10..=200`; the longest a hint waits on an adapter with a timer                                                                               |
+| `routes`             | Required | 1 to 64 path prefixes, matched as string prefixes, so `/news` also matches `/newsletter`. Only these paths are snapshotted or hinted          |
+| `variants`           | `[]`     | Up to 8 query parameters, each with 1 to 32 values; names and values are 1 to 64 letters, digits, `-`, `_` or `.`                             |
+
+`async_prepared` without the table, a `public_host` outside the claim, or
+`reader_trigger = true` on an adapter that offers neither a timer nor an
+after-response lifetime refuses startup. Results and retirement markers live
+in the runtime KV store as `encypher:prep:v1:result:<identity>` and
+`encypher:prep:v1:retired:<identity>`, so the delivery instance needs runtime
+KV (`TRUSTED_SERVER_KV_PATH` on Axum). The module also serves
+`/_encypher/preparation/snapshot`, `/_encypher/preparation/results/<identity>`
+and `/_encypher/preparation/markers/<identity>` to the worker, authenticated
+by the publication secret, and the public
+`/_encypher/preparation/source/<sha256>`.
+
+Prepared text signing and recovery require `"cache_scope": "exact_request"`
+alongside the frozen policy digest. The API then reuses only a result for
+that exact request, including its title, page URL and boundary selector,
+rather than one with the same text and rights alone. The worker retains
+this scope in every publication envelope; missing or unknown scopes are
+refused, never treated as legacy signing. Synchronous signing keeps its
+existing request and cache behavior.
+
+The text identity hash domain is `encypher-preparation/2:text`. Results made
+under the former text cache contract cannot satisfy current reader lookups
+or be published under an old identity. The preparation protocol and media
+identities are unchanged, so this change alone does not require media to
+be signed again. Upgrade the worker and delivery instance together against
+an API that supports exact-request cache isolation. Retained legacy text
+envelopes without the required scope also fail closed during recovery;
+they are not migrated by assigning a scope to an old receipt.
+
+#### Run the worker
+
+```bash
+trusted-server-axum preparation-worker --config worker.toml
+```
+
+Start from `crates/trusted-server-preparation-worker/worker.example.toml`.
+`deployment_id`, `api_base_url`, `domain`, `public_host`, `article_selector`,
+`min_text_length`, `max_media_bytes` and `variants` must equal the delivery
+settings. `edge_url` is the delivery origin whose `/_encypher/preparation/`
+routes the worker calls. `[secrets]` names environment variables, never
+values: `worker_token` (the `cwk_` credential), `signal_secret` and
+`publication_secret` (equal to the delivery secret-store values) and
+`operator_secret` (for `ts preparation`). The four values must differ. The
+loader also requires `workers` `1..=4`, `max_snapshot_bytes` at most 64 MiB and
+not below `max_media_bytes`, `max_preparation_seconds` `1..=3600`,
+`scan_per_minute` `1..=128`, `scan_interval_seconds` `60..=900`, and at most
+1,024 `[[inventory]]` entries. Registered inventory capacity is the lesser of
+1,024 and `scan_per_minute` times the whole minutes in
+`scan_interval_seconds`. At one target per minute and 900 seconds, capacity
+is 15 targets; the defaults of 128 and 900 retain the 1,024-target limit.
+The same capacity covers distinct configured targets, `--register` additions
+and retained inventory. Startup refuses a store above the configured capacity
+without deleting its records; raise the scan capacity to reopen it.
+
+A second process cannot open `store_dir/preparation.redb`, and the worker
+refuses to start without it. `GET /v1/preparation/ready` answers `503` until
+unfinished jobs are recovered, the delivery instance accepts the publication
+secret, the API answers a policy for `https://<public_host>/`, and a signed
+probe release loads: a fresh store fetches one through the API's media
+capabilities, and a store with retained work reloads its own. The worker
+retries every 10 seconds, logging `preparation: not ready` with the failing
+codes, and prepares nothing until ready. It drains on `SIGINT`; any other stop
+is a crash that the next start recovers by reconciling byte reservations and
+reclaiming unfinished claims. Delivery must reach `worker_url`, and the worker
+must reach `edge_url` and `api_base_url`. The worker's warm, retire and status
+routes require the operator secret.
+
+#### Supply the inventory
+
+The worker prepares only the targets it is given. It does not crawl the
+origin, read sitemaps or discover uploads. A target is a path and an optional
+variant. Supply the full inventory through `[[inventory]]` entries, which are
+registered at every start, through `ts preparation warm --register`, or from a
+publication hook that runs `ts preparation warm` for each changed path.
+
+```bash
+export TS_PREPARATION_OPERATOR_SECRET='<operator secret>'
+ts preparation warm --worker-url https://prep.publisher.example.com --register \
+  --target /news/harbor-vote --target /news/budget-2027 --target /media/flood.jpg
+```
+
+The CLI has no file option. For a publisher-supplied list, one path per line:
+
+```bash
+args=()
+while IFS= read -r path; do args+=(--target "$path"); done < targets.txt
+ts preparation warm --worker-url https://prep.publisher.example.com --register "${args[@]}"
+```
+
+One call takes up to 1,024 targets (`413 too_many_targets` above that). Every
+target in a call shares `--variant`, which must be the canonical admitted form,
+pairs sorted by name such as `--variant edition=uk`; run one call per variant.
+The worker URL must be `https`, or `http` on a loopback host. The command
+prints one outcome per target: `queued`, `coalesced` (merged into a waiting
+job), `damped` (published, retired or suppressed), `queue_full`, or
+`not_admitted` (a malformed path or a variant the worker's schema refuses). It
+exits nonzero when any target was `queue_full` or `not_admitted`; repeating the
+call is safe. `--retry` first clears the targets' suppressed outcomes.
+`--register` records the admitted targets before queueing them, so a
+`queue_full` target stays registered. Registration only adds: no command
+removes a target, and deleting an `[[inventory]]` entry does not unregister
+it. A full inventory answers `409 inventory_full` without partially registering
+the batch. Duplicate targets do not consume additional capacity.
+
+Once a minute the worker queues up to `scan_per_minute` registered targets not
+reconciled within about `scan_interval_seconds`, from a persisted cursor. A
+reconciliation prepares only items its target's previous snapshot also held,
+so a new or changed item is prepared on the second pass that sees it; a warm
+prepares the current snapshot at once.
+
+A page target covers its article text and the eligible `data:` URI media and
+inline SVG in that page. A stylesheet target under a
+`provenance.encypher.stylesheet` entry covers its embedded `data:` media. A
+media target covers that file. Images, video, fonts and stylesheets that a page
+links by URL are separate resources: each needs its own target, or a reader
+request that hints it. A target must lie under `routes` and reach a
+`[[serve]]` entry that names the module or, for media, a publisher or asset
+route; otherwise the snapshot is refused as `target_not_configured` or
+`snapshot_unobserved`.
+
+#### Reader hints
+
+With `reader_trigger = false`, delivery only looks up results. With `true`, a
+document or standalone item with misses sends one hint of at most 8 KiB, for a
+path under `routes` with an admitted variant. A hint is never retried or
+stored on the edge; only the worker's admission is durable, and warming and
+reconciliation recover a lost hint. A hint prepares only the items the reader
+saw, and only while a fresh snapshot still holds them; otherwise the item is
+recorded as `source_unstable` for five minutes.
+
+| Adapter                         | Hint lifetime                                                                                  |
+| ------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Axum                            | Real timer; the hint waits at most `admission_ms`                                              |
+| Cloudflare Workers (WASM)       | Real timer; the hint waits at most `admission_ms`. `waitUntil` is not used                     |
+| Spin (WASM)                     | Real timer; the hint waits at most `admission_ms`                                              |
+| Fastly                          | No timer. The hint is sent after the response, at most 8 per response, best effort             |
+| Native Cloudflare or Spin build | No timer and no after-response lifetime: `reader_trigger = true` refuses startup; `false` runs |
+
+Delivery still reads the runtime KV store and the policy endpoint, so no fixed
+latency is promised. Where the adapter has a timer, `max_hold_ms` bounds that
+work; on Fastly only backend timeouts do. Only the Axum adapter has run this
+mode against a live worker and API.
+
+#### Media
+
+The worker hashes media locally and never uploads it. All media preparation
+uses worker contract version 2, so it needs an API that advertises that
+version; text does not. Embedded `data:` media and inline SVG up to
+`max_media_bytes` get an embedded manifest, and their source is named by a
+digest-addressed publisher snapshot at
+`https://<public_host>/_encypher/preparation/source/<sha256>`. A bounded
+standalone file keeps its bytes and gets a detached manifest named by a `Link`
+header. Its source is named by its fetched `https` origin URL where that URL
+has no query, and by a publisher snapshot otherwise. Delivery serves a
+snapshot only after the page and asset passed public admission, as the exact
+bytes with `Content-Disposition: attachment` and a sandbox CSP. A copy of a
+standalone file taken without that `Link` carries no provenance.
+
+Large items need `max_large_media_bytes` above zero on both delivery and
+worker. A source larger than the whole-snapshot bound is read in ranges pinned
+to its strong `ETag` and length, hashed whole under `store_dir/large` and
+signed with a detached manifest. Delivery decorates the origin's own answer
+when the configured origin, type, length, `ETag` and query match. The fetched
+source URL must be `https` without a query (`source_reference_required`
+otherwise), so a query-forwarding route cannot use this lane, and the reader's
+raw query must equal its canonical admitted variant. Reuse trusts the origin's
+strong validators; an `ETag` is not a cryptographic proof.
+
+Privacy and existing provenance fail closed. A snapshot the origin marked
+private (`source_private`), one with its own manifest `Link`
+(`source_has_provenance_link`), `no-transform` (`no_transform`) or a content
+coding (`content_encoded`) is refused and not prepared.
+
+#### Status and capacity
+
+```bash
+ts preparation status --worker-url https://prep.publisher.example.com
+```
+
+The answer has `ready`; `counts` of `pending` and `processing` jobs,
+`artifacts`, `publication_pending`, `publication_acknowledged`,
+`retirement_pending`, `retirement_acknowledged`, `inventory` and
+`reserved_bytes`; `active_refusals_by_code`; and `capacity`: 1,024 `jobs`, of
+which 768 `reader_jobs` (256 slots are kept from reader hints), 8 MiB
+`queue_bytes`, 6 MiB `reader_queue_bytes`, the configured scan capacity as
+`inventory_targets` (at most 1,024), and `artifact_bytes`, the configured
+`artifact_quota_bytes`.
+
+A transient failure retries with backoff, up to six attempts within 24 hours,
+then is suppressed for one hour. An integrity, privacy, unsupported or
+existing-provenance refusal stays until the item's identity changes or
+`warm --retry`. `active_refusals_by_code` counts these retained outcomes. It
+also keeps one diagnostic outcome per extraction refusal reason and exact page
+version, such as `malformed_data_uri`, while valid siblings still prepare. The
+counts record what extraction saw; they are not proof that every medium on a
+page was covered, because linked media appear only when targeted. The worker
+logs each item refusal as `preparation: item refused kind=... code=...`.
+
+`artifact_quota_bytes` is a hard reservation over sources, temporary large
+files, probes, plans, outputs and their metadata, taken before work starts. A
+full quota refuses new work with `quota_exhausted` and never evicts retained
+recovery material; raise the quota and restart, or retire identities. A full
+queue answers `queue_full`.
+
+#### Retirement
+
+```bash
+ts preparation retire --worker-url https://prep.publisher.example.com --identity <64 hex>
+```
+
+An identity is the suffix of its delivery KV key
+`encypher:prep:v1:result:<identity>`. Retirement records a tombstone, raises
+the retirement epoch, drops the item's artifact and plan, and queues a marker.
+Each one-minute housekeeping pass attempts up to 16 queued markers until the
+delivery instance acknowledges them. Bulk retirement and failed deliveries
+can leave markers pending for multiple passes. The command answers `marker`
+`pending` or `acknowledged`, and `status` counts both. A reader refuses a
+result whose marker is present or unreadable. Acknowledgement means the
+delivery KV write succeeded, not that
+every KV replica, downstream cache or downloaded copy changed. Hints, warming
+and reconciliation never prepare a retired identity again; changed content has
+a new identity.
+
+Policy withdrawal is separate from an identity's retirement marker. Text
+lookups retain the existing `policy_ttl_seconds` policy cache; media lookups
+request current policy. Neither path makes withdrawal retroactive for copies
+already downloaded.
+
+#### Durable state
+
+`store_dir` holds `preparation.redb` and the retained files: the only durable
+copy of the queue, inventory, outcomes, tombstones, marker outbox and
+artifacts. When a hint, warm or reconciliation finds a published result
+missing from the delivery KV store, the worker republishes it from its
+artifact without signing again. Back up `store_dir` as one unit while the
+worker is stopped, restore it to the same path, and do not run a restored copy
+beside the original. Never delete `encypher:prep:v1:retired:` entries from the
+delivery KV store. Changing the worker token, `api_base_url` or `domain`
+changes every identity, so all content is prepared again.
 
 ### DataDome Integration
 

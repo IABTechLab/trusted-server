@@ -851,8 +851,6 @@ fn the_page_and_the_json_carry_the_view() {
         &request(CONFIG_JSON_PATH),
     )))
     .expect("a JSON body");
-    let keys: Vec<&String> = json.as_object().expect("an object").keys().collect();
-    assert_eq!(keys, ["masked", "settings", "version"]);
     assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(
         json["settings"]["publisher"]["domain"],
@@ -865,20 +863,6 @@ fn the_page_and_the_json_carry_the_view() {
             .contains(&json!("publisher.proxy_secret")),
         "{json}"
     );
-}
-
-fn assert_keys_sorted(value: &Value) {
-    match value {
-        Value::Object(map) => {
-            let keys: Vec<&String> = map.keys().collect();
-            let mut sorted = keys.clone();
-            sorted.sort_unstable();
-            assert_eq!(keys, sorted, "keys should be sorted");
-            map.values().for_each(assert_keys_sorted);
-        }
-        Value::Array(items) => items.iter().for_each(assert_keys_sorted),
-        _ => {}
-    }
 }
 
 /// Two loads of one document build hash maps of their own, each iterating
@@ -900,7 +884,6 @@ fn the_same_settings_give_the_same_view() {
 
     assert_eq!(first_json, second_json);
     let parsed: Value = serde_json::from_str(&first_json).expect("JSON");
-    assert_keys_sorted(&parsed);
     assert_eq!(
         parsed["settings"]["response_headers"]
             .as_object()

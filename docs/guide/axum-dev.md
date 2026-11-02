@@ -69,6 +69,32 @@ at different paths do not see each other's data. If the variable is set but the
 store cannot be opened, the server exits with an error. When it is unset,
 runtime KV reports unavailable and a warning is logged once.
 
+Encypher's `execution = "async_prepared"` stores published results and
+retirement markers in this store, so set `TRUSTED_SERVER_KV_PATH` for that
+mode.
+
+## Listener address
+
+The bind address comes from `axum.toml`, or from `PORT`, which binds that port
+on loopback. `TS_LISTEN_ADDR`, a full socket address such as `10.0.0.5:8080`,
+overrides both, for example to reach the server from a private network. A
+value that does not parse as a socket address exits with status `2`.
+
+## Preparation worker
+
+The same binary runs Encypher's publisher-operated preparation worker as a
+separate long-lived process with its own store:
+
+```bash
+trusted-server-axum preparation-worker --config worker.toml
+```
+
+Any other argument form prints the usage line and exits with status `2`; a
+configuration, store or listener failure exits with status `1`. The worker
+does not serve publisher traffic. Its configuration, secrets, readiness and
+operator commands are described under
+[Encypher prepared signing](./configuration#encypher-prepared-signing).
+
 ## Runtime boundaries
 
 Axum sanitizes forwarded client-IP headers but does not resolve

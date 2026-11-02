@@ -95,6 +95,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, hea
 use sha2::{Digest as _, Sha256};
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use crate::integrations::IntegrationRequestState;
 use crate::middleware::{ResponseHeader, media_type_of};
 use crate::platform::{CacheSpec, LoadError, LoadedValue, RuntimeServices, StoreKey};
 use crate::response_privacy::cache_control_forbids_shared_storage;
@@ -185,6 +186,119 @@ pub trait MediaSigner: Send + Sync {
             })
         })
     }
+
+    /// Whether delivery only looks up results the signer already holds, so
+    /// core never runs a signing load for a reader. Core then keeps no
+    /// signed representation and reads none it kept, never starts or joins
+    /// a large-lane load, and asks [`lookup_large`](Self::lookup_large) for
+    /// a large version instead. [`sign`](Self::sign) is still asked for a
+    /// captured body, and must itself only look up. `false` by default.
+    fn lookup_only(&self) -> bool {
+        false
+    }
+
+    /// The published headers of one large version, for a signer that
+    /// answers [`lookup_only`](Self::lookup_only). Core decorates the
+    /// origin's own answer with them where the length matches. The default
+    /// finds nothing.
+    fn lookup_large<'a>(
+        &'a self,
+        _services: &'a RuntimeServices,
+        _job: &'a LargeLookupJob<'a>,
+    ) -> LargeLookup<'a> {
+        Box::pin(async {
+            Err(MediaSigningFailure {
+                reason: "large_lookup_unsupported",
+            })
+        })
+    }
+
+    /// Whether the request the module's hooks left `state` on reads a
+    /// representation for the signer's own preparation rather than for a
+    /// reader. Core then signs and looks up nothing, keeps nothing, and
+    /// sends the origin's answer as it came with
+    /// [`snapshot_headers`](Self::snapshot_headers) added. `false` by
+    /// default.
+    fn observes_snapshot(&self, _state: &IntegrationRequestState) -> bool {
+        false
+    }
+
+    /// Headers written on the origin's answer to a request
+    /// [`observes_snapshot`](Self::observes_snapshot) admitted, reporting
+    /// what the origin's own headers said about it. None by default.
+    fn snapshot_headers(
+        &self,
+        _state: &IntegrationRequestState,
+        _facts: &SnapshotFacts,
+    ) -> Vec<ResponseHeader> {
+        Vec::new()
+    }
+}
+
+/// What [`MediaSigner::lookup_large`] returns.
+pub type LargeLookup<'a> =
+    Pin<Box<dyn Future<Output = Result<PublishedLarge, MediaSigningFailure>> + 'a>>;
+
+/// One large version a lookup-only signer is asked about, named by the
+/// origin's own validators. An entity tag is not cryptographic evidence:
+/// the signer relies on the origin honoring strong validator semantics.
+#[derive(Debug, Clone, Copy)]
+pub struct LargeLookupJob<'a> {
+    /// The address the reader asked for, `scheme://host/path`, without its
+    /// query.
+    pub reader_url: &'a str,
+    /// The reader's actual query, without `?`, empty where absent. The
+    /// signer must admit it before using it as a source-version variant.
+    pub reader_query: &'a str,
+    /// What tells this origin apart from another at one address.
+    pub origin_identity: &'a str,
+    /// The lower case host the source is fetched from.
+    pub source_origin_host: &'a str,
+    /// The origin's `Content-Type`, as it sent it.
+    pub content_type: &'a str,
+    /// The single strong entity tag the origin named, quoted.
+    pub etag: &'a str,
+    /// The version's total length.
+    pub length: u64,
+}
+
+/// A large version's published result: the headers its answers carry and
+/// the whole-source digest and length it was verified at.
+#[derive(Debug, Clone)]
+pub struct PublishedLarge {
+    /// Headers written on every answer of the version, as
+    /// [`LargeSignedMedia::headers`].
+    pub headers: Vec<ResponseHeader>,
+    /// SHA-256 of every byte of the version, written as its `Repr-Digest`.
+    pub sha256: [u8; 32],
+    /// The version's length.
+    pub length: u64,
+}
+
+/// What the origin's own headers said about the answer a preparation
+/// snapshot read, read before core changed any of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotFacts {
+    /// The origin's status.
+    pub status: StatusCode,
+    /// The origin marked the answer as one reader's, by a cookie, a
+    /// `Cache-Control` that forbids shared storage or a `Vary` on the
+    /// reader.
+    pub private: bool,
+    /// The origin forbade transforming the body.
+    pub no_transform: bool,
+    /// The origin's own `Link` names a C2PA manifest.
+    pub manifest_link: bool,
+    /// The origin's `Content-Encoding`, empty for identity.
+    pub content_encoding: String,
+    /// The lower case host the source was fetched from.
+    pub origin_host: String,
+    /// Lowercase SHA-256 hex of core's configured-origin identity,
+    /// distinguishing configured sources even at the same host.
+    pub origin_identity_sha256: String,
+    /// The exact fetched address, where it carries no user information,
+    /// query or fragment.
+    pub source_reference: Option<String>,
 }
 
 /// What [`MediaSigner::sign`] returns.
@@ -201,6 +315,9 @@ pub struct MediaJob<'a> {
     /// The address the reader asked for, `scheme://host/path`, without its
     /// query.
     pub reader_url: &'a str,
+    /// The reader's raw query, without `?`. A lookup-only signer admits it
+    /// through its configured variant schema before requesting preparation.
+    pub reader_query: &'a str,
     /// The origin's `Content-Type`, as it sent it.
     pub content_type: &'a str,
     /// The exact body core received, captured before anything else read
@@ -512,9 +629,8 @@ pub(crate) struct VariantIdentity<'a> {
     pub origin_identity: &'a str,
     /// The address core fetches, exactly as fetched.
     pub fetched_url: &'a str,
-    /// The reader's request carried no query, so
-    /// [`reader_url`](Self::reader_url) is the whole address it asked for.
-    pub reader_query_free: bool,
+    /// The reader's actual query, without `?`, empty where absent.
+    pub reader_query: &'a str,
 }
 
 /// Independent remaining browser and shared-cache lifetimes.
@@ -636,6 +752,9 @@ pub(crate) struct MediaClaim {
     /// representation it delivered, see
     /// [`answer_unsigned`](Self::answer_unsigned).
     conditions_answered: AtomicBool,
+    /// The module state of a request the signer reads for its own
+    /// preparation, see [`MediaSigner::observes_snapshot`].
+    snapshot: Option<IntegrationRequestState>,
 }
 
 impl MediaClaim {
@@ -682,12 +801,71 @@ impl MediaClaim {
             shared,
             reads_kept: shared
                 && looks_like_media
+                && !signer.lookup_only()
                 && !crate::publisher::request_asks_for_revalidation(headers),
             looks_like_media,
             names_signed_bytes,
             optimizer_output: false,
             conditions_answered: AtomicBool::new(false),
+            snapshot: None,
         })
+    }
+
+    /// The same claim on a request whose module hooks left `state`: where
+    /// the signer reads it for its own preparation, nothing is signed,
+    /// looked up or kept, and the origin's answer goes as it came with the
+    /// signer's snapshot headers, see [`MediaSigner::observes_snapshot`].
+    pub(crate) fn observing(mut self, state: &IntegrationRequestState) -> Self {
+        if self.signer.observes_snapshot(state) {
+            self.reads_kept = false;
+            self.snapshot = Some(state.clone());
+        }
+        self
+    }
+
+    /// The origin's answer to a snapshot request, as it came, with what its
+    /// own headers said written by the signer.
+    fn snapshot_answer(
+        &self,
+        state: &IntegrationRequestState,
+        identity: &VariantIdentity<'_>,
+        facts: &OriginFacts,
+        mut response: Response<EdgeBody>,
+    ) -> Response<EdgeBody> {
+        let headers = response.headers();
+        let encoding = header_text(headers, &header::CONTENT_ENCODING).trim();
+        let snapshot = SnapshotFacts {
+            status: response.status(),
+            private: facts.private || headers.contains_key(header::SET_COOKIE),
+            no_transform: facts.no_transform,
+            manifest_link: carries_manifest_link(headers),
+            content_encoding: if encoding.eq_ignore_ascii_case("identity") {
+                String::new()
+            } else {
+                encoding.to_ascii_lowercase()
+            },
+            origin_host: url::Url::parse(identity.fetched_url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+                .unwrap_or_default(),
+            origin_identity_sha256: hex::encode(Sha256::digest(
+                identity.origin_identity.as_bytes(),
+            )),
+            source_reference: source_reference(identity.fetched_url).map(str::to_owned),
+        };
+        for (name, value) in self.signer.snapshot_headers(state, &snapshot) {
+            if !is_reserved_header(&name) {
+                response.headers_mut().insert(name, value);
+            }
+        }
+        // The snapshot's own transport is internal: no cache may keep it
+        // for a reader. The origin's privacy was read above, before this
+        // header replaced its own, and travels in the signer's facts.
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        response
     }
 
     /// The same claim on a request the platform's image optimizer answers.
@@ -791,6 +969,9 @@ impl MediaClaim {
             Answered::Kept => return Delivery::Send(self.respond_kept(response)),
             Answered::Origin(facts) => facts,
         };
+        if let Some(state) = &self.snapshot {
+            return Delivery::Send(self.snapshot_answer(state, identity, &facts, response));
+        }
         if self.optimizer_output {
             return Delivery::Send(
                 self.deliver_optimized(services, identity, &facts, response)
@@ -1084,6 +1265,7 @@ impl MediaClaim {
             .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
         let job = MediaJob {
             reader_url: identity.reader_url,
+            reader_query: identity.reader_query,
             content_type: header_text(headers, &header::CONTENT_TYPE),
             source,
             source_sha256: &source_sha256,
@@ -1175,7 +1357,7 @@ impl MediaClaim {
                 representation.insert(name, value);
             }
         }
-        let kept = match keep_for.filter(|_| self.shared) {
+        let kept = match keep_for.filter(|_| self.shared && !self.signer.lookup_only()) {
             Some(lifetime) => {
                 let value = encode_kept(&KeptRecord {
                     kept_at: unix_seconds(),
@@ -1656,7 +1838,7 @@ fn varies_by_reader(headers: &HeaderMap) -> bool {
 /// Whether the origin's own `Link` already names a C2PA manifest, so the
 /// representation carries provenance core must keep as it came rather
 /// than sign again or compete with.
-fn carries_manifest_link(headers: &HeaderMap) -> bool {
+pub(crate) fn carries_manifest_link(headers: &HeaderMap) -> bool {
     headers
         .get_all(header::LINK)
         .iter()
@@ -1769,7 +1951,7 @@ fn is_fragmented_stream_part(bytes: &[u8]) -> bool {
 }
 
 /// Whether a `Cache-Control` line names `directive`.
-fn cache_control_has(headers: &HeaderMap, directive: &str) -> bool {
+pub(crate) fn cache_control_has(headers: &HeaderMap, directive: &str) -> bool {
     headers
         .get_all(header::CACHE_CONTROL)
         .iter()
@@ -2092,3 +2274,6 @@ pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod lookup_tests;

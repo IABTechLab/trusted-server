@@ -129,6 +129,17 @@ whole store to remove Encypher entries. In particular, the current
 `spin cloud key-value` plugin can delete a store but cannot enumerate and
 delete individual entries safely.
 
+With `execution = "async_prepared"`, the same store also holds published
+results under `encypher:prep:v1:result:` and retirement markers under
+`encypher:prep:v1:retired:`; probe releases for result verification are cached
+under `encypher:probe:v1:`, as in the large-media lane. Results and markers
+carry no `expires_at`. Never delete a retirement marker: a reader refuses a
+retired result only while its marker is present. A result the preparation
+worker still retains is republished when a hint, warm or reconciliation finds
+it missing. The WASM component has a real timer, so it accepts
+`reader_trigger = true`; a native host build has none and refuses it at
+startup.
+
 This cache split retires the old `encypher:v3:` article prefix and
 `encypher:policy:v2:` policy prefix. They are deletion candidates only after
 the same checks below. Before deleting `encypher:v3:`, wait the greater of

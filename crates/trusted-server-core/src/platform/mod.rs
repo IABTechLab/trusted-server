@@ -36,6 +36,7 @@
 
 use std::time::Duration;
 
+mod after_response;
 mod auction_target;
 mod cache_headers;
 mod error;
@@ -63,6 +64,11 @@ mod traits;
 mod types;
 mod value_cache;
 
+pub use after_response::{
+    AfterResponseRequest, MAX_AFTER_RESPONSE_BODY_BYTES, MAX_AFTER_RESPONSE_REQUESTS,
+    declare_platform_after_response_handoff, declare_platform_timer, hand_over_after_response,
+    platform_offers_after_response_handoff, platform_offers_timer, take_after_response_requests,
+};
 pub use auction_target::{AuctionTargetCapabilities, AuctionTargetDescriptor};
 pub use cache_headers::{declare_platform_cache_headers, platform_cache_headers};
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};

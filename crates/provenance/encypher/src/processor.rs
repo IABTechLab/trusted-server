@@ -44,6 +44,7 @@ use trusted_server_core::streaming_processor::{AsyncFinish, StreamProcessor};
 
 mod media;
 mod prepared;
+mod published;
 
 pub(crate) use media::EncypherMedia;
 
@@ -118,6 +119,9 @@ pub(crate) struct PageRequest {
     /// which is the address the article is signed for. On a host that
     /// serves several publishers by path it includes the publisher's prefix.
     pub(crate) page_url: String,
+    /// The reader's query, without its `?`, which only the asynchronous
+    /// mode reads, to admit a configured variant.
+    pub(crate) query: String,
     /// The path prefix request addressing removed, such as
     /// `/www.example.com`, or empty. The path gates read the publisher's own
     /// path, without it.
@@ -217,6 +221,18 @@ pub(crate) enum Reason {
     /// The document's media made its most endpoint calls; the item is signed
     /// on a later view.
     Deferred,
+    /// No published result exists for the item's exact identity: it is
+    /// delivered unsigned and the worker may be hinted.
+    NotPrepared,
+    /// The identity's result was retired; it is never served again.
+    Retired,
+    /// The retirement marker could not be read, so no result is served.
+    MarkerUnavailable,
+    /// A published record does not match the identity or item it is for.
+    PublishedRecordInvalid,
+    /// The optimizer's output is never looked up in the asynchronous mode,
+    /// whose standalone results are external manifests over origin bytes.
+    OptimizerOutputUnsupported,
 }
 
 impl Reason {
@@ -277,6 +293,11 @@ impl Reason {
             Self::SvgExistingProvenance => "svg_existing_provenance",
             Self::InlineSvgAltered => "inline_svg_altered",
             Self::Deferred => "deferred",
+            Self::NotPrepared => "not_prepared",
+            Self::Retired => "retired",
+            Self::MarkerUnavailable => "marker_unavailable",
+            Self::PublishedRecordInvalid => "published_record_invalid",
+            Self::OptimizerOutputUnsupported => "optimizer_output_unsupported",
         }
     }
 }
@@ -407,16 +428,13 @@ impl Signer {
             crate::media_api::MEDIA_SIGN_PATH
         );
         let policy_url = format!("{}{POLICY_PATH}", config.api_base_url.trim_end_matches('/'));
-        let context_hash = text::content_hash_hex(&format!(
-            "{}\n{}\n{}",
-            config.api_base_url,
-            config.domain,
-            config.worker_token.expose().trim()
-        ));
-        let cache_context = context_hash
-            .get(..16)
-            .unwrap_or(context_hash.as_str())
-            .to_owned();
+        // One credential context for every path, the preparation worker's
+        // identities included.
+        let cache_context = crate::preparation::protocol::credential_context(
+            &config.api_base_url,
+            &config.domain,
+            config.worker_token.expose(),
+        );
         Self {
             config,
             max_document_bytes,
@@ -578,16 +596,49 @@ impl StreamProcessor for DocumentProcessor {
 }
 
 /// The article found in a held document.
-struct Article {
-    boundary: Boundary,
+pub(crate) struct Article {
+    pub(crate) boundary: Boundary,
     /// Visible text sent for signing, truncated to the API limit.
-    text: String,
+    pub(crate) text: String,
     /// Unicode scalars in `text`.
-    scalars: usize,
+    pub(crate) scalars: usize,
     /// First structural closing-head offset in the original document.
-    head_close: Option<usize>,
+    pub(crate) head_close: Option<usize>,
     /// First completed structural title's inner byte range.
-    title_range: Option<(usize, usize)>,
+    pub(crate) title_range: Option<(usize, usize)>,
+}
+
+/// Find the article and its signable text, with no I/O. The one
+/// implementation every path uses: the reader's, synchronous or
+/// asynchronous, and the preparation worker's.
+pub(crate) fn extract_article(
+    html: &str,
+    article_selector: &str,
+    min_text_length: usize,
+) -> Result<Article, Reason> {
+    let boundary =
+        boundary::find_article_boundary(html, Some(article_selector)).ok_or(Reason::NoBoundary)?;
+    let article = html
+        .get(boundary.start..boundary.end)
+        .ok_or(Reason::NoBoundary)?;
+    if embed::has_existing_markers(article) {
+        return Err(Reason::AlreadySigned);
+    }
+    let metadata = text::document_metadata(html);
+    if metadata.manifest_present {
+        return Err(Reason::ManifestPresent);
+    }
+    let (visible, scalars) = text::visible_text(article, api::MAX_TEXT_SCALARS);
+    if scalars < min_text_length {
+        return Err(Reason::TextTooShort);
+    }
+    Ok(Article {
+        boundary,
+        text: visible,
+        scalars,
+        head_close: metadata.head_close,
+        title_range: metadata.title_range,
+    })
 }
 
 /// Time a document's resolve may still take, on runtimes with a timer.
@@ -719,29 +770,11 @@ impl Signer {
 
     /// Find the article and its signable text, with no I/O.
     fn extract(&self, html: &str) -> Result<Article, Reason> {
-        let boundary = boundary::find_article_boundary(html, Some(&self.config.article_selector))
-            .ok_or(Reason::NoBoundary)?;
-        let article = html
-            .get(boundary.start..boundary.end)
-            .ok_or(Reason::NoBoundary)?;
-        if embed::has_existing_markers(article) {
-            return Err(Reason::AlreadySigned);
-        }
-        let metadata = text::document_metadata(html);
-        if metadata.manifest_present {
-            return Err(Reason::ManifestPresent);
-        }
-        let (visible, scalars) = text::visible_text(article, api::MAX_TEXT_SCALARS);
-        if scalars < self.config.min_text_length {
-            return Err(Reason::TextTooShort);
-        }
-        Ok(Article {
-            boundary,
-            text: visible,
-            scalars,
-            head_close: metadata.head_close,
-            title_range: metadata.title_range,
-        })
+        extract_article(
+            html,
+            &self.config.article_selector,
+            self.config.min_text_length,
+        )
     }
 
     /// Unix time at which an entry written now with `ttl_seconds` expires.
@@ -771,6 +804,13 @@ impl Signer {
             Duration::from_millis(self.config.max_hold_ms).saturating_sub(SKIP_WRITE_RESERVE),
         );
         work.start().await;
+        // The asynchronous mode only looks up what the delivery instance
+        // published; it never signs here, and never falls back to signing.
+        if self.is_async() {
+            return self
+                .resolve_published_document(target, services, document, article, media, &mut work)
+                .await;
+        }
         let policy_digest = match self
             .policy_digest(&request.page_url, services, services.kv_store(), &mut work)
             .await
@@ -1355,7 +1395,8 @@ mod tests {
     };
     use trusted_server_core::platform::{
         PlatformCacheIntent, PlatformError, PlatformHttpClient, PlatformPendingRequest,
-        PlatformResponse, PlatformSelectResult,
+        PlatformResponse, PlatformSelectResult, declare_platform_after_response_handoff,
+        take_after_response_requests,
     };
 
     const TOKEN: &str = "cwk_test_worker_token_value";
@@ -1424,6 +1465,9 @@ mod tests {
         unavailable: bool,
         /// Every read fails with an error other than unavailability.
         fail_reads: bool,
+        /// Reads of keys with this prefix fail with an error other than
+        /// unavailability; every other read succeeds.
+        fail_reads_of: Option<&'static str>,
         /// Every read never completes.
         hung_reads: bool,
         /// Writes to keys with this prefix never complete.
@@ -1543,7 +1587,11 @@ mod tests {
             if self.unavailable {
                 return Err(KvError::Unavailable);
             }
-            if self.fail_reads {
+            if self.fail_reads
+                || self
+                    .fail_reads_of
+                    .is_some_and(|prefix| key.starts_with(prefix))
+            {
                 return Err(KvError::LimitExceeded {
                     message: "test failure".to_owned(),
                 });
@@ -1789,6 +1837,7 @@ mod tests {
         PageRequest {
             method: Method::GET,
             page_url: PAGE_URL.to_owned(),
+            query: String::new(),
             removed_prefix: String::new(),
             response_status: 200,
             origin_response_is_private: false,
@@ -3301,5 +3350,382 @@ mod tests {
                 "log line leaks article text: {line}"
             );
         }
+    }
+
+    // --- asynchronous prepared mode: reader delivery ------------------------
+
+    const SIGNAL_SECRET: &str = "signal-secret-for-tests";
+    const CANONICAL_PAGE: &str = "https://publisher.example.com/news/harbor-vote";
+    const SIGNALS_URL: &str = "https://prep.publisher.example.com/v1/preparation/signals";
+    const CHANGED_ARTICLE: &str = "<!doctype html><html><head><title>Harbor Council Votes</title></head>\
+        <body><nav>Home</nav><article><h1>Harbor council votes on the ferry schedule</h1>\
+        <p>The harbor council met on Wednesday evening and approved a revised ferry schedule \
+        for the coming season.</p><p>Residents asked for earlier departures on weekdays.</p>\
+        </article><footer>Footer</footer></body></html>";
+
+    fn async_factory(reader_trigger: bool) -> Arc<Signer> {
+        let mut config = config_json(TOKEN);
+        config["execution"] = json!("async_prepared");
+        config["preparation"] = json!({
+            "worker_url": "https://prep.publisher.example.com",
+            "loopback_url": "https://publisher.example.com",
+            "deployment_id": "test",
+            "public_host": "publisher.example.com",
+            "signal_secret": SIGNAL_SECRET,
+            "publication_secret": "publication-secret-for-tests",
+            "reader_trigger": reader_trigger,
+            "routes": ["/news/"],
+        });
+        factory_with(config, 5_000_000)
+    }
+
+    /// The identity the worker publishes the article of `html` under, by
+    /// the one item extraction both sides run.
+    fn text_identity(factory: &Signer, html: &str) -> (String, usize) {
+        let article = extract_article(
+            html,
+            &factory.config.article_selector,
+            factory.config.min_text_length,
+        )
+        .expect("should find the article");
+        let context = crate::preparation::items::ItemContext {
+            credential_context: &factory.cache_context,
+            policy_digest: POLICY_DIGEST,
+            page_url: CANONICAL_PAGE,
+            variant: "",
+            article_selector: &factory.config.article_selector,
+            min_text_length: factory.config.min_text_length,
+            max_media_bytes: factory.config.max_media_bytes,
+        };
+        let item = crate::preparation::items::text_item(&context, html, &article);
+        (item.identity, item.scalars)
+    }
+
+    fn publish_text(kv: &MemoryKv, identity: &str, scalars: usize) {
+        kv.insert(
+            &crate::preparation::protocol::result_key(identity),
+            &json!({
+                "protocol": crate::preparation::protocol::PREPARATION_PROTOCOL,
+                "identity": identity,
+                "retirement_epoch": 0,
+                "result": {
+                    "kind": "text",
+                    "plan": plan_json(MARKER),
+                    "manifest_url": MANIFEST_URL,
+                    "scalars": scalars,
+                },
+            }),
+        );
+    }
+
+    fn retire_text(kv: &MemoryKv, identity: &str) {
+        kv.insert(
+            &crate::preparation::protocol::marker_key(identity),
+            &json!({"epoch": 1}),
+        );
+    }
+
+    /// The policy cached as a delivery instance holds it.
+    fn cache_policy(factory: &Signer, kv: &MemoryKv) {
+        kv.insert(
+            &factory.policy_key,
+            &json!({
+                "kind": "digest",
+                "policy_digest": POLICY_DIGEST,
+                "expires_at": unix_now() + 3600,
+            }),
+        );
+    }
+
+    fn assert_no_signing_call(http: &StubHttpClient) {
+        for uri in http.recorded_request_uris() {
+            assert!(
+                !uri.contains("/cdn/sign") && !uri.contains("/media/") && !uri.contains("/hash/"),
+                "a reader should never call the signer: {uri}"
+            );
+        }
+    }
+
+    /// The hint the reader sent, decoded, with its headers.
+    fn sent_hint(
+        http: &StubHttpClient,
+    ) -> (
+        crate::preparation::protocol::SignalRequest,
+        Vec<(String, String)>,
+    ) {
+        let uris = http.recorded_request_uris();
+        let index = uris
+            .iter()
+            .position(|uri| uri == SIGNALS_URL)
+            .expect("should send a hint");
+        let body = &http.recorded_request_bodies()[index];
+        (
+            serde_json::from_slice(body).expect("should send a signal request"),
+            http.recorded_request_headers()[index].clone(),
+        )
+    }
+
+    #[test]
+    fn async_reader_applies_a_published_result_without_any_signing_call() {
+        let factory = async_factory(true);
+        let kv = Arc::new(MemoryKv::default());
+        let (identity, scalars) = text_identity(&factory, ARTICLE);
+        publish_text(&kv, &identity, scalars);
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(200, policy_response(POLICY_DIGEST));
+
+        let output = view(
+            &factory,
+            &timed_services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv),
+        );
+
+        assert_signed(&output);
+        assert_eq!(
+            http.recorded_request_uris().len(),
+            1,
+            "only the policy authority lookup should leave the instance"
+        );
+        assert!(http.recorded_request_uris()[0].contains("/trusted-server/policy"));
+        assert_no_signing_call(&http);
+    }
+
+    #[test]
+    fn async_reader_does_not_apply_a_result_from_the_old_text_cache_contract() {
+        use crate::preparation::protocol::{TEXT_PROJECTION_VERSION, domain_digest};
+
+        let factory = async_factory(true);
+        let article = extract_article(
+            ARTICLE,
+            &factory.config.article_selector,
+            factory.config.min_text_length,
+        )
+        .expect("should find the article");
+        let title =
+            text::title_from_range(ARTICLE, article.title_range).expect("should find the title");
+        let text_hash = crate::media_api::sha256_hex(article.text.as_bytes());
+        let old_identity = domain_digest(
+            "encypher-preparation/1:text",
+            &[
+                factory.cache_context.as_bytes(),
+                POLICY_DIGEST.as_bytes(),
+                CANONICAL_PAGE.as_bytes(),
+                b"",
+                TEXT_PROJECTION_VERSION.as_bytes(),
+                text_hash.as_bytes(),
+                b"1",
+                title.as_bytes(),
+                article.boundary.selector.as_bytes(),
+            ],
+        );
+        for reader_trigger in [false, true] {
+            let factory = async_factory(reader_trigger);
+            let kv = Arc::new(MemoryKv::default());
+            publish_text(&kv, &old_identity, article.scalars);
+            let http = Arc::new(StubHttpClient::new());
+            http.push_response(200, policy_response(POLICY_DIGEST));
+            if reader_trigger {
+                http.push_response(202, b"{}".to_vec());
+            }
+            let output = view(
+                &factory,
+                &timed_services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv),
+            );
+            assert_eq!(
+                output, ARTICLE,
+                "an old text result must leave the current delivery unsigned"
+            );
+            assert_no_signing_call(&http);
+            if reader_trigger {
+                let (hint, _) = sent_hint(&http);
+                assert_eq!(hint.items[0].identity, text_identity(&factory, ARTICLE).0);
+                assert_ne!(hint.items[0].identity, old_identity);
+            } else {
+                assert_eq!(http.recorded_request_uris().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn async_reader_miss_delivers_the_current_bytes_unsigned_and_hints_within_its_budget() {
+        let factory = async_factory(true);
+        let kv = Arc::new(MemoryKv::default());
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(200, policy_response(POLICY_DIGEST));
+        http.push_response(202, b"{}".to_vec());
+
+        let output = view(
+            &factory,
+            &timed_services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv),
+        );
+
+        assert_eq!(
+            output, ARTICLE,
+            "should deliver the current version unsigned"
+        );
+        assert_no_signing_call(&http);
+        let (hint, headers) = sent_hint(&http);
+        let (identity, _) = text_identity(&factory, ARTICLE);
+        assert_eq!(hint.deployment_id, "test");
+        assert_eq!(hint.target.path, "/news/harbor-vote");
+        assert_eq!(hint.target.variant, "");
+        assert_eq!(
+            hint.items,
+            [crate::preparation::protocol::ObservedItem {
+                kind: crate::preparation::protocol::ItemKind::Text,
+                identity,
+            }],
+            "should name the identity of exactly the bytes delivered"
+        );
+        assert!(
+            headers.iter().any(|(name, value)| {
+                name == crate::preparation::protocol::TOKEN_HEADER && value == SIGNAL_SECRET
+            }),
+            "should authenticate with the reader-signal scope only"
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, value)| value.contains(TOKEN) || name == "cookie"),
+            "should carry no worker credential or reader state"
+        );
+    }
+
+    #[test]
+    fn async_reader_never_applies_a_result_published_for_other_bytes() {
+        let factory = async_factory(true);
+        let kv = Arc::new(MemoryKv::default());
+        let (old_identity, scalars) = text_identity(&factory, ARTICLE);
+        publish_text(&kv, &old_identity, scalars);
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(200, policy_response(POLICY_DIGEST));
+        http.push_response(202, b"{}".to_vec());
+
+        let output = run(
+            &factory,
+            Some(request()),
+            &timed_services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv),
+            CHANGED_ARTICLE,
+        );
+
+        assert_eq!(
+            output, CHANGED_ARTICLE,
+            "the changed article should go unsigned"
+        );
+        let (hint, _) = sent_hint(&http);
+        let (new_identity, _) = text_identity(&factory, CHANGED_ARTICLE);
+        assert_ne!(new_identity, old_identity);
+        assert_eq!(
+            hint.items[0].identity, new_identity,
+            "should hint the changed version"
+        );
+        assert_no_signing_call(&http);
+    }
+
+    #[test]
+    fn async_reader_refuses_a_retired_or_unreadable_marker_and_does_not_hint() {
+        let factory = async_factory(true);
+        let (identity, scalars) = text_identity(&factory, ARTICLE);
+
+        let retired = Arc::new(MemoryKv::default());
+        publish_text(&retired, &identity, scalars);
+        retire_text(&retired, &identity);
+        let unreadable = Arc::new(MemoryKv {
+            fail_reads_of: Some("encypher:prep:v1:retired:"),
+            ..MemoryKv::default()
+        });
+        publish_text(&unreadable, &identity, scalars);
+
+        for (name, kv) in [("retired", retired), ("unreadable", unreadable)] {
+            let http = Arc::new(StubHttpClient::new());
+            http.push_response(200, policy_response(POLICY_DIGEST));
+            let output = view(
+                &factory,
+                &timed_services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv),
+            );
+            assert_eq!(
+                output, ARTICLE,
+                "{name}: the published result should not be applied"
+            );
+            assert!(
+                !http
+                    .recorded_request_uris()
+                    .iter()
+                    .any(|uri| uri == SIGNALS_URL),
+                "{name}: a refused result is not an unprepared item"
+            );
+            assert_no_signing_call(&http);
+        }
+    }
+
+    #[test]
+    fn async_reader_hint_to_an_unresponsive_worker_is_bounded_by_its_budget() {
+        let factory = async_factory(true);
+        let kv = Arc::new(MemoryKv::default());
+        cache_policy(&factory, &kv);
+        let http = Arc::new(HungHttpClient::default());
+
+        let output = view(
+            &factory,
+            &timed_services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv),
+        );
+
+        assert_eq!(output, ARTICLE, "the reader should get the current version");
+        assert_eq!(
+            http.sends.load(Ordering::SeqCst),
+            1,
+            "the one hint should be abandoned at its budget, never retried"
+        );
+    }
+
+    #[test]
+    fn async_reader_without_a_timer_hands_the_hint_over_after_the_response() {
+        let factory = async_factory(true);
+        let kv = Arc::new(MemoryKv::default());
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(200, policy_response(POLICY_DIGEST));
+        declare_platform_after_response_handoff();
+        drop(take_after_response_requests());
+
+        let output = view(
+            &factory,
+            &services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv),
+        );
+
+        assert_eq!(output, ARTICLE);
+        assert!(
+            !http
+                .recorded_request_uris()
+                .iter()
+                .any(|uri| uri == SIGNALS_URL),
+            "nothing should be sent while the reader waits"
+        );
+        let handed = take_after_response_requests();
+        assert_eq!(handed.len(), 1, "should hand one hint over");
+        assert_eq!(handed[0].request.uri().to_string(), SIGNALS_URL);
+        let hint: crate::preparation::protocol::SignalRequest =
+            serde_json::from_slice(handed[0].request.body()).expect("should be a signal");
+        assert_eq!(hint.items[0].identity, text_identity(&factory, ARTICLE).0);
+        assert_no_signing_call(&http);
+    }
+
+    #[test]
+    fn async_reader_without_reader_trigger_never_hints() {
+        let factory = async_factory(false);
+        let kv = Arc::new(MemoryKv::default());
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(200, policy_response(POLICY_DIGEST));
+
+        let output = view(
+            &factory,
+            &timed_services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv),
+        );
+
+        assert_eq!(output, ARTICLE);
+        assert_eq!(
+            http.recorded_request_uris().len(),
+            1,
+            "only the policy lookup"
+        );
+        assert_no_signing_call(&http);
     }
 }

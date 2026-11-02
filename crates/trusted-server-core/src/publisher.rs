@@ -2943,8 +2943,9 @@ fn build_template_assembly_params(
         auction_request: None,
         dispatched_auction: None,
         price_granularity,
-        // A request that carries any keeps to the origin path, so none reaches a
-        // document served from a template.
+        // A request that carries any value keeps to the origin path, so only
+        // observations reach a document served from a template. Set by the
+        // caller.
         request_state: IntegrationRequestState::default(),
         // Set by the caller, from the request's services.
         public_prefix: crate::prefix::PublicPrefix::default(),
@@ -5724,9 +5725,10 @@ pub async fn handle_publisher_request(
     log::debug!("Proxying request to configured publisher backend");
 
     let request_path = req.uri().path().to_string();
-    // Whether the reader's address is whole without its query, the only
-    // case it may name a large media source.
-    let reader_query_free = req.uri().query().is_none_or(str::is_empty);
+    // Preserve the reader's original query before the origin URI replaces it.
+    let reader_query = request_path_and_query
+        .split_once('?')
+        .map_or("", |(_, query)| query);
     let is_get = req.method() == http::Method::GET;
     let is_get_or_head = is_get || req.method() == http::Method::HEAD;
 
@@ -5895,7 +5897,8 @@ pub async fn handle_publisher_request(
         req.headers(),
         media_shared,
     )
-    .filter(|_| !request_host.is_empty());
+    .filter(|_| !request_host.is_empty())
+    .map(|claim| claim.observing(&request_state));
     // A reader's range or tag naming signed bytes means nothing to the
     // origin, so it is asked for the whole representation, and the reader's
     // headers are answered against the signed bytes.
@@ -6093,7 +6096,7 @@ pub async fn handle_publisher_request(
             reader_url,
             origin_identity,
             fetched_url,
-            reader_query_free,
+            reader_query,
         }),
         _ => None,
     };
@@ -6425,6 +6428,7 @@ pub async fn handle_publisher_request(
                     params.request_path.clone_from(&request_path);
                     params.public_prefix = services.public_prefix().clone();
                     params.removed_prefix = removed_prefix.clone().unwrap_or_default();
+                    params.request_state = request_state.clone();
                     params.seam_ad_slots = seam_ad_slots.clone();
                     params.dispatched_auction = dispatched_auction.take();
                     params.auction_observation = auction_observation.take();
@@ -7834,6 +7838,17 @@ pub(crate) enum TemplateCacheBypassReason {
     /// A response-bound CSP nonce cannot safely be replayed with a shared document.
     #[display("origin CSP contains a response-bound nonce")]
     CspNonce,
+    /// The origin forbade transforming the body. A replayed template carries
+    /// none of the origin's cache directives, so storing it would let a later
+    /// read of the same address present transformed bytes as if the origin
+    /// had allowed it; every read is answered from a fresh origin fetch instead.
+    #[display("origin forbade transforming the body")]
+    NoTransform,
+    /// The origin's own `Link` names a C2PA manifest. That is provenance of the
+    /// origin's, which a replayed template would lose, so every read keeps it
+    /// by being answered from a fresh origin fetch.
+    #[display("origin names a C2PA manifest")]
+    ProvenanceLink,
     /// A policy header selected for replay could not be represented losslessly.
     #[display("origin policy header is malformed")]
     MalformedPolicyHeader,
@@ -8272,6 +8287,15 @@ fn template_cache_ttl(
         return Err(TemplateCacheBypassReason::CookiePolicy);
     }
     origin_response_may_be_kept(status, response_headers)?;
+    // A stored template replays none of these facts, and a middleware reading
+    // a replayed page is told no origin headers. Keeping such a page out of
+    // the store is what makes "no facts" mean "neither" on every replay.
+    if crate::media_signing::cache_control_has(response_headers, "no-transform") {
+        return Err(TemplateCacheBypassReason::NoTransform);
+    }
+    if crate::media_signing::carries_manifest_link(response_headers) {
+        return Err(TemplateCacheBypassReason::ProvenanceLink);
+    }
     // Checked here, among the leak vectors, because storing under a key that does not
     // cover the origin's Vary is cross-serving rather than mere ineligibility: a request
     // differing only in the uncovered header would read this template.
@@ -18856,6 +18880,54 @@ mod tests {
                     replayed,
                     value(&cold, name.clone()),
                     "should replay the same `{name}` the miss delivered"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_page_whose_origin_forbids_transforming_or_names_a_manifest_is_never_replayed() {
+            // A replayed template reaches middleware with no origin headers, which
+            // a middleware reads as headers it does not know. Were these pages
+            // stored, a later read of the same address would lose the origin's
+            // `no-transform` or its own C2PA manifest link, and a preparation
+            // snapshot of it could be admitted as an unprotected source.
+            for (name, extra) in [
+                (
+                    "no-transform",
+                    ("cache-control", "public, max-age=300, no-transform"),
+                ),
+                (
+                    "manifest link",
+                    (
+                        "link",
+                        "<https://origin.test-publisher.com/m.c2pa>; rel=\"c2pa-manifest\"",
+                    ),
+                ),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let settings = Arc::new(settings_with_mode("esi"));
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                for _ in 0..2 {
+                    let mut headers = vec![("content-type", "text/html; charset=utf-8")];
+                    if extra.0 != "cache-control" {
+                        headers.push(("cache-control", "public, max-age=300"));
+                    }
+                    headers.push(extra);
+                    stub.push_response_with_headers(
+                        200,
+                        b"<html><head></head><body>origin</body></html>".to_vec(),
+                        headers,
+                    );
+                }
+
+                let _ = run(&settings, &services, navigation_request()).await;
+                let _ = run(&settings, &services, navigation_request()).await;
+
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    2,
+                    "{name}: every read should come from the origin, with its own headers"
                 );
             }
         }

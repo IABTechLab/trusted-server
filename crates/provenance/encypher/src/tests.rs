@@ -1715,3 +1715,334 @@ fn publisher_refuses_an_oversized_protected_original_instead_of_serving_rewritte
         );
     }
 }
+
+// --- asynchronous prepared mode through the publisher path ----------------
+
+const PUBLICATION: &str = "publication-secret-for-tests";
+const SNAPSHOT_NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+fn async_table(reader_trigger: bool) -> String {
+    format!(
+        "{}execution = \"async_prepared\"\n\n[provenance.encypher.preparation]\n\
+         worker_url = \"https://prep.publisher.example.com\"\n\
+         loopback_url = \"https://publisher.example.com\"\ndeployment_id = \"test\"\n\
+         public_host = \"publisher.example.com\"\n\
+         signal_secret = \"signal-secret-for-tests\"\n\
+         publication_secret = \"{PUBLICATION}\"\nreader_trigger = {reader_trigger}\n\
+         routes = [\"/news/\"]\n",
+        table()
+    )
+}
+
+fn async_placed() -> Settings {
+    page_settings(&module_settings(&async_table(false), true))
+}
+
+fn async_config(value: serde_json::Value) -> EncypherConfig {
+    let mut config = config_value();
+    config["execution"] = json!("async_prepared");
+    config["preparation"] = value;
+    serde_json::from_value(config).expect("should parse")
+}
+
+fn preparation_value(reader_trigger: bool, public_host: &str) -> serde_json::Value {
+    json!({
+        "worker_url": "https://prep.publisher.example.com",
+        "loopback_url": "https://publisher.example.com",
+        "deployment_id": "test",
+        "public_host": public_host,
+        "signal_secret": "signal-secret-for-tests",
+        "publication_secret": PUBLICATION,
+        "reader_trigger": reader_trigger,
+        "routes": ["/news/"],
+    })
+}
+
+#[test]
+fn async_mode_needs_its_table_a_claimed_public_host_and_a_real_hint_lifetime() {
+    let mut without_table = config_value();
+    without_table["execution"] = json!("async_prepared");
+    assert!(
+        parsed(&without_table).is_err(),
+        "async_prepared without a preparation table would never sign anything"
+    );
+
+    let elsewhere = async_config(preparation_value(false, "cdn.other.example"));
+    assert!(
+        require_claimed_public_host(&elsewhere).is_err(),
+        "a public host off the claim would name addresses the claim does not cover"
+    );
+    for host in ["publisher.example.com", "www.publisher.example.com"] {
+        assert!(require_claimed_public_host(&async_config(preparation_value(false, host))).is_ok());
+    }
+
+    let hinting = async_config(preparation_value(true, "publisher.example.com"));
+    let neither = HintLifetimes {
+        timer: false,
+        after_response: false,
+    };
+    let refusal = require_reader_trigger_capability(&hinting, neither)
+        .expect_err("should refuse reader hints with neither lifetime");
+    assert!(format!("{refusal:?}").contains("reader_trigger"));
+    for lifetimes in [
+        HintLifetimes {
+            timer: true,
+            after_response: false,
+        },
+        HintLifetimes {
+            timer: false,
+            after_response: true,
+        },
+    ] {
+        assert!(require_reader_trigger_capability(&hinting, lifetimes).is_ok());
+    }
+    let warming_only = async_config(preparation_value(false, "publisher.example.com"));
+    assert!(
+        require_reader_trigger_capability(&warming_only, neither).is_ok(),
+        "warming, publication events and reconciliation need no hint lifetime"
+    );
+}
+
+fn snapshot_request(capability: Option<&str>) -> Request<EdgeBody> {
+    let mut builder = Request::builder()
+        .method(Method::GET)
+        .uri("https://publisher.example.com/news/harbor-vote")
+        .header(header::HOST, "publisher.example.com");
+    if let Some(capability) = capability {
+        builder = builder.header(preparation::protocol::CAPABILITY_HEADER, capability);
+    }
+    builder
+        .body(EdgeBody::empty())
+        .expect("should build the snapshot request")
+}
+
+fn capability_for(secret: &str, path_and_query: &str) -> String {
+    preparation::protocol::snapshot_capability(
+        secret,
+        path_and_query,
+        SNAPSHOT_NONCE,
+        web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .expect("should read the clock")
+            .as_secs()
+            + 60,
+    )
+}
+
+fn reported_facts(
+    response: &http::Response<EdgeBody>,
+) -> Option<preparation::protocol::SnapshotOrigin> {
+    response
+        .headers()
+        .get(preparation::protocol::FACTS_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            preparation::protocol::verify_facts_header(PUBLICATION, SNAPSHOT_NONCE, value)
+        })
+}
+
+fn forwarded_capability(stub: &StubHttpClient) -> bool {
+    stub.recorded_request_headers().iter().any(|headers| {
+        headers
+            .iter()
+            .any(|(name, _)| name == preparation::protocol::CAPABILITY_HEADER)
+    })
+}
+
+#[test]
+fn a_snapshot_takes_the_reader_path_unsigned_and_reports_the_origin_s_own_privacy() {
+    for streaming in [false, true] {
+        let stub = origin_stub("public, max-age=60");
+        let capability = capability_for(PUBLICATION, "/news/harbor-vote");
+        let response = served_response(
+            &async_placed(),
+            &services_for(&stub),
+            snapshot_request(Some(&capability)),
+            streaming,
+        );
+
+        let facts = reported_facts(&response).expect("should report authenticated origin facts");
+        assert!(
+            !facts.private,
+            "streaming={streaming}: a public page is not private"
+        );
+        assert_eq!(facts.status, 200);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store"),
+            "streaming={streaming}: the snapshot's own transport stays private"
+        );
+        let body = block_on(response.into_body().into_bytes_bounded(16 * 1024 * 1024))
+            .expect("should read the body");
+        let reader_stub = origin_stub("public, max-age=60");
+        let reader = served_response(
+            &async_placed(),
+            &services_for(&reader_stub),
+            snapshot_request(None),
+            streaming,
+        );
+        let reader_body = block_on(reader.into_body().into_bytes_bounded(16 * 1024 * 1024))
+            .expect("should read the unsigned reader's transformed body");
+        assert_eq!(
+            body.as_ref(),
+            reader_body.as_ref(),
+            "streaming={streaming}: the snapshot is the page as readers get it, unsigned"
+        );
+        assert_eq!(
+            stub.recorded_request_methods(),
+            ["GET"],
+            "streaming={streaming}: the origin only, no policy, sign or lookup"
+        );
+        assert!(
+            !forwarded_capability(&stub),
+            "streaming={streaming}: the capability never reaches the origin"
+        );
+    }
+
+    let stub = origin_stub("private, max-age=0");
+    let capability = capability_for(PUBLICATION, "/news/harbor-vote");
+    let response = served_response(
+        &async_placed(),
+        &services_for(&stub),
+        snapshot_request(Some(&capability)),
+        false,
+    );
+    // Either the facts say the page is one reader's, or core never handed
+    // a reader's own page to the middleware and no facts exist; the snapshot
+    // route refuses both, as `source_private` and `snapshot_unobserved`.
+    if let Some(facts) = reported_facts(&response) {
+        assert!(
+            facts.private,
+            "a private origin page should be reported private"
+        );
+    }
+    assert!(!forwarded_capability(&stub));
+}
+
+#[test]
+fn a_reader_cannot_set_snapshot_state_and_its_capability_header_never_travels() {
+    for (name, capability) in [
+        (
+            "forged secret",
+            capability_for("a-reader-guessing", "/news/harbor-vote"),
+        ),
+        ("another path", capability_for(PUBLICATION, "/news/other")),
+    ] {
+        let stub = origin_stub("public, max-age=60");
+        stub.push_response(
+            200,
+            serde_json::to_vec(&json!({ "policy_digest": POLICY_DIGEST })).expect("should encode"),
+        );
+        let response = served_response(
+            &async_placed(),
+            &services_for(&stub),
+            snapshot_request(Some(&capability)),
+            false,
+        );
+        assert!(
+            response
+                .headers()
+                .get(preparation::protocol::FACTS_HEADER)
+                .is_none(),
+            "{name}: an ordinary read reports no snapshot facts"
+        );
+        assert!(!forwarded_capability(&stub), "{name}: never forwarded");
+        assert!(
+            !stub
+                .recorded_request_methods()
+                .iter()
+                .any(|method| method == "POST"),
+            "{name}: the asynchronous reader never signs"
+        );
+    }
+
+    // The synchronous mode removes the header too, and signs as before.
+    let stub = stub("public, max-age=60");
+    let capability = capability_for(PUBLICATION, "/news/harbor-vote");
+    let page = served(
+        &placed(),
+        &services_for(&stub),
+        snapshot_request(Some(&capability)),
+        false,
+    );
+    assert!(page.contains(MARKER), "the synchronous mode still signs");
+    assert!(!forwarded_capability(&stub));
+}
+
+#[test]
+fn the_asynchronous_publisher_path_applies_a_published_plan_and_never_signs() {
+    let config = parsed(&config_value()).expect("should parse");
+    let article =
+        processor::extract_article(ARTICLE, &config.article_selector, config.min_text_length)
+            .expect("should find the article");
+    let context_hash = preparation::protocol::credential_context(
+        "https://api.example.com",
+        "publisher.example.com",
+        TOKEN,
+    );
+    let context = preparation::items::ItemContext {
+        credential_context: &context_hash,
+        policy_digest: POLICY_DIGEST,
+        page_url: "https://publisher.example.com/news/harbor-vote",
+        variant: "",
+        article_selector: &config.article_selector,
+        min_text_length: config.min_text_length,
+        max_media_bytes: config.max_media_bytes,
+    };
+    let item = preparation::items::text_item(&context, ARTICLE, &article);
+
+    for (published, expect_signed) in [(true, true), (false, false)] {
+        let kv = Arc::new(MemoryKv::default());
+        if published {
+            block_on(
+                kv.put_bytes(
+                    &preparation::protocol::result_key(&item.identity),
+                    bytes::Bytes::from(
+                        serde_json::to_vec(&json!({
+                            "protocol": preparation::protocol::PREPARATION_PROTOCOL,
+                            "identity": item.identity,
+                            "retirement_epoch": 0,
+                            "result": {
+                                "kind": "text",
+                                "plan": {
+                                    "index_unit": "codepoint",
+                                    "operations": [{ "insert_after_index": 5, "marker": MARKER }],
+                                },
+                                "manifest_url": MANIFEST_URL,
+                                "scalars": item.scalars,
+                            },
+                        }))
+                        .expect("should encode"),
+                    ),
+                ),
+            )
+            .expect("should store");
+        }
+        let stub = origin_stub("public, max-age=60");
+        stub.push_response(
+            200,
+            serde_json::to_vec(&json!({ "policy_digest": POLICY_DIGEST })).expect("should encode"),
+        );
+
+        let page = served(
+            &async_placed(),
+            &services_for_kv(&stub, kv),
+            page_request(Method::GET),
+            false,
+        );
+
+        assert_eq!(
+            page.contains(MARKER),
+            expect_signed,
+            "published={published}: only a published plan for these exact bytes is applied"
+        );
+        assert_eq!(
+            stub.recorded_request_methods(),
+            ["GET", "GET"],
+            "published={published}: the origin and the policy authority, never a sign call"
+        );
+    }
+}

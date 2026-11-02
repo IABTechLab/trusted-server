@@ -24,7 +24,7 @@ fn identity() -> VariantIdentity<'static> {
         reader_url: READER_URL,
         origin_identity: ORIGIN_IDENTITY,
         fetched_url: FETCHED_URL,
-        reader_query_free: true,
+        reader_query: "",
     }
 }
 

@@ -194,15 +194,23 @@ impl IntegrationDocumentState {
 /// response with a body, or another response a `[[serve]]` entry covers, is
 /// sent `private, no-store`. A fetch middleware is handed none of these
 /// values.
+///
+/// An observation, left with [`IntegrationRequestState::observe`], is read
+/// the same way but changes nothing about how the request is answered: a
+/// request carrying only observations keeps the shared template and media
+/// paths every reader takes. It is for a module that has to see, not
+/// change, what readers are served.
 #[derive(Clone, Default)]
 pub struct IntegrationRequestState {
     values: IntegrationDocumentStateMap,
+    observed: IntegrationDocumentStateMap,
 }
 
 impl std::fmt::Debug for IntegrationRequestState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IntegrationRequestState")
             .field("keys", &self.values.keys().collect::<Vec<_>>())
+            .field("observed", &self.observed.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -243,36 +251,55 @@ impl IntegrationRequestState {
             .unwrap_or_default()
     }
 
-    /// The value of type `T` left for `integration_id`.
+    /// Leaves `value` on `request` as an observation of `integration_id`,
+    /// which reads like a value but leaves the request on every reader's
+    /// path, see [`IntegrationRequestState`].
+    pub fn observe<T>(request: &mut Request<EdgeBody>, integration_id: &'static str, value: T)
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let mut state = request
+            .extensions_mut()
+            .remove::<Self>()
+            .unwrap_or_default();
+        state
+            .observed
+            .insert((integration_id, TypeId::of::<T>()), Arc::new(value));
+        request.extensions_mut().insert(state);
+    }
+
+    /// The value or observation of type `T` left for `integration_id`.
     #[must_use]
     pub fn get<T>(&self, integration_id: &'static str) -> Option<Arc<T>>
     where
         T: Any + Send + Sync + 'static,
     {
-        let value = self.values.get(&(integration_id, TypeId::of::<T>()))?;
+        let key = (integration_id, TypeId::of::<T>());
+        let value = self.values.get(&key).or_else(|| self.observed.get(&key))?;
         Arc::clone(value).downcast::<T>().ok()
     }
 
-    /// Whether no module left a value.
+    /// Whether no module left a value. Observations do not count.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
 
-    /// Copies every value into the state of a document that is starting.
+    /// Copies every value and observation into the state of a document that
+    /// is starting.
     ///
     /// # Panics
     ///
     /// Panics if the document state's lock is poisoned.
     pub(crate) fn seed(&self, document: &IntegrationDocumentState) {
-        if self.values.is_empty() {
+        if self.values.is_empty() && self.observed.is_empty() {
             return;
         }
         let mut guard = document
             .inner
             .lock()
             .expect("should lock integration document state");
-        for (key, value) in &self.values {
+        for (key, value) in self.observed.iter().chain(&self.values) {
             guard.insert(*key, Arc::clone(value));
         }
     }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::html_processor::{
@@ -1609,6 +1610,84 @@ fn a_serve_chain_s_stream_processor_runs_over_the_reader_s_copy() {
     let page = served(&chain, &rewritten_page());
 
     assert!(page.contains("<title>Reader</title>") && page.ends_with("<!--reader-->"));
+}
+
+struct DocumentSeal(Sha256);
+
+impl crate::streaming_processor::StreamProcessor for DocumentSeal {
+    fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> io::Result<Vec<u8>> {
+        self.0.update(chunk);
+        let mut output = chunk.to_vec();
+        if is_last {
+            output.extend_from_slice(format!("\nsha256:{:x}", self.0.finalize_reset()).as_bytes());
+        }
+        Ok(output)
+    }
+}
+
+struct SealingMiddleware(&'static str);
+
+impl Middleware for SealingMiddleware {
+    fn middleware_id(&self) -> &'static str {
+        self.0
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Serve]
+    }
+
+    fn finalizes_document(&self) -> bool {
+        true
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction {
+            stream: Some(Box::new(DocumentSeal(Sha256::new()))),
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+
+#[test]
+fn finalizing_document_sees_every_transform_even_when_registered_first() {
+    let chain = serve_chain_of(vec![
+        Arc::new(SealingMiddleware("example.seal")),
+        middleware("example.first", |_| MiddlewareAction {
+            stream: Some(Box::new(Append("\nfirst".to_owned()))),
+            ..MiddlewareAction::pass()
+        }),
+        middleware("example.second", |_| MiddlewareAction {
+            stream: Some(Box::new(Append("\nsecond".to_owned()))),
+            ..MiddlewareAction::pass()
+        }),
+        head("example.head", "<meta name=\"final-input\">"),
+    ]);
+    for chunk_size in [1, 8192] {
+        let output = served_with(
+            &chain,
+            &IntegrationRequestState::default(),
+            "<html><head><script id=\"trustedserver-js\"></script></head><body>Article</body></html>",
+            chunk_size,
+        );
+        let (document, seal) = output
+            .rsplit_once("\nsha256:")
+            .expect("should carry a seal");
+        assert_eq!(seal, format!("{:x}", Sha256::digest(document.as_bytes())));
+        assert!(document.ends_with("\nfirst\nsecond"));
+        assert!(document.contains("<meta name=\"final-input\">"));
+    }
+}
+
+#[test]
+fn competing_finalizing_documents_are_refused_before_delivery() {
+    let chain = serve_chain_of(vec![
+        Arc::new(SealingMiddleware("example.first-seal")),
+        Arc::new(SealingMiddleware("example.second-seal")),
+    ]);
+    assert!(
+        create_serve_processor(&chain, &reader(&IntegrationRequestState::default())).is_err(),
+        "two finalizers must not produce a document whose first seal is invalid"
+    );
 }
 
 #[test]

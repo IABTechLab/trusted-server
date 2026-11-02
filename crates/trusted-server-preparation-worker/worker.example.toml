@@ -1,0 +1,43 @@
+# Launch: trusted-server-axum preparation-worker --config worker.toml
+# Store ownership is exclusive. Operator commands use HTTP, not a second DB open.
+listen = "0.0.0.0:8112"
+store_dir = "/var/lib/trusted-server/preparation"
+deployment_id = "publisher-preparation"
+api_base_url = "https://api.example.com"
+domain = "example.com"
+public_host = "www.example.com"
+edge_url = "https://delivery.example.com"
+
+# Match the delivery instance's projection, source ceilings and variants.
+article_selector = "article"
+min_text_length = 50
+max_media_bytes = 5000000
+max_snapshot_bytes = 67108864
+max_large_media_bytes = 1073741824
+max_preparation_seconds = 120
+variants = []
+
+# Sources, temporary assembly, probes, plans, outputs and their identity,
+# outcome and reference metadata share this hard quota. Full storage refuses
+# new work; retained recovery material is never evicted. Conservative
+# workspace is reserved before signing.
+workers = 4
+artifact_quota_bytes = 10737418240
+scan_per_minute = 128
+scan_interval_seconds = 900
+
+# Independent publisher inventory survives lost reader hints and process restarts.
+# An unregistered page is opportunistic coverage only, not universal discovery.
+[[inventory]]
+path = "/news/harbor-vote"
+variant = ""
+
+[secrets]
+# Values come from the process environment, not this file. The signal and
+# publication values must equal the corresponding delivery secret-store entries.
+worker_token = "TS_PREPARATION_WORKER_TOKEN"
+signal_secret = "TS_PREPARATION_SIGNAL_SECRET"
+publication_secret = "TS_PREPARATION_PUBLICATION_SECRET"
+operator_secret = "TS_PREPARATION_OPERATOR_SECRET"
+# Optional, for an authorized staging creation canary only:
+# canary_token = "TS_PREPARATION_CANARY_TOKEN"

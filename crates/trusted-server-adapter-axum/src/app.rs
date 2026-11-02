@@ -300,6 +300,9 @@ fn build_state_with_registrations_and_services(
     integrations: &[IntegrationBuilder],
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    // Every request's services carry the Tokio timer, see
+    // `crate::platform::build_runtime_services`.
+    trusted_server_core::platform::declare_platform_timer();
     // The modules this adapter links come first and the deployment's own
     // follow, which is the order their hooks run in.
     let integrations = module_builders_with(integrations);

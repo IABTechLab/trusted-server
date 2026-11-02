@@ -27,9 +27,10 @@ use bytes::Bytes;
 use edgezero_core::body::Body as EdgeBody;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header};
 use serde::{Deserialize, Serialize};
+use trusted_server_core::integrations::IntegrationRequestState;
 use trusted_server_core::media_signing::{
-    LargeMediaJob, LargeMediaSigning, MediaJob, MediaNamespacing, MediaSigner, MediaSigning,
-    MediaSigningFailure, SignedMedia as DeliveredMedia,
+    LargeLookup, LargeLookupJob, LargeMediaJob, LargeMediaSigning, MediaJob, MediaNamespacing,
+    MediaSigner, MediaSigning, MediaSigningFailure, SignedMedia as DeliveredMedia, SnapshotFacts,
 };
 use trusted_server_core::middleware::ResponseHeader;
 use trusted_server_core::platform::RuntimeServices;
@@ -830,6 +831,13 @@ impl MediaSigner for EncypherMedia {
         job: &'a LargeMediaJob<'a>,
     ) -> LargeMediaSigning<'a> {
         Box::pin(async move {
+            // The asynchronous mode never signs in delivery; core asks
+            // `lookup_large` instead and never reaches this.
+            if self.signer.is_async() {
+                return Err(MediaSigningFailure {
+                    reason: Reason::NotPrepared.code(),
+                });
+            }
             match self.signer.sign_large(services, job).await {
                 Ok(signed) => {
                     log_media(true, Reason::Signed);
@@ -876,16 +884,65 @@ impl MediaSigner for EncypherMedia {
         job: &'a MediaJob<'a>,
     ) -> MediaSigning<'a> {
         Box::pin(async move {
+            // The asynchronous mode looks up only what was published, and
+            // never falls back to signing in delivery.
+            let result = if self.signer.is_async() {
+                self.signer.published_delivery(services, job).await
+            } else {
+                self.signer.sign_delivery(services, job).await
+            };
+            result.map_err(|reason| {
+                log_media(false, reason);
+                MediaSigningFailure {
+                    reason: reason.code(),
+                }
+            })
+        })
+    }
+
+    /// In the asynchronous mode, delivery only looks up published results.
+    fn lookup_only(&self) -> bool {
+        self.signer.is_async()
+    }
+
+    fn lookup_large<'a>(
+        &'a self,
+        services: &'a RuntimeServices,
+        job: &'a LargeLookupJob<'a>,
+    ) -> LargeLookup<'a> {
+        Box::pin(async move {
             self.signer
-                .sign_delivery(services, job)
+                .published_large(services, job)
                 .await
-                .map_err(|reason| {
-                    log_media(false, reason);
-                    MediaSigningFailure {
-                        reason: reason.code(),
-                    }
+                .map_err(|reason| MediaSigningFailure {
+                    reason: reason.code(),
                 })
         })
+    }
+
+    /// A request the module's preparer verified as a preparation snapshot.
+    fn observes_snapshot(&self, state: &IntegrationRequestState) -> bool {
+        self.signer.is_async()
+            && state
+                .get::<crate::preparation::edge::SnapshotGrant>(crate::INTEGRATION_ID)
+                .is_some()
+    }
+
+    fn snapshot_headers(
+        &self,
+        state: &IntegrationRequestState,
+        facts: &SnapshotFacts,
+    ) -> Vec<ResponseHeader> {
+        let (Some(preparation), Some(grant)) = (
+            self.signer.preparation(),
+            state.get::<crate::preparation::edge::SnapshotGrant>(crate::INTEGRATION_ID),
+        ) else {
+            return Vec::new();
+        };
+        let origin = crate::preparation::edge::media_snapshot_origin(facts);
+        crate::preparation::edge::snapshot_facts(preparation, &grant, &origin)
+            .into_iter()
+            .collect()
     }
 }
 

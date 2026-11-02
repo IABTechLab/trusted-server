@@ -222,6 +222,11 @@ fn build_state_with_registrations_and_services(
     integrations: &[IntegrationBuilder],
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    // Declared from the timer every request's services carry, so a native
+    // build without the WASI clock declares none.
+    if crate::platform::runtime_timer().is_some() {
+        trusted_server_core::platform::declare_platform_timer();
+    }
     // The modules this adapter links come first and the deployment's own
     // follow, which is the order their hooks run in.
     let integrations = module_builders_with(integrations);
@@ -2433,5 +2438,49 @@ mod tests {
             Some("deployment-crate"),
             "should put the deployment's builder last"
         );
+    }
+
+    /// The settings of an asynchronous prepared deployment, with or without
+    /// reader hints.
+    fn async_prepared_settings(reader_trigger: bool) -> Settings {
+        Settings::from_toml(&format!(
+            "{}\n[provenance]\nmodule = \"encypher\"\n\n[provenance.encypher]\n\
+             api_base_url = \"https://api.example.com\"\ndomain = \"test-publisher.com\"\n\
+             worker_token = \"cwk_test_worker_token_value\"\nexecution = \"async_prepared\"\n\n\
+             [provenance.encypher.preparation]\n\
+             worker_url = \"https://prep.test-publisher.com\"\n\
+             loopback_url = \"https://test-publisher.com\"\ndeployment_id = \"test\"\n\
+             public_host = \"test-publisher.com\"\nsignal_secret = \"signal-secret\"\n\
+             publication_secret = \"publication-secret\"\nreader_trigger = {reader_trigger}\n\
+             routes = [\"/news/\"]\n\n\
+             [[serve]]\nmedia_type = \"text/html\"\nmiddleware = [\"provenance.encypher\"]\n",
+            trusted_server_core::test_support::tests::crate_test_settings_str(),
+        ))
+        .expect("should load the asynchronous prepared settings")
+    }
+
+    /// Reader hints are admitted only where the build carries the timer
+    /// that bounds them. The native host build has no WASI clock, so it
+    /// declares no timer and refuses them at startup, while the same
+    /// deployment preparing through warming alone starts.
+    #[test]
+    fn reader_hints_follow_the_timer_this_build_actually_carries() {
+        assert!(
+            crate::platform::runtime_timer().is_none(),
+            "the native host build carries no WASI timer"
+        );
+
+        let refused = build_state_with_settings(async_prepared_settings(true));
+
+        assert!(
+            refused.is_err(),
+            "reader hints without a real timer or after-response lifetime should be refused"
+        );
+        assert!(
+            !trusted_server_core::platform::platform_offers_timer(),
+            "no timer should be declared without one"
+        );
+        build_state_with_settings(async_prepared_settings(false))
+            .expect("warming-only asynchronous preparation should start");
     }
 }

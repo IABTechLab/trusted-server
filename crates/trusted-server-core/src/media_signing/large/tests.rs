@@ -49,7 +49,7 @@ fn identity() -> VariantIdentity<'static> {
         reader_url: READER_URL,
         origin_identity: ORIGIN_IDENTITY,
         fetched_url: FETCHED_URL,
-        reader_query_free: true,
+        reader_query: "",
     }
 }
 
@@ -1712,7 +1712,7 @@ fn a_source_no_public_address_names_is_never_hashed() {
     let queried = TestOrigin {
         identity: VariantIdentity {
             fetched_url: QUERY_FETCHED_URL,
-            reader_query_free: false,
+            reader_query: "v=2",
             ..identity()
         },
         ..TestOrigin::plain()
@@ -1822,7 +1822,7 @@ fn a_signed_origin_address_is_never_named_and_its_reads_carry_no_reader_header()
 
     let queried_reader = TestOrigin {
         identity: VariantIdentity {
-            reader_query_free: false,
+            reader_query: "v=2",
             ..identity()
         },
         auth: Some(OriginSigning::new(Arc::new(TestOriginSigner), None)),

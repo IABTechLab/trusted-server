@@ -4,8 +4,9 @@ use std::sync::Mutex;
 use edgezero_core::key_value_store::KvPage;
 use futures::executor::block_on;
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use trusted_server_core::platform::test_support::{
-    StubHttpClient, build_services_with_http_client,
+    StoppedTimer, StubHttpClient, build_services_with_http_client,
 };
 use trusted_server_core::platform::{KvError, PlatformHttpClient, PlatformKvStore};
 
@@ -529,6 +530,7 @@ fn page_request() -> PageRequest {
     PageRequest {
         method: Method::GET,
         page_url: PAGE_URL.to_owned(),
+        query: String::new(),
         removed_prefix: String::new(),
         response_status: 200,
         origin_response_is_private: false,
@@ -848,6 +850,7 @@ fn job<'a>(
 ) -> MediaJob<'a> {
     MediaJob {
         reader_url,
+        reader_query: "",
         content_type: "image/png",
         source,
         source_sha256: sha256,
@@ -1185,4 +1188,671 @@ fn a_warm_signed_result_is_not_delivered_under_a_revoked_credential() {
         ["GET", "POST", "GET"],
         "should neither sign again nor deliver the cached result"
     );
+}
+
+// --- asynchronous prepared mode: lookups only ------------------------------
+
+const READER: &str = "https://publisher.example.com/media/a.png";
+const LINK: &str = "<https://api.example.com/manifests/doc-1>; rel=\"c2pa-manifest\"";
+
+fn async_signer() -> Arc<Signer> {
+    let config: EncypherConfig = serde_json::from_value(json!({
+        "api_base_url": "https://api.example.com",
+        "domain": "publisher.example.com",
+        "worker_token": TOKEN,
+        "execution": "async_prepared",
+        "preparation": {
+            "worker_url": "https://prep.publisher.example.com",
+            "loopback_url": "https://publisher.example.com",
+            "deployment_id": "test",
+            "public_host": "publisher.example.com",
+            "signal_secret": "signal-secret-for-tests",
+            "publication_secret": "publication-secret-for-tests",
+            "routes": ["/media/"],
+        },
+    }))
+    .expect("should parse config");
+    Arc::new(Signer::new(config, 5_000_000))
+}
+
+fn async_variant_signer(reader_trigger: bool) -> Arc<Signer> {
+    let mut config = async_signer().config().clone();
+    let preparation = config
+        .preparation
+        .as_mut()
+        .expect("should configure preparation");
+    preparation.reader_trigger = reader_trigger;
+    preparation.variants = serde_json::from_value(json!([
+        {"name": "asset", "values": ["b"]},
+        {"name": "edition", "values": ["uk", "us"]},
+    ]))
+    .expect("should parse variant schema");
+    Arc::new(Signer::new(config, 5_000_000))
+}
+
+fn policy_http() -> Arc<StubHttpClient> {
+    let http = Arc::new(StubHttpClient::new());
+    http.push_response(
+        200,
+        serde_json::to_vec(&json!({"policy_digest": POLICY_DIGEST})).expect("should encode"),
+    );
+    http
+}
+
+fn standalone_identity(signer: &Signer, source: &[u8]) -> String {
+    crate::preparation::protocol::MediaIdentity {
+        credential_context: signer.credential_context(),
+        policy_digest: POLICY_DIGEST,
+        page_url: READER,
+        variant: "",
+        carrier: crate::preparation::protocol::Carrier::External,
+        mime: "image/png",
+        source_sha256: &sha256_hex(source),
+    }
+    .digest()
+}
+
+fn publish_record(kv: &MemoryKv, identity: &str, result: &serde_json::Value) {
+    kv.set(
+        &crate::preparation::protocol::result_key(identity),
+        Bytes::from(
+            serde_json::to_vec(&json!({
+                "protocol": crate::preparation::protocol::PREPARATION_PROTOCOL,
+                "identity": identity,
+                "retirement_epoch": 0,
+                "result": result,
+            }))
+            .expect("should encode"),
+        ),
+    );
+}
+
+fn assert_lookup_only(http: &StubHttpClient) {
+    let uris = http.recorded_request_uris();
+    assert!(
+        uris.iter()
+            .all(|uri| uri.contains("/trusted-server/policy")),
+        "only the policy authority lookup should leave the instance: {uris:?}"
+    );
+}
+
+#[test]
+fn async_standalone_media_serves_the_origin_bytes_with_the_published_link_or_goes_unsigned() {
+    let signer = async_signer();
+    let media = EncypherMedia::new(Arc::clone(&signer));
+    assert!(
+        media.lookup_only(),
+        "core should keep and load nothing for it"
+    );
+    let source = Bytes::from_static(SOURCE);
+    let sha = sha256_hex(SOURCE);
+    let kv = Arc::new(MemoryKv::default());
+    publish_record(
+        &kv,
+        &standalone_identity(&signer, SOURCE),
+        &json!({
+            "kind": "external",
+            "source_sha256": sha,
+            "headers": [["link", LINK], ["x-encypher-manifest-instance-id", "xmp:iid:0001"]],
+        }),
+    );
+
+    let http = policy_http();
+    let delivered = block_on(media.sign(
+        &services(&http, &kv),
+        &job(READER, &source, &sha, Some(READER), ORIGIN),
+    ))
+    .expect("should find the published result");
+    assert_eq!(
+        delivered.bytes, source,
+        "should deliver the origin's own bytes"
+    );
+    assert!(
+        delivered
+            .headers
+            .iter()
+            .any(|(name, value)| name == "link" && value.to_str().ok() == Some(LINK)),
+        "should carry the published manifest link"
+    );
+    assert_lookup_only(&http);
+
+    // A changed image has its own identity, which nothing was published for.
+    let changed = Bytes::from_static(SIGNED);
+    let changed_sha = sha256_hex(SIGNED);
+    let http = policy_http();
+    let missed = block_on(media.sign(
+        &services(&http, &kv),
+        &job(READER, &changed, &changed_sha, Some(READER), ORIGIN),
+    ))
+    .expect_err("should find nothing for changed bytes");
+    assert_eq!(missed.reason, "not_prepared");
+    assert_lookup_only(&http);
+}
+
+#[test]
+fn async_standalone_media_selects_its_admitted_variant_not_the_base_publication() {
+    let signer = async_variant_signer(false);
+    let media = EncypherMedia::new(Arc::clone(&signer));
+    let source = Bytes::from_static(SOURCE);
+    let sha = sha256_hex(SOURCE);
+    let kv = Arc::new(MemoryKv::default());
+    for (variant, instance) in [("", "base"), ("asset=b&edition=uk", "variant")] {
+        let identity = crate::preparation::protocol::MediaIdentity {
+            credential_context: signer.credential_context(),
+            policy_digest: POLICY_DIGEST,
+            page_url: READER,
+            variant,
+            carrier: crate::preparation::protocol::Carrier::External,
+            mime: "image/png",
+            source_sha256: &sha,
+        }
+        .digest();
+        publish_record(
+            &kv,
+            &identity,
+            &json!({
+                "kind": "external",
+                "source_sha256": sha,
+                "headers": [["link", LINK], ["x-encypher-manifest-instance-id", instance]],
+            }),
+        );
+    }
+    // Bounded delivery hashes the actual body, so query ordering aliases
+    // can use the canonical identity without trusting an origin validator.
+    for reader_query in ["asset=b&edition=uk", "edition=uk&asset=b"] {
+        let http = policy_http();
+        let delivered = block_on(media.sign(
+            &services(&http, &kv),
+            &MediaJob {
+                reader_query,
+                ..job(READER, &source, &sha, None, ORIGIN)
+            },
+        ))
+        .expect("should find the prepared variant");
+        assert!(
+            delivered.headers.iter().any(|(name, value)| {
+                name == "x-encypher-manifest-instance-id" && value == "variant"
+            }),
+            "must select the variant's publication, not the identical-byte base record"
+        );
+        assert_eq!(delivered.bytes, source);
+        assert_lookup_only(&http);
+    }
+}
+
+#[test]
+fn async_standalone_media_requests_only_admitted_missing_variants() {
+    let signer = async_variant_signer(true);
+    let media = EncypherMedia::new(Arc::clone(&signer));
+    let source = Bytes::from_static(SOURCE);
+    let sha = sha256_hex(SOURCE);
+    let reader_url = "https://publisher.example.com/media/image.png";
+    for (query, admitted) in [
+        ("edition=uk&asset=b", true),
+        ("edition=uk&edition=us", false),
+        ("secret=private", false),
+    ] {
+        let http = policy_http();
+        if admitted {
+            http.push_response(202, b"{}".to_vec());
+        }
+        let kv = Arc::new(MemoryKv::default());
+        let runtime = services(&http, &kv).with_timer(Arc::new(StoppedTimer));
+        let missed = block_on(media.sign(
+            &runtime,
+            &MediaJob {
+                reader_query: query,
+                ..job(reader_url, &source, &sha, None, ORIGIN)
+            },
+        ))
+        .expect_err("unprepared media must remain unsigned");
+        assert_eq!(missed.reason, "not_prepared");
+        if admitted {
+            assert_eq!(http.recorded_request_methods(), ["GET", "POST"]);
+            let bodies = http.recorded_request_bodies();
+            let signal: crate::preparation::protocol::SignalRequest =
+                serde_json::from_slice(bodies.last().expect("should submit preparation"))
+                    .expect("should encode the signal");
+            assert_eq!(signal.target.path, "/media/image.png");
+            assert_eq!(signal.target.variant, "asset=b&edition=uk");
+            let identity = crate::preparation::protocol::MediaIdentity {
+                credential_context: signer.credential_context(),
+                policy_digest: POLICY_DIGEST,
+                page_url: reader_url,
+                variant: &signal.target.variant,
+                carrier: crate::preparation::protocol::Carrier::External,
+                mime: "image/png",
+                source_sha256: &sha,
+            }
+            .digest();
+            assert_eq!(signal.items[0].identity, identity);
+        } else {
+            assert_lookup_only(&http);
+        }
+    }
+}
+
+#[test]
+fn async_standalone_media_refuses_a_record_for_other_bytes() {
+    let signer = async_signer();
+    let media = EncypherMedia::new(Arc::clone(&signer));
+    let source = Bytes::from_static(SOURCE);
+    let sha = sha256_hex(SOURCE);
+    let kv = Arc::new(MemoryKv::default());
+    publish_record(
+        &kv,
+        &standalone_identity(&signer, SOURCE),
+        &json!({
+            "kind": "external",
+            "source_sha256": sha256_hex(SIGNED),
+            "headers": [["link", LINK]],
+        }),
+    );
+    let http = policy_http();
+    let refused = block_on(media.sign(
+        &services(&http, &kv),
+        &job(READER, &source, &sha, Some(READER), ORIGIN),
+    ))
+    .expect_err("should refuse a record binding other bytes");
+    assert_eq!(refused.reason, "published_record_invalid");
+    assert_lookup_only(&http);
+}
+
+#[test]
+fn async_large_media_is_decorated_only_for_its_exact_published_version() {
+    let signer = async_signer();
+    let media = EncypherMedia::new(Arc::clone(&signer));
+    let digest = sha256_hex(b"every byte of the version");
+    let locator = |etag: &'static str, length: u64| LargeLookupJob {
+        reader_url: "https://publisher.example.com/media/ferry.mp4",
+        reader_query: "",
+        origin_identity: "origin",
+        source_origin_host: "origin.example.com",
+        content_type: "video/mp4",
+        etag,
+        length,
+    };
+    let origin_identity_sha256 = sha256_hex(b"origin");
+    let identity = crate::preparation::protocol::LargeLocator {
+        credential_context: signer.credential_context(),
+        policy_digest: POLICY_DIGEST,
+        reader_url: "https://publisher.example.com/media/ferry.mp4",
+        variant: "",
+        origin_host: "origin.example.com",
+        origin_identity_sha256: &origin_identity_sha256,
+        mime: "video/mp4",
+        etag: "\"v1\"",
+        length: 20_000_000,
+    }
+    .digest();
+    let kv = Arc::new(MemoryKv::default());
+    publish_record(
+        &kv,
+        &identity,
+        &json!({
+            "kind": "large",
+            "sha256": digest,
+            "length": 20_000_000_u64,
+            "headers": [["link", LINK]],
+        }),
+    );
+
+    let http = policy_http();
+    let published =
+        block_on(media.lookup_large(&services(&http, &kv), &locator("\"v1\"", 20_000_000)))
+            .expect("should find the version's record");
+    assert_eq!(published.length, 20_000_000);
+    assert_eq!(
+        published
+            .sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        digest,
+        "should carry the whole-source digest verified at publication"
+    );
+    assert_lookup_only(&http);
+
+    for (etag, length, reason) in [
+        ("\"v2\"", 20_000_000, "not_prepared"),
+        ("\"v1\"", 20_000_001, "not_prepared"),
+    ] {
+        let http = policy_http();
+        let failure = block_on(media.lookup_large(&services(&http, &kv), &locator(etag, length)))
+            .expect_err("another version should find nothing");
+        assert_eq!(failure.reason, reason, "{etag} {length}");
+        assert_lookup_only(&http);
+    }
+}
+
+#[test]
+fn async_large_media_never_reuses_a_publication_after_its_configured_source_changes() {
+    let signer = async_signer();
+    let media = EncypherMedia::new(Arc::clone(&signer));
+    let source_a = b"library A's ferry video";
+    let length = u64::try_from(source_a.len()).expect("should fit source length");
+    // Core's configured-origin identities for one route before and after an
+    // operator remaps it to another folder on the same origin host. The
+    // public URL, fetched host, MIME, strong ETag and length all stay equal:
+    // validators are scoped to each resource, not to the configuration.
+    let identity_a = "https://origin.example.com/library-a\0/media/";
+    let identity_b = "https://origin.example.com/library-b\0/media/";
+    let job_a = LargeLookupJob {
+        reader_url: "https://publisher.example.com/media/ferry.mp4",
+        reader_query: "",
+        origin_identity: identity_a,
+        source_origin_host: "origin.example.com",
+        content_type: "video/mp4",
+        etag: "\"revision-1\"",
+        length,
+    };
+    let job_b = LargeLookupJob {
+        origin_identity: identity_b,
+        ..job_a
+    };
+    // A's record as publication stored it for configured source A, whose
+    // identity core's authenticated facts reported as this digest.
+    let published_a = crate::preparation::protocol::LargeLocator {
+        credential_context: signer.credential_context(),
+        policy_digest: POLICY_DIGEST,
+        reader_url: job_a.reader_url,
+        variant: "",
+        origin_host: job_a.source_origin_host,
+        origin_identity_sha256: &sha256_hex(identity_a.as_bytes()),
+        mime: job_a.content_type,
+        etag: job_a.etag,
+        length,
+    }
+    .digest();
+    let kv = Arc::new(MemoryKv::default());
+    publish_record(
+        &kv,
+        &published_a,
+        &json!({
+            "kind": "large",
+            "sha256": sha256_hex(source_a),
+            "length": length,
+            "headers": [["link", LINK]],
+        }),
+    );
+
+    let http = policy_http();
+    let published = block_on(media.lookup_large(&services(&http, &kv), &job_a))
+        .expect("should reuse A's publication while the route still serves source A");
+    let digest: [u8; 32] = Sha256::digest(source_a).into();
+    assert_eq!(published.sha256, digest, "should carry A's verified digest");
+    assert_lookup_only(&http);
+
+    let http = policy_http();
+    let failure = block_on(media.lookup_large(&services(&http, &kv), &job_b))
+        .expect_err("should not attach A's manifest and digest to remapped source B");
+    assert_eq!(failure.reason, "not_prepared");
+    assert_lookup_only(&http);
+}
+
+#[test]
+fn async_large_media_never_reuses_a_query_free_publication_for_another_resource() {
+    let signer = async_variant_signer(false);
+    let media = EncypherMedia::new(Arc::clone(&signer));
+    let source_a = b"query-free resource A";
+    let source_b = b"query-pick resource B";
+    assert_eq!(source_a.len(), source_b.len());
+    assert_ne!(source_a, source_b);
+    let length = u64::try_from(source_a.len()).expect("should fit source length");
+    let reader_url = "https://publisher.example.com/media/ferry.mp4";
+    let identity = crate::preparation::protocol::LargeLocator {
+        credential_context: signer.credential_context(),
+        policy_digest: POLICY_DIGEST,
+        reader_url,
+        variant: "",
+        origin_host: "origin.example.com",
+        origin_identity_sha256: &sha256_hex(b"origin"),
+        mime: "video/mp4",
+        etag: "\"revision-1\"",
+        length,
+    }
+    .digest();
+    let kv = Arc::new(MemoryKv::default());
+    publish_record(
+        &kv,
+        &identity,
+        &json!({
+            "kind": "large",
+            "sha256": sha256_hex(source_a),
+            "length": length,
+            "headers": [["link", LINK]],
+        }),
+    );
+    // The reader selected B with ?asset=b. Its origin is allowed to use the
+    // same strong revision tag as A: validators are scoped to each resource.
+    let job = LargeLookupJob {
+        reader_url,
+        reader_query: "asset=b",
+        origin_identity: "origin",
+        source_origin_host: "origin.example.com",
+        content_type: "video/mp4",
+        etag: "\"revision-1\"",
+        length,
+    };
+    let http = policy_http();
+    let failure = block_on(media.lookup_large(&services(&http, &kv), &job))
+        .expect_err("should not attach A's manifest and digest to query-selected B");
+    assert_eq!(failure.reason, "not_prepared");
+    assert_lookup_only(&http);
+}
+
+#[test]
+fn async_large_media_reuses_only_its_admitted_variant_and_refuses_unsupported_queries() {
+    let signer = async_variant_signer(true);
+    let media = EncypherMedia::new(Arc::clone(&signer));
+    let source_a = b"query-free resource A";
+    let source_b = b"query-pick resource B";
+    assert_eq!(source_a.len(), source_b.len());
+    let length = u64::try_from(source_a.len()).expect("should fit source length");
+    let job = LargeLookupJob {
+        reader_url: "https://publisher.example.com/media/ferry.mp4",
+        reader_query: "",
+        origin_identity: "origin",
+        source_origin_host: "origin.example.com",
+        content_type: "video/mp4",
+        etag: "\"revision-1\"",
+        length,
+    };
+    let kv = Arc::new(MemoryKv::default());
+    let link_b = "<https://api.example.com/manifests/doc-b>; rel=\"c2pa-manifest\"";
+    for (variant, source, link) in [
+        ("", source_a, LINK),
+        ("asset=b&edition=uk", source_b, link_b),
+    ] {
+        let identity = crate::preparation::protocol::LargeLocator {
+            credential_context: signer.credential_context(),
+            policy_digest: POLICY_DIGEST,
+            reader_url: job.reader_url,
+            variant,
+            origin_host: job.source_origin_host,
+            origin_identity_sha256: &sha256_hex(job.origin_identity.as_bytes()),
+            mime: job.content_type,
+            etag: job.etag,
+            length,
+        }
+        .digest();
+        publish_record(
+            &kv,
+            &identity,
+            &json!({
+                "kind": "large",
+                "sha256": sha256_hex(source),
+                "length": length,
+                "headers": [["link", link]],
+            }),
+        );
+    }
+    for (query, source, link) in [
+        ("", source_a, LINK),
+        ("asset=b&edition=uk", source_b, link_b),
+    ] {
+        let http = policy_http();
+        let published = block_on(media.lookup_large(
+            &services(&http, &kv),
+            &LargeLookupJob {
+                reader_query: query,
+                ..job
+            },
+        ))
+        .expect("should reuse this resource's own publication");
+        let digest: [u8; 32] = Sha256::digest(source).into();
+        assert_eq!(published.sha256, digest, "{query}");
+        assert_eq!(published.length, length);
+        assert!(
+            published
+                .headers
+                .iter()
+                .any(|(name, value)| { name == "link" && value.to_str().ok() == Some(link) }),
+            "{query}: should select this resource's own manifest"
+        );
+        assert_lookup_only(&http);
+    }
+    for query in [
+        // Raw query order and encoding can select different origin resources.
+        // Equal per-resource validators cannot establish alias equivalence.
+        "edition=uk&asset=b",
+        "asset=%62&edition=uk",
+        "unknown=b",
+        "asset=c",
+        "asset=b&asset=b",
+        "asset=b&asset=c",
+        "asset=b&%61sset=b",
+        "asset=b&edition=unknown",
+    ] {
+        let http = policy_http();
+        let runtime = services(&http, &kv).with_timer(Arc::new(StoppedTimer));
+        let failure = block_on(media.lookup_large(
+            &runtime,
+            &LargeLookupJob {
+                reader_query: query,
+                ..job
+            },
+        ))
+        .expect_err("should refuse an unsupported query rather than fall back to A or B");
+        assert_eq!(failure.reason, "not_prepared", "{query}");
+        assert!(
+            http.recorded_request_uris().is_empty(),
+            "{query}: should neither check policy nor hint an unadmitted target"
+        );
+    }
+}
+
+#[test]
+fn async_large_media_hints_the_exact_admitted_variant_on_a_miss() {
+    let signer = async_variant_signer(true);
+    let media = EncypherMedia::new(Arc::clone(&signer));
+    let job = LargeLookupJob {
+        reader_url: "https://publisher.example.com/media/ferry.mp4",
+        reader_query: "asset=b&edition=uk",
+        origin_identity: "origin",
+        source_origin_host: "origin.example.com",
+        content_type: "video/mp4",
+        etag: "\"revision-1\"",
+        length: 20_000_000,
+    };
+    let identity = crate::preparation::protocol::LargeLocator {
+        credential_context: signer.credential_context(),
+        policy_digest: POLICY_DIGEST,
+        reader_url: job.reader_url,
+        variant: "asset=b&edition=uk",
+        origin_host: job.source_origin_host,
+        origin_identity_sha256: &sha256_hex(job.origin_identity.as_bytes()),
+        mime: job.content_type,
+        etag: job.etag,
+        length: job.length,
+    }
+    .digest();
+    let http = policy_http();
+    http.push_response(202, b"{}".to_vec());
+    let kv = Arc::new(MemoryKv::default());
+    let runtime = services(&http, &kv).with_timer(Arc::new(StoppedTimer));
+    let failure = block_on(media.lookup_large(&runtime, &job))
+        .expect_err("should leave the unprepared variant unsigned");
+    assert_eq!(failure.reason, "not_prepared");
+    assert_eq!(http.recorded_request_methods(), ["GET", "POST"]);
+    let bodies = http.recorded_request_bodies();
+    let signal: crate::preparation::protocol::SignalRequest =
+        serde_json::from_slice(bodies.last().expect("should send a hint"))
+            .expect("should encode the signal protocol");
+    assert_eq!(signal.target.path, "/media/ferry.mp4");
+    assert_eq!(signal.target.variant, "asset=b&edition=uk");
+    assert_eq!(signal.items.len(), 1);
+    assert_eq!(signal.items[0].identity, identity);
+    assert_eq!(
+        signal.items[0].kind,
+        crate::preparation::protocol::ItemKind::Large
+    );
+}
+
+#[test]
+fn only_a_granted_snapshot_read_is_observed_and_its_facts_are_authenticated() {
+    let signer = async_signer();
+    let media = EncypherMedia::new(Arc::clone(&signer));
+    let mut request = Request::builder()
+        .uri(READER)
+        .body(EdgeBody::empty())
+        .expect("should build");
+    assert!(
+        !media.observes_snapshot(&IntegrationRequestState::of(&request)),
+        "an ordinary reader's request is never a snapshot"
+    );
+    let nonce = "0123456789abcdef0123456789abcdef";
+    IntegrationRequestState::observe(
+        &mut request,
+        crate::INTEGRATION_ID,
+        crate::preparation::edge::SnapshotGrant {
+            nonce: nonce.to_owned(),
+        },
+    );
+    let state = IntegrationRequestState::of(&request);
+    assert!(media.observes_snapshot(&state));
+    assert!(
+        !EncypherMedia::new(signer_synchronous()).observes_snapshot(&state),
+        "the synchronous mode observes nothing"
+    );
+
+    let origin_identity_sha256 = sha256_hex(b"https://origin.example.com\0/media/");
+    let facts = SnapshotFacts {
+        status: StatusCode::OK,
+        private: true,
+        no_transform: false,
+        manifest_link: false,
+        content_encoding: String::new(),
+        origin_host: "origin.example.com".to_owned(),
+        origin_identity_sha256: origin_identity_sha256.clone(),
+        source_reference: Some("https://origin.example.com/a.png".to_owned()),
+    };
+    let headers = media.snapshot_headers(&state, &facts);
+    let (name, value) = headers.first().expect("should write the facts header");
+    assert_eq!(name.as_str(), crate::preparation::protocol::FACTS_HEADER);
+    let reported = crate::preparation::protocol::verify_facts_header(
+        "publication-secret-for-tests",
+        nonce,
+        value.to_str().expect("should be text"),
+    )
+    .expect("should verify for the grant's nonce");
+    assert!(reported.private, "should report the origin's own privacy");
+    assert_eq!(reported.origin_host, "origin.example.com");
+    assert_eq!(
+        reported.origin_identity_sha256, origin_identity_sha256,
+        "should authenticate core's configured-source digest with the facts"
+    );
+    assert!(
+        crate::preparation::protocol::verify_facts_header(
+            "publication-secret-for-tests",
+            "fedcba9876543210fedcba9876543210",
+            value.to_str().expect("should be text"),
+        )
+        .is_none(),
+        "should verify for no other read"
+    );
+}
+
+fn signer_synchronous() -> Arc<Signer> {
+    signer()
 }

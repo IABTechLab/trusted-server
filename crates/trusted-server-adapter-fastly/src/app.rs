@@ -346,6 +346,10 @@ pub(crate) fn declare_platform() {
     core_platform::declare_platform_tls_headers(&[FASTLY_TLS_HEADER]);
     core_platform::declare_platform_spoofable_headers(&[FASTLY_CLIENT_IP_HEADER]);
     core_platform::declare_platform_internal_headers(&[FASTLY_DEBUG_POP_HEADER]);
+    // The instance keeps running after its response is sent, and
+    // `crate::send_after_response_handoffs` sends what modules handed over
+    // then. Compute offers no timer, so none is declared.
+    core_platform::declare_platform_after_response_handoff();
 }
 
 /// Build the application state from explicit settings, composing the modules

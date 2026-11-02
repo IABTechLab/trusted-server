@@ -30,7 +30,25 @@ fn main() {
         eprintln!("warning: logger init failed: {e}");
     }
 
-    let config = match port_from_env() {
+    // The publisher's preparation worker role: a separate long-lived
+    // process with its own exclusively owned store, never a task of the
+    // delivery server. `trusted-server-axum preparation-worker --config
+    // <worker.toml>`.
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.first().map(String::as_str) == Some("preparation-worker") {
+        if arguments.len() != 3 || arguments[1] != "--config" || arguments[2].is_empty() {
+            eprintln!("usage: trusted-server-axum preparation-worker --config <worker.toml>");
+            std::process::exit(2);
+        }
+        let path = &arguments[2];
+        if let Err(err) = trusted_server_preparation_worker::run(Path::new(path)) {
+            log::error!("{err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let mut config = match port_from_env() {
         // When PORT is set, bind to a specific address so integration tests
         // can allocate a fresh OS port each run and avoid TIME_WAIT flakiness.
         Some(port) => AxumDevServerConfig {
@@ -40,6 +58,18 @@ fn main() {
         // Normal development path: read bind address from axum.toml.
         None => AxumDevServerConfig::default(),
     };
+    // An explicit listener address supports a publisher's private control
+    // network and local multi-process staging without changing PORT's
+    // existing loopback-only behavior.
+    if let Some(address) = std::env::var_os("TS_LISTEN_ADDR") {
+        match address.to_str().and_then(|address| address.parse().ok()) {
+            Some(address) => config.addr = address,
+            None => {
+                log::error!("TS_LISTEN_ADDR must be a socket address");
+                std::process::exit(2);
+            }
+        }
+    }
 
     log::info!("Listening on http://{}", config.addr);
     let router = TrustedServerApp::routes();

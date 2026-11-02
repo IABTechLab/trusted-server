@@ -865,8 +865,9 @@ impl LargeReferences {
                 .filter(|reference| reference.starts_with("https://"))
                 .map(str::to_owned)
         };
-        let reader = (identity.reader_query_free && identity.reader_url.starts_with("https://"))
-            .then(|| identity.reader_url.to_owned());
+        let reader = (identity.reader_query.is_empty()
+            && identity.reader_url.starts_with("https://"))
+        .then(|| identity.reader_url.to_owned());
         Self { source, reader }
     }
 
@@ -1048,9 +1049,16 @@ impl MediaClaim {
         if !self.shared {
             return Err("large_request_not_shared");
         }
+        // A lookup-only signer keeps nothing here and starts no load, so
+        // neither the outcome's lifetime nor the streaming transport, budget
+        // and timer a load needs decide whether its result is looked up.
+        let lookup_only = self.signer.lookup_only();
         // An outcome that cannot be kept would be worked out again for
         // every request, each range of one playback included.
-        if facts.keep_for.is_none() || !services.loading_cache_for(ASSETS_CACHE).keeps_values() {
+        if !lookup_only
+            && (facts.keep_for.is_none()
+                || !services.loading_cache_for(ASSETS_CACHE).keeps_values())
+        {
             return Err("large_outcome_not_kept");
         }
         let Some(length) = total else {
@@ -1059,14 +1067,16 @@ impl MediaClaim {
         if length > ceiling {
             return Err("exceeds_large_limit");
         }
-        if !services.http_client().supports_streaming_responses() {
-            return Err("no_streaming_transport");
-        }
-        if self.signer.max_large_media_duration().is_zero() {
-            return Err("no_large_media_budget");
-        }
-        if services.timer().is_none() {
-            return Err("no_timer");
+        if !lookup_only {
+            if !services.http_client().supports_streaming_responses() {
+                return Err("no_streaming_transport");
+            }
+            if self.signer.max_large_media_duration().is_zero() {
+                return Err("no_large_media_budget");
+            }
+            if services.timer().is_none() {
+                return Err("no_timer");
+            }
         }
         SourceVersion::of(headers, length).ok_or("no_strong_etag")
     }
@@ -1120,6 +1130,11 @@ impl MediaClaim {
         answer: LargeAnswer,
     ) -> Response<EdgeBody> {
         let signer_id = self.signer.signer_id();
+        if self.signer.lookup_only() {
+            return self
+                .deliver_published_large(services, identity, origin, answer)
+                .await;
+        }
         let budget = LargeBudget {
             started: Instant::now(),
             total: self.signer.max_large_media_duration(),
@@ -1377,6 +1392,26 @@ impl MediaClaim {
         {
             return response;
         }
+        if self.signer.lookup_only() {
+            let Some(version) = SourceVersion::of(response.headers(), 0) else {
+                return response;
+            };
+            let Some(origin_host) = url::Url::parse(identity.fetched_url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            else {
+                return response;
+            };
+            let Some(record) = self
+                .published_large(services, identity, &origin_host, &response, &version, None)
+                .await
+            else {
+                return response;
+            };
+            let (mut parts, body) = response.into_parts();
+            decorate(&mut parts.headers, &record);
+            return Response::from_parts(parts, body);
+        }
         let Some(version) = SourceVersion::of(response.headers(), 0) else {
             return response;
         };
@@ -1415,6 +1450,95 @@ impl MediaClaim {
         let (mut parts, body) = response.into_parts();
         decorate(&mut parts.headers, &record);
         Response::from_parts(parts, body)
+    }
+
+    /// Answers the reader from an origin answer admitted to the large lane
+    /// for a lookup-only signer: the origin's own answer, decorated with
+    /// the version's published headers where the signer holds a result for
+    /// exactly this version and length, else as it came. Nothing is hashed,
+    /// signed, kept or loaded, and no other caller's work is joined.
+    async fn deliver_published_large(
+        &self,
+        services: &RuntimeServices,
+        identity: &VariantIdentity<'_>,
+        origin: PinnedOrigin<'_>,
+        answer: LargeAnswer,
+    ) -> Response<EdgeBody> {
+        let LargeAnswer {
+            response, version, ..
+        } = answer;
+        let origin_host = origin.url.host_str().map(str::to_ascii_lowercase);
+        let Some(origin_host) = origin_host else {
+            return response;
+        };
+        let Some(record) = self
+            .published_large(
+                services,
+                identity,
+                &origin_host,
+                &response,
+                &version,
+                Some(version.length()),
+            )
+            .await
+        else {
+            return response;
+        };
+        let (mut parts, body) = response.into_parts();
+        decorate(&mut parts.headers, &record);
+        Response::from_parts(parts, body)
+    }
+
+    /// The lookup-only signer's published record for `version`, checked
+    /// against `length` where the answer states it.
+    async fn published_large(
+        &self,
+        services: &RuntimeServices,
+        identity: &VariantIdentity<'_>,
+        origin_host: &str,
+        response: &Response<EdgeBody>,
+        version: &SourceVersion,
+        length: Option<u64>,
+    ) -> Option<LargeRecord> {
+        let job = super::LargeLookupJob {
+            reader_url: identity.reader_url,
+            reader_query: identity.reader_query,
+            origin_identity: identity.origin_identity,
+            source_origin_host: origin_host,
+            content_type: header_text(response.headers(), &header::CONTENT_TYPE),
+            etag: version.etag(),
+            length: length.unwrap_or(0),
+        };
+        let signer_id = self.signer.signer_id();
+        match self.signer.lookup_large(services, &job).await {
+            Ok(published)
+                if length.is_none_or(|length| published.length == length)
+                    && published.headers.len() <= LARGE_MAX_HEADERS
+                    && !published
+                        .headers
+                        .iter()
+                        .any(|(name, _)| is_reserved_header(name)) =>
+            {
+                log::debug!("media signing: lane=large signer={signer_id} from=published");
+                Some(LargeRecord {
+                    length: published.length,
+                    sha256: published.sha256,
+                    headers: published.headers,
+                })
+            }
+            Ok(_) => {
+                log::warn!(
+                    "media signing: outcome=unsigned lane=large signer={signer_id} reason=published_record_rejected"
+                );
+                None
+            }
+            Err(failure) => {
+                log::info!(
+                    "media signing: outcome=unsigned lane=large signer={signer_id} reason={failure}"
+                );
+                None
+            }
+        }
     }
 
     /// Answers the reader's preconditions and range against the pinned,

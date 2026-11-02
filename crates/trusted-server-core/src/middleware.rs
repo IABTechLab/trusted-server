@@ -170,7 +170,10 @@ pub struct MiddlewareContext<'a> {
     /// a middleware whose change has to respect a header such as
     /// `Content-Security-Policy`. `None` where core cannot say, being the
     /// fetch phase of a page that may be stored and a page replayed from the
-    /// store, which a middleware treats as headers it does not know.
+    /// store, which a middleware treats as headers it does not know. A page
+    /// replayed from the store is never one whose origin forbade transforming
+    /// it or named a C2PA manifest in its `Link`: core keeps such a page out of
+    /// the store, so it is always read with its origin's own headers.
     pub response_headers: Option<&'a HeaderMap>,
     /// What the adapter reports about the platform the deployment runs on,
     /// as the attestation evidence carries it.
@@ -582,6 +585,15 @@ pub trait Middleware: Send + Sync {
     /// stack answers, because a `304` carries no body and a `206` only part of
     /// one. `false` by default.
     fn needs_whole_body(&self) -> bool {
+        false
+    }
+
+    /// Runs its stream processor after every ordinary processor in this chain.
+    ///
+    /// Use this for a seal or signature that must cover the final transformed
+    /// document. At most one middleware may produce a finalizing processor
+    /// for a document; handlers and inserts still run before all processors.
+    fn finalizes_document(&self) -> bool {
         false
     }
 
@@ -1003,13 +1015,16 @@ impl MiddlewareChain {
     /// Checks each handler's selector, refusing the document when one does
     /// not parse. On a media type other than HTML, an action that decides
     /// about HTML is refused the same way.
+    /// Ordinary stream processors keep their declared order. One document
+    /// finalizer runs last, after every other processor and HTML edit.
     ///
     /// # Errors
     ///
-    /// A message naming the middleware and the selector that does not parse,
-    /// or the HTML decision it made about a document that is not HTML.
+    /// A message naming an invalid selector, an HTML decision on a non-HTML
+    /// document, an inadmissible response header, or competing finalizers.
     pub fn plan(&self, context: &MiddlewareContext<'_>) -> Result<MiddlewarePlan, String> {
         let mut plan = MiddlewarePlan::default();
+        let mut final_processor = None;
         for middleware in &self.middleware {
             let action = middleware.create(context);
             action.validate_selectors().map_err(|problem| {
@@ -1043,8 +1058,24 @@ impl MiddlewareChain {
             plan.body_open_inserts.extend(action.body_open_inserts);
             plan.element_handlers.extend(action.element_handlers);
             plan.text_handlers.extend(action.text_handlers);
-            plan.processors.extend(action.stream);
+            if let Some(processor) = action.stream {
+                if middleware.finalizes_document() {
+                    if let Some((other, _)) = &final_processor {
+                        return Err(format!(
+                            "the {} middleware `{}` and `{other}` both finalize the document",
+                            self.phase,
+                            middleware.middleware_id()
+                        ));
+                    }
+                    final_processor = Some((middleware.middleware_id(), processor));
+                } else {
+                    plan.processors.push(processor);
+                }
+            }
             plan.response_headers.extend(action.response_headers);
+        }
+        if let Some((_, processor)) = final_processor {
+            plan.processors.push(processor);
         }
         Ok(plan)
     }
@@ -1068,6 +1099,7 @@ pub struct MiddlewarePlan {
     /// Text handlers, in the order the middleware were named.
     pub text_handlers: Vec<Box<dyn TextHandler>>,
     /// Stream processors, each handed what the one before it produced.
+    /// Ordinary processors keep their declared order; a finalizer runs last.
     pub processors: Vec<Box<dyn StreamProcessor>>,
     /// Headers for the reader's response, in the order the middleware were
     /// named, a later one replacing an earlier of the same name.

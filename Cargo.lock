@@ -6655,6 +6655,7 @@ dependencies = [
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-preparation-worker",
  "trusted-server-provenance-encypher",
  "trusted-server-shared-aws",
  "trusted-server-tag-google-tag",
@@ -7380,17 +7381,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-preparation-worker"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "bytes",
+ "derive_more",
+ "http",
+ "log",
+ "rand 0.8.6",
+ "redb",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+ "trusted-server-provenance-encypher",
+ "url",
+]
+
+[[package]]
 name = "trusted-server-provenance-encypher"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "derive_more",
  "ed25519-dalek",
  "edgezero-core",
  "ego-tree",
  "error-stack",
  "futures",
+ "hmac",
  "html5ever",
  "http",
  "log",
@@ -7399,6 +7425,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
  "trusted-server-core",
  "url",
  "validator",

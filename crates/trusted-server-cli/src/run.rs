@@ -59,6 +59,10 @@ enum Command {
     /// Questions about a publisher origin's behaviour.
     #[command(subcommand)]
     Origin(crate::commands::origin::OriginCommand),
+    /// Operator control of the publisher's preparation worker, over its
+    /// authenticated HTTP routes.
+    #[command(subcommand)]
+    Preparation(crate::commands::preparation::PreparationCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -200,6 +204,11 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             crate::commands::origin::run(command, &mut out).map(|()| RunOutcome::Success)
+        }
+        Command::Preparation(command) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::commands::preparation::run(&command, &mut out).map(|()| RunOutcome::Success)
         }
     }
 }

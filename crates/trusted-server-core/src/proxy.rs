@@ -1172,7 +1172,8 @@ pub async fn handle_asset_proxy_request(
         incoming_path,
         req.headers(),
         true,
-    );
+    )
+    .map(|claim| claim.observing(&crate::integrations::IntegrationRequestState::of(&req)));
     // The platform's image optimizer reads the origin itself, so core never
     // holds its input. It is asked to keep its input's C2PA manifest and
     // record what it did, and its answer is signed only where it did, see
@@ -1323,7 +1324,7 @@ pub async fn handle_asset_proxy_request(
             reader_url,
             origin_identity,
             fetched_url: target_url.as_str(),
-            reader_query_free: incoming_query.is_empty(),
+            reader_query: incoming_query,
         }),
         _ => None,
     };
@@ -1422,7 +1423,10 @@ pub async fn handle_asset_proxy_request(
                     incoming_path,
                     req.headers(),
                     true,
-                );
+                )
+                .map(|claim| {
+                    claim.observing(&crate::integrations::IntegrationRequestState::of(&req))
+                });
                 let mut platform_req = build_asset_platform_request(
                     req.method(),
                     &target_url,

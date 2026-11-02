@@ -189,7 +189,7 @@ impl ReleaseAuthority {
         }
     }
 
-    /// An authority over test keys.
+    /// An authority over test keys, for tests only.
     #[cfg(test)]
     pub(crate) fn pinned(keys: Vec<VerifyingKey>, floor: u64, revoked: Vec<String>) -> Self {
         Self {

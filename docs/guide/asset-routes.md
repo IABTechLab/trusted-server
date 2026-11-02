@@ -247,6 +247,13 @@ and SVG created later by scripts remain outside these routes. See the
 [provenance coverage limits](./configuration#placing-page-changes) before
 claiming page-wide coverage.
 
+With Encypher's `execution = "async_prepared"`, a routed or rehosted file is
+never signed during delivery. It carries provenance only after the preparation
+worker prepared that exact path, as its own target or from a reader hint, and
+the route prefix must be listed in the preparation `routes`. Preparing the page
+that links the file does not prepare it. See
+[Encypher prepared signing](./configuration#encypher-prepared-signing).
+
 ```toml
 [[proxy.asset_routes]]
 prefix = "/_rehost/assets.example.com/library/"

@@ -873,7 +873,7 @@ impl PlatformTimer for SpinPlatformTimer {
 }
 
 /// The WASI timer in the Spin component; none on the native host.
-fn runtime_timer() -> Option<Arc<dyn PlatformTimer>> {
+pub(crate) fn runtime_timer() -> Option<Arc<dyn PlatformTimer>> {
     #[cfg(all(feature = "spin", target_arch = "wasm32"))]
     let timer: Option<Arc<dyn PlatformTimer>> = Some(Arc::new(SpinPlatformTimer));
     #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]

@@ -61,6 +61,7 @@ mod data_uri;
 mod embed;
 mod embedded;
 mod media_api;
+pub mod preparation;
 mod prepared_probe;
 mod processor;
 mod svg_equivalence;
@@ -89,6 +90,7 @@ const STYLESHEET_MEDIA_TYPE: &str = "text/css";
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 #[validate(schema(function = "validate_hold_exceeds_timeout"))]
+#[validate(schema(function = "validate_execution"))]
 pub struct EncypherConfig {
     /// Encypher API origin, for example `https://api.example.com`. Must be https.
     #[validate(custom(function = validate_api_base_url))]
@@ -168,6 +170,16 @@ pub struct EncypherConfig {
     #[serde(default = "default_max_large_media_ms")]
     #[validate(range(min = 5_000, max = 600_000))]
     pub max_large_media_ms: u64,
+    /// How the module signs: `synchronous`, the default, where a reader's
+    /// delivery signs what it holds no result for, or `async_prepared`,
+    /// where the publisher's preparation worker signs and delivery only
+    /// looks up published results, see [`preparation`].
+    #[serde(default)]
+    pub execution: preparation::Execution,
+    /// `[provenance.encypher.preparation]`, required by `async_prepared`.
+    #[serde(default)]
+    #[validate(nested)]
+    pub preparation: Option<preparation::PreparationConfig>,
 }
 
 /// The prepared service's largest source, in bytes: the largest integer a
@@ -280,15 +292,42 @@ fn validate_hold_exceeds_timeout(config: &EncypherConfig) -> Result<(), Validati
     }
 }
 
+/// `async_prepared` needs its preparation table: it never falls back to
+/// signing in delivery, so without a worker nothing would ever be signed.
+fn validate_execution(config: &EncypherConfig) -> Result<(), ValidationError> {
+    if config.execution == preparation::Execution::AsyncPrepared && config.preparation.is_none() {
+        return Err(ValidationError::new(
+            "async_prepared_requires_preparation_table",
+        ));
+    }
+    Ok(())
+}
+
 /// The worker token, named in `[provenance.encypher]` by its entry in the
-/// secret store, which is in use whenever the module is selected.
-const SECRET_SETTINGS: &[ModuleSecretSetting] = &[ModuleSecretSetting {
-    path: &["worker_token"],
-    in_use: always_in_use,
-}];
+/// secret store, which is in use whenever the module is selected, and the
+/// preparation scopes' secrets, in use in `async_prepared` mode.
+const SECRET_SETTINGS: &[ModuleSecretSetting] = &[
+    ModuleSecretSetting {
+        path: &["worker_token"],
+        in_use: always_in_use,
+    },
+    ModuleSecretSetting {
+        path: &["preparation", "signal_secret"],
+        in_use: async_prepared_in_use,
+    },
+    ModuleSecretSetting {
+        path: &["preparation", "publication_secret"],
+        in_use: async_prepared_in_use,
+    },
+];
 
 fn always_in_use(_table: &serde_json::Map<String, serde_json::Value>) -> bool {
     true
+}
+
+fn async_prepared_in_use(table: &serde_json::Map<String, serde_json::Value>) -> bool {
+    table.get("execution").and_then(serde_json::Value::as_str) == Some("async_prepared")
+        && table.contains_key("preparation")
 }
 
 /// The changes the module supplies, as `[[serve]]` entries name them: the
@@ -309,6 +348,75 @@ pub fn builder() -> IntegrationBuilder {
         .with_module_name(MODULE)
         .with_secret_settings(SECRET_SETTINGS)
         .with_middleware(SUPPLIED_MIDDLEWARE)
+        // Removes every preparation snapshot capability from every request,
+        // and admits only one that verifies, see `preparation::edge`.
+        .with_request_preparer(preparation::edge::prepare_request)
+}
+
+/// Refuses an `async_prepared` table whose public host is not the claimed
+/// domain or its `www.` name, so every prepared address is on the claim.
+fn require_claimed_public_host(config: &EncypherConfig) -> Result<(), Report<TrustedServerError>> {
+    let Some(preparation) = config
+        .preparation
+        .as_ref()
+        .filter(|_| config.execution == preparation::Execution::AsyncPrepared)
+    else {
+        return Ok(());
+    };
+    let host = preparation.public_host.as_str();
+    if host.strip_prefix("www.").unwrap_or(host) == config.domain {
+        return Ok(());
+    }
+    Err(Report::new(TrustedServerError::Settings {
+        message: format!(
+            "[provenance.encypher.preparation] public_host `{host}` is not the claimed domain \
+             `{}` or its `www.` name",
+            config.domain
+        ),
+    }))
+}
+
+/// What the platform the module registers on can do for a reader's hint,
+/// as its adapter declared before serving.
+#[derive(Debug, Clone, Copy)]
+struct HintLifetimes {
+    /// Every request's services carry a real timer.
+    timer: bool,
+    /// The instance sends handed-over requests after the response.
+    after_response: bool,
+}
+
+impl HintLifetimes {
+    fn declared() -> Self {
+        Self {
+            timer: trusted_server_core::platform::platform_offers_timer(),
+            after_response: trusted_server_core::platform::platform_offers_after_response_handoff(),
+        }
+    }
+}
+
+/// Refuses reader hints on a platform that can neither bound a hint while
+/// the reader waits nor send it after the response. Warming, publication
+/// events and reconciliation still prepare content there.
+fn require_reader_trigger_capability(
+    config: &EncypherConfig,
+    lifetimes: HintLifetimes,
+) -> Result<(), Report<TrustedServerError>> {
+    let wants = config.execution == preparation::Execution::AsyncPrepared
+        && config
+            .preparation
+            .as_ref()
+            .is_some_and(|preparation| preparation.reader_trigger);
+    if !wants || lifetimes.timer || lifetimes.after_response {
+        return Ok(());
+    }
+    Err(Report::new(TrustedServerError::Settings {
+        message: "[provenance.encypher.preparation] reader_trigger needs a platform with a \
+                  timer or an after-response lifetime, and this one declares neither; set \
+                  reader_trigger = false and prepare through warming, publication events and \
+                  reconciliation"
+            .to_owned(),
+    }))
 }
 
 /// Refuses a document that selects the module and names its middleware in no
@@ -372,6 +480,7 @@ fn config(settings: &Settings) -> Result<Option<EncypherConfig>, Report<TrustedS
     };
     require_an_entry(settings)?;
     require_scoped_stylesheet_entries(settings)?;
+    require_claimed_public_host(&config)?;
     Ok(Some(config))
 }
 
@@ -402,23 +511,31 @@ pub fn register(
         log::warn!("encypher: not registered, because the worker token is empty");
         return Ok(None);
     }
-    log::info!("encypher: registered for domain={}", config.domain);
+    require_reader_trigger_capability(&config, HintLifetimes::declared())?;
+    log::info!(
+        "encypher: registered for domain={} execution={:?}",
+        config.domain,
+        config.execution
+    );
+    let asynchronous = config.execution == preparation::Execution::AsyncPrepared;
     let max_document_bytes = config
         .max_document_bytes
         .min(settings.publisher.max_buffered_body_bytes);
     let signer = Arc::new(Signer::new(config, max_document_bytes));
-    Ok(Some(
-        IntegrationRegistration::builder(INTEGRATION_ID)
-            .without_js()
-            .with_middleware(Arc::new(Encypher {
-                signer: Arc::clone(&signer),
-            }))
-            .with_middleware(Arc::new(EncypherStylesheet {
-                signer: Arc::clone(&signer),
-            }))
-            .with_media_signer(Arc::new(EncypherMedia::new(signer)))
-            .build(),
-    ))
+    let mut registration = IntegrationRegistration::builder(INTEGRATION_ID)
+        .without_js()
+        .with_middleware(Arc::new(Encypher {
+            signer: Arc::clone(&signer),
+        }))
+        .with_middleware(Arc::new(EncypherStylesheet {
+            signer: Arc::clone(&signer),
+        }))
+        .with_media_signer(Arc::new(EncypherMedia::new(Arc::clone(&signer))));
+    if asynchronous {
+        registration =
+            registration.with_proxy(Arc::new(preparation::edge::PreparationRoutes::new(signer)));
+    }
+    Ok(Some(registration.build()))
 }
 
 /// The middleware, which signs the article and the embedded media of each
@@ -433,12 +550,96 @@ impl std::fmt::Debug for Encypher {
     }
 }
 
-/// What the preparation decided for one document: the page to sign, or none.
-type Admission = Option<PageRequest>;
+/// What the preparation decided for one document.
+enum Admission {
+    /// Nothing to do.
+    Pass,
+    /// The page to sign or look up.
+    Hold(PageRequest),
+    /// A verified preparation snapshot read: nothing is signed or looked
+    /// up, and the answer reports what the origin's own headers said.
+    Snapshot(preparation::edge::SnapshotGrant),
+}
+
+/// The snapshot grant the module's request preparer left on this
+/// document's request, in the asynchronous mode.
+fn snapshot_grant(
+    signer: &Signer,
+    context: &MiddlewareContext<'_>,
+) -> Option<preparation::edge::SnapshotGrant> {
+    if !signer.is_async() {
+        return None;
+    }
+    context
+        .document_state
+        .get::<preparation::edge::SnapshotGrant>(INTEGRATION_ID)
+        .map(|grant| (*grant).clone())
+}
+
+/// The facts header a snapshot read of a document answers with: the
+/// origin's status and privacy as core read them before its own rewrites.
+fn snapshot_action(
+    signer: &Signer,
+    context: &MiddlewareContext<'_>,
+    grant: &preparation::edge::SnapshotGrant,
+) -> MiddlewareAction {
+    let Some(preparation) = signer.preparation() else {
+        return MiddlewareAction::pass();
+    };
+    let headers = context.response_headers;
+    let directive = |name: &str| {
+        headers.is_some_and(|headers| {
+            headers
+                .get_all(http::header::CACHE_CONTROL)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|value| value.split(','))
+                .any(|part| part.trim().eq_ignore_ascii_case(name))
+        })
+    };
+    let manifest_link = headers.is_some_and(|headers| {
+        headers
+            .get_all(http::header::LINK)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|value| value.to_ascii_lowercase().contains("c2pa-manifest"))
+    });
+    let origin = preparation::protocol::SnapshotOrigin {
+        status: context.status.as_u16(),
+        private: context.origin_private,
+        no_transform: directive("no-transform"),
+        manifest_link,
+        content_encoding: String::new(),
+        origin_host: context.origin_host.to_ascii_lowercase(),
+        // HTML identity binds the actual bounded projection, and this
+        // context does not expose core's configured media-origin identity.
+        // An empty digest cannot admit a large-source locator.
+        origin_identity_sha256: String::new(),
+        source_reference: None,
+    };
+    // The facts above were read from the origin's own headers; the
+    // snapshot's transport is then marked internal so no cache keeps it
+    // for a reader.
+    let transport = (
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("private, no-store"),
+    );
+    MiddlewareAction {
+        response_headers: preparation::edge::snapshot_facts(preparation, grant, &origin)
+            .into_iter()
+            .chain(std::iter::once(transport))
+            .collect(),
+        ..MiddlewareAction::pass()
+    }
+}
 
 impl Middleware for Encypher {
     fn middleware_id(&self) -> &'static str {
         MODULE
+    }
+
+    fn finalizes_document(&self) -> bool {
+        true
     }
 
     fn handles_media_type(&self, media_type: &str) -> bool {
@@ -467,7 +668,10 @@ impl Middleware for Encypher {
         call: ModuleCall<'a>,
         context: &'a MiddlewareContext<'a>,
     ) -> Option<Preparation<'a>> {
-        let admission = admit(&call, context, |page| self.signer.admit(page));
+        let admission = match snapshot_grant(&self.signer, context) {
+            Some(grant) => Admission::Snapshot(grant),
+            None => admit(&call, context, |page| self.signer.admit(page)),
+        };
         Some(Box::pin(async move {
             Ok(Box::new(admission) as Box<dyn Any + Send>)
         }))
@@ -476,8 +680,12 @@ impl Middleware for Encypher {
     /// Holds the admitted page, with the security policies its response
     /// carries, which decide whether inline style media may be edited.
     fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
-        let Some(page) = context.take_prepared::<Admission>(MODULE).flatten() else {
-            return MiddlewareAction::pass();
+        let page = match context.take_prepared::<Admission>(MODULE) {
+            Some(Admission::Hold(page)) => page,
+            Some(Admission::Snapshot(grant)) => {
+                return snapshot_action(&self.signer, context, &grant);
+            }
+            Some(Admission::Pass) | None => return MiddlewareAction::pass(),
         };
         let policies = context
             .response_headers
@@ -508,6 +716,10 @@ impl Middleware for EncypherStylesheet {
         STYLESHEET_MIDDLEWARE
     }
 
+    fn finalizes_document(&self) -> bool {
+        true
+    }
+
     fn handles_media_type(&self, media_type: &str) -> bool {
         media_type == STYLESHEET_MEDIA_TYPE
     }
@@ -530,18 +742,22 @@ impl Middleware for EncypherStylesheet {
         call: ModuleCall<'a>,
         context: &'a MiddlewareContext<'a>,
     ) -> Option<Preparation<'a>> {
-        let admission = admit(&call, context, |page| self.signer.admit_stylesheet(page));
+        let admission = match snapshot_grant(&self.signer, context) {
+            Some(grant) => Admission::Snapshot(grant),
+            None => admit(&call, context, |page| self.signer.admit_stylesheet(page)),
+        };
         Some(Box::pin(async move {
             Ok(Box::new(admission) as Box<dyn Any + Send>)
         }))
     }
 
     fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
-        let Some(page) = context
-            .take_prepared::<Admission>(STYLESHEET_MIDDLEWARE)
-            .flatten()
-        else {
-            return MiddlewareAction::pass();
+        let page = match context.take_prepared::<Admission>(STYLESHEET_MIDDLEWARE) {
+            Some(Admission::Hold(page)) => page,
+            Some(Admission::Snapshot(grant)) => {
+                return snapshot_action(&self.signer, context, &grant);
+            }
+            Some(Admission::Pass) | None => return MiddlewareAction::pass(),
         };
         MiddlewareAction {
             stream: Some(Box::new(stylesheet_processor(&self.signer, page))),
@@ -556,7 +772,9 @@ fn admit(
     context: &MiddlewareContext<'_>,
     gate: impl FnOnce(PageRequest) -> Result<PageRequest, processor::Gate>,
 ) -> Admission {
-    let request = ModuleRequest::from_module_context(call).ok()?;
+    let Ok(request) = ModuleRequest::from_module_context(call) else {
+        return Admission::Pass;
+    };
     let removed_prefix = request.removed_prefix().unwrap_or_default();
     let page = PageRequest {
         method: request.method().clone(),
@@ -568,15 +786,16 @@ fn admit(
             request.host(),
             request.path()
         ),
+        query: request.query().to_owned(),
         removed_prefix: removed_prefix.to_owned(),
         response_status: context.status.as_u16(),
         origin_response_is_private: context.origin_private,
     };
     match gate(page) {
-        Ok(page) => Some(page),
+        Ok(page) => Admission::Hold(page),
         Err(gate) => {
             log::debug!("encypher: document not held, gate={}", gate.code());
-            None
+            Admission::Pass
         }
     }
 }

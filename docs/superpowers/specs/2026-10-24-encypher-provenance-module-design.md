@@ -2,9 +2,11 @@
 
 Status: implemented scope on `encypher/all-media-provenance`, extending the
 text-provenance module described below. Local Axum, real HTTPS API and browser
-verification covers the routed subset (section 4). Full repository landing
-gates remain separate. This document claims neither complete page-media
-coverage nor a production deployment.
+verification covers the routed subset (section 4). Opt-in asynchronous
+prepared execution (section 2.6) is implemented on
+`encypher/async-prepared-signing`. Full repository landing gates remain
+separate. This document claims neither complete page-media coverage nor a
+production deployment.
 
 ## 1. Problem
 
@@ -100,11 +102,12 @@ to move onto those interfaces, and the core seams it needs have to be neutral.
   `encypher:policy:v3:` and `encypher:policy-skip:v3:`. Malformed or
   structurally invalid entries are deleted best effort. An alignment failure
   for one HTML representation does not delete a valid plan.
-- **Content identity** remains the policy digest, credential context and
-  canonical article-text hash, not the page URL. The matching Encypher server
-  contract deliberately deduplicates equal canonical text across URL or title
-  changes. A reused plan's manifest URL can therefore retain the first
-  canonical source URL.
+- **Content identity** in the default synchronous mode remains the policy
+  digest, credential context and canonical article-text hash, not the page
+  URL. The matching Encypher server contract deliberately deduplicates equal
+  canonical text across URL or title changes. A reused plan's manifest URL can
+  therefore retain the first canonical source URL. Prepared text identities
+  (section 2.6) also bind the page URL, title and admitted variant.
 - **Original SVG preservation** uses `embedded::scan_html` and its existing
   namespace-aware provenance/equivalence classifier for both source protection
   and signing decisions. A carrier or provenance reference after an editable
@@ -148,11 +151,13 @@ time and output-size limits still apply.
 The prepared large-media lane is opt-in (`max_large_media_bytes = 0` by
 default). It hashes a version-pinned source in bounded chunks and requests
 detached provenance without uploading or buffering the complete media.
-Admission requires the source/version checks, matching prepared API and signed
-probe, streaming support, and one enforceable wall-clock budget for hashing
-and signing. Fastly supplies no such total timer, so this lane stays closed
-there even when the API can sign the source. A refusal delivers an unsigned
-fresh origin response; it does not weaken deadline or source-binding guards.
+In synchronous mode, admission requires the source/version checks, matching
+prepared API and signed probe, streaming support, and one enforceable
+wall-clock budget for hashing and signing. Fastly supplies no such total
+timer, so this lane stays closed there even when the API can sign the source.
+A refusal delivers an unsigned fresh origin response; it does not weaken
+deadline or source-binding guards. In prepared execution the worker hashes and
+delivery only looks up the result (section 2.6).
 
 ### 2.4 Permission contract
 
@@ -175,6 +180,36 @@ The `enabled` flag (selection runs the module), `path_prefixes` (the entry's
 processor factory and request context, the shared-template refusal (the serve
 phase runs on each reader's assembled copy), and the synchronous publisher
 body path.
+
+### 2.6 Asynchronous prepared execution
+
+`execution = "async_prepared"`, with `[provenance.encypher.preparation]`, is
+opt-in; `synchronous` stays the default. A publisher-operated native worker
+(`crates/trusted-server-preparation-worker`, launched as
+`trusted-server-axum preparation-worker --config worker.toml`) owns one
+exclusive redb store: queue, fenced leases, bounded retries, byte quota,
+retained sources, probes and results, inventory reconciliation and a
+retirement outbox. It reads snapshots through the delivery instance's reader
+pipeline, extracts items with the same code delivery runs, hashes media
+locally under worker contract version 2, signs through the API, and asks the
+delivery instance to publish each result. Delivery recomputes the identity,
+recovers the exact receipt from the API without signing and checks it against
+the actual source before storing it under an immutable identity in runtime KV.
+
+Reader delivery only looks up results bound to the exact item, page URL,
+admitted variant, policy and credential context. Text identities also bind
+the page title and boundary selector. Delivery never signs, prepares,
+finalizes, uploads or falls back to synchronous signing; a miss is delivered
+unsigned. Optional reader hints (`reader_trigger`) are bounded and
+best effort: Axum, and Cloudflare and Spin WASM builds, race the hint against
+a real timer (`admission_ms`); Fastly sends it after the response; Cloudflare
+does not use `waitUntil`; native Cloudflare and Spin builds refuse
+`reader_trigger = true`. Coverage comes from supplied targets, registered
+inventory and publication-triggered warming, not from crawling or upload
+discovery. Large sources need a query-free `https` fetched URL and strong
+validators; no path uploads source bytes. The
+[configuration guide](../../guide/configuration.md#encypher-prepared-signing)
+holds the operator contract.
 
 ## 3. Configuration
 
@@ -212,6 +247,9 @@ The settings below belong to `[provenance.encypher]`. Unknown keys are refused.
 | `max_media_sign_calls_per_document` | `8`       | `1..=128`; uncached embedded calls per HTML/CSS pass                                                                                                                         |
 | `max_large_media_bytes`             | `0`       | Disabled at `0`; otherwise `16777216..=9007199246352383` bytes                                                                                                               |
 | `max_large_media_ms`                | `60000`   | `5000..=600000`; one budget for namespace resolution, cache lookup and newly launched hash/sign work                                                                         |
+
+`execution` defaults to `synchronous`; `async_prepared` requires
+`[provenance.encypher.preparation]` (section 2.6).
 
 ### Upgrade and rollout
 
@@ -291,6 +329,10 @@ behavior. Verification using a locally supplied detached manifest does not
 prove that the emitted manifest URL is publicly retrievable. Those are
 distinct deployment checks, not results established by this run.
 
+Prepared execution has actual-network evidence only on the native Axum
+delivery instance with the native worker, a real API and signed probe. The
+Fastly, Cloudflare and Spin hint paths have not run against a live worker.
+
 ## 5. Limits and operator obligations
 
 1. Spin's declared KV store is `default`, which also holds the settings.
@@ -298,20 +340,26 @@ distinct deployment checks, not results established by this run.
    TTL, so `expires_at` prevents stale reads and on-read deletion removes
    encountered stale entries, but abandoned content keys need the
    namespace-retirement procedure in the Spin deployment guide.
-2. Holding the page delays its first byte by the signing time on a cache miss.
-   `max_hold_ms` is a total module bound on Cloudflare, Spin and Axum. Fastly
-   has only first-byte and between-byte transport bounds, as described above.
+2. In synchronous mode, holding the page delays its first byte by the signing
+   time on a cache miss. `max_hold_ms` is a total module bound on Cloudflare,
+   Spin and Axum. Fastly has only first-byte and between-byte transport bounds,
+   as described above. Prepared execution holds no signing work, but its
+   lookups have no fixed latency bound either.
 3. The module skips pages the origin marks private, but cannot detect other
    personalized pages. A deployment places it on public article routes.
 4. Routes cover only bytes that pass through them. Direct third-party frame or
    script requests and SVG created later by scripts require separate evidence
    and are not covered by this implementation.
-5. Enabling a large-media size limit does not make the lane available without
-   an enforceable total deadline. Fastly remains closed; do not substitute its
-   first-byte or between-byte timeout for that deadline.
+5. Enabling a large-media size limit does not make the synchronous lane
+   available without an enforceable total deadline. Fastly remains closed; do
+   not substitute its first-byte or between-byte timeout for that deadline.
 6. A detached-format deployment must prove public retrieval of its emitted
    manifest URL. A local sidecar backchannel proves neither public routing nor
    deployment availability.
+7. Prepared execution covers only supplied targets and hinted items. A page
+   target covers its text and inline media; linked media needs its own target
+   or hint. Worker refusal counts are retained outcomes, not proof of page
+   coverage.
 
 ## 6. Landing evidence checklist
 

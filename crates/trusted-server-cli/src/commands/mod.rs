@@ -3,6 +3,7 @@ pub(crate) mod cache;
 pub(crate) mod config;
 pub(crate) mod keys;
 pub(crate) mod pbs;
+pub(crate) mod preparation;
 // `dev` is `pub` so the macOS-gated `tests/proxy_e2e.rs` suite can reach
 // `commands::dev::proxy`, and `origin` is `pub` so `tests/origin_probe.rs` can drive the
 // shareability probe against a local fixture; the other command modules are
