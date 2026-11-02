@@ -2183,7 +2183,7 @@ provider or bidder route.
 | `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery                                               |
 | `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid asset URLs through first-party endpoints                                                 |
 | `rewrite_clicks`       | Boolean | unset              | Wrap creative links in `/first-party/click`; unset follows `rewrite_creatives` (proxied HTML keeps wrapping) |
-| `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                                                                       |
+| `timeout_ms`           | Integer | `2000`             | Deadline for additional auction network waiting, measured from dispatch                                      |
 | `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                                                                   |
 | `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                                                                   |
 | `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                                                               |
@@ -2431,13 +2431,19 @@ push as proof that a Cloudflare or Spin multi-provider plan can start.
 
 ### Deadline behavior
 
-Configured timeouts are logical budgets, not hard wall-clock guarantees. No
-current adapter claims an abortable provider-wide total-request deadline.
-Already-launched work may complete after the logical budget and a completed late
-response can remain eligible. Once the logical auction budget is exhausted,
-Trusted Server starts no additional provider or mediator network work, then
-finishes local decision and delivery. An auction can therefore exceed its
-configured wall-clock timeout.
+Auction response collection waits only until an absolute deadline measured from
+dispatch, including headers and complete response bodies. One nonblocking snapshot
+retains complete available responses after a slow origin; unfinished providers
+become timeouts and mediation cannot start with an exhausted budget. Backend
+timeout rounding does not extend network waiting.
+Provider bids that are already complete at the final nonblocking snapshot remain
+eligible even after `tmax`; mediation starts only with remaining budget and
+rejects responses collected after its cutoff.
+
+Fastly abandons pending requests; Axum, Cloudflare, and Spin cancel outstanding
+operations where supported. Local processing and delivery can finish after the
+network cutoff. See [Timeout behavior](/guide/auction-orchestration#timeout-behavior)
+for runtime semantics and limitations.
 
 Creative sanitization is opt-in. `sanitize_creatives = true` strips executable
 markup before delivery. `rewrite_creatives = false` leaves asset URLs

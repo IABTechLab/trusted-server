@@ -4655,13 +4655,14 @@ async fn collect_non_html_auction(
                 .and_then(|_| diagnostics_auction_id(settings))
         });
     let placeholder = mediator_placeholder_request();
-    let result = orchestrator
-        .collect_dispatched_auction(
-            dispatched,
-            services,
-            &make_collect_context(settings, services, &placeholder),
-        )
-        .await;
+    // Auction collection nests deadline and trace futures. Keep its future off
+    // the WASI call stack.
+    let result = Box::pin(orchestrator.collect_dispatched_auction(
+        dispatched,
+        services,
+        &make_collect_context(settings, services, &placeholder),
+    ))
+    .await;
     let delivered_winner_slots = write_bids_to_state(
         &result.winning_bids,
         params.price_granularity,
@@ -4716,9 +4717,10 @@ async fn collect_stream_auction(
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
     let collect_ctx = make_collect_context(settings, services, &placeholder);
-    let result = orchestrator
-        .collect_dispatched_auction(dispatched, services, &collect_ctx)
-        .await;
+    // Auction collection nests deadline and trace futures. Keep its future off
+    // the WASI call stack.
+    let result =
+        Box::pin(orchestrator.collect_dispatched_auction(dispatched, services, &collect_ctx)).await;
     log::info!(
         "body_close_hold_loop: collect complete - {} winning bid(s)",
         result.winning_bids.len()
@@ -5668,8 +5670,8 @@ pub async fn handle_publisher_request(
         }
     }
 
-    // SSP requests are already racing through the platform HTTP client, so
-    // origin TTFB tracks origin latency rather than the auction timeout.
+    // Provider operations are already running while the origin loads. Collection
+    // retains buffered results, then waits only for the original remaining budget.
     let origin_result = if let Some(pending) = pending_origin {
         services.http_client().wait(pending).await
     } else {
@@ -12011,7 +12013,7 @@ mod tests {
                 context
                     .services
                     .http_client()
-                    .send_async(request)
+                    .send_async(request.with_cache_bypass())
                     .await
                     .change_context(TrustedServerError::Auction {
                         message: "stub bid launch failed".to_string(),
@@ -19776,7 +19778,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 context
                     .services
                     .http_client()
-                    .send_async(request)
+                    .send_async(request.with_cache_bypass())
                     .await
                     .change_context(TrustedServerError::Auction {
                         message: "test provider launch failed".to_string(),
@@ -26225,6 +26227,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         );
     }
 
+    // Manually polled fixture for publisher injection order, not timer scheduling.
+    // Adapter runtime tests cover autonomous deadline wakeups and cancellation.
     struct GatedAuctionHttpClient {
         inner: StubHttpClient,
         released: std::sync::atomic::AtomicBool,
@@ -26247,6 +26251,33 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         ) -> Result<crate::platform::PlatformPendingRequest, Report<crate::platform::PlatformError>>
         {
             self.inner.send_async(request).await
+        }
+
+        async fn select_until(
+            &self,
+            pending: Vec<crate::platform::PlatformPendingRequest>,
+            deadline: web_time::Instant,
+        ) -> Result<
+            Option<crate::platform::PlatformSelectResult>,
+            Report<crate::platform::PlatformError>,
+        > {
+            self.collections.fetch_add(1, Ordering::SeqCst);
+            let ready = futures::future::poll_fn(|_| {
+                // The gate models completion, so probe it before checking expiry.
+                if self.released.load(Ordering::SeqCst) {
+                    std::task::Poll::Ready(true)
+                } else if web_time::Instant::now() >= deadline {
+                    std::task::Poll::Ready(false)
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            if ready {
+                self.inner.select_until(pending, deadline).await
+            } else {
+                Ok(None)
+            }
         }
 
         async fn select(
@@ -26283,13 +26314,16 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             context
                 .services
                 .http_client()
-                .send_async(crate::platform::PlatformHttpRequest::new(
-                    Request::builder()
-                        .uri("https://bidder.example.com/bid")
-                        .body(EdgeBody::empty())
-                        .expect("should build test bid request"),
-                    "seam-test",
-                ))
+                .send_async(
+                    crate::platform::PlatformHttpRequest::new(
+                        Request::builder()
+                            .uri("https://bidder.example.com/bid")
+                            .body(EdgeBody::empty())
+                            .expect("should build test bid request"),
+                        "seam-test",
+                    )
+                    .with_cache_bypass(),
+                )
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: "Failed to dispatch test auction".to_string(),
@@ -28999,7 +29033,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 context
                     .services
                     .http_client()
-                    .send_async(request)
+                    .send_async(request.with_cache_bypass())
                     .await
                     .change_context(TrustedServerError::Auction {
                         message: "test bidder launch failed".to_string(),
