@@ -172,6 +172,19 @@ pull_sync_concurrency = 3
 # distributor_id = "example-distributor"
 # [ec.identity_providers.settings.attributes]
 # nonId = "liveintent.example.com"
+#
+# LiveRamp (kind "liveramp"): no lookup and no endpoint. Reads the RampID
+# envelope from LiveRamp's own first-party `_lr_env` cookie and keeps it for
+# 15 days. Takes exactly one source; use the one LiveRamp gives you. Add a
+# cookie name that Lockr AIM writes the envelope into to `cookie_names`.
+# [[ec.identity_providers]]
+# id = "liveramp"
+# kind = "liveramp"
+# enabled = false
+# sources = ["liveramp.example.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# cookie_names = ["_lr_env"]
 
 
 # =============================================================================
