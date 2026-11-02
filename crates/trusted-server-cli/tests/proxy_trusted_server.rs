@@ -341,6 +341,14 @@ async fn send(
     request: Request<Full<Bytes>>,
 ) -> (StatusCode, HeaderMap, Bytes) {
     tokio::time::timeout(Duration::from_secs(5), async {
+        // hyper accepts a later request on an HTTP/1 connection only after the
+        // connection task has finished the previous exchange and signalled that
+        // it wants another (`SendRequest::ready`). Sending earlier fails with
+        // "connection was not ready" on a reused connection.
+        browser
+            .ready()
+            .await
+            .expect("should keep the browser connection open for the next request");
         let response = browser
             .send_request(request)
             .await
@@ -567,4 +575,50 @@ async fn real_publisher_rewrites_public_port_and_strips_forwarding_credentials()
         value["base"], "https://cdn.example.com/asset.js",
         "should use public HTTPS for protocol-relative signing over plaintext ingress"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_reuses_one_browser_connection_for_back_to_back_requests() {
+    // Guards the shared `send` helper rather than the proxy. Without its
+    // readiness wait, about 1 request in 4,000 lost the race with the
+    // connection task locally, so this count fails on about 99% of runs.
+    const REQUESTS: usize = 20_000;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("should bind the fictional keep-alive server");
+    let addr = listener
+        .local_addr()
+        .expect("should read the server address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("should accept the browser connection");
+        let service = service_fn(|_request: Request<hyper::body::Incoming>| async {
+            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .await;
+    });
+    let stream = TcpStream::connect(addr)
+        .await
+        .expect("should connect to the keep-alive server");
+    let (mut browser, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("should establish one reusable HTTP/1 connection");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    for _ in 0..REQUESTS {
+        let request = Request::builder()
+            .uri("/")
+            .header(header::HOST, PUBLIC_AUTHORITY)
+            .body(Full::new(Bytes::new()))
+            .expect("should build a fictional request");
+        let (status, _, body) = send(&mut browser, request).await;
+        assert_eq!(status, StatusCode::OK, "should reuse the open connection");
+        assert_eq!(body, Bytes::from_static(b"ok"), "should read each response");
+    }
+    server.abort();
 }
