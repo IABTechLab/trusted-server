@@ -6,7 +6,7 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -20,6 +20,7 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
+use crate::ec::identity::IdentityProviderId;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
@@ -467,22 +468,27 @@ pub struct EcPartner {
     /// Allowlist of domains TS may call for this partner's pull sync.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub pull_sync_allowed_domains: Vec<String>,
-    /// Legacy pull-sync refresh interval retained for config compatibility.
+    /// Catches the removed `pull_sync_ttl_sec` key.
     ///
-    /// EC identity entries no longer store per-partner sync timestamps, so
-    /// this value is not used by the current fill-missing-only pull sync
-    /// behavior.
-    #[serde(
-        default = "EcPartner::default_pull_sync_ttl_sec",
-        deserialize_with = "from_value_or_str"
-    )]
-    pub pull_sync_ttl_sec: u64,
-    /// Max pull sync calls per EC hash per partner per hour.
-    #[serde(
-        default = "EcPartner::default_pull_sync_rate_limit",
-        deserialize_with = "from_value_or_str"
-    )]
-    pub pull_sync_rate_limit: u32,
+    /// The key was replaced by `refresh_after_sec` in
+    /// `[ec.identity.providers.<pull-id>]`. It is parsed only so validation
+    /// can name its replacement instead of failing with a generic
+    /// unknown-field message, and it is never serialized.
+    #[serde(default, rename = "pull_sync_ttl_sec", skip_serializing)]
+    pub removed_pull_sync_ttl_sec: Option<serde_json::Value>,
+    /// Catches the removed `pull_sync_rate_limit` key.
+    ///
+    /// The key was replaced by `max_calls_per_minute` in
+    /// `[ec.identity.providers.<pull-id>]`. It is parsed only so validation
+    /// can name its replacement, and it is never serialized.
+    #[serde(default, rename = "pull_sync_rate_limit", skip_serializing)]
+    pub removed_pull_sync_rate_limit: Option<serde_json::Value>,
+    /// The identity provider that owns this partner's source domain.
+    ///
+    /// The owner refreshes the source and wins in the auction (spec 7.2). It
+    /// must name an enabled provider that resolves the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// Outbound bearer token for pull sync requests.
     #[serde(default)]
     pub ts_pull_token: Option<Redacted<String>>,
@@ -567,16 +573,6 @@ impl EcPartner {
     pub const fn default_batch_rate_limit() -> u32 {
         60
     }
-
-    #[must_use]
-    pub const fn default_pull_sync_ttl_sec() -> u64 {
-        86400
-    }
-
-    #[must_use]
-    pub const fn default_pull_sync_rate_limit() -> u32 {
-        10
-    }
 }
 
 /// Edge Cookie (EC) configuration.
@@ -594,9 +590,24 @@ pub struct Ec {
     #[serde(default)]
     pub ec_store: Option<String>,
 
-    /// Maximum number of concurrent pull-sync requests.
-    #[serde(default = "Ec::default_pull_sync_concurrency")]
-    pub pull_sync_concurrency: usize,
+    /// Server-side identity provider policy (`[ec.identity]`).
+    #[serde(default)]
+    pub identity: IdentitySettings,
+
+    /// Strips the `ts-eids` cookie from publisher-origin requests, as well as
+    /// the `ts-eids-s` mirror that is always stripped. Off by default, so an
+    /// origin that reads `ts-eids` keeps receiving it. An operator whose
+    /// origin rejects large `Cookie` headers turns it on.
+    #[serde(default)]
+    pub strip_eids_cookie_from_origin: bool,
+
+    /// Catches the removed `pull_sync_concurrency` key.
+    ///
+    /// The key was replaced by `[ec.identity].max_concurrency`. It is parsed
+    /// only so validation can name its replacement instead of failing with a
+    /// generic unknown-field message, and it is never serialized.
+    #[serde(default, rename = "pull_sync_concurrency", skip_serializing)]
+    pub removed_pull_sync_concurrency: Option<serde_json::Value>,
 
     /// Entries with `cluster_size` at or below this value are treated as
     /// individual users for identity resolution. B2B publishers should
@@ -627,12 +638,6 @@ impl Ec {
         "trusted-server-placeholder-secret",
         "replace-with-random-ec-passphrase",
     ];
-
-    /// Default maximum concurrent pull-sync requests.
-    #[must_use]
-    pub const fn default_pull_sync_concurrency() -> usize {
-        3
-    }
 
     /// Default cluster trust threshold.
     #[must_use]
@@ -676,6 +681,241 @@ impl Ec {
             return Err(ValidationError::new("short_passphrase"));
         }
         Ok(())
+    }
+}
+
+/// Server-side identity provider policy.
+///
+/// Mapped from the `[ec.identity]` TOML section. Unlike the rest of the
+/// settings, this table and its provider tables accept unknown keys, so a
+/// rollback to an earlier release still loads a config written for a later one.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IdentitySettings {
+    /// Maximum providers dispatched at once.
+    #[serde(default = "IdentitySettings::default_max_concurrency")]
+    pub max_concurrency: usize,
+
+    /// Total time a navigation may wait for hold-mode providers.
+    #[serde(default = "IdentitySettings::default_hold_budget_ms")]
+    pub hold_budget_ms: u64,
+
+    /// Seconds before a provider that timed out in hold mode is held again.
+    #[serde(default = "IdentitySettings::default_hold_retry_sec")]
+    pub hold_retry_sec: u64,
+
+    /// Largest provider response body accepted, in bytes.
+    #[serde(default = "IdentitySettings::default_max_response_bytes")]
+    pub max_response_bytes: usize,
+
+    /// Most backend requests one platform execution may start, counting the
+    /// origin, the auction and every provider call. A provider call that
+    /// would pass it is not sent, and is not a failure. Fastly allows 32
+    /// (10 on trial accounts).
+    #[serde(default = "IdentitySettings::default_max_backend_requests")]
+    pub max_backend_requests: usize,
+
+    /// Whether `/auction` and `/_ts/page-bids` return the `ts-eids-s` mirror
+    /// payload the shim writes. Off until a page script that reads the
+    /// mirror is named (spec 15, question 5).
+    #[serde(default)]
+    pub mirror_enabled: bool,
+
+    /// Seconds a same-origin `/_ts/page-bids` call from a real browser waits
+    /// after the row's last writer flush before it may be the writer itself,
+    /// for single-page apps (spec 5.1). 0 turns the SPA writer off.
+    #[serde(default = "IdentitySettings::default_spa_writer_interval_sec")]
+    pub spa_writer_interval_sec: u64,
+
+    /// Per-provider policy, keyed by identity provider ID.
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderSettings>,
+}
+
+impl IdentitySettings {
+    /// Default maximum concurrent providers.
+    #[must_use]
+    pub const fn default_max_concurrency() -> usize {
+        4
+    }
+
+    /// Default backend request budget: Fastly's per-execution limit.
+    #[must_use]
+    pub const fn default_max_backend_requests() -> usize {
+        32
+    }
+
+    /// Default SPA writer interval: five minutes.
+    #[must_use]
+    pub const fn default_spa_writer_interval_sec() -> u64 {
+        300
+    }
+
+    /// Default hold budget in milliseconds.
+    #[must_use]
+    pub const fn default_hold_budget_ms() -> u64 {
+        100
+    }
+
+    /// Default hold retry interval in seconds.
+    #[must_use]
+    pub const fn default_hold_retry_sec() -> u64 {
+        300
+    }
+
+    /// Default provider response cap in bytes.
+    #[must_use]
+    pub const fn default_max_response_bytes() -> usize {
+        65_536
+    }
+
+    /// Returns the policy for `id`, or the defaults when it has no table.
+    #[must_use]
+    pub fn provider(&self, id: &IdentityProviderId) -> ProviderSettings {
+        self.providers.get(id.as_str()).cloned().unwrap_or_default()
+    }
+}
+
+impl Default for IdentitySettings {
+    fn default() -> Self {
+        Self {
+            max_concurrency: Self::default_max_concurrency(),
+            hold_budget_ms: Self::default_hold_budget_ms(),
+            hold_retry_sec: Self::default_hold_retry_sec(),
+            max_response_bytes: Self::default_max_response_bytes(),
+            max_backend_requests: Self::default_max_backend_requests(),
+            mirror_enabled: false,
+            spa_writer_interval_sec: Self::default_spa_writer_interval_sec(),
+            providers: BTreeMap::new(),
+        }
+    }
+}
+
+/// How a provider's lookup interacts with the navigation response.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderMode {
+    /// Wait for the provider, within the hold budget, before responding.
+    Hold,
+    /// Dispatch after the response is sent.
+    #[default]
+    AfterSend,
+}
+
+/// How far a revoke signal from a provider reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevokeScope {
+    /// Revoke only the signalling provider's identifiers.
+    Provider,
+    /// Revoke every identifier of the user.
+    Global,
+}
+
+/// Policy for one identity provider (`[ec.identity.providers.<id>]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProviderSettings {
+    /// Hold or after-send dispatch.
+    #[serde(default)]
+    pub mode: ProviderMode,
+
+    /// Hold-mode timeout; the hold budget when unset.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+
+    /// Timeout for any dispatch after the response is sent.
+    #[serde(default = "ProviderSettings::default_after_send_timeout_ms")]
+    pub after_send_timeout_ms: u64,
+
+    /// Source domains this provider may write; the descriptor's when unset.
+    #[serde(default)]
+    pub sources: Option<Vec<String>>,
+
+    /// Seconds before a stored ID is refreshed.
+    #[serde(default = "ProviderSettings::default_refresh_after_sec")]
+    pub refresh_after_sec: u64,
+
+    /// Provider calls allowed per minute.
+    #[serde(default = "ProviderSettings::default_max_calls_per_minute")]
+    pub max_calls_per_minute: u32,
+
+    /// Calls per minute from one client address, across every visitor
+    /// behind it. `0` turns the ceiling off.
+    #[serde(default = "ProviderSettings::default_max_calls_per_ip_per_minute")]
+    pub max_calls_per_ip_per_minute: u32,
+
+    /// Failures per minute that open the circuit breaker.
+    #[serde(default = "ProviderSettings::default_breaker_failures_per_minute")]
+    pub breaker_failures_per_minute: u32,
+
+    /// Ordering of this provider's ID in the cookie when it must be trimmed.
+    #[serde(default)]
+    pub cookie_priority: i32,
+
+    /// Scope of this provider's revoke signals; `Provider` when unset.
+    #[serde(default)]
+    pub revoke_scope: Option<RevokeScope>,
+}
+
+impl ProviderSettings {
+    /// Default after-send timeout in milliseconds.
+    #[must_use]
+    pub const fn default_after_send_timeout_ms() -> u64 {
+        1000
+    }
+
+    /// Default refresh interval in seconds.
+    #[must_use]
+    pub const fn default_refresh_after_sec() -> u64 {
+        86_400
+    }
+
+    /// Default provider calls per minute.
+    #[must_use]
+    pub const fn default_max_calls_per_minute() -> u32 {
+        1
+    }
+
+    /// Default calls per minute from one client address.
+    #[must_use]
+    pub const fn default_max_calls_per_ip_per_minute() -> u32 {
+        10
+    }
+
+    /// Default breaker failures per minute.
+    #[must_use]
+    pub const fn default_breaker_failures_per_minute() -> u32 {
+        50
+    }
+
+    /// Hold-mode timeout: `timeout_ms`, else the hold budget.
+    ///
+    /// The coordinator caps it at the remaining hold budget.
+    #[must_use]
+    pub fn hold_timeout_ms(&self, identity: &IdentitySettings) -> u64 {
+        self.timeout_ms.unwrap_or(identity.hold_budget_ms)
+    }
+
+    /// The revoke scope, defaulting to [`RevokeScope::Provider`].
+    #[must_use]
+    pub fn revoke_scope(&self) -> RevokeScope {
+        self.revoke_scope.unwrap_or(RevokeScope::Provider)
+    }
+}
+
+impl Default for ProviderSettings {
+    fn default() -> Self {
+        Self {
+            mode: ProviderMode::default(),
+            timeout_ms: None,
+            after_send_timeout_ms: Self::default_after_send_timeout_ms(),
+            sources: None,
+            refresh_after_sec: Self::default_refresh_after_sec(),
+            max_calls_per_minute: Self::default_max_calls_per_minute(),
+            max_calls_per_ip_per_minute: Self::default_max_calls_per_ip_per_minute(),
+            breaker_failures_per_minute: Self::default_breaker_failures_per_minute(),
+            cookie_priority: 0,
+            revoke_scope: None,
+        }
     }
 }
 
@@ -2049,9 +2289,19 @@ impl Proxy {
 /// Direct Tinybird Events API telemetry configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TinybirdSettings {
-    /// Master enablement for auction telemetry ingestion.
+    /// Master enablement for Tinybird telemetry. Required by both auction and
+    /// access-log emission; each is independently toggled below.
     #[serde(default)]
     pub enabled: bool,
+    /// Emit auction telemetry when `enabled`. Defaults to `true` so existing
+    /// configs preserve their current auction-emission behavior after
+    /// upgrading; set `false` to silence auction events while keeping
+    /// `enabled` on for other Tinybird telemetry (e.g. `access_enabled`).
+    /// The default `true` is omitted from serialized config; `false` is an
+    /// explicit opt-out for binaries that support this field. Older binaries
+    /// may ignore that opt-out and resume auction telemetry on rollback.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub auction_enabled: bool,
     /// Regional Tinybird API host, without scheme or path.
     #[serde(default)]
     pub api_host: String,
@@ -2064,19 +2314,26 @@ pub struct TinybirdSettings {
     /// Secret reference containing the auction datasource APPEND token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auction_token_secret: Option<Redacted<String>>,
-    /// Reserved for future access-log telemetry.
+    /// Emit access-log telemetry when `enabled`, independent of
+    /// `auction_enabled`.
     ///
-    /// `true` is rejected until an access-log emitter is wired, so operators
-    /// cannot enable a setting that silently emits nothing.
+    /// `true` requires `enabled`, non-empty `api_host`/`access_dataset`, a
+    /// resolved `access_token_secret`, `max_body_bytes >= 1024`, and
+    /// `access_sample_rate > 0.0`. This prevents an armed-but-silent sampler
+    /// that enables the flag but emits nothing.
     #[serde(default)]
     pub access_enabled: bool,
-    /// Future access-log Events API datasource name.
+    /// Access-log Events API datasource name. Required non-empty when
+    /// `access_enabled`.
     #[serde(default = "default_tinybird_access_dataset")]
     pub access_dataset: String,
-    /// Deprecated placeholder for the unwired access-log APPEND token.
-    #[serde(default, skip_serializing)]
+    /// Secret reference containing the access-log datasource APPEND token.
+    /// Required when `access_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_token_secret: Option<Redacted<String>>,
-    /// Future fraction of requests to emit for optional access telemetry.
+    /// Fraction of requests to emit for access telemetry. Must be greater
+    /// than `0.0` when `access_enabled`, so an operator cannot enable access
+    /// telemetry while sampling it away entirely.
     #[serde(default)]
     pub access_sample_rate: f64,
     /// Defensive maximum NDJSON body size for one Events API request.
@@ -2089,7 +2346,7 @@ fn default_tinybird_auction_dataset() -> String {
 }
 
 fn default_tinybird_access_dataset() -> String {
-    "access_logs_raw".to_owned()
+    "access_logs_v2".to_owned()
 }
 
 fn default_tinybird_max_body_bytes() -> usize {
@@ -2100,6 +2357,7 @@ impl Default for TinybirdSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            auction_enabled: default_true(),
             api_host: String::new(),
             secret_store: None,
             auction_dataset: default_tinybird_auction_dataset(),
@@ -2122,14 +2380,17 @@ impl TinybirdSettings {
             );
         }
         self.auction_dataset = self.auction_dataset.trim().to_owned();
-        self.auction_token_secret = self.auction_token_secret.take().and_then(|value| {
-            let value = value.expose().trim().to_owned();
-            (!value.is_empty()).then(|| Redacted::new(value))
-        });
+        self.auction_token_secret = normalize_secret(self.auction_token_secret.take());
         self.access_dataset = self.access_dataset.trim().to_owned();
-        self.access_token_secret = None;
+        self.access_token_secret = normalize_secret(self.access_token_secret.take());
     }
 
+    /// Validate this settings block, including the access-telemetry matrix:
+    /// `access_enabled` requires `enabled`, a non-empty `api_host` and
+    /// `access_dataset`, a resolved `access_token_secret`, a `max_body_bytes`
+    /// above the defensive floor enforced below, and an `access_sample_rate`
+    /// greater than `0.0`. Auction emission is independently gated by
+    /// `auction_enabled` and validated the same way.
     fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.normalize();
         if !(0.0..=1.0).contains(&self.access_sample_rate) {
@@ -2142,25 +2403,57 @@ impl TinybirdSettings {
                 message: "tinybird.max_body_bytes must be at least 1024".to_owned(),
             }));
         }
-        if self.access_enabled {
+        if self.access_enabled && !self.enabled {
             return Err(Report::new(TrustedServerError::Configuration {
-                message: "tinybird.access_enabled is reserved for future access-log telemetry; no emitter is currently wired".to_owned(),
+                message: "tinybird.access_enabled requires tinybird.enabled".to_owned(),
             }));
         }
         if !self.enabled {
             return Ok(());
         }
         validate_tinybird_api_host(&self.api_host)?;
-        validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
-        let token = self.auction_token_secret.as_ref().ok_or_else(|| {
-            Report::new(TrustedServerError::Configuration {
-                message:
-                    "tinybird.auction_token_secret is required when Tinybird telemetry is enabled"
-                        .to_owned(),
-            })
-        })?;
-        validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")
+        if self.auction_enabled {
+            validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
+            let token = self.auction_token_secret.as_ref().ok_or_else(|| {
+                Report::new(TrustedServerError::Configuration {
+                    message:
+                        "tinybird.auction_token_secret is required when tinybird.auction_enabled is true"
+                            .to_owned(),
+                })
+            })?;
+            validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")?;
+        }
+        if self.access_enabled {
+            validate_tinybird_dataset(&self.access_dataset, "tinybird.access_dataset")?;
+            if self.access_dataset == "access_logs_raw" {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "tinybird.access_dataset must not be access_logs_raw when access telemetry is enabled; use access_logs_v2 or a datasource with the v2 schema".to_owned(),
+                }));
+            }
+            let token = self.access_token_secret.as_ref().ok_or_else(|| {
+                Report::new(TrustedServerError::Configuration {
+                    message:
+                        "tinybird.access_token_secret is required when tinybird.access_enabled is true"
+                            .to_owned(),
+                })
+            })?;
+            validate_tinybird_secret(token.expose(), "tinybird.access_token_secret")?;
+            if self.access_sample_rate <= 0.0 {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "tinybird.access_sample_rate must be > 0 when tinybird.access_enabled is true".to_owned(),
+                }));
+            }
+        }
+        Ok(())
     }
+}
+
+/// Trim a resolved secret, dropping it entirely when nothing is left.
+fn normalize_secret(value: Option<Redacted<String>>) -> Option<Redacted<String>> {
+    value.and_then(|value| {
+        let value = value.expose().trim().to_owned();
+        (!value.is_empty()).then(|| Redacted::new(value))
+    })
 }
 
 fn validate_tinybird_api_host(host: &str) -> Result<(), Report<TrustedServerError>> {
@@ -2183,6 +2476,17 @@ fn validate_tinybird_api_host(host: &str) -> Result<(), Report<TrustedServerErro
     })
 }
 
+// Takes the resolved secret VALUE, so the error message names only the
+// setting: formatting the value itself would disclose the credential.
+fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!("{setting} must be non-empty after secret resolution"),
+        }));
+    }
+    Ok(())
+}
+
 fn validate_tinybird_dataset(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
     if value.is_empty()
         || value.len() > 128
@@ -2192,15 +2496,6 @@ fn validate_tinybird_dataset(value: &str, setting: &str) -> Result<(), Report<Tr
     {
         return Err(Report::new(TrustedServerError::Configuration {
             message: format!("{setting} must be a non-empty datasource identifier"),
-        }));
-    }
-    Ok(())
-}
-
-fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
-    if value.is_empty() || value.chars().any(char::is_control) {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("{setting} must be non-empty after secret resolution"),
         }));
     }
     Ok(())
@@ -2805,6 +3100,14 @@ pub(crate) const AUCTION_DEBUG_UPSTREAM_METADATA_KEYS: &[&str] = &[
     "upstream_message_truncated",
 ];
 
+/// `skip_serializing_if` helper: true is the serde default for the fields
+/// that use it, so serializing it would only widen the pushed config's
+/// rollback surface.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2950,6 +3253,81 @@ pub enum AuctionDebugCommentFormat {
     #[default]
     Compact,
     Pretty,
+}
+
+/// Request-observability toggles exposed to operators.
+///
+/// The default table must stay omitted from serialized config blobs. Older
+/// binaries deny unknown fields on [`Settings`], so a blob carrying the new
+/// `[observability]` table would fail to load and break rollback. See
+/// [`Settings::observability`].
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilitySettings {
+    /// Emit the `Server-Timing` response header with per-phase request
+    /// timing. Defaults to `false` (off).
+    #[serde(default)]
+    pub server_timing_enabled: bool,
+    /// Section names whose publisher paths keep a named route template in
+    /// access telemetry (`/{section}/*`); everything else collapses to
+    /// `/other/*`. Matching is ASCII case-insensitive on the first path
+    /// segment, and a match requires at least one further segment. Defaults
+    /// to empty, which collapses every publisher path. Names are trimmed and
+    /// must be non-empty, contain no `/` or control characters, fit within 128
+    /// UTF-8 bytes, and number at most 32.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_sections: Vec<String>,
+}
+
+impl ObservabilitySettings {
+    const MAX_ROUTE_SECTIONS: usize = 32;
+    const MAX_ROUTE_SECTION_BYTES: usize = 128;
+
+    fn normalize(&mut self) {
+        self.route_sections = self
+            .route_sections
+            .iter()
+            .map(|section| {
+                section
+                    .trim_matches(|character: char| {
+                        character.is_whitespace() && !character.is_control()
+                    })
+                    .to_owned()
+            })
+            .collect();
+    }
+
+    fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        if self.route_sections.len() > Self::MAX_ROUTE_SECTIONS {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "observability.route_sections must contain at most {} entries",
+                    Self::MAX_ROUTE_SECTIONS
+                ),
+            }));
+        }
+        for section in &self.route_sections {
+            if section.is_empty()
+                || section.len() > Self::MAX_ROUTE_SECTION_BYTES
+                || section.contains('/')
+                || section.chars().any(char::is_control)
+            {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "observability.route_sections entries must be non-empty, contain no slash or control characters, and fit within {} UTF-8 bytes",
+                        Self::MAX_ROUTE_SECTION_BYTES
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// True when every field is at its default, i.e. observability is fully
+    /// disabled and the table can be omitted from serialized output.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Tester-cookie endpoint configuration.
@@ -3274,6 +3652,12 @@ pub struct Settings {
     pub tinybird: TinybirdSettings,
     #[serde(default)]
     pub debug: DebugConfig,
+    /// Request-observability toggles. The default table is omitted from
+    /// serialized config blobs so a config round-tripped without change
+    /// still parses under a prior binary's schema; see
+    /// [`ObservabilitySettings`].
+    #[serde(default, skip_serializing_if = "ObservabilitySettings::is_default")]
+    pub observability: ObservabilitySettings,
 }
 
 impl Settings {
@@ -3364,6 +3748,7 @@ impl Settings {
         self.rewrite.normalize();
         self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
+        self.observability.normalize();
         self.tinybird.normalize();
         self.integrations
             .remove_legacy_static_secret_store_selectors();
@@ -3406,6 +3791,7 @@ impl Settings {
         self.cache.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
         self.tinybird.prepare_runtime()?;
+        self.observability.prepare_runtime()?;
         self.debug
             .auction_html_comment_options
             .validate_metadata_keys()?;
@@ -3636,6 +4022,7 @@ impl Settings {
         "/_ts/admin/keys/deactivate",
         "/_ts/admin/ec",
         "/_ts/admin/ec/{id}",
+        "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
         "/_ts/admin/eids",
         "/_ts/admin/cache/purge",
     ];
@@ -3663,9 +4050,28 @@ impl Settings {
         ),
     ];
 
+    /// Probes for the dynamic provider opt-out route: two concrete IDs and
+    /// providers, so a handler anchored to one shape does not count as
+    /// covering the route.
+    const ADMIN_OPT_OUT_AUTH_PROBES: [&str; 2] = [
+        concat!(
+            "/_ts/admin/ec/",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ".Ab12Z9",
+            "/providers/pull-ssp-example-com/opt-out",
+        ),
+        concat!(
+            "/_ts/admin/ec/",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ".Zz09aB",
+            "/providers/other_provider-2/opt-out",
+        ),
+    ];
+
     fn admin_auth_probes(path: &'static str) -> [&'static str; 2] {
         match path {
             "/_ts/admin/ec/{id}" => Self::ADMIN_EC_ID_AUTH_PROBES,
+            "/_ts/admin/ec/{id}/providers/{provider}/opt-out" => Self::ADMIN_OPT_OUT_AUTH_PROBES,
             path => [path, path],
         }
     }
@@ -4201,6 +4607,7 @@ where
 mod tests {
     use super::*;
     use crate::auction::build_orchestrator;
+    use crate::config::validate_identity_settings;
     use crate::integrations::{
         IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
         prebid::PrebidIntegrationConfig,
@@ -4562,6 +4969,14 @@ mod tests {
         serde_json::from_value::<BaseRevisionSettings>(value)
             .expect("should preserve backward compatibility without forwarder configuration");
     }
+    /// Parses `extra` appended to the shared test fixture TOML, mirroring the
+    /// `format!("{}\n...", crate_test_settings_str())` pattern used throughout
+    /// this module's other tests.
+    fn settings_from_toml_with(extra: &str) -> Result<Settings, Report<TrustedServerError>> {
+        let toml = format!("{}\n{extra}", crate_test_settings_str());
+        Settings::from_toml(&toml)
+    }
+
     fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
         format!(
             "{}\n[trusted_client_ip]\nip_header = \"{ip_header}\"\nauth_header = \"{auth_header}\"\nshared_secret = \"{shared_secret}\"\n",
@@ -4731,8 +5146,9 @@ mod tests {
             pull_sync_enabled: false,
             pull_sync_url: None,
             pull_sync_allowed_domains: Vec::new(),
-            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
-            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            removed_pull_sync_ttl_sec: None,
+            removed_pull_sync_rate_limit: None,
+            owner: None,
             ts_pull_token: Some(Redacted::new(CANARY_EC_PARTNER_TS_PULL_TOKEN.to_string())),
         }];
 
@@ -4761,6 +5177,7 @@ mod tests {
             auction_token_secret: Some(Redacted::new(CANARY_TINYBIRD_AUCTION_TOKEN.to_string())),
             access_token_secret: Some(Redacted::new(CANARY_TINYBIRD_ACCESS_TOKEN.to_string())),
             enabled: false,
+            auction_enabled: true,
             api_host: String::new(),
             secret_store: None,
             auction_dataset: String::new(),
@@ -5482,6 +5899,17 @@ mod tests {
     }
 
     #[test]
+    fn tinybird_deployment_validation_requires_default_on_auction_secret() {
+        let error =
+            settings_from_toml_with("[tinybird]\nenabled = true\napi_host = \"api.example.com\"\n")
+                .expect_err("should reject a missing default-on auction token");
+        assert!(
+            error.to_string().contains("tinybird.auction_token_secret"),
+            "should match runtime blob validation: {error:?}"
+        );
+    }
+
+    #[test]
     fn tinybird_accepts_region_host_without_scheme() {
         let toml = format!(
             "{}\n[tinybird]\nenabled = true\napi_host = \"api.us-east.aws.tinybird.co\"\nauction_token_secret = \"test-auction-token\"\n",
@@ -5494,17 +5922,224 @@ mod tests {
     }
 
     #[test]
-    fn tinybird_access_enabled_is_rejected_until_emitter_is_wired() {
-        let toml = format!(
-            "{}\n[tinybird]\naccess_enabled = true\n",
-            crate_test_settings_str()
+    fn tinybird_access_enabled_with_full_config_is_accepted() {
+        let settings = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_token_secret = \"test-auction-token\"\naccess_enabled = true\naccess_token_secret = \"test-access-token\"\naccess_sample_rate = 1.0\n",
+        )
+        .expect("should accept a fully-specified access telemetry config");
+        assert!(
+            settings.tinybird.access_enabled,
+            "should enable access emission"
         );
+    }
 
-        let err = Settings::from_toml(&toml)
-            .expect_err("should reject access telemetry before emitter exists");
+    #[test]
+    fn access_enabled_rejects_legacy_dataset_after_normalization() {
+        for dataset in ["access_logs_raw", " access_logs_raw "] {
+            let config = format!(
+                "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_enabled = false\naccess_enabled = true\naccess_dataset = \"{dataset}\"\naccess_token_secret = \"test-access-token\"\naccess_sample_rate = 1.0\n"
+            );
+            let error = settings_from_toml_with(&config)
+                .expect_err("should reject v2 access rows targeting the legacy datasource");
+            assert!(
+                error.to_string().contains("tinybird.access_dataset"),
+                "should identify the invalid access dataset: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_access_accepts_legacy_dataset() {
+        let settings = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_token_secret = \"test-auction-token\"\naccess_dataset = \"access_logs_raw\"\n",
+        )
+        .expect("should retain legacy dataset settings while access emission is disabled");
+        assert_eq!(settings.tinybird.access_dataset, "access_logs_raw");
+        assert!(!settings.tinybird.access_enabled);
+    }
+
+    #[test]
+    fn access_enabled_accepts_custom_versioned_dataset() {
+        let settings = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_enabled = false\naccess_enabled = true\naccess_dataset = \"custom_access_v2\"\naccess_token_secret = \"test-access-token\"\naccess_sample_rate = 1.0\n",
+        )
+        .expect("should allow custom access datasource names");
+        assert_eq!(settings.tinybird.access_dataset, "custom_access_v2");
+    }
+
+    #[test]
+    fn access_enabled_requires_tinybird_enabled() {
+        // access_enabled = true with tinybird.enabled omitted (defaults
+        // false) must be rejected: access telemetry cannot run without the
+        // master toggle on.
+        let err = settings_from_toml_with(
+            "[tinybird]\napi_host = \"api.example.com\"\naccess_enabled = true\naccess_sample_rate = 1.0\n",
+        )
+        .expect_err("should reject access telemetry without tinybird.enabled");
         assert!(
             format!("{err:?}").contains("tinybird.access_enabled"),
-            "should report unsupported tinybird.access_enabled setting: {err:?}"
+            "should name the field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn access_enabled_requires_positive_sample_rate() {
+        // access_enabled = true with access_sample_rate = 0 is armed-but-silent: an error.
+        let err = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_token_secret = \"test-auction-token\"\naccess_enabled = true\naccess_token_secret = \"test-access-token\"\naccess_sample_rate = 0.0\n",
+        )
+        .expect_err("should reject armed-but-silent access telemetry");
+        assert!(
+            format!("{err:?}").contains("access_sample_rate"),
+            "should name the field"
+        );
+    }
+
+    #[test]
+    fn access_and_auction_emission_are_independent() {
+        let settings = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_enabled = false\naccess_enabled = true\naccess_token_secret = \"test-access-token\"\naccess_sample_rate = 1.0\n",
+        )
+        .expect("should accept access without auction");
+        assert!(
+            !settings.tinybird.auction_enabled,
+            "should disable auction emission"
+        );
+        assert!(
+            settings.tinybird.access_enabled,
+            "should enable access emission"
+        );
+    }
+
+    #[test]
+    fn access_dataset_defaults_to_versioned_schema() {
+        assert_eq!(
+            TinybirdSettings::default().access_dataset,
+            "access_logs_v2",
+            "should target the versioned access schema rather than the reserved legacy datasource"
+        );
+        let settings = settings_from_toml_with("[tinybird]\nenabled = false\n")
+            .expect("should parse settings without an explicit access dataset");
+        assert_eq!(
+            settings.tinybird.access_dataset, "access_logs_v2",
+            "should apply the same versioned default during deserialization"
+        );
+    }
+
+    #[test]
+    fn auction_enabled_defaults_true_for_existing_configs() {
+        let settings =
+            settings_from_toml_with(
+                "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_token_secret = \"test-auction-token\"\n",
+            )
+                .expect("should parse a pre-decoupling config");
+        assert!(
+            settings.tinybird.auction_enabled,
+            "should preserve current behavior"
+        );
+    }
+
+    #[test]
+    fn observability_defaults_off_and_serializes_away() {
+        let settings = create_test_settings();
+        assert!(
+            !settings.observability.server_timing_enabled,
+            "should default off"
+        );
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            !toml.contains("[observability]"),
+            "should omit the default table so a prior binary can parse the config"
+        );
+    }
+
+    #[test]
+    fn auction_enabled_serializes_only_when_disabled() {
+        let mut settings = create_test_settings();
+        assert!(settings.tinybird.auction_enabled, "should default on");
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            !toml.contains("auction_enabled"),
+            "should omit the default-true key: a rollback must not silently \
+             re-enable auction telemetry an operator disabled"
+        );
+
+        settings.tinybird.auction_enabled = false;
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            toml.contains("auction_enabled = false"),
+            "should serialize the operator's explicit disable"
+        );
+    }
+
+    #[test]
+    fn route_sections_normalize_and_enforce_finite_limits() {
+        let mut settings = create_test_settings();
+        settings.observability.route_sections = vec!["  news  ".to_owned()];
+        settings
+            .normalize_deserialized()
+            .expect("should normalize a valid route section");
+        settings
+            .prepare_runtime()
+            .expect("should accept and normalize a valid route section");
+        assert_eq!(settings.observability.route_sections, ["news"]);
+
+        for invalid in ["", "  ", "news/archive", "news\narchive", "news\n"] {
+            let mut settings = create_test_settings();
+            settings.observability.route_sections = vec![invalid.to_owned()];
+            settings
+                .normalize_deserialized()
+                .expect("should normalize settings before validating route sections");
+            let error = settings
+                .prepare_runtime()
+                .expect_err("should reject an invalid route section");
+            assert!(error.to_string().contains("observability.route_sections"));
+        }
+
+        let mut boundary = create_test_settings();
+        boundary.observability.route_sections = vec!["x".repeat(128)];
+        settings_normalize_and_prepare(&mut boundary);
+        boundary.observability.route_sections = vec!["x".repeat(129)];
+        assert!(boundary.prepare_runtime().is_err(), "129 bytes must fail");
+
+        let mut boundary = create_test_settings();
+        boundary.observability.route_sections = (0..32).map(|index| format!("s{index}")).collect();
+        settings_normalize_and_prepare(&mut boundary);
+        boundary
+            .observability
+            .route_sections
+            .push("extra".to_owned());
+        assert!(boundary.prepare_runtime().is_err(), "33 entries must fail");
+    }
+
+    fn settings_normalize_and_prepare(settings: &mut Settings) {
+        settings
+            .normalize_deserialized()
+            .expect("should normalize route-section limits at the boundary");
+        settings
+            .prepare_runtime()
+            .expect("should accept route-section limits at the boundary");
+    }
+
+    #[test]
+    fn route_sections_serialize_only_when_configured() {
+        let mut settings = create_test_settings();
+        assert!(
+            settings.observability.route_sections.is_empty(),
+            "should default to the collapse-everything allowlist"
+        );
+        settings.observability.server_timing_enabled = true;
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            !toml.contains("route_sections"),
+            "should omit the empty allowlist so a prior binary can parse the config"
+        );
+
+        settings.observability.route_sections = vec!["news".to_owned()];
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            toml.contains("route_sections"),
+            "should serialize a configured allowlist"
         );
     }
 
@@ -6551,8 +7186,9 @@ source_domain = "partner.example.com"
             pull_sync_enabled: true,
             pull_sync_url: Some("https://partner.example.com/sync".to_owned()),
             pull_sync_allowed_domains: vec!["partner.example.com".to_owned()],
-            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
-            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            removed_pull_sync_ttl_sec: None,
+            removed_pull_sync_rate_limit: None,
+            owner: None,
             ts_pull_token: Some(Redacted::new(ts_pull_token.to_owned())),
         }
     }
@@ -8991,10 +9627,41 @@ source_domain = "partner.example.com"
                 "/_ts/admin/keys/deactivate",
                 "/_ts/admin/ec",
                 "/_ts/admin/ec/{id}",
+                "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
                 "/_ts/admin/eids",
                 "/_ts/admin/cache/purge",
             ],
             "should report every admin endpoint as uncovered"
+        );
+    }
+
+    #[test]
+    fn admin_opt_out_route_is_in_admin_endpoints() {
+        assert!(
+            Settings::ADMIN_ENDPOINTS.contains(&"/_ts/admin/ec/{id}/providers/{provider}/opt-out"),
+            "should list the provider opt-out clear route"
+        );
+        let narrow = settings_str_without_admin_handler()
+            + r#"
+            [[handlers]]
+            path = "^/_ts/admin/ec/[^/]+$"
+            username = "admin"
+            password = "secret"
+            "#;
+        let settings: Settings = toml::from_str(&narrow).expect("should deserialize TOML");
+        let uncovered = settings
+            .uncovered_admin_endpoints()
+            .expect("should check admin coverage");
+        assert!(
+            uncovered.contains(&"/_ts/admin/ec/{id}/providers/{provider}/opt-out"),
+            "should require auth coverage of the opt-out route"
+        );
+        assert!(
+            create_test_settings()
+                .uncovered_admin_endpoints()
+                .expect("should check admin coverage")
+                .is_empty(),
+            "control: the admin prefix handler should cover the opt-out route"
         );
     }
 
@@ -9031,6 +9698,7 @@ source_domain = "partner.example.com"
                 "/_ts/admin/keys/deactivate",
                 "/_ts/admin/ec",
                 "/_ts/admin/ec/{id}",
+                "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
                 "/_ts/admin/eids",
                 "/_ts/admin/cache/purge",
             ],
@@ -9603,5 +10271,161 @@ formats = [{{ width = 300, height = 250 }}]
                  Settings::ADMIN_ENDPOINTS — add it to ensure auth coverage"
             );
         }
+    }
+
+    #[test]
+    fn identity_settings_defaults_without_any_table() {
+        let settings: IdentitySettings = toml::from_str("").expect("should parse an empty table");
+        assert_eq!(
+            settings.max_concurrency, 4,
+            "should default the concurrency to 4"
+        );
+        assert_eq!(
+            settings.hold_budget_ms, 100,
+            "should default the hold budget to 100 ms"
+        );
+        assert_eq!(
+            settings.hold_retry_sec, 300,
+            "should default the hold retry to 300 s"
+        );
+        assert_eq!(
+            settings.max_response_bytes, 65_536,
+            "should default the response cap to 64 KiB"
+        );
+        let provider =
+            settings.provider(&"anything".parse().expect("should parse the provider id"));
+        assert_eq!(
+            provider.mode,
+            ProviderMode::AfterSend,
+            "should default to after-send mode"
+        );
+        assert_eq!(
+            provider.after_send_timeout_ms, 1000,
+            "should default the after-send timeout to 1 s"
+        );
+        assert_eq!(
+            provider.hold_timeout_ms(&settings),
+            100,
+            "should default the hold timeout to the budget"
+        );
+        assert_eq!(
+            (
+                provider.refresh_after_sec,
+                provider.max_calls_per_minute,
+                provider.breaker_failures_per_minute,
+                provider.cookie_priority
+            ),
+            (86_400, 1, 50, 0),
+            "should use the spec 10.1 provider defaults"
+        );
+        assert_eq!(
+            provider.revoke_scope(),
+            RevokeScope::Provider,
+            "should scope revokes to the provider by default"
+        );
+        validate_identity_settings(&settings).expect("should accept the defaults");
+    }
+
+    #[test]
+    fn identity_settings_default_matches_an_empty_table() {
+        let parsed: IdentitySettings = toml::from_str("").expect("should parse an empty table");
+        assert_eq!(
+            serde_json::to_value(IdentitySettings::default())
+                .expect("should serialize the default"),
+            serde_json::to_value(parsed).expect("should serialize the parsed value"),
+            "should give Default the serde defaults, not zeros"
+        );
+        let provider: ProviderSettings =
+            toml::from_str("").expect("should parse an empty provider table");
+        assert_eq!(
+            serde_json::to_value(ProviderSettings::default())
+                .expect("should serialize the default"),
+            serde_json::to_value(provider).expect("should serialize the parsed value"),
+            "should give the provider Default the serde defaults"
+        );
+    }
+
+    #[test]
+    fn identity_settings_timeouts_and_bounds_are_enforced() {
+        let settings: IdentitySettings = toml::from_str(
+            "hold_budget_ms = 120\n[providers.id5]\nmode = \"hold\"\nafter_send_timeout_ms = 2500\n",
+        )
+        .expect("should parse a hold-mode table");
+        let provider = settings.provider(&"id5".parse().expect("should parse the provider id"));
+        assert_eq!(
+            provider.hold_timeout_ms(&settings),
+            120,
+            "should use the budget as the hold timeout"
+        );
+        assert_eq!(
+            provider.after_send_timeout_ms, 2500,
+            "should read the after-send timeout"
+        );
+        validate_identity_settings(&settings).expect("should accept a 2.5 s after-send timeout");
+
+        for (name, toml_text) in [
+            ("budget over 1000", "hold_budget_ms = 1001"),
+            ("zero concurrency", "max_concurrency = 0"),
+            ("zero refresh", "[providers.p]\nrefresh_after_sec = 0"),
+            (
+                "zero after-send timeout",
+                "[providers.p]\nafter_send_timeout_ms = 0",
+            ),
+            (
+                "after-send timeout over 10 s",
+                "[providers.p]\nafter_send_timeout_ms = 10001",
+            ),
+            (
+                "hold timeout over budget",
+                "[providers.p]\nmode = \"hold\"\ntimeout_ms = 101",
+            ),
+        ] {
+            let settings: IdentitySettings =
+                toml::from_str(toml_text).expect("should parse before validation");
+            assert!(
+                validate_identity_settings(&settings).is_err(),
+                "should reject {name}"
+            );
+        }
+        let edge: IdentitySettings = toml::from_str("[providers.p]\nafter_send_timeout_ms = 10000")
+            .expect("should parse the upper bound");
+        validate_identity_settings(&edge).expect("control: should accept exactly 10 s");
+        toml::from_str::<IdentitySettings>("[providers.p]\nmode = \"sometimes\"")
+            .expect_err("should reject an unknown mode");
+        toml::from_str::<IdentitySettings>("[providers.p]\nrevoke_scope = \"everyone\"")
+            .expect_err("should reject an unknown revoke scope");
+    }
+
+    #[test]
+    fn identity_settings_revoke_scope_parses_and_keeps_its_default_when_unset() {
+        let settings: IdentitySettings =
+            toml::from_str("[providers.lockr]\nrevoke_scope = \"global\"\n")
+                .expect("should parse the revoke scope");
+        let lockr = settings.provider(&"lockr".parse().expect("should parse the provider id"));
+        assert_eq!(
+            lockr.revoke_scope(),
+            RevokeScope::Global,
+            "should read a global revoke scope"
+        );
+        let other = settings.provider(&"other".parse().expect("should parse the provider id"));
+        assert_eq!(
+            other.revoke_scope(),
+            RevokeScope::Provider,
+            "control: another provider should keep the provider scope"
+        );
+        toml::from_str::<IdentitySettings>("[providers.lockr]\ncapture_enabled = true\n")
+            .expect("should still load a key this build does not know");
+    }
+
+    #[test]
+    fn identity_settings_ec_without_identity_table_parses() {
+        let settings = Settings::from_toml(&crate::test_support::tests::crate_test_settings_str())
+            .expect("should parse settings without an identity table");
+        assert_eq!(
+            serde_json::to_value(&settings.ec.identity).expect("should serialize the parsed table"),
+            serde_json::to_value(IdentitySettings::default())
+                .expect("should serialize the default"),
+            "should give an Ec without [ec.identity] the defaults"
+        );
     }
 }

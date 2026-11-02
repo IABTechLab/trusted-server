@@ -82,6 +82,15 @@ api_token = "partner_api_token"
 bidstream_enabled = true
 ```
 
+Pull partners (`pull_sync_enabled = true`) run from a visitor's second page
+load, because they run after send on a returning visitor's page navigation. A
+partner that returns an error backs off instead of being called on every
+request, and its pace comes from its `[ec.identity.providers.<pull-id>]`
+table, for example `pull-ssp-example-com` for `ssp.example.com`: set
+`refresh_after_sec` and `max_calls_per_minute` there. The old
+`pull_sync_ttl_sec` and `pull_sync_rate_limit` keys are rejected; see the
+[Configuration Reference](/guide/configuration#identity-providers-ec-identity).
+
 Provision the bearer token value under `partner_api_token`, then deploy or
 restart after changing partner configuration. The token is required for this
 demo because it exercises the inbound partner APIs.
@@ -188,6 +197,13 @@ Expected decoded payload contains:
 
 - `source = ssp.example.com`
 - `uids[0].id = <partner-uid>`
+
+When the request also carries browser EIDs, the decoded header lists them
+first, exactly as the `trustedServer` adapter sent them (including `inserter`,
+`matcher` and `mm`), followed by KV-only partner sources. The browser copies
+the same EIDs, without EID-level `ext`, into the `ts-eids` cookie, which
+navigations and `GET /_ts/page-bids` ingest. `/auction` ingests its own body
+EIDs instead of the cookie.
 
 ## 8) Fastly KV Operational Checks
 

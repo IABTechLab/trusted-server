@@ -3,17 +3,19 @@
 //! Parses the `ts-eids` cookie written by the TSJS Prebid integration and
 //! syncs matched partner UIDs to the KV identity graph.
 //!
-//! The current cookie format stores a base64-encoded JSON array of full
-//! OpenRTB-style `Eid` objects (`{source, uids:[...]}`). For rollout
-//! compatibility we also accept the earlier flattened payload shape
-//! (`{source, id, atype}` per entry).
+//! The current cookie holds a base64-encoded JSON array of OpenRTB-style EID
+//! objects, validated entry by entry with the same parser as the `/auction`
+//! body (`ec::client_eids`). The earlier flattened payload shape
+//! (`{source, id, atype}` per entry) is still accepted.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
 
 use crate::openrtb::{Eid, Uid};
 
+use super::client_eids::parse_client_eids;
 use super::kv::PartnerIdUpdate;
 use super::kv_types::MAX_UID_LENGTH;
 use super::registry::PartnerRegistry;
@@ -29,26 +31,9 @@ struct LegacyCookieEid {
     atype: i32,
 }
 
-/// OpenRTB-style `ts-eids` cookie entry.
-#[derive(Debug, Deserialize)]
-struct StructuredCookieEid {
-    source: String,
-    #[serde(default)]
-    uids: Vec<StructuredCookieUid>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StructuredCookieUid {
-    id: String,
-    #[serde(default)]
-    atype: Option<i32>,
-    #[serde(default)]
-    ext: Option<JsonValue>,
-}
-
 enum DecodedCookieEids {
     Legacy(Vec<LegacyCookieEid>),
-    Structured(Vec<StructuredCookieEid>),
+    Structured(Box<RawValue>),
 }
 
 pub(crate) struct DiagnosticEidSource {
@@ -91,8 +76,11 @@ fn decode_prebid_eids_cookie(cookie_value: &str) -> Result<DecodedCookieEids, St
         return Ok(DecodedCookieEids::Legacy(eids));
     }
 
-    let structured = serde_json::from_slice::<Vec<StructuredCookieEid>>(&bytes)
+    let structured = serde_json::from_slice::<Box<RawValue>>(&bytes)
         .map_err(|e| format!("JSON parse failed: {e}"))?;
+    if !structured.get().trim_start().starts_with('[') {
+        return Err("JSON parse failed: ts-eids payload is not an array".to_owned());
+    }
     Ok(DecodedCookieEids::Structured(structured))
 }
 
@@ -107,39 +95,67 @@ impl DecodedCookieEids {
                     uids: vec![entry.id.clone()],
                 })
                 .collect(),
-            Self::Structured(entries) => entries
-                .iter()
-                .filter(|entry| !entry.source.is_empty())
-                .map(|entry| DiagnosticEidSource {
-                    source: entry.source.clone(),
-                    uids: entry.uids.iter().map(|uid| uid.id.clone()).collect(),
-                })
-                .collect(),
+            Self::Structured(raw) => raw_diagnostic_sources(raw),
         }
     }
 
     fn into_openrtb(self) -> Vec<Eid> {
         match self {
             Self::Legacy(entries) => legacy_cookie_eids_to_openrtb(entries),
-            Self::Structured(entries) => structured_cookie_eids_to_openrtb(entries),
+            Self::Structured(raw) => parse_client_eids(&raw),
         }
     }
 }
 
+/// Reports every source and raw UID string in a structured cookie, before
+/// validation, so admin diagnostics can tell "no partner" from "no valid UID".
+fn raw_diagnostic_sources(raw: &RawValue) -> Vec<DiagnosticEidSource> {
+    let Ok(elements) = serde_json::from_str::<Vec<&RawValue>>(raw.get()) else {
+        return Vec::new();
+    };
+
+    elements
+        .iter()
+        .filter_map(|element| {
+            let JsonValue::Object(entry) = serde_json::from_str::<JsonValue>(element.get()).ok()?
+            else {
+                return None;
+            };
+            let source = entry
+                .get("source")
+                .and_then(JsonValue::as_str)
+                .filter(|source| !source.is_empty())?
+                .to_owned();
+            let uids = entry
+                .get("uids")
+                .and_then(JsonValue::as_array)
+                .map(|uids| {
+                    uids.iter()
+                        .filter_map(|uid| uid.get("id").and_then(JsonValue::as_str))
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(DiagnosticEidSource { source, uids })
+        })
+        .collect()
+}
+
 /// Collects validated request-local partner updates without performing KV I/O.
 ///
-/// `body_eids` is the current request's own EIDs (e.g. an `/auction` JSON
-/// body), when the route captured any. It is applied after the `ts-eids`
-/// cookie so it wins on conflicts: the cookie is size-capped by the browser
-/// (see `MAX_EID_COOKIE_BYTES` in the TSJS Prebid integration) and may be
-/// missing partners the request body still carries in full. The `sharedId`
-/// cookie is applied last, unaffected by `body_eids`, preserving its existing
-/// override behavior.
+/// Finalization passes either the `ts-eids` cookie or the request's own client
+/// EIDs, never both: `/auction` passes the client set it used, every other
+/// route the cookie. The `sharedId` cookie is applied last, so it wins over a
+/// Prebid EID for the same partner. With repeated sources, the later entry's
+/// first valid UID is the candidate for that partner.
+///
+/// When `now` is `Some`, each update carries it as its acquisition time.
 pub(crate) fn collect_eid_updates(
     eids_cookie: Option<&str>,
     sharedid_cookie: Option<&str>,
     body_eids: Option<&[Eid]>,
     registry: &PartnerRegistry,
+    now: Option<u64>,
 ) -> Vec<PartnerIdUpdate> {
     if registry.is_empty() {
         return Vec::new();
@@ -156,6 +172,12 @@ pub(crate) fn collect_eid_updates(
         && let Some(update) = collect_sharedid_update(cookie, registry)
     {
         updates.push(update);
+    }
+    if let Some(now) = now {
+        updates = updates
+            .into_iter()
+            .map(|update| update.with_acquired_at(now))
+            .collect();
     }
     dedupe_partner_updates(updates)
 }
@@ -220,13 +242,10 @@ fn collect_prebid_eid_updates_from_eids(
 pub(crate) fn dedupe_partner_updates(updates: Vec<PartnerIdUpdate>) -> Vec<PartnerIdUpdate> {
     let mut latest = std::collections::BTreeMap::new();
     for update in updates {
-        latest.insert(update.partner_id, update.uid);
+        latest.insert(update.partner_id.clone(), update);
     }
 
-    latest
-        .into_iter()
-        .map(|(partner_id, uid)| PartnerIdUpdate::new(partner_id, uid))
-        .collect()
+    latest.into_values().collect()
 }
 
 fn first_valid_uid(uids: &[Uid]) -> Option<&Uid> {
@@ -277,61 +296,19 @@ fn sharedid_cookie_exceeds_size_limit(cookie_value: &str) -> bool {
     cookie_value.len() > MAX_UID_LENGTH
 }
 
-fn structured_cookie_eids_to_openrtb(entries: Vec<StructuredCookieEid>) -> Vec<Eid> {
-    let mut eids = Vec::new();
-
-    for entry in entries {
-        if entry.source.is_empty() {
-            continue;
-        }
-
-        let uids: Vec<_> = entry
-            .uids
-            .into_iter()
-            .filter_map(structured_cookie_uid_to_openrtb)
-            .collect();
-        if uids.is_empty() {
-            continue;
-        }
-
-        eids.push(Eid {
-            source: entry.source,
-            uids,
-        });
-    }
-
-    eids
-}
-
-fn structured_cookie_uid_to_openrtb(uid: StructuredCookieUid) -> Option<Uid> {
-    if uid.id.is_empty() {
-        return None;
-    }
-
-    let atype = uid.atype.filter(|atype| *atype >= 0);
-    let ext = match uid.ext {
-        Some(JsonValue::Object(_)) => uid.ext,
-        _ => None,
-    };
-
-    Some(Uid {
-        id: uid.id,
-        atype,
-        ext,
-    })
-}
-
 fn legacy_cookie_eids_to_openrtb(entries: Vec<LegacyCookieEid>) -> Vec<Eid> {
     entries
         .into_iter()
-        .filter(|entry| !entry.source.is_empty() && !entry.id.is_empty())
-        .map(|entry| Eid {
-            source: entry.source,
-            uids: vec![Uid {
-                id: entry.id,
-                atype: (entry.atype >= 0).then_some(entry.atype),
-                ext: None,
-            }],
+        .filter(|entry| !entry.source.trim().is_empty() && is_valid_eid_uid(&entry.id))
+        .map(|entry| {
+            Eid::new(
+                entry.source,
+                vec![Uid {
+                    id: entry.id,
+                    atype: (entry.atype >= 0).then_some(entry.atype),
+                    ext: None,
+                }],
+            )
         })
         .collect()
 }
@@ -342,6 +319,8 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use serde_json::json;
 
+    use crate::ec::kv::apply_partner_id_updates;
+    use crate::ec::kv_types::KvEntry;
     use crate::ec::registry::PartnerRegistry;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
@@ -359,8 +338,9 @@ mod tests {
             pull_sync_enabled: false,
             pull_sync_url: None,
             pull_sync_allowed_domains: vec![],
-            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
-            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            removed_pull_sync_ttl_sec: None,
+            removed_pull_sync_rate_limit: None,
+            owner: None,
             ts_pull_token: None,
         }
     }
@@ -375,6 +355,100 @@ mod tests {
 
     fn encode_json(value: &serde_json::Value) -> String {
         BASE64.encode(serde_json::to_vec(value).expect("should serialize EID JSON"))
+    }
+
+    #[test]
+    fn structured_cookie_keeps_eid_level_fields() {
+        let entries = json!([{
+            "source": "adserver.org",
+            "inserter": "adserver.org",
+            "matcher": "adserver.org",
+            "mm": 4,
+            "uids": [{ "id": "fictional-tdid", "atype": 1 }]
+        }]);
+
+        let decoded =
+            parse_prebid_eids_cookie(&encode_json(&entries)).expect("should decode cookie");
+
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("should serialize decoded EIDs"),
+            entries,
+            "should keep EID-level fields from the cookie"
+        );
+    }
+
+    #[test]
+    fn structured_cookie_drops_a_mistyped_field_instead_of_the_whole_cookie() {
+        let encoded = encode_json(&json!([
+            { "source": "a.example.com", "uids": [{ "id": "a-uid", "atype": "1" }] },
+            { "source": "b.example.com", "uids": [{ "id": "b-uid", "atype": 3 }] }
+        ]));
+
+        let decoded = parse_prebid_eids_cookie(&encoded).expect("should decode cookie");
+
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("should serialize decoded EIDs"),
+            json!([
+                { "source": "a.example.com", "uids": [{ "id": "a-uid" }] },
+                { "source": "b.example.com", "uids": [{ "id": "b-uid", "atype": 3 }] }
+            ]),
+            "a mistyped atype should drop only that field"
+        );
+    }
+
+    #[test]
+    fn structured_cookie_isolates_an_unparsable_entry() {
+        let raw = r#"[{"source":"a.example.com","uids":[{"id":"a-uid"}]},{"source":"bad.example.com","uids":[{"id":"bad-\ud800"}]}]"#;
+
+        let decoded = parse_prebid_eids_cookie(&BASE64.encode(raw)).expect("should decode cookie");
+
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("should serialize decoded EIDs"),
+            json!([{ "source": "a.example.com", "uids": [{ "id": "a-uid" }] }]),
+            "a lone surrogate should cost only its own entry"
+        );
+    }
+
+    #[test]
+    fn structured_cookie_applies_the_entry_cap() {
+        let entries: Vec<serde_json::Value> = (0..65)
+            .map(|index| json!({ "source": format!("s{index}.example.com"), "uids": [{ "id": "u" }] }))
+            .collect();
+
+        let decoded =
+            parse_prebid_eids_cookie(&encode_json(&serde_json::Value::Array(entries.clone())))
+                .expect("should decode cookie");
+
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("should serialize decoded EIDs"),
+            serde_json::Value::Array(entries[..64].to_vec()),
+            "the body's 64-entry cap should apply to the cookie"
+        );
+    }
+
+    #[test]
+    fn structured_cookie_diagnostics_report_raw_uid_strings() {
+        let registry = make_registry(vec![("example", "example.com")]);
+        let oversized = "x".repeat(MAX_UID_LENGTH + 1);
+        let encoded =
+            encode_json(&json!([{ "source": "example.com", "uids": [{ "id": oversized }] }]));
+
+        let analysis =
+            analyze_prebid_eids_cookie(&encoded, &registry).expect("should decode cookie");
+
+        assert!(
+            analysis.eids.is_empty(),
+            "an oversized UID should not survive validation"
+        );
+        assert_eq!(
+            analysis
+                .diagnostic_sources
+                .iter()
+                .map(|source| (source.source.clone(), source.uids.clone()))
+                .collect::<Vec<_>>(),
+            vec![("example.com".to_owned(), vec![oversized])],
+            "diagnostics should still report the raw source and UID so admin can say no valid UID"
+        );
     }
 
     #[test]
@@ -461,6 +535,16 @@ mod tests {
         let encoded = BASE64.encode(b"not json");
         let result = parse_prebid_eids_cookie(&encoded);
         assert!(result.is_err(), "should reject invalid JSON");
+    }
+
+    #[test]
+    fn parse_prebid_eids_cookie_rejects_non_array_json() {
+        let result = parse_prebid_eids_cookie(&encode_json(&json!({"a": 1})));
+        let error = result.expect_err("should reject a JSON object");
+        assert!(
+            error.contains("not an array"),
+            "should explain that the payload is not an array"
+        );
     }
 
     #[test]
@@ -614,7 +698,13 @@ mod tests {
             {"source": "id5-sync.com", "uids": [{"id": "ID5_abc", "atype": 1}]}
         ]));
 
-        let updates = collect_eid_updates(Some(&eids_cookie), Some(" shared-1 "), None, &registry);
+        let updates = collect_eid_updates(
+            Some(&eids_cookie),
+            Some(" shared-1 "),
+            None,
+            &registry,
+            None,
+        );
 
         assert_eq!(
             updates.len(),
@@ -636,25 +726,26 @@ mod tests {
             {"source": "id5-sync.com", "uids": [{"id": "ID5_stale", "atype": 1}]}
         ]));
         let body_eids = vec![
-            Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![Uid {
+            Eid::new(
+                "id5-sync.com".to_owned(),
+                vec![Uid {
                     id: "ID5_fresh".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
-            },
-            Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![Uid {
+            ),
+            Eid::new(
+                "liveramp.com".to_owned(),
+                vec![Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
-            },
+            ),
         ];
 
-        let updates = collect_eid_updates(Some(&eids_cookie), None, Some(&body_eids), &registry);
+        let updates =
+            collect_eid_updates(Some(&eids_cookie), None, Some(&body_eids), &registry, None);
 
         assert_eq!(
             updates,
@@ -675,7 +766,8 @@ mod tests {
             {"source": "id5-sync.com", "uids": [{"id": "ID5_abc", "atype": 1}]}
         ]));
 
-        let updates = collect_eid_updates(Some(&eids_cookie), Some("shared-1"), None, &registry);
+        let updates =
+            collect_eid_updates(Some(&eids_cookie), Some("shared-1"), None, &registry, None);
 
         assert!(
             updates.is_empty(),
@@ -716,7 +808,13 @@ mod tests {
             {"source": "liveramp.com", "uids": [{"id": "LR_xyz", "atype": 3}]}
         ]));
 
-        let updates = collect_eid_updates(Some(&cookie), Some("shared-cookie-id"), None, &registry);
+        let updates = collect_eid_updates(
+            Some(&cookie),
+            Some("shared-cookie-id"),
+            None,
+            &registry,
+            None,
+        );
 
         assert_eq!(
             updates,
@@ -739,7 +837,7 @@ mod tests {
             }
         ]));
 
-        let updates = collect_eid_updates(Some(&cookie), None, None, &registry);
+        let updates = collect_eid_updates(Some(&cookie), None, None, &registry, None);
 
         assert_eq!(
             updates,
@@ -755,7 +853,8 @@ mod tests {
             {"source": "sharedid.org", "uids": [{"id": "prebid-shared", "atype": 3}]}
         ]));
 
-        let updates = collect_eid_updates(Some(&cookie), Some("cookie-shared"), None, &registry);
+        let updates =
+            collect_eid_updates(Some(&cookie), Some("cookie-shared"), None, &registry, None);
 
         assert_eq!(
             updates,
@@ -771,11 +870,53 @@ mod tests {
             {"source": "unknown.example", "uids": [{"id": "unknown", "atype": 1}]}
         ]));
 
-        let updates = collect_eid_updates(Some(&cookie), None, None, &registry);
+        let updates = collect_eid_updates(Some(&cookie), None, None, &registry, None);
 
         assert!(
             updates.is_empty(),
             "should ignore unmatched partner updates"
+        );
+    }
+
+    #[test]
+    fn golden_browser_ingest_stores_one_uid_per_registered_source() {
+        let registry = make_registry(vec![("id5", "id5-sync.com"), ("sharedid", "sharedid.org")]);
+        let eids_cookie = encode_json(&json!([
+            { "source": "id5-sync.com", "uids": [{ "id": "ID5_earlier_entry", "atype": 1 }] },
+            {
+                "source": "id5-sync.com",
+                "uids": [
+                    { "id": " ", "atype": 1 },
+                    { "id": "ID5_first", "atype": 1, "ext": { "linkType": 2 } },
+                    { "id": "ID5_second", "atype": 1 }
+                ],
+                "inserter": "example.com",
+                "matcher": "partner.example.com",
+                "mm": 3,
+                "ext": { "segments": ["example-segment"] }
+            },
+            { "source": "sharedid.org", "uids": [{ "id": "prebid-shared-id", "atype": 1 }] },
+            { "source": "unregistered.example.com", "uids": [{ "id": "other", "atype": 1 }] }
+        ]));
+        let updates = collect_eid_updates(
+            Some(&eids_cookie),
+            Some(" cookie-shared-id "),
+            None,
+            &registry,
+            Some(1_760_000_000),
+        );
+        let mut entry = KvEntry::minimal("example.com", "existing", 1);
+        apply_partner_id_updates(&mut entry, &updates);
+        let stored = serde_json::to_value(&entry.ids).expect("should serialize ids");
+
+        assert_eq!(
+            stored,
+            json!({
+                "example.com": { "eids": [{ "uids": [{ "id": "existing" }] }] },
+                "id5-sync.com": { "at": 1_760_000_000, "eids": [{ "uids": [{ "id": "ID5_first" }] }] },
+                "sharedid.org": { "at": 1_760_000_000, "eids": [{ "uids": [{ "id": "cookie-shared-id" }] }] }
+            }),
+            "should store one UID per registered source by today's rule, with no EID-level field, atype or ext"
         );
     }
 }

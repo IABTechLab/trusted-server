@@ -17,6 +17,7 @@ use super::openrtb::unused_bidder_params_count;
 use super::plan::AuctionPlan;
 use super::provider::{
     AuctionProvider, GenericOpenRtbProvider, ProviderParseState, ProviderRequestOutcome,
+    ProviderRequestStarted,
 };
 #[cfg(test)]
 use super::routing::RoutedAuction;
@@ -24,6 +25,7 @@ use super::routing::route_auction;
 use super::telemetry::AbandonedProviderCall;
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus};
 use crate::request_signing::RequestSigner;
+use crate::request_timing::{AuctionWaitPlacement, RequestTimings};
 use crate::trace::{
     TraceAuctionCarry, TraceAuctionTerminalReason, TraceAuctionTerminalStatus,
     TraceProviderObservation, TraceProviderRole,
@@ -38,6 +40,8 @@ use crate::trace::{
 /// the original auction budget.
 pub struct DispatchedAuction {
     pending_requests: Vec<PlatformPendingRequest>,
+    /// Whether dispatch started at least one provider request.
+    provider_launched: bool,
     backend_to_provider: HashMap<String, ProviderLaunchState>,
     planned_backend_to_provider: HashMap<String, PlannedLaunchState>,
     completed_responses: Vec<AuctionResponse>,
@@ -69,8 +73,10 @@ struct ProviderLaunchState {
 pub enum DispatchAuctionOutcome {
     /// No provider request was started and no provider failure was observed.
     NotStarted,
-    /// No provider request could be launched, but launch failures were observed.
+    /// Dispatch failed before collection, possibly after starting a request.
     DispatchFailed {
+        /// Whether any provider started a request before dispatch failed.
+        provider_launched: bool,
         /// Original auction request.
         request: AuctionRequest,
         /// Provider launch-failure responses.
@@ -89,7 +95,24 @@ pub enum DispatchAuctionOutcome {
     Dispatched(DispatchedAuction),
 }
 
+/// Synchronous execution failure, including outcomes needed by route telemetry.
+pub(crate) struct AuctionExecutionFailure {
+    /// Admission or dispatch error to propagate through the route's error boundary.
+    pub error: Report<TrustedServerError>,
+    /// Provider outcomes materialized before failure, for terminal telemetry.
+    pub provider_responses: Vec<AuctionResponse>,
+    /// Elapsed dispatch time, or execution time when dispatch returned `NotStarted`.
+    /// Excludes the caller's request parsing and targeting preparation.
+    pub elapsed_ms: u64,
+}
+
 impl DispatchedAuction {
+    /// Whether at least one provider request was started.
+    #[must_use]
+    pub fn has_provider_launch(&self) -> bool {
+        self.provider_launched
+    }
+
     /// Consume the dispatch token without collecting provider responses.
     #[must_use]
     pub fn abandon(
@@ -138,9 +161,20 @@ impl DispatchedAuction {
 
 #[cfg(test)]
 impl DispatchedAuction {
+    /// Creates a token modeling a started provider request that resolved to no bid.
+    pub(crate) fn launched_no_bid_for_test(request: AuctionRequest, timeout_ms: u32) -> Self {
+        let mut dispatched = Self::empty_for_test(request, timeout_ms);
+        dispatched.provider_launched = true;
+        dispatched
+            .completed_responses
+            .push(AuctionResponse::no_bid("example", 0));
+        dispatched
+    }
+
     pub(crate) fn empty_for_test(request: AuctionRequest, timeout_ms: u32) -> Self {
         Self {
             pending_requests: Vec::new(),
+            provider_launched: false,
             backend_to_provider: HashMap::new(),
             planned_backend_to_provider: HashMap::new(),
             completed_responses: Vec::new(),
@@ -909,41 +943,119 @@ impl AuctionOrchestrator {
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
+        self.execute_auction(request, context, None)
+            .await
+            .map(|(result, _)| result)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Execute a synchronous route auction with request-clock collection timing.
+    ///
+    /// Returns the result and whether any provider or mediator request started.
+    /// The bool stays false for Immediate, routing-only, and empty-plan results.
+    /// Only provider launches during dispatch stamp the dispatch offset; actual
+    /// upstream work during collection records wait and resolution timing.
+    ///
+    /// # Errors
+    /// Returns admission or dispatch failures with their provider outcomes and
+    /// elapsed time for route telemetry. Failed dispatch never records collection.
+    pub(crate) async fn run_auction_with_timings(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+        timings: &RequestTimings,
+    ) -> Result<(OrchestrationResult, bool), AuctionExecutionFailure> {
+        self.execute_auction(request, context, Some(timings)).await
+    }
+
+    async fn execute_auction(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+        timings: Option<&RequestTimings>,
+    ) -> Result<(OrchestrationResult, bool), AuctionExecutionFailure> {
         let trace = context.request.extensions().get::<TraceAuctionCarry>();
         let _trace_guard = trace.map(TraceAuctionCarry::cancellation_guard);
-        match self.dispatch_planned_auction(request, context).await {
-            DispatchAuctionOutcome::Dispatched(dispatched) => Ok(self
-                .collect_dispatched_auction(dispatched, context.services, context)
-                .await),
+        let started = Instant::now();
+        #[cfg(test)]
+        let outcome = if self.plan_backed {
+            self.dispatch_planned_auction(request, context).await
+        } else {
+            self.dispatch_auction(request, context).await
+        };
+        #[cfg(not(test))]
+        let outcome = self.dispatch_planned_auction(request, context).await;
+        match outcome {
+            DispatchAuctionOutcome::Dispatched(dispatched) => {
+                if dispatched.has_provider_launch()
+                    && let Some(timings) = timings
+                {
+                    timings.mark_auction_dispatched();
+                }
+                Ok(self
+                    .collect_with_timing(
+                        dispatched,
+                        context.services,
+                        context,
+                        timings.map(|timings| (timings, AuctionWaitPlacement::PreHeader)),
+                    )
+                    .await)
+            }
             DispatchAuctionOutcome::DispatchFailed {
+                provider_launched,
+                provider_responses,
                 fatal_admission_error,
+                elapsed_ms,
                 ..
             } => {
                 if let Some(trace) = trace {
                     trace.finish_dispatch_failed(false);
                 }
-                if let Some(error) = fatal_admission_error {
-                    return Err(error.change_context(TrustedServerError::Auction {
-                        message: "Planned auction admission failed".to_string(),
-                    }));
+                if provider_launched && let Some(timings) = timings {
+                    timings.mark_auction_dispatched();
                 }
-                Err(Report::new(TrustedServerError::Auction {
-                    message: "All eligible planned provider requests failed to launch".to_string(),
-                }))
+                Err(AuctionExecutionFailure {
+                    error: fatal_admission_error
+                        .map(|error| {
+                            error.change_context(TrustedServerError::Auction {
+                                message: "Planned auction admission failed".to_string(),
+                            })
+                        })
+                        .unwrap_or_else(|| {
+                            Report::new(TrustedServerError::Auction {
+                                message: "All eligible planned provider requests failed to launch"
+                                    .to_string(),
+                            })
+                        }),
+                    provider_responses,
+                    elapsed_ms,
+                })
             }
             DispatchAuctionOutcome::NotStarted => {
-                if self.planned_providers.is_empty() {
-                    if let Some(trace) = trace {
-                        trace.finish(TraceAuctionTerminalStatus::Completed, None);
-                    }
-                    Ok(OrchestrationResult::no_bid())
+                #[cfg(test)]
+                let has_providers = if self.plan_backed {
+                    !self.planned_providers.is_empty()
                 } else {
+                    !self.config.providers.is_empty()
+                };
+                #[cfg(not(test))]
+                let has_providers = !self.planned_providers.is_empty();
+                if has_providers {
                     if let Some(trace) = trace {
                         trace.finish_dispatch_failed(true);
                     }
-                    Err(Report::new(TrustedServerError::Auction {
-                        message: "No planned provider request was started".to_string(),
-                    }))
+                    Err(AuctionExecutionFailure {
+                        error: Report::new(TrustedServerError::Auction {
+                            message: "No planned provider request was started".to_string(),
+                        }),
+                        provider_responses: Vec::new(),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    })
+                } else {
+                    if let Some(trace) = trace {
+                        trace.finish(TraceAuctionTerminalStatus::Completed, None);
+                    }
+                    Ok((OrchestrationResult::no_bid(), false))
                 }
             }
         }
@@ -1775,6 +1887,7 @@ impl AuctionOrchestrator {
                         .unwrap_or(usize::MAX)
                 });
                 return DispatchAuctionOutcome::DispatchFailed {
+                    provider_launched: false,
                     request: request.clone(),
                     provider_responses,
                     fatal_admission_error: Some(error),
@@ -1798,6 +1911,7 @@ impl AuctionOrchestrator {
         let mut planned_backend_to_provider = HashMap::new();
         let mut reserved_backend_names = HashSet::new();
         let mut immediate_response_count = 0usize;
+        let mut provider_launch_count = 0usize;
         let mut launch_failure_count = 0usize;
 
         for input in routed.inputs() {
@@ -1856,6 +1970,7 @@ impl AuctionOrchestrator {
                     request: pending,
                     parse_state,
                 }) => {
+                    provider_launch_count += 1;
                     let Some(backend_name) = pending.backend_name().map(str::to_string) else {
                         if let (Some(trace), Some(observation)) = (&trace, trace_observation) {
                             trace.observe_failure(observation);
@@ -1893,6 +2008,8 @@ impl AuctionOrchestrator {
                     if let (Some(trace), Some(observation)) = (&trace, trace_observation) {
                         trace.observe_response(observation, &response);
                     }
+                    // Planned providers use Immediate for routing-only skips such
+                    // as NoImpressions; no request left the edge.
                     immediate_response_count += 1;
                     completed_responses.push(response);
                 }
@@ -1900,6 +2017,8 @@ impl AuctionOrchestrator {
                     if let (Some(trace), Some(observation)) = (&trace, trace_observation) {
                         trace.observe_failure(observation);
                     }
+                    provider_launch_count +=
+                        usize::from(error.contains::<ProviderRequestStarted>());
                     log::warn!(
                         "Planned provider '{}' failed to dispatch: {error:?}",
                         provider.provider_name()
@@ -1931,6 +2050,7 @@ impl AuctionOrchestrator {
                         .unwrap_or(usize::MAX)
                 });
                 return DispatchAuctionOutcome::DispatchFailed {
+                    provider_launched: provider_launch_count > 0,
                     request: request.clone(),
                     provider_responses: completed_responses,
                     fatal_admission_error: None,
@@ -1944,6 +2064,7 @@ impl AuctionOrchestrator {
         }
 
         DispatchAuctionOutcome::Dispatched(DispatchedAuction {
+            provider_launched: provider_launch_count > 0,
             pending_requests,
             backend_to_provider: HashMap::new(),
             planned_backend_to_provider,
@@ -1970,10 +2091,12 @@ impl AuctionOrchestrator {
     /// [`DispatchedAuction`] token. The Fastly host begins the SSP round-trips
     /// while WASM continues to `pending_origin.wait()`.
     ///
-    /// Returns [`DispatchAuctionOutcome::NotStarted`] when no providers are configured or
-    /// all providers are disabled / over budget. Returns
-    /// [`DispatchAuctionOutcome::DispatchFailed`] when provider launch attempts
-    /// happened but none could be started.
+    /// Returns [`DispatchAuctionOutcome::NotStarted`] when the auction is disabled
+    /// or has no providers to execute. Routing-only skips can instead yield a
+    /// [`DispatchAuctionOutcome::Dispatched`] token with immediate responses but
+    /// no provider launch. Admission or launch failures can yield
+    /// [`DispatchAuctionOutcome::DispatchFailed`]; its `provider_launched` flag
+    /// preserves evidence of requests that started before a later failure.
     #[must_use]
     pub async fn dispatch_auction(
         &self,
@@ -2054,8 +2177,12 @@ impl AuctionOrchestrator {
         let completed_responses: Vec<AuctionResponse> = Vec::new();
         #[cfg(test)]
         let mut immediate_response_count = 0usize;
+        #[cfg(test)]
+        let mut provider_launch_count = 0usize;
         #[cfg(not(test))]
         let immediate_response_count = 0usize;
+        #[cfg(not(test))]
+        let provider_launch_count = 0usize;
 
         #[cfg(test)]
         for provider_name in &provider_names {
@@ -2126,6 +2253,10 @@ impl AuctionOrchestrator {
                     request: pending,
                     parse_state,
                 }) => {
+                    #[cfg(test)]
+                    {
+                        provider_launch_count += 1;
+                    }
                     let backend_name = pending.backend_name().map(str::to_string).or_else(|| {
                         if let Some(backend_name) = predicted_backend_name.as_ref() {
                             log::warn!(
@@ -2183,6 +2314,7 @@ impl AuctionOrchestrator {
                     completed_responses.push(response);
                 }
                 Err(e) => {
+                    provider_launch_count += usize::from(e.contains::<ProviderRequestStarted>());
                     let response_time_ms = start_time.elapsed().as_millis() as u64;
                     log::warn!(
                         "Provider '{}' failed to dispatch request: {:?}",
@@ -2202,6 +2334,7 @@ impl AuctionOrchestrator {
                 DispatchAuctionOutcome::NotStarted
             } else {
                 DispatchAuctionOutcome::DispatchFailed {
+                    provider_launched: provider_launch_count > 0,
                     request: request.clone(),
                     provider_responses: completed_responses,
                     fatal_admission_error: None,
@@ -2220,6 +2353,7 @@ impl AuctionOrchestrator {
         );
 
         DispatchAuctionOutcome::Dispatched(DispatchedAuction {
+            provider_launched: provider_launch_count > 0,
             pending_requests,
             backend_to_provider,
             planned_backend_to_provider: HashMap::new(),
@@ -2256,8 +2390,63 @@ impl AuctionOrchestrator {
         services: &RuntimeServices,
         context: &AuctionContext<'_>,
     ) -> OrchestrationResult {
+        self.collect_with_timing(dispatched, services, context, None)
+            .await
+            .0
+    }
+
+    /// Collect with measured wait placement and explicit provider/mediator launch evidence.
+    ///
+    /// Returns the result and whether a provider or mediator request started,
+    /// including post-start failures. The bool stays false for Immediate and
+    /// routing-only outcomes. Wait and resolution are recorded only when true;
+    /// mediator-only work does not fabricate a provider dispatch offset.
+    pub(crate) async fn collect_dispatched_auction_with_timings(
+        &self,
+        dispatched: DispatchedAuction,
+        services: &RuntimeServices,
+        context: &AuctionContext<'_>,
+        timings: &RequestTimings,
+        placement: AuctionWaitPlacement,
+    ) -> (OrchestrationResult, bool) {
+        self.collect_with_timing(dispatched, services, context, Some((timings, placement)))
+            .await
+    }
+
+    async fn collect_with_timing(
+        &self,
+        dispatched: DispatchedAuction,
+        services: &RuntimeServices,
+        context: &AuctionContext<'_>,
+        timing: Option<(&RequestTimings, AuctionWaitPlacement)>,
+    ) -> (OrchestrationResult, bool) {
+        let mut auction_work_started = dispatched.has_provider_launch();
+        let wait_started = Instant::now();
+        let result = self
+            .collect_dispatched_auction_inner(
+                dispatched,
+                services,
+                context,
+                &mut auction_work_started,
+            )
+            .await;
+        if auction_work_started && let Some((timings, placement)) = timing {
+            timings.record_auction_wait(placement, wait_started.elapsed());
+            timings.mark_auction_resolved();
+        }
+        (result, auction_work_started)
+    }
+
+    async fn collect_dispatched_auction_inner(
+        &self,
+        dispatched: DispatchedAuction,
+        services: &RuntimeServices,
+        context: &AuctionContext<'_>,
+        auction_work_started: &mut bool,
+    ) -> OrchestrationResult {
         let DispatchedAuction {
             pending_requests,
+            provider_launched: _,
             mut backend_to_provider,
             mut planned_backend_to_provider,
             completed_responses,
@@ -2596,7 +2785,9 @@ impl AuctionOrchestrator {
                     .request_bids(&request, &mediator_context)
                     .await
                 {
-                    Ok(_) if Instant::now() >= mediator_deadline => {
+                    Ok(outcome) if Instant::now() >= mediator_deadline => {
+                        *auction_work_started |=
+                            matches!(outcome, ProviderRequestOutcome::Pending { .. });
                         log::debug!(
                             "Mediator '{}' exhausted its response budget during launch; using local ranking",
                             mediator.provider_name()
@@ -2613,66 +2804,70 @@ impl AuctionOrchestrator {
                     Ok(ProviderRequestOutcome::Pending {
                         request: pending,
                         parse_state,
-                    }) => match services
-                        .http_client()
-                        .wait_until(pending, mediator_deadline)
-                        .await
-                    {
-                        Ok(platform_resp) => {
-                            let response_time_ms = mediator_start.elapsed().as_millis() as u64;
-                            if Instant::now() >= mediator_deadline {
-                                log::debug!(
-                                    "Mediator '{}' completed after its response deadline; using local ranking ({}ms)",
-                                    mediator.provider_name(),
-                                    response_time_ms
-                                );
-                                None
-                            } else {
-                                match mediator
-                                    .parse_response_with_context_and_state(
-                                        platform_resp,
-                                        response_time_ms,
-                                        &request,
-                                        &mediator_context,
-                                        parse_state.as_deref(),
-                                    )
-                                    .await
-                                {
-                                    Ok(response) => {
-                                        if let (Some(trace), Some(observation)) =
-                                            (&trace, trace_observation.take())
-                                        {
-                                            trace.observe_response(observation, &response);
+                    }) => {
+                        *auction_work_started = true;
+                        match services
+                            .http_client()
+                            .wait_until(pending, mediator_deadline)
+                            .await
+                        {
+                            Ok(platform_resp) => {
+                                let response_time_ms = mediator_start.elapsed().as_millis() as u64;
+                                if Instant::now() >= mediator_deadline {
+                                    log::debug!(
+                                        "Mediator '{}' completed after its response deadline; using local ranking ({}ms)",
+                                        mediator.provider_name(),
+                                        response_time_ms
+                                    );
+                                    None
+                                } else {
+                                    match mediator
+                                        .parse_response_with_context_and_state(
+                                            platform_resp,
+                                            response_time_ms,
+                                            &request,
+                                            &mediator_context,
+                                            parse_state.as_deref(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(response) => {
+                                            if let (Some(trace), Some(observation)) =
+                                                (&trace, trace_observation.take())
+                                            {
+                                                trace.observe_response(observation, &response);
+                                            }
+                                            Some(response)
                                         }
-                                        Some(response)
-                                    }
-                                    Err(error) => {
-                                        log::warn!(
-                                            "Mediator '{}' parse failed: {:?}",
-                                            mediator.provider_name(),
-                                            error
-                                        );
-                                        None
+                                        Err(error) => {
+                                            log::warn!(
+                                                "Mediator '{}' parse failed: {:?}",
+                                                mediator.provider_name(),
+                                                error
+                                            );
+                                            None
+                                        }
                                     }
                                 }
                             }
-                        }
-                        Err(error) => {
-                            if matches!(
-                                error.current_context(),
-                                crate::platform::PlatformError::DeadlineExceeded
-                            ) {
-                                log::debug!(
-                                    "Mediator '{}' exhausted its response budget; using local ranking",
-                                    mediator.provider_name()
-                                );
-                            } else {
-                                log::warn!("Mediator request failed: {:?}", error);
+                            Err(error) => {
+                                if matches!(
+                                    error.current_context(),
+                                    crate::platform::PlatformError::DeadlineExceeded
+                                ) {
+                                    log::debug!(
+                                        "Mediator '{}' exhausted its response budget; using local ranking",
+                                        mediator.provider_name()
+                                    );
+                                } else {
+                                    log::warn!("Mediator request failed: {:?}", error);
+                                }
+                                None
                             }
-                            None
                         }
-                    },
+                    }
                     Err(error) => {
+                        *auction_work_started |= error.contains::<ProviderRequestStarted>();
                         log::warn!(
                             "Mediator '{}' failed to dispatch: {:?}",
                             mediator.provider_name(),
@@ -2959,6 +3154,7 @@ mod tests {
 
     mod trace_auction_live_tests {
         use super::*;
+        use crate::request_timing::RequestTimings;
         use crate::trace::{TraceAuctionCarry, TraceAuctionSource};
         use edgezero_core::body::Body as EdgeBody;
         use http::Request;
@@ -2996,7 +3192,7 @@ mod tests {
             let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
             let settings = create_test_settings();
             let request = planned_request();
-            for split in [false, true] {
+            for (split, timed) in [(false, false), (false, true), (true, false)] {
                 let (inbound, carry) = captured_request(&request);
                 let token = carry.token();
                 let context = AuctionContext {
@@ -3016,10 +3212,16 @@ mod tests {
                         "should preserve the ordinary split outcome"
                     );
                 } else {
-                    let result = orchestrator
-                        .run_auction(&request, &context)
-                        .await
-                        .expect("should preserve successful empty-plan execution");
+                    let result = if timed {
+                        orchestrator
+                            .run_auction_with_timings(&request, &context, &RequestTimings::new())
+                            .await
+                            .map(|(result, _)| result)
+                            .map_err(|failure| failure.error)
+                    } else {
+                        orchestrator.run_auction(&request, &context).await
+                    }
+                    .expect("should preserve successful empty-plan execution");
                     assert!(
                         result.winning_bids.is_empty(),
                         "should preserve an ordinary zero-bid result"
@@ -3617,6 +3819,10 @@ mod tests {
                 else {
                     panic!("all-skipped auction should produce a completed dispatch token");
                 };
+                assert!(
+                    !dispatched.has_provider_launch(),
+                    "routing-only skipped outcomes must not claim a provider launch"
+                );
                 orchestrator
                     .collect_dispatched_auction(dispatched, &services, &context)
                     .await
@@ -5199,6 +5405,10 @@ mod tests {
         else {
             panic!("enabled immediate provider should dispatch");
         };
+        assert!(
+            !dispatched.has_provider_launch(),
+            "should not count an immediate no-bid response as a provider request"
+        );
         let result = orchestrator
             .collect_dispatched_auction(dispatched, &services, &context)
             .await;
@@ -6244,6 +6454,108 @@ mod tests {
         assert_eq!(
             result.provider_responses[0].metadata["error_type"], ERROR_TYPE_TRANSPORT,
             "harness should match production transport classification"
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_no_impressions_immediate_outcome_is_not_a_provider_launch() {
+        let http = Arc::new(StubHttpClient::new());
+        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let services = build_services_with_backend_and_http_client(
+            Arc::clone(&backend) as Arc<_>,
+            Arc::clone(&http) as Arc<_>,
+        );
+        let mut config = planned_prebid_config(&[(
+            "pbs-a",
+            serde_json::json!({}),
+            NotificationConfig::default(),
+        )]);
+        config.bidders.insert(
+            "alpha".parse().expect("should parse bidder ID"),
+            crate::auction::plan::BidderRouteConfig {
+                provider: "pbs-a".parse().expect("should parse provider ID"),
+            },
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(
+            Arc::new(AuctionPlan::compile(config).expect("should compile PBS plan")),
+            None,
+        );
+        let mut request = planned_prebid_request();
+        request.slots[0].bidders.insert(
+            "trustedServer".to_string(),
+            serde_json::json!({"storedRequest":false,"bidderParams":{"alpha":{}}}),
+        );
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let DispatchAuctionOutcome::Dispatched(dispatched) =
+            orchestrator.dispatch_auction(&request, &context).await
+        else {
+            panic!("should retain the routing-only provider response for collection");
+        };
+        assert_eq!(
+            http.recorded_backend_names().len(),
+            0,
+            "should not start an outbound request for NoImpressions"
+        );
+        assert!(
+            !dispatched.has_provider_launch(),
+            "should not establish launch evidence for a routing-only Immediate response"
+        );
+        assert_eq!(
+            dispatched.completed_responses[0].metadata["routing"]["skipped_no_usable_demand"], true,
+            "should retain the routing skip response for collection"
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_started_request_keeps_launch_evidence_after_backend_bookkeeping_failure() {
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(204, Vec::new());
+        http.push_pending_backend_name_override(None);
+        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let services = build_services_with_backend_and_http_client(
+            Arc::clone(&backend) as Arc<_>,
+            Arc::clone(&http) as Arc<_>,
+        );
+        let plan = Arc::new(
+            AuctionPlan::compile(planned_config(
+                &[("provider-a", RoutingMode::AllEligible)],
+                false,
+            ))
+            .expect("should compile planned auction"),
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let request = planned_request();
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let DispatchAuctionOutcome::DispatchFailed {
+            provider_launched, ..
+        } = orchestrator.dispatch_auction(&request, &context).await
+        else {
+            panic!("missing backend bookkeeping should fail dispatch");
+        };
+        assert_eq!(http.recorded_backend_names().len(), 1);
+        assert!(
+            provider_launched,
+            "should retain launch evidence for a started request when bookkeeping fails"
         );
     }
 

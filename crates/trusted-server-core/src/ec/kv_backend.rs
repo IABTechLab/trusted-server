@@ -11,6 +11,8 @@
 //! expressed through [`EcKvWriteMode`] so compare-and-swap loops stay in
 //! core while the platform supplies the actual precondition mechanics.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use error_stack::Report;
@@ -64,13 +66,22 @@ pub enum EcKvWriteOutcome {
     PreconditionFailed,
 }
 
+/// Attached to an [`EcKvStore::insert`] error when the platform refused the
+/// write under its per-key write rate limit, so a caller that can wait may
+/// try again after [`EcKvStore::pause`].
+#[derive(Debug, Clone, Copy)]
+pub struct EcKvRateLimited;
+
 /// Raw KV store primitives backing the EC identity graph.
 ///
 /// Implementations map these operations onto the platform KV API.
 /// Infrastructure failures are reported as [`TrustedServerError::KvStore`];
 /// write precondition failures are part of the normal control flow and are
 /// returned as [`EcKvWriteOutcome::PreconditionFailed`] instead of errors.
-pub trait EcKvStore {
+///
+/// `Send + Sync` so a [`super::kv::KvIdentityGraph`] can be built once and
+/// held in shared application state.
+pub trait EcKvStore: Send + Sync {
     /// Returns the platform store name, used in log and error messages.
     fn store_name(&self) -> &str;
 
@@ -115,8 +126,9 @@ pub trait EcKvStore {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::KvStore`] on store open or write
-    /// failure. Precondition failures are reported through the
-    /// [`EcKvWriteOutcome`] instead.
+    /// failure, with an [`EcKvRateLimited`] attachment when the platform's
+    /// per-key write limit refused it. Precondition failures are reported
+    /// through the [`EcKvWriteOutcome`] instead.
     fn insert(
         &self,
         key: &str,
@@ -169,13 +181,260 @@ pub trait EcKvStore {
     ///
     /// Returns [`TrustedServerError::KvStore`] on store open or delete failure.
     fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>>;
+
+    /// Blocks the request for `duration`, so a write made after the response
+    /// was sent can outlast the platform's per-key write limit.
+    ///
+    /// The default returns at once, for platforms and test doubles that have
+    /// no such limit.
+    fn pause(&self, duration: Duration) {
+        let _ = duration;
+    }
+}
+
+impl<S: EcKvStore + ?Sized> EcKvStore for Arc<S> {
+    fn store_name(&self) -> &str {
+        self.as_ref().store_name()
+    }
+
+    fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+        self.as_ref().lookup(key)
+    }
+
+    fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+        self.as_ref().key_exists(key)
+    }
+
+    fn insert(
+        &self,
+        key: &str,
+        write: EcKvWrite<'_>,
+    ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+        self.as_ref().insert(key, write)
+    }
+
+    fn list_keys_with_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, Report<TrustedServerError>> {
+        self.as_ref().list_keys_with_prefix(prefix, limit)
+    }
+
+    fn count_keys_with_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<u32, Report<TrustedServerError>> {
+        self.as_ref().count_keys_with_prefix(prefix, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+        self.as_ref().delete(key)
+    }
+
+    fn pause(&self, duration: Duration) {
+        self.as_ref().pause(duration);
+    }
+}
+
+/// Counts of KV operations one request makes, shared by every clone.
+///
+/// Reads are row lookups and writes are inserts and deletes. Existence
+/// checks and key listings are not counted: they read no row. A graph reports into it through
+/// [`KvIdentityGraph::with_operation_counts`](super::kv::KvIdentityGraph::with_operation_counts).
+#[derive(Debug, Clone, Default)]
+pub struct KvOperationCounts {
+    reads: Arc<AtomicU32>,
+    writes: Arc<AtomicU32>,
+}
+
+impl KvOperationCounts {
+    /// Reads counted so far.
+    #[must_use]
+    pub fn reads(&self) -> u32 {
+        self.reads.load(Ordering::Relaxed)
+    }
+
+    /// Writes counted so far.
+    #[must_use]
+    pub fn writes(&self) -> u32 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
+    fn record_read(&self) {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_write(&self) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// An [`EcKvStore`] that counts every operation it forwards.
+pub(crate) struct OperationCountingEcKv {
+    inner: Arc<dyn EcKvStore>,
+    counts: KvOperationCounts,
+}
+
+impl OperationCountingEcKv {
+    /// Wraps `inner`, reporting into `counts`.
+    pub(crate) fn new(inner: Arc<dyn EcKvStore>, counts: KvOperationCounts) -> Self {
+        Self { inner, counts }
+    }
+}
+
+impl EcKvStore for OperationCountingEcKv {
+    fn store_name(&self) -> &str {
+        self.inner.store_name()
+    }
+
+    fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+        self.counts.record_read();
+        self.inner.lookup(key)
+    }
+
+    fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+        self.inner.key_exists(key)
+    }
+
+    fn insert(
+        &self,
+        key: &str,
+        write: EcKvWrite<'_>,
+    ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+        self.counts.record_write();
+        self.inner.insert(key, write)
+    }
+
+    fn list_keys_with_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, Report<TrustedServerError>> {
+        self.inner.list_keys_with_prefix(prefix, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+        self.counts.record_write();
+        self.inner.delete(key)
+    }
+
+    fn pause(&self, duration: Duration) {
+        self.inner.pause(duration);
+    }
+}
+
+/// An in-memory store for tests, reachable from other crates through the
+/// `test-utils` feature.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod in_memory {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// In-memory [`EcKvStore`] with generation tracking for CAS tests.
+    pub struct InMemoryEcKv {
+        name: String,
+        entries: Mutex<BTreeMap<String, StoredEntry>>,
+    }
+
+    struct StoredEntry {
+        body: Vec<u8>,
+        metadata: Option<Vec<u8>>,
+        generation: u64,
+    }
+
+    impl InMemoryEcKv {
+        /// An empty store named `name`.
+        pub fn new(name: impl Into<String>) -> Self {
+            Self {
+                name: name.into(),
+                entries: Mutex::new(BTreeMap::new()),
+            }
+        }
+    }
+
+    impl EcKvStore for InMemoryEcKv {
+        fn store_name(&self) -> &str {
+            &self.name
+        }
+
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            let entries = self.entries.lock().expect("should lock in-memory store");
+            Ok(entries.get(key).map(|stored| EcKvLookup {
+                body: stored.body.clone(),
+                metadata: stored.metadata.clone(),
+                generation: stored.generation,
+            }))
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            let entries = self.entries.lock().expect("should lock in-memory store");
+            Ok(entries.contains_key(key))
+        }
+
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            let mut entries = self.entries.lock().expect("should lock in-memory store");
+            let existing_generation = entries.get(key).map(|stored| stored.generation);
+
+            match write.mode {
+                EcKvWriteMode::Add if existing_generation.is_some() => {
+                    return Ok(EcKvWriteOutcome::PreconditionFailed);
+                }
+                EcKvWriteMode::IfGenerationMatch(expected)
+                    if existing_generation != Some(expected) =>
+                {
+                    return Ok(EcKvWriteOutcome::PreconditionFailed);
+                }
+                EcKvWriteMode::Add
+                | EcKvWriteMode::Overwrite
+                | EcKvWriteMode::IfGenerationMatch(_) => {}
+            }
+
+            entries.insert(
+                key.to_owned(),
+                StoredEntry {
+                    body: write.body.as_bytes().to_vec(),
+                    metadata: Some(write.metadata.as_bytes().to_vec()),
+                    generation: existing_generation.unwrap_or(0) + 1,
+                },
+            );
+            Ok(EcKvWriteOutcome::Written)
+        }
+
+        fn list_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            let entries = self.entries.lock().expect("should lock in-memory store");
+            Ok(entries
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .take(limit as usize)
+                .cloned()
+                .collect())
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            let mut entries = self.entries.lock().expect("should lock in-memory store");
+            entries.remove(key);
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
+    pub(crate) use super::in_memory::InMemoryEcKv;
     use super::*;
 
     /// [`EcKvStore`] wrapper that counts `lookup` calls through a shared counter
@@ -309,100 +568,6 @@ pub(crate) mod test_support {
 
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
             self.inner.delete(key)
-        }
-    }
-
-    /// In-memory [`EcKvStore`] with generation tracking for CAS tests.
-    pub(crate) struct InMemoryEcKv {
-        name: String,
-        entries: Mutex<BTreeMap<String, StoredEntry>>,
-    }
-
-    struct StoredEntry {
-        body: Vec<u8>,
-        metadata: Option<Vec<u8>>,
-        generation: u64,
-    }
-
-    impl InMemoryEcKv {
-        pub(crate) fn new(name: impl Into<String>) -> Self {
-            Self {
-                name: name.into(),
-                entries: Mutex::new(BTreeMap::new()),
-            }
-        }
-    }
-
-    impl EcKvStore for InMemoryEcKv {
-        fn store_name(&self) -> &str {
-            &self.name
-        }
-
-        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-            let entries = self.entries.lock().expect("should lock in-memory store");
-            Ok(entries.get(key).map(|stored| EcKvLookup {
-                body: stored.body.clone(),
-                metadata: stored.metadata.clone(),
-                generation: stored.generation,
-            }))
-        }
-
-        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-            let entries = self.entries.lock().expect("should lock in-memory store");
-            Ok(entries.contains_key(key))
-        }
-
-        fn insert(
-            &self,
-            key: &str,
-            write: EcKvWrite<'_>,
-        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
-            let mut entries = self.entries.lock().expect("should lock in-memory store");
-            let existing_generation = entries.get(key).map(|stored| stored.generation);
-
-            match write.mode {
-                EcKvWriteMode::Add if existing_generation.is_some() => {
-                    return Ok(EcKvWriteOutcome::PreconditionFailed);
-                }
-                EcKvWriteMode::IfGenerationMatch(expected)
-                    if existing_generation != Some(expected) =>
-                {
-                    return Ok(EcKvWriteOutcome::PreconditionFailed);
-                }
-                EcKvWriteMode::Add
-                | EcKvWriteMode::Overwrite
-                | EcKvWriteMode::IfGenerationMatch(_) => {}
-            }
-
-            entries.insert(
-                key.to_owned(),
-                StoredEntry {
-                    body: write.body.as_bytes().to_vec(),
-                    metadata: Some(write.metadata.as_bytes().to_vec()),
-                    generation: existing_generation.unwrap_or(0) + 1,
-                },
-            );
-            Ok(EcKvWriteOutcome::Written)
-        }
-
-        fn list_keys_with_prefix(
-            &self,
-            prefix: &str,
-            limit: u32,
-        ) -> Result<Vec<String>, Report<TrustedServerError>> {
-            let entries = self.entries.lock().expect("should lock in-memory store");
-            Ok(entries
-                .keys()
-                .filter(|key| key.starts_with(prefix))
-                .take(limit as usize)
-                .cloned()
-                .collect())
-        }
-
-        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
-            let mut entries = self.entries.lock().expect("should lock in-memory store");
-            entries.remove(key);
-            Ok(())
         }
     }
 

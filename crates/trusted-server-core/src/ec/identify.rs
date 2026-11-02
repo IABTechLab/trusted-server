@@ -16,14 +16,33 @@ use crate::openrtb::{Eid, Uid};
 use crate::settings::Settings;
 
 use super::EcContext;
+use super::checked_current_timestamp;
+use super::identity::SourceDomain;
+use super::identity::UnixTime;
+use super::identity::catalog::ProviderCatalog;
+use super::identity::policy::PolicySignals;
+use super::identity::request::opted_out;
+use super::identity::servable::{ServeContext, is_servable};
 use super::kv::KvIdentityGraph;
+use super::kv_types::KvPartnerId;
 use super::log_id;
 use super::registry::PartnerRegistry;
+
+/// Whether the browser marked the request as a same-origin or same-site
+/// fetch. A missing `Sec-Fetch-Site` header fails closed.
+fn is_same_site_fetch(req: &Request<EdgeBody>) -> bool {
+    req.headers()
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|site| matches!(site, "same-origin" | "same-site"))
+}
 
 /// Handles `GET /_ts/api/v1/identify`.
 ///
 /// Requires Bearer token authentication. Returns only the requesting
-/// partner's UID for the active EC ID.
+/// partner's UID for the active EC ID. A provider-written UID is returned only
+/// to a call with an allowed `Origin` and a same-origin or same-site
+/// `Sec-Fetch-Site`, because the EC ID is a bearer value servers hold too.
 ///
 /// # Errors
 ///
@@ -83,35 +102,79 @@ pub fn handle_identify(
         ));
     };
 
+    // The EC ID is a bearer value partners and the origin hold (spec 9.5).
+    // A provider-written ID goes only to a call the visitor's browser made
+    // from the publisher's site.
+    let browser_context = allowed_origin.is_some() && is_same_site_fetch(req);
     let mut degraded = false;
     let mut uid: Option<String> = None;
     let mut cluster_size: Option<u32> = None;
 
     match kv.get(ec_id) {
-        Ok(Some((entry, generation))) => {
+        Ok(Some((entry, _generation))) => {
             if !entry.consent.ok {
                 // Tombstone entries preserve the withdrawal signal for 24 hours.
-                // Do not extract IDs or evaluate cluster size because that would
-                // write back with the live-entry TTL.
+                // Do not extract IDs or evaluate cluster size.
                 log::trace!("Identify found tombstone for '{}'", log_id(ec_id));
             } else {
-                // Extract only this partner's UID.
-                if let Some(partner_uid) = entry.ids.get(&partner.source_domain)
-                    && !partner_uid.uid.is_empty()
-                {
-                    uid = Some(partner_uid.uid.clone());
+                // Extract only this partner's UID, and only when the shared
+                // servability check passes under this request's consent, never
+                // the row's stored snapshot. A failed clock serves nothing,
+                // because a zero time would make every expiry check pass.
+                if let Some(now) = checked_current_timestamp() {
+                    // Without a runtime no provider is configured.
+                    let empty_catalog;
+                    let catalog = match ec_context.identity_runtime() {
+                        Some(runtime) => runtime.catalog(),
+                        None => {
+                            empty_catalog = ProviderCatalog::empty();
+                            &empty_catalog
+                        }
+                    };
+                    let opted_out = opted_out(&entry);
+                    let serve = ServeContext {
+                        now: UnixTime::from_secs(now),
+                        consent: ec_context.consent(),
+                        signals: PolicySignals::from_headers(req.headers()),
+                        catalog,
+                        opted_out: &opted_out,
+                    };
+                    if let Some(partner_uid) = entry
+                        .ids
+                        .get(&partner.source_domain)
+                        .filter(|record| record.w.is_none() || browser_context)
+                        .filter(|record| {
+                            partner
+                                .source_domain
+                                .parse::<SourceDomain>()
+                                .is_ok_and(|source| is_servable(&serve, &source, record))
+                        })
+                        .and_then(KvPartnerId::first_uid)
+                        .filter(|partner_uid| !partner_uid.is_empty())
+                    {
+                        uid = Some(partner_uid.to_owned());
+                    }
                 }
 
-                // Evaluate cluster size lazily for identify responses. Existing
-                // stored cluster_size values are reused without a prefix-list call.
-                match kv.evaluate_cluster(ec_id, &entry, generation) {
-                    Ok(size) => {
-                        cluster_size = size;
-                    }
-                    Err(err) => {
-                        log::warn!("Cluster evaluation failed for '{}': {err:?}", log_id(ec_id));
-                    }
-                }
+                // Reuse a stored cluster_size; otherwise count without writing.
+                // The writer stores the size, never this read path.
+                cluster_size = match entry
+                    .network
+                    .as_ref()
+                    .and_then(|network| network.cluster_size)
+                {
+                    Some(size) => Some(size),
+                    None => match kv.compute_cluster_size(ec_id) {
+                        Ok(size) => Some(size),
+                        Err(err) => {
+                            log::warn!(
+                                "Cluster evaluation failed for '{}': {err:?}",
+                                log_id(ec_id)
+                            );
+                            None
+                        }
+                    },
+                };
             }
         }
         Ok(None) => {}
@@ -124,13 +187,15 @@ pub fn handle_identify(
         }
     }
 
-    let eid = uid.as_ref().map(|u| Eid {
-        source: partner.source_domain.clone(),
-        uids: vec![Uid {
-            id: u.clone(),
-            atype: Some(partner.openrtb_atype),
-            ext: None,
-        }],
+    let eid = uid.as_ref().map(|u| {
+        Eid::new(
+            partner.source_domain.clone(),
+            vec![Uid {
+                id: u.clone(),
+                atype: Some(partner.openrtb_atype),
+                ext: None,
+            }],
+        )
     });
 
     let body = IdentifyResponse {
@@ -334,6 +399,12 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use crate::ec::identity::runtime::IdentityRuntime;
+    use crate::ec::identity::test_support::{example_entry_set, fixed_provider, full_record};
+    use crate::ec::kv_types::{KvEid, KvEntry, KvUid};
     use crate::ec::registry::PartnerRegistry;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
@@ -372,8 +443,9 @@ mod tests {
             pull_sync_enabled: false,
             pull_sync_url: None,
             pull_sync_allowed_domains: vec![],
-            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
-            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            removed_pull_sync_ttl_sec: None,
+            removed_pull_sync_rate_limit: None,
+            owner: None,
             ts_pull_token: None,
         }
     }
@@ -636,6 +708,258 @@ mod tests {
         assert!(
             body.get("eid").is_none(),
             "eid should be omitted when KV read fails"
+        );
+    }
+
+    fn identify_body(kv: &KvIdentityGraph, ec_id: &str) -> serde_json::Value {
+        identify_body_for(
+            kv,
+            ec_id,
+            make_test_partner("ssp.example.com", VALID_API_TOKEN),
+        )
+    }
+
+    fn identify_body_for(
+        kv: &KvIdentityGraph,
+        ec_id: &str,
+        partner: EcPartner,
+    ) -> serde_json::Value {
+        let settings = create_test_settings();
+        let partners = vec![partner];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let req = Request::builder()
+            .method("GET")
+            // Keep the host aligned with the shared settings fixture.
+            .uri("https://edge.test-publisher.com/identify") // allow-domain: edge.test-publisher.com
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(ec_id));
+
+        let response = handle_identify(&settings, kv, &registry, &req, &ec_context)
+            .expect("should construct identify response");
+        assert_eq!(response.status(), StatusCode::OK, "should answer 200");
+        serde_json::from_slice(&response.into_body().into_bytes().unwrap_or_default())
+            .expect("should decode identify response JSON")
+    }
+
+    #[test]
+    fn handle_identify_omits_an_expired_record_and_keeps_a_valid_one() {
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = KvEntry::minimal("ssp.example.com", "expired-uid", 1);
+        entry
+            .ids
+            .get_mut("ssp.example.com")
+            .expect("should hold the partner source")
+            .exp = Some(50);
+        entry.ids.insert(
+            "other.example.com".to_owned(),
+            KvPartnerId::new("valid-uid"),
+        );
+        let kv = KvIdentityGraph::in_memory("identify-store");
+        kv.create(&ec_id, &entry).expect("should seed KV entry");
+
+        let body = identify_body(&kv, &ec_id);
+
+        assert!(
+            body.get("uid").is_none() && body.get("eid").is_none(),
+            "should not return the expired ID"
+        );
+
+        let mut live = KvEntry::minimal("ssp.example.com", "live-uid", 1);
+        live.ids
+            .get_mut("ssp.example.com")
+            .expect("should hold the partner source")
+            .exp = Some(u64::MAX);
+        let kv = KvIdentityGraph::in_memory("identify-store");
+        kv.create(&ec_id, &live).expect("should seed KV entry");
+
+        let body = identify_body(&kv, &ec_id);
+
+        assert_eq!(body["uid"], "live-uid", "should return the unexpired ID");
+    }
+
+    /// Calls `/identify` for a row whose `ssp.example.com` record `writer`
+    /// wrote, with the provider `prov` configured, and `headers` on the
+    /// request. Returns the `uid` the response carries.
+    fn identify_uid_with_headers(writer: Option<&str>, headers: &[(&str, &str)]) -> Option<String> {
+        let settings = create_test_settings();
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = KvEntry::minimal("other.example.com", "other-uid", 1);
+        entry.ids.insert(
+            "ssp.example.com".to_owned(),
+            KvPartnerId {
+                w: writer.map(str::to_owned),
+                ..KvPartnerId::new("written-uid")
+            },
+        );
+        let kv = KvIdentityGraph::in_memory("identify-store");
+        kv.create(&ec_id, &entry).expect("should seed KV entry");
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut builder = Request::builder()
+            .method("GET")
+            // Keep the host aligned with the shared settings fixture.
+            .uri("https://edge.test-publisher.com/identify") // allow-domain: edge.test-publisher.com
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"));
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let req = builder
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec_context.set_identity_runtime(Arc::new(
+            IdentityRuntime::from_settings_with_providers(
+                &settings,
+                vec![fixed_provider("prov", &["ssp.example.com"])],
+                BTreeMap::new(),
+            )
+            .expect("should build the runtime"),
+        ));
+
+        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .expect("should construct identify response");
+        assert_eq!(response.status(), StatusCode::OK, "should answer 200");
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().into_bytes().unwrap_or_default())
+                .expect("should decode identify response JSON");
+        body["uid"].as_str().map(str::to_owned)
+    }
+
+    #[test]
+    fn identify_returns_a_provider_written_id_only_with_browser_context() {
+        // Keep the host aligned with the shared settings fixture.
+        const ORIGIN: (&str, &str) = ("origin", "https://www.test-publisher.com"); // allow-domain: www.test-publisher.com
+
+        assert_eq!(
+            identify_uid_with_headers(Some("prov"), &[ORIGIN, ("sec-fetch-site", "same-site")])
+                .as_deref(),
+            Some("written-uid"),
+            "should return it to a same-site browser call"
+        );
+        assert_eq!(
+            identify_uid_with_headers(Some("prov"), &[ORIGIN, ("sec-fetch-site", "same-origin")])
+                .as_deref(),
+            Some("written-uid"),
+            "should return it to a same-origin browser call"
+        );
+        for (headers, case) in [
+            (&[][..], "no Origin"),
+            (&[ORIGIN][..], "no Sec-Fetch-Site"),
+            (
+                &[ORIGIN, ("sec-fetch-site", "cross-site")][..],
+                "a cross-site fetch",
+            ),
+            (
+                &[ORIGIN, ("sec-fetch-site", "none")][..],
+                "a user-initiated fetch",
+            ),
+        ] {
+            assert_eq!(
+                identify_uid_with_headers(Some("prov"), headers),
+                None,
+                "should withhold it for {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn identify_returns_a_browser_seeded_id_without_browser_context() {
+        assert_eq!(
+            identify_uid_with_headers(None, &[]).as_deref(),
+            Some("written-uid"),
+            "should keep today's behaviour for an ID no provider wrote"
+        );
+    }
+
+    #[test]
+    fn identify_computes_cluster_size_without_writing() {
+        let (kv, store) = KvIdentityGraph::write_counting("identify-store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let entry = KvEntry::minimal("ssp.example.com", "example-uid", 1);
+        assert!(
+            entry.network.is_none(),
+            "should seed a row without a stored cluster size"
+        );
+        kv.create(&ec_id, &entry).expect("should seed KV entry");
+        store.reset_counts();
+
+        let body = identify_body(&kv, &ec_id);
+
+        assert!(body["cluster_size"].is_number(), "should report a size");
+        assert_eq!(store.writes().total(), 0, "should not write");
+    }
+
+    #[test]
+    fn identify_returns_the_first_uid_of_a_multi_entry_record_with_the_partner_atype() {
+        let (kv, _store) = KvIdentityGraph::write_counting("identify-store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = KvEntry::minimal("other.example.com", "other-uid", 1);
+        let set = [&["example-a", "example-b"][..], &["example-c"][..]]
+            .iter()
+            .enumerate()
+            .map(|(index, ids)| KvEid {
+                uids: ids
+                    .iter()
+                    .map(|id| KvUid {
+                        id: (*id).to_owned(),
+                        atype: Some(1),
+                        ext: None,
+                    })
+                    .collect(),
+                inserter: (index == 0).then(|| "example.com".to_owned()),
+                ..KvEid::default()
+            })
+            .collect();
+        entry
+            .ids
+            .insert("partner.example.com".to_owned(), full_record(None, set));
+        kv.create(&ec_id, &entry).expect("should seed KV entry");
+        let mut partner = make_test_partner("partner.example.com", VALID_API_TOKEN);
+        partner.openrtb_atype = 3;
+        partner.bidstream_enabled = true;
+
+        let body = identify_body_for(&kv, &ec_id, partner);
+
+        assert_eq!(
+            body["uid"],
+            serde_json::json!("example-a"),
+            "should return the first UID of the first entry"
+        );
+        assert_eq!(
+            body["eid"],
+            serde_json::json!({ "source": "partner.example.com", "uids": [{ "id": "example-a", "atype": 3 }] }),
+            "should return one UID with the partner's openrtb_atype, as for a one-UID record"
+        );
+    }
+
+    #[test]
+    fn handle_identify_returns_one_uid_for_a_full_record() {
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = KvEntry::minimal("other.example.com", "other-uid", 1);
+        entry.ids.insert(
+            "ssp.example.com".to_owned(),
+            full_record(None, example_entry_set()),
+        );
+        let kv = KvIdentityGraph::in_memory("identify-store");
+        kv.create(&ec_id, &entry).expect("should seed KV entry");
+
+        let body = identify_body(&kv, &ec_id);
+
+        assert_eq!(body["uid"], "example-a", "should return the first UID");
+        let expected = Eid::new(
+            "ssp.example.com".to_owned(),
+            vec![Uid {
+                id: "example-a".to_owned(),
+                atype: Some(EcPartner::default_openrtb_atype()),
+                ext: None,
+            }],
+        );
+        assert_eq!(
+            body["eid"],
+            serde_json::to_value(expected).expect("should serialize the expected EID"),
+            "should return the one-UID shape, never the full set"
         );
     }
 

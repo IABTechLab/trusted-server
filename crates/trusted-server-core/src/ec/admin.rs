@@ -6,6 +6,9 @@
 //! attach, so operators can debug KV-to-auction propagation without KV
 //! console access.
 //!
+//! Also serves `DELETE /_ts/admin/ec/{id}/providers/{provider}/opt-out`,
+//! which clears a provider's sticky opt-out.
+//!
 //! Also serves `GET /_ts/admin/eids`, which echoes the request's `ts-eids`
 //! and `sharedId` cookies with an ingestion preview — the client-side half
 //! of EID propagation that is never stored server-side.
@@ -26,13 +29,26 @@ use serde_json::Value as JsonValue;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
 
+use crate::consent::ConsentContext;
+use crate::consent::jurisdiction::Jurisdiction;
 use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use crate::cookies::extract_cookie_value;
 use crate::error::TrustedServerError;
 use crate::openrtb::Eid;
 
+use super::checked_current_timestamp;
 use super::eids::{resolve_partner_ids, to_eids};
 use super::generation::is_valid_ec_id;
+use super::identity::IdentityProviderId;
+use super::identity::IdentityRuntime;
+use super::identity::UnixTime;
+use super::identity::catalog::ProviderCatalog;
+use super::identity::input::ThreadRandom;
+use super::identity::mutation::{ApplyContext, IdentityMutation, ProviderStateChange};
+use super::identity::policy::PolicySignals;
+use super::identity::removal::{RemovalTiming, RemovalWriteOutcome, write_removals};
+use super::identity::request::opted_out;
+use super::identity::servable::ServeContext;
 use super::kv::KvIdentityGraph;
 use super::kv_backend::EcKvLookup;
 use super::kv_types::{KvEntry, KvMetadata};
@@ -276,6 +292,7 @@ struct SkippedPartnerId {
 pub fn handle_admin_ec_lookup(
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
+    runtime: Option<&IdentityRuntime>,
     req: &Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let Some(kv) = kv else {
@@ -297,12 +314,110 @@ pub fn handle_admin_ec_lookup(
     };
 
     log::info!("Admin EC lookup: returning entry for '{}'", log_id(&ec_id));
-    let payload = build_lookup_response(registry, kv.store_name(), ec_id, &lookup);
+    let payload = build_lookup_response(registry, runtime, kv.store_name(), ec_id, &lookup);
     let body =
         serde_json::to_string(&payload).change_context(TrustedServerError::Configuration {
             message: "failed to serialize admin EC lookup response".to_owned(),
         })?;
     Ok(json_response(StatusCode::OK, body))
+}
+
+/// Handles `DELETE /_ts/admin/ec/{id}/providers/{provider}/opt-out`.
+///
+/// Clears the provider's sticky opt-out `ps.o` by writing `oc = now`, which
+/// also empties `ps.ov` (spec 8). It runs the removal write's CAS loop and
+/// never reads the request's cookies or consent. Responds:
+///
+/// - `200 OK` with `{"cleared": true}` when the clear was written;
+/// - `400 Bad Request` for an invalid EC ID or provider ID;
+/// - `404 Not Found` when the row is missing or the provider holds no opt-out;
+/// - `405 Method Not Allowed` for any method but `DELETE`;
+/// - `501 Not Implemented` when no EC identity graph is configured;
+/// - `503 Service Unavailable` when the write did not land.
+#[must_use]
+pub fn handle_admin_opt_out_clear(
+    kv: Option<&KvIdentityGraph>,
+    req: &Request<EdgeBody>,
+) -> Response<EdgeBody> {
+    if req.method() != Method::DELETE {
+        let mut response = json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+        response
+            .headers_mut()
+            .insert(header::ALLOW, HeaderValue::from_static("DELETE"));
+        return response;
+    }
+    let Some(kv) = kv else {
+        return admin_ec_lookup_not_supported();
+    };
+    let Some((ec_id, provider)) = opt_out_path_parts(req.uri().path()) else {
+        return json_error(StatusCode::NOT_FOUND, "admin diagnostic route not found");
+    };
+    if !is_valid_ec_id(ec_id) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid EC ID format (expected {64hex}.{6alnum})",
+        );
+    }
+    let Ok(provider) = provider.parse::<IdentityProviderId>() else {
+        return json_error(StatusCode::BAD_REQUEST, "invalid identity provider ID");
+    };
+
+    let Some(now) = checked_current_timestamp() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the clock is unavailable, so the opt-out was not cleared",
+        );
+    };
+    let mut clear = IdentityMutation::default();
+    clear.merge_state(
+        provider.clone(),
+        ProviderStateChange {
+            opt_out_clear: Some(now),
+            ..ProviderStateChange::default()
+        },
+    );
+    let catalog = ProviderCatalog::empty();
+    let context = ApplyContext {
+        now,
+        random: &ThreadRandom,
+        catalog: &catalog,
+    };
+    match write_removals(kv, ec_id, &clear, &context, RemovalTiming::BeforeSend) {
+        RemovalWriteOutcome::Written => {
+            log::info!(
+                "Admin cleared the opt-out of identity provider '{provider}' for '{}'",
+                log_id(ec_id)
+            );
+            json_response(StatusCode::OK, r#"{"cleared":true}"#.to_owned())
+        }
+        RemovalWriteOutcome::NothingToWrite => json_error(
+            StatusCode::NOT_FOUND,
+            "no EC entry, or the provider holds no opt-out to clear",
+        ),
+        RemovalWriteOutcome::Failed => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the opt-out clear could not be written; retry",
+        ),
+    }
+}
+
+/// Splits `/_ts/admin/ec/{id}/providers/{provider}/opt-out` into its EC ID
+/// and provider ID, or `None` for any other shape.
+fn opt_out_path_parts(path: &str) -> Option<(&str, &str)> {
+    let mut segments = path
+        .strip_prefix(ADMIN_EC_PATH)?
+        .strip_prefix('/')?
+        .split('/');
+    let ec_id = segments.next()?;
+    let (Some("providers"), Some(provider), Some("opt-out"), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return None;
+    };
+    Some((ec_id, provider))
 }
 
 /// Returns the portable response used when an adapter has no EC KV backend.
@@ -368,12 +483,26 @@ fn requested_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeB
     Ok(ec_id)
 }
 
+/// Replaces every `ps.<provider>.st` with a marker. Provider state is never
+/// returned by the admin lookup (spec 6.1, 9.3).
+fn redact_provider_state(entry: &mut JsonValue) {
+    let Some(states) = entry.get_mut("ps").and_then(JsonValue::as_object_mut) else {
+        return;
+    };
+    for state in states.values_mut() {
+        if let Some(st) = state.get_mut("st") {
+            *st = JsonValue::String("[redacted]".to_owned());
+        }
+    }
+}
+
 /// Builds the success payload from a raw KV lookup.
 ///
 /// Parse failures are reported in the payload rather than propagated, so
 /// corrupt entries remain inspectable.
 fn build_lookup_response(
     registry: &PartnerRegistry,
+    runtime: Option<&IdentityRuntime>,
     store_name: &str,
     ec_id: String,
     lookup: &EcKvLookup,
@@ -393,14 +522,26 @@ fn build_lookup_response(
 
     match serde_json::from_slice::<JsonValue>(&lookup.body) {
         Ok(mut entry_json) => {
+            redact_provider_state(&mut entry_json);
             add_iso_timestamp_companions(&mut entry_json);
             payload.entry = Some(entry_json);
 
             match serde_json::from_slice::<KvEntry>(&lookup.body) {
-                Ok(entry) => {
+                Ok(mut entry) => {
                     payload.tombstone = Some(!entry.consent.ok);
-                    match entry.validate() {
-                        Ok(()) => payload.auction = Some(build_auction_view(registry, &entry)),
+                    // Upgrade first so the auction view matches what the read
+                    // path serves, with invalid records dropped.
+                    let upgraded = entry
+                        .upgrade_for_read()
+                        .and_then(|dropped| entry.validate().map(|()| dropped));
+                    match upgraded {
+                        Ok(dropped) => {
+                            payload.auction = Some(build_auction_view(registry, &entry, runtime));
+                            if !dropped.is_empty() {
+                                payload.entry_error =
+                                    Some(format!("dropped on read: {}", dropped.join("; ")));
+                            }
+                        }
                         Err(message) => {
                             payload.entry_error = Some(format!(
                                 "entry failed validation (auction reads fail closed \
@@ -481,19 +622,57 @@ fn iso_timestamp(unix_seconds: u64) -> Option<String> {
 
 /// Derives the auction EID view for a valid entry, mirroring the filters in
 /// [`resolve_partner_ids`] and reporting why each stored ID was skipped.
-fn build_auction_view(registry: &PartnerRegistry, entry: &KvEntry) -> AuctionEidsView {
-    let resolved = resolve_partner_ids(registry, entry);
+fn build_auction_view(
+    registry: &PartnerRegistry,
+    entry: &KvEntry,
+    runtime: Option<&IdentityRuntime>,
+) -> AuctionEidsView {
+    // The admin view has no request, so it reads with permissive consent. A
+    // failed clock resolves no KV IDs, as the auction does (spec 4.4).
+    let consent = ConsentContext {
+        jurisdiction: Jurisdiction::NonRegulated,
+        ..ConsentContext::default()
+    };
+    let empty_catalog;
+    let catalog = match runtime {
+        Some(runtime) => runtime.catalog(),
+        None => {
+            empty_catalog = ProviderCatalog::empty();
+            &empty_catalog
+        }
+    };
+    let opted_out = opted_out(entry);
+    let now = checked_current_timestamp();
+    let serve = ServeContext {
+        now: UnixTime::from_secs(now.unwrap_or(0)),
+        consent: &consent,
+        signals: PolicySignals::default(),
+        catalog,
+        opted_out: &opted_out,
+    };
+    let resolved = if now.is_some() {
+        resolve_partner_ids(registry, entry, &serve)
+    } else {
+        Vec::new()
+    };
     let eids = to_eids(&resolved);
 
     let mut skipped = Vec::new();
     for (source_domain, partner_uid) in &entry.ids {
-        let reason = if partner_uid.uid.is_empty() {
+        let reason = if partner_uid.first_uid().is_none_or(str::is_empty) {
             "empty_uid"
         } else {
             match registry.get(source_domain) {
                 None => "not_in_registry",
                 Some(partner) if !partner.bidstream_enabled => "bidstream_disabled",
-                Some(_) => continue,
+                Some(_)
+                    if resolved
+                        .iter()
+                        .any(|item| item.source_domain == *source_domain) =>
+                {
+                    continue;
+                }
+                Some(_) => "not_servable",
             }
         };
         skipped.push(SkippedPartnerId {
@@ -684,7 +863,7 @@ mod tests {
     use super::*;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{EcKvStore as _, EcKvWrite, EcKvWriteMode};
-    use crate::ec::kv_types::KvPartnerId;
+    use crate::ec::kv_types::{KvPartnerId, KvProviderState};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
 
@@ -703,8 +882,9 @@ mod tests {
             pull_sync_enabled: false,
             pull_sync_url: None,
             pull_sync_allowed_domains: vec![],
-            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
-            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            removed_pull_sync_ttl_sec: None,
+            removed_pull_sync_rate_limit: None,
+            owner: None,
             ts_pull_token: None,
         }
     }
@@ -778,15 +958,11 @@ mod tests {
         let mut entry = KvEntry::minimal("bidstream.example", "uid-live", 1_741_824_000);
         entry.ids.insert(
             "disabled.example".to_owned(),
-            KvPartnerId {
-                uid: "uid-disabled".to_owned(),
-            },
+            KvPartnerId::new("uid-disabled"),
         );
         entry.ids.insert(
             "unknown.example".to_owned(),
-            KvPartnerId {
-                uid: "uid-unknown".to_owned(),
-            },
+            KvPartnerId::new("uid-unknown"),
         );
         entry
     }
@@ -971,13 +1147,156 @@ mod tests {
         }
     }
 
+    fn admin_lookup_body_for_test(entry: &KvEntry) -> serde_json::Value {
+        let ec_id = test_ec_id();
+        let kv = kv_with_entry(&ec_id, entry);
+        let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
+
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
+            .expect("should handle lookup");
+        response_json(response)
+    }
+
+    #[test]
+    fn admin_lookup_redacts_provider_state() {
+        let mut entry = KvEntry::minimal("example.com", "example-uid", 1_760_000_000);
+        entry.ps.insert(
+            "id5".to_owned(),
+            KvProviderState {
+                n: Some(5),
+                st: Some(serde_json::json!({ "signature": "secret-state" })),
+                ..KvProviderState::default()
+            },
+        );
+        let body = admin_lookup_body_for_test(&entry);
+
+        assert_eq!(
+            body["entry"]["ps"]["id5"]["st"],
+            serde_json::json!("[redacted]"),
+            "should redact the state"
+        );
+        assert_eq!(
+            body["entry"]["ps"]["id5"]["n"],
+            serde_json::json!(5),
+            "should keep the rest of ps"
+        );
+        assert_eq!(
+            body["entry"]["ids"]["example.com"]["eids"][0]["uids"][0]["id"],
+            serde_json::json!("example-uid"),
+            "should keep the ids"
+        );
+        assert!(
+            !body.to_string().contains("secret-state"),
+            "should never return the provider state"
+        );
+    }
+
+    #[test]
+    fn admin_lookup_reports_records_dropped_on_read() {
+        let ec_id = test_ec_id();
+        let body = serde_json::json!({
+            "v": 2,
+            "created": 1_741_824_000_u64,
+            "consent": { "ok": true, "updated": 1_741_824_000_u64 },
+            "geo": { "country": "US" },
+            "ids": {
+                "bidstream.example": { "eids": [{ "uids": [{ "id": "uid-live" }] }] },
+                "blank.example": { "eids": [{ "uids": [{ "id": " " }] }] }
+            }
+        })
+        .to_string();
+        let kv = kv_with_raw_body(&ec_id, &body);
+        let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
+
+        let json = response_json(
+            handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
+                .expect("should handle lookup"),
+        );
+
+        let error = json["entry_error"].as_str().expect("should report a drop");
+        assert!(
+            error.starts_with("dropped on read: ") && error.contains("blank.example"),
+            "should name the dropped source, got {error}"
+        );
+        assert_eq!(
+            json["auction"]["eids"][0]["source"], "bidstream.example",
+            "should build the auction view from the surviving record"
+        );
+    }
+
+    #[test]
+    fn admin_view_serves_generic_pull_records_with_the_runtime_catalog() {
+        use crate::ec::identity::test_support::{ec_partner, record_for_test};
+        use crate::test_support::tests::create_test_settings;
+
+        let mut partner = ec_partner(
+            "ssp.example.com",
+            "https://sync.ssp.example.com/pull",
+            "example-token-value-0123456789abcdef",
+        );
+        partner.api_token = Some(crate::redacted::Redacted::new(
+            "token-ssp-example-com-32-bytes-minimum".to_owned(),
+        ));
+        let registry = PartnerRegistry::from_config(std::slice::from_ref(&partner))
+            .expect("should build registry");
+        let mut settings = create_test_settings();
+        settings.ec.partners = vec![partner];
+        let runtime = IdentityRuntime::from_settings(
+            &settings,
+            &crate::integrations::IntegrationRegistry::default(),
+        )
+        .expect("should build the runtime");
+        let mut entry = KvEntry::minimal("other.example.com", "other", 1);
+        entry.ids.insert(
+            "ssp.example.com".to_owned(),
+            record_for_test("pulled-uid", Some("pull-ssp-example-com"), 1),
+        );
+
+        let with_runtime = build_auction_view(&registry, &entry, Some(&runtime));
+        let without_runtime = build_auction_view(&registry, &entry, None);
+
+        assert!(
+            with_runtime
+                .eids
+                .iter()
+                .any(|eid| eid.source == "ssp.example.com"),
+            "should serve the pulled record when the runtime's catalog holds its writer"
+        );
+        assert!(
+            without_runtime
+                .eids
+                .iter()
+                .all(|eid| eid.source != "ssp.example.com"),
+            "control: should not serve it without a runtime"
+        );
+    }
+
+    #[test]
+    fn auction_view_reports_an_expired_record_as_not_servable() {
+        let mut entry = KvEntry::minimal("bidstream.example", "uid-expired", 1_741_824_000);
+        entry
+            .ids
+            .get_mut("bidstream.example")
+            .expect("should hold the source")
+            .exp = Some(50);
+
+        let view = build_auction_view(&test_registry(), &entry, None);
+
+        assert!(view.eids.is_empty(), "should not resolve the expired ID");
+        assert_eq!(view.skipped.len(), 1, "should explain the dropped ID");
+        assert_eq!(
+            view.skipped[0].reason, "not_servable",
+            "should report the servability reason"
+        );
+    }
+
     #[test]
     fn returns_entry_with_auction_view() {
         let ec_id = test_ec_id();
         let kv = kv_with_entry(&ec_id, &sample_entry());
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -995,7 +1314,7 @@ mod tests {
         assert_eq!(json["store"], "test-store");
         assert_eq!(json["tombstone"], false);
         assert_eq!(
-            json["entry"]["ids"]["bidstream.example"]["uid"], "uid-live",
+            json["entry"]["ids"]["bidstream.example"]["eids"][0]["uids"][0]["id"], "uid-live",
             "should echo the stored entry verbatim"
         );
         assert_eq!(
@@ -1073,7 +1392,7 @@ mod tests {
         let kv = kv_with_raw_body_and_metadata(&ec_id, &body, &metadata);
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
         let json = response_json(response);
 
@@ -1100,7 +1419,7 @@ mod tests {
         let kv = kv_with_raw_body(&ec_id, &body);
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
         let json = response_json(response);
 
@@ -1132,7 +1451,7 @@ mod tests {
         );
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1152,7 +1471,7 @@ mod tests {
         let kv = KvIdentityGraph::in_memory("test-store");
         let req = get_request(&format!("/_ts/admin/ec/{}", test_ec_id()));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1163,7 +1482,7 @@ mod tests {
         let kv = KvIdentityGraph::in_memory("test-store");
         let req = get_request("/_ts/admin/ec/not-a-valid-id");
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -1175,7 +1494,7 @@ mod tests {
         let kv = kv_with_raw_body(&ec_id, "not json at all");
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(
@@ -1216,7 +1535,7 @@ mod tests {
         let kv = kv_with_raw_body(&ec_id, &body);
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1241,7 +1560,7 @@ mod tests {
         let kv = kv_with_entry(&ec_id, &sample_entry());
         let req = get_request_with_cookie("/_ts/admin/ec", &format!("other=1; ts-ec={ec_id}; x=2"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1266,7 +1585,7 @@ mod tests {
             &format!("ts-ec={stale_ec_id}; ts-ec={live_ec_id}"),
         );
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1283,7 +1602,7 @@ mod tests {
         let kv = KvIdentityGraph::in_memory("test-store");
         let req = get_request("/_ts/admin/ec");
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1301,8 +1620,8 @@ mod tests {
     fn missing_identity_graph_returns_501() {
         let req = get_request(&format!("/_ts/admin/ec/{}", test_ec_id()));
 
-        let response =
-            handle_admin_ec_lookup(None, &test_registry(), &req).expect("should handle lookup");
+        let response = handle_admin_ec_lookup(None, &test_registry(), None, &req)
+            .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
@@ -1336,7 +1655,7 @@ mod tests {
         let kv = KvIdentityGraph::failing("broken-store");
         let req = get_request(&format!("/_ts/admin/ec/{}", test_ec_id()));
 
-        let result = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req);
+        let result = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req);
 
         assert!(result.is_err(), "should propagate KV read failures");
     }
@@ -1479,6 +1798,33 @@ mod tests {
     }
 
     #[test]
+    fn eids_lookup_reports_non_array_cookie_as_parse_error() {
+        let payload = BASE64.encode(br#"{"a":1}"#);
+        let req = get_request_with_cookie("/_ts/admin/eids", &format!("ts-eids={payload}"));
+
+        let response =
+            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+
+        let json = response_json(response);
+        assert_eq!(json["cookie_present"], true);
+        assert!(
+            json["parse_error"]
+                .as_str()
+                .expect("should have parse_error")
+                .contains("ts-eids"),
+            "should describe the parse failure"
+        );
+        assert!(json.get("eids").is_none(), "should omit unparsed eids");
+        assert!(
+            json["ingest"]["matched"]
+                .as_array()
+                .expect("should have matched list")
+                .is_empty(),
+            "non-array cookie should preview no matches"
+        );
+    }
+
+    #[test]
     fn eids_lookup_reports_parse_error() {
         let req = get_request_with_cookie("/_ts/admin/eids", "ts-eids=!!!not-base64!!!");
 
@@ -1532,5 +1878,138 @@ mod tests {
         assert_eq!(matched.len(), 1, "should match the sharedid partner");
         assert_eq!(matched[0]["source_domain"], "sharedid.org");
         assert_eq!(matched[0]["uid"], "shared-uid-123");
+    }
+
+    const OPT_OUT_PROVIDER: &str = "pull-ssp-example-com";
+
+    fn opt_out_path(ec_id: &str, provider: &str) -> String {
+        format!("/_ts/admin/ec/{ec_id}/providers/{provider}/opt-out")
+    }
+
+    fn opted_out_entry() -> KvEntry {
+        let mut entry = sample_entry();
+        entry.ps.insert(
+            OPT_OUT_PROVIDER.to_owned(),
+            KvProviderState {
+                o: Some(crate::ec::kv_types::KvOptOut {
+                    at: 1_000,
+                    fp: "800".to_owned(),
+                }),
+                ov: vec!["0123456789abcdef".to_owned()],
+                ..KvProviderState::default()
+            },
+        );
+        entry.ps.insert(
+            "other-provider".to_owned(),
+            KvProviderState {
+                ov: vec!["fedcba9876543210".to_owned()],
+                ..KvProviderState::default()
+            },
+        );
+        entry
+    }
+
+    #[test]
+    fn admin_clears_provider_opt_out() {
+        let ec_id = test_ec_id();
+        let kv = kv_with_entry(&ec_id, &opted_out_entry());
+
+        let response = handle_admin_opt_out_clear(
+            Some(&kv),
+            &request_with_method(
+                http::Method::DELETE,
+                &opt_out_path(&ec_id, OPT_OUT_PROVIDER),
+            ),
+        );
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should clear the opt-out"
+        );
+        assert_eq!(
+            response_json(response),
+            serde_json::json!({ "cleared": true }),
+            "should report the clear"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read the row")
+            .expect("should hold the row");
+        let state = stored
+            .ps
+            .get(OPT_OUT_PROVIDER)
+            .expect("should keep the provider state");
+        assert!(
+            state.oc.is_some_and(|clear| clear > 1_000),
+            "should store the clear as oc"
+        );
+        assert!(state.ov.is_empty(), "should empty ps.ov");
+        assert_eq!(
+            stored
+                .ps
+                .get("other-provider")
+                .map(|other| other.ov.clone()),
+            Some(vec!["fedcba9876543210".to_owned()]),
+            "control: another provider's state should be untouched"
+        );
+    }
+
+    #[test]
+    fn admin_opt_out_clear_rejects_what_it_cannot_clear() {
+        let ec_id = test_ec_id();
+        let kv = kv_with_entry(&ec_id, &opted_out_entry());
+        let delete = |path: &str| {
+            handle_admin_opt_out_clear(Some(&kv), &request_with_method(http::Method::DELETE, path))
+                .status()
+        };
+
+        assert_eq!(
+            delete(&opt_out_path(&ec_id, "other-provider")),
+            StatusCode::NOT_FOUND,
+            "should not find an opt-out the provider does not hold"
+        );
+        assert_eq!(
+            delete(&opt_out_path("not-an-ec-id", OPT_OUT_PROVIDER)),
+            StatusCode::BAD_REQUEST,
+            "should reject an invalid EC ID"
+        );
+        assert_eq!(
+            delete(&opt_out_path(&ec_id, "Not_A_Provider")),
+            StatusCode::BAD_REQUEST,
+            "should reject an invalid provider ID"
+        );
+        let get = handle_admin_opt_out_clear(
+            Some(&kv),
+            &get_request(&opt_out_path(&ec_id, OPT_OUT_PROVIDER)),
+        );
+        assert_eq!(
+            get.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "should accept only DELETE"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read the row")
+            .expect("should hold the row");
+        assert!(
+            stored
+                .ps
+                .get(OPT_OUT_PROVIDER)
+                .is_some_and(|state| state.oc.is_none() && !state.ov.is_empty()),
+            "control: no rejected request should clear the opt-out"
+        );
+        assert_eq!(
+            handle_admin_opt_out_clear(
+                None,
+                &request_with_method(
+                    http::Method::DELETE,
+                    &opt_out_path(&ec_id, OPT_OUT_PROVIDER)
+                ),
+            )
+            .status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "should report an unconfigured identity graph"
+        );
     }
 }

@@ -25,6 +25,7 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::finalize::BrowserSeed;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::{RuntimeRequestOrigin, sanitize_forwarded_headers};
@@ -44,6 +45,7 @@ use trusted_server_core::publisher::{
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
+use trusted_server_core::request_timing::RequestTimingMiddleware;
 use trusted_server_core::settings::Settings;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::settings_data::{default_config_key, default_secret_store_name};
@@ -223,7 +225,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 18] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -231,6 +233,10 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
         ("/_ts/admin/keys/deactivate", &[Method::POST]),
         ("/_ts/admin/ec", &[Method::GET]),
         ("/_ts/admin/ec/{id}", &[Method::GET]),
+        (
+            "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
+            &[Method::DELETE],
+        ),
         ("/_ts/admin/eids", &[Method::GET]),
         ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
@@ -827,6 +833,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         kv: None,
                         ec_context: &mut ec_context,
                         services: &services,
+                        is_real_browser: false,
+                        seed: &BrowserSeed::empty(),
                         req,
                     })
                     .await
@@ -894,6 +902,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // any middleware registered ahead of it would observe the
             // shared-secret authentication header.
             .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
+            .middleware(RequestTimingMiddleware::default().with_excluded_paths(&["/health"]))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             // Innermost middleware: normalize every routed request (strip
@@ -927,6 +936,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // adapter has no store to read.
             .get("/_ts/admin/ec", admin_ec_not_supported_handler)
             .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
+            // The provider opt-out clear writes the EC identity graph, so it
+            // answers like the lookup.
+            .delete(
+                "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
+                admin_ec_not_supported_handler,
+            )
             .get("/_ts/admin/eids", admin_eids_handler)
             .post("/auction", auction_handler)
             .get(PAGE_BIDS_PATH, page_bids_handler.clone())

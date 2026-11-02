@@ -47,6 +47,16 @@ For example, `/integrations/lockr/api/example?mode=test` forwards to `https://id
 
 ### SDK URL rewriting
 
+Server-side attribute rewriting and the browser script guard recognize only
+`aim.loc.kr` and `identity.loc.kr` URLs whose pathname contains
+`identity-lockr` and ends in `.js`, case-insensitively. Absolute HTTP(S) and
+protocol-relative URLs are supported. Other scripts on those hosts, lookalike
+hosts, and vendor names embedded in another URL's path or query are not claimed.
+
+Query strings and fragments do not prevent SDK recognition. Matching URLs use
+`/integrations/lockr/sdk`, which serves the configured `sdk_url`; the original
+query and fragment are not forwarded to upstream.
+
 With `rewrite_sdk = true`, the server rewrites matching Lockr SDK URLs in HTML to an absolute first-party URL ending in `/integrations/lockr/sdk`, using the request scheme and request host. An external `<base href>` does not redirect the rewritten SDK load to another origin.
 
 The Lockr browser module also intercepts matching dynamically inserted SDK scripts and preload or prefetch links. It rewrites them to `window.location.origin` plus `/integrations/lockr/sdk`. This interception remains active when `rewrite_sdk = false`; that setting controls server-side HTML attribute rewriting only.
@@ -58,6 +68,40 @@ These rewrites load the configured `sdk_url`, not necessarily the SDK version na
 The default `identity-lockr-trust-server.js` SDK uses the relative API prefix `/integrations/lockr/api`. The browser module wraps `XMLHttpRequest.open` to turn root-relative URLs under that prefix into absolute page-origin URLs. This keeps those XHR requests first-party even when the page has an external `<base href>`.
 
 The guard does not intercept `fetch` or `sendBeacon`. It does not reroute arbitrary absolute third-party API URLs. It neither changes private SDK host fields nor polls for SDK initialization.
+
+## EID forwarding
+
+The Lockr SDK writes its ID5 EID into Prebid's first-party data with
+`pbjs.setConfig({ ortb2: { user: { ext: { eids } } } })`. Prebid includes it in
+the `trustedServer` bidder request, and the adapter forwards it to `/auction`
+with its EID-level fields, for example:
+
+```json
+{
+  "source": "id5-sync.com",
+  "inserter": "inserter.example.com",
+  "mm": 2,
+  "uids": [{ "id": "fictional-id5-id", "atype": 1 }]
+}
+```
+
+The SDK writes the EID after its own network call, so the first auction on a
+page may run before it is available. Later auctions include it, and requests
+without an EID body get it from the `ts-eids` cookie and KV.
+
+To store the ID in the EC identity graph, register the source:
+
+```toml
+[[ec.partners]]
+name = "ID5 via Lockr"
+source_domain = "id5-sync.com"
+bidstream_enabled = true
+```
+
+Where GDPR applies and Prebid's TCF enforcement is active, Prebid sends the
+`trustedServer` adapter no EIDs unless the publisher grants the exception
+described in
+[TCF and the `trustedServer` adapter](./prebid.md#tcf-and-the-trustedserver-adapter).
 
 ## Migration from the SDK-host shim
 
@@ -76,3 +120,11 @@ In browser developer tools, check that the SDK loads from the page origin at `/i
 If API calls still go directly to a third-party host, inspect the actual SDK loaded. Check `sdk_url`, unreplaced static tags, and custom SDK routing rather than enabling `rewrite_sdk_host`.
 
 See the [configuration reference](/guide/configuration) for the full integration settings.
+
+### Missing EIDs in bid requests
+
+- Confirm `pbjs.getEvents()` shows a `bidRequested` event for `trustedServer`
+  whose `ortb2.user.ext.eids` contains the `id5-sync.com` entry.
+- Under GDPR, confirm the publisher's Prebid config grants `trustedServer` the
+  full TCF exception.
+- Decode the `/auction` response's `x-ts-eids` header to see what was forwarded.

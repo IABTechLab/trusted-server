@@ -9,6 +9,7 @@ use error_stack::{Report, ResultExt, ensure};
 use http::{HeaderValue, Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use url::Url;
 use uuid::Uuid;
@@ -45,7 +46,10 @@ use super::types::{
 pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
     pub config: Option<JsonValue>,
-    pub eids: Option<JsonValue>,
+    /// Browser EIDs, captured as raw JSON so a malformed entry (for example a
+    /// lone surrogate escape) cannot fail the whole body. Each entry is
+    /// validated on its own by the shared client EID parser.
+    pub eids: Option<Box<RawValue>>,
 }
 
 /// A single ad placement in an [`AdRequest`].
@@ -348,10 +352,30 @@ pub fn convert_to_openrtb_response(
     auction_request: &AuctionRequest,
     ec_allowed: bool,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    Ok(
-        convert_to_openrtb_response_with_report(result, settings, auction_request, ec_allowed)?
-            .response,
-    )
+    convert_to_openrtb_response_with_mirror(result, settings, auction_request, ec_allowed, None)
+}
+
+/// Like [`convert_to_openrtb_response`], carrying the `ts-eids-s` mirror
+/// payload as `ext.ts_eids_s` (spec 6.2).
+///
+/// # Errors
+///
+/// Returns an error if response serialization fails.
+pub(crate) fn convert_to_openrtb_response_with_mirror(
+    result: &OrchestrationResult,
+    settings: &Settings,
+    auction_request: &AuctionRequest,
+    ec_allowed: bool,
+    ts_eids_s: Option<serde_json::Value>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    Ok(convert_to_openrtb_response_with_report(
+        result,
+        settings,
+        auction_request,
+        ec_allowed,
+        ts_eids_s,
+    )?
+    .response)
 }
 
 pub(crate) fn convert_to_openrtb_response_with_report(
@@ -359,8 +383,16 @@ pub(crate) fn convert_to_openrtb_response_with_report(
     settings: &Settings,
     auction_request: &AuctionRequest,
     ec_allowed: bool,
+    ts_eids_s: Option<serde_json::Value>,
 ) -> Result<OpenRtbResponseConversion, Report<TrustedServerError>> {
-    convert_to_openrtb_response_with_trace(result, settings, auction_request, ec_allowed, None)
+    convert_to_openrtb_response_with_trace(
+        result,
+        settings,
+        auction_request,
+        ec_allowed,
+        None,
+        ts_eids_s,
+    )
 }
 
 pub(crate) fn convert_to_openrtb_response_with_trace(
@@ -369,6 +401,7 @@ pub(crate) fn convert_to_openrtb_response_with_trace(
     auction_request: &AuctionRequest,
     ec_allowed: bool,
     trace: Option<&TraceAuctionCarry>,
+    ts_eids_s: Option<serde_json::Value>,
 ) -> Result<OpenRtbResponseConversion, Report<TrustedServerError>> {
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
     let rewrite_creatives = settings.auction.rewrite_creatives;
@@ -541,6 +574,7 @@ pub(crate) fn convert_to_openrtb_response_with_trace(
                 dropped_winner_count: delivery.dropped_winner_count,
                 dropped_winner_reasons: delivery.dropped_winner_reasons.clone(),
             },
+            ts_eids_s,
         }
         .to_ext(),
         ..Default::default()
@@ -595,12 +629,16 @@ mod tests {
         AuctionPlan, AuctionPlanConfig, NotificationConfig, ProviderConfig, ProviderId, RoutingMode,
     };
     use crate::auction::routing::route_auction;
+    use crate::auction::test_support::{
+        repeated_source_provenance_eids, repeated_source_provenance_eids_json,
+    };
     use crate::auction::types::{
         ApsRendererV1, ApsTagType, AuctionResponse, Bid, BidRenderer, BidStatus,
     };
     use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use http::Method;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -848,16 +886,43 @@ mod tests {
     }
 
     #[test]
+    fn eid_header_carries_provenance_fields_and_repeated_sources() {
+        let mut request = make_auction_request();
+        request.user.eids = Some(repeated_source_provenance_eids());
+
+        let response =
+            convert_to_openrtb_response(&make_empty_result(), &make_settings(), &request, true)
+                .expect("should build response");
+
+        let header = response
+            .headers()
+            .get(&HEADER_X_TS_EIDS)
+            .and_then(|value| value.to_str().ok())
+            .expect("should include x-ts-eids");
+        let decoded: serde_json::Value = serde_json::from_slice(
+            &BASE64
+                .decode(header)
+                .expect("should decode x-ts-eids base64"),
+        )
+        .expect("should parse x-ts-eids JSON");
+        assert_eq!(
+            decoded,
+            repeated_source_provenance_eids_json(),
+            "x-ts-eids should show both entries with their own EID-level fields"
+        );
+    }
+
+    #[test]
     fn response_includes_eid_headers_when_eids_present() {
         let mut request = make_auction_request();
-        request.user.eids = Some(vec![Eid {
-            source: "ssp.com".to_owned(),
-            uids: vec![Uid {
+        request.user.eids = Some(vec![Eid::new(
+            "ssp.com".to_owned(),
+            vec![Uid {
                 id: "uid-1".to_owned(),
                 atype: Some(3),
                 ext: None,
             }],
-        }]);
+        )]);
 
         let settings = make_settings();
         let result = make_empty_result();
@@ -1634,9 +1699,14 @@ mod tests {
             metadata: HashMap::new(),
         };
 
-        let conversion =
-            convert_to_openrtb_response_with_report(&result, &settings, &auction_request, false)
-                .expect("should omit invalid winners and preserve valid slots");
+        let conversion = convert_to_openrtb_response_with_report(
+            &result,
+            &settings,
+            &auction_request,
+            false,
+            None,
+        )
+        .expect("should omit invalid winners and preserve valid slots");
         assert_eq!(
             conversion.delivery.delivered_winner_slots,
             HashSet::from(["ordinary".to_string(), "renderer".to_string()]),
@@ -1959,9 +2029,14 @@ mod tests {
         let auction_request = make_auction_request();
         let result = make_result(make_bid("div-gpt-top", "appnexus", None));
 
-        let conversion =
-            convert_to_openrtb_response_with_report(&result, &settings, &auction_request, false)
-                .expect("should omit a winner without a decoded price");
+        let conversion = convert_to_openrtb_response_with_report(
+            &result,
+            &settings,
+            &auction_request,
+            false,
+            None,
+        )
+        .expect("should omit a winner without a decoded price");
         assert!(conversion.delivery.delivered_winner_slots.is_empty());
         assert_eq!(conversion.delivery.dropped_winner_count, 1);
         assert_eq!(
@@ -2030,6 +2105,7 @@ mod tests {
                     &auction,
                     false,
                     Some(&carry),
+                    None,
                 )
                 .expect("should preserve ordinary response conversion");
 
@@ -2108,6 +2184,7 @@ mod tests {
                 &auction,
                 false,
                 Some(&carry),
+                None,
             )
             .expect("should not fail bids on trace projection failure");
 
@@ -2129,9 +2206,10 @@ mod tests {
             let auction = make_auction_request();
             let result = make_empty_result();
 
-            let conversion =
-                convert_to_openrtb_response_with_trace(&result, &settings, &auction, false, None)
-                    .expect("should preserve trace-off conversion");
+            let conversion = convert_to_openrtb_response_with_trace(
+                &result, &settings, &auction, false, None, None,
+            )
+            .expect("should preserve trace-off conversion");
 
             assert!(
                 !conversion

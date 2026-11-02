@@ -84,11 +84,70 @@ passphrase = "ec_passphrase"
 # bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
 # logical KV id is `trusted_server_kv`.
 ec_store = "ec_identity_store"
-# Max concurrent partner pull-sync requests.
-pull_sync_concurrency = 3
 # Optional cluster-heuristic tuning (defaults shown):
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
+# Also strip the ts-eids cookie from publisher-origin requests. The
+# __Host-ts-eids-s mirror is always stripped.
+# strip_eids_cookie_from_origin = false
+
+# Server-side identity provider policy. Every key is optional; the values
+# below are the defaults.
+# [ec.identity]
+# Max identity providers dispatched at once. Replaces the removed
+# ec.pull_sync_concurrency.
+# max_concurrency = 4
+# Total time a navigation may wait for hold-mode providers (at most 1000).
+# hold_budget_ms = 100
+# Seconds before a provider that timed out in hold mode is held again.
+# hold_retry_sec = 300
+# Largest provider response body accepted, in bytes.
+# max_response_bytes = 65536
+# Backend requests one execution may start: origin, auction and provider
+# calls together. Fastly allows 32 (10 on trial accounts).
+# max_backend_requests = 32
+# Return the __Host-ts-eids-s mirror payload from /auction and
+# /_ts/page-bids. Off until a page script that reads it is named.
+# mirror_enabled = false
+# Seconds a same-origin /_ts/page-bids call from a real browser waits after the
+# row's last write before writing itself, for single-page apps. 0 turns it off.
+# spa_writer_interval_sec = 300
+
+# Per-provider policy; the table name is the identity provider ID. A pull
+# partner (`pull_sync_enabled = true`) registers as `pull-` plus its source
+# domain with dots replaced by `-`, so `ssp.example.com` is
+# `pull-ssp-example-com`. These keys replace the removed per-partner
+# `pull_sync_ttl_sec` (now `refresh_after_sec`) and `pull_sync_rate_limit = N`
+# (now `max_calls_per_minute = ceil(N / 60)`).
+# [ec.identity.providers.pull-ssp-example-com]
+# mode = "after_send"             # or "hold"
+# timeout_ms = 100                # hold mode only; at most hold_budget_ms
+# after_send_timeout_ms = 1000    # 1..=10000
+# refresh_after_sec = 86400
+# max_calls_per_minute = 1
+# max_calls_per_ip_per_minute = 10  # 0 turns the per-IP ceiling off
+# breaker_failures_per_minute = 50
+# cookie_priority = 0
+
+# Capture provider (a vendor whose responses Trusted Server proxies; the
+# provider declares `captures`). A capture-only provider must list its
+# `sources`: its opt-out removes browser-ingested records of every source
+# listed here, so list only the sources it is the delivery path for. Each
+# source also needs an [[ec.partners]] entry with bidstream_enabled = true.
+# [ec.identity.providers.examplecapture]
+# sources = ["capture.example.com"]
+# `provider` (default) removes only this provider's records. `global` runs
+# the consent-withdrawal tombstone for a captured opt-out from a real browser.
+# revoke_scope = "provider"
+
+# A source can name the identity provider that owns it. The owner refreshes the
+# source and its result replaces the source's whole entry set. Absent: unowned.
+# [[ec.partners]]
+# name = "Example ID"
+# source_domain = "exampleid.example.com"
+# openrtb_atype = 1
+# bidstream_enabled = true
+# owner = "exampleid"
 
 # Example partner configuration. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.
@@ -353,6 +412,17 @@ provider = "pbs-main"
 # inventory_domain = "publisher.example"
 # inventory_page_origin = "https://www.publisher.example"
 
+[observability]
+# Keep this leaf present so the environment override can apply; the overlay
+# cannot create a missing configuration leaf. The Server-Timing header stays
+# off until enabled.
+server_timing_enabled = false
+# Keep selected first path segments in access-telemetry route templates.
+# Set this array in TOML; the environment overlay cannot set arrays.
+# Use ASCII names; "other" shares the fallback bucket. Matching uses the raw,
+# percent-encoded path, so literal non-ASCII names do not match encoded URLs.
+# route_sections = ["news"]
+
 # Server-side ad slot templates + creative-opportunity auction. Kept active.
 [creative_opportunities]
 # Set false to disable server-side ad templates while keeping slot definitions
@@ -466,13 +536,19 @@ auction_timeout_ms = 500
 #   "/news/x"    -> /123456789/example/news
 #   "/reviews/y" -> /123456789/example/reviews
 
-# Direct Tinybird auction telemetry (off by default). When enabled, `api_host`
+# Direct Tinybird auction/access telemetry (off by default). When enabled, `api_host`
 # is required and must be a bare host (no scheme or path).
 # [tinybird]
 # enabled = true
 # api_host = "api.us-east.tinybird.example"   # required when enabled; host only
-# auction_dataset = "auction_events"          # Events API datasource name
-# auction_token_secret = "tinybird_auction_append_token"  # Key in trusted_server_secrets
+# auction_dataset = "auction_events_raw"      # auction Events API datasource
+# auction_token_secret = "tinybird_auction_append_token"  # key in the default secret store
+# auction_enabled = true                       # emit auction telemetry
+# access_enabled = true                        # positive sample rate required
+# access_dataset = "access_logs_v2"           # deploy this schema before enabling access
+# access_token_secret = "tinybird_access_append_token"    # key in the default secret store
+# access_sample_rate = 0.05                    # sample 5%; sink defaults off
+# max_body_bytes = 1048576                     # maximum NDJSON body, at least 1024
 
 # Debug endpoints (all default false — never enable in production).
 # [debug]

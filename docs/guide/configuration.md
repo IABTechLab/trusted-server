@@ -61,6 +61,7 @@ publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
 - `handlers[*].password`
 - `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
+- `tinybird.access_token_secret`, when Tinybird access telemetry is enabled
 - `integrations.datadome.server_side_key_secret_name`, when protection is enabled
 - `integrations.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
 - `proxy.asset_routes[*].auth.access_key_id`, `secret_access_key`, and optional `session_token`
@@ -70,11 +71,8 @@ resolved only while an instance builds runtime settings. An adapter can map the
 logical ID to a different physical name. For example, Fastly commonly maps
 `trusted_server_secrets` to physical store `ts_secrets`.
 
-One accepted secret-shaped field is deliberately different:
-
-- `tinybird.access_token_secret` is deprecated input. It is accepted for
-  migration, then discarded and omitted from serialized config; use
-  `tinybird.auction_token_secret` as the store key name instead.
+Both Tinybird token fields are active secret-store key references when their
+respective sinks are enabled.
 
 The four deprecated `secret_store` selectors under Tinybird, DataDome, its
 protection-test bypass, and S3 route authentication are also accepted and
@@ -90,26 +88,26 @@ diff; it does not move inline values to a secret store.
 The following table records the independent lifecycle, key-identity,
 serialization, runtime, and secret axes for every exceptional field:
 
-| Path                                                         | Lifecycle  | Key identity                        | Serialization | Runtime              | Secret handling          |
-| ------------------------------------------------------------ | ---------- | ----------------------------------- | ------------- | -------------------- | ------------------------ |
-| `AssetOriginAuth.s3_sig_v4`                                  | deprecated | alias of `AssetOriginAuth.s3_sigv4` | skipped       | deserialization only | none                     |
-| `DataDomeConfig.server_side_key_secret_name`                 | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `DataDomeConfig.server_side_key_secret_store`                | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `Handler.password`                                           | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.secret_store`                             | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `S3SigV4AuthConfig.session_token`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `TinybirdSettings.access_token_secret`                       | deprecated | canonical                           | skipped       | normalized away      | accepted, then discarded |
-| `TinybirdSettings.auction_token_secret`                      | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `TinybirdSettings.secret_store`                              | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical                           | serialized    | active               | store resolved           |
+| Path                                                         | Lifecycle  | Key identity                        | Serialization           | Runtime              | Secret handling |
+| ------------------------------------------------------------ | ---------- | ----------------------------------- | ----------------------- | -------------------- | --------------- |
+| `AssetOriginAuth.s3_sig_v4`                                  | deprecated | alias of `AssetOriginAuth.s3_sigv4` | skipped                 | deserialization only | none            |
+| `DataDomeConfig.server_side_key_secret_name`                 | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `DataDomeConfig.server_side_key_secret_store`                | deprecated | canonical                           | skipped                 | normalized away      | none            |
+| `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | skipped                 | normalized away      | none            |
+| `Ec.passphrase`                                              | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `EcPartner.api_token`                                        | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `Handler.password`                                           | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `S3SigV4AuthConfig.secret_store`                             | deprecated | canonical                           | skipped                 | normalized away      | none            |
+| `S3SigV4AuthConfig.session_token`                            | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `TinybirdSettings.access_token_secret`                       | canonical  | canonical                           | serialized when present | active sink only     | store resolved  |
+| `TinybirdSettings.auction_token_secret`                      | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `TinybirdSettings.secret_store`                              | deprecated | canonical                           | skipped                 | normalized away      | none            |
+| `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical                           | serialized              | active               | store resolved  |
 
 Prepare an initial reference-based deployment in this order:
 
@@ -163,6 +161,7 @@ auction_token_secret = "tinybird_auction_append_token"
 Store the APPEND token value under `tinybird_auction_append_token` in the
 physical store mapped from `trusted_server_secrets`. The token is resolved once
 at startup. Disabled Tinybird telemetry does not require or resolve the token.
+`access_token_secret` follows the same path when `access_enabled` is on.
 The legacy `tinybird.secret_store` field is accepted for one migration release,
 but it is ignored and omitted from newly pushed config.
 
@@ -202,13 +201,14 @@ fail and the service will return its startup-error response.
 | `[[handlers]]`             | Ordered HTTP Basic-auth rules                                           |
 | `[image_optimizer]`        | Reusable Fastly Image Optimizer profiles                                |
 | `[integrations.*]`         | Typed partner and browser integration settings                          |
+| `[observability]`          | Server-Timing header emission and bounded publisher route sections      |
 | `[proxy]`                  | Proxy allowlist, TLS policy, and asset routes                           |
 | `[publisher]`              | Publisher domain, origin, and proxy signing key                         |
 | `[request_signing]`        | Outbound Ed25519 request signing and management-store IDs               |
 | `[response_headers]`       | Headers added to Trusted Server responses                               |
 | `[rewrite]`                | First-party URL rewrite exclusions                                      |
 | `[tester_cookie]`          | Optional tester-cookie endpoints                                        |
-| `[tinybird]`               | Direct Tinybird auction telemetry                                       |
+| `[tinybird]`               | Direct Tinybird auction and access telemetry                            |
 | `[trusted_forwarder]`      | Authenticated browser-facing host and scheme forwarding                 |
 | `[trusted_client_ip]`      | Authenticated front-door client-IP forwarding                           |
 
@@ -743,23 +743,124 @@ The legacy `[consent].consent_store` setting has been removed. Trusted Server us
 
 Legacy consent-store records are not read or migrated into `ec.ec_store`. Their payload schema is not authoritative EC lifecycle state, so do not copy those records into the identity store. You may retain the old store unchanged for a defined rollback window, then unlink its platform resource binding and delete it. No browser-cookie or EC identity-store migration is required.
 
+### Identity Providers (`[ec.identity]`)
+
+Policy for server-side identity providers. The table is optional; every key has a default.
+
+| Key                       | Type    | Default | Meaning                                                                                                                                                                                                         |
+| ------------------------- | ------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `max_concurrency`         | Integer | `4`     | Most providers dispatched at once (at least 1). Replaces `ec.pull_sync_concurrency`.                                                                                                                            |
+| `hold_budget_ms`          | Integer | `100`   | Total wall-clock time a navigation may wait for all hold-mode providers (at most 1000)                                                                                                                          |
+| `hold_retry_sec`          | Integer | `300`   | Seconds to wait before calling a provider again after the hold budget cut its call off                                                                                                                          |
+| `max_response_bytes`      | Integer | `65536` | Largest provider response body accepted, before and after decoding                                                                                                                                              |
+| `max_backend_requests`    | Integer | `32`    | Most backend requests one Fastly execution may start, counting the origin, the auction and provider calls. A provider call past it is skipped, not counted as a failure. Set `10` on Fastly trial accounts      |
+| `mirror_enabled`          | Boolean | `false` | Return the `__Host-ts-eids-s` mirror payload from `/auction` and `/_ts/page-bids`                                                                                                                               |
+| `spa_writer_interval_sec` | Integer | `300`   | Seconds a same-origin `/_ts/page-bids` call from a real browser waits after the row's last write before it writes browser ingest and after-send provider results itself, for single-page apps. `0` turns it off |
+
+#### Per-provider keys
+
+Each provider can have an `[ec.identity.providers.<id>]` table. A provider with no table uses the defaults. The table name is the provider ID: the integration ID of a vendor provider, or the generated `pull-` ID of a pull partner.
+
+| Key                           | Type    | Default                            | Meaning                                                                                                                                                                                                   |
+| ----------------------------- | ------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`                        | String  | `after_send`                       | `hold` runs before the navigation's auction; `after_send` runs after the response is sent. Providers run on a returning visitor's page load; a `hold` provider also on a new visitor's first one (below). |
+| `timeout_ms`                  | Integer | `hold_budget_ms`                   | Hold-mode call timeout, at most `hold_budget_ms`                                                                                                                                                          |
+| `after_send_timeout_ms`       | Integer | `1000`                             | Timeout for any call made after send, `1` to `10000`                                                                                                                                                      |
+| `sources`                     | Array   | every source the provider declares | Narrows the source domains the provider may write. Required for a capture-only provider.                                                                                                                  |
+| `refresh_after_sec`           | Integer | `86400`                            | Seconds before a stored ID is refreshed, and the wait after a skipped call (greater than 0)                                                                                                               |
+| `max_calls_per_minute`        | Integer | `1`                                | Per-visitor burst cap, enforced in 60-second windows                                                                                                                                                      |
+| `max_calls_per_ip_per_minute` | Integer | `10`                               | Ceiling per client address across every visitor behind it, in 60-second windows. `0` turns it off                                                                                                         |
+| `breaker_failures_per_minute` | Integer | `50`                               | Transport failures, timeouts, 429s and 5xx responses in one 60-second window after which the provider is skipped for every visitor                                                                        |
+| `cookie_priority`             | Integer | `0`                                | Lower values are left out of the `__Host-ts-eids-s` mirror first when it exceeds its size cap                                                                                                             |
+| `revoke_scope`                | String  | `provider` (capture only)          | `provider` or `global`. Applies only to a provider that captures IDs; setting it on any other provider is a validation error. See below.                                                                  |
+
+**`mode`, `timeout_ms` and `after_send_timeout_ms`.** A provider runs on a returning visitor's full page navigation. A `hold` provider that does not read the EC ID also runs on a new visitor's first navigation when it runs an auction: the visitor's KV row is created after the call, with its answer, so the first page still makes one KV write. In `hold` mode the call runs before the navigation's auction, within the shared `hold_budget_ms`, and its answer joins that auction. A call the budget cuts off is not a failure: the provider waits `hold_retry_sec` before the next call. When the navigation runs no auction, a hold-mode provider runs after send instead and waits `after_send_timeout_ms`. In `after_send` mode (the default) the provider always runs after the response is sent.
+
+**`sources`.** Narrows the source domains the provider may write, before ownership is checked. It must name only sources the provider declares and keep at least one. A capture-only provider has no usable default and must list its `sources`: its opt-out removes browser-ingested records of every source it lists, so list only the sources it is the delivery path for.
+
+**`refresh_after_sec`, `max_calls_per_minute`, `breaker_failures_per_minute`.** `refresh_after_sec` is how long a stored ID lives before it is refreshed when the provider gives no hint, and how long to wait after a skipped call. `max_calls_per_minute` caps bursts per visitor in 60-second windows, and `max_calls_per_ip_per_minute` caps calls from one client address across visitors, so minting a fresh EC per request cannot multiply calls. `breaker_failures_per_minute` counts transport failures, timeouts, 429s and 5xx responses across all visitors at one edge location. Past it the provider is skipped for everyone until the window clears. Input-caused 4xx responses and unparseable replies back off only that visitor and never open the breaker.
+
+**`cookie_priority`.** When the `__Host-ts-eids-s` mirror exceeds its size cap, whole sources are left out, lowest `cookie_priority` first.
+
+**`revoke_scope`.** For a provider that captures IDs from proxied responses. With `provider`, a captured opt-out removes that provider's records and, for a capture-only provider, the records of its listed sources that no provider wrote. With `global`, a captured opt-out runs the consent-withdrawal tombstone: the row is tombstoned, the `ts-ec` cookie is cleared, and everything is removed, provider opt-outs included. It also sets an `HttpOnly` `ts-ec-revoked` cookie holding a fingerprint of the visitor's consent, and no new EC is minted while that consent is unchanged, so a CMP that still grants does not undo the revoke on the next page. Either way it applies whatever the client, as a consent withdrawal does; only clearing an opt-out needs a real browser.
+
+#### Source ownership (`[[ec.partners]].owner`)
+
+`owner` is an optional key on an `[[ec.partners]]` entry. It names the identity provider that owns that source. An owner refreshes the source and wins over browser and other writers: its result replaces the source's whole entry set, and batch sync writes to it only when the row holds no value for the source. An expired owned record still counts as a value, so batch sync never fills or replaces it. A source with no `owner` is unowned, and a provider can only fill it when absent or expired.
+
+```toml
+[[ec.partners]]
+name = "Example ID"
+source_domain = "exampleid.example.com"
+openrtb_atype = 1
+bidstream_enabled = true
+owner = "exampleid"
+
+[ec.identity.providers.exampleid]
+mode = "hold"
+timeout_ms = 80
+```
+
+**Validation.** Each of these stops startup and fails `ts config validate` and `ts config push`.
+
+| Mistake                                                    | Error                                                                                                                                                      |
+| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `owner` names a provider that is not enabled               | ``ec.partners source `exampleid.example.com` names owner `exampleid`, which is not an enabled identity provider``                                          |
+| `owner` names a capture-only provider                      | ``... names owner `examplecapture`, which is capture-only; a capture-only provider stores no positive ID and cannot own a source``                         |
+| `owner` names a provider that does not claim the source    | ``... names owner `exampleid`, which does not claim that source``                                                                                          |
+| Two providers claim an owned source                        | ``identity provider `other` claims source `exampleid.example.com`, which `exampleid` owns; use ec.identity.providers.other.sources to narrow one of them`` |
+| A provider claims a source with no `[[ec.partners]]` entry | ``identity provider `exampleid` claims source `exampleid.example.com`, which has no [[ec.partners]] entry``                                                |
+| A capture-only provider has no `sources`                   | ``provider `examplecapture` is capture-only, so ec.identity.providers.examplecapture.sources must list the sources it is the delivery path for``           |
+| `sources` names a source the provider does not declare     | ``ec.identity.providers.exampleid.sources names `other.example.com`, which provider `exampleid` does not declare``                                         |
+| A provider table names no enabled provider                 | `ec.identity.providers.missing names no enabled identity provider; configured providers: exampleid`                                                        |
+| `revoke_scope` on a provider that declares no captures     | ``ec.identity.providers.exampleid.revoke_scope is set, but provider `exampleid` declares no captures``                                                     |
+| `timeout_ms` above the hold budget in hold mode            | `ec.identity.providers.exampleid.timeout_ms must not exceed hold_budget_ms (100)`                                                                          |
+| `after_send_timeout_ms` outside 1 to 10000                 | `ec.identity.providers.exampleid.after_send_timeout_ms must be between 1 and 10000, got 0`                                                                 |
+| `refresh_after_sec = 0`                                    | `ec.identity.providers.exampleid.refresh_after_sec must be greater than 0`                                                                                 |
+| `hold_budget_ms` above 1000, `max_concurrency = 0`         | `ec.identity.hold_budget_ms must be at most 1000, got 1001` and `ec.identity.max_concurrency must be at least 1`                                           |
+
+Also an error: a duplicate provider ID, more than 32 enabled providers (generic pull partners included), a `mode` other than `hold` or `after_send`, and a `revoke_scope` other than `provider` or `global`. Before enabling a capture provider on a live service, work through the [capture provider checklist](/guide/edge-cookies#capture-provider-checklist).
+
+**Pull partner provider IDs.** Each `[[ec.partners]]` entry with `pull_sync_enabled = true` registers a provider whose ID is `pull-` plus the source domain with dots replaced by `-`. For example, `ssp.example.com` is `pull-ssp-example-com`. A domain that contains `-`, or an ID that would be longer than 63 characters, also gets `-` and the first 8 hex digits of the SHA-256 of the full domain, so `a-b.example.com` and `a.b.example.com` get different IDs. Configure the partner's pacing in `[ec.identity.providers.pull-ssp-example-com]`.
+
+**Removed keys.** Validation rejects each of these with an error that names its replacement:
+
+| Removed key                                | Replacement                                                                  |
+| ------------------------------------------ | ---------------------------------------------------------------------------- |
+| `ec.pull_sync_concurrency`                 | `[ec.identity].max_concurrency`                                              |
+| `[[ec.partners]].pull_sync_ttl_sec`        | `refresh_after_sec` in `[ec.identity.providers.<pull-id>]`                   |
+| `[[ec.partners]].pull_sync_rate_limit = N` | `max_calls_per_minute = ceil(N / 60)` in `[ec.identity.providers.<pull-id>]` |
+
+The old rate limit counted calls per hour; the new one counts them per minute and defaults to 1, so a partner that kept the old default of 10 per hour is now paced at an effective 60 per hour.
+
+#### Rolling back
+
+This release moves the KV identity row to schema version 2. A release before it cannot read a version 2 row, so rolling back past this release is unsupported once it has written one; going back needs a KV migration to version 1, which is not provided.
+
+To roll back from a release that adds vendor providers to the identity framework without vendors, follow the steps in [Rolling back from vendor providers](/guide/edge-cookies#rolling-back-from-vendor-providers): remove every `owner` and vendor `[ec.identity.providers.*]` table first, because the earlier release rejects both.
+
 ### `[ec]`
 
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
 be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
-| Field                     | Type           | Required | Description                                                             |
-| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
-| `partners`                | Array          | No       | Static partner registry entries                                         |
+| Field                           | Type           | Required | Description                                                                                                             |
+| ------------------------------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `passphrase`                    | String         | Yes      | Publisher passphrase used as HMAC key                                                                                   |
+| `ec_store`                      | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                         |
+| `cluster_trust_threshold`       | Integer        | No       | Cluster size threshold for identity trust decisions                                                                     |
+| `cluster_recheck_secs`          | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps                                                 |
+| `strip_eids_cookie_from_origin` | Boolean        | No       | Also strip `ts-eids` from publisher-origin requests (default `false`; the `__Host-ts-eids-s` mirror is always stripped) |
+| `partners`                      | Array          | No       | Static partner registry entries                                                                                         |
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
 :::
+
+`openrtb_atype` sets the `atype` of EIDs that Trusted Server builds from KV.
+It applies only where KV supplies a source the browser did not send; for a
+source in the browser's EIDs, the browser's own entry and `atype` are
+forwarded instead.
 
 `api_token` is optional. Set it to a key in `trusted_server_secrets` only when
 the partner calls the inbound identify or batch-sync APIs. A partner without
@@ -1541,26 +1642,30 @@ See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and I
 
 ## Tinybird Configuration
 
-`[tinybird]` sends auction events directly to the Tinybird Events API. The
-emitter is active only when `enabled = true`; access-log emission is not wired.
+`[tinybird]` sends auction events and sampled access rows directly to the
+Tinybird Events API. Fastly wires both emitters; each sink requires
+`enabled = true` and its own enable flag. Other adapters do not emit Tinybird
+rows. See [Telemetry](/guide/telemetry) for sampling, privacy, and retention.
 
 ### `[tinybird]`
 
-| Field                  | Type           | Default                | Contract                                                           |
-| ---------------------- | -------------- | ---------------------- | ------------------------------------------------------------------ |
-| `enabled`              | Boolean        | `false`                | Enable auction telemetry                                           |
-| `api_host`             | String         | `""`                   | Required when enabled; regional host without scheme, port, or path |
-| `auction_dataset`      | String         | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                                |
-| `auction_token_secret` | String or null | `null`                 | Store key required when enabled; resolved value must be nonempty   |
-| `access_enabled`       | Boolean        | `false`                | Reserved; `true` fails startup because no emitter is wired         |
-| `access_dataset`       | String         | `"access_logs_raw"`    | Reserved access-log dataset name                                   |
-| `access_sample_rate`   | Number         | `0.0`                  | `0.0..=1.0`; reserved while access emission is disabled            |
-| `max_body_bytes`       | Integer        | `1048576`              | At least `1024` bytes                                              |
+| Field                  | Type           | Default                | Contract                                                                          |
+| ---------------------- | -------------- | ---------------------- | --------------------------------------------------------------------------------- |
+| `enabled`              | Boolean        | `false`                | Master switch for Tinybird telemetry                                              |
+| `auction_enabled`      | Boolean        | `true`                 | Enable auction telemetry when the master switch is on                             |
+| `api_host`             | String         | `""`                   | Required when enabled; regional host without scheme, port, or path                |
+| `auction_dataset`      | String         | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                                               |
+| `auction_token_secret` | String or null | `null`                 | Required for an active auction sink; resolves through the default secret store    |
+| `access_enabled`       | Boolean        | `false`                | Enable sampled post-delivery access telemetry                                     |
+| `access_dataset`       | String         | `"access_logs_v2"`     | Versioned access datasource; `access_logs_raw` is rejected when access is enabled |
+| `access_token_secret`  | String or null | `null`                 | Required for an active access sink; resolves through the default secret store     |
+| `access_sample_rate`   | Number         | `0.0`                  | `0.0..=1.0`; must be positive when access telemetry is enabled                    |
+| `max_body_bytes`       | Integer        | `1048576`              | At least `1024` bytes                                                             |
 
-`secret_store` and `access_token_secret` are deprecated compatibility inputs.
-Both are removed during normalization; neither reaches runtime or serialized
-output. New configurations use only `auction_token_secret`, whose value is
-resolved through `trusted_server_secrets`.
+`secret_store` is a deprecated compatibility input. It is ignored and omitted
+from newly pushed config. Both sink tokens resolve through
+`trusted_server_secrets`. Disabled sinks neither require nor resolve their token
+references, even when stale keys remain in a stored config.
 
 The complete enabled example appears in
 [Tinybird auction telemetry](#tinybird-auction-telemetry).
@@ -3148,6 +3253,183 @@ contains their key references.
 Rollback to the legacy entry point is no longer controlled by runtime config
 keys. Use the normal deployment rollback path to restore a pre-cleanup service
 version if that is required.
+
+## Observability and Access Telemetry Configuration
+
+Settings for the `Server-Timing` response header and the sampled
+access-telemetry sink. Both are off by default and are independent switches:
+enabling one does not enable the other.
+
+### `[observability]`
+
+| Field                   | Type     | Required | Default | Description                                                                                               |
+| ----------------------- | -------- | -------- | ------- | --------------------------------------------------------------------------------------------------------- |
+| `server_timing_enabled` | Boolean  | No       | `false` | Append request-phase timings to the `Server-Timing` response header                                       |
+| `route_sections`        | String[] | No       | `[]`    | Section names kept as publisher route templates (`/{section}/*`) in access telemetry; empty collapses all |
+
+Route sections are matched ASCII-case-insensitively against the first path segment,
+with at least one further segment required. Leading and trailing non-control
+whitespace is trimmed; tabs, newlines, and other control characters are rejected,
+not trimmed. Names are limited to 32 entries of at most 128 UTF-8 bytes each and
+must be nonempty with no slash or control characters. For example,
+`route_sections = [" news "]` normalizes to `["news"]`, preserving `/news/*` but not
+`/news`. Matching uses the raw path without percent-decoding, so literal non-ASCII
+section names do not match their percent-encoded URLs. Use ASCII section names.
+The name `other`, in any case, shares the fallback `/other/*` bucket rather than
+creating a distinct section. Configure this array in TOML, for example
+`route_sections = ["news"]`; the environment overlay cannot set arrays.
+
+**Purpose**: Surfaces per-phase request timing (`ts-total` plus recorded
+phases such as `ts-appbuild`, `ts-filter`, `ts-geo`, `ts-kv`, `ts-origin`, and
+`ts-template-cache`) as a standard `Server-Timing` header, in milliseconds
+with one decimal place. An unrecorded phase is omitted from the header
+rather than rendered as zero. When origin dispatch overlaps auction dispatch or
+EC preload, `ts-origin` measures the remaining origin wait after overlap, not full
+origin latency. Fastly `ts-appbuild` measures per-request setup and includes application
+construction only on cold requests; a non-null warm value is not a cold-start signal.
+Axum builds state at startup and has no per-request app-build phase.
+
+**Emission is conservative**: the header is appended only on responses that
+are conclusively private, meaning `Cache-Control` contains a bare `private` or
+`no-store` directive and no recognized CDN/surrogate cache-control header is present.
+A field-qualified directive such as `private="Set-Cookie"` does not qualify.
+An edge-cache header suppresses timing even alongside private/no-store, since
+shared-cache overrides can replay request-specific timings. A response that is
+heuristically cacheable, carries a bare
+`max-age`, or has no cache header at all never receives the header, because a
+shared-cache object would otherwise replay one request's timings for its
+entire stored lifetime. The long-lived, shared-cacheable `tsjs` asset route is
+the concrete case this excludes. The header is appended, never inserted, so
+an origin-supplied `Server-Timing` value and any entries the fronting
+delivery layer adds are preserved alongside the TS entries.
+
+The Axum adapter applies the same private-response rule at its own terminal
+point before serializing the response, and emits the header only; it does not
+send access-telemetry rows. Cloudflare and Spin collect timing for GPT diagnostics
+only; neither emits `Server-Timing` or access rows, so these emission flags have
+no effect there.
+
+**Example**:
+
+```toml
+[observability]
+server_timing_enabled = true
+```
+
+::: tip The Axum dev server reads this flag once at startup
+The Axum dev server bakes `server_timing_enabled` into its service when it starts.
+Flipping the flag there requires a restart to take effect.
+:::
+
+::: warning Client-visible latency disclosure
+The `Server-Timing` header is sent to every client on eligible responses,
+not only to operators: browsers expose the values to same-origin JavaScript
+via `PerformanceResourceTiming.serverTiming`, and any caller can read the
+raw header. Enabling it publishes measured per-phase server latency,
+including KV read timing on the public identity endpoints (`ts-kv`) and
+origin/cache behaviour on publisher pages (`ts-origin`,
+`ts-template-cache`). This is standard `Server-Timing` practice and the
+values are durations only, but treat the flag as a diagnostic aid to enable
+deliberately, not a general always-on toggle, unless disclosing those
+timings to all clients is acceptable for the deployment.
+:::
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__OBSERVABILITY__SERVER_TIMING_ENABLED=true
+```
+
+::: tip Present-but-false by default
+`server_timing_enabled` ships as `false` in the base operator config rather
+than being left out, even though `false` is also its default. The
+environment-variable overlay can only override a leaf that already exists in
+the parsed TOML; it cannot create a missing one. Keeping the leaf present lets
+`TRUSTED_SERVER__OBSERVABILITY__SERVER_TIMING_ENABLED` take effect without an
+extra edit to add the table first.
+:::
+
+### `[tinybird]` access telemetry keys
+
+The authoritative field reference is [Tinybird Configuration](#tinybird).
+The examples below cover access-sink enablement and rollout.
+
+**Purpose**: `access_enabled` and `auction_enabled` gate the two Tinybird
+sinks separately so that turning on one does not silently turn on (or leave
+off) the other; a settings test locks this decoupling in both directions.
+Setting `access_enabled = true` with `access_sample_rate = 0.0` is rejected at
+config load as an armed-but-silent configuration; use `access_enabled` itself
+to turn the sink off, not the sample rate. Enabling `access_enabled` also
+requires the shared transport fields (`enabled`, non-empty `api_host`,
+`access_dataset`, a resolvable `access_token_secret`, and a
+`max_body_bytes` of at least 1024) to already be set.
+
+**Example**:
+
+```toml
+[tinybird]
+enabled = true
+api_host = "api.tinybird.example.com"
+auction_enabled = false
+
+# Access-only telemetry: no auction APPEND token is required.
+access_enabled = true
+access_dataset = "access_logs_v2"
+access_token_secret = "tinybird_access_append_token"
+access_sample_rate = 0.05
+max_body_bytes = 1048576
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__TINYBIRD__ACCESS_ENABLED=true
+TRUSTED_SERVER__TINYBIRD__ACCESS_SAMPLE_RATE=0.05
+TRUSTED_SERVER__TINYBIRD__AUCTION_ENABLED=false
+```
+
+These overrides require the corresponding leaves to exist in the parsed TOML.
+The example's Tinybird block is commented out; uncomment and configure it first.
+Keep `access_sample_rate` as a TOML float, such as `0.05` or `0.0`, since overlay
+coercion uses the existing leaf's type.
+
+A sampled request dispatches one access-telemetry row to `access_dataset` after
+client delivery. Fastly starts the host-owned request and drops its pending handle,
+without awaiting the ingest reply or retrying. Local serialization/setup/start
+failures are logged; later transport errors, non-2xx responses and ingestion
+acceptance are not observed. The row records the configured sample rate and has a
+30-day TTL. See [Telemetry](/guide/telemetry#access-data-path) for limits, the
+collection-time and delivery-result contracts, and privacy.
+
+### Deploy and rollback ordering
+
+::: warning Push a compatibility config before rolling back
+The compatibility boundary is uneven. The top-level `Settings` schema uses
+`deny_unknown_fields`, so an older binary rejects a config carrying the
+`[observability]` table. The nested `[tinybird]` table does not: an older
+binary accepts unknown keys there, rejects `access_enabled = true` through
+validation, ignores `auction_enabled` entirely, and reads `enabled = true`
+as "auction telemetry on".
+
+**Deploying**: create the versioned `access_logs_v2` datasource and its scoped
+`ts_access_v2_ingest` APPEND token before deploying the emitting binary. Preserve
+`access_logs_raw`; it is the legacy reserved schema, not the target for these
+rows. Upgrade every serving binary before pushing a config containing the new
+fields. An existing explicit `access_dataset = "access_logs_raw"` must be changed
+to `access_logs_v2`, with the matching token key. When access is enabled,
+validation rejects exactly the normalized legacy name `access_logs_raw`; custom
+dataset names remain allowed and disabled legacy configurations remain accepted.
+Follow the workspace cutover in
+[`tinybird/README.md`](https://github.com/IABTechLab/trusted-server/blob/main/tinybird/README.md).
+
+**Rolling back**: push a compatibility config first, then roll the binary
+back. The compatibility config removes the `[observability]` table, sets
+`access_enabled = false`, and, for a deployment that only used the access
+sink, sets `enabled = false` as well. Otherwise the older binary tries to enable
+auction telemetry, or fails startup if no auction token is present. Keep both
+Tinybird datasources during rollback. Do not redeploy an older Tinybird project
+that omits `access_logs_v2`; inspect the deployment dry-run for proposed removals.
+:::
 
 ## Validation
 

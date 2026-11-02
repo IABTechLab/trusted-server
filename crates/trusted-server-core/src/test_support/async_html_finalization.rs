@@ -150,6 +150,7 @@ impl StreamProcessor for FixtureSession {
                     port: url.port(),
                     host_header_override: None,
                     certificate_check: true,
+                    connect_timeout: None,
                     first_byte_timeout: timeout,
                     between_bytes_timeout: timeout,
                     discriminator: Some(ID.to_string()),

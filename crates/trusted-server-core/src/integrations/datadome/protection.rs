@@ -237,6 +237,7 @@ impl DataDomeIntegration {
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(u64::from(self.config.timeout_ms)),
             between_bytes_timeout: Duration::from_millis(u64::from(self.config.timeout_ms)),
+            connect_timeout: None,
             discriminator: None,
         };
 

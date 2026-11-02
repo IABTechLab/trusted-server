@@ -1,11 +1,15 @@
 use http::header::HeaderName;
 
 pub const COOKIE_TS_EC: &str = "ts-ec";
-/// Short-lived signed proof that the current EC row has every pull-partner UID.
-pub const COOKIE_TS_EC_PULL_COMPLETE: &str = "ts-ec-pull-complete";
+/// Marks a global revoke: holds the consent fingerprint the revoke saw, and
+/// stops EC minting while the request's consent is unchanged.
+pub const COOKIE_TS_EC_REVOKED: &str = "ts-ec-revoked";
 /// Cookie written by the Trusted Server JS SDK containing a standard-base64-encoded
 /// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
 pub const COOKIE_TS_EIDS: &str = "ts-eids";
+/// Client-only mirror of the servable server-side EIDs, written by the shim
+/// and never read by the server (spec 6.2).
+pub const COOKIE_TS_EIDS_S: &str = "__Host-ts-eids-s";
 pub const COOKIE_TS_TESTER: &str = "ts-tester";
 pub const COOKIE_SHAREDID: &str = "sharedId";
 
@@ -48,6 +52,8 @@ pub const TS_GIT_VERSION: Option<&str> = match option_env!("TRUSTED_SERVER__GIT_
 // Fastly environment variables
 pub const ENV_FASTLY_SERVICE_VERSION: &str = "FASTLY_SERVICE_VERSION";
 pub const ENV_FASTLY_IS_STAGING: &str = "FASTLY_IS_STAGING";
+pub const ENV_FASTLY_SERVICE_ID: &str = "FASTLY_SERVICE_ID";
+pub const ENV_FASTLY_POP: &str = "FASTLY_POP";
 
 // Common standard header names used across modules
 pub const HEADER_USER_AGENT: HeaderName = HeaderName::from_static("user-agent");

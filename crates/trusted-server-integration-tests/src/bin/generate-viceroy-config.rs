@@ -173,6 +173,7 @@ fn inject_controlled_bidder_backends(
                 port: endpoint.port(),
                 host_header_override: None,
                 certificate_check: true,
+                connect_timeout: None,
                 first_byte_timeout: duration,
                 between_bytes_timeout: duration,
                 discriminator: Some(provider.id.as_str().to_owned()),

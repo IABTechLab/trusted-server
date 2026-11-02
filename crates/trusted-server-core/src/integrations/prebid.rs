@@ -975,6 +975,9 @@ fn validate_external_bundle_config(
 
 pub struct PrebidIntegration {
     config: PrebidIntegrationConfig,
+    /// Every `[[ec.partners]]` source domain, sorted, for the shim's
+    /// `ts-eids` trim (spec 5.3).
+    registered_sources: Vec<String>,
     planned_head_inserts: Option<Vec<String>>,
     #[cfg(test)]
     legacy_config: Option<LegacyPrebidServerConfig>,
@@ -988,6 +991,7 @@ impl PrebidIntegration {
         let engine = Arc::new(BidParamOverrideEngine::try_from_config(&config)?);
         Ok(Arc::new(Self {
             config: PrebidIntegrationConfig::from(&config),
+            registered_sources: Vec::new(),
             planned_head_inserts: None,
             legacy_config: Some(config),
             engine,
@@ -999,9 +1003,14 @@ impl PrebidIntegration {
         Self::try_new(config).expect("should compile prebid bid param overrides")
     }
 
-    fn for_browser_plan(config: &PrebidIntegrationConfig, plan: &AuctionPlan) -> Arc<Self> {
+    fn for_browser_plan(
+        config: &PrebidIntegrationConfig,
+        plan: &AuctionPlan,
+        registered_sources: Vec<String>,
+    ) -> Arc<Self> {
         let mut integration = Self {
             config: config.clone(),
+            registered_sources,
             planned_head_inserts: None,
             #[cfg(test)]
             legacy_config: None,
@@ -1125,6 +1134,7 @@ impl PrebidIntegration {
             } else {
                 Vec::new()
             }),
+            registered_sources: &self.registered_sources,
             ..InjectedPrebidClientConfig::from(browser_config)
         };
         let config_json = serialize_injected_prebid_config(&payload);
@@ -1370,7 +1380,15 @@ pub fn register_for_plan(
     config.excluded_gam_ad_unit_path_suffixes = canonical;
     validate_browser_config_for_startup(&config, &settings.proxy.allowed_domains)?;
     validate_browser_bidder_ownership(&config, plan)?;
-    let integration = PrebidIntegration::for_browser_plan(&config, plan);
+    let registered_sources = settings
+        .ec
+        .partners
+        .iter()
+        .map(|partner| partner.source_domain.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let integration = PrebidIntegration::for_browser_plan(&config, plan, registered_sources);
     Ok(Some(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
             .with_proxy(integration.clone())
@@ -1584,6 +1602,9 @@ struct InjectedPrebidClientConfig<'a> {
     client_side_bidders: &'a [String],
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     excluded_gam_ad_unit_path_suffixes: &'a [String],
+    /// The source domains of `[[ec.partners]]`, nothing else from the table.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    registered_sources: &'a [String],
 }
 
 impl<'a> From<&'a PrebidIntegrationConfig> for InjectedPrebidClientConfig<'a> {
@@ -1601,6 +1622,7 @@ impl<'a> From<&'a PrebidIntegrationConfig> for InjectedPrebidClientConfig<'a> {
             server_side_bidders: None,
             client_side_bidders: &config.client_side_bidders,
             excluded_gam_ad_unit_path_suffixes: &config.excluded_gam_ad_unit_path_suffixes,
+            registered_sources: &[],
         }
     }
 }
@@ -3741,6 +3763,7 @@ mod tests {
     use crate::auction::test_support::{
         canonical_parity_auction_request,
         create_test_auction_context as shared_test_auction_context,
+        repeated_source_provenance_eids, repeated_source_provenance_eids_json,
     };
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
@@ -4303,6 +4326,60 @@ server_url = "https://prebid.example/openrtb2/auction"
             "should inject the canonical suffix list: {config_insert}"
         );
     }
+    #[test]
+    fn injected_config_lists_registered_sources() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                PREBID_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
+                }),
+            )
+            .expect("should replace Prebid test configuration");
+        settings.ec.partners = ["zeta.example.com", "alpha.example.com", "mid.example.com"]
+            .into_iter()
+            .map(|source| {
+                crate::ec::identity::test_support::ec_partner(
+                    source,
+                    "https://sync.example.com/pull",
+                    "example-token-value-0123456789abcdef",
+                )
+            })
+            .collect();
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(&settings).expect("should compile auction plan"),
+        );
+        let registry = IntegrationRegistry::with_plan(&settings, plan)
+            .expect("should build integration registry");
+        let document_state = IntegrationDocumentState::default();
+        let context = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = registry.head_inserts(&context);
+        let config_insert = inserts
+            .iter()
+            .find(|insert| insert.contains("window.__tsjs_prebid"))
+            .expect("should inject planned Prebid config");
+
+        assert!(
+            config_insert.contains(
+                r#""registeredSources":["alpha.example.com","mid.example.com","zeta.example.com"]"#
+            ),
+            "should list every partner source domain, sorted: {config_insert}"
+        );
+        assert!(
+            !config_insert.contains("example-token") && !config_insert.contains("sync.example.com"),
+            "should carry nothing else from the partner table: {config_insert}"
+        );
+    }
+
     #[test]
     fn managed_user_ids_parse_with_opaque_params() {
         let config = parse_prebid_toml(
@@ -7011,34 +7088,58 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
+    fn to_openrtb_forwards_eid_provenance_fields_and_repeated_sources() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.user.eids = Some(repeated_source_provenance_eids());
+        let settings = make_settings();
+        let request = build_test_request();
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        assert_eq!(
+            serialized["user"]["ext"]["eids"],
+            repeated_source_provenance_eids_json(),
+            "Prebid Server should receive both entries with their own EID-level fields"
+        );
+    }
+
+    #[test]
     fn to_openrtb_includes_eids_from_auction_request() {
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.eids = Some(vec![
-            crate::openrtb::Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            crate::openrtb::Eid::new(
+                "liveramp.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
-            },
-            crate::openrtb::Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            ),
+            crate::openrtb::Eid::new(
+                "id5-sync.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "ID5_abc".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
-            },
-            crate::openrtb::Eid {
-                source: "google.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            ),
+            crate::openrtb::Eid::new(
+                "google.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "pair-id".to_owned(),
                     atype: Some(571187),
                     ext: None,
                 }],
-            },
+            ),
         ]);
 
         let settings = make_settings();
@@ -9952,7 +10053,9 @@ set = { networkId = 42 }
                 (None, None),
                 (Some(""), None),
                 (
-                    Some("ts-ec=secret; ts-eids=secret; sharedId=secret; session=secret"),
+                    Some(
+                        "ts-ec=secret; ts-eids=secret; __Host-ts-eids-s=secret; ts-ec-revoked=secret; sharedId=secret; session=secret",
+                    ),
                     None,
                 ),
                 (
@@ -9973,7 +10076,7 @@ set = { networkId = 42 }
                 ),
                 (
                     Some(
-                        " session=secret ; euconsent-v2=TC==; __gpp=GPP; __gpp_sid=2,6; us_privacy=1YNN",
+                        " session=secret ; __Host-ts-eids-s=secret; ts-ec-revoked=secret; euconsent-v2=TC==; __gpp=GPP; __gpp_sid=2,6; us_privacy=1YNN",
                     ),
                     Some("euconsent-v2=TC==; __gpp=GPP; __gpp_sid=2,6; us_privacy=1YNN"),
                 ),
@@ -10189,6 +10292,115 @@ set = { networkId = 42 }
         assert!(
             !to.headers().contains_key("x-forwarded-for"),
             "should not forward the client-supplied XFF when no attested IP exists"
+        );
+    }
+
+    fn cookie_values(request: &http::Request<EdgeBody>) -> Vec<String> {
+        request
+            .headers()
+            .get_all(header::COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("should be ASCII").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn prebid_headers_strip_identity_cookies_when_consent_cookies_are_forwarded() {
+        let cookies = [
+            HeaderValue::from_static("ts-ec=abc; euconsent-v2=tcf; other=1"),
+            HeaderValue::from_static("__Host-ts-eids-s=eyJ2IjoxfQ; partner=p"),
+            HeaderValue::from_static("ts-eids=W10; second=2"),
+        ];
+        let mut to = http::Request::new(EdgeBody::empty());
+
+        apply_prebid_header_values(
+            &PrebidConsentCookies::from_header(cookies.first()),
+            None,
+            None,
+            None,
+            &mut to,
+            ConsentForwardingMode::Both,
+            None,
+        );
+
+        assert_eq!(
+            cookie_values(&to),
+            vec!["euconsent-v2=tcf".to_owned()],
+            "should keep only consent from the selected header and omit every identity cookie"
+        );
+    }
+
+    #[test]
+    fn prebid_headers_strip_identity_and_consent_cookies_in_openrtb_only_mode() {
+        let cookies = [HeaderValue::from_static(
+            "ts-ec=abc; euconsent-v2=tcf; other=1",
+        )];
+        let mut to = http::Request::new(EdgeBody::empty());
+
+        apply_prebid_header_values(
+            &PrebidConsentCookies::from_header(cookies.first()),
+            None,
+            None,
+            None,
+            &mut to,
+            ConsentForwardingMode::OpenrtbOnly,
+            None,
+        );
+
+        assert_eq!(
+            cookie_values(&to),
+            Vec::<String>::new(),
+            "should omit all cookies in OpenRTB-only mode"
+        );
+    }
+
+    #[test]
+    fn prebid_headers_drop_non_utf8_cookie_fields_and_empty_results() {
+        let cookies = [
+            HeaderValue::from_bytes(b"x=\xff").expect("should build an opaque header"),
+            HeaderValue::from_static("ts-ec=abc"),
+        ];
+        let mut to = http::Request::new(EdgeBody::empty());
+
+        apply_prebid_header_values(
+            &PrebidConsentCookies::from_header(cookies.first()),
+            None,
+            None,
+            None,
+            &mut to,
+            ConsentForwardingMode::Both,
+            None,
+        );
+
+        assert!(
+            to.headers().get(header::COOKIE).is_none(),
+            "should send no Cookie header"
+        );
+    }
+
+    #[test]
+    fn prebid_headers_drop_non_utf8_field_but_strip_identity_from_the_rest() {
+        let cookies = [
+            HeaderValue::from_bytes(b"ts-ec=\xff; leaked=1")
+                .expect("should build an opaque header"),
+            HeaderValue::from_static("ts-ec=abc; ts-eids=W10; keep=1"),
+        ];
+        let mut to = http::Request::new(EdgeBody::empty());
+
+        apply_prebid_header_values(
+            &PrebidConsentCookies::from_header(cookies.first()),
+            None,
+            None,
+            None,
+            &mut to,
+            ConsentForwardingMode::Both,
+            None,
+        );
+
+        assert_eq!(
+            cookie_values(&to),
+            Vec::<String>::new(),
+            "should fail closed on the selected non-UTF-8 field without forwarding later fields"
         );
     }
 

@@ -111,6 +111,10 @@ export default withMermaid(
           items: [
             { text: 'Edge Cookies', link: '/guide/edge-cookies' },
             { text: 'EC Setup', link: '/guide/ec-setup-guide' },
+            {
+              text: 'Identity Providers',
+              link: '/guide/identity-providers',
+            },
             { text: 'GDPR Compliance', link: '/guide/gdpr-compliance' },
             { text: 'Ad Serving', link: '/guide/ad-serving' },
             {
@@ -168,6 +172,10 @@ export default withMermaid(
             {
               text: 'GPT Runtime Diagnostics',
               link: '/guide/integrations/gpt-diagnostics',
+            },
+            {
+              text: 'GPT Diagnostics Label Dictionary',
+              link: '/guide/integrations/gpt-diagnostics-dictionary',
             },
             { text: 'Lockr', link: '/guide/integrations/lockr' },
             { text: 'Next.js', link: '/guide/integrations/nextjs' },

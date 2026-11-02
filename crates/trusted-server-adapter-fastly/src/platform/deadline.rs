@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn expired_deadline_attributes_an_invalid_pending_handle() {
-        let result = futures::executor::block_on(FastlyPlatformHttpClient.select_until(
+        let result = futures::executor::block_on(FastlyPlatformHttpClient::default().select_until(
             vec![PlatformPendingRequest::new(42_u32).with_backend_name("example")],
             Instant::now(),
         ))
@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn deadline_collection_rejects_malformed_handles_with_backend_context() {
-        let result = futures::executor::block_on(FastlyPlatformHttpClient.select_until(
+        let result = futures::executor::block_on(FastlyPlatformHttpClient::default().select_until(
             vec![PlatformPendingRequest::new(42_u32).with_backend_name("example")],
             Instant::now() + Duration::from_secs(1),
         ));
@@ -517,7 +517,7 @@ mod tests {
         let failed = PlatformPendingRequest::new(42_u32).with_backend_name("unsupported");
         let healthy = buffered_pending(b"healthy".to_vec(), "healthy");
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient.select_until(vec![failed, healthy], deadline),
+            FastlyPlatformHttpClient::default().select_until(vec![failed, healthy], deadline),
         )
         .expect("should isolate a provider with an unsupported pending handle")
         .expect("should report the failed provider");
@@ -531,7 +531,7 @@ mod tests {
             "should report the unsupported handle"
         );
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient.select_until(result.remaining, deadline),
+            FastlyPlatformHttpClient::default().select_until(result.remaining, deadline),
         )
         .expect("should continue collecting the healthy sibling")
         .expect("should complete the healthy sibling");
@@ -547,7 +547,7 @@ mod tests {
     fn expired_deadline_preserves_an_already_ready_body() {
         let pending = buffered_pending(b"ready".to_vec(), "example");
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient.select_until(vec![pending], Instant::now()),
+            FastlyPlatformHttpClient::default().select_until(vec![pending], Instant::now()),
         )
         .expect("should snapshot an expired ready response")
         .expect("should preserve an already complete response without waiting");
@@ -646,10 +646,11 @@ mod tests {
             buffered_pending(b"fast".to_vec(), "fast"),
         ];
         let deadline = Instant::now() + Duration::from_secs(10);
-        let result =
-            futures::executor::block_on(FastlyPlatformHttpClient.select_until(pending, deadline))
-                .expect("should collect one response")
-                .expect("should complete before deadline");
+        let result = futures::executor::block_on(
+            FastlyPlatformHttpClient::default().select_until(pending, deadline),
+        )
+        .expect("should collect one response")
+        .expect("should complete before deadline");
         let response = result
             .ready
             .expect("should collect the short response first");
@@ -664,7 +665,7 @@ mod tests {
             "should retain the partial response"
         );
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient.select_until(result.remaining, deadline),
+            FastlyPlatformHttpClient::default().select_until(result.remaining, deadline),
         )
         .expect("should resume body collection")
         .expect("should finish the remaining body");
@@ -684,7 +685,7 @@ mod tests {
     fn body_at_the_exact_limit_remains_eligible() {
         let pending = buffered_pending(vec![b'x'; MAX_PLATFORM_RESPONSE_BODY_BYTES], "exact");
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient
+            FastlyPlatformHttpClient::default()
                 .select_until(vec![pending], Instant::now() + Duration::from_secs(10)),
         )
         .expect("should collect an exactly sized body")
@@ -708,7 +709,7 @@ mod tests {
     fn incremental_body_limit_reports_the_failed_backend() {
         let pending = buffered_pending(vec![b'x'; MAX_PLATFORM_RESPONSE_BODY_BYTES + 1], "large");
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient
+            FastlyPlatformHttpClient::default()
                 .select_until(vec![pending], Instant::now() + Duration::from_secs(30)),
         )
         .expect("should return a provider failure")
@@ -737,10 +738,11 @@ mod tests {
             large.into_platform(),
         ];
         let deadline = Instant::now() + Duration::from_secs(10);
-        let result =
-            futures::executor::block_on(FastlyPlatformHttpClient.select_until(pending, deadline))
-                .expect("should return a capacity result")
-                .expect("should reject excess growth");
+        let result = futures::executor::block_on(
+            FastlyPlatformHttpClient::default().select_until(pending, deadline),
+        )
+        .expect("should return a capacity result")
+        .expect("should reject excess growth");
         assert!(
             result.ready.is_err(),
             "should reject excess aggregate buffering"
@@ -751,7 +753,7 @@ mod tests {
             "should attribute capacity pressure to the largest partial response"
         );
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient.select_until(result.remaining, deadline),
+            FastlyPlatformHttpClient::default().select_until(result.remaining, deadline),
         )
         .expect("should retain the healthy provider")
         .expect("should complete the healthy provider");
@@ -773,16 +775,17 @@ mod tests {
             buffered_pending(b"two".to_vec(), "two"),
         ];
         let deadline = Instant::now();
-        let result =
-            futures::executor::block_on(FastlyPlatformHttpClient.select_until(pending, deadline))
-                .expect("should snapshot ready results")
-                .expect("should return first ready result");
+        let result = futures::executor::block_on(
+            FastlyPlatformHttpClient::default().select_until(pending, deadline),
+        )
+        .expect("should snapshot ready results")
+        .expect("should return first ready result");
         assert!(
             result.ready.is_ok(),
             "should preserve a complete ready response"
         );
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient.select_until(result.remaining, deadline),
+            FastlyPlatformHttpClient::default().select_until(result.remaining, deadline),
         )
         .expect("should use cached ready results")
         .expect("should return second ready result");
@@ -799,7 +802,7 @@ mod tests {
             .body(Body::empty())
             .expect("should build fixture request");
         futures::executor::block_on(
-            FastlyPlatformHttpClient.send_async(
+            FastlyPlatformHttpClient::default().send_async(
                 PlatformHttpRequest::new(request, "deadline_origin").with_cache_bypass(),
             ),
         )
@@ -815,7 +818,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         let started = Instant::now();
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient.select_until(vec![stalled, fast], deadline),
+            FastlyPlatformHttpClient::default().select_until(vec![stalled, fast], deadline),
         )
         .expect("should snapshot already ready bids")
         .expect("should retain the complete fast response");
@@ -839,7 +842,7 @@ mod tests {
         let pending = network_pending("stalled", "GET");
         let started = Instant::now();
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient
+            FastlyPlatformHttpClient::default()
                 .select_until(vec![pending], started + Duration::from_millis(80)),
         )
         .expect("should stop waiting for stalled headers");
@@ -859,7 +862,7 @@ mod tests {
         let pending = network_pending("trickle", "GET");
         let started = Instant::now();
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient
+            FastlyPlatformHttpClient::default()
                 .select_until(vec![pending], started + Duration::from_millis(80)),
         )
         .expect("should stop buffering a trickling body");
@@ -883,14 +886,15 @@ mod tests {
             .body(Body::empty())
             .expect("should build the request missing cache bypass");
         let unsupported = futures::executor::block_on(
-            FastlyPlatformHttpClient
+            FastlyPlatformHttpClient::default()
                 .send_async(PlatformHttpRequest::new(request, "deadline_origin")),
         )
         .expect("should dispatch the request missing cache bypass");
         let started = Instant::now();
         let deadline = started + Duration::from_millis(200);
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient.select_until(vec![unsupported, slow, fast], deadline),
+            FastlyPlatformHttpClient::default()
+                .select_until(vec![unsupported, slow, fast], deadline),
         )
         .expect("should isolate a request missing cache bypass")
         .expect("should return the unsupported provider's failure");
@@ -910,7 +914,7 @@ mod tests {
             "should reject SDK guest-caching handles before direct handle conversion"
         );
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient.select_until(result.remaining, deadline),
+            FastlyPlatformHttpClient::default().select_until(result.remaining, deadline),
         )
         .expect("should collect the completed sibling")
         .expect("should finish before deadline");
@@ -934,7 +938,7 @@ mod tests {
     fn network_head_skips_the_body_and_its_declared_length_limit() {
         let pending = network_pending("head", "HEAD");
         let result = futures::executor::block_on(
-            FastlyPlatformHttpClient
+            FastlyPlatformHttpClient::default()
                 .select_until(vec![pending], Instant::now() + Duration::from_secs(1)),
         )
         .expect("should collect HEAD response")

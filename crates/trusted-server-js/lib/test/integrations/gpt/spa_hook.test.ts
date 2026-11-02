@@ -9,6 +9,10 @@ import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/s
 import { gptTransport, joinedGptStore } from '../../trace/gpt-fixtures';
 import { AUCTION_TOKEN, SLOT_TOKEN } from '../../trace/fixtures';
 
+const { mockWriteEidsMirror } = vi.hoisted(() => ({ mockWriteEidsMirror: vi.fn() }));
+
+vi.mock('../../../src/core/eids_mirror', () => ({ writeEidsMirror: mockWriteEidsMirror }));
+
 type TestWindow = Window & {
   googletag?: unknown;
   tsjs?: TsjsApi;
@@ -42,6 +46,7 @@ describe('installSpaAuctionHook', () => {
   const realAddEventListener = window.addEventListener.bind(window);
 
   beforeEach(() => {
+    mockWriteEidsMirror.mockClear();
     vi.resetModules();
     delete (window as TestWindow).tsjs;
     // Restore unwrapped history methods so each module import wraps exactly
@@ -367,6 +372,50 @@ describe('installSpaAuctionHook', () => {
     expect(ts.adSlots).toEqual([{ id: 's1', div_id: 'div-s1' }]);
     expect(ts.bids).toEqual({ s1: { hb_pb: '1.00' } });
     expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('writes the ts-eids-s mirror from a page-bids response that carries one', async () => {
+    const mirror = { value: 'eyJ2IjoxfQ', max_age: 600 };
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({ slots: [], bids: {}, ts_eids_s: mirror }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+
+    history.pushState({}, '', '/mirrored-route');
+    await flushAsync();
+
+    expect(mockWriteEidsMirror).toHaveBeenCalledTimes(1);
+    expect(mockWriteEidsMirror).toHaveBeenCalledWith(mirror);
+  });
+
+  it('passes a clear payload through to the mirror writer', async () => {
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({ slots: [], bids: {}, ts_eids_s: { clear: true } }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+
+    history.pushState({}, '', '/cleared-route');
+    await flushAsync();
+
+    expect(mockWriteEidsMirror).toHaveBeenCalledWith({ clear: true });
+  });
+
+  it('leaves the mirror alone when the page-bids response has none', async () => {
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({ slots: [], bids: {} }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+
+    history.pushState({}, '', '/unmirrored-route');
+    await flushAsync();
+
+    expect(mockWriteEidsMirror).not.toHaveBeenCalled();
   });
 
   it('skips adInit on an empty page-bids response with no prior TS state', async () => {
@@ -816,9 +865,13 @@ describe('installSpaAuctionHook', () => {
     const ts = (window as TestWindow).tsjs!;
     const adInit = vi.fn();
     ts.adInit = adInit;
+    ts.auctionDiagnostics = { auctionResolvedMs: 84 };
 
     history.pushState({}, '', '/first');
+    expect(ts.auctionDiagnostics).toBeUndefined();
+    ts.auctionDiagnostics = { auctionResolvedMs: 40 };
     history.pushState({}, '', '/second');
+    expect(ts.auctionDiagnostics).toBeUndefined();
     await flushAsync();
 
     expect(ts.adSlots).toEqual([{ id: 'newer', div_id: 'div-newer' }]);
@@ -842,13 +895,16 @@ describe('installSpaAuctionHook', () => {
     installSpaAuctionHook();
     const ts = (window as TestWindow).tsjs!;
     ts.adSlots = [{ id: 'existing' } as never];
+    ts.auctionDiagnostics = { auctionResolvedMs: 84 };
     const adInit = vi.fn();
     ts.adInit = adInit;
 
     history.pushState({}, '', '/error-page');
+    expect(ts.auctionDiagnostics).toBeUndefined();
     await flushAsync();
 
     expect(ts.adSlots).toEqual([{ id: 'existing' }]);
+    expect(ts.auctionDiagnostics).toBeUndefined();
     expect(adInit).not.toHaveBeenCalled();
   });
 

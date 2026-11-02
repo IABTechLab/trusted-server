@@ -605,3 +605,9 @@ pub mod nextjs_auction {
 
 #[cfg(feature = "test-utils")]
 pub(crate) mod async_html_finalization;
+/// Shared log capture for identity tests, using the same process-wide logger
+/// as thread-local warning captures.
+#[cfg(test)]
+pub mod logs {
+    pub(crate) use super::logging::{captured_logs, install_capturing_logger};
+}

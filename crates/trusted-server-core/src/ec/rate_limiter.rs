@@ -45,4 +45,20 @@ pub trait RateLimiter {
         // hourly API used by pixel sync.
         self.exceeded(key, per_minute_limit.saturating_mul(60))
     }
+
+    /// Adds one to the 60-second count for `key`, without checking a limit.
+    ///
+    /// The identity circuit breaker records one provider failure this way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError`] on rate counter I/O failure.
+    fn record(&self, key: &str) -> Result<(), Report<TrustedServerError>>;
+
+    /// Returns the 60-second count for `key`, without changing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError`] on rate counter I/O failure.
+    fn count(&self, key: &str) -> Result<u32, Report<TrustedServerError>>;
 }

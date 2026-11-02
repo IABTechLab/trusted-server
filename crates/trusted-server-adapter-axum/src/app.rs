@@ -2,6 +2,7 @@ use core::future::Future;
 use std::sync::Arc;
 
 use edgezero_adapter_axum::context::AxumRequestContext;
+use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -19,6 +20,7 @@ use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::finalize::BrowserSeed;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -234,6 +236,8 @@ async fn dispatch_fallback(
                 kv: None,
                 ec_context: &mut ec_context,
                 services,
+                is_real_browser: false,
+                seed: &BrowserSeed::empty(),
                 req,
             })
             .await
@@ -328,7 +332,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 17] {
+fn named_routes() -> [NamedRoute; 18] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -372,6 +376,13 @@ fn named_routes() -> [NamedRoute; 17] {
         NamedRoute {
             path: "/_ts/admin/ec/{id}",
             primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::AdminEcNotSupported,
+        },
+        // The provider opt-out clear writes the EC identity graph, so it
+        // answers like the lookup: not available on this adapter.
+        NamedRoute {
+            path: "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
+            primary_methods: &[Method::DELETE],
             handler: NamedRouteHandler::AdminEcNotSupported,
         },
         // Admin EIDs echo: pure request inspection (no KV), so the dev
@@ -619,16 +630,10 @@ impl Hooks for TrustedServerApp {
         "TrustedServer"
     }
 
+    /// Returns the bare router without terminal timing; serve with
+    /// [`Self::dev_server_service`] to preserve `Server-Timing` emission.
     fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
-        };
-
-        build_router(&state)
+        Self::routes_with_server_timing_flag().0
     }
 }
 
@@ -648,6 +653,43 @@ impl TrustedServerApp {
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_settings(settings)?;
         Ok(build_router(&state))
+    }
+
+    /// The dev server's fully configured tower service: the application
+    /// router wrapped in the terminal timing layer
+    /// ([`crate::timing::TimingService`]), with `server_timing_enabled`
+    /// read from the same settings snapshot that built the router.
+    ///
+    /// This is the standard construction path for serving this adapter.
+    /// [`Hooks::routes`] satisfies the `Hooks` trait contract and returns
+    /// the bare router without the timing layer; callers who serve traffic
+    /// should use this instead so `server_timing_enabled` is never
+    /// silently discarded.
+    #[must_use]
+    pub fn dev_server_service() -> crate::timing::TimingService<EdgeZeroAxumService> {
+        let (router, server_timing_enabled) = Self::routes_with_server_timing_flag();
+        crate::timing::TimingService::new(EdgeZeroAxumService::new(router), server_timing_enabled)
+    }
+
+    /// Build the router alongside whether `Server-Timing` emission is
+    /// enabled, read from the same settings snapshot used to build the
+    /// router.
+    ///
+    /// The Axum dev server's terminal timing layer ([`crate::timing`]) needs
+    /// this flag once at startup. The Axum dev server builds its application
+    /// state once and reuses the same [`RouterService`] for every request.
+    #[must_use]
+    fn routes_with_server_timing_flag() -> (RouterService, bool) {
+        let state = match build_state() {
+            Ok(s) => s,
+            Err(ref e) => {
+                log::error!("failed to build application state: {:?}", e);
+                return (startup_error_router(e), false);
+            }
+        };
+
+        let server_timing_enabled = state.settings.observability.server_timing_enabled;
+        (build_router(&state), server_timing_enabled)
     }
 
     /// Build the full router with explicit settings and runtime services.
@@ -680,10 +722,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     let trace_state = Arc::clone(state);
 
     let mut router = RouterService::builder()
-        .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
-            Arc::clone(&state.settings),
-            Arc::new(move |request| trace_metadata(&trace_state, request)),
-        )))
+        .pre_dispatch_hook(crate::ingress::HttpTracePreDispatchHook(
+            TracePreDispatchHook::new(
+                Arc::clone(&state.settings),
+                Arc::new(move |request| trace_metadata(&trace_state, request)),
+            ),
+        ))
         // Outermost middleware: strips the configured trusted-client-IP
         // headers before anything else sees the request. Must stay first —
         // any middleware registered ahead of it would observe the
