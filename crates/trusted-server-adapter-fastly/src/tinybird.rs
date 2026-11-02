@@ -316,12 +316,7 @@ pub(crate) async fn emit_access_event(
         })?;
     let request = build_access_events_request(target, row, auth_header)?;
 
-    log::debug!(
-        "sending access telemetry to Tinybird dataset={} host={} backend={}",
-        target.dataset,
-        target.api_host,
-        backend_name
-    );
+    log::debug!("sending access telemetry to Tinybird");
 
     let pending = client
         .send_async(PlatformHttpRequest::new(request, backend_name))

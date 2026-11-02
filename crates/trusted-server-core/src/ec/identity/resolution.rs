@@ -268,10 +268,7 @@ impl ResolvedEid {
     pub fn with_ext(mut self, ext: serde_json::Value) -> Self {
         let fits = ext_fits(&ext);
         if !fits {
-            log::debug!(
-                "Dropping an oversized EID-level ext for source {}",
-                self.source
-            );
+            log::debug!("Dropping an oversized EID-level ext");
         }
         self.ext = fits.then_some(ext);
         self
@@ -803,6 +800,7 @@ mod tests {
 
     use super::*;
     use crate::ec::kv_types::MAX_EID_FIELD_BYTES;
+    use crate::test_support::logs::{captured_logs, install_capturing_logger};
 
     fn source(name: &str) -> SourceDomain {
         name.parse().expect("should parse the source")
@@ -1243,6 +1241,33 @@ mod tests {
             resolution.state_rejected(),
             "should flag the state as rejected"
         );
+    }
+
+    #[test]
+    fn oversized_eid_ext_logs_only_a_fixed_reason() {
+        install_capturing_logger();
+        let source = source("resolution-log-canary.example.com");
+        let eid = ResolvedEid::new(&source, uid("resolution-private-first-uid"))
+            .with_uid(uid("resolution-private-second-uid"))
+            .with_ext(json!({"private-ext": "resolution-private-ext".repeat(MAX_EID_FIELD_BYTES)}));
+        assert!(eid.ext().is_none(), "should still discard oversized ext");
+        let logs = captured_logs();
+        assert!(
+            logs.iter()
+                .any(|line| line == "Dropping an oversized EID-level ext"),
+            "should report the rejection reason"
+        );
+        for value in [
+            source.as_str(),
+            "resolution-private-first-uid",
+            "resolution-private-second-uid",
+            "resolution-private-ext",
+        ] {
+            assert!(
+                logs.iter().all(|line| !line.contains(value)),
+                "should not log identity input: {value}"
+            );
+        }
     }
 
     #[test]
