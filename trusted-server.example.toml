@@ -185,6 +185,16 @@ pull_sync_concurrency = 3
 # tcf_vendor_id = 9999
 # [ec.identity_providers.settings]
 # cookie_names = ["_lr_env"]
+#
+# Yahoo ConnectID (kind "connectid"): no lookup and no endpoint. Reads
+# ConnectID from Yahoo's own first-party `connectId` cookie and keeps it until
+# its last sync plus TTL (at most 14 days). Takes exactly one source.
+# [[ec.identity_providers]]
+# id = "connectid"
+# kind = "connectid"
+# enabled = false
+# sources = ["connectid.example.com"]
+# tcf_vendor_id = 9999
 
 
 # =============================================================================
