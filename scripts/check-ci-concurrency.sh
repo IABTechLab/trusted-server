@@ -40,7 +40,7 @@ if ! command -v "$yq_bin" >/dev/null 2>&1; then
   exit 1
 fi
 
-workflow_prefix='${{ github.workflow }}'
+workflow_prefix="\${{ github.workflow }}"
 expected_workflow_group="${workflow_prefix}-\${{ github.event.pull_request.number || github.run_id }}"
 expected_author_suffix="\${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}"
 matrix_prefix="\${{ matrix."
