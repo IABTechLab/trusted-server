@@ -40,9 +40,9 @@ use crate::settings::IdentityProviderConfig;
 /// Coordinates server-side identity lookups for one navigation.
 ///
 /// Implementations own eligibility, consent, destination checks, the shared
-/// time budget and validation. Providers never see KV, cookies, HTTP or the
-/// clock. Implementations never write KV: they return the change and the
-/// caller spends the [`crate::ec::page_load::PageLoadWrite`] permit.
+/// time budget and validation. Providers never see KV, HTTP or the clock,
+/// and see cookies only as [`RequestCookies`]. Implementations never write
+/// KV: they return the change and the caller spends the [`crate::ec::page_load::PageLoadWrite`] permit.
 #[allow(async_fn_in_trait)]
 pub trait IdentityCoordinator {
     /// Starts lookups for every eligible provider without waiting.
@@ -550,6 +550,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 publisher_domain: lookup.publisher_domain,
                 due_sources: &due,
                 current: OwnedEntries::new(entry, &registered.policy.sources, &registered.id),
+                cookies: lookup.cookies,
                 hashed_email: None,
             };
             if let Some(mut eids) = registered.provider.generate(&input) {
