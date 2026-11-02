@@ -33,6 +33,7 @@ use crate::integrations::{
     sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
+use crate::redacted::Redacted;
 use crate::settings::{AssetOriginAuth, Ec, IntegrationConfig, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
@@ -279,7 +280,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, false)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
-    validate_identity_providers(&settings.ec)?;
+    validate_identity_providers(&with_placeholder_partner_tokens(&settings.ec))?;
     Ok(())
 }
 
@@ -323,6 +324,24 @@ fn validate_gpt_diagnostics_config(settings: &Settings) -> Result<(), Report<Tru
             ),
         })
     })
+}
+
+/// Returns a copy of `ec` whose partner tokens are unique placeholders.
+///
+/// Deploy validation runs before secret references are resolved, so partner
+/// tokens still hold secret key names that would fail the runtime length
+/// check when the partner registry is built.
+fn with_placeholder_partner_tokens(ec: &Ec) -> Ec {
+    let mut ec = ec.clone();
+    for (index, partner) in ec.partners.iter_mut().enumerate() {
+        if partner.api_token.is_some() {
+            partner.api_token = Some(Redacted::new(format!("{index:0>64}")));
+        }
+        if partner.ts_pull_token.is_some() {
+            partner.ts_pull_token = Some(Redacted::new(format!("{index:1>64}")));
+        }
+    }
+    ec
 }
 
 /// Checks the identity-provider rules core owns (spec §12.1).
@@ -1353,6 +1372,16 @@ gam_network_id = "99999"
         let settings = settings_with_identity_provider(serde_json::json!({}));
 
         validate_settings_for_runtime(&settings).expect("should accept valid identity provider");
+    }
+
+    #[test]
+    fn deploy_validation_accepts_provider_with_unresolved_partner_token() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({}));
+        settings.ec.partners[0].api_token =
+            Some(Redacted::new("example_partner_api_token".to_owned()));
+
+        validate_settings_for_deploy(&settings)
+            .expect("should not length-check a partner token secret key name");
     }
 
     #[test]
