@@ -92,6 +92,10 @@ Contributors should run `ts dev install-hooks` to enable the pre-commit
 URL-host linter; see [CONTRIBUTING.md](CONTRIBUTING.md) for that and the rest of
 the contribution guidelines.
 
+## PR Comment Resolution Test
+
+This section was added to test GitHub pull request review comment resolution.
+
 ## License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
