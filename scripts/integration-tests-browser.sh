@@ -19,6 +19,10 @@ cd "$REPO_ROOT"
 ORIGIN_PORT="${INTEGRATION_ORIGIN_PORT:-8888}"
 BROWSER_DIR="crates/trusted-server-integration-tests/browser"
 TSJS_LIB_DIR="crates/trusted-server-js/lib"
+BROWSER_ARTIFACTS_DIR="${ARTIFACTS_DIR:-$REPO_ROOT/target/integration-test-artifacts}"
+if [[ "$BROWSER_ARTIFACTS_DIR" != /* ]]; then
+    BROWSER_ARTIFACTS_DIR="$REPO_ROOT/$BROWSER_ARTIFACTS_DIR"
+fi
 NODE_VERSION="$(grep '^nodejs ' .tool-versions | awk '{print $2}')"
 
 if [ -z "$NODE_VERSION" ]; then
@@ -36,8 +40,16 @@ TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
     cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
 echo "==> Generating Viceroy configs..."
-INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" ./scripts/generate-integration-viceroy-configs.sh
-GENERATED_VICEROY_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy.toml"
+INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" \
+ARTIFACTS_DIR="$BROWSER_ARTIFACTS_DIR" ./scripts/generate-integration-viceroy-configs.sh
+GENERATED_VICEROY_CONFIG_PATH="$BROWSER_ARTIFACTS_DIR/configs/viceroy.toml"
+INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" \
+INTEGRATION_APP_CONFIG_PATH="crates/trusted-server-integration-tests/fixtures/configs/trusted-server.trace.toml" \
+INTEGRATION_BIDDER_ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
+ARTIFACTS_DIR="$BROWSER_ARTIFACTS_DIR/trace" ./scripts/generate-integration-viceroy-configs.sh
+INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" \
+INTEGRATION_APP_CONFIG_PATH="crates/trusted-server-integration-tests/fixtures/configs/trusted-server.trace-auth.toml" \
+ARTIFACTS_DIR="$BROWSER_ARTIFACTS_DIR/trace-auth" ./scripts/generate-integration-viceroy-configs.sh
 
 # --- Build Docker images ---
 echo "==> Building WordPress test container..."
@@ -68,6 +80,10 @@ cd "$REPO_ROOT/$BROWSER_DIR"
 export WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm"
 export INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT"
 export VICEROY_CONFIG_PATH="$GENERATED_VICEROY_CONFIG_PATH"
+export TRACE_VICEROY_CONFIG_PATH="$BROWSER_ARTIFACTS_DIR/trace/configs/viceroy.toml"
+export TRACE_AUTH_VICEROY_CONFIG_PATH="$BROWSER_ARTIFACTS_DIR/trace-auth/configs/viceroy.toml"
+
+node --test trace-fixture.test.cjs
 
 # Cleanup trap: stop any leftover containers on failure
 stop_matching_containers() {

@@ -8,6 +8,8 @@ import {
 } from '../../core/first_impression';
 import { log } from '../../core/log';
 import { resolveSlotElementByDivId } from '../../core/slot_element';
+import { getActiveTraceGptBridge } from '../../trace/runtime';
+import type { TraceGptOpportunity } from '../../trace/gpt';
 import type {
   AuctionSlot,
   AuctionBidData,
@@ -332,10 +334,19 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * riding rAF keeps a single code path whose post-hydration-commit guarantee
  * holds whenever the request is actually issued.
  */
+function traceOpportunity(slot: AuctionSlot, auctionId: string | undefined): TraceGptOpportunity {
+  try {
+    return getActiveTraceGptBridge()?.opportunity(slot, auctionId) ?? { auctionId };
+  } catch {
+    return { auctionId };
+  }
+}
+
 function installScheduleInitialAdInit(ts: TsjsApi): void {
   ts.scheduleInitialAdInit = function (
     initialBids?: Record<string, AuctionBidData>,
-    initialSlots?: AuctionSlot[]
+    initialSlots?: AuctionSlot[],
+    traceAuctionTransport?: unknown
   ) {
     if ((ts.navGeneration ?? 0) !== 0 || ts.initialAdInitScheduled) return;
     ts.initialAdInitScheduled = true;
@@ -346,6 +357,15 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
     }
     const runUnlessNavigated = (): void => {
       if ((ts.navGeneration ?? 0) !== 0) return;
+      try {
+        getActiveTraceGptBridge()?.observeTransport(
+          initialSlots ?? ts.adSlots,
+          traceAuctionTransport,
+          'initial_navigation_ssat'
+        );
+      } catch {
+        // A diagnostic bridge cannot block the ordinary initial ad pass.
+      }
       ts.adInit?.();
     };
     const afterHydrationFrames = (): void => {
@@ -746,12 +766,14 @@ function schedulePublisherFirstImpressionFallback(
       if (tsOwned) (ts.prevGptSlots ??= []).push(gptSlot);
 
       try {
+        const trace = traceOpportunity(slot, bid.hb_auction_id);
         ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
           gptSlot,
           slot.id,
           trustedServerOpportunity(bid),
-          bid.hb_auction_id,
-          slot.formats
+          trace.auctionId,
+          slot.formats,
+          ...(trace.identity ? ([trace.identity] as const) : [])
         );
       } catch {
         // Diagnostics must not alter fallback delivery.
@@ -949,12 +971,14 @@ export function installTsAdInit(): void {
         try {
           const requestedSlotSizes = ts.gptSlotHandoffs?.[slotDivId2]?.formats;
           const opportunity = trustedServerOpportunity(bid);
+          const trace = traceOpportunity(slot, bid.hb_auction_id);
           ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
             gptSlot,
             slot.id,
             opportunity,
-            bid.hb_auction_id,
-            requestedSlotSizes
+            trace.auctionId,
+            requestedSlotSizes,
+            ...(trace.identity ? ([trace.identity] as const) : [])
           );
         } catch {
           // Diagnostics must not alter ad delivery.
@@ -1058,6 +1082,7 @@ export function installTsAdInit(): void {
 interface PageBidsResponse {
   slots: AuctionSlot[];
   bids: Record<string, AuctionBidData>;
+  trace_auction?: unknown;
 }
 
 /** Canonical SPA re-auction endpoint. Mirrors `PAGE_BIDS_PATH` in Rust. */
@@ -1337,6 +1362,11 @@ export function installSpaAuctionHook(): void {
       if (inflight !== controller || ts.navGeneration !== generation) return;
       ts.adSlots = data.slots;
       ts.bids = data.bids;
+      try {
+        getActiveTraceGptBridge()?.observePageBids(data, data.slots);
+      } catch {
+        // A diagnostic bridge cannot block the accepted navigation.
+      }
       // This route is now the committed, loaded state — a later failed
       // navigation rolls back here, and a return trip no-ops correctly.
       lastAppliedPath = path;

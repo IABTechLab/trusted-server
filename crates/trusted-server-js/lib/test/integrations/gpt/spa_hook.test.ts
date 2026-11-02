@@ -4,6 +4,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { TsjsApi } from '../../../src/core/types';
 import { GPT_BOOTSTRAP_PATH } from '../../fixtures/paths';
+import { installTraceRuntime } from '../../../src/trace/runtime';
+import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
+import { gptTransport, joinedGptStore } from '../../trace/gpt-fixtures';
+import { AUCTION_TOKEN, SLOT_TOKEN } from '../../trace/fixtures';
 
 type TestWindow = Window & {
   googletag?: unknown;
@@ -54,6 +58,7 @@ describe('installSpaAuctionHook', () => {
   });
 
   afterEach(() => {
+    delete window.__tsjs_trace_active;
     history.pushState = originalPushState;
     history.replaceState = originalReplaceState;
     // Reset jsdom location back to root for the next test.
@@ -65,6 +70,158 @@ describe('installSpaAuctionHook', () => {
     popstateHandlers = [];
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it.each(['canonical', 'legacy', 'malformed', 'absent', 'throwing-bridge', 'oversized'] as const)(
+    'consumes optional %s transport only after an accepted navigation and before adInit',
+    async (kind) => {
+      const { installSpaAuctionHook } = await importGptModule();
+      installSpaAuctionHook();
+      const ts = (window as TestWindow).tsjs!;
+      window.__tsjs_trace_active = true;
+      const collector = installTraceRuntime(ts)!;
+      const slots = [
+        {
+          id: 'example',
+          gam_unit_path: '/example/ad',
+          div_id: 'example',
+          formats: [[300, 250]] as Array<[number, number]>,
+          ext: { trusted_server: { trace_slot_ref: SLOT_TOKEN } },
+        },
+      ];
+      if (kind === 'oversized') {
+        slots.push(
+          ...Array.from({ length: 64 }, () => ({
+            ...slots[0]!,
+            ext: { trusted_server: { trace_slot_ref: 'private-invalid' } },
+          }))
+        );
+      }
+      document.body.innerHTML = '<div id="example"></div>';
+      const transport = gptTransport('spa_page_bids');
+      const payload = {
+        slots,
+        bids: {},
+        ...(kind === 'absent'
+          ? {}
+          : { trace_auction: kind === 'malformed' ? { schema_version: 1 } : transport }),
+      };
+      if (kind === 'legacy') fetchStub.mockResolvedValueOnce({ ok: false, status: 404 });
+      fetchStub.mockResolvedValue({ ok: true, json: async () => payload });
+      if (kind === 'throwing-bridge')
+        ts.traceGpt = {
+          ...ts.traceGpt!,
+          observePageBids: () => {
+            throw new Error('private-bridge');
+          },
+        };
+      ts.adInit = vi.fn(() => {
+        expect(ts.adSlots).toBe(slots);
+        expect(collector.snapshot().value?.serverAuctions).toHaveLength(
+          ['canonical', 'legacy', 'oversized'].includes(kind) ? 1 : 0
+        );
+      });
+      history.pushState({}, '', '/trace-route');
+      await flushAsync();
+      expect(ts.adInit).toHaveBeenCalledOnce();
+      expect(collector.snapshot().value?.issues).toEqual(
+        kind === 'malformed'
+          ? ['evidence_validation_failed']
+          : kind === 'oversized'
+            ? ['correlation_unavailable']
+            : []
+      );
+      if (kind === 'oversized') {
+        expect(ts.adSlots).toHaveLength(65);
+        expect(ts.traceGpt!.identity(slots[0]!)).toBeUndefined();
+      }
+      if (kind === 'legacy') expect(fetchStub).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it('joins the actual no-bid SPA GPT request with its validated pre-dispatch token', async () => {
+    const { installSpaAuctionHook, installTsAdInit } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    window.__tsjs_trace_active = true;
+    const collector = installTraceRuntime(ts)!;
+    const slot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      clearTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: () => 'example',
+      getTargeting: () => [],
+    };
+    const pubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: () => [slot],
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    vi.stubGlobal('googletag', {
+      cmd: { push: (callback: () => void) => callback() },
+      defineSlot: () => slot,
+      pubads: () => pubads,
+      enableServices: vi.fn(),
+    });
+    const store = new GptDiagnosticsStore({
+      onTraceCorrelation: (value) => collector.recordCorrelation(value),
+    });
+    ts.gptDiagnosticsRecorder = store;
+    document.body.innerHTML = '<div id="example"></div>';
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        slots: [
+          {
+            id: 'example',
+            gam_unit_path: '/example/ad',
+            div_id: 'example',
+            formats: [[300, 250]],
+            ext: { trusted_server: { trace_slot_ref: SLOT_TOKEN } },
+          },
+        ],
+        bids: {},
+        trace_auction: gptTransport('spa_page_bids'),
+      }),
+    });
+    installTsAdInit();
+    history.pushState({}, '', '/trace-no-bid');
+    await flushAsync();
+    store.recordSlotRequested(slot);
+    expect(store.snapshot().slots[0]!.requests[0]).toMatchObject({
+      requestPath: 'trusted_server_direct',
+      trustedServerOpportunity: 'no_candidate',
+      trustedServerAuctionId: AUCTION_TOKEN,
+    });
+    expect(joinedGptStore(store, collector)?.auctions[0]?.slots[0]?.correlation).toBe('matched');
+  });
+
+  it('does not capture a superseded SPA response', async () => {
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    window.__tsjs_trace_active = true;
+    const collector = installTraceRuntime(ts)!;
+    ts.adInit = vi.fn();
+    let resolveOld!: (value: unknown) => void;
+    fetchStub.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveOld = resolve;
+        })
+    );
+    fetchStub.mockResolvedValueOnce({ ok: true, json: async () => ({ slots: [], bids: {} }) });
+    history.pushState({}, '', '/trace-old');
+    history.pushState({}, '', '/trace-new');
+    await flushAsync();
+    resolveOld({
+      ok: true,
+      json: async () => ({ slots: [], bids: {}, trace_auction: gptTransport('spa_page_bids') }),
+    });
+    await flushAsync();
+    expect(collector.snapshot().value?.serverAuctions).toEqual([]);
+    expect(collector.snapshot().value?.issues).toEqual([]);
   });
 
   it('increments navGeneration only when a pathname navigation is accepted', async () => {
