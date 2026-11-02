@@ -158,20 +158,26 @@ pull_sync_concurrency = 3
 #
 # LiveIntent (kind "liveintent"): anonymous lookup, no secrets. Each attribute
 # LiveIntent returns is stored under the source it maps to; every mapped
-# source must be listed in `sources`.
+# source must be listed in `sources`. `nonId` is LiveIntent's own ID; the other
+# attributes (Prebid's names, such as `bidswitch`, `triplelift`, `magnite`,
+# `index`, `openx`, `pubmatic`, `sovrn` and `nexxen`) are partner IDs, sent
+# with UID `ext.provider` naming LiveIntent. `distributor_id` is optional and
+# must be a LiveIntent-issued `did-...` ID; without it the lookup uses the
+# `prebid` path, as Prebid does.
 # [[ec.identity_providers]]
 # id = "liveintent"
 # kind = "liveintent"
 # enabled = false
 # endpoint = "https://liveintent.example.com/idex"
 # allowed_domains = ["liveintent.example.com"]
-# sources = ["liveintent.example.com"]
+# sources = ["liveintent.example.com", "ssp.example.com"]
 # tcf_vendor_id = 9999
 # [ec.identity_providers.settings]
 # publisher_id = "any"
-# distributor_id = "example-distributor"
+# distributor_id = "did-0123"
 # [ec.identity_providers.settings.attributes]
 # nonId = "liveintent.example.com"
+# magnite = "ssp.example.com"
 #
 # LiveRamp (kind "liveramp"): no lookup and no endpoint. Reads the RampID
 # envelope from LiveRamp's own first-party `_lr_env` cookie and keeps it for

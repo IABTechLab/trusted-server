@@ -13,16 +13,16 @@
 - Anonymous only: no hashed email, and no first-party `LiveIntent` cookie (`duid`), because `LookupInput` carries no cookies.
 - The attribute-to-source table is operator configuration (`settings.attributes`), not a hard-coded list; every mapped source must be one of the provider's `sources`.
 - No page URL in `LookupInput`, so `pu` is the publisher origin.
-- EID-level fields are ignored and no `ext` is synthesized (`segments`, `provider`, `rtiPartner`), because `ProviderUid::ext` borrows from the response body.
+- EID-level fields are ignored. As in Prebid, every attribute other than `nonId` is a partner ID whose UID carries a static `ext` of `{"provider":"liveintent.com"}`; no other `ext` (`segments`, `rtiPartner`) is synthesized.
 - The `Expires` header becomes `ProviderExpiry::At`; the provider never reads the clock.
 
 ## Settings
 
-| Key              | Default       | Meaning                                           |
-| ---------------- | ------------- | ------------------------------------------------- |
-| `publisher_id`   | `any`         | Path segment after the distributor.               |
-| `distributor_id` | none          | Sent as `did`; the path uses `prebid` when unset. |
-| `attributes`     | required, ≥ 1 | `LiveIntent` attribute name → stored source.      |
+| Key              | Default       | Meaning                                                                                                                                        |
+| ---------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `publisher_id`   | `any`         | Path segment after the distributor.                                                                                                            |
+| `distributor_id` | none          | A `did-...` ID; sent as `did` and used as the path. LiveIntent rejects any other form, so build rejects it. The path uses `prebid` when unset. |
+| `attributes`     | required, ≥ 1 | `LiveIntent` attribute name → stored source.                                                                                                   |
 
 No Lockr capability: Lockr AIM is not documented to deliver LiveIntent IDs, and the lookup uses LiveIntent's own signals, so a `[settings.lockr]` table is rejected.
 
@@ -33,7 +33,7 @@ No Lockr capability: Lockr AIM is not documented to deliver LiveIntent IDs, and 
 
 ## Response
 
-- `204 No Content` is `LookupOutcome::NoMatch`; another non-2xx status or a non-object body is `ProviderError::InvalidResponse`.
+- `204 No Content` is `LookupOutcome::NoMatch`. LiveIntent answers `204` to anonymous `gdpr=1` lookups and returns only `nonId` without its own third-party cookie; another non-2xx status or a non-object body is `ProviderError::InvalidResponse`.
 - Each configured attribute with a non-empty string value becomes one EID with `atype = 3`, borrowed from the body.
 
 ## Tasks
