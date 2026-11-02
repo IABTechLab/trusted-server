@@ -36,14 +36,15 @@ pub struct ConnectId;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectIdSettings {
-    /// Cookie holding the `ConnectID` object.
-    #[serde(default = "ConnectIdSettings::default_cookie_name")]
-    pub cookie_name: String,
+    /// Cookies holding the `ConnectID` object, read in order; the first
+    /// holding a usable ID wins.
+    #[serde(default = "ConnectIdSettings::default_cookie_names")]
+    pub cookie_names: Vec<String>,
 }
 
 impl ConnectIdSettings {
-    fn default_cookie_name() -> String {
-        "connectId".to_owned()
+    fn default_cookie_names() -> Vec<String> {
+        vec!["connectId".to_owned()]
     }
 }
 
@@ -52,7 +53,7 @@ impl ConnectIdSettings {
 pub struct ConnectIdProvider {
     capabilities: ProviderCapabilities,
     source: SourceDomain,
-    cookie_name: String,
+    cookie_names: Box<[String]>,
 }
 
 impl ProviderKind for ConnectId {
@@ -64,11 +65,15 @@ impl ProviderKind for ConnectId {
         common: &ProviderCommon<'_>,
         settings: ConnectIdSettings,
     ) -> Result<ConnectIdProvider, Report<ProviderConfigError>> {
+        if settings.cookie_names.is_empty() {
+            return Err(Report::new(ProviderConfigError::Invalid)
+                .attach("a connectid provider needs at least one cookie name"));
+        }
         let (capabilities, source) = cookie_capabilities(common, Self::KIND)?;
         Ok(ConnectIdProvider {
             capabilities,
             source,
-            cookie_name: settings.cookie_name,
+            cookie_names: settings.cookie_names.into_boxed_slice(),
         })
     }
 }
@@ -127,7 +132,11 @@ impl IdentityProvider for ConnectIdProvider {
         &self,
         cookies: RequestCookies<'cookie>,
     ) -> Option<Vec<ProviderEid<'cookie>>> {
-        let (id, expiry) = connect_id(cookies.get(&self.cookie_name)?)?;
+        let (id, expiry) = self
+            .cookie_names
+            .iter()
+            .filter_map(|name| cookies.get(name))
+            .find_map(connect_id)?;
         Some(vec![cookie_eid(&self.source, Cow::Owned(id), expiry)])
     }
 }

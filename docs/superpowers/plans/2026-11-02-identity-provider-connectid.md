@@ -10,7 +10,7 @@
 
 ## Cookie
 
-- Default cookie `connectId`; `cookie_name` overrides it.
+- Default cookie `connectId`; `cookie_names` overrides the list, read in order.
 - The value is JSON, optionally percent-encoded: `connectId`, `he`, `puid`, `lastSynced`, `lastUsed`, `ttl` (timestamps and TTL in milliseconds).
 - Only `connectId`, `lastSynced` and `ttl` are read. `he` and `puid` are never deserialized, so they are never stored.
 - A missing `connectId` or `lastSynced`, a non-string ID, a blank or opt-out ID, or malformed JSON reads as no ID.
