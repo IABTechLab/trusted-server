@@ -2,11 +2,17 @@
 
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use error_stack::Report;
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use trusted_server_core::ec::provider::{ProviderEid, ProviderExpiry, ProviderUid};
+use trusted_server_core::ec::eid_types::SourceDomain;
+use trusted_server_core::ec::provider::{
+    EidLevelFields, EidShape, ProviderCapabilities, ProviderCommon, ProviderConfigError,
+    ProviderEid, ProviderExpiry, ProviderUid, SourceCapability, SourceInput,
+};
 
 /// Returns whether `ip` is a public address worth sending to a vendor.
 ///
@@ -107,6 +113,76 @@ pub(crate) fn bounded_expiry(ttl: Option<Duration>) -> ProviderExpiry {
 #[must_use]
 pub(crate) fn join_section_ids(ids: &[u16]) -> String {
     ids.iter().map(u16::to_string).collect::<Vec<_>>().join(",")
+}
+
+/// Agent type of the person-based IDs read from vendor cookies.
+pub(crate) const COOKIE_ATYPE: i32 = 3;
+
+/// Builds the capabilities of a cookie-only provider, which claims exactly
+/// one source and stores one UID for it.
+///
+/// # Errors
+///
+/// Returns [`ProviderConfigError::Invalid`] unless exactly one source is
+/// configured.
+pub(crate) fn cookie_capabilities(
+    common: &ProviderCommon<'_>,
+    kind: &str,
+) -> Result<(ProviderCapabilities, SourceDomain), Report<ProviderConfigError>> {
+    let [source] = common.sources else {
+        return Err(Report::new(ProviderConfigError::Invalid)
+            .attach(format!("a {kind} provider needs exactly one source")));
+    };
+    let one = NonZeroUsize::MIN;
+    let capabilities = ProviderCapabilities {
+        sources: Box::new([SourceCapability {
+            source: source.clone(),
+            input: SourceInput::Anonymous,
+        }]),
+        shape: EidShape {
+            max_eids: one,
+            max_uids_per_eid: one,
+            eid_level_fields: EidLevelFields::Ignored,
+        },
+    };
+    Ok((capabilities, source.clone()))
+}
+
+/// Whether a cookie-carried ID is worth storing: not blank and not an
+/// opt-out placeholder such as `0` or an all-zero UUID.
+#[must_use]
+pub(crate) fn is_usable_id(id: &str) -> bool {
+    let id = id.trim();
+    !id.is_empty() && !id.chars().all(|c| c == '0' || c == '-')
+}
+
+/// One EID for `source` holding the single UID `id` with agent type 3.
+#[must_use]
+pub(crate) fn cookie_eid<'cookie>(
+    source: &SourceDomain,
+    id: Cow<'cookie, str>,
+    expiry: ProviderExpiry,
+) -> ProviderEid<'cookie> {
+    ProviderEid {
+        source: Cow::Owned(source.as_str().to_owned()),
+        inserter: None,
+        matcher: None,
+        mm: None,
+        ext: None,
+        uids: vec![ProviderUid {
+            id,
+            atype: Some(COOKIE_ATYPE),
+            ext: None,
+            expiry,
+        }],
+    }
+}
+
+/// Percent-decodes a cookie value, keeping it unchanged when it is not
+/// valid percent-encoded UTF-8.
+#[must_use]
+pub(crate) fn percent_decoded(value: &str) -> Cow<'_, str> {
+    urlencoding::decode(value).unwrap_or(Cow::Borrowed(value))
 }
 
 /// A complete `OpenRTB` EID as a vendor returns it, borrowed from the body.
@@ -225,6 +301,24 @@ mod tests {
                 "should drop {ip}"
             );
         }
+    }
+
+    #[test]
+    fn filters_blank_and_opt_out_ids() {
+        for id in ["", "  ", "0", "00000000-0000-0000-0000-000000000000"] {
+            assert!(!is_usable_id(id), "should drop {id:?}");
+        }
+        assert!(is_usable_id("id-example-1"), "should keep a real ID");
+    }
+
+    #[test]
+    fn percent_decodes_leniently() {
+        assert_eq!(percent_decoded("a%20b"), "a b", "should decode");
+        assert_eq!(
+            percent_decoded("a+b%zz"),
+            "a+b%zz",
+            "should keep invalid input"
+        );
     }
 
     #[test]
