@@ -22,6 +22,7 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::finalize::BrowserSeed;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -546,6 +547,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         kv: None,
                         ec_context: &mut ec_context,
                         services: &services,
+                        is_real_browser: false,
+                        seed: &BrowserSeed::empty(),
                         req,
                     })
                     .await
@@ -652,6 +655,14 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
             })
+            // The provider opt-out clear writes the EC identity graph, so it
+            // answers like the lookup.
+            .delete(
+                "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
+                |_ctx: RequestContext| async {
+                    Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
+                },
+            )
             // Admin EIDs echo: pure request inspection (no KV), so this
             // adapter serves the real handler.
             .get(

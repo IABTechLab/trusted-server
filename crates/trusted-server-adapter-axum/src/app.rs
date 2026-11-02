@@ -20,6 +20,7 @@ use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::finalize::BrowserSeed;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -235,6 +236,8 @@ async fn dispatch_fallback(
                 kv: None,
                 ec_context: &mut ec_context,
                 services,
+                is_real_browser: false,
+                seed: &BrowserSeed::empty(),
                 req,
             })
             .await
@@ -329,7 +332,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 17] {
+fn named_routes() -> [NamedRoute; 18] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -373,6 +376,13 @@ fn named_routes() -> [NamedRoute; 17] {
         NamedRoute {
             path: "/_ts/admin/ec/{id}",
             primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::AdminEcNotSupported,
+        },
+        // The provider opt-out clear writes the EC identity graph, so it
+        // answers like the lookup: not available on this adapter.
+        NamedRoute {
+            path: "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
+            primary_methods: &[Method::DELETE],
             handler: NamedRouteHandler::AdminEcNotSupported,
         },
         // Admin EIDs echo: pure request inspection (no KV), so the dev

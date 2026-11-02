@@ -82,6 +82,8 @@ fn compute_host_header(scheme: &str, host: &str, port: u16) -> String {
 pub(crate) const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default timeout between response body bytes for backends (10 seconds).
 pub(crate) const DEFAULT_BETWEEN_BYTES_TIMEOUT: Duration = Duration::from_secs(10);
+/// Connect timeout of a backend whose spec sets none.
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Configuration for creating a dynamic Fastly backend.
 ///
@@ -94,6 +96,7 @@ pub struct BackendConfig<'a> {
     certificate_check: bool,
     first_byte_timeout: Duration,
     between_bytes_timeout: Duration,
+    connect_timeout: Option<Duration>,
     host_header_override: Option<&'a str>,
     discriminator: Option<&'a str>,
 }
@@ -112,6 +115,7 @@ impl<'a> BackendConfig<'a> {
             certificate_check: true,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_BETWEEN_BYTES_TIMEOUT,
+            connect_timeout: None,
             host_header_override: None,
             discriminator: None,
         }
@@ -154,6 +158,14 @@ impl<'a> BackendConfig<'a> {
         self
     }
 
+    /// Set the maximum time to wait for the connection. `None`, the default,
+    /// uses [`DEFAULT_CONNECT_TIMEOUT`].
+    #[must_use]
+    pub fn connect_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
     /// Set the outbound Host header sent to the backend origin.
     #[must_use]
     pub fn host_header_override(mut self, host: Option<&'a str>) -> Self {
@@ -183,6 +195,7 @@ impl<'a> BackendConfig<'a> {
             certificate_check: self.certificate_check,
             first_byte_timeout: self.first_byte_timeout,
             between_bytes_timeout: self.between_bytes_timeout,
+            connect_timeout: self.connect_timeout,
             discriminator: self.discriminator.map(str::to_owned),
         }
     }
@@ -237,7 +250,7 @@ impl<'a> BackendConfig<'a> {
         // Target base is host[:port]; SSL is enabled only for https scheme
         let mut builder = Backend::builder(&backend_name, &host_with_port)
             .override_host(&host_header)
-            .connect_timeout(Duration::from_secs(1))
+            .connect_timeout(self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT))
             .first_byte_timeout(self.first_byte_timeout)
             .between_bytes_timeout(self.between_bytes_timeout);
         if self.scheme.eq_ignore_ascii_case("https") {

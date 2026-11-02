@@ -109,6 +109,10 @@ function page() {
   };
 }
 
+function bidWonSubscriptions(prebid) {
+  return prebid.onEvent.mock.calls.filter(([name]) => name === 'bidWon');
+}
+
 describe('separately built Prebid shim and diagnostics artifacts', () => {
   it('does not subscribe or read diagnostic targeting when only the shim is loaded', () => {
     const p = page();
@@ -116,7 +120,12 @@ describe('separately built Prebid shim and diagnostics artifacts', () => {
       p.target.eval(bundles.prebid);
       p.pubads.refresh([p.slot]);
       expect(p.refresh).toHaveBeenCalledOnce();
-      expect(p.prebid.onEvent).not.toHaveBeenCalled();
+      // The EID lifecycle listens for TCF blocks even without diagnostics.
+      expect(p.prebid.onEvent).toHaveBeenCalledExactlyOnceWith(
+        'tcf2Enforcement',
+        expect.any(Function)
+      );
+      expect(bidWonSubscriptions(p.prebid)).toEqual([]);
       expect(p.slot.getTargeting).not.toHaveBeenCalledWith('hb_bidder');
       expect(p.slot.getTargeting).not.toHaveBeenCalledWith('hb_pb');
       expect(p.target.tsjs.gptDiagnosticsRecorder).toBeUndefined();
@@ -140,7 +149,7 @@ describe('separately built Prebid shim and diagnostics artifacts', () => {
       expect(p.refresh).toHaveBeenCalledExactlyOnceWith([p.slot], undefined);
       expect(p.prebid.setTargetingForGPTAsync).toHaveBeenCalledWith(['ad-slot']);
       expect(decoy.onEvent).not.toHaveBeenCalled();
-      expect(p.prebid.onEvent).toHaveBeenCalledExactlyOnceWith('bidWon', expect.any(Function));
+      expect(bidWonSubscriptions(p.prebid)).toEqual([['bidWon', expect.any(Function)]]);
       let cycle = p.target.tsjs.gptDiagnostics.snapshot().slots[0].requests[0];
       expect(cycle.prebidAuction).toMatchObject({
         auctionId: 'auction-1',
@@ -170,7 +179,9 @@ describe('separately built Prebid shim and diagnostics artifacts', () => {
       const previousRecorder = p.target.tsjs.gptDiagnosticsRecorder;
       const previousWin = vi.spyOn(previousRecorder, 'recordPrebidWin');
       p.pubads.refresh([p.slot]);
-      const previousListener = p.prebid.onEvent.mock.calls[1][1];
+      const previousListener = bidWonSubscriptions(p.prebid).find(
+        ([, handler]) => handler !== publisher
+      )[1];
       expect(p.prebidEvents.get('bidWon').size).toBe(2);
       p.target.__tsjs_gpt_diagnostics_runtime.destroy();
       expect(p.prebid.offEvent).toHaveBeenCalledExactlyOnceWith('bidWon', previousListener);
@@ -210,7 +221,7 @@ describe('separately built Prebid shim and diagnostics artifacts', () => {
       p.pubads.refresh([p.slot]);
       expect(p.refresh).toHaveBeenCalledTimes(1);
       p.pubads.refresh([p.slot]);
-      expect(p.prebid.onEvent).toHaveBeenCalledTimes(2);
+      expect(bidWonSubscriptions(p.prebid)).toHaveLength(2);
       p.target.tsjs.gptDiagnosticsRecorder.recordCompletedPrebidAuction = () => {
         throw new Error('diagnostics failed');
       };

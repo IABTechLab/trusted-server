@@ -216,11 +216,10 @@ fn parse_client_eid_ext(value: &JsonValue) -> Option<JsonValue> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, Once};
-
     use serde_json::json;
 
     use super::*;
+    use crate::test_support::logs::{captured_logs, install_capturing_logger};
 
     fn parse(text: &str) -> Vec<Eid> {
         let raw = RawValue::from_string(text.to_owned()).expect("should capture raw JSON");
@@ -243,42 +242,6 @@ mod tests {
     fn ext_of_len(bytes: usize) -> String {
         // `{"k":""}` is 8 bytes.
         format!(r#"{{"k":"{}"}}"#, "x".repeat(bytes - 8))
-    }
-
-    static CAPTURED_LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    static INSTALL_LOGGER: Once = Once::new();
-
-    struct CapturingLogger;
-
-    impl log::Log for CapturingLogger {
-        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.level() <= log::Level::Debug
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            if self.enabled(record.metadata()) {
-                CAPTURED_LOGS
-                    .lock()
-                    .expect("should lock captured logs")
-                    .push(record.args().to_string());
-            }
-        }
-
-        fn flush(&self) {}
-    }
-
-    fn install_capturing_logger() {
-        INSTALL_LOGGER.call_once(|| {
-            log::set_logger(&CapturingLogger).expect("should install the capturing test logger");
-            log::set_max_level(log::LevelFilter::Debug);
-        });
-    }
-
-    fn captured_logs() -> Vec<String> {
-        CAPTURED_LOGS
-            .lock()
-            .expect("should lock captured logs")
-            .clone()
     }
 
     #[test]

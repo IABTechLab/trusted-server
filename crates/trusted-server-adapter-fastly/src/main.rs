@@ -20,18 +20,24 @@ use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_h
 use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_POP, ENV_FASTLY_SERVICE_ID, HEADER_X_TS_VERSION,
 };
+use trusted_server_core::ec::EcKvSnapshot;
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::finalize::ec_finalize_response;
-use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::ec::pull_sync::{
-    PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
+use trusted_server_core::ec::finalize::{ec_finalize_response, retry_failed_withdrawals};
+use trusted_server_core::ec::identity::IdentityRuntime;
+use trusted_server_core::ec::identity::flush::{
+    AfterSendInput, FlushOutcome, defer_capture_writes, lose_pending_removals, may_flush,
+    retry_pending_removals, run_after_send,
 };
+use trusted_server_core::ec::identity::measurement::{IdentityMeasurement, MeasurementInput};
+use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::kv_backend::KvOperationCounts;
+use trusted_server_core::ec::rate_limiter::RateLimiter;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoLookupState;
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
-use trusted_server_core::platform::{PlatformHttpClient, TimedKvStore};
+use trusted_server_core::platform::PlatformHttpClient;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::publisher::TemplateCacheResponseState;
 use trusted_server_core::request_timing::{Phase, RequestTimings, append_server_timing_if_private};
@@ -56,7 +62,7 @@ mod tinybird;
 
 use crate::app::{
     AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp,
-    load_settings_from_config_store,
+    build_identity_runtime_from_reloaded_settings, load_settings_from_config_store,
 };
 use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
@@ -542,7 +548,7 @@ fn edgezero_main(
         .is_some()
     {
         // Trace responses keep their exact hardened headers; no sandbox counters.
-        send_response_to_client(response, None);
+        send_response_to_client(response, None, &timings, None);
         return;
     }
 
@@ -601,88 +607,116 @@ fn edgezero_main(
         access_sample_rate,
         access_telemetry_enabled,
     };
-    let access_http_client = platform::FastlyPlatformHttpClient;
+    let access_http_client = platform::FastlyPlatformHttpClient::default();
 
     if let Some(mut ec_state) = ec_state {
-        if let Some(settings) = settings_snapshot.as_deref() {
-            match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response, &timings) {
-                Ok(partner_registry) => {
-                    let outcome = send_edgezero_response(
+        let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+        if let Some(state) = app_state.as_deref() {
+            let graph = || {
+                if state.identity_graph.is_none() {
+                    log::warn!("identity graph unavailable: ec.ec_store is not configured");
+                }
+                state.identity_graph.clone()
+            };
+            run_post_send_steps(
+                || {
+                    let mut outcome = None;
+                    finalize_send_and_flush(
+                        PostRouteInput {
+                            runtime: Some(&state.identity),
+                            settings: &state.settings,
+                            ec_state: &mut ec_state,
+                            graph: &graph,
+                            rate_limiter: &limiter,
+                            timings: Some(&timings),
+                        },
                         response,
-                        request_filter_effects.as_ref(),
-                        &send_context,
-                        counters.as_ref(),
-                    );
-                    run_post_send_steps(
-                        || {
-                            run_edgezero_pull_sync_after_send(
-                                settings,
-                                &partner_registry,
-                                &ec_state,
-                            )
-                        },
-                        || {
-                            emit_access_telemetry_after_send(
-                                &access_http_client,
-                                settings,
-                                &outcome,
-                                &timings,
-                            )
-                        },
-                    );
-                    return;
-                }
-                Err(e) => {
-                    log::error!(
-                        "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
-                    );
-                }
-            }
-        } else {
-            match load_settings_from_config_store(&runtime_stores) {
-                Ok(settings) => {
-                    match apply_edgezero_ec_finalize(
-                        &settings,
-                        &mut ec_state,
-                        &mut response,
-                        &timings,
-                    ) {
-                        Ok(partner_registry) => {
-                            let outcome = send_edgezero_response(
+                        &mut |response| {
+                            outcome = Some(send_edgezero_response(
                                 response,
                                 request_filter_effects.as_ref(),
                                 &send_context,
                                 counters.as_ref(),
-                            );
-                            run_post_send_steps(
-                                || {
-                                    run_edgezero_pull_sync_after_send(
-                                        &settings,
-                                        &partner_registry,
-                                        &ec_state,
-                                    );
-                                },
-                                || {
-                                    emit_access_telemetry_after_send(
-                                        &access_http_client,
-                                        &settings,
-                                        &outcome,
-                                        &timings,
-                                    )
-                                },
-                            );
-                            return;
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
-                            );
-                        }
+                            ));
+                        },
+                    );
+                    outcome.expect("finalize_send_and_flush always sends the response")
+                },
+                |outcome| {
+                    emit_access_telemetry_after_send(
+                        &access_http_client,
+                        &state.settings,
+                        &outcome,
+                        &timings,
+                    )
+                },
+            );
+            return;
+        }
+        match load_settings_from_config_store(&runtime_stores) {
+            Ok(settings) => {
+                // No application state was built, so the identity runtime
+                // comes from the reloaded settings. Without one, finalize and
+                // the withdrawal retry still run; only phase 4 is skipped.
+                let identity = match build_identity_runtime_from_reloaded_settings(&settings) {
+                    Ok(identity) => {
+                        ec_state
+                            .ec_context
+                            .set_identity_runtime(Arc::clone(&identity));
+                        Some(identity)
                     }
-                }
-                Err(e) => {
-                    log::warn!("EdgeZero EC finalize skipped: failed to reload settings: {e:?}");
-                }
+                    Err(e) => {
+                        log::warn!(
+                            "identity flush skipped: identity runtime unavailable after settings reload: {}",
+                            e.current_context()
+                        );
+                        None
+                    }
+                };
+                let graph = || {
+                    require_identity_graph(&settings)
+                        .map_err(|e| {
+                            log::warn!("identity graph unavailable: {}", e.current_context());
+                        })
+                        .ok()
+                };
+                run_post_send_steps(
+                    || {
+                        let mut outcome = None;
+                        finalize_send_and_flush(
+                            PostRouteInput {
+                                runtime: identity.as_deref(),
+                                settings: &settings,
+                                ec_state: &mut ec_state,
+                                graph: &graph,
+                                rate_limiter: &limiter,
+                                timings: Some(&timings),
+                            },
+                            response,
+                            &mut |response| {
+                                outcome = Some(send_edgezero_response(
+                                    response,
+                                    request_filter_effects.as_ref(),
+                                    &send_context,
+                                    counters.as_ref(),
+                                ));
+                            },
+                        );
+                        outcome.expect("finalize_send_and_flush always sends the response")
+                    },
+                    |outcome| {
+                        emit_access_telemetry_after_send(
+                            &access_http_client,
+                            &settings,
+                            &outcome,
+                            &timings,
+                        )
+                    },
+                );
+                return;
+            }
+            Err(e) => {
+                log::warn!("EdgeZero EC finalize skipped: failed to reload settings: {e:?}");
             }
         }
     }
@@ -757,15 +791,82 @@ fn apply_entry_point_finalize_headers(
     middleware::write_back_geo_lookup_state(response, geo_info.as_ref());
 }
 
-fn apply_edgezero_ec_finalize(
-    settings: &Settings,
-    ec_state: &mut EcFinalizeState,
-    response: &mut HttpResponse,
-    timings: &RequestTimings,
-) -> Result<PartnerRegistry, Report<TrustedServerError>> {
-    let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
+/// What the post-route work reads. It takes the runtime and settings rather
+/// than [`AppState`], because the settings-reload branch has none.
+struct PostRouteInput<'a> {
+    /// `None` when the runtime could not be built: finalize and the
+    /// withdrawal retry still run, and phase 4 is skipped.
+    runtime: Option<&'a IdentityRuntime>,
+    settings: &'a Settings,
+    ec_state: &'a mut EcFinalizeState,
+    /// Builds the identity graph. Called only when finalize or the after-send
+    /// work needs one, and at most once.
+    graph: &'a dyn Fn() -> Option<KvIdentityGraph>,
+    rate_limiter: &'a dyn RateLimiter,
+    /// Only pre-send finalization contributes to request KV timing.
+    timings: Option<&'a RequestTimings>,
+}
+
+/// Finalizes the response, hands it to `send`, then runs the after-send work:
+/// the withdrawal retry first, then phase 4's one flush (spec 5.2), and logs
+/// the request's `identity request measurement` line.
+///
+/// `send` is a callback so phase 4 runs only after the response is sent.
+/// Returns phase 4's outcome, or `None` when finalize could not run.
+fn finalize_send_and_flush(
+    input: PostRouteInput<'_>,
+    response: HttpResponse,
+    send: &mut dyn FnMut(HttpResponse),
+) -> Option<FlushOutcome> {
+    let (outcome, measurement) = finalize_send_and_flush_measured(input, response, send);
+    if let Some(measurement) = measurement {
+        measurement.log();
+    }
+    outcome
+}
+
+/// As [`finalize_send_and_flush`], returning the measurement instead of
+/// logging it. The measurement is `None` when finalize could not run.
+fn finalize_send_and_flush_measured(
+    input: PostRouteInput<'_>,
+    mut response: HttpResponse,
+    send: &mut dyn FnMut(HttpResponse),
+) -> (Option<FlushOutcome>, Option<IdentityMeasurement>) {
+    let PostRouteInput {
+        runtime,
+        settings,
+        ec_state,
+        graph,
+        rate_limiter,
+        timings,
+    } = input;
+    let partner_registry = match PartnerRegistry::from_config(&settings.ec.partners) {
+        Ok(registry) => registry,
+        Err(e) => {
+            log::error!("EdgeZero EC finalize skipped: failed to build partner registry: {e:?}");
+            send(response);
+            return (None, None);
+        }
+    };
+    // Every KV operation from here on counts into this; phase 1's read is
+    // known from the snapshot the route left.
+    let kv_counts = KvOperationCounts::default();
+    let phase_one_read = !matches!(ec_state.ec_context.kv_snapshot(), EcKvSnapshot::NotRead);
+    let mut built: Option<Option<KvIdentityGraph>> = None;
+    let mut graph_once = || {
+        built
+            .get_or_insert_with(|| graph().map(|graph| graph.with_operation_counts(&kv_counts)))
+            .clone()
+    };
+
     let finalize_kv_graph = if ec_state.use_finalize_kv {
-        identity_graph_with_timing(settings, timings)
+        graph_once().map(|graph| {
+            if let Some(timings) = timings {
+                graph.with_request_timings(timings)
+            } else {
+                graph
+            }
+        })
     } else {
         None
     };
@@ -776,74 +877,109 @@ fn apply_edgezero_ec_finalize(
         &partner_registry,
         ec_state.eids_cookie.as_deref(),
         ec_state.sharedid_cookie.as_deref(),
-        response,
+        &mut response,
     );
-    Ok(partner_registry)
-}
+    let status = response.status();
+    send(response);
 
-fn run_edgezero_pull_sync_after_send(
-    settings: &Settings,
-    partner_registry: &PartnerRegistry,
-    ec_state: &EcFinalizeState,
-) {
-    if !ec_state.is_real_browser {
-        return;
+    // A retry skipped because the graph is unavailable leaves the ID failed, so
+    // it counts as a failed run.
+    let withdrawal_after_send = ec_state.ec_context.has_failed_withdrawals();
+    if withdrawal_after_send {
+        match graph_once() {
+            Some(graph) => retry_failed_withdrawals(&mut ec_state.ec_context, &graph),
+            None => log::warn!("withdrawal retry skipped: identity graph unavailable"),
+        }
+    }
+    let withdrawal_after_send_failed = ec_state.ec_context.has_failed_withdrawals();
+
+    // A capture removal write that failed before send gets one more attempt.
+    if ec_state.ec_context.has_pending_removals() {
+        match graph_once() {
+            Some(graph) => retry_pending_removals(&mut ec_state.ec_context, &graph),
+            None => {
+                log::warn!("capture removal retry skipped: identity graph unavailable");
+                lose_pending_removals(&mut ec_state.ec_context);
+            }
+        }
     }
 
-    let prepared_context = build_pull_sync_context(&ec_state.ec_context, partner_registry);
-    let Some((context, kv)) =
-        prepare_pull_sync_after_send(prepared_context, || require_identity_graph(settings))
-    else {
-        return;
-    };
-
-    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    dispatch_pull_sync(
-        settings,
-        &kv,
-        partner_registry,
-        &limiter,
-        &context,
-        &ec_state.services,
-    );
-}
-
-fn prepare_pull_sync_after_send<F>(
-    context: Option<PullSyncContext>,
-    graph_factory: F,
-) -> Option<(PullSyncContext, KvIdentityGraph)>
-where
-    F: FnOnce() -> Result<KvIdentityGraph, Report<TrustedServerError>>,
-{
-    let context = context?;
-    let kv = match graph_factory() {
-        Ok(kv) => kv,
-        Err(err) => {
-            log::debug!("Pull sync: identity graph unavailable, skipping: {err:?}");
-            return None;
+    // Positive capture IDs from a request that is not the writer wait in the
+    // pending key for the next writer.
+    if ec_state.ec_context.has_capture_writes() {
+        match graph_once() {
+            Some(graph) => defer_capture_writes(&mut ec_state.ec_context, &graph),
+            None => log::warn!("capture writes dropped: identity graph unavailable"),
         }
-    };
-    Some((context, kv))
+    }
+
+    let outcome = flush_after_send(
+        runtime,
+        settings,
+        ec_state,
+        &mut graph_once,
+        status,
+        rate_limiter,
+    );
+    let measurement = ec_state.ec_context.identity_measurement(&MeasurementInput {
+        phase_one_read,
+        kv_reads: kv_counts.reads(),
+        kv_writes: kv_counts.writes(),
+        flush: Some(&outcome),
+        withdrawal_after_send,
+        withdrawal_after_send_failed,
+    });
+    (Some(outcome), Some(measurement))
 }
 
-/// Runs the post-send steps in their contract order: EC identity pull-sync
-/// first, then access-telemetry emission.
+/// Phase 4's one flush, or [`FlushOutcome::Skipped`] when it cannot run.
+fn flush_after_send(
+    runtime: Option<&IdentityRuntime>,
+    settings: &Settings,
+    ec_state: &mut EcFinalizeState,
+    graph_once: &mut dyn FnMut() -> Option<KvIdentityGraph>,
+    status: edgezero_core::http::StatusCode,
+    rate_limiter: &dyn RateLimiter,
+) -> FlushOutcome {
+    let Some(runtime) = runtime else {
+        return FlushOutcome::Skipped;
+    };
+    if !ec_state.is_real_browser || !may_flush(&ec_state.ec_context) {
+        return FlushOutcome::Skipped;
+    }
+    let Some(graph) = graph_once() else {
+        log::debug!("identity flush skipped: identity graph unavailable");
+        return FlushOutcome::Skipped;
+    };
+    run_after_send(AfterSendInput {
+        runtime,
+        settings,
+        services: &ec_state.services,
+        graph: &graph,
+        context: &mut ec_state.ec_context,
+        status,
+        rate_limiter,
+    })
+}
+
+/// Completes the identity lifecycle, including send and persistence, before
+/// access-telemetry emission.
 ///
 /// Every `edgezero_main` site that has both steps routes through this
 /// function, so the ordering is owned in exactly one place and the
 /// sequence test can instrument it; `request_elapsed` is already stamped
-/// before either step because `send_edgezero_response` stamps it before
-/// returning.
-fn run_post_send_steps(pull_sync: impl FnOnce(), emit_access_telemetry: impl FnOnce()) {
-    pull_sync();
-    emit_access_telemetry();
+/// before identity persistence because `send_edgezero_response` stamps it
+/// before returning.
+fn run_post_send_steps<T>(identity: impl FnOnce() -> T, emit_access_telemetry: impl FnOnce(T)) {
+    let outcome = identity();
+    emit_access_telemetry(outcome);
 }
 
 /// Builds and dispatches the access row after a response's transport attempt,
 /// when access telemetry is enabled and this request is sampled in.
 ///
 /// Called last at every `send_edgezero_response` call site in
-/// [`edgezero_main`] — after `run_edgezero_pull_sync_after_send` on the two
+/// [`edgezero_main`] — after `finalize_send_and_flush` on the two
 /// EC-finalized paths, and directly after send on the asset/admin/error
 /// fallback path, which never builds an [`EcFinalizeState`] or route-scoped
 /// `RuntimeServices` at all. The Tinybird transport context is therefore
@@ -1068,11 +1204,16 @@ fn send_edgezero_response(
         || build_access_telemetry_snapshot(&response, context),
     );
 
-    send_response_to_client(response, counters);
+    send_response_to_client(response, counters, &context.timings, snapshot)
 }
 
 /// Sends a response, attaching sandbox counters first when supplied.
-fn send_response_to_client(mut response: HttpResponse, counters: Option<&SandboxCounters>) {
+fn send_response_to_client(
+    mut response: HttpResponse,
+    counters: Option<&SandboxCounters>,
+    timings: &RequestTimings,
+    snapshot: Option<AccessTelemetrySnapshot>,
+) -> DeliveryOutcome {
     // Captured before the body is consumed so post-commitment failures can be
     // matched back to the response that carried these counters.
     let counter_context = counters.map_or_else(String::new, |counters| {
@@ -1098,7 +1239,7 @@ fn send_response_to_client(mut response: HttpResponse, counters: Option<&Sandbox
                 EdgeBody::empty(),
             ));
             let (counting, drive_result) =
-                drive_streaming_body(body, skeleton.stream_to_client(), &context.timings);
+                drive_streaming_body(body, skeleton.stream_to_client(), timings);
             let bytes = counting.bytes();
             let streaming_body = counting.into_inner();
             // Computed before `drive_result` is matched by value below, since
@@ -1121,7 +1262,7 @@ fn send_response_to_client(mut response: HttpResponse, counters: Option<&Sandbox
             }
         }
         once => {
-            record_buffered_delivery(&once, &context.timings);
+            record_buffered_delivery(&once, timings);
             compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
             DeliveryOutcome {
                 result: DeliveryResult::Complete,
@@ -1311,31 +1452,17 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
         .with_body(body)
 }
 
-/// Constructs a `KvIdentityGraph` wrapped in the [`Phase::EcKv`] timing
-/// decorator, for request-path callers with a `RequestTimings` handle.
-///
-/// Returns `None` when `ec.ec_store` is not configured, matching
-/// [`require_identity_graph_with_timing`]'s contract on every other axis.
-pub(crate) fn identity_graph_with_timing(
-    settings: &Settings,
-    timings: &RequestTimings,
-) -> Option<KvIdentityGraph> {
-    settings.ec.ec_store.as_ref().map(|store_name| {
-        KvIdentityGraph::new(TimedKvStore::new(
-            FastlyEcKvStore::new(store_name),
-            timings.clone(),
-        ))
-    })
+/// Builds the shared graph over the configured identity store.
+pub(crate) fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
+    require_identity_graph(settings).ok()
 }
 
 /// Constructs a `KvIdentityGraph` from settings, or returns an error if the
 /// `ec_store` config is not set.
 ///
-/// Deliberately untimed: pull-sync (this function's only caller) runs after
-/// `send_edgezero_response`'s Server-Timing freeze point, so a decorated
-/// store here would record into a handle nothing ever renders.
-/// Request-path callers with a `RequestTimings` handle use
-/// [`require_identity_graph_with_timing`] instead.
+/// Deliberately untimed for retained application state. Request-path callers
+/// wrap a clone with `with_request_timings`, or use
+/// [`require_identity_graph_with_timing`] when rebuilding from settings.
 pub(crate) fn require_identity_graph(
     settings: &Settings,
 ) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
@@ -1351,22 +1478,12 @@ pub(crate) fn require_identity_graph(
 /// Constructs a `KvIdentityGraph` wrapped in the [`Phase::EcKv`] timing
 /// decorator, or returns an error if the `ec_store` config is not set.
 ///
-/// Request-path sibling of [`require_identity_graph`], which pull-sync uses
-/// unwrapped because pull-sync runs after the Server-Timing freeze point.
+/// Request-path sibling of [`require_identity_graph`].
 pub(crate) fn require_identity_graph_with_timing(
     settings: &Settings,
     timings: &RequestTimings,
 ) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
-    let store_name = settings.ec.ec_store.as_deref().ok_or_else(|| {
-        Report::new(TrustedServerError::KvStore {
-            store_name: "ec.ec_store".to_owned(),
-            message: "ec.ec_store is not configured".to_owned(),
-        })
-    })?;
-    Ok(KvIdentityGraph::new(TimedKvStore::new(
-        FastlyEcKvStore::new(store_name),
-        timings.clone(),
-    )))
+    require_identity_graph(settings).map(|graph| graph.with_request_timings(timings))
 }
 
 /// Extracts a named cookie value from the request's `Cookie` header.
@@ -1400,6 +1517,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::app::TrustedServerApp;
     use base64::Engine as _;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder;
@@ -1410,6 +1528,7 @@ mod tests {
     };
     use fastly::mime;
     use std::time::Duration;
+    use trusted_server_core::ec::identity::measurement::RouteKind;
     use trusted_server_core::integrations::HeaderMutation;
     use trusted_server_core::platform::{
         PlatformError, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
@@ -1454,9 +1573,7 @@ mod tests {
         }
     }
 
-    fn test_settings() -> Settings {
-        Settings::from_toml(
-            r#"
+    const TEST_SETTINGS_TOML: &str = r#"
             [[handlers]]
             path = "^/_ts/admin"
             username = "admin"
@@ -1475,9 +1592,169 @@ mod tests {
             enabled = false
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
-            "#,
+            "#;
+
+    fn test_settings() -> Settings {
+        Settings::from_toml(TEST_SETTINGS_TOML).expect("should parse test settings")
+    }
+
+    const EC_ID: &str = "0000000000000000000000000000000000000000000000000000000000000000.ABC123";
+
+    /// Allows every call.
+    struct AllowAll;
+
+    impl RateLimiter for AllowAll {
+        fn exceeded(&self, _key: &str, _limit: u32) -> Result<bool, Report<TrustedServerError>> {
+            Ok(false)
+        }
+
+        fn record(&self, _key: &str) -> Result<(), Report<TrustedServerError>> {
+            Ok(())
+        }
+
+        fn count(&self, _key: &str) -> Result<u32, Report<TrustedServerError>> {
+            Ok(0)
+        }
+    }
+
+    /// Marks `request` as sent by a real browser at a client address.
+    fn as_browser(request: &mut HttpRequest) {
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+        request
+            .extensions_mut()
+            .insert(trusted_server_core::platform::ClientInfo {
+                client_ip: Some("192.0.2.10".parse().expect("should parse the client IP")),
+                ..trusted_server_core::platform::ClientInfo::default()
+            });
+    }
+
+    /// A browser document navigation carrying `cookie`.
+    fn navigation(cookie: Option<&str>) -> HttpRequest {
+        let mut builder = edgezero_core::http::request_builder()
+            .method(edgezero_core::http::Method::GET)
+            .uri("https://test-publisher.com/some-page")
+            .header("sec-fetch-dest", "document");
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let mut request = builder
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        as_browser(&mut request);
+        request
+    }
+
+    /// Polls `future` to completion on this thread without entering an
+    /// executor, so code under test that blocks on its own futures, such as
+    /// the hold dispatch of an auction navigation, can run inside it. The
+    /// scripted network is ready at once, so a future that stays pending is a
+    /// test bug.
+    fn poll_ready<F: core::future::Future>(future: F) -> F::Output {
+        let waker = futures::task::noop_waker();
+        let mut context = core::task::Context::from_waker(&waker);
+        let mut future = core::pin::pin!(future);
+        for _ in 0..10_000 {
+            if let core::task::Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+        }
+        unreachable!("the future should complete against the scripted network")
+    }
+
+    /// Routes `request`, then finalizes, sends and flushes it as
+    /// `edgezero_main` does, keeping the sent response.
+    fn drive_request_for_test(
+        state: &Arc<AppState>,
+        request: HttpRequest,
+    ) -> (HttpResponse, Option<FlushOutcome>) {
+        drive_with_runtime(state, request, Some(&state.identity), |_| {})
+    }
+
+    /// As [`drive_request_for_test`], with the runtime the post-route work
+    /// gets: `None` is the settings-reload branch without a runtime.
+    fn drive_with_runtime(
+        state: &Arc<AppState>,
+        request: HttpRequest,
+        runtime: Option<&IdentityRuntime>,
+        prepare: impl FnOnce(&mut EcFinalizeState),
+    ) -> (HttpResponse, Option<FlushOutcome>) {
+        let router = TrustedServerApp::routes_for_state(state);
+        let mut response = poll_ready(router.oneshot(request)).expect("should route the request");
+        let Some(mut ec_state) = response.extensions_mut().remove::<EcFinalizeState>() else {
+            return (response, None);
+        };
+        prepare(&mut ec_state);
+        let mut sent = None;
+        let graph = || state.identity_graph.clone();
+        let outcome = finalize_send_and_flush(
+            PostRouteInput {
+                runtime,
+                settings: &state.settings,
+                ec_state: &mut ec_state,
+                graph: &graph,
+                rate_limiter: &AllowAll,
+                timings: None,
+            },
+            response,
+            &mut |response| sent = Some(response),
+        );
+        (sent.expect("should send the response"), outcome)
+    }
+
+    /// As [`drive_request_for_test`], keeping the request's measurement.
+    fn drive_measured_for_test(
+        state: &Arc<AppState>,
+        request: HttpRequest,
+    ) -> (Option<FlushOutcome>, IdentityMeasurement) {
+        let router = TrustedServerApp::routes_for_state(state);
+        let mut response =
+            futures::executor::block_on(router.oneshot(request)).expect("should route the request");
+        let mut ec_state = response
+            .extensions_mut()
+            .remove::<EcFinalizeState>()
+            .expect("should leave EC state on the response");
+        let graph = || state.identity_graph.clone();
+        let (outcome, measurement) = finalize_send_and_flush_measured(
+            PostRouteInput {
+                runtime: Some(&state.identity),
+                settings: &state.settings,
+                ec_state: &mut ec_state,
+                graph: &graph,
+                rate_limiter: &AllowAll,
+                timings: None,
+            },
+            response,
+            &mut |_| {},
+        );
+        (
+            outcome,
+            measurement.expect("should measure a finalized request"),
         )
-        .expect("should parse test settings")
+    }
+
+    /// A returning visitor's live row, without a cluster size so the flush
+    /// has one change to write.
+    fn seeded_state() -> (
+        Arc<AppState>,
+        Arc<trusted_server_core::ec::identity::test_support::WriteCountingEcKv>,
+    ) {
+        let (graph, store) = KvIdentityGraph::write_counting("drive-store");
+        let consent = trusted_server_core::ec::identity::test_support::allowing_consent();
+        let entry = trusted_server_core::ec::kv_types::KvEntry::new(
+            &consent,
+            None,
+            1_000,
+            "test-publisher.com",
+        );
+        graph.create(EC_ID, &entry).expect("should seed the row");
+        store.reset_counts();
+        let state = crate::app::app_state_with_graph_for_test(test_settings(), graph);
+        (state, store)
     }
 
     /// A minimal [`AccessTelemetrySnapshot`] fixture for tests that only
@@ -1539,7 +1816,13 @@ mod tests {
                 HeaderMutation::set("cache-control", "public, max-age=3600"),
             ],
         };
-        apply_entry_point_finalize_headers(&settings, &mut response, None);
+        apply_entry_point_finalize_headers(
+            &settings,
+            &mut response,
+            None,
+            &GeoLookupState::NotAttempted,
+            &RequestTimings::new(),
+        );
         apply_terminal_response_effects(&mut response, Some(&effects));
         assert_eq!(
             response.headers(),
@@ -1675,7 +1958,13 @@ mod tests {
                 "should preserve action and preflight status"
             );
             let original = response.headers().clone();
-            apply_entry_point_finalize_headers(&settings, &mut response, None);
+            apply_entry_point_finalize_headers(
+                &settings,
+                &mut response,
+                None,
+                &GeoLookupState::NotAttempted,
+                &RequestTimings::new(),
+            );
             apply_terminal_response_effects(&mut response, Some(&effects));
             assert_eq!(
                 response.headers(),
@@ -1708,20 +1997,247 @@ mod tests {
     }
 
     #[test]
-    fn pull_sync_noop_states_skip_post_send_graph_factory() {
-        let calls = std::cell::Cell::new(0);
-        let result = prepare_pull_sync_after_send(None, || {
-            calls.set(calls.get() + 1);
-            Err(Report::new(TrustedServerError::KvStore {
-                store_name: "unexpected".to_owned(),
-                message: "graph factory should not run".to_owned(),
-            }))
-        });
-        assert!(
-            result.is_none(),
-            "a skipped pull-sync plan should return none"
+    fn identity_measurement_records_counts_for_a_writer_navigation() {
+        let (state, _store) = seeded_state();
+        let cookie = format!("ts-ec={EC_ID}");
+
+        let (outcome, measurement) = drive_measured_for_test(&state, navigation(Some(&cookie)));
+
+        assert_eq!(outcome, Some(FlushOutcome::Written), "should flush once");
+        assert_eq!(
+            measurement.cookie_header_bytes(),
+            cookie.len(),
+            "should hold the inbound Cookie header size"
         );
-        assert_eq!(calls.get(), 0, "should not invoke the graph factory");
+        assert_eq!(
+            measurement.kv_reads(),
+            2,
+            "should count the phase 1 read and the pending-key read"
+        );
+        assert_eq!(measurement.kv_writes(), 1, "should count the one write");
+        assert_eq!(
+            measurement.route(),
+            RouteKind::Writer,
+            "should label a returning navigation as the writer"
+        );
+        assert_eq!(
+            measurement.flush(),
+            Some(FlushOutcome::Written),
+            "should hold the phase 4 outcome"
+        );
+        assert_eq!(measurement.removal_lost(), 0, "should lose no removal");
+        assert!(
+            !measurement.withdrawal_after_send() && !measurement.withdrawal_after_send_failed(),
+            "should need no after-send withdrawal run"
+        );
+    }
+
+    #[test]
+    fn identity_measurement_holds_no_identifier() {
+        let (state, _store) = seeded_state();
+        let cookie = format!("ts-ec={EC_ID}; ts-eids=secret-uid-value");
+
+        let (_, measurement) = drive_measured_for_test(&state, navigation(Some(&cookie)));
+        let line = measurement.to_string();
+
+        assert!(
+            line.contains(&format!("cookie_header_bytes={}", cookie.len())),
+            "should still carry the cookie size: {line}"
+        );
+        assert!(!line.contains(EC_ID), "should not hold the EC ID: {line}");
+        assert!(
+            !line.contains("secret-uid-value"),
+            "should not hold a cookie value: {line}"
+        );
+    }
+
+    #[test]
+    fn drive_request_for_test_counts_routing_finalize_and_flush_against_one_store() {
+        let (state, store) = seeded_state();
+
+        let (_, outcome) =
+            drive_request_for_test(&state, navigation(Some(&format!("ts-ec={EC_ID}"))));
+
+        assert_eq!(outcome, Some(FlushOutcome::Written), "should flush once");
+        let writes = store.writes();
+        assert_eq!(writes.lookups, 1, "should read the row once, in phase 1");
+        assert_eq!(
+            writes.if_generation_match, 1,
+            "should write once with a CAS"
+        );
+        assert_eq!(writes.total(), 1, "should make no other write");
+    }
+
+    #[test]
+    fn finalize_send_and_flush_sends_before_it_flushes() {
+        let (state, store) = seeded_state();
+        let router = TrustedServerApp::routes_for_state(&state);
+        let mut response = futures::executor::block_on(
+            router.oneshot(navigation(Some(&format!("ts-ec={EC_ID}")))),
+        )
+        .expect("should route the request");
+        let mut ec_state = response
+            .extensions_mut()
+            .remove::<EcFinalizeState>()
+            .expect("should carry EC state");
+        let writes_at_send = std::cell::Cell::new(None);
+        let timings = RequestTimings::new();
+        let graph = || state.identity_graph.clone();
+
+        let outcome = finalize_send_and_flush(
+            PostRouteInput {
+                runtime: Some(&state.identity),
+                settings: &state.settings,
+                ec_state: &mut ec_state,
+                graph: &graph,
+                rate_limiter: &AllowAll,
+                timings: Some(&timings),
+            },
+            response,
+            &mut |_| writes_at_send.set(Some(store.writes().total())),
+        );
+
+        assert_eq!(
+            writes_at_send.get(),
+            Some(0),
+            "should send before any write"
+        );
+        assert_eq!(outcome, Some(FlushOutcome::Written), "should then flush");
+        assert_eq!(store.writes().total(), 1, "should write once");
+        assert!(
+            timings.snapshot().kv_ms.is_none(),
+            "the after-send flush must not add request-path KV timing"
+        );
+    }
+
+    #[test]
+    fn after_send_noop_states_skip_post_send_graph_factory() {
+        let (state, _) = seeded_state();
+        let router = TrustedServerApp::routes_for_state(&state);
+        // A named route is never the writer, so phase 4 has nothing to do.
+        let request = edgezero_core::http::request_builder()
+            .method(edgezero_core::http::Method::GET)
+            .uri("https://test-publisher.com/.well-known/trusted-server.json")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let mut response =
+            futures::executor::block_on(router.oneshot(request)).expect("should route");
+        let mut ec_state = response
+            .extensions_mut()
+            .remove::<EcFinalizeState>()
+            .expect("should carry EC state");
+        ec_state.use_finalize_kv = false;
+        let calls = std::cell::Cell::new(0);
+        let graph = || {
+            calls.set(calls.get() + 1);
+            None
+        };
+
+        let outcome = finalize_send_and_flush(
+            PostRouteInput {
+                runtime: Some(&state.identity),
+                settings: &state.settings,
+                ec_state: &mut ec_state,
+                graph: &graph,
+                rate_limiter: &AllowAll,
+                timings: None,
+            },
+            response,
+            &mut drop,
+        );
+
+        assert_eq!(outcome, Some(FlushOutcome::Skipped), "should skip phase 4");
+        assert_eq!(calls.get(), 0, "should not build the graph");
+    }
+
+    #[test]
+    fn no_response_sets_or_reads_the_pull_complete_cookie() {
+        let (state, store) = seeded_state();
+        let cookie = format!("ts-ec={EC_ID}; ts-ec-pull-complete=v1.example");
+
+        let (response, _) = drive_request_for_test(&state, navigation(Some(&cookie)));
+
+        assert!(
+            response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .all(|value| !value.starts_with("ts-ec-pull-complete")),
+            "should set no pull-complete cookie"
+        );
+        assert_eq!(
+            store.writes().lookups,
+            1,
+            "should read the row whatever the old marker cookie says"
+        );
+
+        let (withdrawn, _) = drive_with_runtime(
+            &state,
+            navigation(Some(&cookie)),
+            Some(&state.identity),
+            withdraw,
+        );
+        let cookies = set_cookies(&withdrawn);
+        assert!(
+            cookies
+                .iter()
+                .any(|value| value.starts_with("ts-ec=;") && value.contains("Max-Age=0")),
+            "control: finalize should still expire ts-ec on a withdrawal: {cookies:?}"
+        );
+        assert!(
+            cookies
+                .iter()
+                .all(|value| !value.starts_with("ts-ec-pull-complete")),
+            "should not expire a pull-complete cookie either: {cookies:?}"
+        );
+    }
+
+    /// Turns the request's consent into an explicit withdrawal (GPC in a US
+    /// state). Viceroy has no geo, so routing alone cannot produce one.
+    fn withdraw(ec_state: &mut EcFinalizeState) {
+        let consent = ec_state.ec_context.consent_mut();
+        consent.jurisdiction =
+            trusted_server_core::consent::jurisdiction::Jurisdiction::UsState("CA".to_owned());
+        consent.gpc = true;
+    }
+
+    fn set_cookies(response: &HttpResponse) -> Vec<String> {
+        response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn reload_without_identity_runtime_still_finalizes() {
+        let (state, _) = seeded_state();
+
+        let (response, outcome) = drive_with_runtime(
+            &state,
+            navigation(Some(&format!("ts-ec={EC_ID}"))),
+            None,
+            withdraw,
+        );
+
+        let cookies = set_cookies(&response);
+        assert!(
+            cookies
+                .iter()
+                .any(|value| value.starts_with("ts-ec=;") && value.contains("Max-Age=0")),
+            "should still finalize and expire ts-ec without a runtime: {cookies:?}"
+        );
+        let (row, _) = state
+            .identity_graph
+            .as_ref()
+            .expect("should hold the graph")
+            .get(EC_ID)
+            .expect("should read the row")
+            .expect("should keep the tombstone");
+        assert!(!row.consent.ok, "should still tombstone the row");
+        assert_eq!(outcome, Some(FlushOutcome::Skipped), "should skip phase 4");
     }
 
     #[test]
@@ -2229,7 +2745,9 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore)
                 as Arc<dyn trusted_server_core::platform::PlatformKvStore>)
             .backend(Arc::new(crate::platform::FastlyPlatformBackend))
-            .http_client(Arc::new(crate::platform::FastlyPlatformHttpClient))
+            .http_client(Arc::new(
+                crate::platform::FastlyPlatformHttpClient::default(),
+            ))
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(trusted_server_core::platform::ClientInfo::default())
             .build()
@@ -2238,9 +2756,9 @@ mod tests {
     #[test]
     fn ec_finalize_kv_lands_before_freeze() {
         // A pre-seeded EC entry (see fastly.toml's ec_identity_store fixture)
-        // for a returning user carrying an eids cookie that matches the
-        // configured partner. This drives ec_finalize_response into
-        // ingest_eid_cookies, which reads and writes the KV identity graph.
+        // for a returning user carrying an eids cookie. Finalize confirms a
+        // stale pre-route miss before headers freeze. Ordinary browser ingest
+        // now queues for the after-send flush instead of writing here.
         let settings = ec_finalize_settings();
         let ec_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01";
         let eids = serde_json::json!([{
@@ -2277,9 +2795,11 @@ mod tests {
             ec_context.ec_was_present(),
             "the pre-seeded ts-ec cookie should be recognized"
         );
-        // Returning-user EID persistence is gated on the request source; the
-        // dispatcher marks document navigations this way before finalization.
         ec_context.set_eid_sync_source(trusted_server_core::ec::EidSyncSource::Navigation);
+        ec_context.set_recovery_eligible(true);
+        ec_context.set_kv_snapshot(EcKvSnapshot::Missing {
+            ec_id: ec_id.to_owned(),
+        });
 
         let mut ec_state = EcFinalizeState {
             ec_context,
@@ -2289,21 +2809,32 @@ mod tests {
             is_real_browser: true,
             services,
         };
-        let mut response = response_builder()
+        let response = response_builder()
             .header("cache-control", "private, no-store")
             .body(EdgeBody::empty())
             .expect("should build EC finalize response fixture");
         let timings = RequestTimings::new();
 
-        // Mirrors edgezero_main's ordering: EC finalize runs, then the freeze
-        // point (apply_server_timing_header, called just before
-        // response.into_parts() inside send_edgezero_response) renders the
-        // header. Calling both directly exercises exactly this order without
-        // requiring a live Fastly client connection.
-        apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response, &timings)
-            .expect("should finalize EC response");
-        apply_server_timing_header(&mut response, &timings, true);
-
+        // Exercise the production finalize/send/flush boundary without a
+        // live client connection. Header timing freezes in the send callback.
+        let graph = || require_identity_graph(&settings).ok();
+        let mut sent = None;
+        finalize_send_and_flush(
+            PostRouteInput {
+                runtime: None,
+                settings: &settings,
+                ec_state: &mut ec_state,
+                graph: &graph,
+                rate_limiter: &AllowAll,
+                timings: Some(&timings),
+            },
+            response,
+            &mut |mut response| {
+                apply_server_timing_header(&mut response, &timings, true);
+                sent = Some(response);
+            },
+        );
+        let response = sent.expect("should send the finalized response");
         let header = response
             .headers()
             .get("server-timing")
@@ -2854,7 +3385,7 @@ mod tests {
                     .expect("should lock order log")
                     .push("pull_sync")
             },
-            move || {
+            move |_| {
                 emit_log
                     .lock()
                     .expect("should lock order log")
@@ -2867,5 +3398,3666 @@ mod tests {
             vec!["pull_sync", "telemetry"],
             "pull-sync must dispatch before telemetry emits"
         );
+    }
+    /// End-to-end proof of the one-write invariant, the reads and G10 and
+    /// G13 (spec 13). Every test routes a request through the real router,
+    /// finalizes and sends it, and runs phase 4, against one counting store.
+    mod identity_writes {
+        use super::*;
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+
+        use trusted_server_core::ec::identity::IdentityProviderError;
+        use trusted_server_core::ec::identity::test_support::{
+            MULTI_ENTRY_SOURCE, MultiEntryTestProvider, WriteCountingEcKv, allowing_consent,
+        };
+        use trusted_server_core::ec::kv_backend::EcKvStore as _;
+        use trusted_server_core::ec::kv_types::{
+            KvEid, KvEntry, KvNetwork, KvOptOut, KvPartnerId, KvProviderState, KvUid,
+        };
+        use trusted_server_core::integrations::IntegrationRegistration;
+        use trusted_server_core::platform::{
+            GeoInfo, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
+            PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
+        };
+        use trusted_server_core::settings::{EcPartner, ProviderMode, ProviderSettings};
+
+        /// The host the publisher origin answers on.
+        const ORIGIN_HOST: &str = "origin.test-publisher.com";
+
+        /// A cookie value no test treats as a real ID.
+        const SHARED_ID: &str = "shared-id-1";
+
+        /// One answer of the scripted network.
+        #[derive(Clone)]
+        struct Reply {
+            status: u16,
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+        }
+
+        /// One request the scripted network received.
+        #[derive(Clone)]
+        struct Seen {
+            host: String,
+            headers: edgezero_core::http::HeaderMap,
+            body: Vec<u8>,
+        }
+
+        struct Pending {
+            reply: Reply,
+            backend_name: String,
+        }
+
+        /// A network that answers per host and records what it was sent. It
+        /// stands in for the publisher origin, the bidders and the pull
+        /// partners.
+        struct ScriptedNetwork {
+            replies: Mutex<BTreeMap<String, Reply>>,
+            seen: Mutex<Vec<Seen>>,
+        }
+
+        impl ScriptedNetwork {
+            fn new() -> Self {
+                Self {
+                    replies: Mutex::new(BTreeMap::new()),
+                    seen: Mutex::new(Vec::new()),
+                }
+            }
+
+            fn respond(&self, host: &str, status: u16, content_type: &str, body: &str) {
+                self.respond_with_headers(host, status, &[("content-type", content_type)], body);
+            }
+
+            fn respond_with_headers(
+                &self,
+                host: &str,
+                status: u16,
+                headers: &[(&str, &str)],
+                body: &str,
+            ) {
+                self.replies
+                    .lock()
+                    .expect("should lock the replies")
+                    .insert(
+                        host.to_owned(),
+                        Reply {
+                            status,
+                            headers: headers
+                                .iter()
+                                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                                .collect(),
+                            body: body.as_bytes().to_vec(),
+                        },
+                    );
+            }
+
+            /// Forgets the answer for `host`, so a call to it fails in transport.
+            fn clear_reply(&self, host: &str) {
+                self.replies
+                    .lock()
+                    .expect("should lock the replies")
+                    .remove(host);
+            }
+
+            /// Every request that went to `host`, in order.
+            fn requests_to(&self, host: &str) -> Vec<Seen> {
+                self.seen
+                    .lock()
+                    .expect("should lock the requests")
+                    .iter()
+                    .filter(|seen| seen.host == host)
+                    .cloned()
+                    .collect()
+            }
+
+            /// Records `request` and returns its answer with the backend it named.
+            fn record(
+                &self,
+                request: PlatformHttpRequest,
+            ) -> Result<(Reply, String), Report<PlatformError>> {
+                let backend_name = request.backend_name;
+                let (parts, body) = request.request.into_parts();
+                let host = parts.uri.host().unwrap_or_default().to_owned();
+                self.seen
+                    .lock()
+                    .expect("should lock the requests")
+                    .push(Seen {
+                        host: host.clone(),
+                        headers: parts.headers,
+                        body: body
+                            .into_bytes()
+                            .map(|bytes| bytes.to_vec())
+                            .unwrap_or_default(),
+                    });
+                self.replies
+                    .lock()
+                    .expect("should lock the replies")
+                    .get(&host)
+                    .cloned()
+                    .map(|reply| (reply, backend_name))
+                    .ok_or_else(|| Report::new(PlatformError::HttpClient))
+            }
+        }
+
+        fn platform_response(
+            reply: Reply,
+            backend_name: String,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            let mut builder = edgezero_core::http::response_builder().status(reply.status);
+            for (name, value) in reply.headers {
+                builder = builder.header(name, value);
+            }
+            builder
+                .body(EdgeBody::from(reply.body))
+                .map(|response| PlatformResponse::new(response).with_backend_name(backend_name))
+                .map_err(|_| Report::new(PlatformError::HttpClient))
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl PlatformHttpClient for ScriptedNetwork {
+            async fn send(
+                &self,
+                request: PlatformHttpRequest,
+            ) -> Result<PlatformResponse, Report<PlatformError>> {
+                let (reply, backend_name) = self.record(request)?;
+                platform_response(reply, backend_name)
+            }
+
+            async fn send_async(
+                &self,
+                request: PlatformHttpRequest,
+            ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+                let (reply, backend_name) = self.record(request)?;
+                Ok(PlatformPendingRequest::new(Pending {
+                    reply,
+                    backend_name: backend_name.clone(),
+                })
+                .with_backend_name(backend_name))
+            }
+
+            async fn select(
+                &self,
+                mut pending_requests: Vec<PlatformPendingRequest>,
+            ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+                if pending_requests.is_empty() {
+                    return Err(Report::new(PlatformError::HttpClient));
+                }
+                let first = pending_requests.remove(0);
+                let ready = match first.downcast::<Pending>() {
+                    Ok(pending) => platform_response(pending.reply, pending.backend_name),
+                    Err(_) => Err(Report::new(PlatformError::HttpClient)),
+                };
+                Ok(PlatformSelectResult {
+                    ready,
+                    remaining: pending_requests,
+                    failed_backend_name: None,
+                })
+            }
+        }
+
+        /// Locates every client in a country no privacy law of the default
+        /// consent config covers, so EC and EID consent is granted.
+        struct NonRegulatedGeo;
+
+        impl PlatformGeo for NonRegulatedGeo {
+            fn lookup(
+                &self,
+                _client_ip: Option<std::net::IpAddr>,
+            ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+                Ok(Some(GeoInfo {
+                    city: "Example City".to_owned(),
+                    country: "CA".to_owned(),
+                    continent: "NA".to_owned(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    metro_code: 0,
+                    region: None,
+                    asn: None,
+                }))
+            }
+        }
+
+        /// What every scenario shares: the router state, the counting store
+        /// behind its identity graph and the scripted network.
+        struct Scenario {
+            state: Arc<AppState>,
+            store: Arc<WriteCountingEcKv>,
+            network: Arc<ScriptedNetwork>,
+        }
+
+        /// The partner of `source`, registered for the bidstream with no pull.
+        fn partner_toml(source: &str) -> String {
+            format!(
+                r#"
+                [[ec.partners]]
+                name = "Partner {source}"
+                source_domain = "{source}"
+                bidstream_enabled = true
+                api_token = "token-for-{source}-0123456789abcdef"
+                "#
+            )
+        }
+
+        impl Scenario {
+            /// A scenario whose settings are the test settings plus `extra`
+            /// TOML, with `sharedid.org` and `id5-sync.com` registered.
+            fn with_settings(extra: &str) -> Self {
+                let toml = format!(
+                    "{TEST_SETTINGS_TOML}{}{}{extra}",
+                    partner_toml("sharedid.org"),
+                    partner_toml("id5-sync.com"),
+                );
+                Self::from_toml(&toml)
+            }
+
+            fn new() -> Self {
+                Self::with_settings("")
+            }
+
+            fn from_toml(toml: &str) -> Self {
+                let (graph, store) = KvIdentityGraph::write_counting("identity-writes-store");
+                Self::from_parts(toml, graph, store)
+            }
+
+            /// A scenario over `graph`, which must count into `store`.
+            fn from_parts(
+                toml: &str,
+                graph: KvIdentityGraph,
+                store: Arc<WriteCountingEcKv>,
+            ) -> Self {
+                let mut settings = Settings::from_toml(toml).expect("should parse the settings");
+                // These scenarios exercise the mirror; its default-off gate
+                // has its own test.
+                settings.ec.identity.mirror_enabled = true;
+                let network = Arc::new(ScriptedNetwork::new());
+                network.respond(
+                    ORIGIN_HOST,
+                    200,
+                    "text/html",
+                    "<html><head></head><body>page</body></html>",
+                );
+                let state = crate::app::app_state_with_network_for_test(
+                    settings,
+                    graph,
+                    Arc::clone(&network) as Arc<dyn PlatformHttpClient>,
+                    Arc::new(NonRegulatedGeo),
+                );
+                Self {
+                    state,
+                    store,
+                    network,
+                }
+            }
+
+            fn graph(&self) -> &KvIdentityGraph {
+                self.state
+                    .identity_graph
+                    .as_ref()
+                    .expect("should hold the graph")
+            }
+
+            /// Stores `entry` under [`EC_ID`] and zeroes the counts.
+            fn seed(&self, entry: &KvEntry) {
+                self.graph()
+                    .create(EC_ID, entry)
+                    .expect("should seed the row");
+                self.store.reset_counts();
+            }
+
+            /// Seeds a live row that already holds its cluster size, so the
+            /// flush has no change of its own to write (C2).
+            fn seed_live(&self) -> KvEntry {
+                let entry = live_entry();
+                self.seed(&entry);
+                entry
+            }
+
+            /// Drives `request`, and checks that no response of any scenario
+            /// sets a server identity cookie (spec 13).
+            fn drive(&self, request: HttpRequest) -> (HttpResponse, Option<FlushOutcome>) {
+                let (response, outcome) = drive_request_for_test(&self.state, request);
+                assert_no_server_identity_cookie(&response);
+                (response, outcome)
+            }
+
+            /// The row under `ec_id`.
+            fn row_of(&self, ec_id: &str) -> KvEntry {
+                self.graph()
+                    .get(ec_id)
+                    .expect("should read the row")
+                    .expect("should hold the row")
+                    .0
+            }
+
+            /// The row under [`EC_ID`].
+            fn row(&self) -> KvEntry {
+                self.row_of(EC_ID)
+            }
+        }
+
+        /// A live row for [`EC_ID`] with its cluster size present.
+        fn live_entry() -> KvEntry {
+            let mut entry = KvEntry::new(&allowing_consent(), None, 1_000, "test-publisher.com");
+            entry.network = Some(KvNetwork {
+                cluster_size: Some(1),
+            });
+            entry
+        }
+
+        fn with_header(mut request: HttpRequest, name: &'static str, value: &str) -> HttpRequest {
+            request.headers_mut().insert(
+                name,
+                HeaderValue::from_str(value).expect("should encode the header"),
+            );
+            request
+        }
+
+        fn without_header(mut request: HttpRequest, name: &'static str) -> HttpRequest {
+            request.headers_mut().remove(name);
+            request
+        }
+
+        /// The cookies every response of every scenario must leave unset:
+        /// the server sets `ts-ec` and no other identity cookie.
+        fn is_server_identity_cookie(name: &str) -> bool {
+            name == "ts-eids"
+                || name == "__Host-ts-eids-s"
+                || name.starts_with("ts-eids-r")
+                || name == "ts-ec-pull-complete"
+        }
+
+        fn cookie_name(set_cookie: &str) -> &str {
+            set_cookie.split('=').next().unwrap_or_default().trim()
+        }
+
+        fn assert_no_server_identity_cookie(response: &HttpResponse) {
+            for cookie in set_cookies(response) {
+                assert!(
+                    !is_server_identity_cookie(cookie_name(&cookie)),
+                    "should set no identity cookie but ts-ec: {cookie}"
+                );
+            }
+        }
+
+        /// The value of the `name` cookie the response sets.
+        fn set_cookie_value(response: &HttpResponse, name: &str) -> Option<String> {
+            set_cookies(response).into_iter().find_map(|cookie| {
+                let pair = cookie.split(';').next()?;
+                let (found, value) = pair.split_once('=')?;
+                (found.trim() == name).then(|| value.trim().to_owned())
+            })
+        }
+
+        /// The cookie of a returning visitor whose browser holds a sharedId.
+        fn returning_with_shared_id() -> String {
+            format!("ts-ec={EC_ID}; sharedId={SHARED_ID}")
+        }
+
+        /// Asserts every write mode count, so no mode hides behind another.
+        fn assert_writes(store: &WriteCountingEcKv, expected: (usize, usize, usize), what: &str) {
+            let writes = store.writes();
+            assert_eq!(
+                (writes.add, writes.if_generation_match, writes.overwrite),
+                expected,
+                "should make exactly (Add, IfGenerationMatch, Overwrite) writes: {what}"
+            );
+        }
+
+        fn assert_no_writes(store: &WriteCountingEcKv, what: &str) {
+            assert_writes(store, (0, 0, 0), what);
+        }
+
+        /// The UID the row holds for `source`.
+        fn stored_uid(row: &KvEntry, source: &str) -> Option<String> {
+            row.ids
+                .get(source)
+                .and_then(KvPartnerId::first_uid)
+                .map(str::to_owned)
+        }
+
+        #[test]
+        fn returning_visitor_with_changes_writes_once() {
+            let scenario = Scenario::new();
+            scenario.seed_live();
+
+            let (response, outcome) = scenario.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(response.status(), 200, "should serve the origin page");
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            assert_writes(&scenario.store, (0, 1, 0), "one CAS write");
+            assert_eq!(
+                stored_uid(&scenario.row(), "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "should hold the browser's sharedId in KV after the one write"
+            );
+        }
+
+        /// A store that refuses its first `collisions` `Add` writes without
+        /// storing them, as a minted ID that is already taken does.
+        struct CollidingStore {
+            inner: Arc<WriteCountingEcKv>,
+            collisions: Mutex<u32>,
+            refused: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl trusted_server_core::ec::kv_backend::EcKvStore for CollidingStore {
+            fn store_name(&self) -> &str {
+                self.inner.store_name()
+            }
+
+            fn lookup(
+                &self,
+                key: &str,
+            ) -> Result<
+                Option<trusted_server_core::ec::kv_backend::EcKvLookup>,
+                Report<TrustedServerError>,
+            > {
+                self.inner.lookup(key)
+            }
+
+            fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+                self.inner.key_exists(key)
+            }
+
+            fn insert(
+                &self,
+                key: &str,
+                write: trusted_server_core::ec::kv_backend::EcKvWrite<'_>,
+            ) -> Result<
+                trusted_server_core::ec::kv_backend::EcKvWriteOutcome,
+                Report<TrustedServerError>,
+            > {
+                if matches!(
+                    write.mode,
+                    trusted_server_core::ec::kv_backend::EcKvWriteMode::Add
+                ) {
+                    let mut remaining = self.collisions.lock().expect("should lock the count");
+                    if *remaining > 0 {
+                        *remaining -= 1;
+                        self.refused
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return Ok(
+                            trusted_server_core::ec::kv_backend::EcKvWriteOutcome::PreconditionFailed,
+                        );
+                    }
+                }
+                self.inner.insert(key, write)
+            }
+
+            fn list_keys_with_prefix(
+                &self,
+                prefix: &str,
+                limit: u32,
+            ) -> Result<Vec<String>, Report<TrustedServerError>> {
+                self.inner.list_keys_with_prefix(prefix, limit)
+            }
+
+            fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+                self.inner.delete(key)
+            }
+        }
+
+        /// The same navigation with one header replaced.
+        fn navigation_with_header(
+            cookie: Option<&str>,
+            name: &'static str,
+            value: &str,
+        ) -> HttpRequest {
+            with_header(navigation(cookie), name, value)
+        }
+
+        #[test]
+        fn identity_measurement_counts_the_create_write_of_a_new_ec_navigation() {
+            let scenario = Scenario::new();
+            let cookie = format!("sharedId={SHARED_ID}");
+
+            let (outcome, measurement) =
+                drive_measured_for_test(&scenario.state, navigation(Some(&cookie)));
+
+            assert_eq!(
+                measurement.route(),
+                RouteKind::NewEc,
+                "should label a first visit as a new EC"
+            );
+            assert_eq!(
+                measurement.kv_writes(),
+                1,
+                "should count the create write and no other"
+            );
+            assert_eq!(
+                measurement.kv_reads(),
+                0,
+                "should count no read: the create reads nothing"
+            );
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Skipped),
+                "should not flush a new visitor"
+            );
+        }
+
+        #[test]
+        fn new_visitor_navigation_writes_once() {
+            let scenario = Scenario::new();
+            let cookie = format!("sharedId={SHARED_ID}");
+
+            let (response, outcome) = scenario.drive(navigation(Some(&cookie)));
+
+            assert_eq!(response.status(), 200, "should serve the origin page");
+            let minted = set_cookie_value(&response, "ts-ec").expect("should mint an EC");
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Skipped),
+                "should leave a new visitor nothing to flush"
+            );
+            assert_writes(&scenario.store, (1, 0, 0), "one Add and no flush");
+            assert_eq!(
+                stored_uid(&scenario.row_of(&minted), "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "should carry the browser ingest in the create"
+            );
+        }
+
+        #[test]
+        fn new_visitor_collision_remints_and_writes_once() {
+            let (_, counting) = KvIdentityGraph::write_counting("collision-store");
+            let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let graph = KvIdentityGraph::new(CollidingStore {
+                inner: Arc::clone(&counting),
+                collisions: Mutex::new(1),
+                refused: Arc::clone(&refused),
+            });
+            let toml = format!("{TEST_SETTINGS_TOML}{}", partner_toml("sharedid.org"));
+            let scenario = Scenario::from_parts(&toml, graph, counting);
+            let cookie = format!("sharedId={SHARED_ID}");
+
+            let (response, _) = scenario.drive(navigation(Some(&cookie)));
+
+            assert_eq!(
+                refused.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "control: should have met one taken ID first"
+            );
+            assert_writes(
+                &scenario.store,
+                (1, 0, 0),
+                "one Add lands after the collision",
+            );
+            let minted: Vec<String> = set_cookies(&response)
+                .into_iter()
+                .filter(|cookie| cookie_name(cookie) == "ts-ec")
+                .collect();
+            assert_eq!(
+                minted.len(),
+                1,
+                "should set one ts-ec, for the ID that landed"
+            );
+            let id = set_cookie_value(&response, "ts-ec").expect("should mint an EC");
+            assert_eq!(
+                stored_uid(&scenario.row_of(&id), "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "should hold the ingest under the re-minted ID"
+            );
+        }
+
+        #[test]
+        fn returning_visitor_without_changes_writes_nothing() {
+            let scenario = Scenario::new();
+            let mut entry = live_entry();
+            entry.ids.insert(
+                "sharedid.org".to_owned(),
+                KvPartnerId::browser(SHARED_ID, Some(1_500)),
+            );
+            scenario.seed(&entry);
+
+            let (response, outcome) = scenario.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(response.status(), 200, "should serve the origin page");
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::NoChange),
+                "should find the row already holds the ID"
+            );
+            assert_no_writes(&scenario.store, "the browser's ID is already stored");
+
+            let (_, nothing) = scenario.drive(navigation(Some(&format!("ts-ec={EC_ID}"))));
+            assert_eq!(
+                nothing,
+                Some(FlushOutcome::Skipped),
+                "should skip a navigation that carries nothing"
+            );
+            assert_no_writes(&scenario.store, "nothing to ingest");
+
+            let control = Scenario::new();
+            control.seed_live();
+            control.drive(navigation(Some(&returning_with_shared_id())));
+            assert_writes(
+                &control.store,
+                (0, 1, 0),
+                "control: the same request writes when the row lacks the ID",
+            );
+        }
+
+        #[test]
+        fn revalidation_304_with_changes_writes_once() {
+            let scenario = Scenario::new();
+            scenario.seed_live();
+            scenario
+                .network
+                .respond_with_headers(ORIGIN_HOST, 304, &[("etag", "\"page-1\"")], "");
+            let request = navigation_with_header(
+                Some(&returning_with_shared_id()),
+                "if-none-match",
+                "\"page-1\"",
+            );
+
+            let (response, outcome) = scenario.drive(request);
+
+            assert_eq!(response.status(), 304, "should answer the revalidation");
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            assert_writes(&scenario.store, (0, 1, 0), "one CAS write");
+            assert_eq!(
+                stored_uid(&scenario.row(), "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "should hold the sharedId"
+            );
+        }
+
+        #[test]
+        fn returning_navigation_answered_3xx_4xx_5xx_writes_nothing() {
+            let control = Scenario::new();
+            control.seed_live();
+            control.drive(navigation(Some(&returning_with_shared_id())));
+            assert_writes(&control.store, (0, 1, 0), "control: a 200 writes once");
+
+            for status in [301_u16, 302, 400, 404, 410, 500, 502, 503] {
+                let scenario = Scenario::new();
+                scenario.seed_live();
+                scenario.network.respond_with_headers(
+                    ORIGIN_HOST,
+                    status,
+                    &[
+                        ("content-type", "text/html"),
+                        ("location", "https://origin.test-publisher.com/next"),
+                    ],
+                    "<html><head></head><body>answer</body></html>",
+                );
+
+                let (response, outcome) =
+                    scenario.drive(navigation(Some(&returning_with_shared_id())));
+
+                assert_eq!(
+                    response.status().as_u16(),
+                    status,
+                    "should pass the origin status through: {status}"
+                );
+                assert_eq!(
+                    outcome,
+                    Some(FlushOutcome::Skipped),
+                    "should have nothing to flush after {status}"
+                );
+                assert_no_writes(&scenario.store, &format!("origin answered {status}"));
+                assert_eq!(
+                    stored_uid(&scenario.row(), "sharedid.org"),
+                    None,
+                    "should not store the ID the browser sent, after {status}"
+                );
+            }
+        }
+
+        #[test]
+        fn new_visitor_prefetch_writes_once() {
+            let scenario = Scenario::new();
+
+            let (response, _) = scenario.drive(navigation_with_header(
+                Some(&format!("sharedId={SHARED_ID}")),
+                "sec-purpose",
+                "prefetch",
+            ));
+
+            assert!(
+                set_cookie_value(&response, "ts-ec").is_some(),
+                "should mint an EC for a prefetched navigation"
+            );
+            assert_writes(&scenario.store, (1, 0, 0), "one Add");
+        }
+
+        #[test]
+        fn returning_prefetch_writes_nothing() {
+            for header in ["sec-purpose", "purpose"] {
+                let scenario = Scenario::new();
+                scenario.seed_live();
+
+                let (_, outcome) = scenario.drive(navigation_with_header(
+                    Some(&returning_with_shared_id()),
+                    header,
+                    "prefetch",
+                ));
+
+                assert_eq!(
+                    outcome,
+                    Some(FlushOutcome::Skipped),
+                    "should not be the writer: {header}"
+                );
+                assert_no_writes(&scenario.store, header);
+            }
+
+            let control = Scenario::new();
+            control.seed_live();
+            control.drive(navigation(Some(&returning_with_shared_id())));
+            assert_writes(
+                &control.store,
+                (0, 1, 0),
+                "control: the same navigation without prefetch writes once",
+            );
+        }
+
+        #[test]
+        fn new_visitor_without_sec_fetch_dest_writes_once() {
+            let scenario = Scenario::new();
+            let request = with_header(
+                without_header(
+                    navigation(Some(&format!("sharedId={SHARED_ID}"))),
+                    "sec-fetch-dest",
+                ),
+                "accept",
+                "text/html,application/xhtml+xml",
+            );
+
+            let (response, _) = scenario.drive(request);
+
+            assert!(
+                set_cookie_value(&response, "ts-ec").is_some(),
+                "should mint an EC"
+            );
+            assert_writes(&scenario.store, (1, 0, 0), "one Add");
+        }
+
+        #[test]
+        fn returning_iframe_or_no_sec_fetch_dest_writes_nothing() {
+            let requests = [
+                (
+                    "iframe",
+                    navigation_with_header(
+                        Some(&returning_with_shared_id()),
+                        "sec-fetch-dest",
+                        "iframe",
+                    ),
+                ),
+                (
+                    "no Sec-Fetch-Dest",
+                    with_header(
+                        without_header(
+                            navigation(Some(&returning_with_shared_id())),
+                            "sec-fetch-dest",
+                        ),
+                        "accept",
+                        "text/html",
+                    ),
+                ),
+            ];
+            for (name, request) in requests {
+                let scenario = Scenario::new();
+                scenario.seed_live();
+
+                let (_, outcome) = scenario.drive(request);
+
+                assert_eq!(
+                    outcome,
+                    Some(FlushOutcome::Skipped),
+                    "should not be the writer: {name}"
+                );
+                assert_no_writes(&scenario.store, name);
+            }
+
+            let control = Scenario::new();
+            control.seed_live();
+            control.drive(navigation(Some(&returning_with_shared_id())));
+            assert_writes(
+                &control.store,
+                (0, 1, 0),
+                "control: a document navigation writes once",
+            );
+        }
+
+        /// The settings of an enabled Didomi proxy, whose upstream answers on
+        /// `sdk.example.com`.
+        const DIDOMI_TOML: &str = r#"
+            [integrations.didomi]
+            enabled = true
+            sdk_origin = "https://sdk.example.com"
+            api_origin = "https://api.example.com"
+            "#;
+
+        fn didomi_scenario() -> Scenario {
+            let scenario = Scenario::with_settings(DIDOMI_TOML);
+            scenario
+                .network
+                .respond("sdk.example.com", 200, "application/javascript", "loader()");
+            scenario
+        }
+
+        fn didomi_navigation(cookie: Option<&str>) -> HttpRequest {
+            let mut request = navigation(cookie);
+            *request.uri_mut() = "https://test-publisher.com/integrations/didomi/consent/loader.js"
+                .parse()
+                .expect("should parse the proxy URI");
+            request
+        }
+
+        #[test]
+        fn integration_proxy_navigation_minting_ec_writes_once() {
+            let scenario = didomi_scenario();
+
+            let (response, _) =
+                scenario.drive(didomi_navigation(Some(&format!("sharedId={SHARED_ID}"))));
+
+            assert_eq!(response.status(), 200, "should serve the proxied answer");
+            assert_eq!(
+                scenario.network.requests_to("sdk.example.com").len(),
+                1,
+                "control: should have reached the integration, not the publisher"
+            );
+            assert!(
+                scenario.network.requests_to(ORIGIN_HOST).is_empty(),
+                "should not reach the publisher origin"
+            );
+            let minted = set_cookie_value(&response, "ts-ec").expect("should mint an EC");
+            assert_writes(&scenario.store, (1, 0, 0), "one Add");
+            assert_eq!(
+                stored_uid(&scenario.row_of(&minted), "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "should carry the ingest in the create"
+            );
+        }
+
+        /// An enabled auction with one bidder, and one slot for page bids.
+        const AUCTION_TOML: &str = r#"
+            [auction]
+            enabled = true
+            timeout_ms = 2000
+
+            [auction.providers.bidder-main]
+            protocol = "openrtb-2.6"
+            profile = "standard"
+            endpoint = "https://bidder.example.com/auction"
+            routing = "all_eligible"
+
+            [creative_opportunities]
+            enabled = true
+            gam_network_id = "123456789"
+
+            [[creative_opportunities.slot]]
+            id = "leaderboard"
+            gam_unit_path = "/123456789/leaderboard"
+            div_id = "div-gpt-ad-leaderboard"
+            page_patterns = ["/"]
+            formats = [{ width = 728, height = 90 }]
+            "#;
+
+        /// A first-party asset route to a scripted origin.
+        const ASSET_TOML: &str = r#"
+            [[proxy.asset_routes]]
+            prefix = "/assets/"
+            origin_url = "https://assets.example.com"
+            "#;
+
+        /// A pull partner whose answers the scripted network serves.
+        const PULL_PARTNER_TOML: &str = r#"
+            [[ec.partners]]
+            name = "Pull SSP"
+            source_domain = "ssp.example.com"
+            bidstream_enabled = true
+            pull_sync_enabled = true
+            pull_sync_url = "https://sync.ssp.example.com/pull"
+            pull_sync_allowed_domains = ["sync.ssp.example.com"]
+            ts_pull_token = "example-token-value-0123456789abcdef"
+            "#;
+
+        /// The provider the pull partner becomes.
+        const PULL_PROVIDER: &str = "pull-ssp-example-com";
+
+        const BIDDER_HOST: &str = "bidder.example.com";
+        const PULL_HOST: &str = "sync.ssp.example.com";
+
+        /// A scenario with the auction, the Didomi proxy, an asset route and
+        /// the pull partner, and a network that answers all of them.
+        fn full_scenario() -> Scenario {
+            let scenario = Scenario::with_settings(&format!(
+                "{AUCTION_TOML}{DIDOMI_TOML}{ASSET_TOML}{PULL_PARTNER_TOML}"
+            ));
+            scenario.network.respond(
+                BIDDER_HOST,
+                200,
+                "application/json",
+                r#"{"id":"response","seatbid":[]}"#,
+            );
+            scenario
+                .network
+                .respond("sdk.example.com", 200, "application/javascript", "loader()");
+            scenario.network.respond(
+                "assets.example.com",
+                200,
+                "application/javascript",
+                "asset()",
+            );
+            scenario.network.respond(
+                PULL_HOST,
+                200,
+                "application/json",
+                r#"{"uid":"pull-uid-1"}"#,
+            );
+            scenario
+        }
+
+        /// A scenario with the auction and no pull partner.
+        fn auction_scenario() -> Scenario {
+            let scenario = Scenario::with_settings(AUCTION_TOML);
+            scenario.network.respond(
+                BIDDER_HOST,
+                200,
+                "application/json",
+                r#"{"id":"response","seatbid":[]}"#,
+            );
+            scenario
+        }
+
+        fn auction_body(eids: Option<&serde_json::Value>) -> serde_json::Value {
+            let mut body = serde_json::json!({
+                "adUnits": [{
+                    "code": "div-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }]
+            });
+            if let Some(eids) = eids {
+                body["eids"] = eids.clone();
+            }
+            body
+        }
+
+        /// A `/auction` request from a real browser.
+        fn auction_request(cookie: Option<&str>, body: &serde_json::Value) -> HttpRequest {
+            let mut builder = edgezero_core::http::request_builder()
+                .method(edgezero_core::http::Method::POST)
+                .uri("https://test-publisher.com/auction")
+                .header("content-type", "application/json");
+            if let Some(cookie) = cookie {
+                builder = builder.header("cookie", cookie);
+            }
+            let mut request = builder
+                .body(EdgeBody::from(
+                    serde_json::to_vec(body).expect("should serialize the body"),
+                ))
+                .expect("should build request");
+            as_browser(&mut request);
+            request
+        }
+
+        /// A browser's `/_ts/page-bids` call for the home page.
+        fn page_bids_request(cookie: &str) -> HttpRequest {
+            let mut request = edgezero_core::http::request_builder()
+                .method(edgezero_core::http::Method::GET)
+                .uri("https://test-publisher.com/_ts/page-bids?path=%2F")
+                .header("x-tsjs-page-bids", "1")
+                .header("cookie", cookie)
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            as_browser(&mut request);
+            request
+        }
+
+        /// The partner `source` asking who the visitor is.
+        fn identify_request(cookie: &str, source: &str) -> HttpRequest {
+            let mut request = edgezero_core::http::request_builder()
+                .method(edgezero_core::http::Method::GET)
+                .uri("https://test-publisher.com/_ts/api/v1/identify")
+                .header(
+                    "authorization",
+                    format!("Bearer token-for-{source}-0123456789abcdef"),
+                )
+                .header("cookie", cookie)
+                .header("origin", "https://www.test-publisher.com")
+                .header("sec-fetch-site", "same-site")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            as_browser(&mut request);
+            request
+        }
+
+        fn asset_request(cookie: &str) -> HttpRequest {
+            let mut request = edgezero_core::http::request_builder()
+                .method(edgezero_core::http::Method::GET)
+                .uri("https://test-publisher.com/assets/app.js")
+                .header("sec-fetch-dest", "script")
+                .header("cookie", cookie)
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            as_browser(&mut request);
+            request
+        }
+
+        fn json_of(response: HttpResponse) -> serde_json::Value {
+            let bytes = response
+                .into_body()
+                .into_bytes()
+                .expect("should buffer the body");
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        }
+
+        /// The last request body the bidder received.
+        fn bidder_body(scenario: &Scenario) -> serde_json::Value {
+            let seen = scenario
+                .network
+                .requests_to(BIDDER_HOST)
+                .pop()
+                .expect("should have called the bidder");
+            serde_json::from_slice(&seen.body).expect("should parse the bidder request")
+        }
+
+        /// The EIDs of a bidder request, from `user.ext.eids`.
+        fn bidder_eids(body: &serde_json::Value) -> serde_json::Value {
+            body["user"]["ext"]["eids"].clone()
+        }
+
+        /// What `x-ts-eids` carries.
+        fn header_eids(response: &HttpResponse) -> serde_json::Value {
+            use base64::Engine as _;
+            let value = response
+                .headers()
+                .get("x-ts-eids")
+                .and_then(|value| value.to_str().ok())
+                .expect("should carry x-ts-eids");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .expect("should decode x-ts-eids");
+            serde_json::from_slice(&bytes).expect("should parse x-ts-eids")
+        }
+
+        /// The decoded `ts-eids-s` payload of an `/auction` body, or its
+        /// `clear` marker.
+        fn mirror_of(body: &serde_json::Value) -> serde_json::Value {
+            use base64::Engine as _;
+            let member = &body["ext"]["ts_eids_s"];
+            match member["value"].as_str() {
+                Some(value) => {
+                    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(value)
+                        .expect("should decode the mirror");
+                    serde_json::from_slice(&bytes).expect("should parse the mirror")
+                }
+                None => member.clone(),
+            }
+        }
+
+        #[test]
+        fn auction_page_bids_identify_proxy_and_assets_write_nothing() {
+            let scenario = full_scenario();
+            scenario.seed_live();
+            let cookie = returning_with_shared_id();
+            let body = auction_body(None);
+
+            let requests = [
+                ("auction", auction_request(Some(&cookie), &body)),
+                ("page bids", page_bids_request(&cookie)),
+                ("identify", identify_request(&cookie, "sharedid.org")),
+                ("integration proxy subresource", {
+                    let mut request = didomi_navigation(Some(&cookie));
+                    request
+                        .headers_mut()
+                        .insert("sec-fetch-dest", HeaderValue::from_static("script"));
+                    request
+                }),
+                ("asset", asset_request(&cookie)),
+            ];
+            for (name, request) in requests {
+                let (response, _) = scenario.drive(request);
+
+                assert!(
+                    response.status().is_success(),
+                    "should answer {name} with a success, got {}",
+                    response.status()
+                );
+                assert_no_writes(&scenario.store, name);
+            }
+            assert_eq!(
+                scenario.network.requests_to(BIDDER_HOST).len(),
+                2,
+                "control: the auction and the page bids should both have reached the bidder"
+            );
+            for host in ["sdk.example.com", "assets.example.com"] {
+                assert_eq!(
+                    scenario.network.requests_to(host).len(),
+                    1,
+                    "control: the proxy and the asset route should each have reached {host}"
+                );
+            }
+
+            let control = full_scenario();
+            control.seed_live();
+            control.drive(navigation(Some(&cookie)));
+            assert_writes(
+                &control.store,
+                (0, 1, 0),
+                "control: a navigation with the same cookies writes once",
+            );
+        }
+
+        #[test]
+        fn returning_writer_navigation_reads_once() {
+            let changed = Scenario::new();
+            changed.seed_live();
+
+            changed.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(
+                changed.store.writes().lookups,
+                1,
+                "should read once, with a write"
+            );
+            assert_writes(&changed.store, (0, 1, 0), "one CAS write");
+
+            let unchanged = Scenario::new();
+            let mut entry = live_entry();
+            entry.ids.insert(
+                "sharedid.org".to_owned(),
+                KvPartnerId::browser(SHARED_ID, Some(1_500)),
+            );
+            unchanged.seed(&entry);
+
+            unchanged.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(
+                unchanged.store.writes().lookups,
+                1,
+                "should read once, with nothing to write"
+            );
+            assert_no_writes(&unchanged.store, "the row already holds the ID");
+
+            unchanged.drive(navigation(Some(&returning_with_shared_id())));
+            assert_eq!(
+                unchanged.store.writes().lookups,
+                2,
+                "control: the counter should count each navigation's read"
+            );
+        }
+
+        #[test]
+        fn due_after_send_provider_adds_one_reread() {
+            let scenario = full_scenario();
+            scenario.seed_live();
+
+            let (_, outcome) = scenario.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            assert_eq!(
+                scenario.network.requests_to(PULL_HOST).len(),
+                1,
+                "should call the due pull provider after send"
+            );
+            assert_eq!(
+                scenario.store.writes().lookups,
+                2,
+                "should read in phase 1 and once more before dispatching"
+            );
+            assert_writes(
+                &scenario.store,
+                (0, 1, 0),
+                "the browser ingest and the pull in one write",
+            );
+            let row = scenario.row();
+            assert_eq!(
+                stored_uid(&row, "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "should hold the browser ID"
+            );
+            assert_eq!(
+                stored_uid(&row, "ssp.example.com").as_deref(),
+                Some("pull-uid-1"),
+                "should hold the pulled ID"
+            );
+
+            let idle = full_scenario();
+            let mut entry = live_entry();
+            entry.ps.insert(
+                PULL_PROVIDER.to_owned(),
+                trusted_server_core::ec::kv_types::KvProviderState {
+                    n: Some(4_000_000_000),
+                    ..Default::default()
+                },
+            );
+            idle.seed(&entry);
+
+            idle.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert!(
+                idle.network.requests_to(PULL_HOST).is_empty(),
+                "control: should not call a provider that is not due"
+            );
+            assert_eq!(
+                idle.store.writes().lookups,
+                1,
+                "control: should read once when no provider is due"
+            );
+        }
+
+        #[test]
+        fn auction_and_page_bids_keep_one_read() {
+            let cookie = returning_with_shared_id();
+            let auction = full_scenario();
+            auction.seed_live();
+
+            auction.drive(auction_request(Some(&cookie), &auction_body(None)));
+
+            assert_eq!(
+                auction.store.writes().lookups,
+                1,
+                "/auction should read once"
+            );
+            assert_no_writes(&auction.store, "/auction");
+            assert_eq!(
+                auction.network.requests_to(BIDDER_HOST).len(),
+                1,
+                "control: the auction should have run"
+            );
+
+            let page_bids = full_scenario();
+            page_bids.seed_live();
+
+            page_bids.drive(page_bids_request(&cookie));
+
+            assert_eq!(
+                page_bids.store.writes().lookups,
+                1,
+                "/_ts/page-bids should read once"
+            );
+            assert_no_writes(&page_bids.store, "/_ts/page-bids");
+            assert_eq!(
+                page_bids.network.requests_to(BIDDER_HOST).len(),
+                1,
+                "control: the page-bids auction should have run"
+            );
+        }
+
+        #[test]
+        fn same_origin_page_bids_is_the_spa_writer_once_the_interval_passes() {
+            let spa_request = || {
+                let mut request = page_bids_request(&returning_with_shared_id());
+                request.headers_mut().insert(
+                    "sec-fetch-site",
+                    edgezero_core::http::HeaderValue::from_static("same-origin"),
+                );
+                request
+            };
+
+            let due = full_scenario();
+            due.seed_live();
+            let (_, outcome) = due.drive(spa_request());
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Written),
+                "should write once as the SPA writer"
+            );
+            assert_eq!(
+                stored_uid(&due.row(), "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "should ingest the browser's sharedId"
+            );
+            assert_eq!(
+                due.network.requests_to(PULL_HOST).len(),
+                1,
+                "should run the due after-send provider"
+            );
+
+            let recent = full_scenario();
+            let mut row = live_entry();
+            row.wa = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("should read the clock")
+                    .as_secs(),
+            );
+            recent.seed(&row);
+            let (_, outcome) = recent.drive(spa_request());
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Skipped),
+                "should wait out the interval since the last writer flush"
+            );
+            assert_no_writes(&recent.store, "an SPA call within the interval");
+        }
+
+        #[test]
+        fn no_response_sets_an_identity_cookie_other_than_ts_ec() {
+            assert!(
+                is_server_identity_cookie("ts-eids")
+                    && is_server_identity_cookie("__Host-ts-eids-s")
+                    && is_server_identity_cookie("ts-eids-r1")
+                    && is_server_identity_cookie("ts-ec-pull-complete")
+                    && !is_server_identity_cookie("ts-ec"),
+                "control: the check should name exactly the cookies the server never sets"
+            );
+            let browser_cookies = format!(
+                "{}; ts-eids=ignored; __Host-ts-eids-s=ignored; ts-eids-r1=ignored; \
+                 ts-ec-pull-complete=v1.example",
+                returning_with_shared_id()
+            );
+
+            let new_visitor = full_scenario();
+            let (minted, _) = new_visitor.drive(navigation(Some("sharedId=shared-id-1")));
+            assert!(
+                set_cookie_value(&minted, "ts-ec").is_some(),
+                "control: a new visitor's response should set ts-ec"
+            );
+
+            let returning = full_scenario();
+            returning.seed_live();
+            let body = auction_body(None);
+            for request in [
+                navigation(Some(&browser_cookies)),
+                auction_request(Some(&browser_cookies), &body),
+                page_bids_request(&browser_cookies),
+                identify_request(&browser_cookies, "sharedid.org"),
+            ] {
+                let (response, _) = returning.drive(request);
+                let names: Vec<String> = set_cookies(&response)
+                    .iter()
+                    .map(|cookie| cookie_name(cookie).to_owned())
+                    .collect();
+                assert!(
+                    names.iter().all(|name| name == "ts-ec"),
+                    "should set at most ts-ec: {names:?}"
+                );
+            }
+        }
+
+        /// A source `id5-sync.com` entry set with two entries, three UIDs and
+        /// every UID-level and EID-level field.
+        fn full_entry_set() -> Vec<trusted_server_core::ec::kv_types::KvEid> {
+            use trusted_server_core::ec::kv_types::{KvEid, KvUid};
+            vec![
+                KvEid {
+                    uids: vec![
+                        KvUid {
+                            id: "set-uid-a".to_owned(),
+                            atype: Some(1),
+                            ext: Some(serde_json::json!({ "rtiPartner": "A" })),
+                        },
+                        KvUid {
+                            id: "set-uid-b".to_owned(),
+                            atype: Some(3),
+                            ext: Some(serde_json::json!({ "stype": "ppuid" })),
+                        },
+                    ],
+                    inserter: Some("inserter-a.example.com".to_owned()),
+                    matcher: Some("matcher-a.example.com".to_owned()),
+                    mm: Some(3),
+                    ext: Some(serde_json::json!({ "segments": ["s1", "s2"] })),
+                },
+                KvEid {
+                    uids: vec![KvUid {
+                        id: "set-uid-c".to_owned(),
+                        atype: Some(1),
+                        ext: Some(serde_json::json!({ "label": "c" })),
+                    }],
+                    inserter: Some("inserter-b.example.com".to_owned()),
+                    matcher: Some("matcher-b.example.com".to_owned()),
+                    mm: Some(1),
+                    ext: Some(serde_json::json!({ "tier": "gold" })),
+                },
+            ]
+        }
+
+        /// What bidders receive for [`full_entry_set`].
+        fn full_entry_set_eids() -> serde_json::Value {
+            serde_json::json!([
+                {
+                    "source": "id5-sync.com",
+                    "inserter": "inserter-a.example.com",
+                    "matcher": "matcher-a.example.com",
+                    "mm": 3,
+                    "ext": { "segments": ["s1", "s2"] },
+                    "uids": [
+                        { "id": "set-uid-a", "atype": 1, "ext": { "rtiPartner": "A" } },
+                        { "id": "set-uid-b", "atype": 3, "ext": { "stype": "ppuid" } }
+                    ]
+                },
+                {
+                    "source": "id5-sync.com",
+                    "inserter": "inserter-b.example.com",
+                    "matcher": "matcher-b.example.com",
+                    "mm": 1,
+                    "ext": { "tier": "gold" },
+                    "uids": [{ "id": "set-uid-c", "atype": 1, "ext": { "label": "c" } }]
+                }
+            ])
+        }
+
+        /// A live row holding `eids` for `id5-sync.com`, with no writer.
+        fn row_with_set(exp: Option<u64>) -> KvEntry {
+            let mut entry = live_entry();
+            entry.ids.insert(
+                "id5-sync.com".to_owned(),
+                KvPartnerId {
+                    at: Some(1_500),
+                    exp,
+                    eids: full_entry_set(),
+                    ..KvPartnerId::default()
+                },
+            );
+            entry
+        }
+
+        /// A browser entry of a source no partner registers.
+        fn browser_entry() -> serde_json::Value {
+            serde_json::json!({
+                "source": "browser.example.com",
+                "uids": [{ "id": "browser-uid", "atype": 1 }]
+            })
+        }
+
+        const FAR_FUTURE: u64 = 4_000_000_000;
+
+        fn ec_cookie() -> String {
+            format!("ts-ec={EC_ID}")
+        }
+
+        #[test]
+        fn entry_set_round_trips_from_kv_to_bidders() {
+            let scenario = auction_scenario();
+            scenario.seed(&row_with_set(Some(FAR_FUTURE)));
+            let body = auction_body(Some(&serde_json::json!([browser_entry()])));
+
+            let (response, _) = scenario.drive(auction_request(Some(&ec_cookie()), &body));
+
+            let mut expected = vec![browser_entry()];
+            expected.extend(
+                full_entry_set_eids()
+                    .as_array()
+                    .expect("should be a list")
+                    .clone(),
+            );
+            let expected = serde_json::Value::Array(expected);
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                expected,
+                "should send the browser entry, then both stored entries in order, every field intact"
+            );
+            assert_eq!(
+                header_eids(&response),
+                expected,
+                "x-ts-eids should carry what was sent"
+            );
+            let mirror = mirror_of(&json_of(response));
+            assert_eq!(
+                mirror,
+                serde_json::json!({ "v": 1, "eids": full_entry_set_eids() }),
+                "the mirror should hold the same stored entries and no browser entry"
+            );
+            assert_no_writes(&scenario.store, "/auction");
+        }
+
+        #[test]
+        fn entry_set_survives_an_unrelated_flush() {
+            let scenario = Scenario::new();
+            let seeded = row_with_set(Some(FAR_FUTURE));
+            scenario.seed(&seeded);
+
+            let (_, outcome) = scenario.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Written),
+                "should flush the sharedId"
+            );
+            assert_writes(&scenario.store, (0, 1, 0), "one CAS write");
+            let row = scenario.row();
+            assert_eq!(
+                stored_uid(&row, "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "control: the flush should have written the sharedId fill"
+            );
+            assert_eq!(
+                row.ids.get("id5-sync.com"),
+                seeded.ids.get("id5-sync.com"),
+                "should leave the stored entry set exactly as it was"
+            );
+        }
+
+        #[test]
+        fn expired_entry_set_is_never_served_or_mirrored() {
+            let live = auction_scenario();
+            live.seed(&row_with_set(Some(FAR_FUTURE)));
+            let (live_response, _) =
+                live.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+            assert_eq!(
+                bidder_eids(&bidder_body(&live)),
+                full_entry_set_eids(),
+                "control: an unexpired set should be served"
+            );
+            assert_ne!(
+                mirror_of(&json_of(live_response)),
+                serde_json::json!({ "clear": true }),
+                "control: an unexpired set should be mirrored"
+            );
+
+            let expired = auction_scenario();
+            expired.seed(&row_with_set(Some(1_500)));
+            let (response, _) =
+                expired.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+
+            assert_eq!(
+                bidder_eids(&bidder_body(&expired)),
+                serde_json::Value::Null,
+                "should send no EIDs from an expired set"
+            );
+            assert_eq!(
+                mirror_of(&json_of(response)),
+                serde_json::json!({ "clear": true }),
+                "should mirror nothing for an expired set"
+            );
+        }
+
+        /// A version 1 row: `uid` records and no entry sets.
+        fn seed_version_1_row(scenario: &Scenario) {
+            scenario.seed(&live_entry());
+            let lookup = scenario
+                .store
+                .lookup(EC_ID)
+                .expect("should read the row")
+                .expect("should hold the row");
+            let body = serde_json::json!({
+                "v": 1,
+                "created": 1_000,
+                "consent": { "ok": true, "updated": 1_000 },
+                "geo": { "country": "CA" },
+                "network": { "cluster_size": 1 },
+                "ids": { "id5-sync.com": { "uid": "version-1-uid", "at": 1_500 } }
+            })
+            .to_string();
+            let metadata = lookup
+                .metadata
+                .map(|bytes| String::from_utf8(bytes).expect("should be UTF-8"))
+                .unwrap_or_else(|| "{}".to_owned());
+            scenario
+                .store
+                .insert(
+                    EC_ID,
+                    trusted_server_core::ec::kv_backend::EcKvWrite {
+                        body: &body,
+                        metadata: &metadata,
+                        ttl: std::time::Duration::from_secs(3_600),
+                        mode: trusted_server_core::ec::kv_backend::EcKvWriteMode::Overwrite,
+                    },
+                )
+                .expect("should store the version 1 row");
+            scenario.store.reset_counts();
+        }
+
+        fn stored_body(scenario: &Scenario) -> serde_json::Value {
+            let lookup = scenario
+                .store
+                .lookup(EC_ID)
+                .expect("should read the row")
+                .expect("should hold the row");
+            serde_json::from_slice(&lookup.body).expect("should parse the stored row")
+        }
+
+        #[test]
+        fn version_1_row_is_served_and_upgraded_by_the_next_write() {
+            let scenario = auction_scenario();
+            seed_version_1_row(&scenario);
+
+            scenario.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                serde_json::json!([{
+                    "source": "id5-sync.com",
+                    "uids": [{
+                        "id": "version-1-uid",
+                        "atype": trusted_server_core::settings::EcPartner::default_openrtb_atype()
+                    }]
+                }]),
+                "should serve the version 1 record as one entry with one UID"
+            );
+            assert_no_writes(&scenario.store, "/auction");
+            assert_eq!(
+                stored_body(&scenario)["v"],
+                1,
+                "control: the auction should leave the row at version 1"
+            );
+
+            let (_, outcome) = scenario.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Written),
+                "should flush the sharedId"
+            );
+            assert_writes(&scenario.store, (0, 1, 0), "one CAS write");
+            let written = stored_body(&scenario);
+            assert_eq!(written["v"], 2, "should write version 2");
+            let record = &written["ids"]["id5-sync.com"];
+            assert!(
+                record.get("uid").is_none(),
+                "should drop the version 1 uid field: {record}"
+            );
+            assert_eq!(
+                record["eids"][0]["uids"][0]["id"], "version-1-uid",
+                "should keep the UID as an entry"
+            );
+        }
+
+        #[test]
+        fn generic_pull_uid_written_after_send_is_served_on_the_next_auction() {
+            let scenario = full_scenario();
+            scenario.seed_live();
+
+            let (_, outcome) = scenario.drive(navigation(Some(&ec_cookie())));
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Written),
+                "should flush the pull"
+            );
+            let record = scenario.row().ids.get("ssp.example.com").cloned();
+            assert_eq!(
+                record.as_ref().and_then(|record| record.w.as_deref()),
+                Some(PULL_PROVIDER),
+                "should record the pull provider as the writer"
+            );
+
+            let (response, _) =
+                scenario.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+
+            let atype = trusted_server_core::settings::EcPartner::default_openrtb_atype();
+            let served = serde_json::json!([{
+                "source": "ssp.example.com",
+                "uids": [{ "id": "pull-uid-1", "atype": atype }]
+            }]);
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                served,
+                "should serve the pulled UID to bidders"
+            );
+            assert_eq!(
+                mirror_of(&json_of(response)),
+                serde_json::json!({ "v": 1, "eids": served }),
+                "should mirror the pulled UID"
+            );
+        }
+
+        /// As [`drive_with_runtime`], running `after_send` between the send
+        /// and phase 4, where another request can land.
+        fn drive_with_send_hook(
+            state: &Arc<AppState>,
+            request: HttpRequest,
+            after_send: &mut dyn FnMut(),
+        ) -> Option<FlushOutcome> {
+            let router = TrustedServerApp::routes_for_state(state);
+            let mut response = futures::executor::block_on(router.oneshot(request))
+                .expect("should route the request");
+            let mut ec_state = response
+                .extensions_mut()
+                .remove::<EcFinalizeState>()
+                .expect("should carry EC state");
+            let graph = || state.identity_graph.clone();
+            finalize_send_and_flush(
+                PostRouteInput {
+                    runtime: Some(&state.identity),
+                    settings: &state.settings,
+                    ec_state: &mut ec_state,
+                    graph: &graph,
+                    rate_limiter: &AllowAll,
+                    timings: None,
+                },
+                response,
+                &mut |_| after_send(),
+            )
+        }
+
+        /// Withdraws consent on an `/auction` call, as a second tab can.
+        fn withdraw_on_auction(state: &Arc<AppState>) {
+            let (response, _) = drive_with_runtime(
+                state,
+                auction_request(Some(&ec_cookie()), &auction_body(None)),
+                Some(&state.identity),
+                withdraw,
+            );
+            assert_no_server_identity_cookie(&response);
+            assert!(
+                set_cookies(&response)
+                    .iter()
+                    .any(|cookie| cookie.starts_with("ts-ec=;") && cookie.contains("Max-Age=0")),
+                "control: the withdrawal should expire ts-ec: {:?}",
+                set_cookies(&response)
+            );
+        }
+
+        #[test]
+        fn withdrawal_on_auction_after_navigation_send_makes_phase_four_drop_and_call_nothing() {
+            let control = full_scenario();
+            control.seed_live();
+            let (_, outcome) = control.drive(navigation(Some(&returning_with_shared_id())));
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Written),
+                "control: should flush"
+            );
+            assert_eq!(
+                control.network.requests_to(PULL_HOST).len(),
+                1,
+                "control: should call the due provider"
+            );
+
+            let scenario = full_scenario();
+            scenario.seed_live();
+            let state = Arc::clone(&scenario.state);
+
+            let outcome = drive_with_send_hook(
+                &state,
+                navigation(Some(&returning_with_shared_id())),
+                &mut || withdraw_on_auction(&state),
+            );
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Dropped("tombstone")),
+                "should drop the navigation's mutation"
+            );
+            assert!(
+                scenario.network.requests_to(PULL_HOST).is_empty(),
+                "should call no provider after the tombstone"
+            );
+            assert_writes(
+                &scenario.store,
+                (1, 1, 0),
+                "the withdrawal's marker and tombstone only, nothing from phase 4",
+            );
+            let row = scenario.row();
+            assert!(!row.consent.ok, "should leave the tombstone");
+            assert!(row.ids.is_empty(), "should hold no ID after the tombstone");
+        }
+
+        #[test]
+        fn withdrawal_returns_clear_for_the_mirror() {
+            let scenario = auction_scenario();
+            scenario.seed(&row_with_set(Some(FAR_FUTURE)));
+            let (before, _) =
+                scenario.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+            assert_eq!(
+                mirror_of(&json_of(before)),
+                serde_json::json!({ "v": 1, "eids": full_entry_set_eids() }),
+                "control: a live row should be mirrored"
+            );
+
+            withdraw_on_auction(&scenario.state);
+            let (after, _) =
+                scenario.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+
+            assert_eq!(
+                mirror_of(&json_of(after)),
+                serde_json::json!({ "clear": true }),
+                "should tell the shim to expire the mirror"
+            );
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                serde_json::Value::Null,
+                "should send bidders no ID from a tombstoned row"
+            );
+        }
+
+        #[test]
+        fn consent_withdrawal_writes_tombstone_and_marker() {
+            // (refused conditional writes, tombstone CAS attempts, marker
+            // writes, whether the row ends tombstoned)
+            let cases = [
+                (0_usize, 1_usize, 1_usize, true),
+                (5, 6, 1, true),
+                (10, 10, 0, false),
+            ];
+            for (refused, tombstone_attempts, markers, tombstoned) in cases {
+                let scenario = Scenario::new();
+                scenario.seed_live();
+                if refused > 0 {
+                    scenario.store.refuse_conditional_writes(EC_ID, refused);
+                }
+
+                let (response, outcome) = drive_with_runtime(
+                    &scenario.state,
+                    navigation(Some(&ec_cookie())),
+                    Some(&scenario.state.identity),
+                    withdraw,
+                );
+
+                assert_no_server_identity_cookie(&response);
+                assert_eq!(
+                    outcome,
+                    Some(FlushOutcome::Skipped),
+                    "should flush nothing after a withdrawal: {refused} refused"
+                );
+                assert_writes(
+                    &scenario.store,
+                    (markers, tombstone_attempts, 0),
+                    &format!("{refused} refused writes: the marker, then every tombstone attempt"),
+                );
+                assert_eq!(
+                    !scenario.row().consent.ok,
+                    tombstoned,
+                    "should end tombstoned only when an attempt landed: {refused} refused"
+                );
+            }
+        }
+
+        #[test]
+        fn cas_conflict_on_flush_is_one_attempt() {
+            let scenario = Scenario::new();
+            scenario.seed_live();
+            scenario.store.refuse_conditional_writes(EC_ID, 5);
+
+            let (_, outcome) = scenario.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::WriteFailed {
+                    removals: trusted_server_core::ec::identity::flush::RemovalWriteOutcome::NothingToWrite
+                }),
+                "should fail the flush with no removal to write"
+            );
+            assert_writes(
+                &scenario.store,
+                (0, 1, 0),
+                "one refused attempt, and no retry although four more would be refused",
+            );
+
+            let control = Scenario::new();
+            control.seed_live();
+            control.drive(navigation(Some(&returning_with_shared_id())));
+            assert_writes(&control.store, (0, 1, 0), "control: one attempt that lands");
+        }
+
+        #[test]
+        fn refused_flush_is_rederived_by_the_next_navigation() {
+            let scenario = Scenario::new();
+            scenario.seed_live();
+            scenario.store.refuse_conditional_writes(EC_ID, 1);
+
+            scenario.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(
+                stored_uid(&scenario.row(), "sharedid.org"),
+                None,
+                "should not hold the ID after the refused write"
+            );
+            assert_writes(&scenario.store, (0, 1, 0), "the refused attempt");
+
+            let (_, outcome) = scenario.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Written),
+                "should write the second time"
+            );
+            assert_writes(&scenario.store, (0, 2, 0), "one attempt per navigation");
+            assert_eq!(
+                stored_uid(&scenario.row(), "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "should hold the ingest the second navigation re-derived from the same cookies"
+            );
+        }
+
+        #[test]
+        fn deleted_row_is_found_by_the_next_writer_and_rotated() {
+            let scenario = Scenario::new();
+            scenario.seed_live();
+            scenario
+                .graph()
+                .delete(EC_ID)
+                .expect("should delete the row out of band");
+            scenario.store.reset_counts();
+
+            let (response, _) = scenario.drive(navigation(Some(&returning_with_shared_id())));
+
+            let rotated = set_cookie_value(&response, "ts-ec").expect("should set the new EC");
+            assert_ne!(rotated, EC_ID, "should rotate to a new ID");
+            assert_writes(
+                &scenario.store,
+                (1, 0, 0),
+                "one Add creates the replacement",
+            );
+            assert_eq!(
+                stored_uid(&scenario.row_of(&rotated), "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "should carry the ingest in the replacement row"
+            );
+            assert!(
+                scenario.graph().get(EC_ID).expect("should read").is_none(),
+                "should not resurrect the deleted ID"
+            );
+        }
+
+        #[test]
+        fn stager_that_sees_missing_row_returns_clear_and_next_writer_recovers() {
+            let live = auction_scenario();
+            live.seed(&row_with_set(Some(FAR_FUTURE)));
+            let (served, _) = live.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+            assert_ne!(
+                mirror_of(&json_of(served)),
+                serde_json::json!({ "clear": true }),
+                "control: a live row should be mirrored"
+            );
+
+            let scenario = auction_scenario();
+            let (response, _) =
+                scenario.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+
+            assert_eq!(
+                mirror_of(&json_of(response)),
+                serde_json::json!({ "clear": true }),
+                "should return clear for a missing row"
+            );
+            assert_no_writes(&scenario.store, "the stager stores nothing");
+            assert!(
+                scenario.graph().get(EC_ID).expect("should read").is_none(),
+                "should not create the row"
+            );
+
+            let (navigated, _) = scenario.drive(navigation(Some(&returning_with_shared_id())));
+
+            let rotated = set_cookie_value(&navigated, "ts-ec").expect("should set the new EC");
+            assert_ne!(rotated, EC_ID, "the next writer should recover by rotating");
+            assert_writes(&scenario.store, (1, 0, 0), "one Add by the writer");
+        }
+
+        const REGISTERED_ONLY_COOKIE: &str =
+            include_str!("../../trusted-server-js/lib/test/fixtures/ts-eids-registered-only.txt");
+        const ORTB2_ONLY_COOKIE: &str =
+            include_str!("../../trusted-server-js/lib/test/fixtures/ts-eids-ortb2-only.txt");
+
+        /// A provider that answers every call by invalidating the ID of its
+        /// one source, so the flush carries a removal.
+        struct InvalidatingProvider {
+            descriptor: trusted_server_core::ec::identity::ProviderDescriptor,
+            source: trusted_server_core::ec::identity::SourceDomain,
+        }
+
+        impl InvalidatingProvider {
+            fn new(id: &str, source: &str) -> Self {
+                use trusted_server_core::ec::identity::{ProviderDescriptor, Resolves};
+                let source: trusted_server_core::ec::identity::SourceDomain =
+                    source.parse().expect("should parse the source");
+                let descriptor =
+                    ProviderDescriptor::builder(id.parse().expect("should parse the provider ID"))
+                        .with_source(source.clone())
+                        .with_resolves(
+                            Resolves::new().with_endpoint("https://probe.example.com/resolve"),
+                        )
+                        .with_consent_policy(
+                            trusted_server_core::ec::identity::test_support::resolver_policy(),
+                        )
+                        .build()
+                        .expect("should build the descriptor");
+                Self { descriptor, source }
+            }
+        }
+
+        impl trusted_server_core::ec::identity::IdentityProvider for InvalidatingProvider {
+            fn descriptor(&self) -> &trusted_server_core::ec::identity::ProviderDescriptor {
+                &self.descriptor
+            }
+
+            fn request(
+                &self,
+                input: &trusted_server_core::ec::identity::ResolveInput<'_>,
+            ) -> Result<
+                Option<trusted_server_core::ec::identity::ProviderRequest>,
+                Report<trusted_server_core::ec::identity::IdentityProviderError>,
+            > {
+                Ok(Some(
+                    trusted_server_core::ec::identity::ProviderRequest::get(input.endpoint()?),
+                ))
+            }
+
+            fn response(
+                &self,
+                response: &trusted_server_core::ec::identity::ProviderResponse,
+                _input: &trusted_server_core::ec::identity::ResolveInput<'_>,
+            ) -> Result<
+                trusted_server_core::ec::identity::Resolution,
+                Report<trusted_server_core::ec::identity::IdentityProviderError>,
+            > {
+                response.success_text()?;
+                Ok(trusted_server_core::ec::identity::Resolution::invalidate(
+                    &self.source,
+                ))
+            }
+        }
+
+        /// A scenario whose one provider invalidates the ID it wrote for
+        /// `ssp.example.com`, which the seeded row holds and is due to refresh.
+        fn invalidating_scenario() -> Scenario {
+            let Scenario {
+                state,
+                store,
+                network,
+            } = Scenario::new();
+            let provider: Arc<dyn trusted_server_core::ec::identity::IdentityProvider> = Arc::new(
+                InvalidatingProvider::new("removal-probe", "ssp.example.com"),
+            );
+            let runtime = IdentityRuntime::from_settings_with_providers(
+                &state.settings,
+                vec![provider],
+                BTreeMap::from([(
+                    "ssp.example.com".parse().expect("should parse the source"),
+                    "removal-probe"
+                        .parse()
+                        .expect("should parse the provider ID"),
+                )]),
+            )
+            .expect("should build the identity runtime");
+            let scenario = Scenario {
+                state: crate::app::app_state_with_identity_for_test(state, runtime),
+                store,
+                network,
+            };
+            scenario
+                .network
+                .respond("probe.example.com", 200, "text/plain", "ok");
+            let mut entry = live_entry();
+            entry.ids.insert(
+                "ssp.example.com".to_owned(),
+                KvPartnerId {
+                    w: Some("removal-probe".to_owned()),
+                    rv: Some("0123456789abcdef".to_owned()),
+                    at: Some(1_000),
+                    ra: Some(1_500),
+                    ..KvPartnerId::new("probe-uid")
+                },
+            );
+            scenario.seed(&entry);
+            scenario
+        }
+
+        #[test]
+        fn refused_flush_writes_its_removals_alone() {
+            let control = invalidating_scenario();
+            control.drive(navigation(Some(&returning_with_shared_id())));
+            assert_writes(&control.store, (0, 1, 0), "control: one write holds both");
+            let row = control.row();
+            assert_eq!(
+                stored_uid(&row, "ssp.example.com"),
+                None,
+                "control: the removal should be in the one write"
+            );
+            assert_eq!(
+                stored_uid(&row, "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "control: so should the ingest"
+            );
+
+            let refused_once = invalidating_scenario();
+            refused_once.store.refuse_conditional_writes(EC_ID, 1);
+
+            let (_, outcome) = refused_once.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::WriteFailed {
+                    removals:
+                        trusted_server_core::ec::identity::flush::RemovalWriteOutcome::Written
+                }),
+                "should write the removals after the flush is refused"
+            );
+            assert_writes(
+                &refused_once.store,
+                (0, 2, 0),
+                "the refused flush, then the removals alone",
+            );
+            let row = refused_once.row();
+            assert_eq!(
+                stored_uid(&row, "ssp.example.com"),
+                None,
+                "should have removed the invalidated ID"
+            );
+            assert_eq!(
+                stored_uid(&row, "sharedid.org"),
+                None,
+                "should not write the refused ingest with the removals"
+            );
+
+            let refused_always = invalidating_scenario();
+            refused_always.store.refuse_conditional_writes(EC_ID, 6);
+
+            let (_, outcome) = refused_always.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::WriteFailed {
+                    removals: trusted_server_core::ec::identity::flush::RemovalWriteOutcome::Failed
+                }),
+                "should report the removal write failed when every attempt is refused"
+            );
+            assert_writes(
+                &refused_always.store,
+                (1, 6, 0),
+                "the flush once, the removals up to five times, then the pending key",
+            );
+            assert_eq!(
+                stored_uid(&refused_always.row(), "ssp.example.com").as_deref(),
+                Some("probe-uid"),
+                "should leave the row as it was"
+            );
+
+            let (_, next) = refused_always.drive(navigation(Some(&format!("ts-ec={EC_ID}"))));
+
+            assert_eq!(
+                next,
+                Some(FlushOutcome::Written),
+                "should merge the pending key on the next writer"
+            );
+            assert_eq!(
+                stored_uid(&refused_always.row(), "ssp.example.com"),
+                None,
+                "should apply the removal the earlier flush missed"
+            );
+        }
+
+        /// A scenario whose Didomi proxy answers `body`, with a capture-only
+        /// provider listening on that proxy's path and a row holding a
+        /// browser-written `ssp.example.com` ID for it to invalidate.
+        fn capture_scenario(body: &str) -> Scenario {
+            capture_scenario_with(body, false)
+        }
+
+        /// As [`capture_scenario`], with the provider's `revoke_scope` set to
+        /// `"global"` when `global`. The settings are changed after the app
+        /// state is built, as config validation knows no capture-only
+        /// provider.
+        fn capture_scenario_with(body: &str, global: bool) -> Scenario {
+            let Scenario {
+                mut state,
+                store,
+                network,
+            } = Scenario::with_settings(DIDOMI_TOML);
+            if global {
+                let owned = Arc::get_mut(&mut state).expect("should own the fresh state");
+                Arc::make_mut(&mut owned.settings)
+                    .ec
+                    .identity
+                    .providers
+                    .insert(
+                        "didomi".to_owned(),
+                        trusted_server_core::settings::ProviderSettings {
+                            revoke_scope: Some(trusted_server_core::settings::RevokeScope::Global),
+                            ..trusted_server_core::settings::ProviderSettings::default()
+                        },
+                    );
+            }
+            let provider =
+                trusted_server_core::ec::identity::test_support::answering_capture_provider(
+                    "didomi",
+                    &["ssp.example.com"],
+                    None,
+                );
+            let runtime = IdentityRuntime::from_settings_with_providers(
+                &state.settings,
+                vec![provider],
+                BTreeMap::new(),
+            )
+            .expect("should build the identity runtime");
+            let scenario = Scenario {
+                state: crate::app::app_state_with_identity_for_test(state, runtime),
+                store,
+                network,
+            };
+            scenario
+                .network
+                .respond("sdk.example.com", 200, "application/json", body);
+            let mut entry = live_entry();
+            entry.ids.insert(
+                "ssp.example.com".to_owned(),
+                KvPartnerId {
+                    rv: Some("0123456789abcdef".to_owned()),
+                    at: Some(1_000),
+                    ..KvPartnerId::new("probe-uid")
+                },
+            );
+            scenario.seed(&entry);
+            scenario
+        }
+
+        const CAPTURE_INVALIDATION: &str = r#"{"invalidate":["ssp.example.com"]}"#;
+
+        #[test]
+        fn capture_removal_is_a_separate_write_beside_the_one_flush() {
+            let control = capture_scenario(r#"{}"#);
+            control.drive(didomi_navigation(Some(&returning_with_shared_id())));
+            assert_writes(
+                &control.store,
+                (0, 1, 0),
+                "control: a proxied navigation with nothing to capture flushes once",
+            );
+
+            let scenario = capture_scenario(CAPTURE_INVALIDATION);
+
+            let (response, outcome) =
+                scenario.drive(didomi_navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(response.status(), 200, "should serve the proxied answer");
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Written),
+                "should still flush the writer's ingest"
+            );
+            assert_writes(
+                &scenario.store,
+                (0, 2, 0),
+                "the capture removal write, then the writer's one flush",
+            );
+            let row = scenario.row();
+            assert_eq!(
+                stored_uid(&row, "ssp.example.com"),
+                None,
+                "should have removed the captured invalidation"
+            );
+            assert_eq!(
+                stored_uid(&row, "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "should keep the writer's own ingest in its flush"
+            );
+        }
+
+        #[test]
+        fn capture_global_revoke_tombstones_the_row_and_expires_the_ec_cookie() {
+            let scenario = capture_scenario_with(r#"{"opted_out":true}"#, true);
+
+            let (response, _) =
+                scenario.drive(didomi_navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(response.status(), 200, "should serve the proxied answer");
+            let row = scenario.row();
+            assert!(!row.consent.ok, "should tombstone the row");
+            assert!(row.ids.is_empty(), "should remove every ID");
+            assert!(
+                set_cookies(&response).iter().any(|cookie| {
+                    cookie_name(cookie) == "ts-ec" && cookie.contains("Max-Age=0")
+                }),
+                "should expire the EC cookie"
+            );
+            let writes = scenario.store.writes();
+            assert_eq!(
+                (writes.if_generation_match, writes.overwrite),
+                (1, 0),
+                "should write one tombstone and no flush"
+            );
+        }
+
+        #[test]
+        fn failed_capture_removal_write_runs_once_more_after_send() {
+            let scenario = capture_scenario(CAPTURE_INVALIDATION);
+            scenario.store.refuse_conditional_writes(EC_ID, 5);
+
+            let (outcome, measurement) = drive_measured_for_test(
+                &scenario.state,
+                didomi_navigation(Some(&returning_with_shared_id())),
+            );
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Written),
+                "should flush the ingest too"
+            );
+            assert_writes(
+                &scenario.store,
+                (0, 7, 0),
+                "five refused attempts before send, the retry after send, the flush",
+            );
+            assert_eq!(
+                stored_uid(&scenario.row(), "ssp.example.com"),
+                None,
+                "should have written the removal after send"
+            );
+            assert_eq!(measurement.removal_lost(), 0, "should lose no removal");
+        }
+
+        #[test]
+        fn capture_removal_after_both_attempts_reaches_the_row_through_the_pending_key() {
+            let scenario = capture_scenario(CAPTURE_INVALIDATION);
+            scenario.store.refuse_conditional_writes(EC_ID, 10);
+
+            let (outcome, measurement) = drive_measured_for_test(
+                &scenario.state,
+                didomi_navigation(Some(&returning_with_shared_id())),
+            );
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Written),
+                "should flush the merge"
+            );
+            assert_eq!(measurement.removal_lost(), 0, "should lose no removal");
+            assert!(
+                measurement.to_string().contains("removal_deferred=1"),
+                "should print the deferral on the measurement line"
+            );
+            assert_eq!(
+                stored_uid(&scenario.row(), "ssp.example.com"),
+                None,
+                "should apply the removal in the writer's flush"
+            );
+        }
+
+        #[test]
+        fn capture_removal_lost_after_both_attempts_is_counted() {
+            let scenario = capture_scenario(CAPTURE_INVALIDATION);
+            scenario.store.refuse_conditional_writes(EC_ID, 10);
+            scenario.store.fail_all_writes(&format!("pending:{EC_ID}"));
+
+            let (_, measurement) = drive_measured_for_test(
+                &scenario.state,
+                didomi_navigation(Some(&returning_with_shared_id())),
+            );
+
+            assert_eq!(
+                measurement.removal_lost(),
+                1,
+                "should count the removal lost after both attempts"
+            );
+            assert!(
+                measurement.to_string().contains("removal_lost=1"),
+                "should print the count on the measurement line"
+            );
+        }
+
+        #[test]
+        fn capture_positive_ids_are_counted_on_the_measurement_line_and_not_stored() {
+            let scenario = capture_scenario(
+                r#"{"tokens":[{"source":"ssp.example.com","value":"captured-secret-uid"}]}"#,
+            );
+
+            let (_, measurement) = drive_measured_for_test(
+                &scenario.state,
+                didomi_navigation(Some(&returning_with_shared_id())),
+            );
+
+            let line = measurement.to_string();
+            assert!(
+                line.contains("capture_unpersisted=didomi/ssp.example.com:1"),
+                "should count the positive ID: {line}"
+            );
+            assert!(
+                !line.contains("captured-secret-uid"),
+                "should print no value: {line}"
+            );
+            assert_eq!(
+                stored_uid(&scenario.row(), "ssp.example.com").as_deref(),
+                Some("probe-uid"),
+                "should not store the captured ID"
+            );
+        }
+
+        #[test]
+        fn registered_source_beyond_todays_trim_reaches_kv_on_next_navigation() {
+            use base64::Engine as _;
+            let cookie_value = REGISTERED_ONLY_COOKIE.trim_end();
+            let decoded: serde_json::Value = serde_json::from_slice(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(cookie_value)
+                    .expect("should decode the shim's cookie"),
+            )
+            .expect("should parse the shim's cookie");
+            let sources: Vec<&str> = decoded
+                .as_array()
+                .expect("should be a list")
+                .iter()
+                .filter_map(|entry| entry["source"].as_str())
+                .collect();
+            assert_eq!(
+                sources,
+                ["registered.example.com"],
+                "control: the shim should keep only the registered source"
+            );
+            let scenario = Scenario::with_settings(&partner_toml("registered.example.com"));
+            scenario.seed_live();
+
+            let (_, outcome) = scenario.drive(navigation(Some(&format!(
+                "ts-ec={EC_ID}; ts-eids={cookie_value}"
+            ))));
+
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            assert_writes(&scenario.store, (0, 1, 0), "one write");
+            let row = scenario.row();
+            assert_eq!(
+                stored_uid(&row, "registered.example.com"),
+                Some("x".repeat(400)),
+                "should hold the registered source the old trim would have dropped"
+            );
+            assert!(
+                (0..7).all(|index| !row.ids.contains_key(&format!("u{index}.example.com"))),
+                "should hold no unregistered source: {:?}",
+                row.ids.keys().collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn ortb2_only_eid_reaches_kv() {
+            let scenario = Scenario::new();
+            scenario.seed_live();
+            assert_eq!(
+                stored_uid(&scenario.row(), "id5-sync.com"),
+                None,
+                "control: id5-sync.com should be absent from KV before the navigation"
+            );
+            let cookie = format!("ts-ec={EC_ID}; ts-eids={}", ORTB2_ONLY_COOKIE.trim_end());
+
+            let (_, outcome) = scenario.drive(navigation(Some(&cookie)));
+
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            assert_writes(&scenario.store, (0, 1, 0), "one write");
+            assert_eq!(
+                stored_uid(&scenario.row(), "id5-sync.com").as_deref(),
+                Some("fictional-id5"),
+                "should hold the ID5 UID the shim copied from the ortb2 config"
+            );
+        }
+
+        /// Everything a visitor's navigation, `/auction` and `/identify`
+        /// produce, for comparing runs.
+        #[derive(Debug, PartialEq)]
+        struct Observed {
+            navigation: (u16, Option<FlushOutcome>),
+            origin_cookie: Option<String>,
+            row_uids: BTreeMap<String, Option<String>>,
+            bidder_request: serde_json::Value,
+            auction_header_eids: serde_json::Value,
+            auction_mirror: serde_json::Value,
+            identify: (u16, serde_json::Value),
+            writes: (usize, usize, usize),
+        }
+
+        fn observe_with_mirror_cookie(mirror: Option<&str>) -> Observed {
+            let scenario = auction_scenario();
+            let mut entry = live_entry();
+            entry.ids.insert(
+                "id5-sync.com".to_owned(),
+                KvPartnerId::browser("server-id5", Some(1_500)),
+            );
+            scenario.seed(&entry);
+            let mut cookie = returning_with_shared_id();
+            if let Some(mirror) = mirror {
+                cookie.push_str(&format!("; __Host-ts-eids-s={mirror}"));
+            }
+
+            let (nav, nav_outcome) = scenario.drive(navigation(Some(&cookie)));
+            let (auction, _) = scenario.drive(auction_request(Some(&cookie), &auction_body(None)));
+            let (identify, _) = scenario.drive(identify_request(&cookie, "sharedid.org"));
+
+            let mut bidder_request = bidder_body(&scenario);
+            bidder_request
+                .as_object_mut()
+                .expect("should be an object")
+                .remove("id");
+            let row = scenario.row();
+            let writes = scenario.store.writes();
+            let origin_cookie = scenario
+                .network
+                .requests_to(ORIGIN_HOST)
+                .first()
+                .and_then(|seen| seen.headers.get("cookie"))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            Observed {
+                navigation: (nav.status().as_u16(), nav_outcome),
+                origin_cookie,
+                row_uids: row
+                    .ids
+                    .keys()
+                    .map(|source| (source.clone(), stored_uid(&row, source)))
+                    .collect(),
+                bidder_request,
+                auction_header_eids: header_eids(&auction),
+                auction_mirror: mirror_of(&json_of(auction)),
+                identify: (identify.status().as_u16(), json_of(identify)),
+                writes: (writes.add, writes.if_generation_match, writes.overwrite),
+            }
+        }
+
+        #[test]
+        fn forged_mirror_cookie_changes_nothing() {
+            use base64::Engine as _;
+            let encode = |value: &serde_json::Value| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(serde_json::to_vec(value).expect("should serialize the mirror"))
+            };
+            let forged = encode(&serde_json::json!({
+                "v": 1,
+                "eids": [
+                    { "source": "sharedid.org", "uids": [{ "id": "forged-uid", "atype": 1 }] },
+                    { "source": "forged.example.com", "uids": [{ "id": "forged-uid", "atype": 1 }] }
+                ]
+            }));
+            let stale = encode(&serde_json::json!({
+                "v": 1,
+                "eids": [{ "source": "id5-sync.com", "uids": [{ "id": "stale-id5", "atype": 1 }] }]
+            }));
+            let baseline = observe_with_mirror_cookie(None);
+            let shown = format!("{baseline:?}");
+            assert!(
+                shown.contains("server-id5") && shown.contains(SHARED_ID),
+                "control: the baseline should hold the server and browser IDs: {shown}"
+            );
+            assert_eq!(
+                baseline.writes,
+                (0, 1, 0),
+                "control: the navigation should write once"
+            );
+
+            for (name, value) in [
+                ("forged", forged.as_str()),
+                ("stale", stale.as_str()),
+                ("malformed", "%%%not-base64"),
+                ("empty", ""),
+            ] {
+                let observed = observe_with_mirror_cookie(Some(value));
+
+                assert_eq!(
+                    observed, baseline,
+                    "should change no bidder request, answer or write: {name}"
+                );
+                let shown = format!("{observed:?}");
+                assert!(
+                    !shown.contains("forged-uid") && !shown.contains("stale-id5"),
+                    "should carry nothing from the {name} mirror: {shown}"
+                );
+            }
+        }
+
+        /// What the code before the identity work, run on this input,
+        /// stores: the first UID of the last entry of each registered
+        /// source, with the sharedId cookie last, and nothing for an
+        /// unregistered source.
+        const GOLDEN_INGEST_COOKIE: &str = "W3siZXh0Ijp7InNlZ21lbnRzIjpbInMxIl19LCJpbnNlcnRlciI6Imluc2VydGVyLmV4YW1wbGUuY29tIiwibW0iOjIsInNvdXJjZSI6ImlkNS1zeW5jLmNvbSIsInVpZHMiOlt7ImF0eXBlIjoxLCJpZCI6ImlkNS1maXJzdCJ9LHsiYXR5cGUiOjEsImlkIjoiaWQ1LXNlY29uZCJ9XX0seyJzb3VyY2UiOiJ1bnJlZ2lzdGVyZWQuZXhhbXBsZS5jb20iLCJ1aWRzIjpbeyJhdHlwZSI6MSwiaWQiOiJ1bnJlZy0xIn1dfSx7InNvdXJjZSI6InNoYXJlZGlkLm9yZyIsInVpZHMiOlt7ImF0eXBlIjoxLCJpZCI6InByZWJpZC1zaGFyZWQifV19LHsiaW5zZXJ0ZXIiOiJsYXRlci5leGFtcGxlLmNvbSIsIm1tIjoxLCJzb3VyY2UiOiJpZDUtc3luYy5jb20iLCJ1aWRzIjpbeyJhdHlwZSI6MSwiaWQiOiJpZDUtbGFzdC1maXJzdCJ9LHsiYXR5cGUiOjEsImlkIjoiaWQ1LWxhc3Qtc2Vjb25kIn1dfV0=";
+
+        /// The `x-ts-eids` value the code before the identity work builds
+        /// for [`GOLDEN_ROW_EIDS`].
+        const GOLDEN_ROW_HEADER: &str = "W3sic291cmNlIjoiaWQ1LXN5bmMuY29tIiwidWlkcyI6W3siaWQiOiJpZDUtdWlkIiwiYXR5cGUiOjN9XX0seyJzb3VyY2UiOiJzaGFyZWRpZC5vcmciLCJ1aWRzIjpbeyJpZCI6InNoYXJlZC11aWQiLCJhdHlwZSI6M31dfV0=";
+
+        /// A body with repeated sources and EID-level fields.
+        const GOLDEN_BODY_EIDS: &str = r#"[
+            {"inserter":"adserver.org","matcher":"adserver.org","mm":4,"source":"adserver.org","uids":[{"atype":1,"ext":{"rtiPartner":"TDID"},"id":"body-tdid"}]},
+            {"ext":{"segments":["s1"]},"inserter":"other.example.com","mm":1,"source":"adserver.org","uids":[{"atype":1,"id":"body-tdid-2"}]},
+            {"source":"ids.example.com","uids":[{"atype":3,"id":"ids-uid"}]}
+        ]"#;
+
+        /// What the code before the identity work forwards for
+        /// [`GOLDEN_BODY_EIDS`] and an empty row.
+        const GOLDEN_BODY_FORWARDED: &str = r#"[
+            {"source":"adserver.org","uids":[{"id":"body-tdid","atype":1,"ext":{"rtiPartner":"TDID"}}],"inserter":"adserver.org","matcher":"adserver.org","mm":4},
+            {"source":"adserver.org","uids":[{"id":"body-tdid-2","atype":1}],"inserter":"other.example.com","mm":1,"ext":{"segments":["s1"]}},
+            {"source":"ids.example.com","uids":[{"id":"ids-uid","atype":3}]}
+        ]"#;
+
+        fn golden_expected_ingest() -> BTreeMap<String, String> {
+            BTreeMap::from([
+                ("id5-sync.com".to_owned(), "id5-last-first".to_owned()),
+                ("sharedid.org".to_owned(), "shared-1".to_owned()),
+            ])
+        }
+
+        /// Each source's first UID, with a check that the record is one
+        /// entry holding one UID and nothing else.
+        fn assert_one_uid_records(row: &KvEntry) -> BTreeMap<String, String> {
+            row.ids
+                .iter()
+                .map(|(source, record)| {
+                    assert_eq!(record.w, None, "should write no provider: {source}");
+                    assert_eq!(record.eids.len(), 1, "should hold one entry: {source}");
+                    let entry = &record.eids[0];
+                    assert_eq!(entry.uids.len(), 1, "should hold one UID: {source}");
+                    assert_eq!(
+                        (&entry.inserter, &entry.matcher, entry.mm, &entry.ext),
+                        (&None, &None, None, &None),
+                        "should hold no EID-level field: {source}"
+                    );
+                    assert_eq!(
+                        (entry.uids[0].atype, &entry.uids[0].ext),
+                        (None, &None),
+                        "should hold no UID-level field: {source}"
+                    );
+                    (source.clone(), entry.uids[0].id.clone())
+                })
+                .collect()
+        }
+
+        #[test]
+        fn golden_browser_ingest_writes_the_first_uid() {
+            let cookie = format!("ts-eids={GOLDEN_INGEST_COOKIE}; sharedId=shared-1");
+
+            let returning = Scenario::new();
+            returning.seed_live();
+            let (_, outcome) =
+                returning.drive(navigation(Some(&format!("ts-ec={EC_ID}; {cookie}"))));
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            assert_writes(&returning.store, (0, 1, 0), "one flush");
+            assert_eq!(
+                assert_one_uid_records(&returning.row()),
+                golden_expected_ingest(),
+                "the flushed row should hold the UIDs the code before this spec stored"
+            );
+
+            let new_visitor = Scenario::new();
+            let (response, _) = new_visitor.drive(navigation(Some(&cookie)));
+            let minted = set_cookie_value(&response, "ts-ec").expect("should mint an EC");
+            assert_writes(&new_visitor.store, (1, 0, 0), "one create");
+            assert_eq!(
+                assert_one_uid_records(&new_visitor.row_of(&minted)),
+                golden_expected_ingest(),
+                "the created row should hold the same UIDs"
+            );
+        }
+
+        #[test]
+        fn golden_one_uid_row_goes_out_unchanged() {
+            let scenario = auction_scenario();
+            let mut entry = live_entry();
+            for (source, uid) in [("id5-sync.com", "id5-uid"), ("sharedid.org", "shared-uid")] {
+                entry
+                    .ids
+                    .insert(source.to_owned(), KvPartnerId::browser(uid, Some(1_500)));
+            }
+            scenario.seed(&entry);
+
+            let (response, _) =
+                scenario.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+
+            let expected: serde_json::Value = serde_json::json!([
+                { "source": "id5-sync.com", "uids": [{ "id": "id5-uid", "atype": 3 }] },
+                { "source": "sharedid.org", "uids": [{ "id": "shared-uid", "atype": 3 }] }
+            ]);
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                expected,
+                "user.ext.eids should equal what the code before this spec sent"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-ts-eids")
+                    .and_then(|value| value.to_str().ok()),
+                Some(GOLDEN_ROW_HEADER),
+                "x-ts-eids should equal what the code before this spec built, byte for byte"
+            );
+        }
+
+        #[test]
+        fn golden_auction_body_forwarding_is_unchanged() {
+            let scenario = auction_scenario();
+            scenario.seed_live();
+            let eids: serde_json::Value =
+                serde_json::from_str(GOLDEN_BODY_EIDS).expect("should parse the body EIDs");
+            let forwarded: serde_json::Value = serde_json::from_str(GOLDEN_BODY_FORWARDED)
+                .expect("should parse the forwarded EIDs");
+            assert!(
+                forwarded.to_string().contains("rtiPartner")
+                    && forwarded.to_string().contains("other.example.com"),
+                "control: the golden should hold UID-level and EID-level fields"
+            );
+
+            scenario.drive(auction_request(
+                Some(&ec_cookie()),
+                &auction_body(Some(&eids)),
+            ));
+
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                forwarded,
+                "user.ext.eids should equal what the code before this spec forwarded"
+            );
+            assert_no_writes(&scenario.store, "/auction");
+        }
+
+        // ---- A registered provider's complete set, end to end (Task 39b) ----
+
+        /// The provider `MultiEntryTestProvider` registers as.
+        const MULTI_PROVIDER: &str = "exampleid";
+
+        /// The host `MultiEntryTestProvider` calls.
+        const MULTI_HOST: &str = "api.exampleid.example.com";
+
+        /// The registration `exampleid` makes for `provider`.
+        fn multi_registration(provider: MultiEntryTestProvider) -> IntegrationRegistration {
+            IntegrationRegistration::builder("exampleid")
+                .try_with_identity_provider(Ok::<_, Report<IdentityProviderError>>(provider))
+                .expect("should register the provider")
+                .build()
+        }
+
+        /// A scenario with the auction, the `exampleid` source registered for
+        /// the bidstream, and `registrations` contributing providers.
+        /// `exampleid` owns [`MULTI_ENTRY_SOURCE`] and runs in `mode`.
+        fn registered_scenario(
+            registrations: Vec<IntegrationRegistration>,
+            mode: ProviderMode,
+        ) -> Scenario {
+            let Scenario {
+                mut state,
+                store,
+                network,
+            } = Scenario::with_settings(&format!(
+                "{AUCTION_TOML}{}",
+                partner_toml(MULTI_ENTRY_SOURCE)
+            ));
+            let owned = Arc::get_mut(&mut state).expect("should own the fresh state");
+            Arc::make_mut(&mut owned.settings)
+                .ec
+                .identity
+                .providers
+                .insert(
+                    MULTI_PROVIDER.to_owned(),
+                    ProviderSettings {
+                        mode,
+                        ..ProviderSettings::default()
+                    },
+                );
+            let providers = registrations
+                .into_iter()
+                .flat_map(|registration| registration.identity_providers)
+                .collect();
+            let runtime = IdentityRuntime::from_settings_with_providers(
+                &state.settings,
+                providers,
+                BTreeMap::from([(
+                    MULTI_ENTRY_SOURCE.parse().expect("should parse the source"),
+                    MULTI_PROVIDER
+                        .parse()
+                        .expect("should parse the provider ID"),
+                )]),
+            )
+            .expect("should build the identity runtime");
+            let scenario = Scenario {
+                state: crate::app::app_state_with_identity_for_test(state, runtime),
+                store,
+                network,
+            };
+            scenario.network.respond(
+                BIDDER_HOST,
+                200,
+                "application/json",
+                r#"{"id":"response","seatbid":[]}"#,
+            );
+            answer_with(&scenario, "full");
+            scenario
+        }
+
+        /// A scenario whose one provider is `MultiEntryTestProvider`.
+        fn multi_scenario(provider: MultiEntryTestProvider, mode: ProviderMode) -> Scenario {
+            registered_scenario(vec![multi_registration(provider)], mode)
+        }
+
+        /// Makes the provider's endpoint answer with the `entries` shape.
+        fn answer_with(scenario: &Scenario, entries: &str) {
+            scenario.network.respond(
+                MULTI_HOST,
+                200,
+                "application/json",
+                &serde_json::json!({ "entries": entries }).to_string(),
+            );
+        }
+
+        fn kv_uid(id: &str, atype: Option<i32>, ext: Option<serde_json::Value>) -> KvUid {
+            KvUid {
+                id: id.to_owned(),
+                atype,
+                ext,
+            }
+        }
+
+        /// What the provider's `full` answer stores.
+        fn multi_full_set() -> Vec<KvEid> {
+            vec![
+                KvEid {
+                    uids: vec![
+                        kv_uid(
+                            "uid-a",
+                            Some(1),
+                            Some(serde_json::json!({ "rtiPartner": "example" })),
+                        ),
+                        kv_uid("uid-b", None, None),
+                    ],
+                    inserter: Some("inserter-a.example.com".to_owned()),
+                    matcher: Some("matcher-a.example.com".to_owned()),
+                    mm: Some(2),
+                    ext: None,
+                },
+                KvEid {
+                    uids: vec![kv_uid("uid-c", None, None)],
+                    inserter: None,
+                    matcher: None,
+                    mm: None,
+                    ext: Some(serde_json::json!({ "segments": ["example"] })),
+                },
+            ]
+        }
+
+        /// The first entry of the `full` answer, which the `first` answer
+        /// returns alone.
+        fn multi_first_set() -> Vec<KvEid> {
+            multi_full_set().into_iter().take(1).collect()
+        }
+
+        /// The first entry as bidders see it.
+        fn multi_first_eid() -> serde_json::Value {
+            serde_json::json!({
+                "source": MULTI_ENTRY_SOURCE,
+                "inserter": "inserter-a.example.com",
+                "matcher": "matcher-a.example.com",
+                "mm": 2,
+                "uids": [
+                    { "id": "uid-a", "atype": 1, "ext": { "rtiPartner": "example" } },
+                    { "id": "uid-b", "atype": EcPartner::default_openrtb_atype() }
+                ]
+            })
+        }
+
+        /// The second entry as bidders see it, with the provenance default.
+        fn multi_second_eid() -> serde_json::Value {
+            serde_json::json!({
+                "source": MULTI_ENTRY_SOURCE,
+                "inserter": "default-inserter.example.com",
+                "matcher": "default-matcher.example.com",
+                "ext": { "segments": ["example"] },
+                "uids": [{ "id": "uid-c", "atype": EcPartner::default_openrtb_atype() }]
+            })
+        }
+
+        /// A row holding `eids` for [`MULTI_ENTRY_SOURCE`], written by the
+        /// provider and due for a refresh.
+        fn multi_row(eids: Vec<KvEid>) -> KvEntry {
+            let mut entry = live_entry();
+            entry.ids.insert(
+                MULTI_ENTRY_SOURCE.to_owned(),
+                KvPartnerId {
+                    w: Some(MULTI_PROVIDER.to_owned()),
+                    rv: Some("0123456789abcdef".to_owned()),
+                    at: Some(1_000),
+                    ra: Some(1_500),
+                    eids,
+                    ..KvPartnerId::default()
+                },
+            );
+            entry
+        }
+
+        /// The record under [`MULTI_ENTRY_SOURCE`], with its fresh `rv` and `at`
+        /// checked and copied into the expectation of the caller.
+        fn fresh_record(row: &KvEntry) -> KvPartnerId {
+            let record = row
+                .ids
+                .get(MULTI_ENTRY_SOURCE)
+                .expect("should hold the provider's record")
+                .clone();
+            let revision = record.rv.as_deref().expect("should carry a revision");
+            assert!(
+                revision.len() == 16
+                    && revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "should carry a 16 digit lowercase hex rv"
+            );
+            assert_ne!(
+                revision, "0123456789abcdef",
+                "should carry a fresh rv, not the seeded one"
+            );
+            assert!(record.at.is_some(), "should record when it was acquired");
+            record
+        }
+
+        #[test]
+        fn registered_provider_full_set_reaches_kv_mirror_and_bidstream_in_order() {
+            let scenario = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            scenario.seed_live();
+
+            let (_, outcome) = scenario.drive(navigation(Some(&ec_cookie())));
+
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            assert_eq!(
+                scenario.network.requests_to(MULTI_HOST).len(),
+                1,
+                "should call the registered provider once"
+            );
+            assert_writes(&scenario.store, (0, 1, 0), "one flush holds the whole set");
+            let record = fresh_record(&scenario.row());
+            assert_eq!(
+                record,
+                KvPartnerId {
+                    w: Some(MULTI_PROVIDER.to_owned()),
+                    rv: record.rv.clone(),
+                    at: record.at,
+                    exp: None,
+                    ra: None,
+                    ru: None,
+                    eids: multi_full_set(),
+                },
+                "should store both entries as returned, written by the provider"
+            );
+
+            scenario.store.reset_counts();
+            let body = auction_body(Some(&serde_json::json!([browser_entry()])));
+            let (response, _) = scenario.drive(auction_request(Some(&ec_cookie()), &body));
+
+            let expected =
+                serde_json::json!([browser_entry(), multi_first_eid(), multi_second_eid()]);
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                expected,
+                "user.ext.eids should carry the browser entry, then both entries in order"
+            );
+            assert_eq!(
+                header_eids(&response),
+                expected,
+                "x-ts-eids should carry the same"
+            );
+            assert_eq!(
+                mirror_of(&json_of(response)),
+                serde_json::json!({ "v": 1, "eids": [multi_first_eid(), multi_second_eid()] }),
+                "the mirror should decode to the same two entries, defaults included"
+            );
+            assert_eq!(
+                scenario.network.requests_to(MULTI_HOST).len(),
+                1,
+                "control: the /auction should serve from KV without calling the provider"
+            );
+            assert_no_writes(&scenario.store, "/auction");
+        }
+
+        #[test]
+        fn new_visitor_hold_answer_is_created_with_the_row_in_one_write() {
+            let scenario = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            let mut request = navigation(None);
+            *request.uri_mut() = "https://test-publisher.com/"
+                .parse()
+                .expect("should parse the home page URI");
+
+            let (response, outcome) = scenario.drive(request);
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Skipped),
+                "should leave nothing for a flush"
+            );
+            assert_eq!(
+                scenario.network.requests_to(MULTI_HOST).len(),
+                1,
+                "should call the hold-mode provider on the first navigation"
+            );
+            assert_writes(&scenario.store, (1, 0, 0), "one create holds the answer");
+            let ec_id = set_cookie_value(&response, "ts-ec").expect("should set the EC cookie");
+            let (row, _) = scenario
+                .graph()
+                .get(&ec_id)
+                .expect("should read the row")
+                .expect("should create the row");
+            assert_eq!(
+                row.ids
+                    .values()
+                    .find(|record| record.w.as_deref() == Some(MULTI_PROVIDER))
+                    .map(|record| record.eids.clone()),
+                Some(multi_full_set()),
+                "should create the row with the provider's answer"
+            );
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                serde_json::json!([multi_first_eid(), multi_second_eid()]),
+                "should hand this navigation's auction the answer"
+            );
+        }
+
+        #[test]
+        fn one_entry_one_uid_result_is_written_as_one_entry() {
+            let scenario = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            scenario.seed_live();
+            answer_with(&scenario, "single");
+
+            scenario.drive(navigation(Some(&ec_cookie())));
+
+            assert_writes(&scenario.store, (0, 1, 0), "one flush");
+            let record = fresh_record(&scenario.row());
+            assert_eq!(
+                record,
+                KvPartnerId {
+                    w: Some(MULTI_PROVIDER.to_owned()),
+                    rv: record.rv.clone(),
+                    at: record.at,
+                    exp: None,
+                    ra: None,
+                    ru: None,
+                    eids: vec![KvEid {
+                        uids: vec![kv_uid(
+                            "uid-a",
+                            Some(1),
+                            Some(serde_json::json!({ "rtiPartner": "example" }))
+                        )],
+                        inserter: None,
+                        matcher: None,
+                        mm: None,
+                        ext: None,
+                    }],
+                },
+                "should store one entry holding one UID"
+            );
+            let stored = stored_body(&scenario);
+            assert_eq!(
+                stored["ids"][MULTI_ENTRY_SOURCE],
+                serde_json::json!({
+                    "w": MULTI_PROVIDER,
+                    "rv": record.rv,
+                    "at": record.at,
+                    "eids": [{
+                        "uids": [{
+                            "id": "uid-a",
+                            "atype": 1,
+                            "ext": { "rtiPartner": "example" }
+                        }]
+                    }]
+                }),
+                "should write the one shape of spec 6.1"
+            );
+        }
+
+        #[test]
+        fn later_result_without_an_entry_removes_it() {
+            let scenario = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            let mut row = multi_row(multi_full_set());
+            row.ids.insert(
+                "id5-sync.com".to_owned(),
+                KvPartnerId::browser("id5-uid", Some(1_500)),
+            );
+            scenario.seed(&row);
+            answer_with(&scenario, "first");
+
+            let (_, outcome) = scenario.drive(navigation(Some(&ec_cookie())));
+
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            assert_eq!(
+                scenario.network.requests_to(MULTI_HOST).len(),
+                1,
+                "control: the due record should have been refreshed"
+            );
+            let after = scenario.row();
+            let record = fresh_record(&after);
+            assert_eq!(
+                record,
+                KvPartnerId {
+                    w: Some(MULTI_PROVIDER.to_owned()),
+                    rv: record.rv.clone(),
+                    at: record.at,
+                    exp: None,
+                    ra: None,
+                    ru: None,
+                    eids: multi_first_set(),
+                },
+                "should leave exactly the returned entry in KV"
+            );
+            assert_eq!(
+                after.ids.get("id5-sync.com"),
+                row.ids.get("id5-sync.com"),
+                "should keep the record of a source the result does not name"
+            );
+
+            let (_, _) = scenario.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                serde_json::json!([
+                    multi_first_eid(),
+                    { "source": "id5-sync.com", "uids": [{ "id": "id5-uid", "atype": 3 }] }
+                ]),
+                "should serve exactly the remaining entry, and the other source's record"
+            );
+        }
+
+        #[test]
+        fn stateful_result_with_an_oversized_set_keeps_only_its_removals() {
+            let scenario = multi_scenario(MultiEntryTestProvider::stateful(), ProviderMode::Hold);
+            let mut row = multi_row(multi_first_set());
+            row.ps.insert(
+                MULTI_PROVIDER.to_owned(),
+                KvProviderState {
+                    st: Some(serde_json::json!({ "seen": false })),
+                    ..KvProviderState::default()
+                },
+            );
+            scenario.seed(&row);
+            answer_with(&scenario, "oversized");
+
+            scenario.drive(navigation(Some(&ec_cookie())));
+
+            assert_eq!(
+                scenario.network.requests_to(MULTI_HOST).len(),
+                1,
+                "control: the provider should have been called"
+            );
+            let after = scenario.row();
+            assert!(
+                !after.ids.contains_key(MULTI_ENTRY_SOURCE),
+                "should apply the also_invalidate removal and store none of the oversized set"
+            );
+            let state = after
+                .ps
+                .get(MULTI_PROVIDER)
+                .expect("should keep the provider's row state");
+            assert!(
+                state.n.is_some_and(|wait_until| wait_until > 1_700_000_000),
+                "should back off the rejected answer"
+            );
+            assert_eq!(
+                state,
+                &KvProviderState {
+                    n: state.n,
+                    f: 1,
+                    o: None,
+                    oc: None,
+                    iv: state.iv.clone(),
+                    ov: Vec::new(),
+                    st: Some(serde_json::json!({ "seen": false })),
+                },
+                "should keep the old state, not the rejected replacement, and count one failure"
+            );
+            assert_eq!(
+                state.iv.len(),
+                2,
+                "should record the two invalidated UIDs, so the removal is not undone"
+            );
+        }
+
+        #[test]
+        fn identify_returns_the_first_uid_of_a_full_record() {
+            let scenario = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            let mut row = multi_row(multi_full_set());
+            row.ids
+                .get_mut(MULTI_ENTRY_SOURCE)
+                .expect("should hold the record")
+                .ra = None;
+            row.ids.insert(
+                "id5-sync.com".to_owned(),
+                KvPartnerId::browser("id5-uid", Some(1_500)),
+            );
+            scenario.seed(&row);
+            let atype = EcPartner::default_openrtb_atype();
+
+            let full = json_of(
+                scenario
+                    .drive(identify_request(&ec_cookie(), MULTI_ENTRY_SOURCE))
+                    .0,
+            );
+            let one_uid = json_of(
+                scenario
+                    .drive(identify_request(&ec_cookie(), "id5-sync.com"))
+                    .0,
+            );
+
+            assert_eq!(full["uid"], "uid-a", "should return the first UID");
+            assert_eq!(
+                full["eid"],
+                serde_json::json!({
+                    "source": MULTI_ENTRY_SOURCE,
+                    "uids": [{ "id": "uid-a", "atype": atype }]
+                }),
+                "should return the first UID with the partner's openrtb_atype"
+            );
+            assert_eq!(
+                one_uid["eid"],
+                serde_json::json!({
+                    "source": "id5-sync.com",
+                    "uids": [{ "id": "id5-uid", "atype": atype }]
+                }),
+                "control: a one-UID record should have the same shape"
+            );
+            let keys = |body: &serde_json::Value| {
+                body.as_object()
+                    .expect("should be an object")
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                keys(&full),
+                keys(&one_uid),
+                "should answer in the same shape"
+            );
+        }
+
+        #[test]
+        fn rollback_to_part_1_config_keeps_the_owners_opt_out() {
+            let scenario = Scenario::with_settings(&format!(
+                "{AUCTION_TOML}{}",
+                partner_toml(MULTI_ENTRY_SOURCE)
+            ));
+            scenario.network.respond(
+                BIDDER_HOST,
+                200,
+                "application/json",
+                r#"{"id":"response","seatbid":[]}"#,
+            );
+            let mut row = multi_row(multi_full_set());
+            row.ps.insert(
+                MULTI_PROVIDER.to_owned(),
+                KvProviderState {
+                    n: Some(FAR_FUTURE),
+                    f: 2,
+                    o: Some(KvOptOut {
+                        at: 1_200,
+                        fp: "0".to_owned(),
+                    }),
+                    oc: Some(1_100),
+                    iv: vec!["00112233445566ff".to_owned()],
+                    ov: vec!["8899aabbccddeeff".to_owned()],
+                    st: Some(serde_json::json!({ "seen": true })),
+                },
+            );
+            scenario.seed(&row);
+
+            let (_, outcome) = scenario.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            let after = scenario.row();
+            assert_eq!(
+                after.ps.get(MULTI_PROVIDER),
+                Some(&KvProviderState {
+                    n: None,
+                    f: 0,
+                    o: Some(KvOptOut {
+                        at: 1_200,
+                        fp: "0".to_owned(),
+                    }),
+                    oc: Some(1_100),
+                    iv: Vec::new(),
+                    ov: vec!["8899aabbccddeeff".to_owned()],
+                    st: None,
+                }),
+                "should keep o, oc and ov and lose n, f, iv and st"
+            );
+            assert_eq!(
+                after.ids.get(MULTI_ENTRY_SOURCE),
+                row.ids.get(MULTI_ENTRY_SOURCE),
+                "should keep the multi-entry record readable"
+            );
+            assert_eq!(
+                stored_uid(&after, "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "control: the flush should have written the ingest"
+            );
+
+            scenario.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+            let sent = bidder_eids(&bidder_body(&scenario));
+            assert!(
+                !sent.to_string().contains(MULTI_ENTRY_SOURCE),
+                "should not serve a record whose provider the catalog no longer has: {sent}"
+            );
+            assert!(
+                sent.to_string().contains("sharedid.org"),
+                "control: should still serve the browser record: {sent}"
+            );
+        }
+
+        /// A scenario whose Didomi proxy answers `body`, with a capture-only
+        /// provider registered through an `IntegrationRegistration`, and a
+        /// row holding a browser-written `ssp.example.com` ID.
+        fn registered_capture_scenario(body: &str, global: bool) -> Scenario {
+            let Scenario {
+                mut state,
+                store,
+                network,
+            } = Scenario::with_settings(DIDOMI_TOML);
+            if global {
+                let owned = Arc::get_mut(&mut state).expect("should own the fresh state");
+                Arc::make_mut(&mut owned.settings)
+                    .ec
+                    .identity
+                    .providers
+                    .insert(
+                        "didomi".to_owned(),
+                        ProviderSettings {
+                            revoke_scope: Some(trusted_server_core::settings::RevokeScope::Global),
+                            ..ProviderSettings::default()
+                        },
+                    );
+            }
+            let registration = IntegrationRegistration::builder("didomi")
+                .with_identity_provider(
+                    trusted_server_core::ec::identity::test_support::answering_capture_provider(
+                        "didomi",
+                        &["ssp.example.com"],
+                        None,
+                    ),
+                )
+                .build();
+            let runtime = IdentityRuntime::from_settings_with_providers(
+                &state.settings,
+                registration.identity_providers,
+                BTreeMap::new(),
+            )
+            .expect("should build the identity runtime");
+            let scenario = Scenario {
+                state: crate::app::app_state_with_identity_for_test(state, runtime),
+                store,
+                network,
+            };
+            scenario
+                .network
+                .respond("sdk.example.com", 200, "application/json", body);
+            let mut entry = live_entry();
+            entry.ids.insert(
+                "ssp.example.com".to_owned(),
+                KvPartnerId {
+                    rv: Some("0123456789abcdef".to_owned()),
+                    at: Some(1_000),
+                    ..KvPartnerId::new("probe-uid")
+                },
+            );
+            scenario.seed(&entry);
+            scenario
+        }
+
+        #[test]
+        fn captured_revocation_writes_with_cas() {
+            let clean = registered_capture_scenario(CAPTURE_INVALIDATION, false);
+            clean.drive(didomi_navigation(Some(&returning_with_shared_id())));
+            assert_writes(
+                &clean.store,
+                (0, 2, 0),
+                "one CAS write for the removal before send, then the writer's flush",
+            );
+            assert_eq!(
+                stored_uid(&clean.row(), "ssp.example.com"),
+                None,
+                "should remove the captured ID"
+            );
+
+            let fifth = registered_capture_scenario(CAPTURE_INVALIDATION, false);
+            fifth.store.refuse_conditional_writes(EC_ID, 4);
+            fifth.drive(didomi_navigation(Some(&returning_with_shared_id())));
+            assert_writes(
+                &fifth.store,
+                (0, 6, 0),
+                "four refused attempts and the fifth before send, no retry after send, the flush",
+            );
+            assert_eq!(
+                stored_uid(&fifth.row(), "ssp.example.com"),
+                None,
+                "should remove the ID on the fifth attempt"
+            );
+
+            let retried = registered_capture_scenario(CAPTURE_INVALIDATION, false);
+            retried.store.refuse_conditional_writes(EC_ID, 5);
+            retried.drive(didomi_navigation(Some(&returning_with_shared_id())));
+            assert_writes(
+                &retried.store,
+                (0, 7, 0),
+                "five refused attempts before send, one more after send, the flush",
+            );
+            assert_eq!(
+                stored_uid(&retried.row(), "ssp.example.com"),
+                None,
+                "should remove the ID on the attempt after send"
+            );
+        }
+
+        #[test]
+        fn global_revoke_from_real_browser_writes_as_withdrawal() {
+            let withdrawn = Scenario::new();
+            withdrawn.seed_live();
+            drive_with_runtime(
+                &withdrawn.state,
+                navigation(Some(&ec_cookie())),
+                Some(&withdrawn.state.identity),
+                withdraw,
+            );
+            let withdrawal_writes = withdrawn.store.writes();
+
+            let scenario = registered_capture_scenario(r#"{"opted_out":true}"#, true);
+
+            let (response, _) =
+                scenario.drive(didomi_navigation(Some(&returning_with_shared_id())));
+
+            let row = scenario.row();
+            assert!(!row.consent.ok, "should tombstone the row");
+            assert!(row.ids.is_empty(), "should remove every ID");
+            assert_eq!(
+                scenario.row().consent.ok,
+                withdrawn.row().consent.ok,
+                "should end as a consent withdrawal does"
+            );
+            let writes = scenario.store.writes();
+            assert_eq!(
+                (writes.add, writes.if_generation_match, writes.overwrite),
+                (
+                    withdrawal_writes.add,
+                    withdrawal_writes.if_generation_match,
+                    withdrawal_writes.overwrite
+                ),
+                "should write the tombstone and its marker as a withdrawal does"
+            );
+            assert!(
+                set_cookies(&response).iter().any(|cookie| {
+                    cookie_name(cookie) == "ts-ec" && cookie.contains("Max-Age=0")
+                }),
+                "should expire the EC cookie"
+            );
+        }
+
+        /// A proxied navigation from a client that fails the real-browser
+        /// check: no `Sec-Fetch-Dest`, a non-browser user agent.
+        fn non_browser_didomi_navigation() -> HttpRequest {
+            let mut request = didomi_navigation(Some(&returning_with_shared_id()));
+            request.extensions_mut().clear();
+            request.headers_mut().remove("sec-fetch-dest");
+            request
+                .headers_mut()
+                .insert("user-agent", HeaderValue::from_static("curl/8.0"));
+            request
+        }
+
+        #[test]
+        fn non_browser_capture_writes_its_removal() {
+            let scenario = registered_capture_scenario(CAPTURE_INVALIDATION, false);
+            assert!(
+                scenario.row().ids.contains_key("ssp.example.com"),
+                "control: the seeded row holds the record"
+            );
+
+            let (response, _) = scenario.drive(non_browser_didomi_navigation());
+
+            assert_eq!(response.status(), 200, "should serve the proxied answer");
+            assert!(
+                !scenario.row().ids.contains_key("ssp.example.com"),
+                "should apply the removal whatever the client"
+            );
+            assert!(
+                !set_cookies(&response)
+                    .iter()
+                    .any(|cookie| cookie_name(cookie) == "ts-ec" && cookie.contains("Max-Age=0")),
+                "should not expire the EC cookie"
+            );
+        }
+
+        #[test]
+        fn non_browser_global_revoke_writes_as_withdrawal() {
+            let scenario = registered_capture_scenario(r#"{"opted_out":true}"#, true);
+
+            let (response, _) = scenario.drive(non_browser_didomi_navigation());
+
+            assert!(!scenario.row().consent.ok, "should tombstone the row");
+            assert!(
+                set_cookies(&response).iter().any(|cookie| {
+                    cookie_name(cookie) == "ts-ec" && cookie.contains("Max-Age=0")
+                }),
+                "should expire the EC cookie"
+            );
+        }
+
+        #[test]
+        fn returning_navigation_answered_404_flushes_only_hold_removals_and_backoff() {
+            let removal_row = || multi_row(multi_first_set());
+            let drive_home = |scenario: &Scenario, status: u16| {
+                scenario.network.respond(
+                    ORIGIN_HOST,
+                    status,
+                    "text/html",
+                    "<html><head></head><body>page</body></html>",
+                );
+                let mut request = navigation(Some(&ec_cookie()));
+                *request.uri_mut() = "https://test-publisher.com/"
+                    .parse()
+                    .expect("should parse the home page URI");
+                scenario.drive(request)
+            };
+
+            let ok = multi_scenario(MultiEntryTestProvider::stateful(), ProviderMode::Hold);
+            ok.seed(&removal_row());
+            answer_with(&ok, "oversized");
+            drive_home(&ok, 200);
+            assert!(
+                !ok.row().ids.contains_key(MULTI_ENTRY_SOURCE),
+                "control: a 200 should flush the removal"
+            );
+
+            let not_found = multi_scenario(MultiEntryTestProvider::stateful(), ProviderMode::Hold);
+            not_found.seed(&removal_row());
+            answer_with(&not_found, "oversized");
+            drive_home(&not_found, 404);
+
+            assert_eq!(
+                not_found.network.requests_to(MULTI_HOST).len(),
+                1,
+                "should still have run the hold call"
+            );
+            let after = not_found.row();
+            assert!(
+                !after.ids.contains_key(MULTI_ENTRY_SOURCE),
+                "should flush the hold answer's removal on a 404"
+            );
+            assert_eq!(
+                after.ps.get(MULTI_PROVIDER).map(|state| state.iv.len()),
+                Some(2),
+                "should flush the removal's record of the two invalidated UIDs"
+            );
+
+            let backoff = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            backoff.seed_live();
+            answer_with(&backoff, "none");
+            drive_home(&backoff, 404);
+            assert!(
+                backoff
+                    .row()
+                    .ps
+                    .get(MULTI_PROVIDER)
+                    .and_then(|state| state.n)
+                    .is_some_and(|wait_until| wait_until > 1_700_000_000),
+                "should flush the no_match backoff on a 404"
+            );
+
+            let positive = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            positive.seed_live();
+            answer_with(&positive, "full");
+            drive_home(&positive, 404);
+            assert!(
+                !positive.row().ids.contains_key(MULTI_ENTRY_SOURCE),
+                "should store no positive hold answer on a 404"
+            );
+        }
+
+        /// A scenario like [`Scenario::new`] with `MultiEntryTestProvider`
+        /// registered on its own source, and its endpoint left unanswered so
+        /// the provider writes nothing the golden tests would see.
+        fn golden_registered_scenario() -> Scenario {
+            let scenario = registered_scenario(
+                vec![multi_registration(MultiEntryTestProvider::new())],
+                ProviderMode::AfterSend,
+            );
+            scenario.network.clear_reply(MULTI_HOST);
+            scenario
+        }
+
+        #[test]
+        fn golden_browser_ingest_with_a_registered_provider_writes_the_first_uid() {
+            let cookie = format!("ts-eids={GOLDEN_INGEST_COOKIE}; sharedId=shared-1");
+
+            let returning = golden_registered_scenario();
+            returning.seed_live();
+            let (_, outcome) =
+                returning.drive(navigation(Some(&format!("ts-ec={EC_ID}; {cookie}"))));
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            assert_writes(&returning.store, (0, 1, 0), "one flush");
+            assert_eq!(
+                assert_one_uid_records(&returning.row()),
+                golden_expected_ingest(),
+                "the flushed row should hold the UIDs the code before this spec stored"
+            );
+
+            let new_visitor = golden_registered_scenario();
+            let (response, _) = new_visitor.drive(navigation(Some(&cookie)));
+            let minted = set_cookie_value(&response, "ts-ec").expect("should mint an EC");
+            assert_writes(&new_visitor.store, (1, 0, 0), "one create");
+            assert_eq!(
+                assert_one_uid_records(&new_visitor.row_of(&minted)),
+                golden_expected_ingest(),
+                "the created row should hold the same UIDs"
+            );
+        }
+
+        #[test]
+        fn golden_one_uid_row_with_a_registered_provider_goes_out_unchanged() {
+            let scenario = golden_registered_scenario();
+            let mut entry = live_entry();
+            for (source, uid) in [("id5-sync.com", "id5-uid"), ("sharedid.org", "shared-uid")] {
+                entry
+                    .ids
+                    .insert(source.to_owned(), KvPartnerId::browser(uid, Some(1_500)));
+            }
+            scenario.seed(&entry);
+
+            let (response, _) =
+                scenario.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                serde_json::json!([
+                    { "source": "id5-sync.com", "uids": [{ "id": "id5-uid", "atype": 3 }] },
+                    { "source": "sharedid.org", "uids": [{ "id": "shared-uid", "atype": 3 }] }
+                ]),
+                "user.ext.eids should equal what the code before this spec sent"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-ts-eids")
+                    .and_then(|value| value.to_str().ok()),
+                Some(GOLDEN_ROW_HEADER),
+                "x-ts-eids should equal what the code before this spec built, byte for byte"
+            );
+        }
+
+        #[test]
+        fn golden_auction_body_forwarding_with_a_registered_provider_is_unchanged() {
+            let scenario = golden_registered_scenario();
+            scenario.seed_live();
+            let eids: serde_json::Value =
+                serde_json::from_str(GOLDEN_BODY_EIDS).expect("should parse the body EIDs");
+            let forwarded: serde_json::Value = serde_json::from_str(GOLDEN_BODY_FORWARDED)
+                .expect("should parse the forwarded EIDs");
+
+            scenario.drive(auction_request(
+                Some(&ec_cookie()),
+                &auction_body(Some(&eids)),
+            ));
+
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                forwarded,
+                "user.ext.eids should equal what the code before this spec forwarded"
+            );
+            assert_no_writes(&scenario.store, "/auction");
+        }
     }
 }

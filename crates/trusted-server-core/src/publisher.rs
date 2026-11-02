@@ -41,7 +41,7 @@ use sha2::Digest as _;
 use web_time::Instant;
 
 use crate::auction::endpoints::{
-    merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
+    AuctionIdentity, auction_identity, mirror_enabled, mirror_member, resolve_client_auction_eids,
 };
 use crate::auction::formats::sanitize_publisher_page_url;
 use crate::auction::orchestrator::{
@@ -61,13 +61,19 @@ use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
-use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
-use crate::cookies::handle_request_cookies;
+use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
+use crate::cookies::{
+    TS_ORIGIN_STRIPPED_COOKIE_NAMES, TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS,
+    handle_request_cookies, strip_cookie_headers,
+};
 use crate::creative_opportunities::{
     AdStackGateInput, AssemblyMode, CreativeOpportunitiesConfig, RuntimeAdStackExpected,
     evaluate_ad_stack_gate,
 };
+use crate::ec::identity::coordinator::{HoldResults, hold_before_auction};
+use crate::ec::identity::mirror::MirrorPayload;
+use crate::ec::identity::policy::PolicySignals;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::registry::PartnerRegistry;
 use crate::ec::{EcContext, EidSyncSource};
@@ -75,7 +81,9 @@ use crate::error::TrustedServerError;
 use crate::html_processor::{
     BodyCloseInjection, HtmlProcessorConfig, create_html_processor_with_document_state,
 };
-use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
+use crate::http_util::{
+    RequestInfo, is_navigation_request, is_prefetch_request, serve_static_with_etag,
+};
 use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
 use crate::platform::{
     ClientInfo, GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices,
@@ -3497,30 +3505,29 @@ struct EcSnapshotPreloadInput {
     is_get: bool,
     has_ec_id: bool,
     has_kv: bool,
-    marker_valid: bool,
+    /// A returning EC's writer navigation: phase 1 reads the row on every
+    /// one (spec 5.2, 6.3).
+    returning_writer: bool,
     auction_needs_row: bool,
-    eid_cookie_may_need_persistence: bool,
     privacy_needs_row: bool,
 }
 
 fn should_preload_ec_snapshot(input: &EcSnapshotPreloadInput) -> bool {
     let eligible = input.is_navigation && input.is_get && input.has_ec_id && input.has_kv;
-    let marker_can_skip = input.marker_valid
-        && !input.auction_needs_row
-        && !input.eid_cookie_may_need_persistence
-        && !input.privacy_needs_row;
-    eligible && !marker_can_skip
+    eligible && (input.returning_writer || input.auction_needs_row || input.privacy_needs_row)
 }
 
 /// Rewrites a downstream request into an outbound publisher-origin request.
 ///
 /// Restricts advertised encodings to those the rewrite pipeline can handle,
 /// strips the internal `fastly-ssl` scheme signal so it never leaks to the
-/// backend, and retargets the URI and `Host` header at the origin.
+/// backend, strips the `ts-eids-s` mirror (and `ts-eids` too when
+/// `strip_eids`), and retargets the URI and `Host` header at the origin.
 fn rewrite_origin_request(
     req: &mut Request<EdgeBody>,
     target_uri: Uri,
     origin_host_header: &str,
+    strip_eids: bool,
 ) -> Result<(), Report<TrustedServerError>> {
     restrict_accept_encoding(req);
     // Layering wart: `fastly-ssl` is a vendor-specific header name. Core only
@@ -3532,6 +3539,15 @@ fn rewrite_origin_request(
     // separate change. Until then we strip it here so the edge signal never
     // reaches publisher backends.
     req.headers_mut().remove("fastly-ssl");
+    // The publisher origin keeps `ts-ec`, and `ts-eids` unless the operator
+    // strips it too. It never receives the mirror, which would push its
+    // `Cookie` header past its size before this spec (spec 6.2).
+    let stripped = if strip_eids {
+        TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS
+    } else {
+        TS_ORIGIN_STRIPPED_COOKIE_NAMES
+    };
+    strip_cookie_headers(req.headers_mut(), stripped);
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -3589,18 +3605,6 @@ pub(crate) fn is_bot_user_agent(req: &Request<EdgeBody>) -> bool {
     BOT_USER_AGENT_FRAGMENTS
         .iter()
         .any(|frag| ua.contains(frag))
-}
-
-/// Returns true when the request advertises itself as a prefetch via either
-/// the standard `Sec-Purpose` or the legacy `Purpose` header.
-pub(crate) fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
-    let header = |name: &str| {
-        req.headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains("prefetch"))
-    };
-    header("sec-purpose") || header("purpose")
 }
 
 /// Returns whether request-scoped signals permit an ad-eligible navigation.
@@ -5137,9 +5141,6 @@ pub async fn handle_publisher_request(
     let ec_id_owned = active_ec_id_owned.clone().filter(|_| ec_allowed);
     let ec_id = ec_id_owned.as_deref();
     let cookie_jar = handle_request_cookies(&req)?;
-    if let Some(registry) = auction.registry {
-        ec_context.validate_pull_sync_marker(settings, registry);
-    }
     let geo = ec_context.geo_info().cloned();
 
     let parsed_origin = url::Url::parse(&settings.publisher.origin_url).change_context(
@@ -5163,6 +5164,7 @@ pub async fn handle_publisher_request(
             certificate_check: settings.proxy.certificate_check,
             first_byte_timeout: DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT,
+            connect_timeout: None,
             discriminator: None,
         })
         .change_context(TrustedServerError::Proxy {
@@ -5461,28 +5463,28 @@ pub async fn handle_publisher_request(
         });
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
         .then_some(TemplateCacheResponseState::BypassRequest);
-    rewrite_origin_request(&mut req, target_uri, &origin_host_header)?;
+    rewrite_origin_request(
+        &mut req,
+        target_uri,
+        &origin_host_header,
+        settings.ec.strip_eids_cookie_from_origin,
+    )?;
 
     let request_method = req.method().clone();
     let mut origin_request = Some(req);
-    let eid_cookie_may_need_persistence = cookie_jar
-        .as_ref()
-        .is_some_and(|jar| jar.get(COOKIE_TS_EIDS).is_some() || jar.get(COOKIE_SHAREDID).is_some());
-    // This decision also gates the concurrent origin send below. A marker skip
-    // cannot currently delay the origin behind an auction because marker
-    // validation requires a non-empty registry, and every such auction sets
-    // `auction_needs_row` and retains the preload.
+    // This decision also gates the concurrent origin send below.
     let should_preload_ec = should_preload_ec_snapshot(&EcSnapshotPreloadInput {
         is_navigation,
         is_get,
         has_ec_id: active_ec_id.is_some(),
         has_kv: kv.is_some(),
-        marker_valid: ec_context.pull_sync_marker().is_valid(),
+        returning_writer: ec_context.identity().writer()
+            && ec_context.ec_was_present()
+            && !ec_context.ec_generated(),
         auction_needs_row: should_run_auction
             && auction
                 .registry
                 .is_some_and(|registry| !registry.is_empty()),
-        eid_cookie_may_need_persistence,
         privacy_needs_row: crate::ec::consent::ec_consent_withdrawn(&consent_context),
     });
     let mut pending_origin = None;
@@ -5524,6 +5526,18 @@ pub async fn handle_publisher_request(
                     message: "Failed to start publisher origin request".to_string(),
                 })?,
         );
+    }
+    // A new visitor's row is created now, after the hold-mode providers its
+    // auction waits for, so their answers ride the one create (spec 4.7).
+    let mut new_visitor_hold = None;
+    if ec_context.has_deferred_create() {
+        if should_run_auction && !matched_slots.is_empty() {
+            ec_context.identity_mut().set_runs_auction(true);
+            new_visitor_hold = hold_before_auction(settings, services, ec_context).await;
+        }
+        if let Err(err) = ec_context.complete_deferred_create(settings, kv) {
+            log::warn!("EC generation failed for publisher proxy: {err:?}");
+        }
     }
     if should_preload_ec && let (Some(graph), Some(active_ec_id)) = (kv, active_ec_id) {
         let refreshed = graph.load_snapshot(active_ec_id);
@@ -5612,6 +5626,13 @@ pub async fn handle_publisher_request(
         }
 
         if should_run_auction {
+            // This navigation runs an auction: hold-mode providers run now,
+            // within their budget, and phase 4 leaves them alone (spec 4.7).
+            ec_context.identity_mut().set_runs_auction(true);
+            let hold = match new_visitor_hold.take() {
+                Some(hold) => Some(hold),
+                None => hold_before_auction(settings, services, ec_context).await,
+            };
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
                 request_path: &request_path,
@@ -5634,8 +5655,10 @@ pub async fn handle_publisher_request(
                     kv_snapshot: ec_context.kv_snapshot(),
                     partner_registry: auction.registry,
                     ec_context,
+                    signals: PolicySignals::from_headers(auction_client_request.headers()),
                     services,
                     geo: geo.as_ref(),
+                    hold: hold.as_ref(),
                     path_label: "Server-side",
                 },
             );
@@ -6331,8 +6354,14 @@ struct AuctionEidTargeting<'a> {
     kv_snapshot: &'a crate::ec::EcKvSnapshot,
     partner_registry: Option<&'a PartnerRegistry>,
     ec_context: &'a EcContext,
+    /// Policy signals the consent context does not carry, read from the
+    /// request's headers.
+    signals: PolicySignals,
     services: &'a RuntimeServices,
     geo: Option<&'a GeoInfo>,
+    /// What the hold dispatch before this auction learned, on a writer
+    /// navigation that dispatched one. Page-bids and the tests pass `None`.
+    hold: Option<&'a HoldResults>,
     /// Prefix for the consent-stripped warning (e.g. `"Server-side"`).
     path_label: &'a str,
 }
@@ -6342,11 +6371,12 @@ struct AuctionEidTargeting<'a> {
 ///
 /// Shared verbatim by the initial-page and page-bids dispatch paths so the EID
 /// resolution and consent gating live in one place; `path_label` only varies
-/// the consent-stripped warning message.
+/// the consent-stripped warning message. Returns the request's
+/// [`AuctionIdentity`], so the page-bids mirror reads the same server set.
 fn apply_auction_eids_and_device(
     auction_request: &mut AuctionRequest,
     targeting: &AuctionEidTargeting<'_>,
-) {
+) -> AuctionIdentity {
     let ts_eids_value = targeting
         .cookie_jar
         .and_then(|j| j.get(COOKIE_TS_EIDS))
@@ -6356,12 +6386,20 @@ fn apply_auction_eids_and_device(
     } else {
         None
     };
-    let kv_eids = resolve_auction_eids(
+    let mut identity = auction_identity(
         targeting.kv_snapshot,
         targeting.partner_registry,
         targeting.ec_context,
+        targeting.signals,
     );
-    let merged_eids = merge_auction_eids(client_eids, kv_eids);
+    if let (Some(hold), Some(registry), Some(runtime)) = (
+        targeting.hold,
+        targeting.partner_registry,
+        targeting.ec_context.identity_runtime(),
+    ) {
+        identity.add_hold_results(hold.clone(), registry, runtime.catalog());
+    }
+    let merged_eids = identity.merge(client_eids.as_deref());
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
         gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
@@ -6385,6 +6423,7 @@ fn apply_auction_eids_and_device(
         device.ip = client_ip;
         device.geo = targeting.geo.cloned();
     }
+    identity
 }
 
 /// Build an [`AuctionRequest`] from matched creative opportunity slots.
@@ -7907,6 +7946,7 @@ pub async fn handle_page_bids(
         crate::integrations::gpt_diagnostics::prepare_request(settings, &mut req)?;
 
     ec_context.set_eid_sync_source(EidSyncSource::PageBids);
+    ec_context.decide_spa_writer(&req, settings.ec.identity.spa_writer_interval_sec);
 
     // Deprecation signal for the transition alias. Evaluated after the
     // cross-site gate, so the count reflects genuine SPA clients still running a
@@ -8070,6 +8110,9 @@ pub async fn handle_page_bids(
         .map(TraceAuctionCarry::cancellation_guard);
 
     let mut auction_diagnostics = None;
+    // What the auction's KV read gave it, for the `ts-eids-s` mirror. It stays
+    // `None` when no auction runs, so the mirror is then absent.
+    let mut auction_identity_read: Option<AuctionIdentity> = None;
     let (winning_bids, prebuilt_bid_map) = if matched_slots.is_empty() {
         (std::collections::HashMap::new(), None)
     } else {
@@ -8108,9 +8151,9 @@ pub async fn handle_page_bids(
                 _ => crate::ec::EcKvSnapshot::NotRead,
             };
             // Hand the loaded row to the request context so response
-            // finalization — which runs on an EC context the adapter owns,
-            // after this handler returns — ingests `ts-eids`/`sharedId` updates
-            // from this read instead of paying for a second lookup.
+            // finalization, which runs on an EC context the adapter owns after
+            // this handler returns, reuses this read instead of paying for a
+            // second lookup.
             if !matches!(page_bids_kv_snapshot, crate::ec::EcKvSnapshot::NotRead) {
                 ec_context.set_kv_snapshot(page_bids_kv_snapshot.clone());
             }
@@ -8124,7 +8167,7 @@ pub async fn handle_page_bids(
                     user_agent,
                 )
             });
-            apply_auction_eids_and_device(
+            let identity = apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
                     cookie_jar: cookie_jar.as_ref(),
@@ -8132,11 +8175,14 @@ pub async fn handle_page_bids(
                     kv_snapshot: &page_bids_kv_snapshot,
                     partner_registry: auction.registry,
                     ec_context,
+                    signals: PolicySignals::from_headers(req.headers()),
                     services,
                     geo: geo.as_ref(),
+                    hold: None,
                     path_label: "Page-bids",
                 },
             );
+            auction_identity_read = Some(identity);
             let timeout_ms = co_config
                 .auction_timeout_ms
                 .unwrap_or(settings.auction.timeout_ms);
@@ -8287,6 +8333,24 @@ pub async fn handle_page_bids(
                 message: "Failed to serialize page-bids diagnostics".to_string(),
             })?;
     }
+    // A consent denial clears the mirror, as `/auction` does, so a
+    // withdrawal reaches the cookie (spec 5.6).
+    let mirror = if consent_allows_auction {
+        match &auction_identity_read {
+            Some(identity) => identity.mirror_member(ec_context),
+            None => mirror_member(
+                &crate::ec::EcKvSnapshot::NotRead,
+                None,
+                ec_context,
+                PolicySignals::from_headers(req.headers()),
+            ),
+        }
+    } else {
+        mirror_enabled(ec_context).then(|| MirrorPayload::Clear.to_json())
+    };
+    if let Some(mirror) = mirror {
+        body["ts_eids_s"] = mirror;
+    }
     let body = serde_json::to_string(&body).change_context(TrustedServerError::Proxy {
         message: "Failed to serialize page-bids response".to_string(),
     })?;
@@ -8356,6 +8420,83 @@ mod tests {
             cookie_disqualifies: false,
             request_requires_origin: false,
         }
+    }
+
+    /// The `Cookie` header `rewrite_origin_request` leaves, with the
+    /// operator's `strip_eids` choice.
+    fn origin_cookies_after_rewrite(strip_eids: bool) -> Vec<String> {
+        let mut req = Request::builder()
+            .uri("https://www.example.com/article")
+            .header(header::COOKIE, "ts-ec=abc; ts-eids=W10; session=1")
+            .header(
+                header::COOKIE,
+                "__Host-ts-eids-s=eyJ2IjoxfQ; ts-ec-pull-complete=v1",
+            )
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        rewrite_origin_request(
+            &mut req,
+            "https://origin.example.com/article"
+                .parse()
+                .expect("should parse uri"),
+            "origin.example.com",
+            strip_eids,
+        )
+        .expect("should rewrite request");
+
+        req.headers()
+            .get_all(header::COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("should be ASCII").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn rewrite_origin_request_strips_only_the_mirror_by_default() {
+        assert_eq!(
+            origin_cookies_after_rewrite(false),
+            vec!["ts-ec=abc; ts-eids=W10; session=1; ts-ec-pull-complete=v1"],
+            "should keep ts-ec and ts-eids, as before the mirror existed, and drop the mirror"
+        );
+    }
+
+    #[test]
+    fn rewrite_origin_request_strips_ts_eids_when_the_operator_asks() {
+        assert_eq!(
+            origin_cookies_after_rewrite(true),
+            vec!["ts-ec=abc; session=1; ts-ec-pull-complete=v1"],
+            "should keep ts-ec, the pull marker and unrelated cookies, and drop the ID cookies"
+        );
+    }
+
+    #[test]
+    fn rewrite_origin_request_drops_cookie_header_when_only_id_cookies() {
+        let mut req = Request::builder()
+            .uri("https://www.example.com/")
+            .header(header::COOKIE, "ts-eids=W10; __Host-ts-eids-s=eyJ2IjoxfQ")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        rewrite_origin_request(
+            &mut req,
+            "https://origin.example.com/"
+                .parse()
+                .expect("should parse uri"),
+            "origin.example.com",
+            true,
+        )
+        .expect("should rewrite request");
+
+        assert!(
+            req.headers().get(header::COOKIE).is_none(),
+            "should drop the empty Cookie header"
+        );
+        assert_eq!(
+            req.headers()[header::HOST],
+            "origin.example.com",
+            "should still set Host"
+        );
     }
 
     #[test]
@@ -8666,9 +8807,8 @@ mod tests {
             is_get: true,
             has_ec_id: true,
             has_kv: true,
-            marker_valid: false,
+            returning_writer: true,
             auction_needs_row: false,
-            eid_cookie_may_need_persistence: false,
             privacy_needs_row: false,
         };
         assert!(should_preload_ec_snapshot(&baseline));
@@ -8691,29 +8831,24 @@ mod tests {
     }
 
     #[test]
-    fn valid_marker_skips_only_when_no_other_consumer_needs_snapshot() {
-        let marker_only = EcSnapshotPreloadInput {
+    fn stager_navigation_preloads_only_for_an_auction_or_a_withdrawal() {
+        let stager = EcSnapshotPreloadInput {
             is_navigation: true,
             is_get: true,
             has_ec_id: true,
             has_kv: true,
-            marker_valid: true,
+            returning_writer: false,
             auction_needs_row: false,
-            eid_cookie_may_need_persistence: false,
             privacy_needs_row: false,
         };
-        assert!(!should_preload_ec_snapshot(&marker_only));
+        assert!(!should_preload_ec_snapshot(&stager));
         assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
             auction_needs_row: true,
-            ..marker_only
-        }));
-        assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
-            eid_cookie_may_need_persistence: true,
-            ..marker_only
+            ..stager
         }));
         assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
             privacy_needs_row: true,
-            ..marker_only
+            ..stager
         }));
     }
     use crate::auction::test_support::canonical_parity_auction_request;
@@ -8966,10 +9101,20 @@ mod tests {
             Arc::clone(&http) as Arc<dyn crate::platform::PlatformHttpClient>
         );
         let ec_id = format!("{}.CkId01", "b".repeat(64));
-        let mut ec_context = EcContext::new_for_test_with_ip(
+        let mut ec_context = EcContext::new_writer_for_test_with_ip(
             Some(ec_id),
             scheduling_consent(),
             Some("203.0.113.7".to_owned()),
+        );
+        // A returning visitor's writer navigation, which phase 1 always reads.
+        ec_context.identity_mut().set_writer_decision(
+            crate::ec::identity::request::WriterDecision {
+                writer: true,
+                is_real_browser: true,
+                user_agent: None,
+                dnt: false,
+                page_url: None,
+            },
         );
         assert!(
             ec_context.ec_allowed() && ec_context.ec_value().is_some(),
@@ -9092,49 +9237,18 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    enum MarkerProbe {
-        Valid,
-        Malformed,
-        WrongEc,
-        Expired,
-        PartnerSetMismatch,
-    }
-
-    fn marker_partner(source_domain: &str) -> crate::settings::EcPartner {
-        crate::settings::EcPartner {
-            name: format!("Marker partner {source_domain}"),
-            source_domain: source_domain.to_owned(),
-            openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
-            bidstream_enabled: true,
-            api_token: Some(crate::redacted::Redacted::new(format!(
-                "marker-{source_domain}-api-token-32-bytes-minimum"
-            ))),
-            batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
-            pull_sync_enabled: true,
-            pull_sync_url: Some(format!("https://sync.{source_domain}/pull")),
-            pull_sync_allowed_domains: vec![format!("sync.{source_domain}")],
-            pull_sync_ttl_sec: crate::settings::EcPartner::default_pull_sync_ttl_sec(),
-            pull_sync_rate_limit: crate::settings::EcPartner::default_pull_sync_rate_limit(),
-            ts_pull_token: Some(crate::redacted::Redacted::new("pull-token".to_owned())),
-        }
-    }
-
     #[test]
     fn body_less_auction_eids_put_cookie_entries_first_and_kv_only_sources_after() {
         let ec_id = format!("{}.navmrg", "a".repeat(64));
         let registry = PartnerRegistry::from_config(&[
-            marker_partner("ids.example.com"),
-            marker_partner("other.example.com"),
+            pull_partner_config("ids.example.com"),
+            pull_partner_config("other.example.com"),
         ])
         .expect("should build partner registry");
         let mut entry = KvEntry::minimal("ids.example.com", "kv-stale", 1000);
-        entry.ids.insert(
-            "other.example.com".to_owned(),
-            KvPartnerId {
-                uid: "kv-other".to_owned(),
-            },
-        );
+        entry
+            .ids
+            .insert("other.example.com".to_owned(), KvPartnerId::new("kv-other"));
         let snapshot = EcKvSnapshot::Present {
             ec_id: ec_id.clone(),
             entry: Box::new(entry),
@@ -9170,8 +9284,10 @@ mod tests {
                 kv_snapshot: &snapshot,
                 partner_registry: Some(&registry),
                 ec_context: &ec_context,
+                signals: PolicySignals::default(),
                 services: &services,
                 geo: None,
+                hold: None,
                 path_label: "Test",
             },
         );
@@ -9194,83 +9310,190 @@ mod tests {
         );
     }
 
-    async fn run_marker_lookup_probe(
-        probe: MarkerProbe,
-        has_eid_cookie: bool,
-        has_matched_auction_slot: bool,
-    ) -> usize {
-        let mut settings = if has_matched_auction_slot {
-            scheduling_settings()
-        } else {
-            create_test_settings()
+    /// Sends the origin's requests to a [`StubHttpClient`] and a hold
+    /// provider's to a [`FakeHttpClient`], so one navigation can reach both.
+    struct HoldRoutingClient {
+        origin: Arc<StubHttpClient>,
+        providers: Arc<crate::ec::identity::test_support::fake_http::FakeHttpClient>,
+        provider_hosts: Vec<String>,
+    }
+
+    struct RoutedPending {
+        provider: bool,
+        inner: crate::platform::PlatformPendingRequest,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::platform::PlatformHttpClient for HoldRoutingClient {
+        fn supports_concurrent_fanout(&self) -> bool {
+            false
+        }
+
+        async fn send(
+            &self,
+            request: crate::platform::PlatformHttpRequest,
+        ) -> Result<crate::platform::PlatformResponse, Report<crate::platform::PlatformError>>
+        {
+            self.origin.send(request).await
+        }
+
+        async fn send_async(
+            &self,
+            request: crate::platform::PlatformHttpRequest,
+        ) -> Result<crate::platform::PlatformPendingRequest, Report<crate::platform::PlatformError>>
+        {
+            let host = request.request.uri().host().unwrap_or_default().to_owned();
+            let provider = self.provider_hosts.contains(&host);
+            let inner = if provider {
+                self.providers.send_async(request).await?
+            } else {
+                self.origin.send_async(request).await?
+            };
+            Ok(crate::platform::PlatformPendingRequest::new(
+                RoutedPending { provider, inner },
+            ))
+        }
+
+        async fn select(
+            &self,
+            mut pending_requests: Vec<crate::platform::PlatformPendingRequest>,
+        ) -> Result<crate::platform::PlatformSelectResult, Report<crate::platform::PlatformError>>
+        {
+            let first = pending_requests.remove(0);
+            let ready = self.wait(first).await;
+            Ok(crate::platform::PlatformSelectResult {
+                ready,
+                remaining: pending_requests,
+                failed_backend_name: None,
+            })
+        }
+
+        async fn wait(
+            &self,
+            pending: crate::platform::PlatformPendingRequest,
+        ) -> Result<crate::platform::PlatformResponse, Report<crate::platform::PlatformError>>
+        {
+            let routed = pending
+                .downcast::<RoutedPending>()
+                .map_err(|_| Report::new(crate::platform::PlatformError::HttpClient))?;
+            if routed.provider {
+                self.providers.wait(routed.inner).await
+            } else {
+                self.origin.wait(routed.inner).await
+            }
+        }
+    }
+
+    /// What one writer navigation with a hold provider did.
+    struct HoldNavigation {
+        provider_hosts: Vec<String>,
+        auction_eids: serde_json::Value,
+        set_cookies: Vec<String>,
+        runs_auction: bool,
+        staged_sources: Vec<String>,
+    }
+
+    /// Drives a returning writer navigation that runs an auction, with one
+    /// hold-mode provider that answers `found` for `ids.example.com`.
+    async fn run_hold_navigation(with_limiter: bool) -> HoldNavigation {
+        use crate::ec::identity::test_support::fake_http::{
+            AnsweringProvider, FakeBackend, FakeHttpClient,
         };
-        settings.ec.partners = vec![marker_partner("ssp.example.com")];
-        let registry = PartnerRegistry::from_config(&settings.ec.partners)
-            .expect("should build pull partner registry");
-        let http = Arc::new(StubHttpClient::new());
-        http.set_concurrent_fanout(true);
-        http.push_response(200, b"<html><body>ok</body></html>".to_vec());
-        let lookups = Arc::new(AtomicUsize::new(0));
-        let graph = KvIdentityGraph::new(OrderRecordingKv {
-            inner: InMemoryEcKv::new("marker-store"),
-            http: Arc::clone(&http),
-            http_calls_at_lookup: Arc::new(AtomicUsize::new(0)),
-            lookups: Arc::clone(&lookups),
-        });
-        let services = build_services_with_http_client(
-            Arc::clone(&http) as Arc<dyn crate::platform::PlatformHttpClient>
+
+        let mut settings = scheduling_settings();
+        settings.ec.identity.providers.insert(
+            "hold-provider".to_owned(),
+            crate::settings::ProviderSettings {
+                mode: crate::settings::ProviderMode::Hold,
+                ..crate::settings::ProviderSettings::default()
+            },
         );
+        let origin = Arc::new(StubHttpClient::new());
+        origin.push_response_with_headers(
+            200,
+            b"<html><body>ok</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let providers = Arc::new(FakeHttpClient::new());
+        providers.respond(
+            "hold.example.com",
+            200,
+            &serde_json::to_vec(&serde_json::json!({
+                "answer": "found",
+                "entries": [{ "uids": [{ "id": "nav-uid", "atype": 1 }] }]
+            }))
+            .expect("should serialize the answer"),
+        );
+        let client = Arc::new(HoldRoutingClient {
+            origin: Arc::clone(&origin),
+            providers: Arc::clone(&providers),
+            provider_hosts: vec!["hold.example.com".to_owned()],
+        });
+        let services = crate::platform::RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::test_support::NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(FakeBackend::new()))
+            .http_client(client)
+            .geo(Arc::new(crate::platform::test_support::NoopGeo))
+            .client_info(crate::platform::ClientInfo::default())
+            .build();
+
         let ec_id = format!("{}.CkId01", "b".repeat(64));
-        let marker = match probe {
-            MarkerProbe::Valid => {
-                crate::ec::pull_sync_marker::create_marker_for_test(&settings, &registry, &ec_id)
-            }
-            MarkerProbe::Malformed => "not-a-marker".to_owned(),
-            MarkerProbe::WrongEc => crate::ec::pull_sync_marker::create_marker_for_test(
-                &settings,
-                &registry,
-                &format!("{}.Other1", "c".repeat(64)),
-            ),
-            MarkerProbe::Expired => {
-                crate::ec::pull_sync_marker::create_marker_for_test_with_expiry(
-                    &settings,
-                    &registry,
-                    &ec_id,
-                    crate::ec::current_timestamp().saturating_sub(1),
-                )
-            }
-            MarkerProbe::PartnerSetMismatch => {
-                let other_registry =
-                    PartnerRegistry::from_config(&[marker_partner("other.example.com")])
-                        .expect("should build alternate registry");
-                crate::ec::pull_sync_marker::create_marker_for_test(
-                    &settings,
-                    &other_registry,
-                    &ec_id,
-                )
-            }
-        };
-        let mut ec_context = EcContext::new_for_test_with_ip(
+        let (graph, _store) = KvIdentityGraph::write_counting("hold-navigation-store");
+        graph
+            .create(
+                &ec_id,
+                &KvEntry::new(&scheduling_consent(), None, 1_000, "test-publisher.com"),
+            )
+            .expect("should seed the row");
+        let mut ec_context = EcContext::new_writer_for_test_with_ip(
             Some(ec_id),
             scheduling_consent(),
             Some("203.0.113.7".to_owned()),
         );
-        ec_context.set_pull_sync_marker_for_test(
-            crate::ec::pull_sync_marker::PullSyncMarkerState::from_cookie(Some(marker)),
+        ec_context.identity_mut().set_writer_decision(
+            crate::ec::identity::request::WriterDecision {
+                writer: true,
+                is_real_browser: true,
+                user_agent: None,
+                dnt: false,
+                page_url: None,
+            },
         );
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-        let slots = has_matched_auction_slot
-            .then(scheduling_slot)
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut request = navigation_request();
-        if has_eid_cookie {
-            request
-                .headers_mut()
-                .insert(header::COOKIE, HeaderValue::from_static("ts-eids=present"));
+        ec_context.set_identity_runtime(Arc::new(
+            crate::ec::identity::IdentityRuntime::from_settings_with_providers(
+                &settings,
+                vec![
+                    AnsweringProvider::new(
+                        "hold-provider",
+                        "hold.example.com",
+                        "ids.example.com",
+                        None,
+                    )
+                    .into_provider(),
+                ],
+                std::collections::BTreeMap::new(),
+            )
+            .expect("should build the runtime"),
+        ));
+        if with_limiter {
+            ec_context.set_identity_rate_limiter(Arc::new(
+                crate::ec::identity::test_support::FakeRateLimiter::new(),
+            ));
         }
+        let registry = PartnerRegistry::from_config(&[pull_partner_config("ids.example.com")])
+            .expect("should build partner registry");
+        let captured = Arc::new(Mutex::new(None));
+        let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        orchestrator.register_provider(Arc::new(SchedulingCaptureProvider {
+            captured: Arc::clone(&captured),
+            http: Arc::clone(&origin),
+            lookups: Arc::new(AtomicUsize::new(0)),
+        }));
+        let slots = [scheduling_slot()];
 
-        let result = handle_publisher_request(
+        let response = handle_publisher_request(
             &settings,
             &services,
             Some(&graph),
@@ -9281,7 +9504,493 @@ mod tests {
                 slots: &slots,
                 registry: Some(&registry),
             },
-            request,
+            navigation_request(),
+            EdgeCacheHeader::SurrogateControl,
+        )
+        .await
+        .expect("should proxy the origin response");
+
+        let headers = match &response {
+            PublisherResponse::PassThrough { response, .. }
+            | PublisherResponse::Stream { response, .. }
+            | PublisherResponse::AssembleTemplate { response, .. }
+            | PublisherResponse::Buffered(response) => response.headers().clone(),
+        };
+        let auction_eids = captured
+            .lock()
+            .expect("should lock captured auction")
+            .take()
+            .map(|captured| {
+                serde_json::to_value(&captured.request.user.eids)
+                    .expect("should serialize the EIDs")
+            })
+            .expect("should have dispatched the auction");
+        HoldNavigation {
+            provider_hosts: providers.sent_hosts(),
+            auction_eids,
+            set_cookies: headers
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .map(|value| value.to_str().unwrap_or_default().to_owned())
+                .collect(),
+            runs_auction: ec_context.identity().runs_auction(),
+            staged_sources: ec_context
+                .identity()
+                .mutation()
+                .positive_changes()
+                .iter()
+                .filter_map(|change| match change {
+                    crate::ec::identity::mutation::PartnerIdChange::FillMissing {
+                        source, ..
+                    } => Some(source.to_string()),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn hold_answer_reaches_the_navigation_auction_and_the_writer_mutation() {
+        let navigation = run_hold_navigation(true).await;
+
+        assert_eq!(
+            navigation.provider_hosts,
+            ["hold.example.com"],
+            "should call the hold provider once, before the auction"
+        );
+        assert_eq!(
+            navigation.auction_eids,
+            serde_json::json!([
+                { "source": "ids.example.com", "uids": [{ "id": "nav-uid", "atype": 1 }] }
+            ]),
+            "should send the hold answer in this navigation's auction"
+        );
+        assert!(
+            navigation.runs_auction,
+            "should record that the navigation ran an auction, so phase 4 skips hold providers"
+        );
+        assert_eq!(
+            navigation.staged_sources,
+            ["ids.example.com"],
+            "should stage the answer in the writer's mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_without_a_rate_limiter_dispatches_nothing() {
+        let navigation = run_hold_navigation(false).await;
+
+        assert!(
+            navigation.provider_hosts.is_empty(),
+            "should fail closed and call no provider without a limiter: {:?}",
+            navigation.provider_hosts
+        );
+        assert_eq!(
+            navigation.auction_eids,
+            serde_json::Value::Null,
+            "should run the auction without a hold answer"
+        );
+        assert!(
+            navigation.runs_auction && navigation.staged_sources.is_empty(),
+            "control: the navigation still ran its auction and staged nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_sets_no_cookie() {
+        let navigation = run_hold_navigation(true).await;
+
+        assert_eq!(
+            navigation.provider_hosts,
+            ["hold.example.com"],
+            "control: should have run the hold provider"
+        );
+        assert!(
+            navigation.set_cookies.is_empty(),
+            "should set no cookie from a hold answer: {:?}",
+            navigation.set_cookies
+        );
+    }
+
+    #[test]
+    fn full_set_hold_answer_is_sent_in_order_and_flushed_whole() {
+        use crate::ec::identity::descriptor::EidProvenance;
+        use crate::ec::identity::test_support::fake_http::AnsweringProvider;
+        use crate::ec::identity::test_support::hold_fixture::{HoldFixture, live_row};
+        use crate::ec::kv_types::{KvEid, KvUid};
+
+        let provider = AnsweringProvider::new(
+            "hold-provider",
+            "hold.example.com",
+            "ids.example.com",
+            Some(
+                EidProvenance::new()
+                    .with_inserter("default.example.com")
+                    .with_mm(2),
+            ),
+        )
+        .into_provider();
+        let mut fixture = HoldFixture::new(
+            vec![(provider, crate::settings::ProviderMode::Hold)],
+            &live_row(),
+            true,
+        );
+        fixture.client.respond(
+            "hold.example.com",
+            200,
+            &serde_json::to_vec(&serde_json::json!({
+                "answer": "found",
+                "entries": [
+                    {
+                        "uids": [{ "id": "uid-a", "atype": 1 }, { "id": "uid-b", "atype": 3 }],
+                        "inserter": "vendor.example.com"
+                    },
+                    { "uids": [{ "id": "uid-c", "atype": 1 }] }
+                ]
+            }))
+            .expect("should serialize the answer"),
+        );
+        let snapshot = fixture.context.kv_snapshot().clone();
+        let ec_id = fixture
+            .context
+            .ec_value()
+            .expect("should hold an EC ID")
+            .to_owned();
+        let registry = PartnerRegistry::from_config(&[pull_partner_config("ids.example.com")])
+            .expect("should build partner registry");
+
+        let hold = fixture.run_hold();
+        let services = noop_services();
+        let mut auction_request = canonical_parity_auction_request();
+        auction_request.user.consent = None;
+        auction_request.user.eids = None;
+        apply_auction_eids_and_device(
+            &mut auction_request,
+            &AuctionEidTargeting {
+                cookie_jar: None,
+                ec_id: Some(ec_id.as_str()),
+                kv_snapshot: &snapshot,
+                partner_registry: Some(&registry),
+                ec_context: &fixture.context,
+                signals: PolicySignals::default(),
+                services: &services,
+                geo: None,
+                hold: Some(&hold),
+                path_label: "Test",
+            },
+        );
+        let outcome = fixture.flush(http::StatusCode::OK);
+
+        assert_eq!(
+            serde_json::to_value(&auction_request.user.eids).expect("should serialize EIDs"),
+            serde_json::json!([
+                {
+                    "source": "ids.example.com",
+                    "inserter": "vendor.example.com",
+                    "uids": [{ "id": "uid-a", "atype": 1 }, { "id": "uid-b", "atype": 3 }]
+                },
+                {
+                    "source": "ids.example.com",
+                    "inserter": "default.example.com",
+                    "mm": 2,
+                    "uids": [{ "id": "uid-c", "atype": 1 }]
+                }
+            ]),
+            "should send both entries in order, the first as returned and the second with the provenance default"
+        );
+        assert_eq!(
+            outcome,
+            crate::ec::identity::flush::FlushOutcome::Written,
+            "should flush the answer"
+        );
+        let uid = |id: &str, atype: i32| KvUid {
+            id: id.to_owned(),
+            atype: Some(atype),
+            ext: None,
+        };
+        assert_eq!(
+            fixture.row().ids["ids.example.com"].eids,
+            vec![
+                KvEid {
+                    uids: vec![uid("uid-a", 1), uid("uid-b", 3)],
+                    inserter: Some("vendor.example.com".to_owned()),
+                    matcher: None,
+                    mm: None,
+                    ext: None,
+                },
+                KvEid {
+                    uids: vec![uid("uid-c", 1)],
+                    inserter: None,
+                    matcher: None,
+                    mm: None,
+                    ext: None,
+                },
+            ],
+            "should store the set as returned, without the default"
+        );
+        assert_eq!(
+            fixture.store.writes().total(),
+            1,
+            "should make the one flush write"
+        );
+    }
+
+    /// The navigation and page-bids merge for `snapshot` and a `ts-eids`
+    /// cookie holding `cookie_entries`, plus any `extra_cookie`.
+    fn publisher_merge(
+        snapshot: &EcKvSnapshot,
+        registry: &PartnerRegistry,
+        ec_context: &EcContext,
+        cookie_entries: &serde_json::Value,
+        extra_cookie: Option<&str>,
+    ) -> Option<Vec<crate::openrtb::Eid>> {
+        let cookie =
+            BASE64.encode(serde_json::to_vec(cookie_entries).expect("should serialize cookie"));
+        let mut header = format!("{COOKIE_TS_EIDS}={cookie}");
+        if let Some(extra) = extra_cookie {
+            header.push_str("; ");
+            header.push_str(extra);
+        }
+        let jar = parse_cookies_to_jar(&header);
+        let services = noop_services();
+        let mut auction_request = canonical_parity_auction_request();
+        auction_request.user.consent = None;
+        auction_request.user.eids = None;
+        apply_auction_eids_and_device(
+            &mut auction_request,
+            &AuctionEidTargeting {
+                cookie_jar: Some(&jar),
+                ec_id: ec_context.ec_value(),
+                kv_snapshot: snapshot,
+                partner_registry: Some(registry),
+                ec_context,
+                signals: PolicySignals::default(),
+                services: &services,
+                geo: None,
+                hold: None,
+                path_label: "Test",
+            },
+        );
+        auction_request.user.eids
+    }
+
+    fn publisher_merge_fixture(entry: KvEntry) -> (EcKvSnapshot, PartnerRegistry, EcContext) {
+        let ec_id = format!("{}.navmrg", "a".repeat(64));
+        let registry = PartnerRegistry::from_config(&[
+            pull_partner_config("ids.example.com"),
+            pull_partner_config("other.example.com"),
+        ])
+        .expect("should build partner registry");
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: None,
+        };
+        let ec_context = EcContext::new_for_test(
+            Some(ec_id),
+            ConsentContext {
+                jurisdiction: Jurisdiction::NonRegulated,
+                ..ConsentContext::default()
+            },
+        );
+        (snapshot, registry, ec_context)
+    }
+
+    fn publisher_eid(source: &str, id: &str, atype: i32) -> crate::openrtb::Eid {
+        crate::openrtb::Eid {
+            source: source.to_owned(),
+            uids: vec![crate::openrtb::Uid {
+                id: id.to_owned(),
+                atype: Some(atype),
+                ext: None,
+            }],
+            inserter: None,
+            matcher: None,
+            mm: None,
+            ext: None,
+        }
+    }
+
+    #[test]
+    fn merge_publisher_never_reads_the_mirror_cookie() {
+        let entry = KvEntry::minimal("other.example.com", "kv-other", 1000);
+        let (snapshot, registry, ec_context) = publisher_merge_fixture(entry);
+        let cookie_entries = serde_json::json!([{ "source": "ids.example.com", "uids": [{ "id": "b", "atype": 1 }] }]);
+        let mirror = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({ "v": 1, "eids": [
+                { "source": "mirror-only.example.com", "uids": [{ "id": "m", "atype": 1 }] }
+            ] }))
+            .expect("should serialize the mirror"),
+        );
+
+        let without = publisher_merge(&snapshot, &registry, &ec_context, &cookie_entries, None);
+        let with = publisher_merge(
+            &snapshot,
+            &registry,
+            &ec_context,
+            &cookie_entries,
+            Some(&format!("__Host-ts-eids-s={mirror}")),
+        );
+
+        assert_eq!(
+            with,
+            Some(vec![
+                publisher_eid("ids.example.com", "b", 1),
+                publisher_eid(
+                    "other.example.com",
+                    "kv-other",
+                    crate::settings::EcPartner::default_openrtb_atype()
+                ),
+            ]),
+            "should merge the cookie and KV only"
+        );
+        assert_eq!(with, without, "the mirror cookie should change nothing");
+    }
+
+    #[test]
+    fn merge_publisher_denial_drops_a_browser_uid_in_a_claimants_iv_for_an_unowned_source() {
+        let mut entry = KvEntry::minimal("other.example.com", "kv-other", 1000);
+        entry.ps.insert(
+            "pull-ids-example-com".to_owned(),
+            crate::ec::kv_types::KvProviderState {
+                iv: vec![crate::ec::identity::revision::uid_hash("invalidated")],
+                ..Default::default()
+            },
+        );
+        let (snapshot, registry, mut ec_context) = publisher_merge_fixture(entry);
+        let mut settings = create_test_settings();
+        settings.ec.partners = vec![pull_partner_config("ids.example.com")];
+        ec_context.set_identity_runtime(Arc::new(
+            crate::ec::identity::IdentityRuntime::from_settings(
+                &settings,
+                &IntegrationRegistry::default(),
+            )
+            .expect("should build the runtime"),
+        ));
+        let cookie_entries = serde_json::json!([
+            { "source": "ids.example.com", "uids": [{ "id": "invalidated", "atype": 1 }] }
+        ]);
+
+        let merged = publisher_merge(&snapshot, &registry, &ec_context, &cookie_entries, None);
+
+        assert_eq!(
+            merged,
+            Some(vec![publisher_eid(
+                "other.example.com",
+                "kv-other",
+                crate::settings::EcPartner::default_openrtb_atype()
+            )]),
+            "the invalidated browser UID should not be sent"
+        );
+    }
+
+    #[test]
+    fn merge_publisher_owner_value_beats_the_browser_cookie_value() {
+        let mut entry = KvEntry::minimal("other.example.com", "kv-other", 1000);
+        entry.ids.insert(
+            "ids.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                w: Some("owner".to_owned()),
+                ..crate::ec::kv_types::KvPartnerId::new("owner-uid")
+            },
+        );
+        let (snapshot, registry, mut ec_context) = publisher_merge_fixture(entry);
+        let owner =
+            crate::ec::identity::test_support::fixed_provider("owner", &["ids.example.com"]);
+        ec_context.set_identity_runtime(Arc::new(
+            crate::ec::identity::IdentityRuntime::from_settings_with_providers(
+                &create_test_settings(),
+                vec![owner],
+                std::collections::BTreeMap::from([(
+                    crate::ec::identity::test_support::source("ids.example.com"),
+                    crate::ec::identity::test_support::pid("owner"),
+                )]),
+            )
+            .expect("should build the runtime"),
+        ));
+        let cookie_entries = serde_json::json!([
+            { "source": "ids.example.com", "uids": [{ "id": "browser-uid", "atype": 1 }] },
+            { "source": "other.example.com", "uids": [{ "id": "browser-other", "atype": 1 }] }
+        ]);
+
+        let merged = publisher_merge(&snapshot, &registry, &ec_context, &cookie_entries, None);
+
+        let atype = crate::settings::EcPartner::default_openrtb_atype();
+        assert_eq!(
+            merged,
+            Some(vec![
+                publisher_eid("other.example.com", "browser-other", 1),
+                publisher_eid("ids.example.com", "owner-uid", atype),
+            ]),
+            "the owner's value should replace the browser's, and the unowned browser value should still win"
+        );
+    }
+
+    fn pull_partner_config(source_domain: &str) -> crate::settings::EcPartner {
+        crate::settings::EcPartner {
+            name: format!("Partner {source_domain}"),
+            source_domain: source_domain.to_owned(),
+            openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
+            bidstream_enabled: true,
+            api_token: Some(crate::redacted::Redacted::new(format!(
+                "partner-{source_domain}-api-token-32-bytes-minimum"
+            ))),
+            batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: true,
+            pull_sync_url: Some(format!("https://sync.{source_domain}/pull")),
+            pull_sync_allowed_domains: vec![format!("sync.{source_domain}")],
+            removed_pull_sync_ttl_sec: None,
+            removed_pull_sync_rate_limit: None,
+            owner: None,
+            ts_pull_token: Some(crate::redacted::Redacted::new("pull-token".to_owned())),
+        }
+    }
+
+    /// Runs a navigation without an auction and counts its KV reads.
+    async fn run_navigation_lookup_probe(writer: bool) -> usize {
+        let settings = create_test_settings();
+        let http = Arc::new(StubHttpClient::new());
+        http.set_concurrent_fanout(true);
+        http.push_response(200, b"<html><body>ok</body></html>".to_vec());
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let graph = KvIdentityGraph::new(OrderRecordingKv {
+            inner: InMemoryEcKv::new("probe-store"),
+            http: Arc::clone(&http),
+            http_calls_at_lookup: Arc::new(AtomicUsize::new(0)),
+            lookups: Arc::clone(&lookups),
+        });
+        let services = build_services_with_http_client(
+            Arc::clone(&http) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let ec_id = format!("{}.CkId01", "b".repeat(64));
+        let mut ec_context = EcContext::new_writer_for_test_with_ip(
+            Some(ec_id),
+            scheduling_consent(),
+            Some("203.0.113.7".to_owned()),
+        );
+        ec_context.identity_mut().set_writer_decision(
+            crate::ec::identity::request::WriterDecision {
+                writer,
+                is_real_browser: true,
+                user_agent: None,
+                dnt: false,
+                page_url: None,
+            },
+        );
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+
+        let result = handle_publisher_request(
+            &settings,
+            &services,
+            Some(&graph),
+            &mut ec_context,
+            AuctionDispatch {
+                integration_registry: &IntegrationRegistry::empty_for_tests(),
+                orchestrator: &orchestrator,
+                slots: &[],
+                registry: None,
+            },
+            navigation_request(),
             EdgeCacheHeader::SurrogateControl,
         )
         .await;
@@ -9291,42 +10000,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_completeness_marker_skips_pull_only_snapshot_lookup() {
+    async fn returning_writer_navigation_reads_kv_without_an_auction() {
         assert_eq!(
-            run_marker_lookup_probe(MarkerProbe::Valid, false, false).await,
-            0
+            run_navigation_lookup_probe(true).await,
+            1,
+            "should read the row once in phase 1"
         );
-    }
-
-    #[tokio::test]
-    async fn invalid_markers_fall_back_to_snapshot_lookup() {
-        for probe in [
-            MarkerProbe::Malformed,
-            MarkerProbe::WrongEc,
-            MarkerProbe::Expired,
-            MarkerProbe::PartnerSetMismatch,
-        ] {
-            assert_eq!(
-                run_marker_lookup_probe(probe, false, false).await,
-                1,
-                "invalid marker should retain the normal preload"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn valid_marker_does_not_skip_eid_cookie_persistence_lookup() {
         assert_eq!(
-            run_marker_lookup_probe(MarkerProbe::Valid, true, false).await,
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn valid_marker_does_not_skip_auction_snapshot_lookup() {
-        assert_eq!(
-            run_marker_lookup_probe(MarkerProbe::Valid, false, true).await,
-            1
+            run_navigation_lookup_probe(false).await,
+            0,
+            "control: a stager navigation without an auction should read nothing"
         );
     }
 
@@ -14475,7 +15158,7 @@ mod tests {
             queue_shareable_html(&stub);
 
             for (index, cache_status) in ["miss-stored", "hit"].into_iter().enumerate() {
-                let mut ec_context = EcContext::new_for_test_with_ip(
+                let mut ec_context = EcContext::new_writer_for_test_with_ip(
                     Some(format!("{}.CkId01", "b".repeat(64))),
                     scheduling_consent(),
                     Some("203.0.113.7".to_owned()),
@@ -20882,12 +21565,23 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 .map(|(_, value)| value.as_str())
         }
 
+        /// A returning visitor's writer navigation, which phase 1 reads.
         fn active_ec_context() -> EcContext {
-            EcContext::new_for_test_with_ip(
+            let mut context = EcContext::new_writer_for_test_with_ip(
                 Some(format!("{}.CkId01", "b".repeat(64))),
                 scheduling_consent(),
                 Some("203.0.113.7".to_owned()),
-            )
+            );
+            context.identity_mut().set_writer_decision(
+                crate::ec::identity::request::WriterDecision {
+                    writer: true,
+                    is_real_browser: true,
+                    user_agent: None,
+                    dnt: false,
+                    page_url: None,
+                },
+            );
+            context
         }
 
         #[tokio::test]
@@ -22143,7 +22837,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             ..Default::default()
         };
         let mut ec_context =
-            EcContext::new_for_test_with_ip(None, consent, Some("203.0.113.7".to_string()));
+            EcContext::new_writer_for_test_with_ip(None, consent, Some("203.0.113.7".to_string()));
         assert!(
             ec_context.ec_allowed(),
             "test precondition: consent must allow EC creation"
@@ -30387,6 +31081,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         use crate::platform::test_support::{StubHttpClient, noop_services};
         use crate::platform::{PlatformHttpRequest, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
+        use base64::Engine as _;
         use error_stack::{Report, ResultExt};
         use http::Method;
         use std::sync::{Arc, Mutex};
@@ -30583,6 +31278,317 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let mut req = make_page_bids_request(path);
             set_test_header(&mut req, "cookie", "__Host-ts-console=1");
             req
+        }
+
+        const MIRROR_SOURCE: &str = "mirror.example.com";
+
+        fn mirror_registry() -> PartnerRegistry {
+            let mut partner = crate::ec::identity::test_support::ec_partner(
+                MIRROR_SOURCE,
+                "https://sync.mirror.example.com/pull",
+                "example-token-value-0123456789abcdef",
+            );
+            partner.pull_sync_enabled = false;
+            partner.pull_sync_url = None;
+            partner.pull_sync_allowed_domains = Vec::new();
+            partner.ts_pull_token = None;
+            partner.api_token = Some(crate::redacted::Redacted::new(
+                "token-mirror-example-com-32-bytes-minimum".to_owned(),
+            ));
+            PartnerRegistry::from_config(&[partner]).expect("should build partner registry")
+        }
+
+        fn mirror_ec_id() -> String {
+            format!("{}.mirror", "a".repeat(64))
+        }
+
+        fn seeded_graph(records: &[(&str, &str)]) -> KvIdentityGraph {
+            let graph = KvIdentityGraph::in_memory("test_store");
+            let mut entry =
+                crate::ec::kv_types::KvEntry::minimal("unregistered.example.com", "x", 1);
+            entry.ids.clear();
+            for (source, uid) in records {
+                entry.ids.insert(
+                    (*source).to_owned(),
+                    crate::ec::kv_types::KvPartnerId::browser(*uid, Some(1)),
+                );
+            }
+            graph
+                .create(&mirror_ec_id(), &entry)
+                .expect("should seed the live row");
+            graph
+        }
+
+        fn consenting_context_with_ec() -> EcContext {
+            let mut context = EcContext::new_for_test(
+                Some(mirror_ec_id()),
+                crate::consent::ConsentContext {
+                    jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                    ..Default::default()
+                },
+            );
+            context.enable_mirror_for_test();
+            context
+        }
+
+        async fn page_bids_body(
+            settings: &Settings,
+            graph: &KvIdentityGraph,
+            ec_context: &mut EcContext,
+            req: Request<EdgeBody>,
+        ) -> serde_json::Value {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"no bid".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let orchestrator =
+                auction_id_test_orchestrator(settings, Arc::new(Mutex::new(None)), false);
+            let registry = mirror_registry();
+            let slots = article_slot();
+            let response = handle_page_bids(
+                settings,
+                &services,
+                Some(graph),
+                AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
+                    orchestrator: &orchestrator,
+                    slots: &slots,
+                    registry: Some(&registry),
+                },
+                ec_context,
+                req,
+            )
+            .await
+            .expect("should return ok response");
+            serde_json::from_slice(
+                &response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should read the page-bids body"),
+            )
+            .expect("should parse the page-bids body")
+        }
+
+        fn auction_settings() -> Settings {
+            let mut settings = settings_with_co();
+            settings.auction.providers =
+                crate::auction::AuctionConfig::legacy_provider_map(&[AUCTION_ID_TEST_PROVIDER]);
+            settings
+        }
+
+        #[tokio::test]
+        async fn page_bids_never_writes_kv() {
+            let settings = auction_settings();
+            let (graph, store) = KvIdentityGraph::write_counting("test_store");
+            let mut entry =
+                crate::ec::kv_types::KvEntry::minimal("unregistered.example.com", "x", 1);
+            entry.ids.clear();
+            graph
+                .create(&mirror_ec_id(), &entry)
+                .expect("should seed the live row");
+            store.reset_counts();
+            let cookie = base64::engine::general_purpose::STANDARD.encode(
+                serde_json::to_vec(&serde_json::json!([
+                    { "source": MIRROR_SOURCE, "uids": [{ "id": "cookie-uid" }] }
+                ]))
+                .expect("should serialize the cookie"),
+            );
+            let mut req = make_page_bids_request("/2024/01/my-article/");
+            req.headers_mut().insert(
+                header::COOKIE,
+                HeaderValue::from_str(&format!("ts-eids={cookie}"))
+                    .expect("should build the cookie header"),
+            );
+            let mut ec_context = consenting_context_with_ec();
+
+            let _ = page_bids_body(&settings, &graph, &mut ec_context, req).await;
+            let mut response = Response::new(EdgeBody::empty());
+            crate::ec::finalize::ec_finalize_response(
+                &settings,
+                &mut ec_context,
+                Some(&graph),
+                &mirror_registry(),
+                Some(&cookie),
+                None,
+                &mut response,
+            );
+
+            let writes = store.writes();
+            assert_eq!(
+                (writes.add, writes.if_generation_match, writes.overwrite),
+                (0, 0, 0),
+                "should write nothing to KV"
+            );
+            assert!(
+                ec_context.identity().mutation().is_empty(),
+                "should queue nothing for a writer"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_returns_the_mirror_payload() {
+            let settings = auction_settings();
+            let graph = seeded_graph(&[(MIRROR_SOURCE, "uid-mirror")]);
+            let mut ec_context = consenting_context_with_ec();
+
+            let body = page_bids_body(
+                &settings,
+                &graph,
+                &mut ec_context,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await;
+
+            let mirror = &body["ts_eids_s"];
+            let decoded: serde_json::Value = serde_json::from_slice(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(mirror["value"].as_str().expect("should hold a value"))
+                    .expect("should be unpadded base64url"),
+            )
+            .expect("should be JSON");
+            let atype = crate::settings::EcPartner::default_openrtb_atype();
+            assert_eq!(
+                decoded,
+                serde_json::json!({ "v": 1, "eids": [{
+                    "source": MIRROR_SOURCE,
+                    "uids": [{ "id": "uid-mirror", "atype": atype }]
+                }] }),
+                "should hold the servable record's EID"
+            );
+            assert_eq!(
+                mirror["max_age"], 86_400,
+                "should live a day without an exp"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_preserves_identity_mirror_alongside_trace_and_timings() {
+            let mut settings = auction_settings();
+            settings
+                .integrations
+                .insert_config(
+                    "gpt_diagnostics",
+                    &serde_json::json!({"enabled": true, "trace_page_enabled": true}),
+                )
+                .expect("should enable trace capture");
+            let settings = Arc::new(settings);
+            let graph = seeded_graph(&[(MIRROR_SOURCE, "uid-mirror")]);
+            let mut ec_context = consenting_context_with_ec();
+            let mut req = make_active_page_bids_request("/2024/01/my-article/");
+            let timings = RequestTimings::new();
+            req.extensions_mut().insert(timings.handle().clone());
+            let hook = crate::trace::TracePreDispatchHook::new(
+                Arc::clone(&settings),
+                Arc::new(|_| panic!("should not load SPA setup metadata")),
+            );
+            edgezero_core::router::PreDispatchHook::handle(&hook, &mut req)
+                .await
+                .expect("should freeze SPA trace gate");
+
+            let body = page_bids_body(&settings, &graph, &mut ec_context, req).await;
+
+            assert_eq!(
+                body["trace_auction"]["evidence"]["source"], "spa_page_bids",
+                "should retain trace alongside the identity mirror"
+            );
+            assert!(
+                body["ts_eids_s"]["value"].is_string(),
+                "should retain the live mirror alongside trace"
+            );
+            assert!(
+                body["auctionDiagnostics"].is_object(),
+                "should retain request-clock diagnostics alongside trace and identity"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_omits_the_mirror_while_it_is_disabled() {
+            let settings = auction_settings();
+            let graph = seeded_graph(&[(MIRROR_SOURCE, "uid-mirror")]);
+            let consent = |gdpr_applies| crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                gdpr_applies,
+                ..Default::default()
+            };
+            let mut granted = EcContext::new_for_test(Some(mirror_ec_id()), consent(false));
+            let mut denied = EcContext::new_for_test(Some(mirror_ec_id()), consent(true));
+
+            let granted_body = page_bids_body(
+                &settings,
+                &graph,
+                &mut granted,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await;
+            let denied_body = page_bids_body(
+                &settings,
+                &graph,
+                &mut denied,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await;
+
+            assert!(
+                granted_body.get("ts_eids_s").is_none(),
+                "should return no mirror value while the mirror is off"
+            );
+            assert!(
+                denied_body.get("ts_eids_s").is_none(),
+                "should return no mirror clear while the mirror is off"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_clears_the_mirror_when_consent_denies_the_auction() {
+            let settings = auction_settings();
+            let graph = seeded_graph(&[(MIRROR_SOURCE, "uid-mirror")]);
+            // GDPR applies without a TC string: EC use stays allowed outside a
+            // GDPR jurisdiction, but the server-side auction gate denies.
+            let mut ec_context = EcContext::new_for_test(
+                Some(mirror_ec_id()),
+                crate::consent::ConsentContext {
+                    jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                    gdpr_applies: true,
+                    ..Default::default()
+                },
+            );
+            ec_context.enable_mirror_for_test();
+            assert!(ec_context.ec_allowed(), "should allow EC use");
+
+            let body = page_bids_body(
+                &settings,
+                &graph,
+                &mut ec_context,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await;
+
+            assert_eq!(
+                body["ts_eids_s"],
+                serde_json::json!({ "clear": true }),
+                "should clear the mirror as /auction does on a consent denial"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_without_an_auction_omits_the_mirror() {
+            let settings = settings_with_co_auction_disabled();
+            let graph = seeded_graph(&[(MIRROR_SOURCE, "uid-mirror")]);
+            let mut ec_context = consenting_context_with_ec();
+
+            let body = page_bids_body(
+                &settings,
+                &graph,
+                &mut ec_context,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await;
+
+            assert!(
+                body.get("ts_eids_s").is_none(),
+                "should leave the mirror cookie as it is"
+            );
         }
 
         #[tokio::test]

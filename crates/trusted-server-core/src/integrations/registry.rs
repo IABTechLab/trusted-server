@@ -5,12 +5,17 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
+use futures::StreamExt as _;
 use http::{Method, Request, Response};
 use matchit::Router;
 
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
+use crate::ec::finalize::BrowserSeed;
+use crate::ec::identity::coordinator::{CaptureCall, decode_body, has_capture_rule, run_capture};
+use crate::ec::identity::input::ThreadRandom;
+use crate::ec::identity::{IdentityProvider, IdentityProviderError};
 use crate::ec::kv::KvIdentityGraph;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
@@ -619,6 +624,7 @@ pub struct IntegrationRegistration {
     pub html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    pub identity_providers: Vec<Arc<dyn IdentityProvider>>,
 }
 
 impl IntegrationRegistration {
@@ -645,6 +651,7 @@ impl IntegrationRegistrationBuilder {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                identity_providers: Vec::new(),
             },
         }
     }
@@ -691,6 +698,34 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
+    /// Registers an identity provider this integration contributes.
+    #[must_use]
+    pub fn with_identity_provider(mut self, provider: Arc<dyn IdentityProvider>) -> Self {
+        self.registration.identity_providers.push(provider);
+        self
+    }
+
+    /// Registers a provider built by a fallible constructor.
+    ///
+    /// A failure becomes [`TrustedServerError::Integration`], naming the
+    /// integration the builder already holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Integration`] when `provider` is an error.
+    pub fn try_with_identity_provider<P: IdentityProvider + 'static>(
+        self,
+        provider: Result<P, Report<IdentityProviderError>>,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        match provider {
+            Ok(provider) => Ok(self.with_identity_provider(Arc::new(provider))),
+            Err(error) => Err(Report::new(TrustedServerError::Integration {
+                integration: self.registration.integration_id.to_owned(),
+                message: error.current_context().to_string(),
+            })),
+        }
+    }
+
     /// Mark this integration's JS module for deferred loading via
     /// `<script defer>` instead of the main synchronous bundle.
     #[must_use]
@@ -724,6 +759,51 @@ type RouteValue = (Arc<dyn IntegrationProxy>, &'static str, String);
 /// pattern into [`RouteValue`] itself).
 #[cfg(test)]
 type RouteEntry<'a> = (Method, &'a str, (Arc<dyn IntegrationProxy>, &'static str));
+/// Rejects a capture rule outside the registering integration's own routes.
+fn validate_capture_rules(
+    registration: &IntegrationRegistration,
+) -> Result<(), Report<TrustedServerError>> {
+    let routes: Vec<String> = registration
+        .proxies
+        .iter()
+        .flat_map(|proxy| proxy.routes())
+        .map(|route| route.path)
+        .collect();
+    for provider in &registration.identity_providers {
+        let Some(captures) = provider.descriptor().captures() else {
+            continue;
+        };
+        let rejected = captures
+            .paths()
+            .iter()
+            .map(|(_, path)| path)
+            .find(|path| {
+                !routes.iter().any(|route| match route.strip_suffix('*') {
+                    Some(base) if base.ends_with('/') => path.starts_with(base),
+                    _ => route == *path,
+                })
+            })
+            // An exact route never contains a prefix, which matches more paths.
+            .or_else(|| {
+                captures.prefixes().iter().find(|prefix| {
+                    !routes.iter().any(|route| match route.strip_suffix('*') {
+                        Some(base) if base.ends_with('/') => prefix.starts_with(base),
+                        _ => false,
+                    })
+                })
+            });
+        if let Some(rejected) = rejected {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "integration `{}` identity provider `{}` captures `{rejected}`, which is outside its own routes",
+                    registration.integration_id,
+                    provider.descriptor().id()
+                ),
+            }));
+        }
+    }
+    Ok(())
+}
 
 struct IntegrationRegistryInner {
     // Method-specific routers for O(log n) lookups
@@ -745,6 +825,7 @@ struct IntegrationRegistryInner {
     html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    identity_providers: Vec<Arc<dyn IdentityProvider>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -766,6 +847,7 @@ impl Default for IntegrationRegistryInner {
             html_stream_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            identity_providers: Vec::new(),
         }
     }
 }
@@ -806,7 +888,137 @@ pub struct ProxyDispatchInput<'a> {
     pub kv: Option<&'a KvIdentityGraph>,
     pub ec_context: &'a mut EcContext,
     pub services: &'a RuntimeServices,
+    /// Whether the client looks like a real browser. EC generation needs it.
+    pub is_real_browser: bool,
+    /// The request's browser ingest, carried by an EC minted here.
+    pub seed: &'a BrowserSeed,
     pub req: Request<EdgeBody>,
+}
+
+/// What capturing a proxied response reads besides the response.
+struct CaptureExchange<'a> {
+    settings: &'a Settings,
+    services: &'a RuntimeServices,
+    kv: Option<&'a KvIdentityGraph>,
+    ec_context: &'a mut EcContext,
+    method: &'a Method,
+    path: &'a str,
+}
+
+/// A proxied body, buffered for capture or left alone.
+enum Buffered {
+    /// The whole body, as sent (still encoded).
+    Whole(bytes::Bytes),
+    /// A body over the cap, rebuilt so the browser still receives every byte.
+    Passthrough(EdgeBody),
+}
+
+/// Buffers `body` up to `cap` bytes. A body over the cap, or a stream that
+/// fails, is handed back whole so the browser receives it unchanged.
+async fn buffer_up_to(body: EdgeBody, cap: usize) -> Buffered {
+    match body {
+        EdgeBody::Once(bytes) if bytes.len() <= cap => Buffered::Whole(bytes),
+        EdgeBody::Stream(mut stream) => {
+            let mut items = Vec::new();
+            let mut total = 0_usize;
+            while let Some(item) = stream.next().await {
+                let over = match &item {
+                    Ok(chunk) => {
+                        total = total.saturating_add(chunk.len());
+                        total > cap
+                    }
+                    Err(_) => true,
+                };
+                items.push(item);
+                if over {
+                    return Buffered::Passthrough(EdgeBody::from_stream(
+                        futures::stream::iter(items).chain(stream),
+                    ));
+                }
+            }
+            let mut whole = Vec::with_capacity(total);
+            for chunk in items.iter().filter_map(|item| item.as_ref().ok()) {
+                whole.extend_from_slice(chunk);
+            }
+            Buffered::Whole(bytes::Bytes::from(whole))
+        }
+        other => Buffered::Passthrough(other),
+    }
+}
+
+/// Offers a proxied 2xx response to the identity providers whose capture rule
+/// matches, and returns it unchanged (spec 4.7).
+///
+/// A body over `max_response_bytes` is passed through uncaptured. The request
+/// body is never read here.
+async fn capture_proxied_response(
+    exchange: CaptureExchange<'_>,
+    response: Response<EdgeBody>,
+) -> Response<EdgeBody> {
+    let CaptureExchange {
+        settings,
+        services,
+        kv,
+        ec_context,
+        method,
+        path,
+    } = exchange;
+    if !response.status().is_success() {
+        return response;
+    }
+    let Some(runtime) = ec_context.identity().runtime().cloned() else {
+        return response;
+    };
+    if !has_capture_rule(runtime.catalog(), method, path) {
+        return response;
+    }
+
+    let cap = settings.ec.identity.max_response_bytes;
+    let (parts, body) = response.into_parts();
+    let declared_over_cap = parts
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > cap);
+    if declared_over_cap {
+        log::debug!("Skipping capture on '{path}': the response is over the size cap");
+        return Response::from_parts(parts, body);
+    }
+    let raw = match buffer_up_to(body, cap).await {
+        Buffered::Whole(raw) => raw,
+        Buffered::Passthrough(body) => {
+            log::debug!("Skipping capture on '{path}': the response is over the size cap");
+            return Response::from_parts(parts, body);
+        }
+    };
+
+    let encoding = parts
+        .headers
+        .get(http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok());
+    match decode_body(encoding, raw.to_vec(), cap) {
+        Some(decoded) => {
+            let random = ThreadRandom;
+            let deps = runtime.deps(settings, services, &random, None);
+            run_capture(
+                &deps,
+                kv,
+                ec_context,
+                &CaptureCall {
+                    method,
+                    path,
+                    status: parts.status,
+                    headers: &parts.headers,
+                    body: &decoded,
+                },
+            );
+        }
+        None => {
+            log::debug!("Skipping capture on '{path}': the body is undecodable or over the cap")
+        }
+    }
+    Response::from_parts(parts, EdgeBody::from_bytes(raw))
 }
 
 /// In-memory registry of integrations discovered from settings.
@@ -835,15 +1047,10 @@ impl IntegrationRegistry {
     /// # Errors
     ///
     /// Returns an error if route registration fails due to duplicate routes or invalid paths.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
     pub fn with_plan(
         settings: &Settings,
         plan: Arc<AuctionPlan>,
     ) -> Result<Self, Report<TrustedServerError>> {
-        let mut inner = IntegrationRegistryInner::default();
         let mut registrations = Vec::new();
         if let Some(registration) = crate::integrations::prebid::register_for_plan(settings, &plan)?
         {
@@ -862,7 +1069,31 @@ impl IntegrationRegistry {
             }
         }
 
+        let mut registry = Self::from_registrations(registrations)?;
+        registry.plan = Some(plan);
+        registry.ensure_async_html_finish_allowed(settings)?;
+        Ok(registry)
+    }
+
+    /// Merges registrations into a registry with no auction plan.
+    ///
+    /// Tests pass a registration no settings can produce.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when a route fails to
+    /// register, or when an identity provider's capture rule lies outside
+    /// the routes of the integration that registered it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
+    pub(crate) fn from_registrations(
+        registrations: Vec<IntegrationRegistration>,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let mut inner = IntegrationRegistryInner::default();
         for registration in registrations {
+            validate_capture_rules(&registration)?;
             inner
                 .enabled_integration_ids
                 .push(registration.integration_id);
@@ -928,6 +1159,9 @@ impl IntegrationRegistry {
                 .extend(registration.html_stream_processors);
             inner.head_injectors.extend(registration.head_injectors);
             inner.request_filters.extend(registration.request_filters);
+            inner
+                .identity_providers
+                .extend(registration.identity_providers);
             if registration.js_disabled {
                 inner.disabled_js_ids.push(registration.integration_id);
             } else if registration.js_deferred {
@@ -935,12 +1169,16 @@ impl IntegrationRegistry {
             }
         }
 
-        let registry = Self {
+        Ok(Self {
             inner: Arc::new(inner),
-            plan: Some(plan),
-        };
-        registry.ensure_async_html_finish_allowed(settings)?;
-        Ok(registry)
+            plan: None,
+        })
+    }
+
+    /// The identity providers integrations registered.
+    #[must_use]
+    pub fn identity_providers(&self) -> Vec<Arc<dyn IdentityProvider>> {
+        self.inner.identity_providers.clone()
     }
 
     /// Return whether this registry and another consumer share the same plan allocation.
@@ -1066,26 +1304,44 @@ impl IntegrationRegistry {
             kv,
             ec_context,
             services,
+            is_real_browser,
+            seed,
             mut req,
         } = input;
         if let Some((proxy, _, _)) = self.find_route(method, path) {
             // Organic proxy handler: generate if needed (best effort).
-            // Only generate for document navigations — subresource requests
-            // may lack consent signals such as the Sec-GPC header.
-            if is_navigation_request(&req) {
-                if let Err(err) = ec_context.generate_if_needed(settings, kv) {
+            // Only generate for document navigations by real browsers —
+            // subresource requests may lack consent signals such as the
+            // Sec-GPC header.
+            if is_real_browser && is_navigation_request(&req) {
+                if let Err(err) = ec_context.generate_if_needed(settings, kv, seed) {
                     log::warn!("EC generation failed for integration proxy: {err:?}");
                 }
             } else {
                 log::debug!(
-                    "EC generation skipped for integration proxy: non-document request (path={path})",
+                    "EC generation skipped for integration proxy: not a real-browser document request (path={path})",
                 );
             }
 
             // Remove any caller-supplied EC header rather than forwarding it.
             req.headers_mut().remove(HEADER_X_TS_EC.clone());
 
-            Some(proxy.handle(settings, services, req).await)
+            let handled = proxy.handle(settings, services, req).await;
+            Some(match handled {
+                Ok(response) => Ok(capture_proxied_response(
+                    CaptureExchange {
+                        settings,
+                        services,
+                        kv,
+                        ec_context,
+                        method,
+                        path,
+                    },
+                    response,
+                )
+                .await),
+                Err(error) => Err(error),
+            })
         } else {
             None
         }
@@ -1366,6 +1622,7 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                identity_providers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
@@ -1396,6 +1653,7 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors,
                 request_filters: Vec::new(),
+                identity_providers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
@@ -1422,6 +1680,7 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters,
+                identity_providers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
@@ -1489,6 +1748,7 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                identity_providers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
@@ -1501,6 +1761,10 @@ impl IntegrationRegistry {
 mod tests {
     use super::*;
     use crate::constants::COOKIE_TS_EC;
+    use crate::ec::identity::examples::{
+        ExampleCaptureProvider, ExampleIdProvider, example_config,
+    };
+    use crate::ec::identity::test_support::{fixed_capture_provider, fixed_provider};
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
 
@@ -1880,6 +2144,8 @@ mod tests {
             kv: None,
             ec_context: &mut ec_context,
             services: &noop_services(),
+            is_real_browser: true,
+            seed: &BrowserSeed::empty(),
             req,
         }))
         .expect("should match route")
@@ -2237,6 +2503,8 @@ mod tests {
             kv: None,
             ec_context: &mut ec_context,
             services: &services,
+            is_real_browser: true,
+            seed: &BrowserSeed::empty(),
             req,
         }));
 
@@ -2250,6 +2518,149 @@ mod tests {
         assert!(
             response.headers().get("x-echo-ts-ec").is_none(),
             "should not have x-ts-ec header on integration request"
+        );
+    }
+
+    #[test]
+    fn handle_proxy_generates_an_ec_only_for_a_real_browser() {
+        let settings = create_test_settings();
+        let registry = IntegrationRegistry::from_routes(vec![(
+            Method::GET,
+            "/integrations/test/ec",
+            (
+                Arc::new(EcTestProxy) as Arc<dyn IntegrationProxy>,
+                "ec_test",
+            ),
+        )]);
+        let services = noop_services();
+        let mut minted = Vec::new();
+
+        for is_real_browser in [false, true] {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("https://test-publisher.com/integrations/test/ec")
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            let mut ec_context = EcContext::new_for_test_with_ip(
+                None,
+                crate::consent::ConsentContext {
+                    jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                    ..crate::consent::ConsentContext::default()
+                },
+                Some("192.0.2.1".to_owned()),
+            );
+
+            let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+                method: &Method::GET,
+                path: "/integrations/test/ec",
+                settings: &settings,
+                kv: None,
+                ec_context: &mut ec_context,
+                services: &services,
+                is_real_browser,
+                seed: &BrowserSeed::empty(),
+                req,
+            }));
+
+            assert!(
+                result.is_some_and(|response| response.is_ok()),
+                "should handle the request"
+            );
+            minted.push(ec_context.ec_value().is_some());
+        }
+
+        assert_eq!(
+            minted,
+            [false, true],
+            "should mint an EC only when the client is a real browser"
+        );
+    }
+
+    #[test]
+    fn integration_proxy_new_ec_carries_browser_ingest() {
+        let settings = create_test_settings();
+        let registry = IntegrationRegistry::from_routes(vec![(
+            Method::GET,
+            "/integrations/test/ec",
+            (
+                Arc::new(EcTestProxy) as Arc<dyn IntegrationProxy>,
+                "ec_test",
+            ),
+        )]);
+        let services = noop_services();
+        let (graph, store) = KvIdentityGraph::write_counting("ec-store");
+        let consent = crate::consent::ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..crate::consent::ConsentContext::default()
+        };
+        let mut ec_context =
+            EcContext::new_for_test_with_ip(None, consent, Some("192.0.2.1".to_owned()));
+        let partner_registry =
+            crate::ec::registry::PartnerRegistry::from_config(&[crate::settings::EcPartner {
+                name: "Shared ID".to_owned(),
+                source_domain: "sharedid.org".to_owned(),
+                openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
+                bidstream_enabled: true,
+                api_token: Some(crate::redacted::Redacted::new(
+                    "token-sharedid.org-32-bytes-minimum-value".to_owned(),
+                )),
+                batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
+                pull_sync_enabled: false,
+                pull_sync_url: None,
+                pull_sync_allowed_domains: vec![],
+                removed_pull_sync_ttl_sec: None,
+                removed_pull_sync_rate_limit: None,
+                owner: None,
+                ts_pull_token: None,
+            }])
+            .expect("should build partner registry");
+        let seed = crate::ec::finalize::browser_seed(
+            &settings,
+            &partner_registry,
+            ec_context.consent(),
+            None,
+            Some("example-shared-id"),
+            1_760_000_000,
+        );
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/integrations/test/ec")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::GET,
+            path: "/integrations/test/ec",
+            settings: &settings,
+            kv: Some(&graph),
+            ec_context: &mut ec_context,
+            services: &services,
+            is_real_browser: true,
+            seed: &seed,
+            req,
+        }));
+
+        assert!(
+            result.is_some_and(|response| response.is_ok()),
+            "should handle the request"
+        );
+        let writes = store.writes();
+        assert_eq!(writes.add, 1, "should write one create");
+        assert_eq!(writes.total(), 1, "should write nothing else");
+        let ec_id = ec_context.ec_value().expect("should mint an EC");
+        let (stored, _) = graph
+            .get(ec_id)
+            .expect("should read store")
+            .expect("should hold the new row");
+        assert_eq!(
+            stored
+                .ids
+                .get("sharedid.org")
+                .and_then(crate::ec::kv_types::KvPartnerId::first_uid),
+            Some("example-shared-id"),
+            "should carry the seeded UID in the create"
         );
     }
 
@@ -2287,6 +2698,8 @@ mod tests {
             kv: None,
             ec_context: &mut ec_context,
             services: &services,
+            is_real_browser: true,
+            seed: &BrowserSeed::empty(),
             req,
         }))
         .expect("should handle proxy request");
@@ -2336,6 +2749,8 @@ mod tests {
             kv: None,
             ec_context: &mut ec_context,
             services: &services,
+            is_real_browser: true,
+            seed: &BrowserSeed::empty(),
             req,
         }))
         .expect("should handle proxy request");
@@ -2382,6 +2797,8 @@ mod tests {
             kv: None,
             ec_context: &mut ec_context,
             services: &services,
+            is_real_browser: true,
+            seed: &BrowserSeed::empty(),
             req,
         }));
 
@@ -2627,5 +3044,617 @@ mod tests {
             recombined, all_sorted,
             "should reconstruct full module list from immediate + deferred"
         );
+    }
+
+    struct ExampleCaptureProxy;
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for ExampleCaptureProxy {
+        fn integration_name(&self) -> &'static str {
+            "examplecapture"
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![IntegrationEndpoint::post("/integrations/examplecapture/*")]
+        }
+
+        async fn handle(
+            &self,
+            _settings: &Settings,
+            _services: &RuntimeServices,
+            _req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            Ok(Response::new(EdgeBody::empty()))
+        }
+    }
+
+    fn capture_registration(path: &str) -> IntegrationRegistration {
+        IntegrationRegistration::builder("examplecapture")
+            .with_proxy(Arc::new(ExampleCaptureProxy))
+            .try_with_identity_provider(ExampleCaptureProvider::with_capture_path(path))
+            .expect("should register the capture provider")
+            .build()
+    }
+
+    #[test]
+    fn try_with_identity_provider_converts_a_constructor_error_once() {
+        let failing: Result<ExampleIdProvider, Report<IdentityProviderError>> =
+            Err(IdentityProviderError::config("bad partner id"));
+        let error = IntegrationRegistration::builder("exampleid")
+            .try_with_identity_provider(failing)
+            .err()
+            .expect("should fail on a constructor error");
+        assert!(
+            matches!(error.current_context(), TrustedServerError::Integration { integration, .. } if integration == "exampleid"),
+            "should name the integration"
+        );
+
+        let built = IntegrationRegistration::builder("exampleid")
+            .try_with_identity_provider(ExampleIdProvider::new(&example_config()))
+            .expect("should register a valid provider")
+            .build();
+        assert_eq!(
+            built.identity_providers.len(),
+            1,
+            "should hold one registered provider"
+        );
+    }
+
+    #[test]
+    fn capture_rule_outside_the_integrations_routes_is_rejected_at_startup() {
+        let error = IntegrationRegistry::from_registrations(vec![capture_registration(
+            "/integrations/other/api",
+        )])
+        .err()
+        .expect("should reject a capture rule outside the integration's routes");
+        assert!(
+            format!("{error}").contains("examplecapture"),
+            "should name the integration"
+        );
+
+        let registry = IntegrationRegistry::from_registrations(vec![capture_registration(
+            "/integrations/examplecapture/api/token",
+        )])
+        .expect("should accept a capture rule under the integration's own routes");
+        assert_eq!(
+            registry.identity_providers().len(),
+            1,
+            "should expose the registered provider"
+        );
+    }
+
+    #[test]
+    fn capture_prefix_must_lie_under_a_wildcard_route() {
+        let registration = |provider_id: &str| {
+            IntegrationRegistration::builder("examplecapture")
+                .with_proxy(Arc::new(ExampleCaptureProxy))
+                .with_identity_provider(fixed_capture_provider(
+                    provider_id,
+                    &["examplecapture.example.com"],
+                ))
+                .build()
+        };
+
+        IntegrationRegistry::from_registrations(vec![registration("examplecapture")])
+            .expect("should accept a prefix under the wildcard route");
+        assert!(
+            IntegrationRegistry::from_registrations(vec![registration("other")]).is_err(),
+            "should reject a prefix outside the routes"
+        );
+    }
+
+    struct ExactRouteProxy;
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for ExactRouteProxy {
+        fn integration_name(&self) -> &'static str {
+            "examplecapture"
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![IntegrationEndpoint::post(
+                "/integrations/examplecapture/api",
+            )]
+        }
+
+        async fn handle(
+            &self,
+            _settings: &Settings,
+            _services: &RuntimeServices,
+            _req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            Ok(Response::new(EdgeBody::empty()))
+        }
+    }
+
+    #[test]
+    fn capture_prefix_under_an_exact_route_is_rejected_with_the_prefix_named() {
+        let registration = |proxy: Arc<dyn IntegrationProxy>| {
+            IntegrationRegistration::builder("examplecapture")
+                .with_proxy(proxy)
+                .with_identity_provider(fixed_capture_provider(
+                    "examplecapture",
+                    &["examplecapture.example.com"],
+                ))
+                .build()
+        };
+
+        IntegrationRegistry::from_registrations(vec![registration(Arc::new(ExampleCaptureProxy))])
+            .expect("control: a wildcard route should contain the prefix");
+        let error =
+            IntegrationRegistry::from_registrations(vec![registration(Arc::new(ExactRouteProxy))])
+                .err()
+                .expect("should reject a prefix under an exact route");
+        assert!(
+            format!("{error}").contains("/integrations/examplecapture/"),
+            "should name the rejected prefix: {error}"
+        );
+    }
+
+    #[test]
+    fn two_integrations_registering_the_same_provider_id_fail_at_startup() {
+        let registration = |integration: &'static str| {
+            IntegrationRegistration::builder(integration)
+                .with_identity_provider(fixed_provider("shared-id", &["shared.example.com"]))
+                .build()
+        };
+
+        let registry = IntegrationRegistry::from_registrations(vec![registration("first")])
+            .expect("control: one registration should build");
+        let duplicated = IntegrationRegistry::from_registrations(vec![
+            registration("first"),
+            registration("second"),
+        ])
+        .expect("should merge both registrations");
+        let error = crate::ec::identity::catalog::ProviderCatalog::from_settings(
+            &crate::test_support::tests::create_test_settings(),
+            &duplicated.identity_providers(),
+        )
+        .err()
+        .expect("should reject the duplicate provider ID");
+        assert!(
+            format!("{error}").contains("`shared-id` is declared more than once"),
+            "should report the duplicate: {error}"
+        );
+        assert_eq!(registry.identity_providers().len(), 1, "should hold one");
+    }
+
+    /// Revoke-only capture around `handle_proxy` (spec 4.7).
+    mod capture_proxy {
+        use std::collections::BTreeMap;
+        use std::io::Write as _;
+        use std::sync::{Arc, Mutex};
+
+        use bytes::Bytes;
+        use serde_json::json;
+
+        use super::*;
+        use crate::ec::identity::IdentityRuntime;
+        use crate::ec::identity::revision::set_hashes;
+        use crate::ec::identity::test_support::hold_fixture::live_row;
+        use crate::ec::identity::test_support::{
+            TEST_EC_ID, WriteCountingEcKv, allowing_consent, answering_capture_provider,
+            record_for_test,
+        };
+        use crate::ec::kv_types::KvEntry;
+        use crate::test_support::logs::{captured_logs, install_capturing_logger};
+        use crate::test_support::tests::create_test_settings;
+
+        const FIRST: &str = "a.example.com";
+
+        /// How the upstream answers.
+        #[derive(Clone)]
+        struct Upstream {
+            status: StatusCode,
+            headers: Vec<(&'static str, &'static str)>,
+            body: Vec<u8>,
+            streamed: bool,
+        }
+
+        impl Upstream {
+            fn json(body: &serde_json::Value) -> Self {
+                Self {
+                    status: StatusCode::OK,
+                    headers: vec![("content-type", "application/json")],
+                    body: serde_json::to_vec(body).expect("should serialize the body"),
+                    streamed: false,
+                }
+            }
+        }
+
+        struct ScriptedProxy {
+            upstream: Upstream,
+            request_body: Arc<Mutex<Option<Vec<u8>>>>,
+        }
+
+        #[async_trait(?Send)]
+        impl IntegrationProxy for ScriptedProxy {
+            fn integration_name(&self) -> &'static str {
+                "lockr"
+            }
+
+            fn routes(&self) -> Vec<IntegrationEndpoint> {
+                vec![
+                    IntegrationEndpoint::post("/integrations/lockr/*"),
+                    IntegrationEndpoint::post("/integrations/examplecapture/*"),
+                ]
+            }
+
+            async fn handle(
+                &self,
+                _settings: &Settings,
+                _services: &RuntimeServices,
+                req: Request<EdgeBody>,
+            ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+                let seen = req.into_body().into_bytes().unwrap_or_default().to_vec();
+                *self.request_body.lock().expect("should lock the body") = Some(seen);
+                let mut builder = Response::builder().status(self.upstream.status);
+                for (name, value) in &self.upstream.headers {
+                    builder = builder.header(*name, *value);
+                }
+                let body = if self.upstream.streamed {
+                    let chunks: Vec<Result<Bytes, std::io::Error>> = self
+                        .upstream
+                        .body
+                        .chunks(7)
+                        .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                        .collect();
+                    EdgeBody::from_stream(futures::stream::iter(chunks))
+                } else {
+                    EdgeBody::from(self.upstream.body.clone())
+                };
+                Ok(builder.body(body).expect("should build the response"))
+            }
+        }
+
+        /// What one proxied call left behind.
+        struct Exchange {
+            response: Response<EdgeBody>,
+            request_body: Option<Vec<u8>>,
+            store: Arc<WriteCountingEcKv>,
+            context: EcContext,
+            row: Option<KvEntry>,
+        }
+
+        impl Exchange {
+            fn response_bytes(self) -> Vec<u8> {
+                futures::executor::block_on(self.response.into_body().into_bytes_bounded(1 << 20))
+                    .expect("should read the response body")
+                    .to_vec()
+            }
+        }
+
+        struct Call<'a> {
+            provider: Arc<dyn IdentityProvider>,
+            path: &'a str,
+            upstream: Upstream,
+            request_body: &'a [u8],
+            real_browser: bool,
+            row: Option<&'a KvEntry>,
+            max_response_bytes: usize,
+        }
+
+        fn call<'a>(
+            provider: Arc<dyn IdentityProvider>,
+            path: &'a str,
+            upstream: Upstream,
+        ) -> Call<'a> {
+            Call {
+                provider,
+                path,
+                upstream,
+                request_body: b"{}",
+                real_browser: true,
+                row: None,
+                max_response_bytes: 65_536,
+            }
+        }
+
+        fn exchange(call: Call<'_>) -> Exchange {
+            let mut settings = create_test_settings();
+            settings.ec.identity.max_response_bytes = call.max_response_bytes;
+            let request_body = Arc::new(Mutex::new(None));
+            let registry = IntegrationRegistry::from_registrations(vec![
+                IntegrationRegistration::builder("lockr")
+                    .with_proxy(Arc::new(ScriptedProxy {
+                        upstream: call.upstream,
+                        request_body: Arc::clone(&request_body),
+                    }))
+                    .with_identity_provider(call.provider)
+                    .build(),
+            ])
+            .expect("should build the registry");
+            let runtime = Arc::new(
+                IdentityRuntime::from_settings_with_providers(
+                    &settings,
+                    registry.identity_providers(),
+                    BTreeMap::new(),
+                )
+                .expect("should build the runtime"),
+            );
+            let (graph, store) = KvIdentityGraph::write_counting("capture-proxy-store");
+            if let Some(row) = call.row {
+                graph.create(TEST_EC_ID, row).expect("should seed the row");
+            }
+            let mut context = EcContext::new_for_test_with_ip(
+                Some(TEST_EC_ID.to_owned()),
+                allowing_consent(),
+                Some("192.0.2.10".to_owned()),
+            );
+            context.set_identity_runtime(runtime);
+            context.set_kv_snapshot(graph.load_snapshot(TEST_EC_ID));
+            store.reset_counts();
+
+            let req = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("https://www.example.com{}", call.path))
+                .body(EdgeBody::from(call.request_body.to_vec()))
+                .expect("should build the request");
+            let response = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+                method: &http::Method::POST,
+                path: call.path,
+                settings: &settings,
+                kv: Some(&graph),
+                ec_context: &mut context,
+                services: &noop_services(),
+                is_real_browser: call.real_browser,
+                seed: &BrowserSeed::empty(),
+                req,
+            }))
+            .expect("should match the route")
+            .expect("the proxy should answer");
+            let row = graph.get(TEST_EC_ID).ok().flatten().map(|(row, _)| row);
+            Exchange {
+                response,
+                request_body: request_body.lock().expect("should lock the body").clone(),
+                store,
+                context,
+                row,
+            }
+        }
+
+        fn token_body() -> serde_json::Value {
+            json!({"tokens": [{"source": FIRST, "value": "secret-uid-a"}]})
+        }
+
+        fn gzip(bytes: &[u8]) -> Vec<u8> {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(bytes).expect("should compress");
+            encoder.finish().expect("should finish the stream")
+        }
+
+        fn brotli(bytes: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            {
+                let mut encoder = ::brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+                encoder.write_all(bytes).expect("should compress");
+            }
+            out
+        }
+
+        fn counted(exchange: &Exchange) -> usize {
+            exchange.context.identity().capture_unpersisted().len()
+        }
+
+        #[test]
+        fn capture_runs_only_for_matching_rules() {
+            let token = json!({"tokens": [{
+                "source": "examplecapture.example.com", "value": "v", "expires": 4_102_444_800_u64
+            }]});
+            let provider = || -> Arc<dyn IdentityProvider> {
+                Arc::new(ExampleCaptureProvider::new().expect("should build the provider"))
+            };
+
+            let matching = exchange(call(
+                provider(),
+                "/integrations/examplecapture/api/token",
+                Upstream::json(&token),
+            ));
+            let other_path = exchange(call(
+                provider(),
+                "/integrations/examplecapture/api/other",
+                Upstream::json(&token),
+            ));
+
+            assert_eq!(counted(&matching), 1, "should capture on the matching rule");
+            assert_eq!(
+                counted(&other_path),
+                0,
+                "should not capture on a path outside the rules"
+            );
+        }
+
+        #[test]
+        fn capture_runs_only_on_a_2xx_response() {
+            let provider = || answering_capture_provider("lockr", &[FIRST], None);
+            let path = "/integrations/lockr/api/token";
+            let mut failing = Upstream::json(&token_body());
+            failing.status = StatusCode::INTERNAL_SERVER_ERROR;
+
+            let ok = exchange(call(provider(), path, Upstream::json(&token_body())));
+            let error = exchange(call(provider(), path, failing));
+
+            assert_eq!(counted(&ok), 1, "should capture a 200");
+            assert_eq!(counted(&error), 0, "should not capture a 500");
+            assert_eq!(
+                error.response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "should still return the 500"
+            );
+        }
+
+        #[test]
+        fn capture_decodes_gzip_and_brotli_responses_and_forwards_them_unchanged() {
+            let plain = serde_json::to_vec(&token_body()).expect("should serialize");
+            for (encoding, compressed) in [("gzip", gzip(&plain)), ("br", brotli(&plain))] {
+                let upstream = Upstream {
+                    status: StatusCode::OK,
+                    headers: vec![
+                        ("content-type", "application/json"),
+                        ("content-encoding", encoding),
+                    ],
+                    body: compressed.clone(),
+                    streamed: false,
+                };
+
+                let result = exchange(call(
+                    answering_capture_provider("lockr", &[FIRST], None),
+                    "/integrations/lockr/api/token",
+                    upstream,
+                ));
+
+                assert_eq!(counted(&result), 1, "should decode {encoding} for capture");
+                assert_eq!(
+                    result.response.headers()["content-encoding"],
+                    encoding,
+                    "should keep the encoding header"
+                );
+                assert_eq!(
+                    result.response_bytes(),
+                    compressed,
+                    "should forward the {encoding} bytes unchanged"
+                );
+            }
+        }
+
+        #[test]
+        fn capture_never_reads_the_request_body() {
+            install_capturing_logger();
+            let request_body = serde_json::to_vec(
+                &json!({"email": "capture-body-7731@example.com", "consent": true}),
+            )
+            .expect("should serialize");
+            let mut request = call(
+                answering_capture_provider("lockr", &[FIRST], None),
+                "/integrations/lockr/api/token",
+                Upstream::json(&token_body()),
+            );
+            request.request_body = &request_body;
+
+            let result = exchange(request);
+
+            assert_eq!(
+                result.request_body.as_deref(),
+                Some(request_body.as_slice()),
+                "should hand the upstream the request body unchanged"
+            );
+            assert_eq!(counted(&result), 1, "control: the response is captured");
+            assert!(
+                !captured_logs()
+                    .iter()
+                    .any(|line| line.contains("capture-body-7731")),
+                "should log nothing from the request body"
+            );
+        }
+
+        #[test]
+        fn capture_skips_an_oversized_proxied_body() {
+            let body = json!({"tokens": [{"source": FIRST, "value": "x".repeat(200)}]});
+            let provider = || answering_capture_provider("lockr", &[FIRST], None);
+            let path = "/integrations/lockr/api/token";
+            let plain = serde_json::to_vec(&body).expect("should serialize");
+
+            for streamed in [false, true] {
+                let mut upstream = Upstream::json(&body);
+                upstream.streamed = streamed;
+                let mut oversized = call(provider(), path, upstream.clone());
+                oversized.max_response_bytes = 64;
+                let skipped = exchange(oversized);
+                assert_eq!(
+                    counted(&skipped),
+                    0,
+                    "should not capture (streamed={streamed})"
+                );
+                assert_eq!(
+                    skipped.response_bytes(),
+                    plain,
+                    "should pass the body through unchanged (streamed={streamed})"
+                );
+
+                let within = exchange(call(provider(), path, upstream));
+                assert_eq!(counted(&within), 1, "control: captures within the cap");
+                assert_eq!(
+                    within.response_bytes(),
+                    plain,
+                    "control: forwards the buffered body unchanged (streamed={streamed})"
+                );
+            }
+        }
+
+        #[test]
+        fn capture_removal_from_a_real_browser_is_written_before_the_response_returns() {
+            let mut seeded = live_row();
+            seeded
+                .ids
+                .insert(FIRST.to_owned(), record_for_test("secret-uid-a", None, 500));
+            let mut request = call(
+                answering_capture_provider("lockr", &[FIRST], None),
+                "/integrations/lockr/api/token",
+                Upstream::json(&json!({"invalidate": [FIRST]})),
+            );
+            request.row = Some(&seeded);
+
+            let result = exchange(request);
+
+            let row = result.row.as_ref().expect("should hold the row");
+            assert!(!row.ids.contains_key(FIRST), "should remove the record");
+            assert_eq!(
+                row.ps["lockr"].iv,
+                set_hashes(&seeded.ids[FIRST].eids),
+                "should hash the record into iv"
+            );
+            assert_eq!(result.store.writes().total(), 1, "should write once");
+        }
+
+        #[test]
+        fn capture_from_a_non_browser_writes_only_removals() {
+            let mut seeded = live_row();
+            seeded.ids.insert(
+                FIRST.to_owned(),
+                record_for_test("secret-uid-a", Some("lockr"), 500),
+            );
+            for body in [json!({"invalidate": [FIRST]}), json!({"opted_out": true})] {
+                let mut request = call(
+                    answering_capture_provider("lockr", &[FIRST], None),
+                    "/integrations/lockr/api/token",
+                    Upstream::json(&body),
+                );
+                request.real_browser = false;
+                request.row = Some(&seeded);
+
+                let result = exchange(request);
+
+                let row = result.row.as_ref().expect("should hold the row");
+                assert!(
+                    !row.ids.contains_key(FIRST),
+                    "should apply the removal for {body}"
+                );
+                assert_eq!(
+                    result.store.writes().total(),
+                    1,
+                    "should write once for {body}"
+                );
+            }
+
+            let mut request = call(
+                answering_capture_provider("lockr", &[FIRST], None),
+                "/integrations/lockr/api/token",
+                Upstream::json(&token_body()),
+            );
+            request.real_browser = false;
+            request.row = Some(&seeded);
+            let result = exchange(request);
+            assert_eq!(
+                result.store.writes().total(),
+                0,
+                "should write nothing for a positive result"
+            );
+            assert_eq!(
+                result.row.as_ref(),
+                Some(&seeded),
+                "should change no row for a positive result"
+            );
+        }
     }
 }

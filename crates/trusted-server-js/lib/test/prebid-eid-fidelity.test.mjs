@@ -29,6 +29,8 @@ const CONTROL_EID = {
   source: 'control.example.com',
   uids: [{ id: 'control-uid', atype: 1 }],
 };
+// The `[[ec.partners]]` sources the server injects; `ts-eids` keeps only these.
+const REGISTERED_SOURCES = ['control.example.com', 'ids.example.com', 'preset.example.com'];
 const PRESET_COOKIE_EIDS = [{ source: 'preset.example.com', uids: [{ id: 'preset-uid' }] }];
 const LIVERAMP_EID = {
   source: 'liveramp.com',
@@ -201,7 +203,11 @@ function createPage({ cookies = [], vendorConsents, purposeOneConsent = true } =
 
   // Mirror the server's head-injected state.
   pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
-  pageWindow.__tsjs_prebid = { clientSideBidders: [], serverSideBidders: [] };
+  pageWindow.__tsjs_prebid = {
+    clientSideBidders: [],
+    serverSideBidders: [],
+    registeredSources: REGISTERED_SOURCES,
+  };
 
   return {
     pageWindow,
@@ -485,9 +491,11 @@ describe('trustedServer EIDs with real Prebid.js', () => {
         results.some((result) => result.biddersBlocked.includes('trustedServer')),
         'trustedServer should not be blocked with the rule'
       ).toBe(false);
-      expect(readTsEidsCookie(page.pageWindow), 'ts-eids should copy the body set').toEqual([
+      // LiveRamp stays in the request body but is not a registered cookie
+      // source. The registered preset source survives this request's merge.
+      expect(readTsEidsCookie(page.pageWindow), 'ts-eids should merge registered sources').toEqual([
         CONTROL_EID,
-        LIVERAMP_EID,
+        ...PRESET_COOKIE_EIDS,
       ]);
     } finally {
       await page.close();

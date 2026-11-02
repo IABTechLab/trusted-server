@@ -74,6 +74,10 @@ impl<S: EcKvStore> EcKvStore for TimedKvStore<S> {
         let _span = self.timings.span(Phase::EcKv);
         self.inner.delete(key)
     }
+
+    fn pause(&self, duration: std::time::Duration) {
+        self.inner.pause(duration);
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +148,57 @@ mod tests {
             self.record("delete");
             self.inner.delete(key)
         }
+
+        fn pause(&self, duration: Duration) {
+            self.record("pause");
+            self.inner.pause(duration);
+        }
+    }
+
+    #[test]
+    fn request_timing_preserves_shared_graph_state_and_pause() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let graph = crate::ec::kv::KvIdentityGraph::new(DelayingCountingEcKv {
+            inner: InMemoryEcKv::new("test-store"),
+            calls: std::sync::Arc::clone(&calls),
+        });
+        let timings = RequestTimings::new();
+        let timed = graph.clone().with_request_timings(&timings);
+        timed
+            .write_key(
+                "shared-key",
+                "{}",
+                Duration::from_secs(60),
+                crate::ec::kv_backend::EcKvWriteMode::Add,
+            )
+            .expect("should write through the timed graph");
+        assert!(
+            graph
+                .lookup_key("shared-key")
+                .expect("should read shared store")
+                .is_some(),
+            "should preserve the original store instead of reconstructing it"
+        );
+        assert!(
+            timed
+                .lookup_key("shared-key")
+                .expect("should read timed store")
+                .is_some(),
+            "should preserve the timed graph's store"
+        );
+        let before_pause = timings.snapshot().kv_ms;
+        assert!(before_pause.is_some(), "should record store latency");
+        timed.pause(Duration::from_millis(7));
+        assert_eq!(
+            timings.snapshot().kv_ms,
+            before_pause,
+            "should not count rate-limit pauses as KV operation latency"
+        );
+        assert_eq!(
+            *calls.lock().expect("should lock store calls"),
+            vec!["insert", "lookup", "lookup", "pause"],
+            "should forward operations and the identity flush pause exactly once"
+        );
     }
 
     #[test]

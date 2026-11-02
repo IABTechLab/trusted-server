@@ -67,7 +67,8 @@ pub struct ConsentedProvidersSettings {
 /// An Extended User ID entry from an identity provider.
 ///
 /// Mirrors `OpenRTB` 2.6 §3.2.27. Browser entries keep the EID-level fields
-/// Prebid set; KV-resolved entries leave them empty.
+/// Prebid set; KV-resolved entries carry the EID-level fields a provider
+/// stored, and a record from browser ingest or a version 1 row has none.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Eid {
@@ -234,6 +235,10 @@ pub struct ResponseExt {
     /// Optional request-scoped trace transport under its own namespace.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trusted_server: Option<TraceResponseExt>,
+    /// The `ts-eids-s` mirror payload, absent when the request read no KV
+    /// (spec 6.2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts_eids_s: Option<serde_json::Value>,
 }
 
 impl ToExt for ResponseExt {}
@@ -365,6 +370,7 @@ mod tests {
                 dropped_winner_count: 0,
                 dropped_winner_reasons: Default::default(),
             },
+            ts_eids_s: None,
         }
         .to_ext();
 

@@ -41,13 +41,13 @@ pub mod eids;
 pub mod finalize;
 pub mod generation;
 pub mod identify;
+pub mod identity;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
 pub mod partner;
 pub mod prebid_eids;
 pub mod pull_sync;
-pub(crate) mod pull_sync_marker;
 pub mod rate_limiter;
 pub mod registry;
 
@@ -68,32 +68,43 @@ pub fn log_id(ec_id: &str) -> String {
     format!("{prefix}\u{2026}")
 }
 
+use std::sync::Arc;
+
 use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
-use http::Request;
+use http::{Request, header};
+use url::Url;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE};
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_REVOKED};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::openrtb::Eid;
+use crate::http_util::{is_document_navigation, is_prefetch_request};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
 
-use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph};
+use self::finalize::BrowserSeed;
+use self::identity::measurement::{IdentityMeasurement, MeasurementInput, RouteKind};
+use self::identity::request::{RequestIdentity, WriterDecision};
+use self::identity::runtime::IdentityRuntime;
+use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph, apply_partner_id_updates};
 use self::kv_types::KvEntry;
-use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
+use self::rate_limiter::RateLimiter;
 
-/// Bounded request classifications that may persist browser EID cookies.
+/// Bounded request classifications that may stage browser EID cookies.
 ///
 /// Adapters classify publisher navigations and `POST /auction` only after
 /// pre-route filters allow dispatch. The shared page-bids handler classifies an
 /// admitted SPA navigation, while EC finalization classifies new identities.
-/// Challenged or blocked requests remain unclassified and cannot persist EIDs.
+/// Challenged or blocked requests remain unclassified and cannot stage EIDs.
+///
+/// Only [`Self::NewEc`] still reports an `EID sync measurement` line. A
+/// returning visitor's request reports the `identity request measurement`
+/// line instead, which carries no source label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 pub enum EidSyncSource {
     /// Publisher top-level document navigation.
@@ -175,6 +186,9 @@ impl EcKvSnapshot {
     }
 }
 
+/// Create attempts a new EC makes, each with a fresh ID after a collision.
+const MAX_CREATE_ATTEMPTS: usize = 5;
+
 pub use generation::{
     ec_hash, generate_ec_id, is_valid_ec_hash, is_valid_ec_id, normalize_ec_id_for_kv,
 };
@@ -183,8 +197,6 @@ pub use generation::{
 struct RequestEc {
     /// EC ID from the `ts-ec` cookie, if present.
     cookie_ec: Option<String>,
-    /// Pull-sync completeness marker, if present.
-    pull_sync_marker: Option<String>,
     /// The parsed cookie jar (retained for consent pipeline input).
     jar: Option<CookieJar>,
 }
@@ -201,17 +213,7 @@ fn parse_ec_from_request(req: &Request<EdgeBody>) -> Result<RequestEc, Report<Tr
         .and_then(|j| j.get(COOKIE_TS_EC))
         .map(cookie::Cookie::value)
         .and_then(|value| request_ec_id_if_allowed(value, "ts-ec cookie"));
-    let pull_sync_marker = jar
-        .as_ref()
-        .and_then(|j| j.get(COOKIE_TS_EC_PULL_COMPLETE))
-        .map(cookie::Cookie::value)
-        .map(str::to_owned);
-
-    Ok(RequestEc {
-        cookie_ec,
-        pull_sync_marker,
-        jar,
-    })
+    Ok(RequestEc { cookie_ec, jar })
 }
 
 fn request_ec_id_if_allowed(value: &str, source: &str) -> Option<String> {
@@ -273,16 +275,19 @@ pub struct EcContext {
     kv_snapshot: EcKvSnapshot,
     /// Whether this request may rotate an orphaned EC identity.
     recovery_eligible: bool,
-    /// EIDs the route resolved from the current request: the `/auction` JSON
-    /// body, or the `ts-eids` cookie when the body carried none. Carried to
-    /// response finalization so KV ingestion can use the full set the client
-    /// sent instead of being limited to whatever fits in the size-capped
-    /// `ts-eids` cookie.
-    client_eids: Option<Vec<Eid>>,
-    /// Browser-carried proof of recent pull-partner completeness.
-    pull_sync_marker: PullSyncMarkerState,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
+    /// Identity state this request decides and collects.
+    identity: RequestIdentity,
+    /// Withdrawn EC IDs whose before-send tombstone returned
+    /// [`EcKvSnapshot::Failed`], for the after-send retry.
+    failed_withdrawals: Vec<String>,
+    /// The `ts-ec-revoked` marker the request carried: the consent
+    /// fingerprint a global revoke saw (spec 8).
+    revoke_marker: Option<String>,
+    /// The row of an EC minted by [`EcContext::mint_deferred`], created after
+    /// the hold dispatch.
+    deferred_create: Option<Box<KvEntry>>,
 }
 
 impl EcContext {
@@ -362,9 +367,25 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
-            client_eids: None,
-            pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
             eid_sync_source: None,
+            identity: {
+                let mut identity = RequestIdentity::default();
+                identity.set_cookie_header_bytes(
+                    req.headers()
+                        .get_all(header::COOKIE)
+                        .iter()
+                        .map(|value| value.as_bytes().len())
+                        .sum(),
+                );
+                identity
+            },
+            failed_withdrawals: Vec::new(),
+            revoke_marker: parsed
+                .jar
+                .as_ref()
+                .and_then(|jar| jar.get(COOKIE_TS_EC_REVOKED))
+                .map(|cookie| cookie.value().to_owned()),
+            deferred_create: None,
         })
     }
 
@@ -377,6 +398,10 @@ impl EcContext {
     /// If an EC ID already exists (from the request), this is a no-op.
     /// If consent does not permit EC creation, this is a no-op.
     ///
+    /// The new row carries `seed`, the request's browser ingest, so a new
+    /// visitor's create is the one write (spec 5.2 phase 1). Pass
+    /// [`BrowserSeed::empty`] when there is nothing to seed.
+    ///
     /// # Errors
     ///
     /// Returns an error if the client IP is unavailable and generation is
@@ -385,9 +410,88 @@ impl EcContext {
         &mut self,
         settings: &Settings,
         kv: Option<&KvIdentityGraph>,
+        seed: &BrowserSeed,
     ) -> Result<(), Report<TrustedServerError>> {
-        if self.ec_value.is_some() {
+        let Some(entry) = self.new_entry_if_needed(settings, seed) else {
             return Ok(());
+        };
+        self.create_entry(settings, kv, entry, MAX_CREATE_ATTEMPTS)
+    }
+
+    /// Mints an EC ID as [`generate_if_needed`](Self::generate_if_needed)
+    /// would, but keeps its row for
+    /// [`complete_deferred_create`](Self::complete_deferred_create), so a new
+    /// visitor's hold-mode providers can join the create (spec 4.7).
+    ///
+    /// No row exists until the create, so nothing may disclose the ID before
+    /// it: the hold dispatch calls no provider that reads it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client IP is unavailable or HMAC generation
+    /// fails.
+    pub fn mint_deferred(
+        &mut self,
+        settings: &Settings,
+        seed: &BrowserSeed,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let Some(entry) = self.new_entry_if_needed(settings, seed) else {
+            return Ok(());
+        };
+        let ec_id = generation::generate_ec_id(settings, self.require_client_ip()?)?;
+        log::info!(
+            "Minted new EC ID with a deferred create: {}",
+            log_id(&ec_id)
+        );
+        self.ec_value = Some(ec_id);
+        self.ec_generated = true;
+        self.deferred_create = Some(Box::new(entry));
+        Ok(())
+    }
+
+    /// Creates the row [`mint_deferred`](Self::mint_deferred) kept, with
+    /// whatever the hold dispatch added. Does nothing without one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the create fails or no unique ID is found.
+    pub fn complete_deferred_create(
+        &mut self,
+        settings: &Settings,
+        kv: Option<&KvIdentityGraph>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let Some(entry) = self.deferred_create.take() else {
+            return Ok(());
+        };
+        // One attempt: the auction may already hold the minted ID, so a
+        // collision fails the create instead of minting another.
+        self.create_entry(settings, kv, *entry, 1)
+    }
+
+    /// Whether a minted EC still waits for its create.
+    #[must_use]
+    pub fn has_deferred_create(&self) -> bool {
+        self.deferred_create.is_some()
+    }
+
+    /// The row a minted EC will be created with.
+    #[must_use]
+    pub(crate) fn deferred_entry(&self) -> Option<&KvEntry> {
+        self.deferred_create.as_deref()
+    }
+
+    /// Replaces the row a minted EC will be created with.
+    pub(crate) fn set_deferred_entry(&mut self, entry: KvEntry) {
+        if self.deferred_create.is_some() {
+            self.deferred_create = Some(Box::new(entry));
+        }
+    }
+
+    /// The new row for a request without an EC whose consent allows one, or
+    /// `None` when it needs none.
+    fn new_entry_if_needed(&self, settings: &Settings, seed: &BrowserSeed) -> Option<KvEntry> {
+        if self.ec_value.is_some() {
+            return None;
         }
 
         if !consent::ec_consent_granted(&self.consent) {
@@ -395,32 +499,61 @@ impl EcContext {
                 "EC generation skipped: consent not granted (jurisdiction={})",
                 self.consent.jurisdiction,
             );
-            return Ok(());
+            return None;
         }
 
-        let client_ip = self.client_ip.as_deref().ok_or_else(|| {
+        if self.revoke_blocks_minting() {
+            log::info!("EC generation skipped: a global revoke holds until consent changes");
+            return None;
+        }
+
+        let mut entry = KvEntry::new(
+            &self.consent,
+            self.geo_info.as_ref(),
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        entry.device = self
+            .device_signals
+            .as_ref()
+            .map(DeviceSignals::to_kv_device);
+        apply_partner_id_updates(&mut entry, seed.updates());
+        Some(entry)
+    }
+
+    fn require_client_ip(&self) -> Result<&str, Report<TrustedServerError>> {
+        self.client_ip.as_deref().ok_or_else(|| {
             Report::new(TrustedServerError::EdgeCookie {
                 message: "Client IP required for EC generation but unavailable".to_owned(),
             })
-        })?;
+        })
+    }
 
-        const MAX_CREATE_ATTEMPTS: usize = 5;
-        for attempt in 0..MAX_CREATE_ATTEMPTS {
-            let ec_id = generation::generate_ec_id(settings, client_ip)?;
-            log::info!("Generated new EC ID: {}", log_id(&ec_id));
-            let now = current_timestamp();
-            let mut entry = KvEntry::new(
-                &self.consent,
-                self.geo_info.as_ref(),
-                now,
-                &settings.publisher.domain,
-            );
-            entry.device = self
-                .device_signals
-                .as_ref()
-                .map(DeviceSignals::to_kv_device);
+    /// Creates `entry` under the minted EC ID, or a fresh one, retrying an ID
+    /// collision with a fresh ID.
+    fn create_entry(
+        &mut self,
+        settings: &Settings,
+        kv: Option<&KvIdentityGraph>,
+        entry: KvEntry,
+        max_attempts: usize,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let client_ip = self.require_client_ip()?.to_owned();
+        let mut minted = self.ec_value.take();
+        self.ec_generated = false;
+
+        for attempt in 0..max_attempts {
+            let ec_id = match minted.take() {
+                Some(ec_id) => ec_id,
+                None => {
+                    let ec_id = generation::generate_ec_id(settings, &client_ip)?;
+                    log::info!("Generated new EC ID: {}", log_id(&ec_id));
+                    ec_id
+                }
+            };
 
             if let Some(graph) = kv {
+                self.identity.record_create_attempt();
                 match graph.create_if_absent(&ec_id, &entry) {
                     Ok(CreateIfAbsentOutcome::Written) => {
                         self.kv_snapshot = EcKvSnapshot::Present {
@@ -431,7 +564,7 @@ impl EcContext {
                     }
                     Ok(CreateIfAbsentOutcome::AlreadyExists) => {
                         log::warn!(
-                            "Generated EC ID collision on attempt {}/{MAX_CREATE_ATTEMPTS}",
+                            "Generated EC ID collision on attempt {}/{max_attempts}",
                             attempt + 1
                         );
                         continue;
@@ -451,14 +584,11 @@ impl EcContext {
 
             self.ec_value = Some(ec_id);
             self.ec_generated = true;
-            self.pull_sync_marker.invalidate_for_replaced_ec();
             return Ok(());
         }
 
         Err(Report::new(TrustedServerError::EdgeCookie {
-            message: format!(
-                "Failed to allocate a unique EC ID after {MAX_CREATE_ATTEMPTS} attempts"
-            ),
+            message: format!("Failed to allocate a unique EC ID after {max_attempts} attempts"),
         }))
     }
 
@@ -514,6 +644,209 @@ impl EcContext {
         self.device_signals = Some(signals);
     }
 
+    /// Builds the `identity request measurement` for this request after
+    /// phase 4 (spec 14, step 1).
+    ///
+    /// The route kind is `new_ec` for a request that generated an EC,
+    /// `writer` for the one browser-driven writer, and `stager` otherwise.
+    #[must_use]
+    pub fn identity_measurement(&self, input: &MeasurementInput<'_>) -> IdentityMeasurement {
+        let route = if self.ec_generated {
+            RouteKind::NewEc
+        } else if self.identity.writer() {
+            RouteKind::Writer
+        } else {
+            RouteKind::Stager
+        };
+        IdentityMeasurement {
+            cookie_header_bytes: self.identity.cookie_header_bytes(),
+            route,
+            // A snapshot that came from the new-EC create read nothing, and
+            // each create attempt is one write made before routing.
+            kv_reads: input
+                .kv_reads
+                .saturating_add(u32::from(
+                    input.phase_one_read && self.identity.create_attempts() == 0,
+                ))
+                .saturating_add(self.identity.capture_kv_reads()),
+            // The capture's pre-send reads and writes go through the
+            // request-state graph, which the adapter's counters do not see.
+            kv_writes: input
+                .kv_writes
+                .saturating_add(self.identity.create_attempts())
+                .saturating_add(self.identity.capture_kv_writes()),
+            flush: input.flush.copied(),
+            removal_lost: self.identity.removal_lost(),
+            removal_deferred: self.identity.removal_deferred(),
+            withdrawal_after_send: input.withdrawal_after_send,
+            withdrawal_after_send_failed: input.withdrawal_after_send_failed,
+            capture_unpersisted: self.identity.capture_unpersisted().clone(),
+        }
+    }
+
+    /// Asks finalize to run the consent-withdrawal tombstone path for this
+    /// request, as a `revoke_scope = "global"` capture does from any client
+    /// (spec 8).
+    pub(crate) fn request_global_revoke(&mut self) {
+        self.identity.request_global_revoke();
+    }
+
+    /// Whether the request carries a global-revoke marker for its own
+    /// consent, which stops EC minting (spec 8).
+    #[must_use]
+    pub(crate) fn revoke_blocks_minting(&self) -> bool {
+        self.revoke_marker.as_deref() == Some(cookies::revoke_marker_value(&self.consent).as_str())
+    }
+
+    /// Whether the request carries a global-revoke marker at all.
+    #[must_use]
+    pub(crate) fn has_revoke_marker(&self) -> bool {
+        self.revoke_marker.is_some()
+    }
+
+    /// Sets the request's global-revoke marker, as if it carried the cookie.
+    #[cfg(test)]
+    pub(crate) fn set_revoke_marker_for_test(&mut self, marker: &str) {
+        self.revoke_marker = Some(marker.to_owned());
+    }
+
+    /// Whether a capture asked for the consent-withdrawal tombstone path.
+    /// The adapter gives finalize the identity graph when it did.
+    #[must_use]
+    pub fn global_revoke_requested(&self) -> bool {
+        self.identity.global_revoke_requested()
+    }
+
+    /// The identity state this request decides and collects.
+    #[must_use]
+    pub(crate) fn identity(&self) -> &RequestIdentity {
+        &self.identity
+    }
+
+    /// The identity state this request decides and collects, to fill.
+    pub(crate) fn identity_mut(&mut self) -> &mut RequestIdentity {
+        &mut self.identity
+    }
+
+    /// Gives the request the identity runtime built for the settings load.
+    ///
+    /// The adapter calls this where it builds the request's EC state.
+    pub fn set_identity_runtime(&mut self, runtime: Arc<IdentityRuntime>) {
+        self.identity.set_runtime(runtime);
+    }
+
+    /// Turns the `ts-eids-s` mirror on for this request, keeping its provider
+    /// catalog, or with no provider when it has no runtime yet.
+    #[cfg(test)]
+    pub(crate) fn enable_mirror_for_test(&mut self) {
+        let runtime = match self.identity_runtime() {
+            Some(runtime) => runtime.with_mirror_enabled(),
+            None => IdentityRuntime::from_settings_with_providers(
+                &crate::test_support::tests::create_test_settings(),
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+            )
+            .expect("should build an empty runtime")
+            .with_mirror_enabled(),
+        };
+        self.set_identity_runtime(Arc::new(runtime));
+    }
+
+    /// Gives the request the limiter that counts provider calls for the burst
+    /// cap and the circuit breaker before the response is sent.
+    pub fn set_identity_rate_limiter(&mut self, limiter: Arc<dyn RateLimiter + Send + Sync>) {
+        self.identity.set_rate_limiter(limiter);
+    }
+
+    /// The identity runtime, when the adapter set one.
+    #[must_use]
+    pub(crate) fn identity_runtime(&self) -> Option<&IdentityRuntime> {
+        self.identity.runtime().map(Arc::as_ref)
+    }
+
+    /// Records whether the request passed the real-browser check, for a route
+    /// that is never the writer.
+    pub fn set_real_browser(&mut self, is_real_browser: bool) {
+        self.identity.set_real_browser(is_real_browser);
+    }
+
+    /// Decides whether this request is the one browser-driven identity writer.
+    ///
+    /// Only an organic real-browser top-level document navigation that is not
+    /// a prefetch writes (spec 5.1). Also captures the user agent, `DNT` and
+    /// the page URL without query or fragment.
+    ///
+    /// The page URL is read from the request URI, so it needs an absolute
+    /// URI. The Fastly adapter gives one (`edgezero-adapter-fastly` builds the
+    /// request from `get_url_str()`); a request with an origin-form URI has no
+    /// page URL, and a provider that wants the `PageUrl` input is then not
+    /// due.
+    pub fn decide_writer(
+        &mut self,
+        req: &Request<EdgeBody>,
+        organic_route: bool,
+        is_real_browser: bool,
+    ) {
+        let writer = organic_route
+            && is_document_navigation(req)
+            && !is_prefetch_request(req)
+            && is_real_browser;
+        let user_agent = req
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let dnt = req
+            .headers()
+            .get("dnt")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim() == "1");
+        let page_url = Url::parse(&req.uri().to_string()).ok().map(|mut url| {
+            url.set_query(None);
+            url.set_fragment(None);
+            url
+        });
+        self.identity.set_writer_decision(WriterDecision {
+            writer,
+            is_real_browser,
+            user_agent,
+            dnt,
+            page_url,
+        });
+    }
+
+    /// Decides whether a `/_ts/page-bids` call is the SPA writer (spec 5.1):
+    /// a real browser, `Sec-Fetch-Site: same-origin` and an interval above
+    /// zero. The flush then checks the interval against the row's last
+    /// writer flush. Reads the real-browser flag set earlier with
+    /// [`set_real_browser`](Self::set_real_browser).
+    pub fn decide_spa_writer(&mut self, req: &Request<EdgeBody>, interval_sec: u64) {
+        let same_origin = req
+            .headers()
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok())
+            == Some("same-origin");
+        if !(same_origin && interval_sec > 0 && self.identity.is_real_browser()) {
+            return;
+        }
+        self.identity.set_writer_decision(WriterDecision {
+            writer: true,
+            is_real_browser: true,
+            user_agent: req
+                .headers()
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            dnt: req
+                .headers()
+                .get("dnt")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.trim() == "1"),
+            page_url: None,
+        });
+        self.identity.set_spa_writer(true);
+    }
+
     /// Returns the device signals, if set.
     #[must_use]
     pub fn device_signals(&self) -> Option<&DeviceSignals> {
@@ -536,6 +869,49 @@ impl EcContext {
     #[must_use]
     pub fn kv_snapshot(&self) -> &EcKvSnapshot {
         &self.kv_snapshot
+    }
+
+    /// Returns the withdrawn EC IDs whose tombstone has failed and not yet
+    /// succeeded.
+    ///
+    /// Before the after-send retry these are the before-send failures. After
+    /// it, only the IDs that failed a second time remain, which is what the
+    /// failure counters count.
+    #[must_use]
+    pub(crate) fn failed_withdrawals(&self) -> &[String] {
+        &self.failed_withdrawals
+    }
+
+    /// Whether any withdrawn EC ID's tombstone is still unwritten.
+    #[must_use]
+    pub fn has_failed_withdrawals(&self) -> bool {
+        !self.failed_withdrawals.is_empty()
+    }
+
+    /// Whether a capture removal write failed before send and awaits its
+    /// one retry after send.
+    #[must_use]
+    pub fn has_pending_removals(&self) -> bool {
+        self.identity.pending_removals().is_some()
+    }
+
+    /// Whether a capture kept positive writes for the pending key, which
+    /// [`identity::flush::defer_capture_writes`] appends after send.
+    #[must_use]
+    pub fn has_capture_writes(&self) -> bool {
+        !self.identity.capture_writes().is_empty()
+    }
+
+    /// Forgets a withdrawn EC ID whose retried tombstone was written.
+    pub(crate) fn clear_failed_withdrawal(&mut self, ec_id: &str) {
+        self.failed_withdrawals.retain(|id| id != ec_id);
+    }
+
+    /// Records a withdrawn EC ID whose before-send tombstone failed.
+    pub(crate) fn record_failed_withdrawal(&mut self, ec_id: &str) {
+        if !self.failed_withdrawals.iter().any(|id| id == ec_id) {
+            self.failed_withdrawals.push(ec_id.to_owned());
+        }
     }
 
     /// Replaces the request-scoped identity-graph snapshot.
@@ -565,55 +941,11 @@ impl EcContext {
         self.recovery_eligible
     }
 
-    /// Records the current request's own EIDs (e.g. an `/auction` body) for
-    /// use by response finalization's KV ingestion.
-    pub(crate) fn set_client_eids(&mut self, eids: Vec<Eid>) {
-        self.client_eids = Some(eids);
-    }
-
-    /// Returns the current request's own EIDs, if the route captured any.
-    #[must_use]
-    pub(crate) fn client_eids(&self) -> Option<&[Eid]> {
-        self.client_eids.as_deref()
-    }
-
-    /// Validates a browser completeness marker against the active EC and partner set.
-    pub(crate) fn validate_pull_sync_marker(
-        &mut self,
-        settings: &Settings,
-        registry: &registry::PartnerRegistry,
-    ) {
-        validate_marker_state(
-            &mut self.pull_sync_marker,
-            settings,
-            registry,
-            self.ec_value.as_deref(),
-        );
-    }
-
-    /// Returns the current pull-sync marker state.
-    #[must_use]
-    pub(crate) fn pull_sync_marker(&self) -> &PullSyncMarkerState {
-        &self.pull_sync_marker
-    }
-
-    /// Returns mutable pull-sync marker state for response reconciliation.
-    pub(crate) fn pull_sync_marker_mut(&mut self) -> &mut PullSyncMarkerState {
-        &mut self.pull_sync_marker
-    }
-
-    /// Sets pull-sync marker state in focused unit tests.
-    #[cfg(test)]
-    pub(crate) fn set_pull_sync_marker_for_test(&mut self, state: PullSyncMarkerState) {
-        self.pull_sync_marker = state;
-    }
-
     /// Replaces an orphaned active ID after its new backing row is persisted.
     pub(crate) fn replace_with_generated(&mut self, ec_id: String, snapshot: EcKvSnapshot) {
         self.ec_value = Some(ec_id);
         self.ec_generated = true;
         self.kv_snapshot = snapshot;
-        self.pull_sync_marker.invalidate_for_replaced_ec();
     }
 
     /// Returns whether EC creation is permitted by consent for this request.
@@ -663,10 +995,32 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
-            client_eids: None,
-            pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            identity: RequestIdentity::default(),
+            failed_withdrawals: Vec::new(),
+            revoke_marker: None,
+            deferred_create: None,
         }
+    }
+
+    /// Creates a test-only [`EcContext`] for a real browser's writer
+    /// navigation, with explicit client IP.
+    #[cfg(test)]
+    #[must_use]
+    pub fn new_writer_for_test_with_ip(
+        ec_value: Option<String>,
+        consent: ConsentContext,
+        client_ip: Option<String>,
+    ) -> Self {
+        let mut context = Self::new_for_test_with_ip(ec_value, consent, client_ip);
+        context.identity.set_writer_decision(WriterDecision {
+            writer: true,
+            is_real_browser: true,
+            user_agent: None,
+            dnt: false,
+            page_url: None,
+        });
+        context
     }
 
     /// Creates a test-only [`EcContext`] with explicit client IP.
@@ -688,9 +1042,11 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
-            client_eids: None,
-            pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            identity: RequestIdentity::default(),
+            failed_withdrawals: Vec::new(),
+            revoke_marker: None,
+            deferred_create: None,
         }
     }
 
@@ -716,9 +1072,11 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
-            client_eids: None,
-            pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            identity: RequestIdentity::default(),
+            failed_withdrawals: Vec::new(),
+            revoke_marker: None,
+            deferred_create: None,
         }
     }
 }
@@ -773,6 +1131,128 @@ mod tests {
     };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+
+    #[test]
+    fn decide_spa_writer_needs_a_same_origin_browser_and_an_interval() {
+        let page_bids = |site: Option<&str>| {
+            let mut builder = Request::builder()
+                .uri("https://www.example.com/_ts/page-bids?path=/a")
+                .header("x-tsjs-page-bids", "1");
+            if let Some(site) = site {
+                builder = builder.header("sec-fetch-site", site);
+            }
+            builder
+                .body(EdgeBody::empty())
+                .expect("should build the request")
+        };
+        let decide = |request: &Request<EdgeBody>, browser: bool, interval: u64| {
+            let mut context = EcContext::default();
+            context.set_real_browser(browser);
+            context.decide_spa_writer(request, interval);
+            (context.identity().writer(), context.identity().spa_writer())
+        };
+
+        assert_eq!(
+            decide(&page_bids(Some("same-origin")), true, 300),
+            (true, true),
+            "should make a same-origin browser page-bids call the SPA writer"
+        );
+        for (name, request, browser, interval) in [
+            ("no Sec-Fetch-Site", page_bids(None), true, 300),
+            ("same-site", page_bids(Some("same-site")), true, 300),
+            ("not a browser", page_bids(Some("same-origin")), false, 300),
+            ("interval off", page_bids(Some("same-origin")), true, 0),
+        ] {
+            assert_eq!(
+                decide(&request, browser, interval),
+                (false, false),
+                "should not be the writer: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_writer_needs_every_condition() {
+        let navigation = || {
+            Request::builder()
+                .uri("https://www.example.com/a?b=c#d")
+                .header("sec-fetch-dest", "document")
+                .header(header::USER_AGENT, "ExampleBrowser/1.0")
+                .header("dnt", "1")
+                .body(EdgeBody::empty())
+                .expect("should build the request")
+        };
+        let mut context = EcContext::default();
+        context.decide_writer(&navigation(), true, true);
+        assert!(
+            context.identity().writer(),
+            "should make an organic real-browser document navigation the writer"
+        );
+        assert!(
+            context.identity().is_real_browser(),
+            "should record the real browser"
+        );
+        assert_eq!(
+            context.identity().page_url().map(Url::as_str),
+            Some("https://www.example.com/a"),
+            "should drop the query and fragment"
+        );
+        assert_eq!(
+            context.identity().user_agent(),
+            Some("ExampleBrowser/1.0"),
+            "should capture the user agent"
+        );
+        assert!(context.identity().dnt(), "should capture DNT");
+
+        for (name, organic, browser, request) in [
+            ("named route", false, true, navigation()),
+            ("bot", true, false, navigation()),
+            (
+                "prefetch",
+                true,
+                true,
+                Request::builder()
+                    .header("sec-fetch-dest", "document")
+                    .header("sec-purpose", "prefetch")
+                    .body(EdgeBody::empty())
+                    .expect("should build the request"),
+            ),
+        ] {
+            let mut context = EcContext::default();
+            context.decide_writer(&request, organic, browser);
+            assert!(
+                !context.identity().writer(),
+                "should not be a writer: {name}"
+            );
+            assert_eq!(
+                context.identity().is_real_browser(),
+                browser,
+                "should keep the real-browser flag: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_writer_has_no_page_url_for_an_origin_form_uri() {
+        let request = Request::builder()
+            .uri("/a?b=c")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build the request");
+        let mut context = EcContext::default();
+
+        context.decide_writer(&request, true, true);
+
+        assert!(
+            context.identity().writer(),
+            "control: the request is still the writer"
+        );
+        assert_eq!(
+            context.identity().page_url(),
+            None,
+            "should have no page URL without an absolute URI"
+        );
+    }
 
     /// [`EcKvStore`] wrapper whose first `collisions` `Add` writes report a
     /// precondition failure, forcing generation to retry with a fresh suffix.
@@ -845,7 +1325,7 @@ mod tests {
             EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()));
         let graph = KvIdentityGraph::new(AddCollidingEcKv::new(2));
 
-        ec.generate_if_needed(&settings, Some(&graph))
+        ec.generate_if_needed(&settings, Some(&graph), &BrowserSeed::empty())
             .expect("should generate after bounded collisions");
 
         assert!(ec.ec_value().is_some(), "should allocate a fresh EC ID");
@@ -857,6 +1337,100 @@ mod tests {
     }
 
     #[test]
+    fn a_revoke_marker_for_this_consent_stops_minting_until_consent_changes() {
+        let settings = create_test_settings();
+        let mint_under = |consent: ConsentContext, marker: &str| {
+            let mut ec =
+                EcContext::new_for_test_with_ip(None, consent, Some("192.0.2.5".to_owned()));
+            ec.set_revoke_marker_for_test(marker);
+            let graph = KvIdentityGraph::in_memory("ec-store");
+            ec.generate_if_needed(&settings, Some(&graph), &BrowserSeed::empty())
+                .expect("should not error");
+            ec.ec_generated()
+        };
+        let same = cookies::revoke_marker_value(&granting_consent());
+        let mut with_gpc = granting_consent();
+        with_gpc.gpc = true;
+        let earlier = cookies::revoke_marker_value(&with_gpc);
+
+        assert_ne!(earlier, same, "precondition: GPC changes the marker value");
+        assert!(
+            !mint_under(granting_consent(), &same),
+            "should not mint while the consent the revoke saw is unchanged"
+        );
+        assert!(
+            mint_under(granting_consent(), &earlier),
+            "should mint once the consent differs from the one the revoke saw"
+        );
+    }
+
+    #[test]
+    fn read_from_request_reads_the_revoke_marker() {
+        let settings = create_test_settings();
+        let req = create_test_request(&[("cookie", "ts-ec-revoked=10009")]);
+
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+
+        assert!(ec.has_revoke_marker(), "should read the marker cookie");
+        let plain =
+            EcContext::read_from_request(&settings, &create_test_request(&[]), &noop_services())
+                .expect("should read EC context");
+        assert!(!plain.has_revoke_marker(), "control: no cookie, no marker");
+    }
+
+    #[test]
+    fn mint_deferred_writes_nothing_until_the_create() {
+        let settings = create_test_settings();
+        let graph = KvIdentityGraph::in_memory("ec-store");
+        let mut ec =
+            EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()));
+
+        ec.mint_deferred(&settings, &BrowserSeed::empty())
+            .expect("should mint");
+
+        let ec_id = ec.ec_value().expect("should hold the minted ID").to_owned();
+        assert!(ec.has_deferred_create(), "should keep the row for later");
+        assert!(
+            graph.get(&ec_id).expect("should read").is_none(),
+            "should write nothing yet"
+        );
+
+        ec.complete_deferred_create(&settings, Some(&graph))
+            .expect("should create");
+
+        assert_eq!(
+            ec.ec_value(),
+            Some(ec_id.as_str()),
+            "should keep the minted ID"
+        );
+        assert!(
+            graph.get(&ec_id).expect("should read").is_some(),
+            "should create the row"
+        );
+        assert!(
+            matches!(ec.kv_snapshot(), EcKvSnapshot::Present { .. }),
+            "should hold the created row"
+        );
+    }
+
+    #[test]
+    fn deferred_create_fails_on_a_collision_instead_of_reminting() {
+        let settings = create_test_settings();
+        let graph = KvIdentityGraph::new(AddCollidingEcKv::new(1));
+        let mut ec =
+            EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()));
+        ec.mint_deferred(&settings, &BrowserSeed::empty())
+            .expect("should mint");
+
+        let result = ec.complete_deferred_create(&settings, Some(&graph));
+
+        assert!(result.is_err(), "should fail rather than mint another ID");
+        assert!(ec.ec_value().is_none(), "should keep no EC");
+        assert!(!ec.ec_generated(), "should not count as generated");
+    }
+
+    #[test]
     fn generate_if_needed_errors_after_collision_exhaustion() {
         let settings = create_test_settings();
         let mut ec =
@@ -864,7 +1438,7 @@ mod tests {
         // Collide on every attempt so the bounded retry is exhausted.
         let graph = KvIdentityGraph::new(AddCollidingEcKv::new(u32::MAX));
 
-        let result = ec.generate_if_needed(&settings, Some(&graph));
+        let result = ec.generate_if_needed(&settings, Some(&graph), &BrowserSeed::empty());
 
         assert!(result.is_err(), "should fail after exhausting attempts");
         assert!(
@@ -1085,7 +1659,7 @@ mod tests {
 
         let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
             .expect("should read EC context");
-        ec.generate_if_needed(&settings, None)
+        ec.generate_if_needed(&settings, None, &BrowserSeed::empty())
             .expect("should not error when EC already exists");
 
         assert_eq!(

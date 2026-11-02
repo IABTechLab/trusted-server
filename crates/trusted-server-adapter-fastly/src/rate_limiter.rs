@@ -22,6 +22,31 @@ fn effective_hourly_limit(hourly_limit: u32) -> u32 {
     hourly_limit_to_per_minute_limit(hourly_limit).saturating_mul(60)
 }
 
+/// The two counter calls the breaker uses, so tests can fake them.
+trait CounterOps {
+    fn increment(&self, key: &str) -> Result<(), String>;
+    fn lookup_count(&self, key: &str) -> Result<u32, String>;
+}
+
+fn counter_error(action: &str, message: &str) -> Report<TrustedServerError> {
+    Report::new(TrustedServerError::KvStore {
+        store_name: RATE_COUNTER_NAME.to_owned(),
+        message: format!("Failed to {action} sync rate counter: {message}"),
+    })
+}
+
+fn record_with(counter: &dyn CounterOps, key: &str) -> Result<(), Report<TrustedServerError>> {
+    counter
+        .increment(key)
+        .map_err(|message| counter_error("increment", &message))
+}
+
+fn count_with(counter: &dyn CounterOps, key: &str) -> Result<u32, Report<TrustedServerError>> {
+    counter
+        .lookup_count(key)
+        .map_err(|message| counter_error("read", &message))
+}
+
 /// Fastly Edge Rate Limiting implementation of [`RateLimiter`].
 pub struct FastlyRateLimiter {
     counter: RateCounter,
@@ -72,11 +97,125 @@ impl RateLimiter for FastlyRateLimiter {
 
         Ok(false)
     }
+
+    fn record(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+        record_with(&self.counter, key)
+    }
+
+    fn count(&self, key: &str) -> Result<u32, Report<TrustedServerError>> {
+        count_with(&self.counter, key)
+    }
+}
+
+impl CounterOps for RateCounter {
+    fn increment(&self, key: &str) -> Result<(), String> {
+        RateCounter::increment(self, key, 1).map_err(|error| error.to_string())
+    }
+
+    fn lookup_count(&self, key: &str) -> Result<u32, String> {
+        RateCounter::lookup_count(self, key, CounterDuration::SixtySecs)
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
+
+    struct FakeCounter {
+        increments: RefCell<Vec<String>>,
+        lookups: RefCell<Vec<String>>,
+        count: u32,
+        fail: bool,
+    }
+
+    impl FakeCounter {
+        fn new(count: u32, fail: bool) -> Self {
+            Self {
+                increments: RefCell::new(Vec::new()),
+                lookups: RefCell::new(Vec::new()),
+                count,
+                fail,
+            }
+        }
+    }
+
+    impl CounterOps for FakeCounter {
+        fn increment(&self, key: &str) -> Result<(), String> {
+            self.increments.borrow_mut().push(key.to_owned());
+            if self.fail {
+                return Err("counter unavailable".to_owned());
+            }
+            Ok(())
+        }
+
+        fn lookup_count(&self, key: &str) -> Result<u32, String> {
+            self.lookups.borrow_mut().push(key.to_owned());
+            if self.fail {
+                return Err("counter unavailable".to_owned());
+            }
+            Ok(self.count)
+        }
+    }
+
+    #[test]
+    fn record_increments_once() {
+        let counter = FakeCounter::new(0, false);
+
+        record_with(&counter, "identity-fail:example")
+            .expect("should record against a working counter");
+
+        assert_eq!(
+            *counter.increments.borrow(),
+            vec!["identity-fail:example".to_owned()],
+            "should increment the key exactly once"
+        );
+        assert!(
+            counter.lookups.borrow().is_empty(),
+            "should not read the count while recording"
+        );
+    }
+
+    #[test]
+    fn count_reads_the_sixty_second_window() {
+        let counter = FakeCounter::new(7, false);
+
+        let count = count_with(&counter, "identity-fail:example")
+            .expect("should count against a working counter");
+
+        assert_eq!(count, 7, "should return the counter's value");
+        assert_eq!(
+            *counter.lookups.borrow(),
+            vec!["identity-fail:example".to_owned()],
+            "should look the key up once"
+        );
+        assert!(
+            counter.increments.borrow().is_empty(),
+            "should not change the count while reading it"
+        );
+    }
+
+    #[test]
+    fn counter_errors_map_to_kv_store_errors() {
+        let counter = FakeCounter::new(0, true);
+
+        let record_error = record_with(&counter, "identity-fail:example")
+            .expect_err("should fail when the increment fails");
+        let count_error = count_with(&counter, "identity-fail:example")
+            .expect_err("should fail when the lookup fails");
+
+        for error in [record_error, count_error] {
+            assert!(
+                matches!(
+                    error.current_context(),
+                    TrustedServerError::KvStore { store_name, .. } if store_name == RATE_COUNTER_NAME
+                ),
+                "should map the failure to a KV store error naming the counter"
+            );
+        }
+    }
 
     #[test]
     fn zero_hourly_limit_denies_all() {

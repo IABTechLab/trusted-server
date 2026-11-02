@@ -24,6 +24,7 @@
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
 //! | GET | `/_ts/admin/ec` | [`handle_admin_ec_lookup`] |
 //! | GET | `/_ts/admin/ec/{id}` | [`handle_admin_ec_lookup`] |
+//! | DELETE | `/_ts/admin/ec/{id}/providers/{provider}/opt-out` | [`handle_admin_opt_out_clear`] |
 //! | GET | `/_ts/admin/eids` | [`handle_admin_eids_lookup`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
@@ -109,11 +110,14 @@ use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
+    handle_admin_opt_out_clear,
 };
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
+use trusted_server_core::ec::finalize::{BrowserSeed, browser_seed};
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
+use trusted_server_core::ec::identity::IdentityRuntime;
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
@@ -125,7 +129,8 @@ use trusted_server_core::integrations::{
     RequestFilterRegistryOutcome,
 };
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformGeo as _, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, PlatformGeo, PlatformHttpClient, PlatformKvStore, RuntimeServices,
+    StoreName,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -193,6 +198,18 @@ pub(crate) struct AppState {
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
+    /// Identity providers, keys and policy, built once per settings load.
+    pub(crate) identity: Arc<IdentityRuntime>,
+    /// The identity graph over `ec.ec_store`, built once. `None` when no
+    /// store is configured.
+    pub(crate) identity_graph: Option<KvIdentityGraph>,
+    /// Replaces the Fastly HTTP client in tests, so a request reaches a
+    /// scripted origin and bidder instead of the network.
+    #[cfg(test)]
+    pub(crate) http_client_for_test: Option<Arc<dyn PlatformHttpClient>>,
+    /// Replaces the Fastly geolocation in tests, which Viceroy does not serve.
+    #[cfg(test)]
+    pub(crate) geo_for_test: Option<Arc<dyn PlatformGeo>>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -219,6 +236,49 @@ pub(crate) fn load_settings_from_config_store(
     )
 }
 
+/// Builds the identity runtime for one settings load.
+///
+/// # Errors
+///
+/// Returns an error when a provider cannot be described or the catalog rules fail.
+pub(crate) fn build_identity_runtime(
+    settings: &Settings,
+    integrations: &IntegrationRegistry,
+) -> Result<Arc<IdentityRuntime>, Report<TrustedServerError>> {
+    IdentityRuntime::from_settings(settings, integrations).map(Arc::new)
+}
+
+/// Builds the identity runtime for settings loaded without application
+/// state, from the integration registry those settings describe.
+///
+/// A plan or registry failure is logged and the runtime is built with no
+/// registered providers, so generic pull providers still run.
+///
+/// # Errors
+///
+/// Returns an error when the identity runtime cannot be built.
+pub(crate) fn build_identity_runtime_from_reloaded_settings(
+    settings: &Settings,
+) -> Result<Arc<IdentityRuntime>, Report<TrustedServerError>> {
+    let registry = compile_auction_plan(settings)
+        .and_then(|plan| IntegrationRegistry::with_plan(settings, Arc::new(plan)));
+    identity_runtime_from_registry_result(settings, registry)
+}
+
+fn identity_runtime_from_registry_result(
+    settings: &Settings,
+    registry: Result<IntegrationRegistry, Report<TrustedServerError>>,
+) -> Result<Arc<IdentityRuntime>, Report<TrustedServerError>> {
+    let registry = registry.unwrap_or_else(|error| {
+        log::warn!(
+            "identity runtime built without registered providers: integration registry unavailable after settings reload: {}",
+            error.current_context()
+        );
+        IntegrationRegistry::default()
+    });
+    build_identity_runtime(settings, &registry)
+}
+
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
@@ -228,17 +288,69 @@ pub(crate) fn build_state_from_settings(
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+    let identity = build_identity_runtime(&settings, &registry)?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
+    let identity_graph = crate::maybe_identity_graph(&settings);
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         default_kv_store,
+        identity_graph,
         auction_telemetry_sink,
+        identity,
+        #[cfg(test)]
+        http_client_for_test: None,
+        #[cfg(test)]
+        geo_for_test: None,
     }))
+}
+
+/// Builds application state from `settings` with `graph` as its identity
+/// graph, so routing, finalize and the after-send flush all use one store.
+#[cfg(test)]
+pub(crate) fn app_state_with_graph_for_test(
+    settings: Settings,
+    graph: KvIdentityGraph,
+) -> Arc<AppState> {
+    let state = build_state_from_settings(settings).expect("should build app state from settings");
+    let mut state = Arc::try_unwrap(state)
+        .unwrap_or_else(|_| unreachable!("a freshly built state should have one owner"));
+    state.identity_graph = Some(graph);
+    Arc::new(state)
+}
+
+/// `state` with `identity` as its identity runtime, for a request that
+/// reaches a provider no configuration can name.
+#[cfg(test)]
+pub(crate) fn app_state_with_identity_for_test(
+    state: Arc<AppState>,
+    identity: IdentityRuntime,
+) -> Arc<AppState> {
+    let mut state = Arc::try_unwrap(state)
+        .unwrap_or_else(|_| unreachable!("a freshly built state should have one owner"));
+    state.identity = Arc::new(identity);
+    Arc::new(state)
+}
+
+/// As [`app_state_with_graph_for_test`], with `client` answering every
+/// outbound request the routes make and `geo` locating every client.
+#[cfg(test)]
+pub(crate) fn app_state_with_network_for_test(
+    settings: Settings,
+    graph: KvIdentityGraph,
+    client: Arc<dyn PlatformHttpClient>,
+    geo: Arc<dyn PlatformGeo>,
+) -> Arc<AppState> {
+    let state = app_state_with_graph_for_test(settings, graph);
+    let mut state = Arc::try_unwrap(state)
+        .unwrap_or_else(|_| unreachable!("a freshly built state should have one owner"));
+    state.http_client_for_test = Some(client);
+    state.geo_for_test = Some(geo);
+    Arc::new(state)
 }
 
 fn warn_if_certificate_check_disabled(settings: &Settings) {
@@ -267,6 +379,13 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     // No cooperative timer is installed: Fastly host calls block. EOF consumers
     // must bound their own transport calls using the remaining finish budget.
+    let http_client: Arc<dyn PlatformHttpClient> = Arc::new(FastlyPlatformHttpClient::default());
+    #[cfg(test)]
+    let http_client = state.http_client_for_test.clone().unwrap_or(http_client);
+    let geo: Arc<dyn PlatformGeo> = Arc::new(FastlyPlatformGeo);
+    #[cfg(test)]
+    let geo = state.geo_for_test.clone().unwrap_or(geo);
+
     let client_info = ctx
         .request()
         .extensions()
@@ -287,8 +406,8 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .template_cache(Arc::new(crate::template_cache::FastlyTemplateCache::new()))
         .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
         .backend(Arc::new(FastlyPlatformBackend))
-        .http_client(Arc::new(FastlyPlatformHttpClient))
-        .geo(Arc::new(FastlyPlatformGeo))
+        .http_client(http_client)
+        .geo(geo)
         .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
         .build()
@@ -325,21 +444,20 @@ const TSJS_ROUTE_TEMPLATE: &str = "/static/tsjs=*";
 ///
 /// `edgezero_main` pops this from the response after dispatch and runs
 /// [`trusted_server_core::ec::finalize::ec_finalize_response`] plus the
-/// pull-sync hook on the converted fastly response — the same EC response
+/// after-send identity flush on the converted fastly response — the same EC response
 /// lifecycle the legacy path drives through `RouteResult`.
 #[derive(Clone)]
 pub(crate) struct EcFinalizeState {
     pub(crate) ec_context: EcContext,
     /// Whether EC finalization may write to the KV identity graph.
-    /// `KvIdentityGraph` wraps a non-`Sync` `dyn EcKvStore` and cannot ride
-    /// in response extensions, so `edgezero_main` rebuilds the graph from
-    /// settings when this is set.
+    /// `edgezero_main` takes the graph from application state when this is
+    /// set.
     pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid_cookie: Option<String>,
     pub(crate) is_real_browser: bool,
-    /// Per-request services carried to the entry point so the pull-sync
-    /// dispatcher can reuse the same platform HTTP client.
+    /// Per-request services carried to the entry point so the after-send
+    /// providers reuse the same platform HTTP client.
     pub(crate) services: RuntimeServices,
 }
 
@@ -351,6 +469,11 @@ struct EcRequestState {
     ec_context: EcContext,
     kv_graph: Option<KvIdentityGraph>,
     finalize_kv_graph: Option<KvIdentityGraph>,
+    /// The graph integration proxy dispatch gets, for every client: a
+    /// proxied capture's removals and opt-outs are revocations and keep the
+    /// write path, as consent withdrawals do (spec 4.7). EC generation on
+    /// that route checks the real-browser flag itself.
+    proxy_kv_graph: Option<KvIdentityGraph>,
     eids_cookie: Option<String>,
     sharedid_cookie: Option<String>,
     is_real_browser: bool,
@@ -368,9 +491,12 @@ struct EcRequestState {
 
 impl EcRequestState {
     fn into_finalize_state(self) -> EcFinalizeState {
+        // A global revoke is a withdrawal from any client (spec 8).
+        let use_finalize_kv =
+            self.finalize_kv_graph.is_some() || self.ec_context.global_revoke_requested();
         EcFinalizeState {
             ec_context: self.ec_context,
-            use_finalize_kv: self.finalize_kv_graph.is_some(),
+            use_finalize_kv,
             eids_cookie: self.eids_cookie,
             sharedid_cookie: self.sharedid_cookie,
             is_real_browser: self.is_real_browser,
@@ -386,6 +512,30 @@ impl EcRequestState {
         match &self.geo_info {
             Some(info) => GeoLookupState::Resolved(info.clone()),
             None => GeoLookupState::Attempted,
+        }
+    }
+}
+
+/// Collects the request's browser ingest for a new EC's one create.
+///
+/// An unreadable partner registry yields an empty seed: the create still
+/// happens, without the ingest.
+fn browser_seed_for(state: &AppState, ec: &EcRequestState) -> BrowserSeed {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    match PartnerRegistry::from_config(&state.settings.ec.partners) {
+        Ok(registry) => browser_seed(
+            &state.settings,
+            &registry,
+            ec.ec_context.consent(),
+            ec.eids_cookie.as_deref(),
+            ec.sharedid_cookie.as_deref(),
+            now,
+        ),
+        Err(err) => {
+            log::warn!("Browser ingest skipped: partner registry is unavailable: {err:?}");
+            BrowserSeed::empty()
         }
     }
 }
@@ -425,10 +575,11 @@ fn device_signals_for(req: &Request) -> DeviceSignals {
 /// Builds the per-request EC state, mirroring the pre-routing prelude of the
 /// legacy `route_request` step by step.
 fn build_ec_request_state(
-    settings: &Settings,
+    state: &AppState,
     services: &RuntimeServices,
     req: &Request,
 ) -> EcRequestState {
+    let settings = &*state.settings;
     let device_signals = device_signals_for(req);
     let is_real_browser = device_signals.looks_like_browser();
     if !is_real_browser {
@@ -459,6 +610,10 @@ fn build_ec_request_state(
         match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
+                context.set_real_browser(is_real_browser);
+                context.set_identity_runtime(Arc::clone(&state.identity));
+                context
+                    .set_identity_rate_limiter(Arc::new(FastlyRateLimiter::new(RATE_COUNTER_NAME)));
                 // Orphan-recovery eligibility is intentionally left false here.
                 // Authorizing it during generic pre-routing would let named
                 // routes and request-filter short circuits (e.g. a DataDome
@@ -474,7 +629,15 @@ fn build_ec_request_state(
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
     // consent withdrawals. Revocations keep the write path so tombstones stay
     // authoritative even for privacy-extension-heavy clients.
-    let kv_graph = crate::identity_graph_with_timing(settings, &timings);
+    let kv_graph = state
+        .identity_graph
+        .clone()
+        .map(|graph| graph.with_request_timings(&timings));
+    let proxy_kv_graph = if setup_error.is_none() {
+        kv_graph.clone()
+    } else {
+        None
+    };
     let finalize_kv_graph = if setup_error.is_none()
         && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
     {
@@ -488,6 +651,7 @@ fn build_ec_request_state(
         ec_context,
         kv_graph,
         finalize_kv_graph,
+        proxy_kv_graph,
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
@@ -608,6 +772,17 @@ async fn execute_named(
     // These diagnostics are read-only. Running the normal EC lifecycle would
     // attach finalization state and could ingest request cookies into KV after
     // the handler returns, violating that contract.
+    // The opt-out clear writes one KV row through the removal write, never the
+    // request's cookies, so it skips the EC lifecycle for the same reason.
+    if matches!(handler, NamedRouteHandler::AdminOptOutClear) {
+        let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
+        let graph = state
+            .identity_graph
+            .clone()
+            .map(|graph| graph.with_request_timings(&timings));
+        return Ok(handle_admin_opt_out_clear(graph.as_ref(), &req));
+    }
+
     if matches!(
         handler,
         NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
@@ -620,8 +795,16 @@ async fn execute_named(
                     // authenticated diagnostic.
                     let timings =
                         RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
-                    let kv = crate::identity_graph_with_timing(&state.settings, &timings);
-                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
+                    let kv = state
+                        .identity_graph
+                        .clone()
+                        .map(|graph| graph.with_request_timings(&timings));
+                    handle_admin_ec_lookup(
+                        kv.as_ref(),
+                        &registry,
+                        Some(state.identity.as_ref()),
+                        &req,
+                    )
                 }
                 NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
                 _ => unreachable!("admin diagnostics should use early dispatch"),
@@ -637,7 +820,7 @@ async fn execute_named(
         return Ok(http_error(&report));
     }
 
-    let mut ec = build_ec_request_state(&state.settings, &services, &req);
+    let mut ec = build_ec_request_state(&state, &services, &req);
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
     if let Some(report) = ec.setup_error.take() {
@@ -685,6 +868,9 @@ async fn run_named_route(
         NamedRouteHandler::AdminCachePurge => {
             unreachable!("cache purge should be handled before EC setup")
         }
+        NamedRouteHandler::AdminOptOutClear => {
+            unreachable!("opt-out clear should be handled before EC setup")
+        }
         NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
         NamedRouteHandler::BatchSync => {
             // Dispatched by execute_named before EC state is built.
@@ -695,7 +881,10 @@ async fn run_named_route(
                 cors_preflight_identify(&state.settings, &req)
             } else {
                 let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
-                let kv = crate::require_identity_graph_with_timing(&state.settings, &timings)?;
+                let kv = match state.identity_graph.clone() {
+                    Some(graph) => graph.with_request_timings(&timings),
+                    None => crate::require_identity_graph_with_timing(&state.settings, &timings)?,
+                };
                 let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
                 handle_identify(
                     &state.settings,
@@ -775,8 +964,7 @@ async fn run_named_route(
 /// graph + partner registry + rate limiter, with a default EC context for
 /// response finalization.
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
-    let device_signals = device_signals_for(&req);
-    let is_real_browser = device_signals.looks_like_browser();
+    let is_real_browser = device_signals_for(&req).looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
     let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
@@ -785,7 +973,7 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
         crate::require_identity_graph_with_timing(&state.settings, &timings).and_then(|kv| {
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
             let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-            handle_batch_sync(&kv, &partner_registry, &limiter, req)
+            handle_batch_sync(&kv, &partner_registry, &limiter, &state.identity, req)
         });
 
     let mut response = result.unwrap_or_else(|e| http_error(&e));
@@ -830,7 +1018,7 @@ async fn dispatch_fallback(
         return http_error(&report);
     }
 
-    let mut ec = build_ec_request_state(&state.settings, services, &req);
+    let mut ec = build_ec_request_state(state, services, &req);
     if let Some(report) = ec.setup_error.take() {
         let response = http_error(&report);
         return attach_dispatch_extensions(response, ec, RequestFilterEffects::default());
@@ -872,15 +1060,19 @@ async fn dispatch_fallback(
             route_class: RouteClass::IntegrationProxy,
             route_template: pattern.to_owned(),
         });
+        ec.ec_context.decide_writer(&req, true, ec.is_real_browser);
+        let seed = browser_seed_for(state, &ec);
         state
             .registry
             .handle_proxy(ProxyDispatchInput {
                 method: &method,
                 path: &path,
                 settings: &state.settings,
-                kv: ec.kv_graph.as_ref(),
+                kv: ec.proxy_kv_graph.as_ref(),
                 ec_context: &mut ec.ec_context,
                 services,
+                is_real_browser: ec.is_real_browser,
+                seed: &seed,
                 req,
             })
             .await
@@ -931,15 +1123,23 @@ async fn dispatch_fallback(
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
         let is_navigation = is_navigation_request(&req);
+        ec.ec_context.decide_writer(&req, true, ec.is_real_browser);
         if is_navigation {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Navigation);
         }
         let is_publisher_navigation = ec.is_real_browser && is_navigation;
-        if is_publisher_navigation
-            && let Err(err) = ec
-                .ec_context
-                .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
-        {
+        let seed = browser_seed_for(state, &ec);
+        // With a hold-mode provider that can run before the row exists, the
+        // create waits for it inside the publisher handler (spec 4.7).
+        let minted = if !is_publisher_navigation {
+            Ok(())
+        } else if state.identity.holds_on_first_navigation() {
+            ec.ec_context.mint_deferred(&state.settings, &seed)
+        } else {
+            ec.ec_context
+                .generate_if_needed(&state.settings, ec.kv_graph.as_ref(), &seed)
+        };
+        if let Err(err) = minted {
             log::warn!("EC generation failed for publisher proxy: {err:?}");
         }
 
@@ -1173,6 +1373,7 @@ enum NamedRouteHandler {
     DeactivateKey,
     AdminEcLookup,
     AdminEidsLookup,
+    AdminOptOutClear,
     AdminCachePurge,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
@@ -1261,6 +1462,15 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/admin/ec/{id}",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::AdminEcLookup,
+        route_class: RouteClass::Ec,
+    },
+    // Operator clear of a provider's sticky opt-out (`ps.o`). Only DELETE is
+    // claimed: any other method reaches the publisher fallback, which denies
+    // the reserved admin namespace locally.
+    NamedRoute {
+        path: "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
+        primary_methods: &[Method::DELETE],
+        handler: NamedRouteHandler::AdminOptOutClear,
         route_class: RouteClass::Ec,
     },
     // Admin EIDs echo: decodes the request's ts-eids/sharedId cookies with
@@ -1437,7 +1647,7 @@ impl TrustedServerApp {
         (Self::routes_for_state(&state), Some(state))
     }
 
-    fn routes_for_state(state: &Arc<AppState>) -> RouterService {
+    pub(crate) fn routes_for_state(state: &Arc<AppState>) -> RouterService {
         let mut router = RouterService::builder()
             .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
                 Arc::clone(&state.settings),
@@ -1546,9 +1756,9 @@ mod tests {
         AppState, AuctionDispatch, EcContext, EdgeCacheHeader, EidSyncSource, HandlerFuture,
         NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RouteClass,
         RouteMetadata, RuntimeStoreConfig, TSJS_ROUTE_TEMPLATE, TrustedServerApp,
-        build_orchestrator_with_plan, build_per_request_services, build_state_from_settings,
-        compile_auction_plan, handle_publisher_request, publisher_response_into_streaming_response,
-        startup_error_router,
+        build_identity_runtime, build_orchestrator_with_plan, build_per_request_services,
+        build_state_from_settings, compile_auction_plan, handle_publisher_request,
+        publisher_response_into_streaming_response, startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
@@ -1563,6 +1773,7 @@ mod tests {
     use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
+    use trusted_server_core::ec::identity::test_support::ec_partner;
 
     use error_stack::Report;
     use futures::StreamExt as _;
@@ -1658,6 +1869,28 @@ mod tests {
         block_on(router.oneshot(request)).expect("should route request")
     }
 
+    #[test]
+    fn reloaded_identity_runtime_keeps_pull_providers_when_the_registry_fails() {
+        let mut settings = test_settings();
+        settings.ec.partners = vec![ec_partner(
+            "ssp.example.com",
+            "https://sync.ssp.example.com/pull",
+            "example-token-value-0123456789abcdef",
+        )];
+        let failed = Err(Report::new(TrustedServerError::Configuration {
+            message: "registry failed".to_owned(),
+        }));
+
+        let runtime = super::identity_runtime_from_registry_result(&settings, failed)
+            .expect("should still build the pull runtime");
+
+        assert_eq!(
+            format!("{runtime:?}"),
+            "IdentityRuntime { providers: 1, .. }",
+            "should hold the generic pull provider"
+        );
+    }
+
     fn test_settings() -> Settings {
         Settings::from_toml(
             r#"
@@ -1746,6 +1979,8 @@ mod tests {
         filters: Vec<Arc<dyn IntegrationRequestFilter>>,
     ) -> Arc<AppState> {
         let settings = test_settings();
+        let identity = build_identity_runtime(&settings, &IntegrationRegistry::default())
+            .expect("should build the identity runtime");
         let plan = Arc::new(
             trusted_server_core::auction::compile_auction_plan(&settings)
                 .expect("should compile auction plan"),
@@ -1764,6 +1999,10 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
+            identity,
+            identity_graph: None,
+            http_client_for_test: None,
+            geo_for_test: None,
         })
     }
 
@@ -2253,6 +2492,35 @@ mod tests {
             eids_route.primary_methods,
             &[Method::GET],
             "/_ts/admin/eids must have GET as its only primary method"
+        );
+    }
+
+    #[test]
+    fn admin_opt_out_clear_route_is_registered() {
+        // The operator clear is a DELETE on its own route. The route must call
+        // the core handler, and `/_ts/admin/ec/{id}` must stay GET-only so the
+        // clear is reachable only through the dedicated path.
+        let route = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/_ts/admin/ec/{id}/providers/{provider}/opt-out")
+            .expect("should register the provider opt-out clear route");
+        assert!(
+            matches!(route.handler, NamedRouteHandler::AdminOptOutClear),
+            "the route must map to the opt-out clear handler"
+        );
+        assert_eq!(
+            route.primary_methods,
+            &[Method::DELETE],
+            "the route must have DELETE as its only primary method"
+        );
+        let lookup = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/_ts/admin/ec/{id}")
+            .expect("should register the lookup route");
+        assert_eq!(
+            lookup.primary_methods,
+            &[Method::GET],
+            "control: the lookup route must stay GET-only"
         );
     }
 

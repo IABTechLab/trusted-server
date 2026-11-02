@@ -9,10 +9,13 @@
 use std::borrow::Cow;
 
 use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use validator::{Validate, ValidationError, ValidationErrors};
 
+use crate::ec::identity::ProviderDescriptor;
+use crate::ec::identity::provider::IdentityProviderConfig;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::integrations::{
@@ -32,7 +35,15 @@ use crate::integrations::{
     sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
-use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
+use crate::settings::{
+    AssetOriginAuth, IdentitySettings, IntegrationConfig, ProviderMode, Settings,
+};
+
+/// Largest `[ec.identity].hold_budget_ms`.
+const MAX_HOLD_BUDGET_MS: u64 = 1000;
+
+/// Largest `after_send_timeout_ms` of a provider.
+const MAX_AFTER_SEND_TIMEOUT_MS: u64 = 10_000;
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 #[cfg(test)]
@@ -272,6 +283,13 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, false)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
+    validate_identity_settings(&settings.ec.identity)?;
+    validate_removed_keys(settings)?;
+    crate::ec::identity::catalog::validate_identity_catalog(
+        &identity_descriptors_for_deploy(settings)?,
+        &settings.ec.partners,
+        &settings.ec.identity,
+    )?;
     Ok(())
 }
 
@@ -291,6 +309,153 @@ pub fn validate_settings_for_runtime(
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, true)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
+    validate_identity_settings(&settings.ec.identity)?;
+    validate_removed_keys(settings)?;
+    crate::ec::identity::catalog::validate_identity_catalog(
+        &identity_descriptors_for_deploy(settings)?,
+        &settings.ec.partners,
+        &settings.ec.identity,
+    )?;
+    Ok(())
+}
+
+/// Every identity provider descriptor a deploy declares, built from
+/// settings alone.
+///
+/// It holds the generic pull descriptors from `settings.ec.partners`, which
+/// carry no secret, then one line per identity integration. No production
+/// integration has a line yet. Tests list the fictional `exampleid`
+/// integration so the list's shape is exercised.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when a pull partner or an
+/// enabled identity integration cannot be described.
+pub(crate) fn identity_descriptors_for_deploy(
+    settings: &Settings,
+) -> Result<Vec<ProviderDescriptor>, Report<TrustedServerError>> {
+    #[allow(unused_mut)]
+    let mut descriptors =
+        crate::ec::identity::generic_pull::generic_pull_descriptors(&settings.ec.partners)?;
+    #[cfg(test)]
+    descriptors.extend(validate_identity_integration::<
+        crate::ec::identity::examples::ExampleIdConfig,
+    >(
+        settings,
+        crate::ec::identity::examples::EXAMPLEID_INTEGRATION_ID,
+    )?);
+    Ok(descriptors)
+}
+
+/// Parses `[integrations.<id>]` as `T` and, when it is enabled, describes the
+/// provider it enables.
+///
+/// It never builds a provider and never reads a secret, so it runs at deploy
+/// time, when secret fields still hold secret-store key names.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the integration's
+/// config does not parse or validate, or its descriptor cannot be built.
+/// Returns `Ok(None)` when the integration is absent or disabled.
+// Temporary: the first production identity integration adds the first caller.
+#[allow(dead_code)]
+pub(crate) fn validate_identity_integration<T: IdentityProviderConfig + DeserializeOwned>(
+    settings: &Settings,
+    id: &str,
+) -> Result<Option<ProviderDescriptor>, Report<TrustedServerError>> {
+    let Some(config) = settings.integration_config::<T>(id)? else {
+        return Ok(None);
+    };
+    config
+        .build_descriptor()
+        .map(Some)
+        .change_context(TrustedServerError::Configuration {
+            message: format!("integrations.{id}: the identity provider cannot be described"),
+        })
+}
+
+fn identity_configuration_error(message: String) -> Report<TrustedServerError> {
+    Report::new(TrustedServerError::Configuration { message })
+}
+
+/// Validates the numeric rules of `[ec.identity]`.
+///
+/// Rules that need provider descriptors live in the identity catalog
+/// validation instead.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] naming the first key that is
+/// out of range.
+pub(crate) fn validate_identity_settings(
+    settings: &IdentitySettings,
+) -> Result<(), Report<TrustedServerError>> {
+    if settings.hold_budget_ms > MAX_HOLD_BUDGET_MS {
+        return Err(identity_configuration_error(format!(
+            "ec.identity.hold_budget_ms must be at most {MAX_HOLD_BUDGET_MS}, got {}",
+            settings.hold_budget_ms
+        )));
+    }
+    if settings.max_concurrency == 0 {
+        return Err(identity_configuration_error(
+            "ec.identity.max_concurrency must be at least 1".to_owned(),
+        ));
+    }
+    for (id, provider) in &settings.providers {
+        if provider.refresh_after_sec == 0 {
+            return Err(identity_configuration_error(format!(
+                "ec.identity.providers.{id}.refresh_after_sec must be greater than 0"
+            )));
+        }
+        if !(1..=MAX_AFTER_SEND_TIMEOUT_MS).contains(&provider.after_send_timeout_ms) {
+            return Err(identity_configuration_error(format!(
+                "ec.identity.providers.{id}.after_send_timeout_ms must be between 1 and {MAX_AFTER_SEND_TIMEOUT_MS}, got {}",
+                provider.after_send_timeout_ms
+            )));
+        }
+        if provider.mode == ProviderMode::Hold
+            && provider
+                .timeout_ms
+                .is_some_and(|timeout| timeout > settings.hold_budget_ms)
+        {
+            return Err(identity_configuration_error(format!(
+                "ec.identity.providers.{id}.timeout_ms must not exceed hold_budget_ms ({})",
+                settings.hold_budget_ms
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects config keys that were removed instead of deprecated.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] naming the replacement of the
+/// first removed key that is set.
+pub(crate) fn validate_removed_keys(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    if settings.ec.removed_pull_sync_concurrency.is_some() {
+        return Err(identity_configuration_error(
+            "ec.pull_sync_concurrency was removed; set [ec.identity].max_concurrency instead"
+                .to_owned(),
+        ));
+    }
+    for partner in &settings.ec.partners {
+        let id = crate::ec::identity::generic_pull::generic_pull_id(&partner.source_domain);
+        if partner.removed_pull_sync_ttl_sec.is_some() {
+            return Err(identity_configuration_error(format!(
+                "ec.partners `{}`: pull_sync_ttl_sec was removed; set refresh_after_sec in [ec.identity.providers.{id}] instead",
+                partner.source_domain
+            )));
+        }
+        if partner.removed_pull_sync_rate_limit.is_some() {
+            return Err(identity_configuration_error(format!(
+                "ec.partners `{}`: pull_sync_rate_limit was removed; set max_calls_per_minute = ceil(N / 60) in [ec.identity.providers.{id}] instead",
+                partner.source_domain
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -576,8 +741,18 @@ mod tests {
 
     use super::*;
     use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
+    use crate::ec::identity::catalog::validate_identity_catalog;
+    use crate::ec::identity::descriptor::Resolves;
+    use crate::ec::identity::examples::ExampleCaptureProvider;
+    use crate::ec::identity::provider::{IdentityProvider as _, IdentityProviderConfig};
+    use crate::ec::identity::resolution::IdentityProviderError;
+    use crate::ec::identity::runtime::IdentityRuntime;
+    use crate::ec::identity::test_support::ec_partner;
+    use crate::integrations::IntegrationRegistry;
     use crate::redacted::Redacted;
-    use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
+    use crate::settings::{
+        ProviderSettings, ProxyAssetRoute, RevokeScope, S3SigV4AuthConfig, TrustedClientIpConfig,
+    };
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
     use edgezero_core::blob_envelope::BlobEnvelope;
@@ -1809,6 +1984,277 @@ password = "production-admin-password-32-bytes"
         assert!(
             err.to_string().contains("missing-provider"),
             "validation error should mention invalid provider"
+        );
+    }
+
+    #[test]
+    fn removed_pull_sync_concurrency_is_rejected_with_its_replacement() {
+        let toml = crate_test_settings_str().replace("[ec]\n", "[ec]\npull_sync_concurrency = 3\n");
+        let mut settings = Settings::from_toml(&toml).expect("should parse the removed key");
+        settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
+
+        let deploy = validate_settings_for_deploy(&settings).expect_err("should reject at deploy");
+        assert!(
+            format!("{deploy:?}").contains("[ec.identity].max_concurrency"),
+            "should name the replacement at deploy, got: {deploy:?}"
+        );
+        let runtime =
+            validate_settings_for_runtime(&settings).expect_err("should reject at runtime");
+        assert!(
+            format!("{runtime:?}").contains("[ec.identity].max_concurrency"),
+            "should name the replacement at runtime, got: {runtime:?}"
+        );
+
+        let control = crate_test_settings_str()
+            .replace("[ec]\n", "[ec.identity]\nmax_concurrency = 3\n\n[ec]\n");
+        let mut control = Settings::from_toml(&control).expect("should parse the replacement key");
+        control.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
+        validate_settings_for_deploy(&control).expect("control: should pass at deploy");
+    }
+
+    #[test]
+    fn removed_partner_pull_keys_are_rejected_with_their_replacements() {
+        let base = crate_test_settings_str();
+        let partner = |extra: &str| {
+            format!(
+                "{base}\n[[ec.partners]]\nname = \"Example SSP\"\nsource_domain = \"ssp.example.com\"\npull_sync_enabled = true\npull_sync_url = \"https://sync.ssp.example.com/pull\"\npull_sync_allowed_domains = [\"sync.ssp.example.com\"]\nts_pull_token = \"example-token-value-0123456789abcdef\"\n{extra}\n"
+            )
+        };
+        let parse = |toml: &str| {
+            let mut settings = Settings::from_toml(toml).expect("should parse the settings");
+            settings.proxy.allowed_domains =
+                vec!["*.example".to_string(), "*.example.com".to_string()];
+            settings
+        };
+
+        for (key, replacement) in [
+            ("pull_sync_ttl_sec = 3600", "refresh_after_sec"),
+            ("pull_sync_rate_limit = 20", "max_calls_per_minute"),
+        ] {
+            let settings = parse(&partner(key));
+            let deploy =
+                validate_settings_for_deploy(&settings).expect_err("should reject at deploy");
+            assert!(
+                format!("{deploy:?}").contains(replacement),
+                "should name {replacement} at deploy, got: {deploy:?}"
+            );
+            let runtime =
+                validate_settings_for_runtime(&settings).expect_err("should reject at runtime");
+            assert!(
+                format!("{runtime:?}").contains(replacement),
+                "should name {replacement} at runtime, got: {runtime:?}"
+            );
+        }
+
+        let control = parse(&partner(""));
+        validate_settings_for_deploy(&control).expect("control: should pass at deploy");
+    }
+
+    #[derive(Debug, Deserialize, Validate)]
+    struct SecretedExampleConfig {
+        enabled: bool,
+        // Held so the config has a secret field, which no descriptor reads.
+        #[allow(dead_code)]
+        api_key: Redacted<String>,
+    }
+
+    impl IntegrationConfig for SecretedExampleConfig {
+        fn is_enabled(&self) -> bool {
+            self.enabled
+        }
+    }
+
+    impl IdentityProviderConfig for SecretedExampleConfig {
+        fn build_descriptor(&self) -> Result<ProviderDescriptor, Report<IdentityProviderError>> {
+            ProviderDescriptor::builder("secreted".parse()?)
+                .with_source("secreted.example.com".parse()?)
+                .with_resolves(Resolves::new().with_endpoint("https://api.example.com/fetch"))
+                .with_consent_policy(crate::ec::identity::test_support::resolver_policy())
+                .build()
+        }
+    }
+
+    fn exampleid_settings(partner_owner: Option<&str>) -> Settings {
+        let mut settings = valid_settings();
+        settings.integrations.insert(
+            "exampleid".to_owned(),
+            serde_json::json!({
+                "enabled": true,
+                "endpoint": "https://api.example.com/fetch",
+                "partner_id": 7,
+                "gvl_id": 1,
+            }),
+        );
+        let mut partner = ec_partner(
+            "exampleid.example.com",
+            "https://sync.exampleid.example.com/pull",
+            "example-token-value-0123456789abcdef",
+        );
+        partner.pull_sync_enabled = false;
+        partner.pull_sync_url = None;
+        partner.pull_sync_allowed_domains = Vec::new();
+        partner.owner = partner_owner.map(ToOwned::to_owned);
+        settings.ec.partners = vec![partner];
+        settings
+    }
+
+    #[test]
+    fn config_without_ec_identity_is_accepted() {
+        let settings = valid_settings();
+
+        assert!(
+            settings.ec.identity.providers.is_empty(),
+            "should hold no provider tables"
+        );
+        validate_settings_for_deploy(&settings).expect("should accept a config with no identity");
+    }
+
+    #[test]
+    fn identity_integration_descriptor_joins_deploy_validation() {
+        let settings = exampleid_settings(Some("exampleid"));
+
+        let descriptors =
+            identity_descriptors_for_deploy(&settings).expect("should describe the deploy");
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor.id().as_str())
+                .collect::<Vec<_>>(),
+            ["exampleid"],
+            "should hold the integration's descriptor"
+        );
+        validate_settings_for_deploy(&settings).expect("should accept a declared owner");
+
+        let unknown_owner = exampleid_settings(Some("missing"));
+        let error = validate_settings_for_deploy(&unknown_owner)
+            .expect_err("should reject an owner no enabled provider matches");
+        assert!(
+            format!("{error}").contains("missing"),
+            "should name the owner: {error}"
+        );
+
+        let mut disabled = exampleid_settings(None);
+        disabled.integrations.insert(
+            "exampleid".to_owned(),
+            serde_json::json!({ "enabled": false }),
+        );
+        assert!(
+            identity_descriptors_for_deploy(&disabled)
+                .expect("should describe the deploy")
+                .is_empty(),
+            "control: a disabled integration declares no descriptor"
+        );
+    }
+
+    #[test]
+    fn build_descriptor_runs_in_deploy_validation_without_secrets() {
+        let mut settings = valid_settings();
+        settings.integrations.insert(
+            "secreted".to_owned(),
+            serde_json::json!({ "enabled": true, "api_key": "secret-store-key-name" }),
+        );
+
+        let descriptor =
+            validate_identity_integration::<SecretedExampleConfig>(&settings, "secreted")
+                .expect("should validate a config whose secret holds a key name")
+                .expect("should describe an enabled integration");
+        assert_eq!(
+            descriptor.id().as_str(),
+            "secreted",
+            "should return the descriptor"
+        );
+
+        settings.integrations.insert(
+            "secreted".to_owned(),
+            serde_json::json!({ "enabled": false, "api_key": "secret-store-key-name" }),
+        );
+        assert!(
+            validate_identity_integration::<SecretedExampleConfig>(&settings, "secreted")
+                .expect("should accept a disabled integration")
+                .is_none(),
+            "control: a disabled integration has no descriptor"
+        );
+        assert!(
+            validate_identity_integration::<SecretedExampleConfig>(&settings, "absent")
+                .expect("should accept an absent integration")
+                .is_none(),
+            "control: an absent integration has no descriptor"
+        );
+    }
+
+    #[test]
+    fn capture_settings_on_a_provider_without_captures_are_rejected_at_deploy() {
+        let mut settings = exampleid_settings(None);
+        settings.ec.identity.providers.insert(
+            "exampleid".to_owned(),
+            ProviderSettings {
+                revoke_scope: Some(RevokeScope::Global),
+                ..ProviderSettings::default()
+            },
+        );
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should reject revoke_scope on a resolve-only provider");
+        assert!(
+            format!("{error}").contains("exampleid"),
+            "should name the provider: {error}"
+        );
+
+        let capturing = ExampleCaptureProvider::new().expect("should build the provider");
+        let partner = ec_partner(
+            "examplecapture.example.com",
+            "https://sync.examplecapture.example.com/pull",
+            "example-token-value-0123456789abcdef",
+        );
+        let mut identity = IdentitySettings::default();
+        identity.providers.insert(
+            "examplecapture".to_owned(),
+            ProviderSettings {
+                revoke_scope: Some(RevokeScope::Global),
+                sources: Some(vec!["examplecapture.example.com".to_owned()]),
+                ..ProviderSettings::default()
+            },
+        );
+        validate_identity_catalog(&[capturing.descriptor().clone()], &[partner], &identity)
+            .expect("control: the same key on a capturing provider should pass");
+    }
+
+    #[test]
+    fn capture_enabled_has_no_effect() {
+        let base = format!(
+            "{}\n[[ec.partners]]\nname = \"Example SSP\"\nsource_domain = \"ssp.example.com\"\npull_sync_enabled = true\npull_sync_url = \"https://sync.ssp.example.com/pull\"\npull_sync_allowed_domains = [\"sync.ssp.example.com\"]\nts_pull_token = \"example-token-value-0123456789abcdef\"\n",
+            crate_test_settings_str()
+        );
+        let parse = |toml: &str| {
+            let mut settings = Settings::from_toml(toml).expect("should parse the settings");
+            settings.proxy.allowed_domains =
+                vec!["*.example".to_string(), "*.example.com".to_string()];
+            settings
+        };
+        let plain = parse(&base);
+        let flagged = parse(&format!(
+            "{base}\n[ec.identity.providers.pull-ssp-example-com]\ncapture_enabled = true\n"
+        ));
+
+        validate_settings_for_deploy(&flagged).expect("should accept the lenient key");
+        let plain_runtime = IdentityRuntime::from_settings(&plain, &IntegrationRegistry::default())
+            .expect("should build");
+        let flagged_runtime =
+            IdentityRuntime::from_settings(&flagged, &IntegrationRegistry::default())
+                .expect("should build");
+        let id = "pull-ssp-example-com".parse().expect("should parse the ID");
+        assert_eq!(
+            flagged_runtime.catalog().sources_of(&id),
+            plain_runtime.catalog().sources_of(&id),
+            "should change no provider source"
+        );
+        assert!(
+            !flagged_runtime.catalog().is_capture_only(&id)
+                && flagged_runtime
+                    .catalog()
+                    .owner_of(&"ssp.example.com".parse().expect("should parse"))
+                    .is_none(),
+            "should make no provider a capturer and give no source an owner"
         );
     }
 }

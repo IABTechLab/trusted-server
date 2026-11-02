@@ -331,10 +331,10 @@ describe('tsjs-prebid production artifacts', () => {
     expect(shimCode).not.toContain(analyticsArtifact.manifest.prebidVersion);
     expect(shimCode).not.toContain('_pbjsGlobals');
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
-    // Main's trace-enabled shim measures 52,464 bytes. The diagnostics bridge
-    // and bidder-request EID collector bring the combined artifact to 53,175.
-    // Keep a narrow budget while optional diagnostics own Prebid evidence listeners.
-    expect(Buffer.byteLength(shimCode)).toBeLessThan(53_500);
+    // The RC shim measures 53,175 bytes. Server identity mirroring and the
+    // registered-source EID cookie merge bring it to 54,447 bytes on Node 24.20.0.
+    // Round to the next 100 bytes; diagnostics listeners must still stay separate.
+    expect(Buffer.byteLength(shimCode)).toBeLessThan(54_500);
     // The optional diagnostics bundle owns subscription, correlation, and
     // candidate reads. Only its completed-auction bridge remains in the shim.
     expect(shimCode).not.toContain('bidWon');

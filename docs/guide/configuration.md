@@ -743,19 +743,115 @@ The legacy `[consent].consent_store` setting has been removed. Trusted Server us
 
 Legacy consent-store records are not read or migrated into `ec.ec_store`. Their payload schema is not authoritative EC lifecycle state, so do not copy those records into the identity store. You may retain the old store unchanged for a defined rollback window, then unlink its platform resource binding and delete it. No browser-cookie or EC identity-store migration is required.
 
+### Identity Providers (`[ec.identity]`)
+
+Policy for server-side identity providers. The table is optional; every key has a default.
+
+| Key                       | Type    | Default | Meaning                                                                                                                                                                                                         |
+| ------------------------- | ------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `max_concurrency`         | Integer | `4`     | Most providers dispatched at once (at least 1). Replaces `ec.pull_sync_concurrency`.                                                                                                                            |
+| `hold_budget_ms`          | Integer | `100`   | Total wall-clock time a navigation may wait for all hold-mode providers (at most 1000)                                                                                                                          |
+| `hold_retry_sec`          | Integer | `300`   | Seconds to wait before calling a provider again after the hold budget cut its call off                                                                                                                          |
+| `max_response_bytes`      | Integer | `65536` | Largest provider response body accepted, before and after decoding                                                                                                                                              |
+| `max_backend_requests`    | Integer | `32`    | Most backend requests one Fastly execution may start, counting the origin, the auction and provider calls. A provider call past it is skipped, not counted as a failure. Set `10` on Fastly trial accounts      |
+| `mirror_enabled`          | Boolean | `false` | Return the `__Host-ts-eids-s` mirror payload from `/auction` and `/_ts/page-bids`                                                                                                                               |
+| `spa_writer_interval_sec` | Integer | `300`   | Seconds a same-origin `/_ts/page-bids` call from a real browser waits after the row's last write before it writes browser ingest and after-send provider results itself, for single-page apps. `0` turns it off |
+
+#### Per-provider keys
+
+Each provider can have an `[ec.identity.providers.<id>]` table. A provider with no table uses the defaults. The table name is the provider ID: the integration ID of a vendor provider, or the generated `pull-` ID of a pull partner.
+
+| Key                           | Type    | Default                            | Meaning                                                                                                                                                                                                   |
+| ----------------------------- | ------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`                        | String  | `after_send`                       | `hold` runs before the navigation's auction; `after_send` runs after the response is sent. Providers run on a returning visitor's page load; a `hold` provider also on a new visitor's first one (below). |
+| `timeout_ms`                  | Integer | `hold_budget_ms`                   | Hold-mode call timeout, at most `hold_budget_ms`                                                                                                                                                          |
+| `after_send_timeout_ms`       | Integer | `1000`                             | Timeout for any call made after send, `1` to `10000`                                                                                                                                                      |
+| `sources`                     | Array   | every source the provider declares | Narrows the source domains the provider may write. Required for a capture-only provider.                                                                                                                  |
+| `refresh_after_sec`           | Integer | `86400`                            | Seconds before a stored ID is refreshed, and the wait after a skipped call (greater than 0)                                                                                                               |
+| `max_calls_per_minute`        | Integer | `1`                                | Per-visitor burst cap, enforced in 60-second windows                                                                                                                                                      |
+| `max_calls_per_ip_per_minute` | Integer | `10`                               | Ceiling per client address across every visitor behind it, in 60-second windows. `0` turns it off                                                                                                         |
+| `breaker_failures_per_minute` | Integer | `50`                               | Transport failures, timeouts, 429s and 5xx responses in one 60-second window after which the provider is skipped for every visitor                                                                        |
+| `cookie_priority`             | Integer | `0`                                | Lower values are left out of the `__Host-ts-eids-s` mirror first when it exceeds its size cap                                                                                                             |
+| `revoke_scope`                | String  | `provider` (capture only)          | `provider` or `global`. Applies only to a provider that captures IDs; setting it on any other provider is a validation error. See below.                                                                  |
+
+**`mode`, `timeout_ms` and `after_send_timeout_ms`.** A provider runs on a returning visitor's full page navigation. A `hold` provider that does not read the EC ID also runs on a new visitor's first navigation when it runs an auction: the visitor's KV row is created after the call, with its answer, so the first page still makes one KV write. In `hold` mode the call runs before the navigation's auction, within the shared `hold_budget_ms`, and its answer joins that auction. A call the budget cuts off is not a failure: the provider waits `hold_retry_sec` before the next call. When the navigation runs no auction, a hold-mode provider runs after send instead and waits `after_send_timeout_ms`. In `after_send` mode (the default) the provider always runs after the response is sent.
+
+**`sources`.** Narrows the source domains the provider may write, before ownership is checked. It must name only sources the provider declares and keep at least one. A capture-only provider has no usable default and must list its `sources`: its opt-out removes browser-ingested records of every source it lists, so list only the sources it is the delivery path for.
+
+**`refresh_after_sec`, `max_calls_per_minute`, `breaker_failures_per_minute`.** `refresh_after_sec` is how long a stored ID lives before it is refreshed when the provider gives no hint, and how long to wait after a skipped call. `max_calls_per_minute` caps bursts per visitor in 60-second windows, and `max_calls_per_ip_per_minute` caps calls from one client address across visitors, so minting a fresh EC per request cannot multiply calls. `breaker_failures_per_minute` counts transport failures, timeouts, 429s and 5xx responses across all visitors at one edge location. Past it the provider is skipped for everyone until the window clears. Input-caused 4xx responses and unparseable replies back off only that visitor and never open the breaker.
+
+**`cookie_priority`.** When the `__Host-ts-eids-s` mirror exceeds its size cap, whole sources are left out, lowest `cookie_priority` first.
+
+**`revoke_scope`.** For a provider that captures IDs from proxied responses. With `provider`, a captured opt-out removes that provider's records and, for a capture-only provider, the records of its listed sources that no provider wrote. With `global`, a captured opt-out runs the consent-withdrawal tombstone: the row is tombstoned, the `ts-ec` cookie is cleared, and everything is removed, provider opt-outs included. It also sets an `HttpOnly` `ts-ec-revoked` cookie holding a fingerprint of the visitor's consent, and no new EC is minted while that consent is unchanged, so a CMP that still grants does not undo the revoke on the next page. Either way it applies whatever the client, as a consent withdrawal does; only clearing an opt-out needs a real browser.
+
+#### Source ownership (`[[ec.partners]].owner`)
+
+`owner` is an optional key on an `[[ec.partners]]` entry. It names the identity provider that owns that source. An owner refreshes the source and wins over browser and other writers: its result replaces the source's whole entry set, and batch sync writes to it only when the row holds no value for the source. An expired owned record still counts as a value, so batch sync never fills or replaces it. A source with no `owner` is unowned, and a provider can only fill it when absent or expired.
+
+```toml
+[[ec.partners]]
+name = "Example ID"
+source_domain = "exampleid.example.com"
+openrtb_atype = 1
+bidstream_enabled = true
+owner = "exampleid"
+
+[ec.identity.providers.exampleid]
+mode = "hold"
+timeout_ms = 80
+```
+
+**Validation.** Each of these stops startup and fails `ts config validate` and `ts config push`.
+
+| Mistake                                                    | Error                                                                                                                                                      |
+| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `owner` names a provider that is not enabled               | ``ec.partners source `exampleid.example.com` names owner `exampleid`, which is not an enabled identity provider``                                          |
+| `owner` names a capture-only provider                      | ``... names owner `examplecapture`, which is capture-only; a capture-only provider stores no positive ID and cannot own a source``                         |
+| `owner` names a provider that does not claim the source    | ``... names owner `exampleid`, which does not claim that source``                                                                                          |
+| Two providers claim an owned source                        | ``identity provider `other` claims source `exampleid.example.com`, which `exampleid` owns; use ec.identity.providers.other.sources to narrow one of them`` |
+| A provider claims a source with no `[[ec.partners]]` entry | ``identity provider `exampleid` claims source `exampleid.example.com`, which has no [[ec.partners]] entry``                                                |
+| A capture-only provider has no `sources`                   | ``provider `examplecapture` is capture-only, so ec.identity.providers.examplecapture.sources must list the sources it is the delivery path for``           |
+| `sources` names a source the provider does not declare     | ``ec.identity.providers.exampleid.sources names `other.example.com`, which provider `exampleid` does not declare``                                         |
+| A provider table names no enabled provider                 | `ec.identity.providers.missing names no enabled identity provider; configured providers: exampleid`                                                        |
+| `revoke_scope` on a provider that declares no captures     | ``ec.identity.providers.exampleid.revoke_scope is set, but provider `exampleid` declares no captures``                                                     |
+| `timeout_ms` above the hold budget in hold mode            | `ec.identity.providers.exampleid.timeout_ms must not exceed hold_budget_ms (100)`                                                                          |
+| `after_send_timeout_ms` outside 1 to 10000                 | `ec.identity.providers.exampleid.after_send_timeout_ms must be between 1 and 10000, got 0`                                                                 |
+| `refresh_after_sec = 0`                                    | `ec.identity.providers.exampleid.refresh_after_sec must be greater than 0`                                                                                 |
+| `hold_budget_ms` above 1000, `max_concurrency = 0`         | `ec.identity.hold_budget_ms must be at most 1000, got 1001` and `ec.identity.max_concurrency must be at least 1`                                           |
+
+Also an error: a duplicate provider ID, more than 32 enabled providers (generic pull partners included), a `mode` other than `hold` or `after_send`, and a `revoke_scope` other than `provider` or `global`. Before enabling a capture provider on a live service, work through the [capture provider checklist](/guide/edge-cookies#capture-provider-checklist).
+
+**Pull partner provider IDs.** Each `[[ec.partners]]` entry with `pull_sync_enabled = true` registers a provider whose ID is `pull-` plus the source domain with dots replaced by `-`. For example, `ssp.example.com` is `pull-ssp-example-com`. A domain that contains `-`, or an ID that would be longer than 63 characters, also gets `-` and the first 8 hex digits of the SHA-256 of the full domain, so `a-b.example.com` and `a.b.example.com` get different IDs. Configure the partner's pacing in `[ec.identity.providers.pull-ssp-example-com]`.
+
+**Removed keys.** Validation rejects each of these with an error that names its replacement:
+
+| Removed key                                | Replacement                                                                  |
+| ------------------------------------------ | ---------------------------------------------------------------------------- |
+| `ec.pull_sync_concurrency`                 | `[ec.identity].max_concurrency`                                              |
+| `[[ec.partners]].pull_sync_ttl_sec`        | `refresh_after_sec` in `[ec.identity.providers.<pull-id>]`                   |
+| `[[ec.partners]].pull_sync_rate_limit = N` | `max_calls_per_minute = ceil(N / 60)` in `[ec.identity.providers.<pull-id>]` |
+
+The old rate limit counted calls per hour; the new one counts them per minute and defaults to 1, so a partner that kept the old default of 10 per hour is now paced at an effective 60 per hour.
+
+#### Rolling back
+
+This release moves the KV identity row to schema version 2. A release before it cannot read a version 2 row, so rolling back past this release is unsupported once it has written one; going back needs a KV migration to version 1, which is not provided.
+
+To roll back from a release that adds vendor providers to the identity framework without vendors, follow the steps in [Rolling back from vendor providers](/guide/edge-cookies#rolling-back-from-vendor-providers): remove every `owner` and vendor `[ec.identity.providers.*]` table first, because the earlier release rejects both.
+
 ### `[ec]`
 
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
 be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
-| Field                     | Type           | Required | Description                                                             |
-| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
-| `partners`                | Array          | No       | Static partner registry entries                                         |
+| Field                           | Type           | Required | Description                                                                                                             |
+| ------------------------------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `passphrase`                    | String         | Yes      | Publisher passphrase used as HMAC key                                                                                   |
+| `ec_store`                      | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                         |
+| `cluster_trust_threshold`       | Integer        | No       | Cluster size threshold for identity trust decisions                                                                     |
+| `cluster_recheck_secs`          | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps                                                 |
+| `strip_eids_cookie_from_origin` | Boolean        | No       | Also strip `ts-eids` from publisher-origin requests (default `false`; the `__Host-ts-eids-s` mirror is always stripped) |
+| `partners`                      | Array          | No       | Static partner registry entries                                                                                         |
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.

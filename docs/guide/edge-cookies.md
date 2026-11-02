@@ -61,11 +61,11 @@ sequenceDiagram
         TS-->>B: Response + Set-Cookie: ts-ec=...
     else Return Visit (EC cookie present)
         Note over TS: Phase 2: Routing<br/>EC exists — skip generation
-        Note over TS: Phase 3: Finalize<br/>Ingest Prebid EID cookies
+        Note over TS: Phase 3: Finalize<br/>Stage Prebid EID cookies<br/>(written once in phase 4)
         TS-->>B: Response<br/>(no cookie refresh)
     end
 
-    Note over TS,KV: Phase 4: Post-send (background)<br/>Dispatch pull-sync to partners
+    Note over TS,KV: Phase 4: Post-send (background)<br/>Writer request only: call due pull partners,<br/>then one KV write
 ```
 
 ### Response Finalization
@@ -83,7 +83,7 @@ flowchart TD
     ExplicitWithdrawal -- "No" --> HeaderOnly
 
     ConsentCheck -- "Yes" --> WasPresent{EC was present<br/>in request?}
-    WasPresent -- "Yes, not generated" --> Returning["Ingest Prebid EID cookies<br/>No cookie or KV TTL refresh"]
+    WasPresent -- "Yes, not generated" --> Returning["Stage Prebid EID cookies for the writer's one flush<br/>No cookie or KV TTL refresh"]
     WasPresent -- "No, just generated" --> NewEc["Ingest Prebid EID cookies<br/>Set ts-ec cookie"]
 ```
 
@@ -273,15 +273,93 @@ The relevant OpenRTB structure forwarded to Prebid Server and downstream partner
 
 Browser EIDs are forwarded as sent; KV adds EIDs only for registered sources the browser did not send. Browser-supplied EIDs, from the `/auction` request body, the `ts-eids` cookie, or the `sharedId` cookie, only fill partner UIDs that are missing from KV; a different stored UID is kept, as described in [Prebid EID Flow](#prebid-eid-flow).
 
-### Pull-Sync Completeness Marker
+### One KV Write per EC-Bearing Request
 
-When the identity graph contains a UID for every pull-enabled partner, Trusted Server sets a signed, host-only `ts-ec-pull-complete` cookie. The cookie contains no partner UID or EC ID. It authenticates a one-hour expiration and a fingerprint of the current pull-partner source-domain set, bound to the active EC ID with key material derived from `ec.passphrase`.
+At most one request per page view writes browser-driven identity changes to KV: a full page navigation from a returning visitor (a request that already carries a valid `ts-ec`). Every other route reads KV and stages its changes but never writes them:
 
-A valid marker avoids a KV lookup only when pull-sync completeness is the sole reason to inspect the row. Auctions that need stored EIDs, browser EID-cookie ingestion, explicit withdrawal, and generation continue to use KV. The marker acts as recent proof that the row existed, so deletion of a previously complete row is not detected until the marker expires, at most one hour after issuance. Partner-set changes, passphrase rotation, malformed values, and expiration invalidate the marker and restore the normal lookup and orphan-recovery path.
+- `/auction` and `/_ts/api/v1/identify` no longer write KV. `/_ts/page-bids` writes only as the single-page-app writer: a same-origin call from a real browser, at most once per `spa_writer_interval_sec` (300 seconds by default) since the row's last write, with browser EIDs and after-send providers only.
+- The writer request collects every change from the page load: browser EIDs from the `ts-eids` and `sharedId` cookies, pull partner results and the cluster size. It sends the response first, then writes everything once, after send, with a generation check. A failed write is not retried as a whole.
+- A new visitor's first request still creates the row before routing, as before.
+- Two kinds of write are exempt because a withdrawal or removal must not be lost: the consent-withdrawal tombstone (with one more attempt after send when it fails before send), and a retry that writes only the removals of a failed flush.
 
-Pull sync runs after response delivery, so a partner response that fills the last missing UID cannot set the marker on that already-sent response. A later eligible request verifies the completed row and issues the marker. Explicit withdrawal expires both `ts-ec` and any present `ts-ec-pull-complete` marker even when KV is unavailable.
+Pull partners run in the same after-send step, from a visitor's second page load, because they need a returning visitor's row. A partner that fails backs off instead of being called on every request, and its pace is set by its `[ec.identity.providers.<pull-id>]` table (see the [Configuration Reference](/guide/configuration#identity-providers-ec-identity)).
 
-Issuing or expiring the marker adds `Set-Cookie` to the outgoing response. Cache-privacy handling makes an otherwise shareable response private when that happens. A valid marker is not refreshed on each request, so this cost is limited to responses that establish or clear marker state in exchange for avoiding later KV reads.
+The `ts-ec-pull-complete` completeness cookie no longer exists. Trusted Server neither sets nor reads it. A copy that a browser still holds is ignored and expires on its own within its one-hour `Max-Age`.
+
+Each request also logs one `identity request measurement: ...` line after the response is sent. It carries the inbound `Cookie` header size in bytes, KV reads and writes labelled by route kind (`writer`, `stager` or `new_ec`), the flush outcome, the number of removals deferred to the pending key and of lost removals, and whether a withdrawal tombstone needed its after-send run and failed. It holds no EC ID, UID or cookie value. It replaces the `EID sync measurement: ...` line for returning visitors; that line is now logged only for a new EC.
+
+### The `ts-eids-s` Mirror Cookie
+
+`__Host-ts-eids-s` is a client-only mirror of the server-side IDs for page scripts. It is off by default; `[ec.identity] mirror_enabled = true` turns it on. The shim writes it from the `ext.ts_eids_s` member of `/auction` responses and the `ts_eids_s` member of `/_ts/page-bids` responses (see the [API Reference](/guide/api-reference)). The server never sets, reads or trusts it, and it strips it from requests to the origin and to Prebid Server.
+
+- Attributes: `Path=/; Secure; SameSite=Lax`, no `Domain`, and not `HttpOnly`, because the shim writes it with `document.cookie`.
+- Lifetime: a `Max-Age` of at most one day, and never past the earliest expiry of an ID it holds.
+- Size: at most 2,048 bytes. When the IDs do not fit, whole sources are left out, lowest `cookie_priority` first, never part of a source.
+- The shim now writes only registered (`[[ec.partners]]`) sources into `ts-eids`, and merges each auction's entries into the cookie per source instead of replacing it. A source an auction lacks stays in the cookie until it expires; a TCF block still clears it.
+
+## Server-Side Identity Providers
+
+Identity providers fetch or capture IDs on the server. Engineers who write one should read [Writing an Identity Provider](/guide/identity-providers). The sections below are for operators. Per-key reference is in the [Configuration Reference](/guide/configuration#identity-providers-ec-identity).
+
+### Capture Provider Checklist
+
+A capture provider reads responses that Trusted Server proxies for a vendor. A captured revocation, opt-out or clear is written to KV at once. A captured positive ID is counted in `capture_unpersisted`; when it comes from a browser whose consent allows the provider and differs from what KV holds, it is stored by the next writer navigation, through the `pending:<ec_id>` KV key. A removal whose KV writes all fail waits in the same key (`removal_deferred` on the measurement line) and is counted in `removal_lost` only when that key cannot take it either. Work through these steps before enabling one on a live service:
+
+1. **Register every captured source.** Each source the provider declares has an `[[ec.partners]]` entry with `bidstream_enabled = true` and the right `openrtb_atype`.
+2. **Move a source off pull sync first.** A source that is going to have an `owner` must not also have `pull_sync_enabled = true`. A pull-sync entry registers a generic pull provider that claims the source, and two providers cannot claim an owned source.
+3. **Keep `sources` minimal.** The provider's `sources` list in `[ec.identity.providers.<id>]` holds only the sources it is the delivery path for. Its opt-out removes browser-ingested records of every source on the list, whoever produced them.
+4. **Run the live acceptance check.** After a revocation is captured on a live page, look up the visitor's row with `GET /_ts/admin/ec` and confirm it shows the provider's `ps.o` and no record for the provider's sources. After the vendor issues again, confirm the row shows `ps.oc`, and that the next returning-visitor navigation ingests the source again. Use `GET /_ts/admin/eids` with the visitor's `ts-eids` cookie to preview what the browser would ingest. Read the `identity request measurement: ...` log line of the revocation request: `removal_lost` must stay at `0`, and `capture_unpersisted` shows the positive IDs a durable path would add.
+
+### Revoke Scope
+
+`revoke_scope` in `[ec.identity.providers.<id>]` decides how far a captured opt-out reaches. The default, `provider`, removes only that provider's records and, for a capture-only provider, the records of its listed sources that no provider wrote.
+
+With `revoke_scope = "global"`, a captured opt-out runs the consent-withdrawal tombstone: the row is tombstoned, the `ts-ec` cookie is cleared, and everything is removed, provider opt-outs included. It also sets an `HttpOnly` `ts-ec-revoked` cookie holding a fingerprint of the visitor's consent (TCF purposes, US opt-outs and GPC). No new EC is minted while the visitor's consent matches it, so a CMP that still grants does not undo the revoke on the next page. Once the consent changes, the visitor starts again with a new EC and the marker is expired. Like a consent withdrawal, a captured removal or opt-out applies whatever the client, including one that fails the bot check. Only clearing an opt-out needs a real browser, because a clear re-enables IDs.
+
+### Complete Provider EIDs
+
+A provider can return more than one EID entry for a source, several UIDs per entry, and EID-level `inserter`, `matcher`, `mm` and `ext`. KV stores the whole set in the source's `eids` array, and the admin lookup (`GET /_ts/admin/ec`) shows it in the row's `ids` map, as stored (other row fields omitted):
+
+```json
+{
+  "entry": {
+    "ids": {
+      "exampleid.example.com": {
+        "w": "exampleid",
+        "rv": "0123456789abcdef",
+        "at": 1790000000,
+        "eids": [
+          {
+            "uids": [
+              { "id": "uid-a", "atype": 1, "ext": { "kind": "a" } },
+              { "id": "uid-b" }
+            ],
+            "inserter": "exampleid.example.com",
+            "matcher": "exampleid.example.com",
+            "mm": 2
+          },
+          { "uids": [{ "id": "uid-c" }], "ext": { "segment": "x" } }
+        ]
+      }
+    }
+  }
+}
+```
+
+Bidders receive the entries in that order, after the browser's entries. An entry that sets none of `inserter`, `matcher` and `mm` gets the provider's configured defaults at output. The `ext` data is stored only in KV and reaches bidders, `x-ts-eids` and the `__Host-ts-eids-s` mirror under the same consent gates as the UIDs. The mirror can be read by every script on the page.
+
+`GET /_ts/api/v1/identify` is unchanged: it still returns one UID per source, the first UID of the first entry, with the partner's `openrtb_atype`.
+
+### Rolling Back from Vendor Providers
+
+To go back to the identity release without vendor providers:
+
+1. Remove every `owner` key from `[[ec.partners]]` and every vendor `[ec.identity.providers.*]` table first, then push the config. The earlier release's validation rejects both. Pull-partner tables (`pull-...`) stay.
+2. Deploy the earlier release.
+
+After the rollback, multi-entry records stay readable but are not served while the provider that wrote them is not configured, and browser ingest may replace them. Each provider's `ps.o`, `ps.oc` and `ps.ov` (the opt-out, its clear and the removed-ID hashes) are kept, so opt-outs survive; the rest of its `ps` is pruned. Invalidated values can therefore be seeded once more, and stateful providers start over when rolled forward again.
+
+Rolling back past the identity release is unsupported, because a release before it cannot read KV schema version 2.
 
 ## Configuration
 
@@ -307,6 +385,17 @@ sets `Path=/`, `Secure`, `HttpOnly`, `SameSite=Lax`, and a `Max-Age`.
 `Domain` is computed as `.{publisher.domain}`. The separate
 `cookie_domain` setting applies only to non-EC cookies.
 
+## Cookies Forwarded to the Origin
+
+`ts-ec` and `ts-eids` still reach the publisher origin. The
+`__Host-ts-eids-s` mirror cookie does not: Trusted Server strips it from
+the request before it forwards it, so the origin's `Cookie` header stays
+the size it was before the mirror existed. An operator whose origin
+rejects large `Cookie` headers can strip `ts-eids` as well with
+`[ec] strip_eids_cookie_from_origin = true`. Prebid Server never receives
+any Trusted Server identity cookie (`ts-ec`, `ts-eids`, or
+`__Host-ts-eids-s`).
+
 ## Operational Notes
 
 - Rotate the secret periodically. Rotation produces a new 64-hex base
@@ -321,12 +410,13 @@ sets `Path=/`, `Secure`, `HttpOnly`, `SameSite=Lax`, and a `Max-Age`.
 - When consent is blocked but not explicitly withdrawn, Trusted Server strips EC response headers for that request but leaves any existing `ts-ec` cookie intact; cookie expiry and tombstones happen only on explicit withdrawal.
 - `/_ts/api/v1/identify` is read-oriented and returns identity enrichment for the authenticated partner. It computes `cluster_size` only when the EC entry does not already store one.
 - `/_ts/api/v1/batch-sync` validates every input, groups valid mappings by normalized EC ID, and applies the last valid UID for each group once. Group outcomes still account for every original input; infrastructure failures reject the failing and remaining groups. Mapping timestamps remain required for API compatibility but do not order writes. See the [API Reference](/guide/api-reference) for the complete contract.
-- Pull sync fills missing partner UIDs only. Existing partner UIDs are not periodically refreshed because EC entries no longer store per-partner sync timestamps.
+- Pull sync fills missing partner UIDs only, from a returning visitor's second page load. Existing partner UIDs are not periodically refreshed because EC entries no longer store per-partner sync timestamps.
 
 ## Next Steps
 
 - Follow the [EC Setup Guide](/guide/ec-setup-guide)
 - [Configuration Reference](/guide/configuration)
+- [Writing an Identity Provider](/guide/identity-providers)
 - [GDPR Compliance](/guide/gdpr-compliance) for consent signal handling
 - Configure [Ad Serving](/guide/ad-serving)
 - [Collective Sync](/guide/collective-sync) for cross-publisher data sharing details and diagrams

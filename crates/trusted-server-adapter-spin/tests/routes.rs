@@ -152,6 +152,49 @@ async fn authenticated_admin_ec_routes_return_501() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_opt_out_clear_route_returns_501() {
+    // The clear writes the EC identity graph, which is Fastly KV backed, so
+    // Spin answers the DELETE locally with 501 like the EC lookup.
+    let path = format!(
+        "/_ts/admin/ec/{}.abc123/providers/pull-ssp-example-com/opt-out",
+        "a".repeat(64)
+    );
+    let delete = request_builder()
+        .method("DELETE")
+        .uri(&path)
+        .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let resp = route(test_router(), delete).await;
+
+    assert_eq!(
+        resp.status().as_u16(),
+        501,
+        "DELETE {path} should report that the opt-out clear is unsupported"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json"),
+        "should answer with the same JSON as the EC lookup"
+    );
+
+    let get = request_builder()
+        .method("GET")
+        .uri(&path)
+        .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let resp = route(test_router(), get).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "control: GET {path} should be denied locally as an unknown admin route"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_ec_route_without_credentials_returns_401() {
     let req = request_builder()
         .method("GET")

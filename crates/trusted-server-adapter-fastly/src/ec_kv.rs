@@ -7,7 +7,7 @@
 use error_stack::{Report, ResultExt};
 use fastly::kv_store::{InsertMode, KVStore, KVStoreError, ListPage};
 use trusted_server_core::ec::kv_backend::{
-    EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
+    EcKvLookup, EcKvRateLimited, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
 };
 use trusted_server_core::ec::log_id;
 use trusted_server_core::error::TrustedServerError;
@@ -151,6 +151,15 @@ impl EcKvStore for FastlyEcKvStore {
             Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
                 Ok(EcKvWriteOutcome::PreconditionFailed)
             }
+            Err(KVStoreError::TooManyRequests) => Err(Report::new(KVStoreError::TooManyRequests)
+                .change_context(TrustedServerError::KvStore {
+                    store_name: self.store_name.clone(),
+                    message: format!(
+                        "Per-key write limit refused the entry for key '{}'",
+                        log_id(key)
+                    ),
+                })
+                .attach_opaque(EcKvRateLimited)),
             Err(err) => Err(
                 Report::new(err).change_context(TrustedServerError::KvStore {
                     store_name: self.store_name.clone(),
@@ -186,6 +195,10 @@ impl EcKvStore for FastlyEcKvStore {
                 store_name: self.store_name.clone(),
                 message: format!("Failed to delete key '{}'", log_id(key)),
             })
+    }
+
+    fn pause(&self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
     }
 }
 
@@ -225,6 +238,18 @@ mod tests {
             "meta": { "limit": EXISTENCE_PAGE_SIZE, "next_cursor": next_cursor, "prefix": "key" }
         }))
         .expect("should build a list page")
+    }
+
+    #[test]
+    fn pause_blocks_for_the_duration() {
+        let started = std::time::Instant::now();
+
+        store().pause(Duration::from_millis(50));
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "should block for at least the requested duration"
+        );
     }
 
     #[test]
