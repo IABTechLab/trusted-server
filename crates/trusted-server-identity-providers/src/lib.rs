@@ -19,6 +19,7 @@ pub mod liveintent;
 pub mod liveramp;
 pub mod sharedid;
 pub mod uid2;
+pub mod unifiedid;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +48,7 @@ pub fn is_registered_kind(kind: &str) -> bool {
             | uid2::Uid2::KIND
             | sharedid::SharedId::KIND
             | criteo::Criteo::KIND
+            | unifiedid::UnifiedId::KIND
     )
 }
 
@@ -92,6 +94,7 @@ pub fn build(
         uid2::Uid2::KIND => build_kind::<uid2::Uid2>(config, secrets),
         sharedid::SharedId::KIND => build_kind::<sharedid::SharedId>(config, secrets),
         criteo::Criteo::KIND => build_kind::<criteo::Criteo>(config, secrets),
+        unifiedid::UnifiedId::KIND => build_kind::<unifiedid::UnifiedId>(config, secrets),
         kind => Err(Report::new(ProviderConfigError::UnknownKind)
             .attach(format!("kind `{kind}` is not registered"))),
     }
