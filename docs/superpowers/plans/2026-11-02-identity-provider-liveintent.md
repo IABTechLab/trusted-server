@@ -34,7 +34,7 @@ No Lockr capability: Lockr AIM is not documented to deliver LiveIntent IDs, and 
 
 ## Response
 
-- `204 No Content` is `LookupOutcome::NoMatch`. LiveIntent answers `204` to anonymous `gdpr=1` lookups and returns only `nonId` without its own third-party cookie; another non-2xx status or a non-object body is `ProviderError::InvalidResponse`.
+- `204 No Content` is `LookupOutcome::NoMatch`. LiveIntent answers `204` to anonymous `gdpr=1` lookups. On the `prebid` path it returns only `nonId`; with the publisher's own `distributor_id` (for example `did-0123`) and the `_lc2_fpi` first-party ID as `duid`, it also returns partner IDs without its third-party cookie, so a publisher wanting partner IDs must set `distributor_id`; another non-2xx status or a non-object body is `ProviderError::InvalidResponse`.
 - Each resolved attribute with a non-empty string value becomes one EID with `atype = 3`, borrowed from the body; `segments`, the TDID `matcher` and the UID `ext` values are added as above.
 
 ## Tasks
