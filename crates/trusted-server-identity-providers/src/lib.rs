@@ -14,6 +14,7 @@ pub mod connectid;
 pub mod id5;
 pub mod liveintent;
 pub mod liveramp;
+pub mod uid2;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +40,7 @@ pub fn is_registered_kind(kind: &str) -> bool {
             | liveintent::LiveIntent::KIND
             | liveramp::LiveRamp::KIND
             | connectid::ConnectId::KIND
+            | uid2::Uid2::KIND
     )
 }
 
@@ -68,6 +70,7 @@ pub fn build(
         liveintent::LiveIntent::KIND => build_kind::<liveintent::LiveIntent>(config, secrets),
         liveramp::LiveRamp::KIND => build_kind::<liveramp::LiveRamp>(config, secrets),
         connectid::ConnectId::KIND => build_kind::<connectid::ConnectId>(config, secrets),
+        uid2::Uid2::KIND => build_kind::<uid2::Uid2>(config, secrets),
         kind => Err(Report::new(ProviderConfigError::UnknownKind)
             .attach(format!("kind `{kind}` is not registered"))),
     }
