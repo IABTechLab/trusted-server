@@ -788,7 +788,7 @@ mod tests {
         kv.create(&ec_id, &entry).expect("should seed KV entry");
         let req = Request::builder()
             .method("GET")
-            .uri("https://edge.test-publisher.com/identify")
+            .uri("https://edge.example.com/identify")
             .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
             .body(EdgeBody::empty())
             .expect("should build test request");
