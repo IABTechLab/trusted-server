@@ -23,7 +23,7 @@
 
 ## Lockr
 
-Lockr AIM writes the UID2 token into a cookie named by its own configuration. List that name in `cookie_names`. Lockr-delivered LiveRamp envelopes are handled by the `liveramp` kind's `cookie_names`, so no separate Lockr kind exists. Lockr-delivered ID5 cookies are not read; the `id5` kind resolves ID5 by lookup.
+`uid2` declares the Lockr capability (see `2026-11-02-identity-provider-lockr-capability.md`). With `[settings.lockr] enabled = true`, the Lockr cookies (default `["__uid2_advertising_token"]`) are read last, after the identity cookie and `cookie_names`, with the raw-token parser. Lockr names already in `cookie_names` are not read twice.
 
 ## Tasks
 

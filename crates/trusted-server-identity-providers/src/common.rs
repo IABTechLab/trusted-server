@@ -11,7 +11,8 @@ use serde_json::value::RawValue;
 use trusted_server_core::ec::eid_types::SourceDomain;
 use trusted_server_core::ec::provider::{
     EidLevelFields, EidShape, ProviderCapabilities, ProviderCommon, ProviderConfigError,
-    ProviderEid, ProviderExpiry, ProviderUid, SourceCapability, SourceInput,
+    ProviderEid, ProviderExpiry, ProviderKind, ProviderUid, RequestCookies, SourceCapability,
+    SourceInput,
 };
 
 /// Returns whether `ip` is a public address worth sending to a vendor.
@@ -183,6 +184,120 @@ pub(crate) fn cookie_eid<'cookie>(
 #[must_use]
 pub(crate) fn percent_decoded(value: &str) -> Cow<'_, str> {
     urlencoding::decode(value).unwrap_or(Cow::Borrowed(value))
+}
+
+/// Settings for the Lockr capability, under a provider's
+/// `[ec.identity_providers.settings.lockr]`.
+///
+/// Lockr AIM writes other vendors' IDs into first-party cookies on the
+/// publisher domain, under key names configured per publisher in Lockr.
+/// Only kinds implementing [`ReadsLockr`] accept this table; the settings
+/// of every other kind reject it as an unknown field.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockrSettings {
+    /// Whether the Lockr cookies are read. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Lockr cookies read in order, after the vendor's own cookies.
+    /// Defaults to the vendor's known Lockr key.
+    #[serde(default)]
+    pub cookie_names: Option<Vec<String>>,
+}
+
+/// The Lockr capability: declared by provider kinds whose IDs Lockr AIM
+/// delivers.
+pub(crate) trait ReadsLockr: ProviderKind {
+    /// The key names Lockr uses for this vendor by default.
+    const LOCKR_COOKIE_NAMES: &'static [&'static str];
+}
+
+/// Reads a provider's cookie-carried ID: the vendor's own cookies in order,
+/// then, when the Lockr capability is enabled, the Lockr cookies in order.
+///
+/// Each value goes to the provider's own parser, so Lockr reuses it.
+#[derive(Debug)]
+pub(crate) struct CookieReader {
+    provider_id: String,
+    own: Box<[String]>,
+    lockr: Box<[String]>,
+}
+
+impl CookieReader {
+    /// A reader for a kind without the Lockr capability.
+    pub(crate) fn own(common: &ProviderCommon<'_>, own: Vec<String>) -> Self {
+        Self {
+            provider_id: common.id.to_owned(),
+            own: own.into_boxed_slice(),
+            lockr: Box::default(),
+        }
+    }
+
+    /// A reader for a kind with the Lockr capability. Lockr names already
+    /// in `own` are skipped, since they were read first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderConfigError::Invalid`] when Lockr is enabled with
+    /// an empty `cookie_names` list.
+    pub(crate) fn with_lockr<K: ReadsLockr>(
+        common: &ProviderCommon<'_>,
+        own: Vec<String>,
+        lockr: LockrSettings,
+    ) -> Result<Self, Report<ProviderConfigError>> {
+        let mut reader = Self::own(common, own);
+        if !lockr.enabled {
+            return Ok(reader);
+        }
+        let names = lockr.cookie_names.unwrap_or_else(|| {
+            K::LOCKR_COOKIE_NAMES
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect()
+        });
+        if names.is_empty() {
+            return Err(Report::new(ProviderConfigError::Invalid).attach(format!(
+                "lockr for a {} provider needs at least one cookie name",
+                K::KIND
+            )));
+        }
+        reader.lockr = names
+            .into_iter()
+            .filter(|name| !reader.own.contains(name))
+            .collect();
+        Ok(reader)
+    }
+
+    /// Whether any cookie name is configured.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.own.is_empty() && self.lockr.is_empty()
+    }
+
+    /// Returns the first value `parse` accepts, trying the own cookies
+    /// before the Lockr cookies.
+    pub(crate) fn read<'cookie, T>(
+        &self,
+        cookies: RequestCookies<'cookie>,
+        mut parse: impl FnMut(&'cookie str) -> Option<T>,
+    ) -> Option<T> {
+        if let Some(found) = self
+            .own
+            .iter()
+            .filter_map(|name| cookies.get(name))
+            .find_map(&mut parse)
+        {
+            return Some(found);
+        }
+        let (name, found) = self.lockr.iter().find_map(|name| {
+            let found = parse(cookies.get(name)?)?;
+            Some((name, found))
+        })?;
+        log::debug!(
+            "Identity provider '{}' reads its ID from cookie '{name}' (origin lockr)",
+            self.provider_id
+        );
+        Some(found)
+    }
 }
 
 /// A complete `OpenRTB` EID as a vendor returns it, borrowed from the body.

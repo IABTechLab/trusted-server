@@ -133,8 +133,14 @@ pull_sync_concurrency = 3
 # ID5 (kind "id5"): anonymous lookup, no secrets. The first source receives
 # the legacy `universal_uid`. Use the endpoint and sources ID5 gives you.
 # Before any lookup it reads the first-party cookies in `cookie_names`, in
-# order (Prebid's ID5 module writes `id5id`; Lockr AIM writes the ID under a
-# key name from its own configuration, so list that name too).
+# order (Prebid's ID5 module writes `id5id`).
+#
+# Lockr capability (id5, liveramp and uid2 only): Lockr AIM writes other
+# vendors' IDs into first-party cookies under key names configured per
+# publisher in Lockr. Enable `[ec.identity_providers.settings.lockr]` to read
+# them after the vendor's own cookies and before any lookup; `cookie_names`
+# defaults to the vendor's known Lockr key. connectid and liveintent reject a
+# `lockr` table.
 # [[ec.identity_providers]]
 # id = "id5"
 # kind = "id5"
@@ -145,6 +151,9 @@ pull_sync_concurrency = 3
 # tcf_vendor_id = 9999
 # [ec.identity_providers.settings]
 # partner_id = 1234
+# cookie_names = ["id5id"]
+# [ec.identity_providers.settings.lockr]
+# enabled = true
 # cookie_names = ["id5id"]
 #
 # LiveIntent (kind "liveintent"): anonymous lookup, no secrets. Each attribute
@@ -166,8 +175,8 @@ pull_sync_concurrency = 3
 #
 # LiveRamp (kind "liveramp"): no lookup and no endpoint. Reads the RampID
 # envelope from LiveRamp's own first-party `_lr_env` cookie and keeps it for
-# 15 days. Takes exactly one source; use the one LiveRamp gives you. Add a
-# cookie name that Lockr AIM writes the envelope into to `cookie_names`.
+# 15 days. Takes exactly one source; use the one LiveRamp gives you. Supports
+# the Lockr capability.
 # [[ec.identity_providers]]
 # id = "liveramp"
 # kind = "liveramp"
@@ -175,6 +184,9 @@ pull_sync_concurrency = 3
 # sources = ["liveramp.example.com"]
 # tcf_vendor_id = 9999
 # [ec.identity_providers.settings]
+# cookie_names = ["_lr_env"]
+# [ec.identity_providers.settings.lockr]
+# enabled = true
 # cookie_names = ["_lr_env"]
 #
 # Yahoo ConnectID (kind "connectid"): no lookup and no endpoint. Reads
@@ -193,7 +205,8 @@ pull_sync_concurrency = 3
 # from the UID2 SDK's `__uid_2` cookie until its `identity_expires`, falling
 # back to Prebid's raw `__uid2_advertising_token` cookie. Never stores or uses
 # the refresh token. Takes exactly one source. `cookie_names` lists the raw
-# token cookies, read in order after `identity_cookie_name`.
+# token cookies, read in order after `identity_cookie_name`. Supports the
+# Lockr capability; Lockr cookies are read last, as raw tokens.
 # [[ec.identity_providers]]
 # id = "uid2"
 # kind = "uid2"
@@ -201,6 +214,9 @@ pull_sync_concurrency = 3
 # sources = ["uid2.example.com"]
 # [ec.identity_providers.settings]
 # identity_cookie_name = "__uid_2"
+# cookie_names = ["__uid2_advertising_token"]
+# [ec.identity_providers.settings.lockr]
+# enabled = true
 # cookie_names = ["__uid2_advertising_token"]
 
 

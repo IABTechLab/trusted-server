@@ -9,6 +9,8 @@
 //! depends on it.
 
 mod common;
+
+pub use common::LockrSettings;
 pub mod connectid;
 pub mod id5;
 pub mod liveintent;
@@ -38,6 +40,19 @@ pub fn is_registered_kind(kind: &str) -> bool {
             | liveramp::LiveRamp::KIND
             | connectid::ConnectId::KIND
             | uid2::Uid2::KIND
+    )
+}
+
+/// Whether `kind` declares the Lockr capability, so its settings accept a
+/// `[ec.identity_providers.settings.lockr]` table.
+///
+/// The settings of every other kind reject that table as an unknown field
+/// when the provider is built.
+#[must_use]
+pub fn reads_lockr(kind: &str) -> bool {
+    matches!(
+        kind,
+        id5::Id5::KIND | liveramp::LiveRamp::KIND | uid2::Uid2::KIND
     )
 }
 
@@ -118,6 +133,8 @@ pub fn build_coordinator(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     fn create_test_settings() -> Settings {
@@ -139,6 +156,72 @@ mod tests {
             "#,
         )
         .expect("should parse test settings")
+    }
+
+    #[test]
+    fn only_lockr_capable_kinds_accept_lockr_settings() {
+        for (kind, endpoint, sources, settings) in [
+            (
+                "id5",
+                Some("https://id5.example.com/g/v2"),
+                json!(["id5.example.com"]),
+                json!({ "partner_id": 1234 }),
+            ),
+            (
+                "liveintent",
+                Some("https://li.example.com/idex"),
+                json!(["li.example.com"]),
+                json!({ "attributes": { "nonId": "li.example.com" } }),
+            ),
+            ("liveramp", None, json!(["liveramp.example.com"]), json!({})),
+            (
+                "connectid",
+                None,
+                json!(["connectid.example.com"]),
+                json!({}),
+            ),
+            ("uid2", None, json!(["uid2.example.com"]), json!({})),
+        ] {
+            let mut settings = settings;
+            settings["lockr"] = json!({ "enabled": true });
+            let config: IdentityProviderConfig = serde_json::from_value(json!({
+                "id": kind,
+                "kind": kind,
+                "endpoint": endpoint,
+                "allowed_domains": ["id5.example.com", "li.example.com"],
+                "sources": sources,
+                "settings": settings,
+            }))
+            .expect("should parse provider config");
+
+            let built = build(&config, &ProviderSecrets::default());
+
+            assert_eq!(
+                built.is_ok(),
+                reads_lockr(kind),
+                "should accept lockr settings only for capable kind {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_lockr_rejects_an_empty_cookie_list() {
+        let config: IdentityProviderConfig = serde_json::from_value(json!({
+            "id": "uid2",
+            "kind": "uid2",
+            "sources": ["uid2.example.com"],
+            "settings": { "lockr": { "enabled": true, "cookie_names": [] } },
+        }))
+        .expect("should parse provider config");
+
+        let error = build(&config, &ProviderSecrets::default())
+            .err()
+            .expect("should reject an empty lockr cookie list");
+
+        assert!(
+            matches!(error.current_context(), ProviderConfigError::Invalid),
+            "should report invalid config"
+        );
     }
 
     #[test]
