@@ -212,12 +212,14 @@ impl PartnerRegistry {
     ///
     /// For adapters with no identity-provider implementations: no source is
     /// provider-owned, so browser-supplied IDs are ingested for every source.
+    /// Kind registration is unknown here, so no unregistered-kind warning is
+    /// logged; use [`Self::from_ec_with_kinds`] where kinds are known.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`Self::from_config`].
     pub fn from_ec(ec: &Ec) -> Result<Self, Report<TrustedServerError>> {
-        Self::from_ec_with_kinds(ec, |_| false)
+        Self::from_config(&ec.partners)
     }
 
     /// Builds the registry from `[ec]` settings and marks every source claimed
