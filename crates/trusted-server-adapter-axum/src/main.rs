@@ -127,7 +127,10 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    Router::new().fallback_service(service_fn(move |req| service.clone().oneshot(req)))
+    Router::new().fallback_service(service_fn(move |mut req| {
+        trusted_server_adapter_axum::ingress::capture_http_ingress(&mut req);
+        service.clone().oneshot(req)
+    }))
 }
 
 /// Parses an optional `RUST_LOG` value into the logger's maximum level.
@@ -175,6 +178,95 @@ mod tests {
     use std::task::{Context, Poll};
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listener_trace_actions_require_matching_transport_origin() {
+        let settings = trusted_server_core::settings::Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+            [publisher]
+            domain = "localhost"
+            cookie_domain = "localhost"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "integration-test-proxy-secret"
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            [integrations.gpt_diagnostics]
+            enabled = true
+            trace_page_enabled = true
+            [observability]
+            server_timing_enabled = true
+            "#,
+        )
+        .expect("should parse listener trace settings");
+        let routes = TrustedServerApp::routes_with_settings(settings)
+            .expect("should build listener trace routes");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind an isolated HTTP listener");
+        let origin = format!(
+            "http://{}",
+            listener.local_addr().expect("should expose port")
+        );
+        let service = TimingService::new(EdgeZeroAxumService::new(routes), true);
+        let unbound = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("{origin}/_ts/trace/enable"))
+                    .header("host", origin.trim_start_matches("http://"))
+                    .header("origin", &origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-ts-trace-action", "enable")
+                    .body(Body::empty())
+                    .expect("should build unbound trace action"),
+            )
+            .await
+            .expect("should reject action without listener metadata");
+        assert_eq!(unbound.status().as_u16(), 403);
+        assert!(!unbound.headers().contains_key("set-cookie"));
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                dev_server_router(service).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .expect("should serve trace requests");
+        });
+        let client = reqwest::Client::new();
+        for action in ["enable", "end"] {
+            for (browser_origin, expected_status) in [
+                ("https://attacker.example.com", 403),
+                (origin.as_str(), 200),
+            ] {
+                let response = client
+                    .post(format!("{origin}/_ts/trace/{action}"))
+                    .header("origin", browser_origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-ts-trace-action", action)
+                    .header("forwarded", "host=attacker.example.com;proto=https")
+                    .header("x-forwarded-host", "attacker.example.com")
+                    .header("x-forwarded-proto", "https")
+                    .send()
+                    .await
+                    .expect("should request trace action through the listener");
+                assert_eq!(response.status().as_u16(), expected_status);
+                assert_eq!(response.headers()["cache-control"], "no-store, private");
+                assert!(response.headers().contains_key("content-security-policy"));
+                assert!(response.headers().contains_key("server-timing"));
+                assert_eq!(
+                    response.headers().contains_key("set-cookie"),
+                    expected_status == 200,
+                    "should mutate cookies only for the listener's matching origin"
+                );
+            }
+        }
+        server.abort();
+    }
 
     struct ReadinessSensitiveService {
         polled: bool,

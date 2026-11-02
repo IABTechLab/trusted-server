@@ -6,6 +6,8 @@
 
 /// Application routing and handler registration for the Axum dev server.
 pub mod app;
+/// Transport ingress for the adapter-owned plain HTTP listener.
+pub mod ingress;
 /// Request middleware (auth, response finalisation).
 pub mod middleware;
 /// Platform-trait implementations backed by env vars and `reqwest`.
