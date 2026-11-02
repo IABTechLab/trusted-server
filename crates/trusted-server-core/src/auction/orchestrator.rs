@@ -1700,8 +1700,7 @@ impl AuctionOrchestrator {
             && !context.services.http_client().supports_concurrent_fanout()
         {
             log::warn!(
-                "{} planned auction providers configured on a runtime without concurrent fanout",
-                self.planned_providers.len()
+                "Multiple planned auction providers configured on a runtime without concurrent fanout"
             );
             return DispatchAuctionOutcome::NotStarted;
         }
