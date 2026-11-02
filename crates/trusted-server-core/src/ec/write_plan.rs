@@ -58,7 +58,17 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
 
     let mut entry = base.clone();
     apply_browser_ingest(&mut entry, input.browser_ingest, input.registry);
-    let written = apply_lookups(&mut entry, input.lookups, input.now);
+    let written = if input.lookups.is_for(input.ec_id) {
+        apply_lookups(&mut entry, input.lookups, input.now)
+    } else {
+        if !input.lookups.is_empty() {
+            log::info!(
+                "EC write planner: discarding lookups made for another EC ID than '{}'",
+                super::log_id(input.ec_id)
+            );
+        }
+        Vec::new()
+    };
     for record in entry.ids.values_mut() {
         record.prune_expired(input.now);
     }
@@ -111,23 +121,35 @@ fn serialized_len(entry: &KvEntry) -> usize {
 
 fn enforce_size_cap(entry: &mut KvEntry, written: &[SourceDomain]) {
     while serialized_len(entry) > MAX_ENTRY_BYTES {
-        let Some(source) = written.iter().rev().find(|source| {
+        if let Some(source) = written.iter().rev().find(|source| {
             entry
                 .ids
                 .get(source.as_str())
                 .is_some_and(KvPartnerId::is_provider_written)
-        }) else {
-            log::warn!("EC write planner: row exceeds size cap with no provider UIDs left to drop");
+        }) {
+            let record = entry
+                .ids
+                .get_mut(source.as_str())
+                .expect("should hold a written source");
+            record.drop_last_uid();
+            if record.uid.is_empty() {
+                entry.ids.remove(source.as_str());
+            }
+            continue;
+        }
+        // No provider UIDs from this navigation are left: drop whole records,
+        // largest first, so every later write still fits the cap.
+        let Some(largest) = entry
+            .ids
+            .iter()
+            .max_by_key(|(_, record)| serde_json::to_vec(record).map_or(usize::MAX, |b| b.len()))
+            .map(|(source, _)| source.clone())
+        else {
+            log::warn!("EC write planner: row exceeds size cap with no partner IDs left to drop");
             return;
         };
-        let record = entry
-            .ids
-            .get_mut(source.as_str())
-            .expect("should hold a written source");
-        record.drop_last_uid();
-        if record.uid.is_empty() {
-            entry.ids.remove(source.as_str());
-        }
+        log::warn!("EC write planner: dropping '{largest}' to fit the row size cap");
+        entry.ids.remove(&largest);
     }
 }
 
@@ -184,17 +206,20 @@ mod tests {
                 )
             })
             .collect();
-        LookupResults::new(vec![ProviderLookup {
-            provider: ProviderId::new("example-provider"),
-            status: LookupStatus::Found {
-                kept: 1,
-                dropped: DropCounts::default(),
-            },
-            entries: vec![(
-                SourceDomain::try_from(source).expect("should build source"),
-                vec![KvEid::new(EidFields::default(), uids)],
-            )],
-        }])
+        LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::Found {
+                    kept: 1,
+                    dropped: DropCounts::default(),
+                },
+                entries: vec![(
+                    SourceDomain::try_from(source).expect("should build source"),
+                    vec![KvEid::new(EidFields::default(), uids)],
+                )],
+            }],
+        )
     }
 
     fn input<'a>(
@@ -247,6 +272,36 @@ mod tests {
         assert_eq!(
             entry.ids["ids.example.com"].uid, "p-1",
             "should store provider uid, not client uid"
+        );
+    }
+
+    #[test]
+    fn lookups_for_another_ec_id_are_discarded() {
+        let registry = registry(&["ids.example.com"]);
+        let snapshot = EcKvSnapshot::Missing {
+            ec_id: EC_ID.to_owned(),
+        };
+        let new_entry = live_entry();
+        let lookups_for_old = LookupResults::new(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.OLD123",
+            found("ids.example.com", &["p-1"]).iter().cloned().collect(),
+        );
+
+        let change = plan_write(&input(
+            &snapshot,
+            Some(&new_entry),
+            &[],
+            &lookups_for_old,
+            &registry,
+        ))
+        .expect("should plan create");
+
+        let RowChange::Create(entry) = change else {
+            panic!("should create a new row")
+        };
+        assert!(
+            !entry.ids.contains_key("ids.example.com"),
+            "should not attribute the old EC ID's lookups to the new row"
         );
     }
 
@@ -315,6 +370,35 @@ mod tests {
             plan_write(&input(&snapshot, None, &ingest, &lookups, &registry)).is_none(),
             "should not overwrite blindly"
         );
+    }
+
+    #[test]
+    fn oversized_row_without_provider_uids_drops_records_until_it_fits() {
+        let registry = registry(&[]);
+        let mut entry = live_entry();
+        for i in 0..40 {
+            entry.ids.insert(
+                format!("source{i:02}.example.com"),
+                KvPartnerId::single(format!("{i:03}{}", "x".repeat(500))),
+            );
+        }
+        let snapshot = EcKvSnapshot::Missing {
+            ec_id: EC_ID.to_owned(),
+        };
+        let lookups = LookupResults::default();
+
+        let change = plan_write(&input(&snapshot, Some(&entry), &[], &lookups, &registry))
+            .expect("should plan create");
+
+        let RowChange::Create(entry) = change else {
+            panic!("should create")
+        };
+        let size = serde_json::to_vec(&entry).expect("should serialize").len();
+        assert!(
+            size <= MAX_ENTRY_BYTES,
+            "should fit the row cap, got {size}"
+        );
+        assert!(!entry.ids.is_empty(), "should keep the records that fit");
     }
 
     #[test]

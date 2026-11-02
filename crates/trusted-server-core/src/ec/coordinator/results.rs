@@ -124,14 +124,29 @@ pub struct ProviderLookup {
 /// Validated results of one navigation's lookups.
 #[derive(Debug, Clone, Default)]
 pub struct LookupResults {
+    /// EC ID the lookups were made for; `None` when nothing was looked up.
+    ec_id: Option<String>,
     lookups: Vec<ProviderLookup>,
 }
 
 impl LookupResults {
-    /// Wraps per-provider results in provider-config order.
+    /// Wraps per-provider results, made for `ec_id`, in provider-config
+    /// order.
     #[must_use]
-    pub fn new(lookups: Vec<ProviderLookup>) -> Self {
-        Self { lookups }
+    pub fn new(ec_id: &str, lookups: Vec<ProviderLookup>) -> Self {
+        Self {
+            ec_id: Some(ec_id.to_owned()),
+            lookups,
+        }
+    }
+
+    /// Whether these results were looked up for `ec_id`.
+    ///
+    /// A navigation can switch EC IDs after dispatch (orphan recovery mints a
+    /// new one), so results for another ID must not be attributed to it.
+    #[must_use]
+    pub fn is_for(&self, ec_id: &str) -> bool {
+        self.ec_id.as_deref() == Some(ec_id)
     }
 
     /// Iterates results in provider-config order.

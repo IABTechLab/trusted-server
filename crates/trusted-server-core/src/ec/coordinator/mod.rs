@@ -96,6 +96,8 @@ pub struct LookupContext<'a> {
 pub struct PendingLookups<Pending> {
     requests: Vec<Tagged<Pending>>,
     deadline: Option<Deadline>,
+    /// EC ID the lookups were dispatched for.
+    ec_id: String,
     /// Request time, for validating `exp` and resolving relative expiry.
     now: UnixSeconds,
     /// Providers that finished at dispatch (skipped or failed to send).
@@ -107,6 +109,7 @@ impl<Pending> Default for PendingLookups<Pending> {
         Self {
             requests: Vec::new(),
             deadline: None,
+            ec_id: String::new(),
             now: UnixSeconds::new(0),
             early: Vec::new(),
         }
@@ -421,6 +424,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         lookup: &LookupContext<'_>,
     ) -> PendingLookups<T::Pending> {
         let mut pending = PendingLookups {
+            ec_id: lookup.ec_id.to_owned(),
             now: lookup.now,
             ..PendingLookups::default()
         };
@@ -511,6 +515,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         let PendingLookups {
             requests,
             deadline,
+            ec_id,
             now,
             early,
         } = pending;
@@ -530,7 +535,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         for lookup in &lookups {
             log_outcome(lookup);
         }
-        LookupResults::new(lookups)
+        LookupResults::new(&ec_id, lookups)
     }
 
     fn plan_write(&self, input: &WritePlanInput<'_>) -> Option<RowChange> {

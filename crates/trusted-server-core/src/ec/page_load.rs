@@ -54,15 +54,24 @@ impl NavigationPermit {
     /// are the page load itself and keep the permit.
     #[must_use]
     pub fn confirm(self, status: StatusCode) -> Option<PageLoadWrite> {
-        let redirect = matches!(
+        (!Self::is_redirect(status)).then_some(PageLoadWrite(()))
+    }
+
+    /// Whether `status` is a redirect (301, 302, 303, 307, 308) on which the
+    /// page load's write is skipped.
+    ///
+    /// Callers use this to drop work, such as pending identity lookups, whose
+    /// only purpose is that write.
+    #[must_use]
+    pub fn is_redirect(status: StatusCode) -> bool {
+        matches!(
             status,
             StatusCode::MOVED_PERMANENTLY
                 | StatusCode::FOUND
                 | StatusCode::SEE_OTHER
                 | StatusCode::TEMPORARY_REDIRECT
                 | StatusCode::PERMANENT_REDIRECT
-        );
-        (!redirect).then_some(PageLoadWrite(()))
+        )
     }
 
     /// Builds a permit without a request, for tests.
@@ -222,6 +231,28 @@ mod tests {
             assert!(
                 NavigationPermit::for_test().confirm(status).is_none(),
                 "should not write on redirect {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_redirect_matches_only_write_skipping_statuses() {
+        for status in [
+            http::StatusCode::MOVED_PERMANENTLY,
+            http::StatusCode::FOUND,
+            http::StatusCode::SEE_OTHER,
+            http::StatusCode::TEMPORARY_REDIRECT,
+            http::StatusCode::PERMANENT_REDIRECT,
+        ] {
+            assert!(
+                NavigationPermit::is_redirect(status),
+                "should treat {status} as a redirect"
+            );
+        }
+        for status in [http::StatusCode::OK, http::StatusCode::NOT_MODIFIED] {
+            assert!(
+                !NavigationPermit::is_redirect(status),
+                "should not treat {status} as a redirect"
             );
         }
     }

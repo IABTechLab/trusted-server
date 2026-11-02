@@ -123,7 +123,6 @@ use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::provider::ClientSignals;
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
@@ -152,7 +151,7 @@ use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
-use trusted_server_identity_providers::build_coordinator;
+use trusted_server_identity_providers::{build_coordinator, partner_registry};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -679,7 +678,7 @@ async fn execute_named(
         handler,
         NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
     ) {
-        let response = PartnerRegistry::from_ec(&state.settings.ec)
+        let response = partner_registry(&state.settings.ec)
             .and_then(|registry| match handler {
                 NamedRouteHandler::AdminEcLookup => {
                     // Deliberately do not use an EC request-state graph: that
@@ -760,7 +759,7 @@ async fn run_named_route(
                 cors_preflight_identify(&state.settings, &req)
             } else {
                 let kv = crate::require_identity_graph(&state.settings)?;
-                let partner_registry = PartnerRegistry::from_ec(&state.settings.ec)?;
+                let partner_registry = partner_registry(&state.settings.ec)?;
                 handle_identify(
                     &state.settings,
                     &kv,
@@ -774,7 +773,7 @@ async fn run_named_route(
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Auction => {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Auction);
-            let partner_registry = PartnerRegistry::from_ec(&state.settings.ec)?;
+            let partner_registry = partner_registry(&state.settings.ec)?;
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
@@ -798,7 +797,7 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 return Ok(page_bids_preflight_denied());
             }
-            let partner_registry = PartnerRegistry::from_ec(&state.settings.ec)?;
+            let partner_registry = partner_registry(&state.settings.ec)?;
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
@@ -845,7 +844,7 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
-        let partner_registry = PartnerRegistry::from_ec(&state.settings.ec)?;
+        let partner_registry = partner_registry(&state.settings.ec)?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
         handle_batch_sync(&kv, &partner_registry, &limiter, req)
     });
@@ -983,7 +982,7 @@ async fn dispatch_fallback(
         // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
         // server-side EIDs, same as the legacy auction.
         let slots = state.settings.creative_opportunity_slots();
-        match PartnerRegistry::from_ec(&state.settings.ec) {
+        match partner_registry(&state.settings.ec) {
             Ok(partner_registry) => {
                 let auction = AuctionDispatch {
                     integration_registry: &state.registry,
@@ -2909,7 +2908,10 @@ mod tests {
         }));
         let coordinator = ProviderCoordinator::new(
             vec![RegisteredProvider::new(provider_config, provider)],
-            Arc::new(PartnerRegistry::from_ec(&settings.ec).expect("should build registry")),
+            Arc::new(
+                PartnerRegistry::from_ec_with_kinds(&settings.ec, |_| true)
+                    .expect("should build registry"),
+            ),
             Duration::from_millis(200),
         )
         .expect("should build coordinator");

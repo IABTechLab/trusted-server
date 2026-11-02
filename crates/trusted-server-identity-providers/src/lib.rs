@@ -15,7 +15,26 @@ use error_stack::Report;
 use trusted_server_core::ec::coordinator::{ProviderCoordinator, RegisteredProvider};
 use trusted_server_core::ec::provider::{IdentityProvider, ProviderConfigError};
 use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::settings::{IdentityProviderConfig, ProviderSecrets, Settings};
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::settings::{Ec, IdentityProviderConfig, ProviderSecrets, Settings};
+
+/// Whether `kind` has a registered implementation.
+///
+/// No kinds are registered yet.
+#[must_use]
+pub fn is_registered_kind(_kind: &str) -> bool {
+    false
+}
+
+/// Builds the partner registry, marking only sources claimed by enabled
+/// providers whose kind is registered as provider-owned.
+///
+/// # Errors
+///
+/// Returns the same errors as [`PartnerRegistry::from_ec`].
+pub fn partner_registry(ec: &Ec) -> Result<PartnerRegistry, Report<TrustedServerError>> {
+    PartnerRegistry::from_ec_with_kinds(ec, is_registered_kind)
+}
 
 /// Builds the provider for a configured `kind`.
 ///
@@ -50,6 +69,17 @@ pub fn build_coordinator(
         .identity_providers
         .iter()
         .filter(|config| config.enabled)
+        .filter(|config| {
+            let registered = is_registered_kind(config.kind());
+            if !registered {
+                log::warn!(
+                    "Identity provider '{}' skipped: kind '{}' is not registered",
+                    config.id,
+                    config.kind()
+                );
+            }
+            registered
+        })
         .collect();
     if enabled.is_empty() {
         return Ok(None);
@@ -61,7 +91,7 @@ pub fn build_coordinator(
                 .map(|provider| RegisteredProvider::new(config.clone(), provider))
         })
         .collect::<Result<Vec<_>, Report<ProviderConfigError>>>()?;
-    let partners = PartnerRegistry::from_ec(&settings.ec)
+    let partners = partner_registry(&settings.ec)
         .map_err(|report| report.change_context(ProviderConfigError::Invalid))?;
     let budget = Duration::from_millis(settings.ec.identity_budget_ms);
     ProviderCoordinator::new(registered, Arc::new(partners), budget).map(Some)
@@ -125,22 +155,23 @@ mod tests {
     }
 
     #[test]
-    fn enabled_unknown_kind_fails_the_build() {
+    fn enabled_unknown_kind_is_skipped_and_claims_no_sources() {
         let mut settings = create_test_settings();
         settings.ec.identity_providers = vec![
             toml::from_str(
-                "id = \"p\"\nkind = \"missing\"\nendpoint = \"https://ids.example.com/\"",
+                "id = \"p\"\nkind = \"missing\"\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]",
             )
             .expect("should parse"),
         ];
 
-        let error = build_coordinator(&settings)
-            .err()
-            .expect("should reject unknown kind");
+        let coordinator =
+            build_coordinator(&settings).expect("should skip unregistered provider kinds");
+        let registry = partner_registry(&settings.ec).expect("should build registry");
 
+        assert!(coordinator.is_none(), "should build no coordinator");
         assert!(
-            matches!(error.current_context(), ProviderConfigError::UnknownKind),
-            "should report unknown kind"
+            !registry.is_provider_owned("ids.example.com"),
+            "should leave unregistered provider sources to browser ingest"
         );
     }
 }

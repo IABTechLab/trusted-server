@@ -18,6 +18,7 @@ use trusted_server_core::ec::coordinator::transport::PlatformLookupTransport;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::pull_sync::{
     PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
 };
@@ -30,6 +31,7 @@ use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::trace::{TraceTerminalResponse, is_trace_path};
 use trusted_server_core::version_header::{apply_git_version_header, git_version_header_value};
+use trusted_server_identity_providers::partner_registry;
 
 mod app;
 mod backend;
@@ -659,6 +661,14 @@ fn apply_edgezero_ec_finalize(
     identity: Option<IdentityLookups>,
     response: &mut HttpResponse,
 ) -> Result<PartnerRegistry, Report<TrustedServerError>> {
+    // A redirect skips the write, so do not wait for lookups it would discard.
+    let identity = identity.filter(|_| {
+        let redirect = NavigationPermit::is_redirect(response.status());
+        if redirect {
+            log::debug!("Identity lookups dropped: redirect response skips the write");
+        }
+        !redirect
+    });
     if let Some(IdentityLookups {
         coordinator,
         pending,
@@ -669,7 +679,7 @@ fn apply_edgezero_ec_finalize(
         let results = futures::executor::block_on(coordinator.collect(&transport, pending));
         ec_state.ec_context.set_lookup_results(results);
     }
-    let partner_registry = PartnerRegistry::from_ec(&settings.ec)?;
+    let partner_registry = partner_registry(&settings.ec)?;
     let finalize_kv_graph = if ec_state.use_finalize_kv {
         maybe_identity_graph(settings)
     } else {

@@ -660,14 +660,24 @@ pub(crate) fn merge_auction_eids(
             if uid.id.trim().is_empty() || uid.id.len() > MAX_UID_LENGTH {
                 continue;
             }
+            // A duplicate keeps the earlier UID's fields but fills its
+            // missing `atype` and `ext` from the later one.
             let duplicate = merged
-                .iter()
+                .iter_mut()
                 .filter(|existing| existing.source == source)
-                .flat_map(|existing| existing.uids.iter())
-                .chain(kept.iter())
-                .any(|existing: &Uid| existing.id == uid.id);
-            if !duplicate {
-                kept.push(uid);
+                .flat_map(|existing| existing.uids.iter_mut())
+                .chain(kept.iter_mut())
+                .find(|existing: &&mut Uid| existing.id == uid.id);
+            match duplicate {
+                Some(existing) => {
+                    if existing.atype.is_none() {
+                        existing.atype = uid.atype;
+                    }
+                    if existing.ext.is_none() {
+                        existing.ext = uid.ext;
+                    }
+                }
+                None => kept.push(uid),
             }
         }
         if kept.is_empty() {
@@ -2255,6 +2265,40 @@ mod tests {
             merged[0].uids[0].ext,
             Some(json!({ "provider": "server" })),
             "should prefer resolved ext"
+        );
+    }
+
+    #[test]
+    fn merge_auction_eids_fills_missing_atype_and_ext_from_duplicate() {
+        let client_eids = Some(vec![Eid::new(
+            "adserver.org".to_string(),
+            vec![Uid {
+                id: "shared_uid".to_string(),
+                atype: Some(1),
+                ext: Some(json!({ "provider": "client" })),
+            }],
+        )]);
+        let resolved_eids = Some(vec![Eid::new(
+            "adserver.org".to_string(),
+            vec![Uid {
+                id: "shared_uid".to_string(),
+                atype: None,
+                ext: None,
+            }],
+        )]);
+
+        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
+
+        assert_eq!(merged[0].uids.len(), 1, "should deduplicate duplicate uid");
+        assert_eq!(
+            merged[0].uids[0].atype,
+            Some(1),
+            "should fill missing atype from the duplicate"
+        );
+        assert_eq!(
+            merged[0].uids[0].ext,
+            Some(json!({ "provider": "client" })),
+            "should fill missing ext from the duplicate"
         );
     }
 

@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 error-stack = { workspace = true }
+log = { workspace = true }
 trusted-server-core = { workspace = true }
 
 [dev-dependencies]

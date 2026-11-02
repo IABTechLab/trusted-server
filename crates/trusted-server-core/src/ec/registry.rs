@@ -208,21 +208,45 @@ impl PartnerRegistry {
         })
     }
 
-    /// Builds the registry from `[ec]` settings and marks every source claimed
-    /// by an enabled identity provider as provider-owned.
+    /// Builds the registry from `[ec]` settings without provider ownership.
+    ///
+    /// For adapters with no identity-provider implementations: no source is
+    /// provider-owned, so browser-supplied IDs are ingested for every source.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`Self::from_config`].
     pub fn from_ec(ec: &Ec) -> Result<Self, Report<TrustedServerError>> {
+        Self::from_ec_with_kinds(ec, |_| false)
+    }
+
+    /// Builds the registry from `[ec]` settings and marks every source claimed
+    /// by an enabled identity provider whose kind is registered as
+    /// provider-owned.
+    ///
+    /// An enabled provider with an unregistered kind never runs, so its
+    /// sources stay open to browser ingest and a warning is logged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::from_config`].
+    pub fn from_ec_with_kinds(
+        ec: &Ec,
+        is_registered_kind: impl Fn(&str) -> bool,
+    ) -> Result<Self, Report<TrustedServerError>> {
         let mut registry = Self::from_config(&ec.partners)?;
-        for source in ec
-            .identity_providers
-            .iter()
-            .filter(|provider| provider.enabled)
-            .flat_map(|provider| &provider.sources)
-        {
-            registry.mark_provider_owned(source);
+        for provider in ec.identity_providers.iter().filter(|p| p.enabled) {
+            if !is_registered_kind(provider.kind()) {
+                log::warn!(
+                    "Identity provider '{}' has unregistered kind '{}'; its sources stay browser-ingested",
+                    provider.id,
+                    provider.kind()
+                );
+                continue;
+            }
+            for source in &provider.sources {
+                registry.mark_provider_owned(source);
+            }
         }
         Ok(registry)
     }
@@ -499,7 +523,8 @@ mod tests {
             .expect("should parse disabled provider"),
         ];
 
-        let registry = PartnerRegistry::from_ec(&ec).expect("should build registry");
+        let registry = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
+            .expect("should build registry");
 
         assert!(
             registry.is_provider_owned("ids.example.com"),
@@ -508,6 +533,34 @@ mod tests {
         assert!(
             !registry.is_provider_owned("other.example.com"),
             "should not mark disabled provider source"
+        );
+    }
+
+    #[test]
+    fn from_ec_skips_providers_with_unregistered_kinds() {
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        ec.partners = vec![make_partner(
+            "ids.example.com",
+            &valid_api_token("ids-partner"),
+        )];
+        ec.identity_providers = vec![
+            toml::from_str(
+                "id = \"a\"\nkind = \"missing\"\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse enabled provider"),
+        ];
+
+        let with_kinds = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
+            .expect("should build registry");
+        let plain = PartnerRegistry::from_ec(&ec).expect("should build registry");
+
+        assert!(
+            !with_kinds.is_provider_owned("ids.example.com"),
+            "should not claim sources for an unregistered kind"
+        );
+        assert!(
+            !plain.is_provider_owned("ids.example.com"),
+            "should not claim sources without provider implementations"
         );
     }
 
