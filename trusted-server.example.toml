@@ -276,6 +276,19 @@ pull_sync_concurrency = 3
 # sources = ["criteo.example.com"]
 # [ec.identity_providers.settings]
 # cookie_names = ["cto_bidid"]
+#
+# Unified ID (kind "unifiedid"): no lookup and no endpoint. Reads The Trade
+# Desk ID from the `TDID` field of Prebid's `pbjs-unifiedid` cookie and stores
+# it as Prebid sends it: atype 1, UID `ext` `{"rtiPartner":"TDID"}`, and
+# `inserter`/`matcher` `adserver.org` with `mm` 4. Takes exactly one source;
+# do not also list that source for a liveintent `thetradedesk` attribute.
+# [[ec.identity_providers]]
+# id = "unifiedid"
+# kind = "unifiedid"
+# enabled = false
+# sources = ["unifiedid.example.com"]
+# [ec.identity_providers.settings]
+# cookie_names = ["pbjs-unifiedid"]
 
 
 # =============================================================================
