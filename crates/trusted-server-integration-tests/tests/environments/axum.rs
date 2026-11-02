@@ -1,4 +1,4 @@
-use crate::common::config::integration_app_config_envelope;
+use crate::common::config::{envelope_with_public_origin, integration_app_config_envelope};
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
@@ -55,11 +55,29 @@ impl RuntimeEnvironment for AxumDevServer {
     }
 
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
+        let app_config = integration_app_config_envelope(origin_port())?;
+        self.spawn_with_app_config(&app_config)
+    }
+
+    fn health_check_path(&self) -> &str {
+        "/health"
+    }
+}
+
+impl AxumDevServer {
+    /// Spawn the real native binary with an isolated app-config envelope.
+    ///
+    /// Normal [`RuntimeEnvironment::spawn`] retains its disabled baseline config.
+    ///
+    /// # Errors
+    ///
+    /// Returns a spawn or readiness error if the native process is unavailable.
+    pub(crate) fn spawn_with_app_config(&self, app_config: &str) -> TestResult<RuntimeProcess> {
         let binary = self.binary_path();
         let port = super::find_available_port().unwrap_or(AXUM_DEFAULT_PORT);
 
         let base_url = format!("http://127.0.0.1:{port}");
-        let app_config = integration_app_config_envelope(origin_port(), &base_url)?;
+        let app_config = envelope_with_public_origin(app_config, &base_url)?;
         let store_name = default_config_store_name();
         let config_key = default_config_key();
         let config_variable = config_env_var(store_name.as_ref(), &config_key);
@@ -100,12 +118,6 @@ impl RuntimeEnvironment for AxumDevServer {
         })
     }
 
-    fn health_check_path(&self) -> &str {
-        "/health"
-    }
-}
-
-impl AxumDevServer {
     /// Resolve the path to the compiled `trusted-server-axum` binary.
     ///
     /// Respects the `AXUM_BINARY_PATH` environment variable for CI overrides.
