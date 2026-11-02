@@ -53,7 +53,7 @@ The pass itself, `rewrite_creative_html_impl` (`creative.rs:1125`), registers ev
 | Anchor handler                   | `creative.rs:1283`                   | `a[href], area[href]` → `build_click_url`, sets `href` and `data-tsclick`. |
 | Body-less fragment TSJS fallback | `creative.rs:1391`                   | Prepends the bundle when no `<body>` token was seen.                       |
 
-Every per-URL decision for assets and anchors goes through `to_abs` (`creative.rs:54-75`). It trims, maps `//host` to `https://host`, rejects anything that is not an `http://` or `https://` prefix, and returns `None` when `settings.rewrite.is_excluded` matches (`creative.rs:70`). `None` leaves the attribute untouched, so an excluded anchor keeps its raw `href` and gets no `data-tsclick`.
+Every per-URL decision for assets and anchors goes through `to_abs` (`creative.rs:54-75`). It trims, maps `//cdn.example.com` to `https://cdn.example.com`, rejects anything that is not an `http://` or `https://` prefix, and returns `None` when `settings.rewrite.is_excluded` matches (`creative.rs:70`). `None` leaves the attribute untouched, so an excluded anchor keeps its raw `href` and gets no `data-tsclick`.
 
 `to_abs` returns the trimmed input string, not a parsed URL. `build_signed_url_for` (`creative.rs:554`) parses it again with `url::Url` and, if parsing fails, returns the clear URL unchanged (`creative.rs:560-562`).
 
@@ -178,7 +178,7 @@ pub(super) fn normalize_creative_url(url: &str) -> Option<url::Url> {
 }
 ```
 
-It trims the input, maps a protocol-relative `//host/...` to `https://host/...`, and accepts only a case-insensitive `http://` or `https://` prefix. It parses absolute input without an intermediate `format!`, and returns `None` for empty, relative, non-http(s) or unparseable input. It needs no separate hostless check, because `url` rejects an `http(s)` URL without a host. It makes no policy decision and reads no settings.
+It trims the input, maps a protocol-relative `//cdn.example.com/...` to `https://cdn.example.com/...`, and accepts only a case-insensitive `http://` or `https://` prefix. It parses absolute input without an intermediate `format!`, and returns `None` for empty, relative, non-http(s) or unparseable input. It needs no separate hostless check, because `url` rejects an `http(s)` URL without a host. It makes no policy decision and reads no settings.
 
 Policy lives on `Rewrite` in `settings.rs`:
 
@@ -246,7 +246,7 @@ These edge cases change, all in the safe direction:
 
 - Uppercase `exclude_domains` entries start matching, because the shared matcher is case-insensitive and entries are lowercased at load. `/first-party/sign` returns `502` for those hosts, where it used to return `200`, or `403` for hosts outside `proxy.allowed_domains`.
 - Empty and bare `"*"` exclude entries, which never matched a host, are dropped with a warning.
-- An `http(s)`-prefixed value that `url::Url` cannot parse (for example `https://exa mple.example/x`) is left byte-for-byte untouched. Before, `to_abs` accepted it and `build_signed_url_for` wrote the raw string back re-quoted, so `<img src='…'>` became `<img src="…">`, and an anchor also gained `data-tsclick="https://exa mple.example/x"`. Red-phase runs against `main` reproduced both.
+- An `http(s)`-prefixed value that `url::Url` cannot parse (for example `https://example.com invalid/x`) is left byte-for-byte untouched. Before, `to_abs` accepted it and `build_signed_url_for` wrote the raw string back re-quoted, so `<img src='…'>` became `<img src="…">`, and an anchor also gained `data-tsclick="https://example.com invalid/x"`. Red-phase runs against `main` reproduced both.
 
 These go in `CHANGELOG.md` under Unreleased › Fixed, as one entry, in whichever PR lands the shared step. The exact text is in the plan's "Shared step" section.
 

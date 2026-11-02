@@ -20,6 +20,9 @@ pub enum PlatformError {
     /// HTTP client request failed.
     #[display("http client error")]
     HttpClient,
+    /// The absolute HTTP collection deadline elapsed.
+    #[display("http collection deadline exceeded")]
+    DeadlineExceeded,
     /// Geo lookup failed.
     #[display("geo lookup error")]
     Geo,
