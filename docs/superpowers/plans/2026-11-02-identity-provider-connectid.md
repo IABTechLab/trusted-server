@@ -22,6 +22,10 @@ No Lockr capability: Lockr AIM is not documented to deliver ConnectID, so a `[se
 - One EID for the single configured source, one UID with `atype = 3`.
 - Expiry `ProviderExpiry::At(lastSynced + min(ttl, 14 days))`; a missing `ttl` uses the shared default TTL. The provider reads no clock: the coordinator's validation drops the ID once that time has passed.
 
+## Not ported from the reference provider
+
+- The reference calls Yahoo's sync endpoint, which needs a hashed email on every call. The logged-in experience is out of scope, so nothing is ported; this provider reads the `connectId` cookie only.
+
 ## Tasks
 
 - [ ] Add `connectid.rs` and register the kind in `is_registered_kind` and `build`.
