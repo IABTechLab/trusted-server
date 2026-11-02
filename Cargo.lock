@@ -6556,6 +6556,7 @@ dependencies = [
  "tokio",
  "tower 0.4.13",
  "trusted-server-core",
+ "web-time",
 ]
 
 [[package]]
@@ -6576,6 +6577,7 @@ dependencies = [
  "tokio",
  "toml",
  "trusted-server-core",
+ "web-time",
  "worker",
 ]
 
@@ -6593,6 +6595,7 @@ dependencies = [
  "error-stack",
  "esi",
  "fastly",
+ "fastly-sys",
  "fern",
  "futures",
  "log",
@@ -6603,6 +6606,7 @@ dependencies = [
  "trusted-server-core",
  "url",
  "urlencoding",
+ "web-time",
 ]
 
 [[package]]
@@ -6624,6 +6628,7 @@ dependencies = [
  "spin-sdk",
  "tokio",
  "trusted-server-core",
+ "web-time",
 ]
 
 [[package]]

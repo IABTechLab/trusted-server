@@ -135,6 +135,22 @@ The typed `profile_config` fields are:
 | `bid_param_override_rules` | `[]`    | Ordered exact-match rules; later matching rules win |
 | `consent_forwarding`       | `both`  | `openrtb_only`, `cookies_only`, or `both`           |
 
+PBS never receives the browser's full `Cookie` header. `both` and
+`cookies_only` forward only `euconsent-v2`, `__gpp`, `__gpp_sid`, and
+`us_privacy`; `openrtb_only` sends no Cookie header. Identity and publisher
+session cookies are excluded in all modes. Unreadable headers and malformed
+cookie pairs are omitted, and no header is sent when no allowed pair remains.
+Cookie parsing matches consent extraction, including trimmed names/values and
+last-duplicate selection. Decimal GPP section whitespace is normalized.
+Cookie-sourced consent is omitted from the OpenRTB body in `cookies_only` when
+the extracted cookies can be forwarded safely. Only an affected unsafe signal
+falls back to the body; the GPP string and section IDs fall back together if
+either GPP cookie is unsafe. Policy-sourced consent retains its existing body
+fallback.
+
+See [Integration cookie forwarding](./cookie-forwarding) for the complete
+outbound audit and intentional partner-specific exceptions.
+
 `notifications.suppress_all` replaces the old global notification switch.
 `notifications.suppress_seats` removes `nurl` and `burl` only for exact returned
 `seatbid.seat` values. It does not match bidder route IDs. See
@@ -983,7 +999,7 @@ The downstream Prebid Server request includes:
 
 - `user.id` when EC forwarding is allowed
 - `user.ext.eids` containing the merged, deduplicated EID set
-- forwarded browser cookies (subject to consent-forwarding mode)
+- only allowlisted consent cookies in `both` and `cookies_only`; no Cookie header in `openrtb_only`
 
 In practice, this gives operators both:
 
