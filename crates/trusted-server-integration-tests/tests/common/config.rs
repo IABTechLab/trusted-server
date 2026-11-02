@@ -8,31 +8,54 @@ use crate::common::runtime::{TestError, TestResult};
 const GENERATED_AT: &str = "2026-06-23T00:00:00Z";
 const APP_CONFIG: &str = include_str!("../../fixtures/configs/trusted-server.integration.toml");
 
-/// Compile fictional native credentials for the integration feature configuration.
+/// Recover feature settings from the exact customized runtime envelope.
 ///
 /// # Errors
-/// Returns a config-generation error if the fixture or native rendering is invalid.
+/// Returns a fixture-generation error for invalid envelopes or feature config.
+pub fn fixture_settings(envelope: &str) -> TestResult<trusted_server_core::settings::Settings> {
+    let envelope: BlobEnvelope =
+        serde_json::from_str(envelope).map_err(|_| Report::new(TestError::ConfigGeneration))?;
+    envelope
+        .verify()
+        .map_err(|_| Report::new(TestError::ConfigGeneration))?;
+    let config: TrustedServerAppConfig = serde_json::from_value(envelope.into_data())
+        .map_err(|_| Report::new(TestError::ConfigGeneration))?;
+    Ok(config.into_settings())
+}
+
+/// Render credentials for this exact envelope, including customized handlers.
 ///
-/// # Examples
-/// Use `integration_native_fixtures("spin")` to obtain the fixture's generated
-/// Spin variable names and public test values.
-pub fn integration_native_fixtures(
+/// # Errors
+/// Returns a fixture-generation error when compilation or rendering fails.
+pub fn app_config_native_fixtures(
+    envelope: &str,
     adapter: &str,
 ) -> TestResult<Vec<trusted_server_integration_tests::NativeFixture>> {
-    let config: TrustedServerAppConfig =
-        toml::from_str(APP_CONFIG).map_err(|_| Report::new(TestError::ConfigGeneration))?;
-    trusted_server_integration_tests::native_fixtures(&config.into_settings(), adapter)
+    trusted_server_integration_tests::native_fixtures(&fixture_settings(envelope)?, adapter)
         .map_err(|_| Report::new(TestError::ConfigGeneration))
 }
 
 pub fn integration_app_config_envelope(origin_port: u16) -> TestResult<String> {
-    app_config_envelope(origin_port, |_| Ok(()))
+    app_config_envelope(origin_port, false, |_| Ok(()))
+}
+
+/// Generate an isolated runtime fixture with an explicit trace feature setting.
+///
+/// # Errors
+///
+/// Returns a fixture-generation error when configuration validation fails.
+pub fn integration_app_config_envelope_with_trace(
+    origin_port: u16,
+    trace: bool,
+) -> TestResult<String> {
+    app_config_envelope(origin_port, trace, |_| Ok(()))
 }
 
 /// Builds the integration app-config envelope after `customize` edits the
 /// parsed fixture.
 fn app_config_envelope(
     origin_port: u16,
+    trace: bool,
     customize: impl FnOnce(&mut toml::Table) -> TestResult<()>,
 ) -> TestResult<String> {
     let origin_url = format!("http://127.0.0.1:{origin_port}");
@@ -50,6 +73,18 @@ fn app_config_envelope(
         })?;
     let mut settings = app_config.into_settings();
     settings.publisher.origin_url = origin_url;
+    if trace {
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &serde_json::json!({"enabled":true,"trace_page_enabled":true}),
+            )
+            .map_err(|report| {
+                Report::new(TestError::ConfigGeneration)
+                    .attach(format!("invalid trace fixture config: {report:?}"))
+            })?;
+    }
     let app_config = TrustedServerAppConfig::new(settings).map_err(|report| {
         Report::new(TestError::ConfigGeneration)
             .attach(format!("invalid generated integration config: {report:?}"))
@@ -77,7 +112,7 @@ pub fn cloudflare_config_json(origin_port: u16) -> TestResult<String> {
 /// The fixture's providers are removed so the enabled auction completes
 /// through the orchestrator and telemetry without any outbound provider call.
 pub fn cloudflare_auction_config_json(origin_port: u16) -> TestResult<String> {
-    let envelope = app_config_envelope(origin_port, |table| {
+    let envelope = app_config_envelope(origin_port, false, |table| {
         let auction = table_mut(table, "auction")?;
         auction.insert("enabled".to_string(), toml::Value::Boolean(true));
         auction.remove("providers");
@@ -108,6 +143,95 @@ fn cloudflare_binding_json(binding: &serde_json::Value) -> TestResult<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn customized_handlers_get_their_own_native_credentials_on_every_adapter() {
+        let baseline = integration_app_config_envelope(8888).expect("should generate baseline");
+        let customized = app_config_envelope(8888, true, |table| {
+            table
+                .get_mut("handlers")
+                .and_then(toml::Value::as_array_mut)
+                .expect("should retain handler array")
+                .insert(
+                    0,
+                    toml::Value::Table(toml::Table::from_iter([
+                        (
+                            "path".to_owned(),
+                            toml::Value::String("^/_ts/trace".to_owned()),
+                        ),
+                        (
+                            "username".to_owned(),
+                            toml::Value::String("example-user".to_owned()),
+                        ),
+                    ])),
+                );
+            Ok(())
+        })
+        .expect("should generate customized handler features");
+        for adapter in ["axum", "fastly", "cloudflare", "spin"] {
+            let baseline =
+                app_config_native_fixtures(&baseline, adapter).expect("should render baseline");
+            let customized = app_config_native_fixtures(&customized, adapter)
+                .expect("should render exact customized config");
+            assert_eq!(customized.len(), baseline.len() + 1);
+            let added = customized
+                .iter()
+                .filter(|entry| {
+                    !baseline
+                        .iter()
+                        .any(|old| old.native.native_name == entry.native.native_name)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(added.len(), 1);
+            assert_eq!(added[0].descriptor_id, "handler.password");
+            assert_eq!(added[0].value, "integration-admin-password-32-bytes-ok");
+        }
+    }
+
+    #[test]
+    fn trace_browser_fixture_keeps_auctions_and_shared_assembly_disabled() {
+        let envelope: serde_json::Value = serde_json::from_str(
+            &integration_app_config_envelope_with_trace(8888, true)
+                .expect("should generate normal-browser trace fixture"),
+        )
+        .expect("should parse trace browser envelope");
+        assert_eq!(
+            envelope["data"]["auction"]["enabled"], false,
+            "should keep the normal browser workflow independent of bidder transport"
+        );
+        assert!(
+            envelope["data"]
+                .get("creative_opportunities")
+                .is_none_or(serde_json::Value::is_null),
+            "should keep shared assembly and configured server slots out of this fixture"
+        );
+        assert_eq!(
+            envelope["data"]["integrations"]["gpt_diagnostics"]["trace_page_enabled"], true,
+            "should activate trace only through the explicit isolated configuration"
+        );
+    }
+
+    #[test]
+    fn trace_runtime_boundary_config_enables_only_explicit_fixture() {
+        let baseline: serde_json::Value = serde_json::from_str(
+            &integration_app_config_envelope(8888).expect("should generate baseline envelope"),
+        )
+        .expect("should parse baseline envelope");
+        assert_ne!(
+            baseline["data"]["integrations"]["gpt_diagnostics"]["trace_page_enabled"], true,
+            "should keep the trace feature disabled in the ordinary baseline"
+        );
+        let enabled: serde_json::Value = serde_json::from_str(
+            &integration_app_config_envelope_with_trace(8888, true)
+                .expect("should generate trace fixture envelope"),
+        )
+        .expect("should parse trace envelope");
+        assert_eq!(
+            enabled["data"]["integrations"]["gpt_diagnostics"]["trace_page_enabled"], true,
+            "should explicitly enable isolated trace fixture"
+        );
+    }
     const FASTLY_CONFIG: &str = include_str!("../../../../fastly.toml");
     const VICEROY_TEMPLATE: &str = include_str!("../../fixtures/configs/viceroy-template.toml");
     const LOGICAL_SECRET_STORE_ID: &str = "trusted_server_secrets";

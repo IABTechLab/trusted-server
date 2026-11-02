@@ -58,6 +58,7 @@ pub fn native_fixtures(settings: &Settings, adapter: &str) -> Result<Vec<NativeF
                 },
                 "ec.pull" | "tinybird.auction" => "fictional-export-token-32-bytes-ok".to_owned(),
                 "clientip.shared" => "fictional-client-ip-shared-secret-32-bytes".to_owned(),
+                "forwarder.shared" => "fictional-forwarder-shared-secret-32-bytes".to_owned(),
                 "datadome.server" => "0123456789ABCDEF0123456789ABCDEF".to_owned(),
                 "datadome.bypass" => "fictional-datadome-bypass-32-bytes-ok".to_owned(),
                 "s3.access-id" => "AKIAFICTIONALTESTONLY".to_owned(),
@@ -153,7 +154,7 @@ mod tests {
     fn equal_handler_owners_share_one_physical_fixture_on_every_adapter() {
         let settings = equal_handler_settings();
         let plan = compile_bindings(&settings).expect("should compile both equal handler owners");
-        assert_eq!(plan.entries().len(), 13);
+        assert_eq!(plan.entries().len(), 14);
         let handlers = plan
             .entries()
             .iter()
@@ -167,7 +168,7 @@ mod tests {
                 .expect("should coalesce equal physical requests without losing compiler owners");
             assert_eq!(
                 fixtures.len(),
-                12,
+                13,
                 "one fixture per exact request on {adapter}"
             );
             assert_eq!(
@@ -222,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn all_twelve_roles_generate_valid_fictional_native_inputs_on_every_adapter() {
+    fn all_thirteen_roles_generate_valid_fictional_native_inputs_on_every_adapter() {
         let config: TrustedServerAppConfig = toml::from_str(include_str!(
             "../fixtures/configs/secret-bindings.all-roles.toml"
         ))
@@ -231,14 +232,14 @@ mod tests {
         for adapter in ["axum", "fastly", "cloudflare", "spin"] {
             let fixtures = native_fixtures(&settings, adapter)
                 .expect("should compile valid native fixtures for the selected adapter");
-            assert_eq!(fixtures.len(), 12, "all roles must be active for {adapter}");
+            assert_eq!(fixtures.len(), 13, "all roles must be active for {adapter}");
             let names = fixtures
                 .iter()
                 .map(|fixture| &fixture.native.native_name)
                 .collect::<std::collections::BTreeSet<_>>();
             assert_eq!(
                 names.len(),
-                12,
+                13,
                 "distinct contexts must retain distinct native identities"
             );
             if adapter == "spin" {

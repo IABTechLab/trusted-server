@@ -1,6 +1,8 @@
 //! Fastly-backed implementations of the platform traits defined in
 //! `trusted-server-core::platform`.
 
+mod deadline;
+
 use bytes::Bytes;
 use error_stack::{Report, ResultExt};
 use fastly::geo::{Geo, geo_lookup};
@@ -19,6 +21,19 @@ use trusted_server_core::platform::{
     StoreName,
 };
 use trusted_server_core::settings::TrustedClientIpConfig;
+
+// Cache-pass requests always have a direct SDK pending handle. Keep this proof
+// with the pending request until the deadline collector consumes it.
+struct CacheBypassPending(fastly::http::request::PendingRequest);
+
+fn unwrap_pending(
+    pending: PlatformPendingRequest,
+) -> Result<fastly::http::request::PendingRequest, PlatformPendingRequest> {
+    match pending.downcast::<CacheBypassPending>() {
+        Ok(pending) => Ok(pending.0),
+        Err(pending) => pending.downcast(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // FastlyPlatformConfigStore
@@ -181,6 +196,21 @@ impl PlatformBackend for FastlyPlatformBackend {
             .ensure()
             .change_context(PlatformError::Backend)
     }
+}
+
+fn buffered_response_to_platform(
+    response: &fastly::Response,
+    backend_name: String,
+    bytes: Vec<u8>,
+) -> Result<PlatformResponse, Report<PlatformError>> {
+    let mut builder = edgezero_core::http::response_builder().status(response.get_status());
+    for (name, value) in response.get_headers() {
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    let response = builder
+        .body(edgezero_core::body::Body::from(bytes))
+        .change_context(PlatformError::HttpClient)?;
+    Ok(PlatformResponse::new(response).with_backend_name(backend_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +522,11 @@ fn apply_fastly_cache_intent(request: &mut fastly::Request, intent: &PlatformCac
 /// environment cannot register a real Fastly backend, so the common
 /// `StubHttpClient` driver test records the one-send 3xx behavior while adapter
 /// tests cover request conversion and the single-send boundary.
+///
+/// Deadline collection requires [`PlatformCacheIntent::Bypass`], which all
+/// auction requests use. This guarantees a direct SDK pending handle that can
+/// join body handles in one timed host wait. Shared-cache requests retain the
+/// SDK caching state machine through the unbounded send/select/wait APIs.
 pub struct FastlyPlatformHttpClient;
 
 #[async_trait::async_trait(?Send)]
@@ -541,7 +576,12 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let pending = fastly_req
             .send_async(&backend_name)
             .change_context(PlatformError::HttpClient)?;
-        Ok(PlatformPendingRequest::new(pending)
+        let pending = if cache_intent.is_bypass() {
+            PlatformPendingRequest::new(CacheBypassPending(pending))
+        } else {
+            PlatformPendingRequest::new(pending)
+        };
+        Ok(pending
             .with_backend_name(backend_name)
             .with_response_handling(stream_response, request_method))
     }
@@ -568,7 +608,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let mut fastly_pending: Vec<PendingRequest> = Vec::with_capacity(pending_requests.len());
 
         for platform_req in pending_requests {
-            let inner = platform_req.downcast::<PendingRequest>().map_err(|platform_req| {
+            let inner = unwrap_pending(platform_req).map_err(|platform_req| {
                 let backend_name = platform_req.backend_name().unwrap_or("<unknown>");
                 Report::new(PlatformError::HttpClient).attach(format!(
                     "PlatformPendingRequest inner type is not fastly::PendingRequest for backend '{backend_name}'"
@@ -622,16 +662,22 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         })
     }
 
+    async fn select_until(
+        &self,
+        pending_requests: Vec<PlatformPendingRequest>,
+        deadline: web_time::Instant,
+    ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+        deadline::select_until(pending_requests, deadline)
+    }
+
     async fn wait(
         &self,
         pending: PlatformPendingRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        use fastly::http::request::PendingRequest;
-
         let backend_hint = pending.backend_name().map(str::to_owned);
         let stream_response = pending.stream_response();
         let request_is_head = pending.request_method() == Some(&edgezero_core::http::Method::HEAD);
-        let pending = pending.downcast::<PendingRequest>().map_err(|pending| {
+        let pending = unwrap_pending(pending).map_err(|pending| {
             let backend_name = pending.backend_name().unwrap_or("<unknown>");
             Report::new(PlatformError::HttpClient).attach(format!(
                 "PlatformPendingRequest inner type is not fastly::PendingRequest for backend '{backend_name}'"
@@ -1191,11 +1237,6 @@ mod tests {
             .capabilities();
         assert!(client.supports_concurrent_fanout());
         assert!(capabilities.supports_concurrent_provider_fanout());
-        assert!(!client.has_enforceable_total_request_deadline());
-        assert!(
-            !capabilities.has_enforceable_total_request_deadline(),
-            "first-byte and between-byte timers are not a hard total request deadline"
-        );
     }
 
     #[test]

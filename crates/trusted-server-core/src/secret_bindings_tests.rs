@@ -39,6 +39,10 @@ fn all_roles() -> Settings {
         }))
         .expect("should deserialize trusted-client-IP feature settings"),
     );
+    settings.trusted_forwarder = Some(
+        serde_json::from_value(serde_json::json!({"auth_header": "x-fictional-forwarder-auth"}))
+            .expect("should parse trusted-forwarder features"),
+    );
     settings.tinybird.enabled = true;
     settings.tinybird.api_host = "api.tinybird.example.com".into();
     settings.integrations.insert(
@@ -98,8 +102,8 @@ fn resolve(settings: &Settings, store: &SpyStore) -> BindingResult<ResolvedBindi
 }
 
 #[test]
-fn all_twelve_golden_contexts_match_independent_sha256_base32_vectors() {
-    // Independently generated using Bun's node:crypto SHA256 and an LP/VEC encoder.
+fn all_thirteen_golden_contexts_match_independent_sha256_base32_vectors() {
+    // Independently generated SHA256/base32 LP/VEC vectors (Node; Python for forwarder).
     let golden = [
         (
             "proxy",
@@ -126,6 +130,10 @@ fn all_twelve_golden_contexts_match_independent_sha256_base32_vectors() {
             "ts1_c5xmtldm34soypp5vwjijlo5f2nhbh5whlhplffr4y2rldgpoida",
         ),
         (
+            "forwarder",
+            "ts1_i4lpnmg4kujjjqixk45k46maavynfadhyrbzqmfqlejdwiwsgkgq",
+        ),
+        (
             "tinybird",
             "ts1_mo6xycw4jkjdmzy36w7n4uyskkyjdrcyqxxdpof25mmklaofqvfq",
         ),
@@ -150,8 +158,9 @@ fn all_twelve_golden_contexts_match_independent_sha256_base32_vectors() {
             "ts1_x4xisdyxzwrk446nxsn62rpjyozb5i3ng3xqgr6xp2sdnnr54cpa",
         ),
     ];
-    let plan = compile_bindings(&all_roles()).expect("should compile all twelve credential roles");
-    assert_eq!(plan.entries().len(), 12);
+    let plan =
+        compile_bindings(&all_roles()).expect("should compile all thirteen credential roles");
+    assert_eq!(plan.entries().len(), 13);
     for (scope, key) in golden {
         let entry = plan
             .entries()
@@ -161,8 +170,34 @@ fn all_twelve_golden_contexts_match_independent_sha256_base32_vectors() {
         assert_eq!(entry.key(), key, "scope {scope}");
         assert_eq!(entry.key().len(), 56);
     }
-    assert_eq!(secret_fields().len(), 12);
-    assert_eq!(DESCRIPTORS.len(), 12);
+    assert_eq!(secret_fields().len(), 13);
+    assert_eq!(DESCRIPTORS.len(), 13);
+}
+
+#[test]
+fn forwarder_credential_retains_base_validation_and_separate_purpose() {
+    assert!(validate_credential("forwarder", b"fictional-forwarder-secret-0123456789").is_ok());
+    for value in [
+        "short",
+        "fictional-secret-with space-0123456789",
+        "fictional-secret-with\n-control-0123456789",
+        "replace-with-a-random-shared-secret",
+    ] {
+        assert!(validate_credential("forwarder", value.as_bytes()).is_err());
+    }
+    let plan = compile_bindings(&all_roles()).expect("should compile inbound credential roles");
+    let forwarder = plan
+        .entries()
+        .iter()
+        .find(|entry| entry.scope() == "forwarder")
+        .expect("should require forwarder credential");
+    let client_ip = plan
+        .entries()
+        .iter()
+        .find(|entry| entry.scope() == "clientip")
+        .expect("should require client-IP credential");
+    assert_ne!(forwarder.key(), client_ip.key());
+    assert_eq!(forwarder.target(), &CompiledTarget::None);
 }
 
 #[test]
@@ -900,6 +935,7 @@ fn removed_reference_properties_reject_regardless_of_activation_or_value() {
         json!({"ec":{"partners":[{"ts_pull_token":"SENTINEL", "pull_sync_enabled":false}]}}),
         json!({"handlers":[{"password":"SENTINEL"}]}),
         json!({"trusted_client_ip":{"shared_secret":"SENTINEL"}}),
+        json!({"trusted_forwarder":{"shared_secret":"SENTINEL"}}),
         json!({"tinybird":{"enabled":false,"auction_token_secret":"SENTINEL"}}),
         json!({"integrations":{"datadome":{"enabled":false,"server_side_key_secret_name":"SENTINEL"}}}),
         json!({"integrations":{"datadome":{"protection_test_bypass":{"enabled":false,"credential_secret_name":"SENTINEL"}}}}),

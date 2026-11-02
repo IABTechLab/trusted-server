@@ -130,6 +130,13 @@ fn install_shadow(
                 .ok_or_else(|| invalid("trusted_client_ip", "invalid compiled identity"))?
                 .shared_secret = value();
         }
+        "forwarder.shared" => {
+            settings
+                .trusted_forwarder
+                .as_mut()
+                .ok_or_else(|| invalid("trusted_forwarder", "invalid compiled identity"))?
+                .shared_secret = value();
+        }
         "tinybird.auction" => settings.tinybird.auction_token_secret = Some(value()),
         // DataDome consumes private uses directly. Never copy native values into
         // its serializable, dynamically typed integration configuration.
@@ -248,6 +255,12 @@ mod tests {
             }))
             .expect("should parse trusted client IP features"),
         );
+        settings.trusted_forwarder = Some(
+            serde_json::from_value(
+                serde_json::json!({"auth_header": "x-fictional-forwarder-auth"}),
+            )
+            .expect("should parse trusted-forwarder features"),
+        );
         settings.tinybird.enabled = true;
         settings.tinybird.api_host = "api.tinybird.example.com".to_owned();
         settings.integrations.insert(
@@ -296,7 +309,56 @@ mod tests {
     }
 
     #[test]
-    fn secret_scoping_attacker_all_twelve_roles_load_through_verified_envelope() {
+    fn trusted_forwarder_resolves_shared_secret_from_default_store() {
+        let (data, store) = all_roles_fixture();
+        let loaded =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should resolve the implicit forwarder binding");
+        let binding = loaded
+            .resolved_bindings
+            .entries()
+            .iter()
+            .find(|entry| entry.compiled().descriptor_id() == "forwarder.shared")
+            .expect("should capture the forwarder binding");
+        assert!(
+            loaded
+                .trusted_forwarder
+                .as_ref()
+                .expect("should retain forwarder features")
+                .authenticates(binding.credential())
+        );
+        assert!(
+            !crate::config::unresolved_settings_value(loaded.settings())
+                .expect("should serialize only features")["trusted_forwarder"]
+                .as_object()
+                .expect("should serialize the section")
+                .contains_key("shared_secret")
+        );
+    }
+
+    #[test]
+    fn trusted_forwarder_missing_shared_secret_fails_resolution_without_leaking_key() {
+        let (data, mut store) = all_roles_fixture();
+        let config: TrustedServerAppConfig =
+            serde_json::from_value(data.clone()).expect("should parse features");
+        let plan = compile_bindings(config.settings()).expect("should compile roles");
+        let binding = plan
+            .entries()
+            .iter()
+            .find(|entry| entry.descriptor_id() == "forwarder.shared")
+            .expect("should require a forwarder binding");
+        store.values.remove(binding.key());
+        let error =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect_err("should reject a missing forwarder binding");
+        let message = format!("{error:?}");
+        assert!(message.contains("trusted_forwarder.shared_secret"));
+        assert!(!message.contains(binding.key()));
+        assert!(!message.contains("fictional-provider-diagnostic"));
+    }
+
+    #[test]
+    fn secret_scoping_attacker_all_thirteen_roles_load_through_verified_envelope() {
         let (data, store) = all_roles_fixture();
         let loaded =
             settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
@@ -307,7 +369,7 @@ mod tests {
             .iter()
             .map(|binding| binding.compiled().scope())
             .collect();
-        assert_eq!(scopes.len(), 12);
+        assert_eq!(scopes.len(), 13);
         let output = serde_json::to_string(loaded.settings())
             .expect("should serialize feature settings without native values");
         assert!(!output.contains("fictional-credential-"));
@@ -322,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_scoping_attacker_reference_injection_rejects_all_twelve_roles_before_reads() {
+    fn secret_scoping_attacker_reference_injection_rejects_all_thirteen_roles_before_reads() {
         let (data, _) = all_roles_fixture();
         let config: TrustedServerAppConfig =
             serde_json::from_value(data.clone()).expect("should parse feature fixture");

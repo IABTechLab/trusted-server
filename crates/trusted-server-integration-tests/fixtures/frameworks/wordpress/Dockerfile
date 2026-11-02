@@ -9,7 +9,7 @@
 # Run manually:
 #   docker run -p 8080:80 test-wordpress:latest
 
-FROM php:8.3-cli-alpine
+FROM php:8.5-cli-alpine
 
 WORKDIR /var/www/html
 

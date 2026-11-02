@@ -9,7 +9,7 @@ use subtle::ConstantTimeEq as _;
 use url::Url;
 
 use crate::error::TrustedServerError;
-use crate::http_util::is_navigation_request;
+use crate::http_util::{RequestInfo, is_navigation_request};
 use crate::integrations::{
     HeaderMutation, RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
 };
@@ -277,6 +277,15 @@ impl DataDomeIntegration {
     ) -> ProtectionPayload {
         let req = &*input.request;
         let client_info = input.services.client_info();
+        let public_info = crate::forwarder::public_origin(req)
+            .and_then(|_| RequestInfo::from_request(req, client_info).ok());
+        let request_host = public_info
+            .as_ref()
+            .map_or_else(|| request_host(req), |info| info.host.clone());
+        let request_protocol = public_info.as_ref().map_or_else(
+            || req.uri().scheme_str().unwrap_or_default(),
+            |info| info.scheme.as_str(),
+        );
         let mut fields = Vec::new();
         let header_client_id = header_value(req, HEADER_DATADOME_CLIENT_ID);
         let cookie_header = header_value(req, header::COOKIE.as_str());
@@ -335,7 +344,7 @@ impl DataDomeIntegration {
         push_field(&mut fields, "CookiesLen", cookie_header.len().to_string());
         push_header_field(&mut fields, req, "From", "from");
         push_field(&mut fields, "HeadersList", headers_list(req));
-        push_field(&mut fields, "Host", request_host(req));
+        push_field(&mut fields, "Host", &request_host);
         push_field(&mut fields, "Method", req.method().as_str());
         push_field(&mut fields, "ModuleVersion", MODULE_VERSION);
         push_header_field(&mut fields, req, "Origin", header::ORIGIN.as_str());
@@ -347,11 +356,7 @@ impl DataDomeIntegration {
             header::CONTENT_LENGTH.as_str(),
         );
         push_header_field(&mut fields, req, "Pragma", header::PRAGMA.as_str());
-        push_field(
-            &mut fields,
-            "Protocol",
-            req.uri().scheme_str().unwrap_or_default(),
-        );
+        push_field(&mut fields, "Protocol", request_protocol);
         push_header_field(&mut fields, req, "Referer", header::REFERER.as_str());
         push_field(&mut fields, "Request", request_path_and_query(req));
         push_field(&mut fields, "RequestModuleName", REQUEST_MODULE_NAME);
@@ -382,7 +387,7 @@ impl DataDomeIntegration {
             "sec-fetch-storage-access",
         );
         push_header_field(&mut fields, req, "SecFetchUser", "sec-fetch-user");
-        push_field(&mut fields, "ServerHostname", request_host(req));
+        push_field(&mut fields, "ServerHostname", &request_host);
         push_field(
             &mut fields,
             "ServerName",
@@ -975,6 +980,87 @@ mod tests {
             assert_eq!(
                 http.recorded_request_uris(),
                 vec!["https://protection.example.com/validate-request"]
+            );
+        }
+    }
+
+    #[test]
+    fn public_origin_datadome_payload_preserves_transport_tls_metadata() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.publisher.domain = "publisher.example.com".to_owned();
+        settings.trusted_forwarder = Some(crate::settings::TrustedForwarderConfig {
+            auth_header: crate::forwarder::FORWARDER_AUTH_HEADER.to_owned(),
+            shared_secret: crate::redacted::Redacted::new(
+                "fictional-forwarder-secret-0123456789".to_owned(),
+            ),
+        });
+        let integration = protection_integration();
+        let mut services = crate::platform::test_support::noop_services();
+        services.client_info.server_hostname = Some("transport.example.com".to_owned());
+        services.client_info.tls_protocol = Some("TLSv1.3".to_owned());
+        services.client_info.tls_cipher = Some("transport-cipher".to_owned());
+        for authenticated in [true, false] {
+            let mut request = Request::builder()
+                .uri("http://internal.example.com/page?x=1")
+                .header(header::HOST, "internal.example.com")
+                .header(
+                    crate::forwarder::FORWARDER_AUTH_HEADER,
+                    "fictional-forwarder-secret-0123456789",
+                )
+                .header("x-forwarded-host", "publisher.example.com:8443")
+                .header("x-forwarded-proto", "https")
+                .body(EdgeBody::empty())
+                .expect("should construct filter request");
+            if !authenticated {
+                request
+                    .headers_mut()
+                    .remove(crate::forwarder::FORWARDER_AUTH_HEADER);
+            }
+            crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+            let payload = integration.build_protection_payload(
+                &RequestFilterInput {
+                    settings: &settings,
+                    services: &services,
+                    request: &mut request,
+                    geo_info: None,
+                    is_integration_route: false,
+                },
+                "fictional-server-side-key",
+            );
+            let fields: HashMap<_, _> = payload.fields.into_iter().collect();
+            let host = if authenticated {
+                "publisher.example.com:8443"
+            } else {
+                "internal.example.com"
+            };
+            assert_eq!(
+                fields["Host"], host,
+                "should send effective browser authority"
+            );
+            assert_eq!(
+                fields["ServerHostname"], host,
+                "should send effective browser server hostname"
+            );
+            assert_eq!(
+                fields["Protocol"],
+                if authenticated { "https" } else { "http" },
+                "should retain legacy URI protocol without authentication"
+            );
+            assert_eq!(
+                fields["ServerName"], "transport.example.com",
+                "should retain actual runtime server name"
+            );
+            assert_eq!(
+                fields["TlsProtocol"], "TLSv1.3",
+                "should retain actual TLS protocol"
+            );
+            assert_eq!(
+                fields["TlsCipher"], "transport-cipher",
+                "should retain actual TLS cipher"
+            );
+            assert_eq!(
+                fields["Request"], "/page?x=1",
+                "should retain request path and query"
             );
         }
     }

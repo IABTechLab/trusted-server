@@ -1,0 +1,5 @@
+{
+  "files": ["build-trace.mjs", "trace-asset-sources.mjs", "tsconfig.json"],
+  "source_roots": ["src/trace"],
+  "toolchain_roots": ["vite"]
+}

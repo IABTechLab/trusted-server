@@ -17,7 +17,7 @@ use crate::error::TrustedServerError;
 use crate::platform::{PlatformSecretStore, StoreName};
 use crate::settings::{
     AssetOriginAuth, Ec, EcPartner, Handler, OriginQueryPolicy, Publisher, Settings,
-    TrustedClientIpConfig,
+    TrustedClientIpConfig, TrustedForwarderConfig,
 };
 
 /// Versioned domain separator for the context-derived native-key ABI.
@@ -72,6 +72,12 @@ pub const DESCRIPTORS: &[BindingDescriptor] = &[
         id: "clientip.shared",
         scope: "clientip",
         schema_path: "trusted_client_ip.shared_secret",
+        optional: false,
+    },
+    BindingDescriptor {
+        id: "forwarder.shared",
+        scope: "forwarder",
+        schema_path: "trusted_forwarder.shared_secret",
         optional: false,
     },
     BindingDescriptor {
@@ -131,6 +137,7 @@ pub fn secret_fields() -> Vec<edgezero_core::app_config::SecretField> {
                     name,
                     "partners"
                         | "trusted_client_ip"
+                        | "trusted_forwarder"
                         | "tinybird"
                         | "integrations"
                         | "datadome"
@@ -918,6 +925,16 @@ pub fn compile_bindings(settings: &Settings) -> BindingResult<BindingPlan> {
             CompiledTarget::None,
         )?;
     }
+    if settings.trusted_forwarder.is_some() {
+        add(
+            "forwarder.shared",
+            "forwarder",
+            "trusted_forwarder.shared_secret".into(),
+            strings(&["app"]),
+            strings(&["none"]),
+            CompiledTarget::None,
+        )?;
+    }
     if settings.tinybird.access_enabled {
         return Err(invalid(
             "tinybird.access_enabled",
@@ -1161,6 +1178,7 @@ fn validate_value(scope: &str, bytes: &[u8], path: &str) -> BindingResult<()> {
         "ecin" | "ecpull" => EcPartner::is_placeholder_api_token(value),
         "handler" => Handler::is_placeholder_password(value),
         "clientip" => TrustedClientIpConfig::is_placeholder_shared_secret(value),
+        "forwarder" => TrustedForwarderConfig::is_placeholder_shared_secret(value),
         "tinybird" | "ddserver" | "ddbypass" | "s3id" | "s3secret" | "s3sess" => false,
         _ => return Err(invalid(path, "unsupported credential scope")),
     };
@@ -1169,13 +1187,15 @@ fn validate_value(scope: &str, bytes: &[u8], path: &str) -> BindingResult<()> {
     }
     if matches!(
         scope,
-        "ecpass" | "ecin" | "ecpull" | "clientip" | "ddbypass"
+        "ecpass" | "ecin" | "ecpull" | "clientip" | "forwarder" | "ddbypass"
     ) && bytes.len() < 32
     {
         return Err(invalid(path, "credential below minimum length"));
     }
-    if scope == "clientip" && !bytes.iter().all(|byte| matches!(*byte, b'!'..=b'~')) {
-        return Err(invalid(path, "invalid client IP credential"));
+    if matches!(scope, "clientip" | "forwarder")
+        && !bytes.iter().all(|byte| matches!(*byte, b'!'..=b'~'))
+    {
+        return Err(invalid(path, "invalid forwarding credential"));
     }
     if scope == "ecin" && value.trim().is_empty() {
         return Err(invalid(path, "empty credential"));
@@ -1268,6 +1288,7 @@ pub fn reject_removed_references(value: &Value) -> BindingResult<()> {
         ("publisher", "proxy_secret"),
         ("ec", "passphrase"),
         ("trusted_client_ip", "shared_secret"),
+        ("trusted_forwarder", "shared_secret"),
         ("tinybird", "auction_token_secret"),
         ("integrations.datadome", "server_side_key_secret_name"),
         (

@@ -1,4 +1,4 @@
-use crate::common::config::{cloudflare_config_json, integration_native_fixtures};
+use crate::common::config::{app_config_native_fixtures, cloudflare_config_json};
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
@@ -42,7 +42,13 @@ fn write_generated_ci_config(wrangler_dir: &Path, config_json: &str) -> TestResu
         .get_mut("vars")
         .and_then(toml::Value::as_table_mut)
         .ok_or_else(|| Report::new(TestError::ConfigGeneration))?;
-    for fixture in integration_native_fixtures("cloudflare")? {
+    let binding: serde_json::Value =
+        serde_json::from_str(config_json).map_err(|_| Report::new(TestError::ConfigGeneration))?;
+    let envelope = binding
+        .get(trusted_server_core::config_payload::CONFIG_BLOB_KEY)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Report::new(TestError::ConfigGeneration))?;
+    for fixture in app_config_native_fixtures(envelope, "cloudflare")? {
         vars.insert(
             fixture.native.native_name,
             toml::Value::String(fixture.value),
@@ -80,14 +86,32 @@ impl RuntimeEnvironment for CloudflareWorkers {
     }
 
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
-        let wrangler_dir = self.wrangler_dir();
-        let config =
-            write_generated_ci_config(&wrangler_dir, &cloudflare_config_json(origin_port())?)?;
-        self.spawn_wrangler(&wrangler_dir, &config)
+        self.spawn_with_readiness(|base_url| {
+            super::wait_for_ready(base_url, self.health_check_path(), true)
+        })
     }
 
     fn health_check_path(&self) -> &str {
         "/.well-known/trusted-server.json"
+    }
+}
+
+impl CloudflareWorkers {
+    /// Start an isolated fixture with an explicit authenticated readiness probe.
+    ///
+    /// The standard [`RuntimeEnvironment::spawn`] retains its original readiness check.
+    ///
+    /// # Errors
+    ///
+    /// Returns the existing spawn failure or the supplied readiness-probe error.
+    pub(crate) fn spawn_with_readiness(
+        &self,
+        ready: impl FnOnce(&str) -> TestResult<()>,
+    ) -> TestResult<RuntimeProcess> {
+        let wrangler_dir = self.wrangler_dir();
+        let config =
+            write_generated_ci_config(&wrangler_dir, &cloudflare_config_json(origin_port())?)?;
+        self.spawn_wrangler(&wrangler_dir, &config, ready)
     }
 }
 
@@ -104,12 +128,31 @@ impl CloudflareWorkers {
     /// written or `wrangler dev` cannot be started, and
     /// [`TestError::RuntimeNotReady`] if the health check times out.
     pub fn spawn_with_config_json(&self, config_json: &str) -> TestResult<RuntimeProcess> {
-        let wrangler_dir = self.wrangler_dir();
-        let config = write_generated_ci_config(&wrangler_dir, config_json)?;
-        self.spawn_wrangler(&wrangler_dir, &config)
+        self.spawn_with_config_json_and_readiness(config_json, |base_url| {
+            super::wait_for_ready(base_url, self.health_check_path(), true)
+        })
     }
 
-    fn spawn_wrangler(&self, wrangler_dir: &Path, config: &str) -> TestResult<RuntimeProcess> {
+    /// Start an exact customized envelope with its generated credentials and probe.
+    ///
+    /// # Errors
+    /// Returns configuration, startup or readiness errors.
+    pub(crate) fn spawn_with_config_json_and_readiness(
+        &self,
+        config_json: &str,
+        ready: impl FnOnce(&str) -> TestResult<()>,
+    ) -> TestResult<RuntimeProcess> {
+        let wrangler_dir = self.wrangler_dir();
+        let config = write_generated_ci_config(&wrangler_dir, config_json)?;
+        self.spawn_wrangler(&wrangler_dir, &config, ready)
+    }
+
+    fn spawn_wrangler(
+        &self,
+        wrangler_dir: &Path,
+        config: &str,
+        ready: impl FnOnce(&str) -> TestResult<()>,
+    ) -> TestResult<RuntimeProcess> {
         let port = super::find_available_port().unwrap_or(CLOUDFLARE_DEFAULT_PORT);
 
         #[cfg(unix)]
@@ -177,7 +220,7 @@ impl CloudflareWorkers {
         let handle = CloudflareHandle { child };
         let base_url = format!("http://127.0.0.1:{port}");
 
-        super::wait_for_ready(&base_url, self.health_check_path(), true)?;
+        ready(&base_url)?;
 
         Ok(RuntimeProcess {
             inner: Box::new(handle),

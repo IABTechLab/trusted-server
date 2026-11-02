@@ -20,6 +20,7 @@ Remove these properties everywhere, including disabled features, JSON blobs, com
 | `ec.partners[*].ts_pull_token`                                        | `ec.pull`          | Existing `pull_sync_enabled`                                         |
 | `handlers[*].password`                                                | `handler.password` | Each configured handler                                              |
 | `trusted_client_ip.shared_secret`                                     | `clientip.shared`  | Section present                                                      |
+| `trusted_forwarder.shared_secret`                                     | `forwarder.shared` | Section present                                                      |
 | `tinybird.auction_token_secret`                                       | `tinybird.auction` | Tinybird enabled                                                     |
 | `integrations.datadome.server_side_key_secret_name`                   | `datadome.server`  | Integration and Protection enabled                                   |
 | `integrations.datadome.protection_test_bypass.credential_secret_name` | `datadome.bypass`  | Integration, Protection, and bypass enabled                          |

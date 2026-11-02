@@ -1,4 +1,4 @@
-use crate::common::config::{integration_app_config_envelope, integration_native_fixtures};
+use crate::common::config::{app_config_native_fixtures, integration_app_config_envelope};
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
@@ -30,13 +30,30 @@ impl RuntimeEnvironment for AxumDevServer {
     }
 
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
+        let app_config = integration_app_config_envelope(origin_port())?;
+        self.spawn_with_app_config(&app_config)
+    }
+
+    fn health_check_path(&self) -> &str {
+        "/health"
+    }
+}
+
+impl AxumDevServer {
+    /// Spawn the real native binary with an isolated app-config envelope.
+    ///
+    /// Normal [`RuntimeEnvironment::spawn`] retains its disabled baseline config.
+    ///
+    /// # Errors
+    ///
+    /// Returns a spawn or readiness error if the native process is unavailable.
+    pub(crate) fn spawn_with_app_config(&self, app_config: &str) -> TestResult<RuntimeProcess> {
         let binary = self.binary_path();
         let port = super::find_available_port().unwrap_or(AXUM_DEFAULT_PORT);
 
-        let app_config = integration_app_config_envelope(origin_port())?;
         let config_variable = config_env_var("trusted_server_config", "trusted_server_config");
 
-        let fixtures = integration_native_fixtures("axum")?;
+        let fixtures = app_config_native_fixtures(app_config, "axum")?;
         let mut child = Command::new(&binary)
             .env("PORT", port.to_string())
             .env(
@@ -90,12 +107,6 @@ impl RuntimeEnvironment for AxumDevServer {
         })
     }
 
-    fn health_check_path(&self) -> &str {
-        "/health"
-    }
-}
-
-impl AxumDevServer {
     /// Resolve the path to the compiled `trusted-server-axum` binary.
     ///
     /// Respects the `AXUM_BINARY_PATH` environment variable for CI overrides.

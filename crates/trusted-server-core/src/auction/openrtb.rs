@@ -17,7 +17,6 @@ use super::routing::{
     PrebidTransportHeaders, ProviderAuctionInput, ProviderSlotInput, RoutedAuction,
 };
 use super::types::{AdFormat, AdSlot, AuctionResponse, Bid};
-use crate::consent::ConsentSource;
 use crate::error::TrustedServerError;
 use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs,
@@ -347,13 +346,14 @@ fn build_common_request(
         ProfilePolicy::Standard(_) => common.publisher.page_url.clone(),
     };
     let consent = common.user.consent.as_ref();
-    let body_consent = match policy {
-        ProfilePolicy::Prebid(plan) => consent.filter(|value| {
-            plan.consent_forwarding.includes_body_consent()
-                || !matches!(value.source, ConsentSource::Cookie)
-        }),
-        _ => consent,
+    let selected_consent = match policy {
+        ProfilePolicy::Prebid(plan) => routed
+            .prebid_transport_headers()
+            .consent_cookies()
+            .body_consent(consent, plan.consent_forwarding),
+        _ => consent.map(std::borrow::Cow::Borrowed),
     };
+    let body_consent = selected_consent.as_deref();
     let raw_tc = body_consent.and_then(|value| value.raw_tc_string.clone());
     let user = Some(User {
         id: common.user.id.clone(),

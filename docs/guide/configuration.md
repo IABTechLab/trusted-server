@@ -46,7 +46,7 @@ ts config validate
 
 All active app credentials use the logical `trusted_server_secrets` store and trusted native deployment mapping. Config supplies feature activation, identity, and destination; core derives the only allowed lookup. Enabled roles require their binding. Disabled roles make no secret reads.
 
-All twelve removed credential properties reject even on disabled features. See the [migration table](./secret-binding-migration#removed-properties) and new optional-credential flags. No inline values, secret references, generated-key overrides, labels, or per-field store selectors belong in new config.
+All thirteen removed credential properties reject even on disabled features. See the [migration table](./secret-binding-migration#removed-properties) and new optional-credential flags. No inline values, secret references, generated-key overrides, labels, or per-field store selectors belong in new config.
 
 Trusted-client-IP credentials are store-backed, not inline. The former inline description was wrong. Deprecated Tinybird `access_token_secret` remains discarded; `access_enabled = true` is rejected. Deprecated Tinybird/DataDome/S3 store selectors remain ignored and absent from serialization. `s3_sig_v4` remains a deserialize alias for `s3_sigv4`.
 
@@ -119,6 +119,7 @@ fail and the service will return its startup-error response.
 | `[rewrite]`                | First-party URL rewrite exclusions                                      |
 | `[tester_cookie]`          | Optional tester-cookie endpoints                                        |
 | `[tinybird]`               | Direct Tinybird auction telemetry                                       |
+| `[trusted_forwarder]`      | Authenticated browser-facing host and scheme forwarding                 |
 | `[trusted_client_ip]`      | Authenticated front-door client-IP forwarding                           |
 
 ## Example: Production Setup
@@ -447,9 +448,56 @@ TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 
 Use this optional section when a trusted CDN service forwards requests to the
 Fastly service running Trusted Server. It lets Trusted Server use the reader's
-address instead of the immediate fronting edge node's address. Only the Fastly
-adapter honours this section; the Cloudflare, Spin, and Axum adapters validate
-it but keep using their own runtime client address.
+address instead of the immediate fronting edge node's address. Fastly applies this section throughout request handling. Cloudflare, Spin,
+and Axum apply it to trace setup and traced publisher-document metadata; their
+ordinary request handling keeps using the runtime client address.
+
+### `[trusted_forwarder]`
+
+Presence requires the generated `forwarder.shared` native binding in `trusted_server_secrets`. Do not put a shared secret or key name in app config; provision it through the reviewed secret plan.
+
+Trusted Server can accept the browser-facing authority and scheme from an
+explicitly authenticated forwarder. This preserves the public origin when the
+upstream leg uses plain HTTP or sends a different Host. Leave the section absent
+for direct traffic. Unauthenticated forwarding headers never establish a public
+origin.
+
+```toml
+[trusted_forwarder]
+auth_header = "x-ts-forwarder-auth"
+```
+
+The authentication header and generated native binding are required. Generate a cryptographically random token, such
+as 32 random bytes encoded as hex; the stored value must contain at least 32
+ASCII graphic bytes. Length validation does not establish entropy. The
+credential is redacted in diagnostics; temporary fixed-size digests are compared
+in constant time and are never stored or exposed. Configure the forwarder to send
+the same actual value in the header named by `auth_header`. For `ts dev proxy`,
+use `auth_header = "x-ts-forwarder-auth"` and pass the local token file through
+`--forwarder-secret-file`; see its
+[authenticated forwarding setup](./ts-dev-proxy.md#authenticated-forwarding).
+
+The forwarder must replace client-supplied `X-Forwarded-Host` and
+`X-Forwarded-Proto` with the actual browser-facing authority and HTTP/HTTPS
+scheme. The authority includes a non-default browser port. Exactly one field of
+each kind and one matching authentication field are required. Lists, ambiguous
+or malformed values, and hosts outside `publisher.domain` or its subdomains
+cannot establish trust. Missing or invalid authentication falls back to the
+runtime transport origin. Hostname case and default ports canonicalize for
+comparison.
+
+The validated public origin supplies URL rewriting and trace Origin checks.
+The actual ingress URI, Host, TLS metadata, target provenance and cookie-header
+fidelity remain transport facts. Trace actions still require an exact browser
+Origin, same-origin Fetch Metadata, the action control, no query and an empty
+body; forwarding does not expand identify CORS or relax cookie policy.
+
+Forwarding credentials and raw forwarding fields are removed before routing,
+including trace preflight returns. Authentication names cannot overlap
+forwarding sources, internal controls or configured trusted-client-IP fields.
+Omitted configuration stays omitted from serialized blobs. Deploy a compatible
+server before enabling this section, and remove it before rolling back to an
+older server.
 
 ### `[trusted_client_ip]`
 
@@ -521,8 +569,13 @@ header before deploying.
 
 Startup fails closed if the configured key is missing, empty, invalid UTF-8, or
 resolves to an invalid shared-secret value. Every adapter removes the configured
-IP and authentication headers before routing, although only Fastly uses them for
-client-IP resolution.
+IP and authentication headers before ordinary routing. Fastly uses them for
+client-IP resolution throughout request handling. Axum, Cloudflare and Spin also
+use them for the masked client IP in both trace setup and traced publisher
+documents; their ordinary request
+handling continues to use the runtime-provided address. Both trace surfaces omit
+runtime geolocation when it describes a different address from the authenticated
+reader.
 
 **Environment Overrides**:
 
@@ -1656,9 +1709,18 @@ See [GPT](/guide/integrations/gpt).
 
 **Section**: `[integrations.gpt_diagnostics]`
 
-The only field is `enabled`, a Boolean that defaults to `false`. When enabled,
-the standalone diagnostics tag is available, but individual browser sessions
-still require the activation flow in [GPT diagnostics](/guide/integrations/gpt-diagnostics).
+Both fields default to `false`:
+
+| Field                | Type    | Contract                                                         |
+| -------------------- | ------- | ---------------------------------------------------------------- |
+| `enabled`            | Boolean | Make the GPT diagnostics module available for activated sessions |
+| `trace_page_enabled` | Boolean | Enable the mobile trace endpoint; requires `enabled = true`      |
+
+Individual browser sessions still require the activation flow in
+[GPT diagnostics](/guide/integrations/gpt-diagnostics). The mobile endpoint does
+not activate tracing on a GET. Before enabling it, accept the documented
+same-origin visibility and privacy implications of cookie health, masked network
+facts and browser-carried auction evidence.
 
 ### JS Asset Proxy Integration
 
@@ -1992,7 +2054,7 @@ provider or bidder route.
 | `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery                                               |
 | `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid asset URLs through first-party endpoints                                                 |
 | `rewrite_clicks`       | Boolean | unset              | Wrap creative links in `/first-party/click`; unset follows `rewrite_creatives` (proxied HTML keeps wrapping) |
-| `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                                                                       |
+| `timeout_ms`           | Integer | `2000`             | Deadline for additional auction network waiting, measured from dispatch                                      |
 | `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                                                                   |
 | `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                                                                   |
 | `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                                                               |
@@ -2240,13 +2302,19 @@ push as proof that a Cloudflare or Spin multi-provider plan can start.
 
 ### Deadline behavior
 
-Configured timeouts are logical budgets, not hard wall-clock guarantees. No
-current adapter claims an abortable provider-wide total-request deadline.
-Already-launched work may complete after the logical budget and a completed late
-response can remain eligible. Once the logical auction budget is exhausted,
-Trusted Server starts no additional provider or mediator network work, then
-finishes local decision and delivery. An auction can therefore exceed its
-configured wall-clock timeout.
+Auction response collection waits only until an absolute deadline measured from
+dispatch, including headers and complete response bodies. One nonblocking snapshot
+retains complete available responses after a slow origin; unfinished providers
+become timeouts and mediation cannot start with an exhausted budget. Backend
+timeout rounding does not extend network waiting.
+Provider bids that are already complete at the final nonblocking snapshot remain
+eligible even after `tmax`; mediation starts only with remaining budget and
+rejects responses collected after its cutoff.
+
+Fastly abandons pending requests; Axum, Cloudflare, and Spin cancel outstanding
+operations where supported. Local processing and delivery can finish after the
+network cutoff. See [Timeout behavior](/guide/auction-orchestration#timeout-behavior)
+for runtime semantics and limitations.
 
 Creative sanitization is opt-in. `sanitize_creatives = true` strips executable
 markup before delivery. `rewrite_creatives = false` leaves asset URLs

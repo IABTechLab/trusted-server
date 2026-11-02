@@ -24,7 +24,7 @@ use crate::integrations::{
     didomi::DidomiIntegrationConfig,
     google_tag_manager::GoogleTagManagerConfig,
     gpt::GptConfig,
-    gpt_diagnostics::GptDiagnosticsConfig,
+    gpt_diagnostics::{GPT_DIAGNOSTICS_INTEGRATION_ID, GptDiagnosticsConfig},
     js_asset_proxy::{JS_ASSET_PROXY_INTEGRATION_ID, JsAssetProxyConfig},
     lockr::LockrConfig,
     nextjs::NextJsIntegrationConfig,
@@ -213,6 +213,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     crate::secret_bindings::compile_bindings(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
     validate_js_asset_proxy_config(settings)?;
+    validate_gpt_diagnostics_config(settings)?;
 
     let mut structural_settings = settings.clone();
     structural_settings.prepare_runtime()?;
@@ -235,11 +236,34 @@ pub fn validate_settings_for_runtime(
 ) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
     validate_js_asset_proxy_config(settings)?;
+    validate_gpt_diagnostics_config(settings)?;
     settings.validate_admin_handler_passwords()?;
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, true)?;
     PartnerRegistry::from_settings(settings).map(|_| ())?;
     Ok(())
+}
+
+fn validate_gpt_diagnostics_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let Some(raw_config) = settings.integrations.get(GPT_DIAGNOSTICS_INTEGRATION_ID) else {
+        return Ok(());
+    };
+    // Validate this dependency even when the normal integration lookup skips
+    // disabled integrations, including the default when enabled is omitted.
+    let config: GptDiagnosticsConfig = serde_json::from_value(raw_config.clone()).map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "integration startup failed for `{GPT_DIAGNOSTICS_INTEGRATION_ID}`: configuration could not be parsed: {error}"
+            ),
+        })
+    })?;
+    config.validate().map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "integration startup failed for `{GPT_DIAGNOSTICS_INTEGRATION_ID}`: {error}"
+            ),
+        })
+    })
 }
 
 fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
@@ -816,6 +840,7 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("handlers[*].password".to_owned(), false),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
+                ("trusted_forwarder.shared_secret".to_owned(), false),
                 ("tinybird.auction_token_secret".to_owned(), true),
                 (
                     "integrations.datadome.server_side_key_secret_name".to_owned(),
@@ -1048,6 +1073,50 @@ gam_network_id = "99999"
     }
 
     #[test]
+    fn trusted_forwarder_deploy_compiles_implicit_credential() {
+        let mut value =
+            serde_json::to_value(valid_settings()).expect("should serialize test settings");
+        value["trusted_forwarder"] = serde_json::json!({"auth_header": "x-ts-forwarder-auth"});
+        let settings =
+            serde_json::from_value(value).expect("should deserialize feature configuration");
+        TrustedServerAppConfig::new(settings)
+            .expect("should validate the unresolved implicit role");
+    }
+
+    #[test]
+    fn trusted_forwarder_deploy_rejects_reserved_auth_header_without_resolved_credentials() {
+        for auth_header in ["X-Forwarded-Host", "X-TS-DataDome-Bypass"] {
+            let mut value =
+                serde_json::to_value(valid_settings()).expect("should serialize test settings");
+            value["trusted_forwarder"] = serde_json::json!({"auth_header": auth_header});
+            let settings =
+                serde_json::from_value(value).expect("should deserialize feature configuration");
+            let error = TrustedServerAppConfig::new(settings)
+                .expect_err("should validate headers without resolved credentials");
+            assert!(
+                format!("{error:?}").contains("reserved_trusted_forwarder_auth_header"),
+                "should reject the reserved authentication header"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_deploy_rejects_client_ip_collision_without_resolved_credentials() {
+        let mut value =
+            serde_json::to_value(valid_settings()).expect("should serialize test settings");
+        value["trusted_forwarder"] = serde_json::json!({"auth_header": "X-TS-Client-IP-Auth"});
+        value["trusted_client_ip"] = serde_json::json!({"ip_header": "x-ts-client-ip", "auth_header": "x-ts-client-ip-auth"});
+        let settings =
+            serde_json::from_value(value).expect("should deserialize feature configuration");
+        let error = TrustedServerAppConfig::new(settings)
+            .expect_err("should validate collisions without resolved credentials");
+        assert!(
+            format!("{error:?}").contains("colliding_trusted_forwarder_client_ip_header"),
+            "should reject colliding authentication headers"
+        );
+    }
+
+    #[test]
     fn app_config_compiles_trusted_client_ip_credential_without_serializing_shadow() {
         let mut settings = valid_settings();
         settings.trusted_client_ip = Some(TrustedClientIpConfig {
@@ -1086,6 +1155,80 @@ gam_network_id = "99999"
             err.to_string().contains("invalid_publisher_domain"),
             "error should identify the structural validation failure: {err:?}"
         );
+    }
+
+    #[test]
+    fn trace_config_requires_enabled_on_both_validation_paths() {
+        for raw in [
+            serde_json::json!({"enabled": false, "trace_page_enabled": true}),
+            serde_json::json!({"trace_page_enabled": true}),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &raw)
+                .expect("should insert trace configuration");
+
+            for validation in [validate_settings_for_deploy, validate_settings_for_runtime] {
+                let error = validation(&settings)
+                    .expect_err("should reject trace without enabled diagnostics");
+                assert!(
+                    format!("{error:?}").contains("trace_page_enabled requires enabled = true"),
+                    "should identify the trace configuration dependency: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trace_config_accepts_valid_flags_and_rejects_disabled_unknown_fields() {
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({"enabled": true, "trace_page_enabled": true}),
+            serde_json::json!({"enabled": true, "trace_page_enabled": false}),
+            serde_json::json!({"enabled": false, "trace_page_enabled": false}),
+            serde_json::json!({"trace_page_enabled": false}),
+            serde_json::json!({"enabled": true}),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &raw)
+                .expect("should insert valid trace configuration");
+            validate_settings_for_deploy(&settings)
+                .expect("should accept valid trace configuration at deployment");
+            validate_settings_for_runtime(&settings)
+                .expect("should accept valid trace configuration at runtime");
+        }
+
+        for (raw, expected) in [
+            (
+                serde_json::json!({"enabled": false, "trace_page_enabeld": false}),
+                "unknown field",
+            ),
+            (
+                serde_json::json!({"trace_page_enabeld": false}),
+                "unknown field",
+            ),
+            (
+                serde_json::json!({"enabled": false, "trace_page_enabled": "false"}),
+                "boolean",
+            ),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &raw)
+                .expect("should insert invalid trace configuration");
+            for validation in [validate_settings_for_deploy, validate_settings_for_runtime] {
+                let error = validation(&settings)
+                    .expect_err("should reject invalid disabled trace configuration");
+                assert!(
+                    format!("{error:?}").contains(expected),
+                    "should identify the configuration schema error"
+                );
+            }
+        }
     }
 
     #[test]

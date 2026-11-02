@@ -55,6 +55,7 @@ Keys have a reserved `ts1_` namespace. Use the CLI renderer, not a hand-written 
 | `ec.pull`          | Partner pull sync enabled                  | Partner domain and exact HTTPS pull endpoint                        |
 | `handler.password` | Each handler                               | Exact regex and username                                            |
 | `clientip.shared`  | Trusted-client-IP section present          | App, front-door authentication                                      |
+| `forwarder.shared` | Trusted-forwarder section present          | App, browser-facing origin authentication                           |
 | `tinybird.auction` | Tinybird enabled                           | Events endpoint and exact dataset                                   |
 | `datadome.server`  | Integration and Protection enabled         | Exact Protection endpoint                                           |
 | `datadome.bypass`  | Protection and test bypass enabled         | App, separate inbound bypass                                        |

@@ -59,6 +59,10 @@ pub fn install_test_bindings(settings: &mut Settings) -> Result<(), Report<Trust
                 .trusted_client_ip
                 .as_ref()
                 .map(|config| config.shared_secret.expose().as_str()),
+            "forwarder.shared" => settings
+                .trusted_forwarder
+                .as_ref()
+                .map(|config| config.shared_secret.expose().as_str()),
             "tinybird.auction" => settings
                 .tinybird
                 .auction_token_secret
