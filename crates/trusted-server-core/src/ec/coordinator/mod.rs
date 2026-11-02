@@ -29,7 +29,8 @@ use crate::ec::kv_types::KvEntry;
 use crate::ec::page_load::RowChange;
 use crate::ec::provider::{
     ClientSignals, IdentityProvider, LookupInput, LookupOutcome, OwnedEntries, ProviderConfigError,
-    ProviderResponse, SourceInput, destination_allowed, parse_sources, validate_enabled_configs,
+    ProviderEid, ProviderResponse, RequestCookies, SourceInput, destination_allowed, parse_sources,
+    validate_enabled_configs,
 };
 use crate::ec::rate_limiter::RateLimiter;
 use crate::ec::registry::PartnerRegistry;
@@ -83,6 +84,8 @@ pub struct LookupContext<'a> {
     pub client: ClientSignals<'a>,
     /// Publisher domain.
     pub publisher_domain: &'a str,
+    /// Request cookies, read by providers that use first-party cookies.
+    pub cookies: RequestCookies<'a>,
     /// Existing EC rate limiter, used only for `rate_limit_per_hour`.
     pub rate_limiter: &'a dyn RateLimiter,
     /// Request time.
@@ -103,6 +106,8 @@ pub struct PendingLookups<Pending> {
     now: UnixSeconds,
     /// Providers that finished at dispatch (skipped or failed to send).
     early: Vec<Tagged<LookupStatus>>,
+    /// Providers whose IDs were read from first-party cookies, validated.
+    from_cookies: Vec<Tagged<ProviderLookup>>,
 }
 
 impl<Pending> Default for PendingLookups<Pending> {
@@ -113,6 +118,7 @@ impl<Pending> Default for PendingLookups<Pending> {
             ec_id: String::new(),
             now: UnixSeconds::new(0),
             early: Vec::new(),
+            from_cookies: Vec::new(),
         }
     }
 }
@@ -122,6 +128,7 @@ impl<Pending> std::fmt::Debug for PendingLookups<Pending> {
         f.debug_struct("PendingLookups")
             .field("requests", &self.requests.len())
             .field("early", &self.early.len())
+            .field("from_cookies", &self.from_cookies.len())
             .finish_non_exhaustive()
     }
 }
@@ -130,7 +137,7 @@ impl<Pending> PendingLookups<Pending> {
     /// Whether nothing was dispatched or skipped.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.requests.is_empty() && self.early.is_empty()
+        self.requests.is_empty() && self.early.is_empty() && self.from_cookies.is_empty()
     }
 }
 
@@ -393,6 +400,17 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 return self.lookup(provider, LookupStatus::InvalidResponse, Vec::new());
             }
         };
+        self.validated(provider, eids, now)
+    }
+
+    /// Validates parsed entries into the provider's outcome.
+    fn validated(
+        &self,
+        provider: ProviderIndex,
+        eids: Vec<ProviderEid<'_>>,
+        now: UnixSeconds,
+    ) -> ProviderLookup {
+        let registered = &self.providers[provider.get()];
         let policy = ValidationPolicy {
             provider: &registered.id,
             claimed: &registered.policy.sources,
@@ -464,6 +482,19 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 }));
                 continue;
             }
+            // IDs in the vendor's own first-party cookies stand in for a
+            // lookup. Only providers with due sources read them, so a held
+            // live UID is not rewritten on every navigation.
+            if let Some(eids) = registered.provider.read_request_cookies(lookup.cookies) {
+                let found = self.validated(provider, eids, lookup.now);
+                if matches!(found.status, LookupStatus::Found { .. }) {
+                    pending.from_cookies.push(Tagged {
+                        provider,
+                        value: found,
+                    });
+                    continue;
+                }
+            }
             if Self::rate_limited(registered, lookup) {
                 pending.early.push(skip(SkipReason::RateLimited));
                 continue;
@@ -522,6 +553,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             ec_id,
             now,
             early,
+            from_cookies,
         } = pending;
         let responses = match deadline {
             Some(deadline) if !requests.is_empty() => transport.gather(requests, deadline).await,
@@ -531,6 +563,9 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             (0..self.providers.len()).map(|_| None).collect();
         for Tagged { provider, value } in early {
             slots[provider.get()] = Some(self.lookup(provider, value, Vec::new()));
+        }
+        for Tagged { provider, value } in from_cookies {
+            slots[provider.get()] = Some(value);
         }
         for Tagged { provider, value } in responses {
             slots[provider.get()] = Some(self.interpret(provider, value, now));
@@ -581,7 +616,9 @@ mod tests {
 
     type Reply = fn() -> Result<TransportResponse, Report<TransportError>>;
 
-    struct EchoProvider(ProviderCapabilities);
+    /// Echoes the response body as one UID; when the cookie name is set, also
+    /// reads that cookie as one UID.
+    struct EchoProvider(ProviderCapabilities, Option<&'static str>);
 
     impl IdentityProvider for EchoProvider {
         fn capabilities(&self) -> &ProviderCapabilities {
@@ -623,6 +660,26 @@ mod tests {
                     expiry: ProviderExpiry::Unspecified,
                 }],
             }]))
+        }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> Option<Vec<ProviderEid<'cookie>>> {
+            let id = cookies.get(self.1?)?;
+            Some(vec![ProviderEid {
+                source: Cow::Borrowed("ids.example.com"),
+                inserter: None,
+                matcher: None,
+                mm: None,
+                ext: None,
+                uids: vec![ProviderUid {
+                    id: Cow::Borrowed(id),
+                    atype: None,
+                    ext: None,
+                    expiry: ProviderExpiry::At(UnixSeconds::new(5000)),
+                }],
+            }])
         }
     }
 
@@ -724,17 +781,24 @@ mod tests {
     }
 
     fn echo_provider(input: SourceInput) -> EchoProvider {
-        EchoProvider(ProviderCapabilities {
-            sources: Box::new([SourceCapability {
-                source: SourceDomain::try_from("ids.example.com").expect("should parse"),
-                input,
-            }]),
-            shape: EidShape {
-                max_eids: NonZeroUsize::new(4).expect("should be non-zero"),
-                max_uids_per_eid: NonZeroUsize::new(4).expect("should be non-zero"),
-                eid_level_fields: EidLevelFields::Preserved,
+        cookie_provider(input, None)
+    }
+
+    fn cookie_provider(input: SourceInput, cookie: Option<&'static str>) -> EchoProvider {
+        EchoProvider(
+            ProviderCapabilities {
+                sources: Box::new([SourceCapability {
+                    source: SourceDomain::try_from("ids.example.com").expect("should parse"),
+                    input,
+                }]),
+                shape: EidShape {
+                    max_eids: NonZeroUsize::new(4).expect("should be non-zero"),
+                    max_uids_per_eid: NonZeroUsize::new(4).expect("should be non-zero"),
+                    eid_level_fields: EidLevelFields::Preserved,
+                },
             },
-        })
+            cookie,
+        )
     }
 
     fn coordinator_with(
@@ -780,6 +844,7 @@ mod tests {
                 user_agent: None,
             },
             publisher_domain: "www.example.com",
+            cookies: RequestCookies::new("vendor_id=c-1"),
             rate_limiter: limiter,
             now: UnixSeconds::new(1000),
         };
@@ -1115,6 +1180,63 @@ mod tests {
     }
 
     #[test]
+    fn first_party_cookie_id_replaces_the_lookup() {
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            cookie_provider(SourceInput::Anonymous, Some("vendor_id")),
+        ));
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &missing(), &granting());
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            matches!(lookup.status, LookupStatus::Found { kept: 1, .. }),
+            "should keep the cookie UID"
+        );
+        assert_eq!(
+            lookup.entries[0].1[0].uids()[0].id().as_str(),
+            "c-1",
+            "should store the cookie value"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send no lookup");
+    }
+
+    #[test]
+    fn missing_or_invalid_cookie_falls_back_to_the_lookup() {
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            cookie_provider(SourceInput::Anonymous, Some("absent")),
+        ));
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &missing(), &granting());
+
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { kept: 1, .. }),
+            "should use the lookup"
+        );
+        assert_eq!(transport.sent.borrow().len(), 1, "should send the lookup");
+    }
+
+    #[test]
+    fn cookie_is_not_read_without_consent() {
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config("tcf_vendor_id = 9999"),
+            cookie_provider(SourceInput::Anonymous, Some("vendor_id")),
+        ));
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &missing(), &granting());
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Consent),
+            "should skip for consent"
+        );
+    }
+
+    #[test]
     fn disabled_provider_is_not_registered() {
         let coordinator = coordinator("enabled = false");
 
@@ -1124,7 +1246,7 @@ mod tests {
     #[test]
     fn endpoint_outside_allowlist_is_rejected_at_build() {
         let mut config = provider_config("");
-        config.endpoint = "https://other.example.com/".to_owned();
+        config.endpoint = Some("https://other.example.com/".to_owned());
 
         let error = ProviderCoordinator::new(
             vec![RegisteredProvider::new(
@@ -1145,10 +1267,13 @@ mod tests {
 
     #[test]
     fn source_outside_capabilities_is_rejected_at_build() {
-        let provider = EchoProvider(ProviderCapabilities {
-            sources: Box::new([]),
-            ..echo_provider(SourceInput::Anonymous).0
-        });
+        let provider = EchoProvider(
+            ProviderCapabilities {
+                sources: Box::new([]),
+                ..echo_provider(SourceInput::Anonymous).0
+            },
+            None,
+        );
 
         let error = ProviderCoordinator::new(
             vec![RegisteredProvider::new(provider_config(""), provider)],

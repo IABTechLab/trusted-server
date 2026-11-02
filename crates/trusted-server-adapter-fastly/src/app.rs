@@ -122,7 +122,7 @@ use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::page_load::NavigationPermit;
-use trusted_server_core::ec::provider::ClientSignals;
+use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
@@ -407,6 +407,13 @@ async fn dispatch_identity_lookups(
         .headers()
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
+    let cookie_header = req
+        .headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
@@ -422,6 +429,7 @@ async fn dispatch_identity_lookups(
                     user_agent,
                 },
                 publisher_domain: &state.settings.publisher.domain,
+                cookies: RequestCookies::new(&cookie_header),
                 rate_limiter: &limiter,
                 now: UnixSeconds::new(now),
             },
@@ -1550,7 +1558,7 @@ mod tests {
     use trusted_server_core::ec::provider::{
         ClientSignals, EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
         ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry, ProviderRequest,
-        ProviderResponse, ProviderUid, SourceCapability, SourceInput,
+        ProviderResponse, ProviderUid, RequestCookies, SourceCapability, SourceInput,
     };
     use trusted_server_core::ec::rate_limiter::RateLimiter;
     use trusted_server_core::ec::registry::PartnerRegistry;
@@ -2931,6 +2939,7 @@ mod tests {
                     user_agent: None,
                 },
                 publisher_domain: "test-publisher.com",
+                cookies: RequestCookies::default(),
                 rate_limiter: &AllowAll,
                 now: UnixSeconds::new(1_700_000_000),
             },

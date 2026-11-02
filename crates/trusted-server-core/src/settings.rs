@@ -595,7 +595,11 @@ pub struct IdentityProviderConfig {
     )]
     pub enabled: bool,
     /// Lookup endpoint; must be `https` with a host in `allowed_domains`.
-    pub endpoint: String,
+    ///
+    /// Optional for kinds that only read first-party cookies; kinds that
+    /// make lookups reject a missing endpoint when they are built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     /// Exact hosts the coordinator may call for this provider.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub allowed_domains: Vec<String>,

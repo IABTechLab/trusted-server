@@ -78,7 +78,12 @@ impl ProviderKind for Id5 {
             return Err(Report::new(ProviderConfigError::Invalid)
                 .attach("an id5 provider needs at least one source"));
         }
-        let mut url = common.endpoint.clone();
+        let mut url = common
+            .endpoint
+            .ok_or_else(|| {
+                Report::new(ProviderConfigError::Invalid).attach("a id5 provider needs an endpoint")
+            })?
+            .clone();
         url.path_segments_mut()
             .map_err(|()| {
                 Report::new(ProviderConfigError::Invalid).attach("endpoint cannot hold a path")
