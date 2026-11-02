@@ -566,9 +566,10 @@ as 32 random bytes encoded as hex; the stored value must contain at least 32
 ASCII graphic bytes. Length validation does not establish entropy. The
 credential is redacted in diagnostics; temporary fixed-size digests are compared
 in constant time and are never stored or exposed. Configure the forwarder to send
-the same actual value in the header named by `auth_header`. The current
-`ts dev proxy` does not inject this credential; see its
-[host header behavior](./ts-dev-proxy.md#host-header-behavior).
+the same actual value in the header named by `auth_header`. For `ts dev proxy`,
+use `auth_header = "x-ts-forwarder-auth"` and pass the local token file through
+`--forwarder-secret-file`; see its
+[authenticated forwarding setup](./ts-dev-proxy.md#authenticated-forwarding).
 
 The forwarder must replace client-supplied `X-Forwarded-Host` and
 `X-Forwarded-Proto` with the actual browser-facing authority and HTTP/HTTPS
