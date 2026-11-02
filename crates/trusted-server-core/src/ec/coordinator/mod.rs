@@ -272,7 +272,8 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         self.providers.is_empty()
     }
 
-    /// Claimed sources lacking a live UID, minus sources needing input V1
+    /// Claimed sources lacking a live provider-written UID (a browser
+    /// fallback does not count), minus sources needing input V1
     /// never has; the flag reports whether any source was removed for input.
     fn due_sources(
         registered: &Registered<P>,
@@ -285,7 +286,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         for source in &registered.policy.sources {
             let held = entry
                 .and_then(|entry| entry.ids.get(source.as_str()))
-                .is_some_and(|record| record.has_live_uid(now));
+                .is_some_and(|record| record.is_provider_written() && record.has_live_uid(now));
             if held {
                 continue;
             }
@@ -560,8 +561,9 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::TcfConsent;
+    use crate::ec::eid_types::{AgentType, EidFields, Expiry, UidValue};
     use crate::ec::kv::KvIdentityGraph;
-    use crate::ec::kv_types::KvPartnerId;
+    use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
     use crate::ec::provider::{
         EidLevelFields, EidShape, ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry,
         ProviderRequest, ProviderUid, SourceCapability,
@@ -829,6 +831,49 @@ mod tests {
         assert_eq!(transport.sent.borrow().len(), 1, "should send one request");
     }
 
+    fn provider_record(id: &str) -> KvPartnerId {
+        let uid = KvUid::new(
+            UidValue::try_from(id).expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            Expiry::Never,
+        );
+        KvPartnerId::from_eids(
+            vec![KvEid::new(EidFields::default(), vec![uid])],
+            UnixSeconds::new(1000),
+        )
+        .expect("should build provider record")
+    }
+
+    #[test]
+    fn source_with_browser_fallback_uid_is_still_due() {
+        // Arrange
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.ids.insert(
+            "ids.example.com".to_owned(),
+            KvPartnerId::single("fallback"),
+        );
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+        );
+
+        // Assert
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should look up a source holding only a browser fallback"
+        );
+        assert_eq!(transport.sent.borrow().len(), 1, "should send one request");
+    }
+
     #[test]
     fn source_with_live_uid_is_not_due() {
         let coordinator = coordinator("");
@@ -837,7 +882,7 @@ mod tests {
         entry.consent.ok = true;
         entry
             .ids
-            .insert("ids.example.com".to_owned(), KvPartnerId::single("legacy"));
+            .insert("ids.example.com".to_owned(), provider_record("p-1"));
 
         let results = run(
             &coordinator,

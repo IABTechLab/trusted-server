@@ -1584,6 +1584,123 @@ mod tests {
     }
 
     #[test]
+    fn finalize_withholds_provider_owned_fallback_when_purpose_four_is_denied() {
+        // Arrange
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("purp4o");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let purpose1_only_consent = purpose_one_only_consent();
+        let live = KvEntry::new(
+            &purpose1_only_consent,
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .expect("should seed the live row this request updates");
+        let mut ec_context = EcContext::new_for_test_with_cookie(
+            Some(ec_id.clone()),
+            Some(ec_id.clone()),
+            true,
+            false,
+            purpose1_only_consent,
+        );
+        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+        ec_context.set_eid_sync_source(EidSyncSource::Navigation);
+        ec_context.set_navigation_permit(NavigationPermit::for_test());
+        ec_context.set_client_eids(vec![Eid::new(
+            "id5-sync.com".to_owned(),
+            vec![Uid {
+                id: "ID5_should_not_persist".to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+        )]);
+        let mut registry = PartnerRegistry::from_config(&[make_partner("id5-sync.com")])
+            .expect("should build registry");
+        assert!(
+            registry.mark_provider_owned("id5-sync.com"),
+            "should mark the provider source"
+        );
+        let mut response = empty_response();
+
+        // Act
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        // Assert
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should remain");
+        assert!(
+            !stored.ids.contains_key("id5-sync.com"),
+            "should keep the provider-owned fallback out of KV without Purpose 4"
+        );
+    }
+
+    #[test]
+    fn finalize_stores_browser_fallback_for_provider_owned_source() {
+        // Arrange
+        let settings = create_test_settings();
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            None,
+            granting_consent(),
+            Some("192.0.2.10".to_owned()),
+        );
+        ec_context
+            .generate_if_needed(&settings, Some(&graph))
+            .expect("should mint a new EC");
+        ec_context.set_navigation_permit(NavigationPermit::for_test());
+        let ec_id = ec_context.ec_value().expect("should mint").to_owned();
+        let mut registry = PartnerRegistry::from_config(&[make_partner("sharedid.org")])
+            .expect("should build registry");
+        assert!(
+            registry.mark_provider_owned("sharedid.org"),
+            "should mark the provider source"
+        );
+        let mut response = empty_response();
+
+        // Act
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            Some("fallback-cookie-id"),
+            &mut response,
+        );
+
+        // Assert
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("should create the row");
+        let record = stored
+            .ids
+            .get("sharedid.org")
+            .expect("should store the browser fallback");
+        assert_eq!(
+            record.uid, "fallback-cookie-id",
+            "should store the browser uid"
+        );
+        assert!(
+            !record.is_provider_written(),
+            "should mark the fallback as not provider-written"
+        );
+    }
+
+    #[test]
     fn finalize_auction_confirmed_miss_does_not_create_a_row() {
         // The same path with a genuinely absent row must stay a no-op: a route
         // without orphan recovery must never mint an identity-graph entry.

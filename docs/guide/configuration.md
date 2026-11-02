@@ -803,6 +803,14 @@ Lookups run only for an existing or newly issued EC, only when consent allows
 EID persistence, and, when `tcf_vendor_id` is set, only with TCF vendor consent
 for that vendor.
 
+A provider owns its `sources`: its results replace whatever the row holds for
+them, and batch sync rejects them. Browser-resolved IDs (`ts-eids`, `sharedId`,
+`/auction` body EIDs) for an owned source are stored only as a fallback, when
+the row has no live provider-written UID for the source and the provider kept
+nothing for it on that navigation. The fallback follows the normal browser
+ingest rules, never overwrites an existing value, and does not stop later
+lookups: the next successful lookup replaces it.
+
 | Field             | Type    | Required | Description                                                             |
 | ----------------- | ------- | -------- | ----------------------------------------------------------------------- |
 | `id`              | String  | Yes      | Stable provider ID used in logs, metrics and KV ownership               |

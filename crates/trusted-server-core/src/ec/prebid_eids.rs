@@ -157,10 +157,9 @@ pub(crate) fn collect_eid_updates(
     {
         updates.push(update);
     }
-    let mut updates = dedupe_partner_updates(updates);
-    // Provider-owned sources are written only by their identity provider.
-    updates.retain(|update| !registry.is_provider_owned(&update.partner_id));
-    updates
+    // Provider-owned sources stay in the list: the write planner ingests them
+    // only as a fallback when the provider left the source empty.
+    dedupe_partner_updates(updates)
 }
 
 pub(crate) fn collect_prebid_eid_updates(
