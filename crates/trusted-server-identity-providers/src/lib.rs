@@ -22,7 +22,7 @@ pub mod sharedid;
 pub mod uid2;
 pub mod unifiedid;
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -273,7 +273,9 @@ fn build_phase_coordinator(
     if registered.is_empty() {
         return Ok(None);
     }
-    ProviderCoordinator::new(registered, partners, budget).map(Some)
+    let pull_sync_concurrency = NonZeroUsize::new(settings.ec.pull_sync_concurrency);
+    ProviderCoordinator::new(registered, partners, budget)
+        .map(|coordinator| Some(coordinator.with_pull_sync_concurrency(pull_sync_concurrency)))
 }
 
 #[cfg(test)]

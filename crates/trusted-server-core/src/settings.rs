@@ -761,8 +761,8 @@ pub struct Ec {
     #[serde(default)]
     pub ec_store: Option<String>,
 
-    /// Maximum number of concurrent pull-sync requests; retained for config
-    /// compatibility; unused.
+    /// Maximum number of pull-sync lookups dispatched per navigation; 0
+    /// means no limit.
     #[serde(default = "Ec::default_pull_sync_concurrency")]
     pub pull_sync_concurrency: usize,
 
@@ -854,6 +854,19 @@ impl Ec {
         "trusted-server-placeholder-secret",
         "replace-with-random-ec-passphrase",
     ];
+
+    /// Normalizes every partner's `pull_sync_allowed_domains`: trimmed,
+    /// lowercased and without a trailing dot, matching how request hosts are
+    /// compared.
+    fn normalize_pull_sync_domains(&mut self) {
+        for domain in self
+            .partners
+            .iter_mut()
+            .flat_map(|partner| partner.pull_sync_allowed_domains.iter_mut())
+        {
+            *domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        }
+    }
 
     /// Default maximum concurrent pull-sync requests.
     #[must_use]
@@ -3618,6 +3631,7 @@ impl Settings {
         self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
+        self.ec.normalize_pull_sync_domains();
         self.integrations
             .remove_legacy_static_secret_store_selectors();
         self.consent.validate();
@@ -4559,6 +4573,30 @@ mod tests {
                     .get("identity_after_response_budget_ms")
                     .is_none(),
             "should serialize no identity keys"
+        );
+    }
+
+    #[test]
+    fn pull_sync_allowed_domains_are_normalized_at_load() {
+        let toml = format!(
+            r#"{}
+            [[ec.partners]]
+            name = "Pull partner"
+            source_domain = "partner.example.com"
+            pull_sync_enabled = true
+            pull_sync_url = "https://sync.example.com/pull"
+            pull_sync_allowed_domains = [" Sync.Example.COM. "]
+            ts_pull_token = "example-pull-token-32-bytes-minimum"
+            "#,
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml).expect("should parse settings");
+
+        assert_eq!(
+            settings.ec.partners[0].pull_sync_allowed_domains,
+            vec!["sync.example.com".to_owned()],
+            "should trim, lowercase and drop the trailing dot"
         );
     }
 

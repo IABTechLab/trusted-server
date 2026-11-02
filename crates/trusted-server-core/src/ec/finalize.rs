@@ -76,13 +76,17 @@ pub fn ec_finalize_response(
     expire_retired_pull_marker(ec_context, response);
 }
 
-/// Sets or expires the mirror cookie (spec §10).
+/// Sets or expires the mirror cookie (spec §10). Best effort.
 ///
 /// Navigations rebuild it from the row as it stands after the page-load
 /// write: the committed row is stored as the `Present` snapshot, so
 /// [`super::EcKvSnapshot::entry_for`] returns it, or the read snapshot when no
-/// write landed. Without EC and EID consent it is expired on navigations and on any
-/// response whose request carried it.
+/// write landed. Without EC and EID consent it is expired on any response
+/// whose request carried it.
+///
+/// The cookie is only expired when the request carried it, so responses to
+/// browsers without a mirror stay free of `Set-Cookie`. When the row could
+/// not be read authoritatively (KV failure), the mirror is left untouched.
 fn apply_mirror(
     ec_context: &EcContext,
     registry: &PartnerRegistry,
@@ -92,9 +96,10 @@ fn apply_mirror(
     let decision = if !mirror_consent(ec_context.consent()) {
         MirrorCookie::Expire
     } else if navigation {
-        let row = ec_context
-            .ec_value()
-            .and_then(|ec_id| ec_context.kv_snapshot().entry_for(ec_id));
+        let Some(row) = mirror_row(ec_context) else {
+            log::debug!("Leaving the mirror cookie untouched: identity row is unavailable");
+            return;
+        };
         build_mirror(
             row,
             ec_context.consent(),
@@ -112,13 +117,33 @@ fn apply_mirror(
                 value.as_str()
             ),
         ),
-        MirrorCookie::Expire if ec_context.mirror_cookie_present() || navigation => {
+        MirrorCookie::Expire if ec_context.mirror_cookie_present() => {
             append_cookie(
                 response,
                 &format!("{COOKIE_TS_EIDS_MIRROR}=; Path=/; Secure; SameSite=Lax; Max-Age=0"),
             );
         }
         MirrorCookie::Expire => {}
+    }
+}
+
+/// The row the mirror is built from.
+///
+/// Returns `Some(None)` when there is authoritatively no row (no EC or a
+/// missing row), and `None` when the row is unknown because the read failed
+/// or never happened.
+fn mirror_row(ec_context: &EcContext) -> Option<Option<&KvEntry>> {
+    let Some(ec_id) = ec_context.ec_value() else {
+        return Some(None);
+    };
+    let snapshot = ec_context.kv_snapshot();
+    match snapshot {
+        EcKvSnapshot::Present { .. } | EcKvSnapshot::Missing { .. }
+            if snapshot.belongs_to(ec_id) =>
+        {
+            Some(snapshot.entry_for(ec_id))
+        }
+        _ => None,
     }
 }
 
@@ -1980,7 +2005,11 @@ mod tests {
         )
     }
 
-    fn run_mirror_navigation(lookups: LookupResults) -> Response<EdgeBody> {
+    fn run_mirror_navigation(
+        lookups: LookupResults,
+        mirror_present: bool,
+        kv_read_failed: bool,
+    ) -> Response<EdgeBody> {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("mirr01");
         let graph = KvIdentityGraph::in_memory("mirror_store");
@@ -1993,7 +2022,15 @@ mod tests {
         graph
             .create(&ec_id, &live)
             .expect("should seed the live row");
-        let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), true);
+        let snapshot = if kv_read_failed {
+            EcKvSnapshot::Failed {
+                ec_id: ec_id.clone(),
+            }
+        } else {
+            graph.load_snapshot(&ec_id)
+        };
+        let mut ec_context = returning_user_context(&ec_id, snapshot, true);
+        ec_context.set_mirror_cookie_present_for_test(mirror_present);
         ec_context.set_lookup_results(lookups);
         let mut registry = PartnerRegistry::from_config(&[make_partner("ids.example.com")])
             .expect("should build registry");
@@ -2014,7 +2051,7 @@ mod tests {
 
     #[test]
     fn navigation_sets_mirror_from_committed_row() {
-        let response = run_mirror_navigation(provider_found("ids.example.com"));
+        let response = run_mirror_navigation(provider_found("ids.example.com"), false, false);
 
         let cookies = mirror_cookies(&response);
         assert_eq!(cookies.len(), 1, "should set one mirror cookie");
@@ -2030,13 +2067,61 @@ mod tests {
 
     #[test]
     fn navigation_without_provider_uids_expires_mirror() {
-        let response = run_mirror_navigation(LookupResults::default());
+        let response = run_mirror_navigation(LookupResults::default(), true, false);
 
         let cookies = mirror_cookies(&response);
         assert_eq!(cookies.len(), 1, "should emit one mirror cookie");
         assert!(
             cookies[0].contains("Max-Age=0"),
             "should expire the mirror when no provider UID qualifies"
+        );
+    }
+
+    #[test]
+    fn navigation_without_mirror_cookie_emits_no_expiry() {
+        let response = run_mirror_navigation(LookupResults::default(), false, false);
+
+        assert!(
+            mirror_cookies(&response).is_empty(),
+            "should not expire a mirror the request did not carry"
+        );
+    }
+
+    #[test]
+    fn kv_read_failure_leaves_mirror_untouched() {
+        let response = run_mirror_navigation(provider_found("ids.example.com"), true, true);
+
+        assert!(
+            mirror_cookies(&response).is_empty(),
+            "should leave the mirror untouched when the row could not be read"
+        );
+    }
+
+    #[test]
+    fn withdrawn_consent_without_mirror_cookie_emits_nothing() {
+        let settings = create_test_settings();
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = make_context_with_consent(None, None, false, false, consent);
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            None,
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            mirror_cookies(&response).is_empty(),
+            "should not expire a mirror the request did not carry"
         );
     }
 

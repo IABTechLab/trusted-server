@@ -1,7 +1,7 @@
 //! The JS-readable mirror of provider-owned bidstream UIDs (spec §10).
 
 use base64::Engine as _;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 use crate::consent::ConsentContext;
 use crate::consent::allows_eid_persistence;
@@ -39,14 +39,15 @@ impl MirrorValue {
 /// Holds live, provider-written UIDs of `bidstream_enabled` partners, in
 /// partner config order, as unpadded base64url JSON
 /// `{"v":1,"eids":[...]}`. UIDs that would push the value past
-/// [`MAX_MIRROR_BYTES`] are skipped. Returns [`MirrorCookie::Expire`] when
-/// consent does not allow the EC or EID persistence, the row is missing or withdrawn,
-/// or nothing qualifies.
+/// [`MAX_MIRROR_BYTES`] are skipped, as are UIDs that fail to serialize.
+/// Returns [`MirrorCookie::Expire`] when consent does not allow the EC or EID
+/// persistence, the row is missing or withdrawn, or nothing qualifies.
 ///
 /// # Performance
 ///
-/// Re-encodes once per kept UID; the size cap bounds this to a few dozen
-/// small encodes per navigation.
+/// Linear in the row size: each EID header and UID is serialized once, the
+/// encoded length is tracked arithmetically, and the value is base64-encoded
+/// once at the end.
 #[must_use]
 pub fn build_mirror(
     row: Option<&KvEntry>,
@@ -57,8 +58,7 @@ pub fn build_mirror(
     let Some(row) = row.filter(|row| row.consent.ok && mirror_consent(consent)) else {
         return MirrorCookie::Expire;
     };
-    let mut eids: Vec<Value> = Vec::new();
-    let mut encoded: Option<String> = None;
+    let mut mirror = MirrorBuilder::default();
     for partner in partners
         .in_config_order()
         .filter(|partner| partner.bidstream_enabled)
@@ -66,50 +66,150 @@ pub fn build_mirror(
         let Some(record) = row.ids.get(&partner.source_domain) else {
             continue;
         };
+        let source = partner.source_domain.as_str();
+        // Ownerless UIDs of a pull-sync partner's source were written by
+        // legacy pull sync, so they belong to that partner's provider.
+        let pull_sync_owned =
+            partner.provider_owned && partner.pull_sync_enabled && partner.pull_sync_url.is_some();
+        if record.eids().is_empty() {
+            if pull_sync_owned && !record.uid.is_empty() {
+                let header = legacy_header(source);
+                let uid = serde_json::to_string(&serde_json::json!({
+                    "id": record.uid,
+                    "atype": partner.openrtb_atype,
+                }));
+                mirror.push_eid(source, header, [uid]);
+            }
+            continue;
+        }
         for eid in record.eids() {
-            let entry_index = eids.len();
-            eids.push(eid_json(&partner.source_domain, eid));
-            let mut kept = 0_usize;
-            for uid in eid
+            let uids = eid
                 .uids()
                 .iter()
-                .filter(|uid| uid.owner().is_some() && uid.is_live(now))
-            {
-                uids_mut(&mut eids[entry_index]).push(uid_json(uid));
-                if let Some(value) = encode(&eids) {
-                    encoded = Some(value);
-                    kept += 1;
-                } else {
-                    uids_mut(&mut eids[entry_index]).pop();
-                }
-            }
-            if kept == 0 {
-                eids.pop();
-            }
+                .filter(|uid| (pull_sync_owned || uid.owner().is_some()) && uid.is_live(now))
+                .map(|uid| serde_json::to_string(&uid_json(uid)));
+            mirror.push_eid(source, eid_header(source, eid), uids);
         }
     }
-    match encoded {
-        Some(value) if !eids.is_empty() => MirrorCookie::Set(MirrorValue(value)),
-        _ => MirrorCookie::Expire,
+    let MirrorBuilder {
+        mut json,
+        eid_count,
+    } = mirror;
+    if eid_count == 0 {
+        return MirrorCookie::Expire;
     }
+    json.push_str(JSON_SUFFIX);
+    let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+    debug_assert!(
+        value.len() <= MAX_MIRROR_BYTES,
+        "should respect the size cap"
+    );
+    MirrorCookie::Set(MirrorValue(value))
+}
+
+/// Accumulates the mirror JSON, tracking its encoded size so each part is
+/// serialized once.
+struct MirrorBuilder {
+    json: String,
+    eid_count: usize,
+}
+
+impl Default for MirrorBuilder {
+    fn default() -> Self {
+        Self {
+            json: String::from(JSON_PREFIX),
+            eid_count: 0,
+        }
+    }
+}
+
+impl MirrorBuilder {
+    /// Appends one EID with every UID that still fits; drops the EID when
+    /// none does. Parts that fail to serialize are skipped and logged.
+    fn push_eid(
+        &mut self,
+        source: &str,
+        header: Option<String>,
+        uids: impl IntoIterator<Item = Result<String, serde_json::Error>>,
+    ) {
+        let Some(header) = header else {
+            log::warn!("Skipping mirror EID for '{source}': header does not serialize");
+            return;
+        };
+        let eid_start = self.json.len();
+        let mut kept = 0_usize;
+        for uid in uids {
+            let Ok(uid) = uid else {
+                log::warn!("Skipping mirror UID for '{source}': does not serialize");
+                continue;
+            };
+            let added = if kept == 0 {
+                usize::from(self.eid_count > 0) + header.len() + uid.len() + EID_SUFFIX.len()
+            } else {
+                1 + uid.len()
+            };
+            if encoded_len(self.json.len() + added + JSON_SUFFIX.len()) > MAX_MIRROR_BYTES {
+                continue;
+            }
+            if kept == 0 {
+                if self.eid_count > 0 {
+                    self.json.push(',');
+                }
+                self.json.push_str(&header);
+            } else {
+                self.json.push(',');
+            }
+            self.json.push_str(&uid);
+            kept += 1;
+        }
+        if kept > 0 {
+            self.json.push_str(EID_SUFFIX);
+            self.eid_count += 1;
+        } else {
+            self.json.truncate(eid_start);
+        }
+    }
+}
+
+/// Header for a legacy single-UID record: the source only.
+fn legacy_header(source: &str) -> Option<String> {
+    let mut object = Map::new();
+    object.insert("source".to_owned(), Value::from(source));
+    object.insert("uids".to_owned(), Value::Array(Vec::new()));
+    open_uids_array(serde_json::to_string(&Value::Object(object)).ok()?)
+}
+
+const JSON_PREFIX: &str = r#"{"v":1,"eids":["#;
+const JSON_SUFFIX: &str = "]}";
+const EID_SUFFIX: &str = "]}";
+
+/// Unpadded base64 length of `bytes` input bytes.
+fn encoded_len(bytes: usize) -> usize {
+    (bytes * 4).div_ceil(3)
+}
+
+/// Serializes an EID without its UIDs, ending in an open `"uids":[`.
+///
+/// `uids` sorts last among the EID's keys, so the empty array closes the
+/// serialized object.
+fn eid_header(source: &str, eid: &KvEid) -> Option<String> {
+    open_uids_array(serde_json::to_string(&eid_json(source, eid)).ok()?)
+}
+
+/// Turns a serialized EID ending in `"uids":[]}` into one ending in an open
+/// `"uids":[`.
+fn open_uids_array(mut header: String) -> Option<String> {
+    let open = header.strip_suffix(EID_SUFFIX)?.len();
+    header.ends_with(r#""uids":[]}"#).then(|| {
+        header.truncate(open);
+        header
+    })
 }
 
 /// Whether consent allows the mirror: EC consent and EID persistence.
 #[must_use]
 pub(crate) fn mirror_consent(consent: &ConsentContext) -> bool {
     ec_consent_granted(consent) && allows_eid_persistence(consent)
-}
-
-fn uids_mut(eid: &mut Value) -> &mut Vec<Value> {
-    eid["uids"]
-        .as_array_mut()
-        .expect("should hold a uids array")
-}
-
-fn encode(eids: &[Value]) -> Option<String> {
-    let json = serde_json::to_vec(&json!({ "v": 1, "eids": eids })).ok()?;
-    let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
-    (value.len() <= MAX_MIRROR_BYTES).then_some(value)
 }
 
 fn eid_json(source: &str, eid: &KvEid) -> Value {
@@ -150,6 +250,7 @@ mod tests {
     use super::*;
     use crate::ec::eid_types::{AgentType, EidFields, ProviderId, UidValue};
     use crate::ec::kv_types::KvPartnerId;
+    use serde_json::json;
 
     fn partners(bidstream: bool) -> PartnerRegistry {
         let partner = serde_json::from_value(json!({
@@ -248,6 +349,73 @@ mod tests {
                 MirrorCookie::Expire
             ),
             "should expire without a row"
+        );
+    }
+
+    #[test]
+    fn mirrors_legacy_uid_of_pull_sync_partner_only() {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry
+            .ids
+            .insert("ids.example.com".to_owned(), KvPartnerId::single("legacy"));
+        let pull_partner = serde_json::from_value(json!({
+            "name": "ids", "source_domain": "ids.example.com", "bidstream_enabled": true,
+            "pull_sync_enabled": true, "pull_sync_url": "https://sync.example.com/pull",
+            "pull_sync_allowed_domains": ["sync.example.com"],
+            "ts_pull_token": "example-pull-token-32-bytes-minimum"
+        }))
+        .expect("should build partner");
+        let mut pull =
+            PartnerRegistry::from_config(&[pull_partner]).expect("should build registry");
+        pull.mark_provider_owned("ids.example.com", None);
+        let now = UnixSeconds::new(1000);
+
+        let MirrorCookie::Set(value) = build_mirror(Some(&entry), &granting(), &pull, now) else {
+            panic!("should mirror the legacy pull-sync UID");
+        };
+
+        assert_eq!(
+            decode(&value)["eids"][0]["uids"][0]["id"],
+            json!("legacy"),
+            "should attribute the ownerless UID to the pull-sync partner"
+        );
+        assert_eq!(
+            build_mirror(Some(&entry), &granting(), &partners(true), now),
+            MirrorCookie::Expire,
+            "should not mirror ownerless UIDs of other partners"
+        );
+    }
+
+    #[test]
+    fn mirrors_several_eids_as_valid_json() {
+        let mut entry = row(vec![uid("one", Expiry::Never), uid("two", Expiry::Never)]);
+        let record = KvPartnerId::from_eids(
+            vec![
+                KvEid::new(EidFields::default(), vec![uid("a", Expiry::Never)]),
+                KvEid::new(EidFields::default(), vec![uid("b", Expiry::Never)]),
+            ],
+            UnixSeconds::new(0),
+        )
+        .expect("should build record");
+        entry.ids.insert("ids.example.com".to_owned(), record);
+
+        let MirrorCookie::Set(value) = build_mirror(
+            Some(&entry),
+            &granting(),
+            &partners(true),
+            UnixSeconds::new(1000),
+        ) else {
+            panic!("should set the mirror");
+        };
+
+        assert_eq!(
+            decode(&value),
+            json!({ "v": 1, "eids": [
+                { "source": "ids.example.com", "uids": [{ "id": "a", "atype": 1 }] },
+                { "source": "ids.example.com", "uids": [{ "id": "b", "atype": 1 }] }
+            ] }),
+            "should join EIDs into valid JSON"
         );
     }
 

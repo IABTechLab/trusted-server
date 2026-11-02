@@ -278,7 +278,8 @@ Trusted Server mirrors provider-written UIDs for `bidstream_enabled` partners in
 - **Name**: `__Host-ts-eids-mirror`
 - **Attributes**: `Path=/; Secure; SameSite=Lax; Max-Age=<EC cookie max age>`, host-only (no `Domain`) and not `HttpOnly`
 - **Contents**: unpadded base64url JSON `{"v":1,"eids":[{"source":"ids.example.com","uids":[{"id":"...","atype":1,"exp":1767225600}]}]}`, partners in `[[ec.partners]]` order, at most 3584 bytes; UIDs that do not fit are left out
-- **Updates**: every page navigation rebuilds it from the row after that navigation's write, and expires it when no live provider UID qualifies. Without EC and EID consent it is expired on navigations and on any response whose request carried it.
+- **Contents source**: live UIDs written by an identity provider. UIDs that legacy pull sync stored without an owner count as the pull-sync partner's own.
+- **Updates** (best effort): page navigations rebuild it from the row after that navigation's write. It is expired only when the request carried it, either because no live provider UID qualifies or because EC and EID consent is missing (on any response). Responses to browsers without a mirror get no mirror `Set-Cookie`. When the identity row cannot be read (KV failure) the mirror is left untouched, and a mirror that cannot be built is skipped without failing the response.
 
 Readers must drop UIDs whose `exp` (Unix seconds) has passed and strip `exp` before using a UID.
 

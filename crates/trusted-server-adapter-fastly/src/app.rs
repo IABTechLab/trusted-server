@@ -373,8 +373,6 @@ pub(crate) struct EcFinalizeState {
     pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid_cookie: Option<String>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) is_real_browser: bool,
     /// Per-request services carried to the entry point so the pull-sync
     /// dispatcher can reuse the same platform HTTP client.
     pub(crate) services: RuntimeServices,
@@ -562,7 +560,6 @@ impl EcRequestState {
             use_finalize_kv: self.finalize_kv_graph.is_some(),
             eids_cookie: self.eids_cookie,
             sharedid_cookie: self.sharedid_cookie,
-            is_real_browser: self.is_real_browser,
             services: self.services,
         }
     }
@@ -937,8 +934,6 @@ async fn run_named_route(
 /// graph + partner registry + rate limiter, with a default EC context for
 /// response finalization.
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
-    let device_signals = device_signals_for(&req);
-    let is_real_browser = device_signals.looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
@@ -956,7 +951,6 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
         use_finalize_kv: false,
         eids_cookie,
         sharedid_cookie,
-        is_real_browser,
         services: services.clone(),
     });
     response
@@ -3476,7 +3470,10 @@ mod tests {
             .get::<super::EcFinalizeState>()
             .expect("fallback response should carry EcFinalizeState");
         assert!(
-            finalize.is_real_browser,
+            finalize
+                .ec_context
+                .device_signals()
+                .is_some_and(DeviceSignals::looks_like_browser),
             "browser-shaped JA4/H2 signals from the request extension must mark the request as a real browser"
         );
     }
@@ -3495,7 +3492,10 @@ mod tests {
             .get::<super::EcFinalizeState>()
             .expect("fallback response should carry EcFinalizeState");
         assert!(
-            !finalize.is_real_browser,
+            !finalize
+                .ec_context
+                .device_signals()
+                .is_some_and(DeviceSignals::looks_like_browser),
             "a request without captured device signals should not be classified as a real browser"
         );
     }

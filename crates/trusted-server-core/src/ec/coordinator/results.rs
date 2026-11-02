@@ -69,6 +69,9 @@ pub enum SkipReason {
     /// Every source of the provider is excluded where GDPR applies; the
     /// provider's stored UIDs are removed.
     Region,
+    /// The row snapshot read failed, so consent state (such as a withdrawal
+    /// tombstone) is unknown.
+    SnapshotUnavailable,
 }
 
 /// One outcome per provider per navigation.
@@ -115,6 +118,7 @@ impl LookupStatus {
             Self::Skipped(SkipReason::Input) => "skipped_input",
             Self::Skipped(SkipReason::RateLimited) => "skipped_rate_limited",
             Self::Skipped(SkipReason::Region) => "skipped_region",
+            Self::Skipped(SkipReason::SnapshotUnavailable) => "skipped_snapshot_unavailable",
             Self::Skipped(SkipReason::Destination) => "destination_rejected",
             Self::Skipped(SkipReason::OptedOut) => "skipped_opted_out",
         }
