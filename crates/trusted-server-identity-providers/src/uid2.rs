@@ -9,9 +9,9 @@
 //! never stored, and no refresh is made server side.
 //!
 //! When `__uid_2` yields nothing, Prebid's `__uid2_advertising_token`
-//! cookie is read as a raw token with the shared default TTL. Lockr AIM can
+//! cookie (or each name in `cookie_names`) is read as a raw token with the shared default TTL. Lockr AIM can
 //! write the token into a cookie whose name comes from its own
-//! configuration; set `token_cookie_name` to it.
+//! configuration; list that name in `cookie_names`.
 //!
 //! Parsing is lenient: an undecodable cookie, a missing token or expiry,
 //! or a blank or opt-out token reads as no ID.
@@ -41,9 +41,10 @@ pub struct Uid2Settings {
     /// Cookie holding the UID2 SDK identity JSON.
     #[serde(default = "Uid2Settings::default_identity_cookie_name")]
     pub identity_cookie_name: String,
-    /// Cookie holding a raw advertising token.
-    #[serde(default = "Uid2Settings::default_token_cookie_name")]
-    pub token_cookie_name: String,
+    /// Cookies holding a raw advertising token, read in order after the
+    /// identity cookie.
+    #[serde(default = "Uid2Settings::default_cookie_names")]
+    pub cookie_names: Vec<String>,
 }
 
 impl Uid2Settings {
@@ -51,8 +52,8 @@ impl Uid2Settings {
         "__uid_2".to_owned()
     }
 
-    fn default_token_cookie_name() -> String {
-        "__uid2_advertising_token".to_owned()
+    fn default_cookie_names() -> Vec<String> {
+        vec!["__uid2_advertising_token".to_owned()]
     }
 }
 
@@ -62,7 +63,7 @@ pub struct Uid2Provider {
     capabilities: ProviderCapabilities,
     source: SourceDomain,
     identity_cookie_name: String,
-    token_cookie_name: String,
+    cookie_names: Box<[String]>,
 }
 
 impl ProviderKind for Uid2 {
@@ -79,7 +80,7 @@ impl ProviderKind for Uid2 {
             capabilities,
             source,
             identity_cookie_name: settings.identity_cookie_name,
-            token_cookie_name: settings.token_cookie_name,
+            cookie_names: settings.cookie_names.into_boxed_slice(),
         })
     }
 }
@@ -135,7 +136,12 @@ impl IdentityProvider for Uid2Provider {
         let (token, expiry) = cookies
             .get(&self.identity_cookie_name)
             .and_then(identity)
-            .or_else(|| cookies.get(&self.token_cookie_name).and_then(raw_token))?;
+            .or_else(|| {
+                self.cookie_names
+                    .iter()
+                    .filter_map(|name| cookies.get(name))
+                    .find_map(raw_token)
+            })?;
         Some(vec![cookie_eid(&self.source, Cow::Owned(token), expiry)])
     }
 }
@@ -209,7 +215,7 @@ mod tests {
 
     #[test]
     fn reads_configured_cookie_names() {
-        let provider = provider(&json!({ "token_cookie_name": "example_lockr_uid2" }));
+        let provider = provider(&json!({ "cookie_names": ["example_lockr_uid2"] }));
 
         let read = read(&*provider, "example_lockr_uid2=AgAAAAexampletoken");
 
