@@ -66,6 +66,9 @@ pub enum SkipReason {
     /// The vendor reports an opt-out; the provider's stored UIDs are
     /// removed.
     OptedOut,
+    /// The row snapshot read failed, so consent state (such as a withdrawal
+    /// tombstone) is unknown.
+    SnapshotUnavailable,
 }
 
 /// One outcome per provider per navigation.
@@ -108,6 +111,7 @@ impl LookupStatus {
             Self::Skipped(SkipReason::NotDue) => "skipped_not_due",
             Self::Skipped(SkipReason::Input) => "skipped_input",
             Self::Skipped(SkipReason::RateLimited) => "skipped_rate_limited",
+            Self::Skipped(SkipReason::SnapshotUnavailable) => "skipped_snapshot_unavailable",
             Self::Skipped(SkipReason::Destination) => "destination_rejected",
             Self::Skipped(SkipReason::OptedOut) => "skipped_opted_out",
         }

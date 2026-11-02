@@ -753,7 +753,7 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 | ----------------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
 | `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                   |
 | `ec_store`                          | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`             | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
+| `pull_sync_concurrency`             | Integer        | No       | Maximum pull-sync lookups dispatched per navigation (0 = no limit)      |
 | `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                     |
 | `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
 | `partners`                          | Array          | No       | Static partner registry entries                                         |

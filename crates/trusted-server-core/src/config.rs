@@ -363,7 +363,24 @@ fn validate_identity_providers(ec: &Ec) -> Result<(), Report<TrustedServerError>
         report.change_context(TrustedServerError::Configuration {
             message: format!("ec.identity_providers: {detail}"),
         })
-    })
+    })?;
+    // Pull-sync partners run as providers too; a source claimed by both would
+    // fail the coordinator build on every request.
+    for config in ec.identity_providers.iter().filter(|config| config.enabled) {
+        if let Some(source) = config.sources.iter().find(|source| {
+            partners
+                .find_by_source_domain(source)
+                .is_some_and(|partner| partner.pull_sync_enabled && partner.pull_sync_url.is_some())
+        }) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "ec.identity_providers: source `{source}` of provider `{}` is also claimed by a pull-sync partner",
+                    config.id
+                ),
+            }));
+        }
+    }
+    Ok(())
 }
 
 fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
@@ -1396,6 +1413,30 @@ gam_network_id = "99999"
         assert!(
             err.to_string().contains("allowed_domains"),
             "should explain the allowlist rule: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_source_claimed_by_provider_and_pull_sync() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({}));
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "ids",
+                "source_domain": "ids.example.com",
+                "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"],
+                "ts_pull_token": "example-pull-token-32-bytes-minimum",
+            }))
+            .expect("should build partner"),
+        ];
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject a source claimed twice");
+
+        assert!(
+            err.to_string().contains("pull-sync partner"),
+            "should explain the double claim: {err:?}"
         );
     }
 
