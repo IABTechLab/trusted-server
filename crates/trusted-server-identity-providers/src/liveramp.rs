@@ -7,8 +7,9 @@
 //! [`ENVELOPE_TTL`]. No server call is made: the refresh contract is not
 //! confirmed, so the browser keeps refreshing the cookie.
 //!
-//! Lockr AIM can write the same envelope into a cookie whose name comes
-//! from its own configuration; list that name in `cookie_names`.
+//! With the Lockr capability enabled (`[settings.lockr]`), the cookies Lockr
+//! AIM writes the envelope into (default key `_lr_env`) are read after the
+//! own cookies, with the same parser.
 //!
 //! Parsing is lenient: an undecodable cookie, a body without a string
 //! `envelope`, or a blank or opt-out envelope reads as no ID.
@@ -28,7 +29,8 @@ use trusted_server_core::ec::provider::{
 };
 
 use crate::common::{
-    bounded_expiry, cookie_capabilities, cookie_eid, is_usable_id, percent_decoded,
+    CookieReader, LockrSettings, ReadsLockr, bounded_expiry, cookie_capabilities, cookie_eid,
+    is_usable_id, percent_decoded,
 };
 
 /// How long a stored envelope is kept.
@@ -44,6 +46,9 @@ pub struct LiveRampSettings {
     /// Cookies read in order; the first holding an envelope wins.
     #[serde(default = "LiveRampSettings::default_cookie_names")]
     pub cookie_names: Vec<String>,
+    /// The Lockr capability; see [`LockrSettings`].
+    #[serde(default)]
+    pub lockr: LockrSettings,
 }
 
 impl LiveRampSettings {
@@ -57,7 +62,11 @@ impl LiveRampSettings {
 pub struct LiveRampProvider {
     capabilities: ProviderCapabilities,
     source: SourceDomain,
-    cookie_names: Box<[String]>,
+    cookies: CookieReader,
+}
+
+impl ReadsLockr for LiveRamp {
+    const LOCKR_COOKIE_NAMES: &'static [&'static str] = &["_lr_env"];
 }
 
 impl ProviderKind for LiveRamp {
@@ -69,7 +78,9 @@ impl ProviderKind for LiveRamp {
         common: &ProviderCommon<'_>,
         settings: LiveRampSettings,
     ) -> Result<LiveRampProvider, Report<ProviderConfigError>> {
-        if settings.cookie_names.is_empty() {
+        let cookies =
+            CookieReader::with_lockr::<Self>(common, settings.cookie_names, settings.lockr)?;
+        if cookies.is_empty() {
             return Err(Report::new(ProviderConfigError::Invalid)
                 .attach("a liveramp provider needs at least one cookie name"));
         }
@@ -77,7 +88,7 @@ impl ProviderKind for LiveRamp {
         Ok(LiveRampProvider {
             capabilities,
             source,
-            cookie_names: settings.cookie_names.into_boxed_slice(),
+            cookies,
         })
     }
 }
@@ -121,11 +132,7 @@ impl IdentityProvider for LiveRampProvider {
         &self,
         cookies: RequestCookies<'cookie>,
     ) -> Option<Vec<ProviderEid<'cookie>>> {
-        let envelope = self
-            .cookie_names
-            .iter()
-            .filter_map(|name| cookies.get(name))
-            .find_map(envelope)?;
+        let envelope = self.cookies.read(cookies, envelope)?;
         Some(vec![cookie_eid(
             &self.source,
             Cow::Owned(envelope),
@@ -206,6 +213,47 @@ mod tests {
             read.map(|(id, _)| id).as_deref(),
             Some("env-example"),
             "should read it"
+        );
+    }
+
+    #[test]
+    fn ignores_lockr_cookies_while_lockr_is_disabled() {
+        let provider = provider(&json!({
+            "lockr": { "cookie_names": ["example_lockr_env"] },
+        }));
+        let value = encoded(&json!({ "envelope": "env-example" }), &STANDARD);
+
+        let read = read(&*provider, &format!("example_lockr_env={value}"));
+
+        assert!(
+            read.is_none(),
+            "should not read a Lockr cookie when disabled"
+        );
+    }
+
+    #[test]
+    fn reads_a_custom_lockr_cookie_after_the_own_cookie() {
+        let provider = provider(&json!({
+            "lockr": { "enabled": true, "cookie_names": ["example_lockr_env"] },
+        }));
+        let own = encoded(&json!({ "envelope": "env-own" }), &STANDARD);
+        let lockr = encoded(&json!({ "envelope": "env-lockr" }), &STANDARD);
+
+        let both = read(
+            &*provider,
+            &format!("example_lockr_env={lockr}; _lr_env={own}"),
+        );
+        let lockr_only = read(&*provider, &format!("example_lockr_env={lockr}"));
+
+        assert_eq!(
+            both.map(|(id, _)| id).as_deref(),
+            Some("env-own"),
+            "should prefer the own cookie"
+        );
+        assert_eq!(
+            lockr_only.map(|(id, _)| id).as_deref(),
+            Some("env-lockr"),
+            "should fall back to the Lockr cookie"
         );
     }
 

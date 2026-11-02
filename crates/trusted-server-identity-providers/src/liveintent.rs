@@ -4,6 +4,9 @@
 //! and asks for the attributes the operator configured. Each attribute maps
 //! to one configured `OpenRTB` source. The lookup is anonymous: no hashed
 //! email and no first-party `LiveIntent` cookie are sent.
+//!
+//! This kind has no Lockr capability: Lockr AIM is not documented to
+//! deliver `LiveIntent` IDs, so a `lockr` settings table is rejected.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};

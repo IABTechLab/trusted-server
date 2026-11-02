@@ -8,10 +8,12 @@
 //! passed. The refresh token and response key are never read, so they are
 //! never stored, and no refresh is made server side.
 //!
-//! When `__uid_2` yields nothing, Prebid's `__uid2_advertising_token`
-//! cookie (or each name in `cookie_names`) is read as a raw token with the shared default TTL. Lockr AIM can
-//! write the token into a cookie whose name comes from its own
-//! configuration; list that name in `cookie_names`.
+//! When `__uid_2` yields nothing, the cookies in `cookie_names` (default
+//! Prebid's `__uid2_advertising_token`) are read as a raw token with the
+//! shared default TTL. With the Lockr capability enabled
+//! (`[settings.lockr]`), the cookies Lockr AIM writes the raw token into
+//! (default key `__uid2_advertising_token`) are read last, with the same
+//! parser.
 //!
 //! Parsing is lenient: an undecodable cookie, a missing token or expiry,
 //! or a blank or opt-out token reads as no ID.
@@ -28,7 +30,8 @@ use trusted_server_core::ec::provider::{
 };
 
 use crate::common::{
-    bounded_expiry, cookie_capabilities, cookie_eid, is_usable_id, percent_decoded,
+    CookieReader, LockrSettings, ReadsLockr, bounded_expiry, cookie_capabilities, cookie_eid,
+    is_usable_id, percent_decoded,
 };
 
 /// The UID2 provider kind.
@@ -45,6 +48,9 @@ pub struct Uid2Settings {
     /// identity cookie.
     #[serde(default = "Uid2Settings::default_cookie_names")]
     pub cookie_names: Vec<String>,
+    /// The Lockr capability; see [`LockrSettings`].
+    #[serde(default)]
+    pub lockr: LockrSettings,
 }
 
 impl Uid2Settings {
@@ -63,7 +69,11 @@ pub struct Uid2Provider {
     capabilities: ProviderCapabilities,
     source: SourceDomain,
     identity_cookie_name: String,
-    cookie_names: Box<[String]>,
+    cookies: CookieReader,
+}
+
+impl ReadsLockr for Uid2 {
+    const LOCKR_COOKIE_NAMES: &'static [&'static str] = &["__uid2_advertising_token"];
 }
 
 impl ProviderKind for Uid2 {
@@ -80,7 +90,11 @@ impl ProviderKind for Uid2 {
             capabilities,
             source,
             identity_cookie_name: settings.identity_cookie_name,
-            cookie_names: settings.cookie_names.into_boxed_slice(),
+            cookies: CookieReader::with_lockr::<Self>(
+                common,
+                settings.cookie_names,
+                settings.lockr,
+            )?,
         })
     }
 }
@@ -136,12 +150,7 @@ impl IdentityProvider for Uid2Provider {
         let (token, expiry) = cookies
             .get(&self.identity_cookie_name)
             .and_then(identity)
-            .or_else(|| {
-                self.cookie_names
-                    .iter()
-                    .filter_map(|name| cookies.get(name))
-                    .find_map(raw_token)
-            })?;
+            .or_else(|| self.cookies.read(cookies, raw_token))?;
         Some(vec![cookie_eid(&self.source, Cow::Owned(token), expiry)])
     }
 }
@@ -224,6 +233,36 @@ mod tests {
             Some("AgAAAAexampletoken"),
             "should read the configured cookie"
         );
+    }
+
+    #[test]
+    fn reads_the_lockr_cookie_last() {
+        let enabled = provider(&json!({
+            "lockr": { "enabled": true, "cookie_names": ["example_lockr_uid2"] },
+        }));
+        let disabled = provider(&json!({
+            "lockr": { "cookie_names": ["example_lockr_uid2"] },
+        }));
+        let own = identity_cookie(&json!({
+            "advertising_token": "AgAAAAowntoken",
+            "identity_expires": 1_700_000_000_000_u64,
+        }));
+
+        let both = read(&*enabled, &format!("example_lockr_uid2=AgAAAAlockr; {own}"));
+        let lockr_only = read(&*enabled, "example_lockr_uid2=AgAAAAlockr");
+        let ignored = read(&*disabled, "example_lockr_uid2=AgAAAAlockr");
+
+        assert_eq!(
+            both.map(|(token, _)| token).as_deref(),
+            Some("AgAAAAowntoken"),
+            "should prefer the identity cookie"
+        );
+        assert_eq!(
+            lockr_only.map(|(token, _)| token).as_deref(),
+            Some("AgAAAAlockr"),
+            "should read the Lockr cookie as a raw token"
+        );
+        assert!(ignored.is_none(), "should ignore Lockr while disabled");
     }
 
     #[test]
