@@ -192,7 +192,8 @@ mod tests {
             "should not match another domain"
         );
         assert!(
-            !source.matches("https://id5-sync.com"),
+            // The domain parser must reject URL syntax.
+            !source.matches("https://id5-sync.com"), // allow-domain: id5-sync.com
             "should not match a URL"
         );
     }

@@ -729,7 +729,8 @@ mod tests {
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()
             .method("GET")
-            .uri("https://edge.test-publisher.com/identify")
+            // Keep the host aligned with the shared settings fixture.
+            .uri("https://edge.test-publisher.com/identify") // allow-domain: edge.test-publisher.com
             .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
             .body(EdgeBody::empty())
             .expect("should build test request");
@@ -798,7 +799,8 @@ mod tests {
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut builder = Request::builder()
             .method("GET")
-            .uri("https://edge.test-publisher.com/identify")
+            // Keep the host aligned with the shared settings fixture.
+            .uri("https://edge.test-publisher.com/identify") // allow-domain: edge.test-publisher.com
             .header("authorization", format!("Bearer {VALID_API_TOKEN}"));
         for (name, value) in headers {
             builder = builder.header(*name, *value);
@@ -827,7 +829,8 @@ mod tests {
 
     #[test]
     fn identify_returns_a_provider_written_id_only_with_browser_context() {
-        const ORIGIN: (&str, &str) = ("origin", "https://www.test-publisher.com");
+        // Keep the host aligned with the shared settings fixture.
+        const ORIGIN: (&str, &str) = ("origin", "https://www.test-publisher.com"); // allow-domain: www.test-publisher.com
 
         assert_eq!(
             identify_uid_with_headers(Some("prov"), &[ORIGIN, ("sec-fetch-site", "same-site")])

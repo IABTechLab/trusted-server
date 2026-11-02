@@ -969,7 +969,8 @@ mod tests {
         assert_eq!(requests.len(), 1, "should send exactly one request");
         assert_eq!(
             requests[0].uri,
-            "https://api.us-east.aws.tinybird.co/v0/events?name=access_logs_v2"
+            // Assert the default Tinybird endpoint without sending a real request.
+            "https://api.us-east.aws.tinybird.co/v0/events?name=access_logs_v2" // allow-domain: api.us-east.aws.tinybird.co
         );
         assert_eq!(requests[0].method, Method::POST.to_string());
         assert_eq!(

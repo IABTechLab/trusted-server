@@ -3510,7 +3510,8 @@ mod tests {
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
+            # Keep the host aligned with the shared settings fixture.
+            origin_url = "https://origin.test-publisher.com" # allow-domain: origin.test-publisher.com
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]

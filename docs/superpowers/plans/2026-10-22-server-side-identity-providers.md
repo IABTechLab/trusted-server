@@ -729,7 +729,8 @@ mod tests {
         assert_eq!(source.as_str(), "id5-sync.com", "should lower-case and drop the trailing dot");
         assert!(source.matches("id5-sync.COM"), "should match another spelling");
         assert!(!source.matches("example.com"), "should not match another domain");
-        assert!(!source.matches("https://id5-sync.com"), "should not match a URL");
+        // The domain parser must reject URL syntax.
+        assert!(!source.matches("https://id5-sync.com"), "should not match a URL"); // allow-domain: id5-sync.com
     }
 
     #[test]

@@ -1637,7 +1637,8 @@ mod tests {
     fn navigation(cookie: Option<&str>) -> HttpRequest {
         let mut builder = edgezero_core::http::request_builder()
             .method(edgezero_core::http::Method::GET)
-            .uri("https://test-publisher.com/some-page")
+            // Keep the host aligned with the shared settings fixture.
+            .uri("https://test-publisher.com/some-page") // allow-domain: test-publisher.com
             .header("sec-fetch-dest", "document");
         if let Some(cookie) = cookie {
             builder = builder.header("cookie", cookie);
@@ -2117,7 +2118,8 @@ mod tests {
         // A named route is never the writer, so phase 4 has nothing to do.
         let request = edgezero_core::http::request_builder()
             .method(edgezero_core::http::Method::GET)
-            .uri("https://test-publisher.com/.well-known/trusted-server.json")
+            // Keep the host aligned with the shared settings fixture.
+            .uri("https://test-publisher.com/.well-known/trusted-server.json") // allow-domain: test-publisher.com
             .body(EdgeBody::empty())
             .expect("should build request");
         let mut response =
@@ -2714,7 +2716,8 @@ mod tests {
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
+            # Keep the host aligned with the shared settings fixture.
+            origin_url = "https://origin.test-publisher.com" # allow-domain: origin.test-publisher.com
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
@@ -2768,7 +2771,8 @@ mod tests {
         let eids_cookie = base64::engine::general_purpose::STANDARD.encode(eids.to_string());
         let request = edgezero_core::http::request_builder()
             .method(fastly::http::Method::GET)
-            .uri("https://test-publisher.com/article")
+            // Keep the host aligned with the shared settings fixture.
+            .uri("https://test-publisher.com/article") // allow-domain: test-publisher.com
             .header("cookie", format!("ts-ec={ec_id}; ts-eids={eids_cookie}"))
             .body(EdgeBody::empty())
             .expect("should build EC finalize test request");
@@ -4079,7 +4083,8 @@ mod tests {
                     status,
                     &[
                         ("content-type", "text/html"),
-                        ("location", "https://origin.test-publisher.com/next"),
+                        // Keep the host aligned with the shared settings fixture.
+                        ("location", "https://origin.test-publisher.com/next"), // allow-domain: origin.test-publisher.com
                     ],
                     "<html><head></head><body>answer</body></html>",
                 );
@@ -4240,7 +4245,8 @@ mod tests {
 
         fn didomi_navigation(cookie: Option<&str>) -> HttpRequest {
             let mut request = navigation(cookie);
-            *request.uri_mut() = "https://test-publisher.com/integrations/didomi/consent/loader.js"
+            // Keep the host aligned with the shared settings fixture.
+            *request.uri_mut() = "https://test-publisher.com/integrations/didomi/consent/loader.js" // allow-domain: test-publisher.com
                 .parse()
                 .expect("should parse the proxy URI");
             request
@@ -4380,7 +4386,8 @@ mod tests {
         fn auction_request(cookie: Option<&str>, body: &serde_json::Value) -> HttpRequest {
             let mut builder = edgezero_core::http::request_builder()
                 .method(edgezero_core::http::Method::POST)
-                .uri("https://test-publisher.com/auction")
+                // Keep the host aligned with the shared settings fixture.
+                .uri("https://test-publisher.com/auction") // allow-domain: test-publisher.com
                 .header("content-type", "application/json");
             if let Some(cookie) = cookie {
                 builder = builder.header("cookie", cookie);
@@ -4398,7 +4405,8 @@ mod tests {
         fn page_bids_request(cookie: &str) -> HttpRequest {
             let mut request = edgezero_core::http::request_builder()
                 .method(edgezero_core::http::Method::GET)
-                .uri("https://test-publisher.com/_ts/page-bids?path=%2F")
+                // Keep the host aligned with the shared settings fixture.
+                .uri("https://test-publisher.com/_ts/page-bids?path=%2F") // allow-domain: test-publisher.com
                 .header("x-tsjs-page-bids", "1")
                 .header("cookie", cookie)
                 .body(EdgeBody::empty())
@@ -4411,13 +4419,15 @@ mod tests {
         fn identify_request(cookie: &str, source: &str) -> HttpRequest {
             let mut request = edgezero_core::http::request_builder()
                 .method(edgezero_core::http::Method::GET)
-                .uri("https://test-publisher.com/_ts/api/v1/identify")
+                // Keep the host aligned with the shared settings fixture.
+                .uri("https://test-publisher.com/_ts/api/v1/identify") // allow-domain: test-publisher.com
                 .header(
                     "authorization",
                     format!("Bearer token-for-{source}-0123456789abcdef"),
                 )
                 .header("cookie", cookie)
-                .header("origin", "https://www.test-publisher.com")
+                // Keep the host aligned with the shared settings fixture.
+                .header("origin", "https://www.test-publisher.com") // allow-domain: www.test-publisher.com
                 .header("sec-fetch-site", "same-site")
                 .body(EdgeBody::empty())
                 .expect("should build request");
@@ -4428,7 +4438,8 @@ mod tests {
         fn asset_request(cookie: &str) -> HttpRequest {
             let mut request = edgezero_core::http::request_builder()
                 .method(edgezero_core::http::Method::GET)
-                .uri("https://test-publisher.com/assets/app.js")
+                // Keep the host aligned with the shared settings fixture.
+                .uri("https://test-publisher.com/assets/app.js") // allow-domain: test-publisher.com
                 .header("sec-fetch-dest", "script")
                 .header("cookie", cookie)
                 .body(EdgeBody::empty())
@@ -6375,7 +6386,8 @@ mod tests {
         fn new_visitor_hold_answer_is_created_with_the_row_in_one_write() {
             let scenario = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
             let mut request = navigation(None);
-            *request.uri_mut() = "https://test-publisher.com/"
+            // Keep the host aligned with the shared settings fixture.
+            *request.uri_mut() = "https://test-publisher.com/" // allow-domain: test-publisher.com
                 .parse()
                 .expect("should parse the home page URI");
 
@@ -6907,7 +6919,8 @@ mod tests {
                     "<html><head></head><body>page</body></html>",
                 );
                 let mut request = navigation(Some(&ec_cookie()));
-                *request.uri_mut() = "https://test-publisher.com/"
+                // Keep the host aligned with the shared settings fixture.
+                *request.uri_mut() = "https://test-publisher.com/" // allow-domain: test-publisher.com
                     .parse()
                     .expect("should parse the home page URI");
                 scenario.drive(request)

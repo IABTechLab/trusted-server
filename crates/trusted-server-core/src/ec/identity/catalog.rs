@@ -401,7 +401,8 @@ mod tests {
     }
 
     fn owned_partner(source: &str, owner: Option<&str>) -> EcPartner {
-        let mut partner = ec_partner(source, &format!("https://sync.{source}/pull"), TOKEN);
+        // The interpolated suffix is a reserved fixture domain.
+        let mut partner = ec_partner(source, &format!("https://sync.{source}/pull"), TOKEN); // allow-domain: sync
         partner.pull_sync_enabled = false;
         partner.owner = owner.map(ToOwned::to_owned);
         partner
@@ -528,7 +529,8 @@ mod tests {
             (0..count)
                 .map(|n| {
                     let source = format!("ssp{n}.example.com");
-                    ec_partner(&source, &format!("https://sync.{source}/pull"), TOKEN)
+                    // The interpolated suffix is a reserved fixture domain.
+                    ec_partner(&source, &format!("https://sync.{source}/pull"), TOKEN) // allow-domain: sync
                 })
                 .collect()
         };

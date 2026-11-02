@@ -2538,7 +2538,8 @@ mod tests {
         for is_real_browser in [false, true] {
             let req = Request::builder()
                 .method(Method::GET)
-                .uri("https://test-publisher.com/integrations/test/ec")
+                // Keep the host aligned with the shared settings fixture.
+                .uri("https://test-publisher.com/integrations/test/ec") // allow-domain: test-publisher.com
                 .header("sec-fetch-dest", "document")
                 .body(EdgeBody::empty())
                 .expect("should build request");
@@ -2625,7 +2626,8 @@ mod tests {
         );
         let req = Request::builder()
             .method(Method::GET)
-            .uri("https://test-publisher.com/integrations/test/ec")
+            // Keep the host aligned with the shared settings fixture.
+            .uri("https://test-publisher.com/integrations/test/ec") // allow-domain: test-publisher.com
             .header("sec-fetch-dest", "document")
             .body(EdgeBody::empty())
             .expect("should build request");

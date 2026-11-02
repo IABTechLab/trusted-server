@@ -9937,7 +9937,8 @@ mod tests {
             ))),
             batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: true,
-            pull_sync_url: Some(format!("https://sync.{source_domain}/pull")),
+            // The interpolated suffix is a reserved fixture domain.
+            pull_sync_url: Some(format!("https://sync.{source_domain}/pull")), // allow-domain: sync
             pull_sync_allowed_domains: vec![format!("sync.{source_domain}")],
             removed_pull_sync_ttl_sec: None,
             removed_pull_sync_rate_limit: None,
@@ -14039,7 +14040,8 @@ mod tests {
                         );
                         assert_eq!(
                             stub.recorded_request_uris(),
-                            vec!["https://origin.test-publisher.com/article"],
+                            // Keep the host aligned with the shared settings fixture.
+                            vec!["https://origin.test-publisher.com/article"], // allow-domain: origin.test-publisher.com
                             "should defer the mediator request until the lazy body is polled"
                         );
                     }
@@ -14078,11 +14080,13 @@ mod tests {
                     );
                     let expected = if launched {
                         vec![
-                            "https://origin.test-publisher.com/article",
+                            // Keep the host aligned with the shared settings fixture.
+                            "https://origin.test-publisher.com/article", // allow-domain: origin.test-publisher.com
                             "https://mediator.example.com/auction",
                         ]
                     } else {
-                        vec!["https://origin.test-publisher.com/article"]
+                        // Keep the host aligned with the shared settings fixture.
+                        vec!["https://origin.test-publisher.com/article"] // allow-domain: origin.test-publisher.com
                     };
                     assert_eq!(stub.recorded_request_uris(), expected, "{mediator:?}");
                 }
