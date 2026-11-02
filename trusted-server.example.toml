@@ -257,6 +257,17 @@ pull_sync_concurrency = 3
 # sources = ["sharedid.example.com"]
 # [ec.identity_providers.settings]
 # cookie_names = ["_sharedid", "_pubcid"]
+#
+# Criteo (kind "criteo"): no lookup and no endpoint. Reads Criteo's bid ID
+# from the first-party `cto_bidid` cookie Prebid's Criteo module keeps and
+# stores it verbatim as a device-based (atype 1) ID. Takes exactly one source.
+# [[ec.identity_providers]]
+# id = "criteo"
+# kind = "criteo"
+# enabled = false
+# sources = ["criteo.example.com"]
+# [ec.identity_providers.settings]
+# cookie_names = ["cto_bidid"]
 
 
 # =============================================================================
