@@ -24,6 +24,10 @@
 
 `liveramp` declares the Lockr capability (see `2026-11-02-identity-provider-lockr-capability.md`). With `[settings.lockr] enabled = true`, the Lockr cookies (default `["_lr_env"]`) are read after `cookie_names` with the same envelope parser. `cookie_names` may be empty only when Lockr is enabled.
 
+## Not ported from the reference provider
+
+- The reference refreshes a stored envelope server side (placement ID, approved countries, 15 or 30 days by region). It needs the visitor's region, which `LookupInput` does not carry, and its request and response shape are unconfirmed with LiveRamp, so this provider keeps reading the `_lr_env` cookie only.
+
 ## Tasks
 
 - [ ] Add `cookie_capabilities`, `cookie_eid`, `is_usable_id` and `percent_decoded` to `common.rs`.
