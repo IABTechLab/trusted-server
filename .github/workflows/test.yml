@@ -45,13 +45,23 @@ jobs:
         if: steps.cache-viceroy.outputs.cache-hit != 'true'
         run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.viceroy-version }}" --locked --force
 
-      - name: Use Node.js for the served-seam contract
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the served-seam contract
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
       - name: Run tests
         run: cargo test-fastly
+
+      - name: Run Fastly absolute deadline slow-network tests
+        run: node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"
+
+      - name: Run trace emitted-script regressions
+        run: |
+          cargo test -p trusted-server-core --target x86_64-unknown-linux-gnu --lib trace_document_skipped_emitted_script_leaves_ad_state_untouched -- --ignored
+          cargo test -p trusted-server-core --target x86_64-unknown-linux-gnu --lib trace_document_emitted_script_deep_freezes_owned_context_in_node -- --ignored
 
       - name: Run tests (reusable-sandbox feature)
         run: cargo test-fastly-reuse
@@ -129,17 +139,28 @@ jobs:
           components: clippy
           cache-key: cargo-axum
 
-      - name: Read pinned Node.js version for CLI fixtures
+      - name: Read pinned Node.js version
         id: node-version
         shell: bash
         run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-node@v4
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the CLI fixtures
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.version }}
 
       - name: Build Axum adapter
         run: cargo build -p trusted-server-adapter-axum
+
+      - name: Verify prebuilt trace source digest parity
+        shell: bash
+        run: |
+          bundle_dir="$(mktemp -d)"
+          trap 'rm -rf "$bundle_dir"' EXIT
+          node crates/trusted-server-js/lib/build-all.mjs --out-dir "$bundle_dir"
+          TSJS_PREBUILT_DIR="$bundle_dir" cargo check-axum --locked
 
       - name: Run Axum adapter tests
         run: cargo test-axum
@@ -197,6 +218,15 @@ jobs:
           components: clippy
           cache-key: cargo-cloudflare
 
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
       - name: Check Cloudflare adapter (native host)
         run: cargo check -p trusted-server-adapter-cloudflare
 
@@ -221,6 +251,15 @@ jobs:
           target: wasm32-wasip1
           components: clippy
           cache-key: cargo-spin
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Check Spin adapter (native host)
         run: cargo check -p trusted-server-adapter-spin
@@ -258,6 +297,15 @@ jobs:
           components: clippy, rustfmt
           cache-key: cargo-parity
 
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
       - name: Format check (parity test crate)
         run: cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check
 
@@ -283,12 +331,15 @@ jobs:
           components: "clippy, rustfmt"
           cache-key: cargo-cli
 
-      - name: Read pinned Node.js version for CLI fixtures
+      - name: Read pinned Node.js version
         id: node-version
         shell: bash
         run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-node@v4
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the CLI fixtures
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.version }}
 

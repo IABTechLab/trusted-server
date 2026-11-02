@@ -3,6 +3,7 @@ use std::fmt;
 
 use edgezero_core::http::{Method, Request as EdgeRequest, Response as EdgeResponse};
 use error_stack::Report;
+use web_time::Instant;
 
 use super::PlatformError;
 use super::image_optimizer::PlatformImageOptimizerOptions;
@@ -348,7 +349,17 @@ pub trait PlatformHttpClient: Send + Sync {
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>>;
 
-    /// Start an upstream request without waiting for it to complete.
+    /// Starts an upstream request without waiting for its response.
+    ///
+    /// Adapters retain ownership of the request operation so it can progress
+    /// while the publisher origin is fetched. Dropping its pending handle
+    /// cancels or abandons unfinished work according to the runtime contract.
+    ///
+    /// On Cloudflare and Spin the request runs as a task on the runtime
+    /// executor, so [`Self::wait`] and [`Self::select_until`] must be awaited
+    /// on that executor. Driving them through a blocking executor such as
+    /// `futures::executor::block_on` blocks the only thread the task can run
+    /// on and hangs.
     ///
     /// # Errors
     ///
@@ -359,27 +370,13 @@ pub trait PlatformHttpClient: Send + Sync {
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>>;
 
-    /// Whether [`send_async`](Self::send_async) defers execution so multiple
-    /// pending requests progress concurrently and [`select`](Self::select)
-    /// races them.
+    /// Whether multiple pending requests can progress concurrently.
     ///
-    /// Platforms where `send_async` executes each request eagerly before
-    /// returning (e.g. Cloudflare Workers) return `false`. On such platforms
-    /// multi-request fan-out runs sequentially and accrues the sum of the
-    /// individual latencies, so callers with a latency budget (the auction
-    /// orchestrator) must check this before launching more than one request.
+    /// Fastly and Axum provide concurrent fan-out. Cloudflare and Spin retain
+    /// a single-provider contract and return `false`; the auction orchestrator
+    /// checks this capability before launching more than one request.
     fn supports_concurrent_fanout(&self) -> bool {
         true
-    }
-
-    /// Whether the adapter enforces a hard total deadline for each request.
-    ///
-    /// First-byte and between-byte timers do not qualify: connection setup or a
-    /// byte-trickling response can still overrun the logical auction budget. The
-    /// auction collector uses this explicit capability to decide whether an
-    /// already-completed late response remains eligible.
-    fn has_enforceable_total_request_deadline(&self) -> bool {
-        false
     }
 
     /// Whether [`send`](Self::send) can preserve upstream response bodies as
@@ -415,6 +412,80 @@ pub trait PlatformHttpClient: Send + Sync {
         pending_requests: Vec<PlatformPendingRequest>,
     ) -> Result<PlatformSelectResult, Report<PlatformError>>;
 
+    /// Collects an available response, waiting only until an absolute deadline.
+    ///
+    /// On expiry, implementations take one nonblocking snapshot of complete
+    /// available responses before relinquishing unfinished requests. This
+    /// preserves buffered bids when a publisher origin delays collection.
+    /// Subsequent calls may drain only the completed snapshot. The deadline
+    /// bounds network waiting, not eligibility by an upstream arrival timestamp.
+    /// Returns `Ok(None)` when no complete response remains. Both header waits
+    /// and body reads must be bounded; unfinished work is canceled or abandoned.
+    /// Fastly cannot cancel backend requests with the installed SDK.
+    /// Stream-marked requests require the separate streaming wait contract.
+    ///
+    /// # Performance
+    ///
+    /// Complete response bodies are buffered within adapter-specific limits.
+    /// Deadline expiry drops incomplete bodies and pending handles after the
+    /// nonblocking snapshot; complete buffered responses remain collectible.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use trusted_server_core::platform::{PlatformHttpClient, PlatformPendingRequest, PlatformSelectResult, PlatformError};
+    /// # use error_stack::Report;
+    /// # async fn collect(client: &dyn PlatformHttpClient, pending: Vec<PlatformPendingRequest>) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+    /// let deadline = web_time::Instant::now() + std::time::Duration::from_millis(100);
+    /// client.select_until(pending, deadline).await
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::Unsupported`] unless the adapter implements
+    /// bounded collection, or an HTTP error when polling itself fails.
+    async fn select_until(
+        &self,
+        pending_requests: Vec<PlatformPendingRequest>,
+        _deadline: Instant,
+    ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+        drop(pending_requests);
+        Err(Report::new(PlatformError::Unsupported)
+            .attach("absolute-deadline HTTP collection is unavailable"))
+    }
+
+    /// Waits for a complete buffered response before an absolute deadline.
+    ///
+    /// Uses [`Self::select_until`] so expiry also relinquishes the pending
+    /// request and never falls back to an unbounded wait.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use trusted_server_core::platform::{PlatformHttpClient, PlatformPendingRequest, PlatformResponse, PlatformError};
+    /// # use error_stack::Report;
+    /// # async fn collect(client: &dyn PlatformHttpClient, pending: PlatformPendingRequest) -> Result<PlatformResponse, Report<PlatformError>> {
+    /// let deadline = web_time::Instant::now() + std::time::Duration::from_millis(100);
+    /// client.wait_until(pending, deadline).await
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::DeadlineExceeded`] on expiry, an adapter polling
+    /// error, or the attributed upstream error in the selected result.
+    async fn wait_until(
+        &self,
+        pending: PlatformPendingRequest,
+        deadline: Instant,
+    ) -> Result<PlatformResponse, Report<PlatformError>> {
+        self.select_until(vec![pending], deadline)
+            .await?
+            .ok_or_else(|| Report::new(PlatformError::DeadlineExceeded))?
+            .ready
+    }
+
     /// Wait for a single in-flight request to complete.
     ///
     /// This is a convenience wrapper around [`select`](Self::select) for the
@@ -434,10 +505,68 @@ pub trait PlatformHttpClient: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
 
     use super::*;
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn bounded_collection_default_relinquishes_expired_handles() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let response = futures::executor::block_on(UnavailableHttpClient.select_until(
+            vec![PlatformPendingRequest::new(DropProbe(Arc::clone(&dropped)))],
+            Instant::now(),
+        ))
+        .expect_err("should reject unsupported collection even after expiry");
+        assert!(matches!(
+            response.current_context(),
+            PlatformError::Unsupported
+        ));
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "should drop abandoned state"
+        );
+    }
+
+    #[test]
+    fn bounded_collection_default_fails_closed_instead_of_unbounded_polling() {
+        let error = futures::executor::block_on(UnavailableHttpClient.select_until(
+            vec![PlatformPendingRequest::new(())],
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .expect_err("should reject unsupported bounded collection");
+        assert!(
+            matches!(error.current_context(), PlatformError::Unsupported),
+            "should not delegate to unbounded select"
+        );
+    }
+
+    #[test]
+    fn unsupported_bounded_wait_reports_unsupported() {
+        let error = futures::executor::block_on(
+            UnavailableHttpClient.wait_until(PlatformPendingRequest::new(()), Instant::now()),
+        )
+        .expect_err("should reject an unsupported wait");
+        assert!(
+            matches!(error.current_context(), PlatformError::Unsupported),
+            "should preserve the unsupported collection contract"
+        );
+    }
 
     #[test]
     fn platform_http_request_cache_bypass_defaults_to_false() {
