@@ -9,10 +9,26 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
+      - name: Read pinned Node version
+        id: tools
+        run: echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
       - run: node --test scripts/release/phase1.test.mjs
+      # Refuse a tag the publisher would reject before building and signing.
+      - name: Refuse non-SemVer release tags
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node --input-type=module -e "
+          import { isReleaseTag } from './scripts/release/publish.mjs'
+          if (!isReleaseTag(process.env.RELEASE_TAG)) throw Error('Release tags must be vMAJOR.MINOR.PATCH[-PRERELEASE]')
+          "
   build:
     needs: checks
     name: Build ${{ matrix.asset }}
@@ -53,7 +69,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             asset: trusted-server-axum-aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: Read pinned toolchains
@@ -63,7 +79,7 @@ jobs:
           set -euo pipefail
           echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
           echo "rust=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ steps.tools.outputs.node }}
       - name: Install the pinned Rust toolchain without build caches
@@ -87,7 +103,7 @@ jobs:
             TMPDIR="${TMPDIR:-/tmp}" RUNNER_TEMP="$RUNNER_TEMP" \
             SOURCE_COMMIT="$SOURCE_COMMIT" RELEASE_VERSION="$RELEASE_VERSION" \
             bash scripts/release/phase1-build.sh "$BUILD_PACKAGE" "$BUILD_TARGET" "$RELEASE_ASSET"
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@v6
         with:
           name: release-${{ matrix.asset }}
           path: release-assets/*
@@ -118,7 +134,7 @@ jobs:
           ]
     steps:
       # Only fixed inline checks execute here; never checkout or execute build inputs.
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+      - uses: actions/download-artifact@v7
         with:
           name: release-${{ matrix.asset }}
           path: release-assets
@@ -129,18 +145,18 @@ jobs:
           set -euo pipefail
           cd release-assets
           test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 2
-          for file in "$ASSET" "$ASSET.spdx.json"; do test -f "$file" && test ! -L "$file" && test -s "$file"; done
+          for file in "$ASSET" "$ASSET.spdx.json"; do test -f "$file" && test ! -L "$file" && test -s "$file" || exit 1; done
           sha256sum "$ASSET" "$ASSET.spdx.json" > ../inputs.sha256
       - name: Attest SLSA build provenance
         id: provenance
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        uses: actions/attest@v4
         with:
           subject-path: |
             release-assets/${{ matrix.asset }}
             release-assets/${{ matrix.asset }}.spdx.json
       - name: Attest the binary's SPDX SBOM
         id: sbom
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        uses: actions/attest@v4
         with:
           subject-path: release-assets/${{ matrix.asset }}
           sbom-path: release-assets/${{ matrix.asset }}.spdx.json
@@ -152,13 +168,14 @@ jobs:
         run: |
           set -euo pipefail
           (cd release-assets && sha256sum --check ../inputs.sha256)
-          test -s "$PROVENANCE" && test -s "$SBOM"
+          test -s "$PROVENANCE"
+          test -s "$SBOM"
           mkdir signed-assets
           cp "$PROVENANCE" "signed-assets/$ASSET.provenance.sigstore.json"
           cp "$SBOM" "signed-assets/$ASSET.sbom.sigstore.json"
           cp inputs.sha256 signed-assets/SHA256SUMS
           (cd signed-assets && sha256sum "$ASSET.provenance.sigstore.json" "$ASSET.sbom.sigstore.json" >> SHA256SUMS)
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@v6
         with:
           name: signed-${{ matrix.asset }}
           path: signed-assets/*

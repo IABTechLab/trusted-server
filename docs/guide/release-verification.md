@@ -11,6 +11,9 @@ The tag caller is `.github/workflows/release.yml`. Its local reusable
 revision. The reusable workflow is the certificate signer and provenance builder;
 the caller remains the publication owner. Build jobs have no signing authority,
 and signing jobs do not check out, compile or execute the downloaded binaries.
+The caller's publication job checks out only `scripts/release/publish.mjs`, its
+release-notes template and `.tool-versions` from the tagged commit, and runs
+them with the pinned Node and a checksum-verified GitHub CLI 2.102.0.
 
 ## Platforms and coverage
 
@@ -33,16 +36,16 @@ The musl asset needs no dynamic loader or libraries; Alpine and a scratch-like
 container are required smoke images, while distroless-static is another deployment option
 without a separate Phase 1 runtime test. All acquired smoke images are digest-pinned; build logs record their image IDs. These required startup checks do not establish complete platform/tool qualification.
 Axum defaults to `127.0.0.1:8787`. Set runtime `EDGEZERO__ADAPTER__HOST=0.0.0.0`
-and `EDGEZERO__ADAPTER__PORT=8080` for containers and publish that port. `PORT`
+and `EDGEZERO__ADAPTER__PORT=8080` for evaluation containers and publish that port. `PORT`
 is a legacy alias. Ports must be 1–65535; zero is rejected. When both are set, they must agree; both values are
 validated and any invalid explicit value fails startup. This runtime setting is never compiled into the executable.
 The smoke reaches a bridge-networked container through a host-published port;
 loopback-only binding cannot pass it. TLS termination, graceful shutdown and
-request/resource limits remain follow-up production hardening.
+request/resource limits are not provided.
 
 Axum's TLS client requires a runtime CA certificate bundle, including for health
 request initialization. Every Axum smoke mounts the runner's system CA
-bundle read-only at `/ca.pem` with `SSL_CERT_FILE=/ca.pem`; production operators
+bundle read-only at `/ca.pem` with `SSL_CERT_FILE=/ca.pem`; operators
 must supply their own runtime trust store. This is runtime data, not an embedded
 configuration or dynamically linked library.
 Native libraries and provider tools needed by individual `ts` commands retain their existing prerequisites. Cloudflare, Spin, Windows and Linux ARM64 CLI releases follow separately.
@@ -65,13 +68,16 @@ vulnerability scan.
 
 ## Download and verify
 
-Use an independently trusted GitHub CLI installation with `gh attestation verify`,
-`gh release verify`, and `gh release verify-asset`. Use the GitHub CLI version
-recorded in the release job log. The SBOM comparison below also uses `jq`.
+Use an independently trusted GitHub CLI 2.102.0 or later with `gh attestation verify`,
+`gh release verify`, and `gh release verify-asset`, authenticated with
+`gh auth login` or `GH_TOKEN`. The SBOM comparison below also uses `jq`, and the
+checksum steps use `shasum` (use `sha256sum --check` where `shasum` is absent).
 Verification needs GitHub network access. Obtain the approved tag
 and its 40-character source commit through an independent source-review process.
-Phase 1 requires a lightweight tag pointing directly to that source commit.
-The retained strict SemVer validation remains deferred; use a separately approved tag. A checksum or commit supplied only with
+Phase 1 requires a strict SemVer `v` tag (such as `v1.2.3` or `v1.2.3-rc.1`;
+build metadata such as `+build.1` is refused) that is lightweight and points directly to that source commit. The release notes
+repeat the commands below but stay editable after publication, so never take
+`REPO`, `TAG` or `COMMIT` from them. A checksum or commit supplied only with
 an untrusted download is not source approval.
 
 Run this in a new private directory, using Bash. Replace the fictional tag and
@@ -82,9 +88,11 @@ individually approved, never-reused rehearsal tag.
 
 ```bash
 set -euo pipefail
+# Take REPO, TAG and COMMIT from your independent source review.
 REPO=IABTechLab/trusted-server
 TAG=v1.2.3
 COMMIT=0123456789abcdef0123456789abcdef01234567
+[[ -n "$REPO" && -n "$TAG" && "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
 ASSETS=(trusted-server-axum-x86_64-unknown-linux-gnu trusted-server-axum-x86_64-unknown-linux-musl trusted-server-axum-aarch64-unknown-linux-gnu trusted-server-fastly.wasm ts-aarch64-apple-darwin ts-x86_64-apple-darwin ts-x86_64-unknown-linux-gnu)
 gh release download "$TAG" --repo "$REPO" --dir .
 test "$(gh api "repos/$REPO/releases/tags/$TAG" --jq .immutable)" = true
@@ -105,7 +113,7 @@ shasum -a 256 --check SHA256SUMS
 
 <!-- release-verification:end -->
 
-Provenance covers the binary and its SPDX document; the SBOM attestation covers the binary. The verified SBOM predicate must equal the shipped SPDX document. `--signer-workflow` matches a prefix; the separate `--cert-identity` check pins the exact reusable workflow at the tag. GitHub CLI makes those two identity options mutually exclusive.
+Provenance covers the binary and its SPDX document; the SBOM attestation covers the binary. The verified SBOM predicate must equal the shipped SPDX document. `--signer-workflow` matches that workflow path at any ref; the separate `--cert-identity` check pins the exact reusable workflow at the tag. GitHub CLI makes those two identity options mutually exclusive.
 
 The checksums cover the other 28 assets, never `SHA256SUMS` itself. Immutable release verification establishes membership; provenance establishes the reviewed signer and source. Both are required.
 
@@ -136,8 +144,9 @@ shasum -a 256 trusted_root.jsonl
 ```
 
 Transfer the binaries, their bundles, published SPDX documents, approved source
-pins and trusted roots to the offline machine. Reuse `REPO`, `TAG`, `COMMIT`,
-`ASSETS`, `WORKFLOW` and `IDENTITY` from above. Supplying both the bundle and
+pins and trusted roots to the offline machine. Shell variables do not transfer:
+set `REPO`, `TAG`, `COMMIT`, `ASSETS`, `WORKFLOW` and `IDENTITY` again on the
+offline machine, from the same independently reviewed values. Supplying both the bundle and
 custom roots avoids network acquisition; there is no `--offline` flag.
 
 Before disconnecting, obtain an independent trusted SHA-256 pin for each binary
@@ -146,6 +155,8 @@ Do not treat SHA256SUMS delivered with the same untrusted download as that pin.
 Transfer that approved pin file as `APPROVED_BINARY_SHA256SUMS`.
 
 ```bash
+set -euo pipefail
+test "${#ASSETS[@]}" -eq 7
 shasum -a 256 --check APPROVED_BINARY_SHA256SUMS
 for asset in "${ASSETS[@]}"; do
   for kind in provenance sbom; do
@@ -180,14 +191,19 @@ download the `ts-<target>` release asset matching their platform, verify it with
 the `gh attestation verify` and `gh release verify-asset` commands above, then
 copy that verified file into a directory on their `PATH` as `ts` and make it
 executable. Verify before first execution. Individual commands may still require
-a source checkout and provider tools; see [CLI](/guide/cli).
+a source checkout and provider tools; see [CLI](./cli.md).
 
-## Run a verified Axum release
+## Run a verified Axum build
+
+Axum remains a development and evaluation adapter, not a production deployment
+target (see [Axum dev server](./axum-dev.md)). The release attests its binaries
+so an evaluation runs the reviewed bytes; it does not change that support
+policy.
 
 Select one of the three `trusted-server-axum-<target>` assets above, download it
 and complete the same online/offline attestation and immutable membership checks
-before execution. The aarch64 GNU variant is for ARM servers. Copy the verified
-file into your deployment directory, make it executable, and retain its digest.
+before execution. The aarch64 GNU variant is for ARM hosts. Copy the verified
+file into a private working directory, make it executable, and retain its digest.
 
 Application configuration and secrets stay external. With a reviewed checkout's
 `edgezero.toml` and adapter manifests available, use the verified `ts` CLI to
@@ -219,9 +235,9 @@ EDGEZERO__ADAPTER__PORT=8080 ./trusted-server-axum-x86_64-unknown-linux-gnu
 With `EDGEZERO__ADAPTER__HOST` unset, either port setting retains loopback
 (`127.0.0.1`). Setting `EDGEZERO__ADAPTER__HOST` to a non-loopback address
 (such as `0.0.0.0`) is an explicit operator choice that exposes the listener
-on that interface. Use your reviewed reverse proxy and
-TLS configuration for public traffic. Axum has no help/version or dry-run mode.
-Its build smoke starts an isolated server with a fictional external config
+on that interface. The Axum binary does not parse command-line arguments:
+`--help` or `--version` starts a listener instead of printing anything, and
+there is no dry-run mode. Its build smoke starts an isolated server with a fictional external config
 envelope and requires `/health` to return `200` and `ok`, distinguishing a
 configured router from the configuration-error router. This is a startup check,
 not production proxy/load qualification.
@@ -296,28 +312,30 @@ logical config-store ID and participates in the template build digest. Build
 facts include the source commit. The CLI carries the fictional example-config
 scaffold, not an operator config.
 
-Release Fastly responses report `x-ts-version` as the full 40-character source
-commit supplied by the release build. Development display fallbacks are not the
-release identity. `ts --version` labels `package=<version> source=<commit> target=<triple> variant=default`. Release mode requires the full 40-character lowercase source commit; the package version is not the release tag. Attestation pins authenticate these inputs externally.
-The executable's SHA-256 is checked externally against the retained release
-bytes; exposing that digest as a runtime build fact belongs to #161.
+Release Fastly and Axum responses report `x-ts-version` as the full 40-character
+source commit supplied by the release build. Development display fallbacks are
+not the release identity. `ts --version` prints
+`ts package=<version> source=<commit> target=<triple> variant=default`. Release
+mode requires the full 40-character lowercase source commit; the package version
+is not the release tag. Attestation pins authenticate these inputs externally.
 
-The current compile-time input audit is recorded in the spec's Phase 1 note.
+The executable's SHA-256 is checked externally against the retained release
+bytes; exposing that digest as a runtime build fact belongs to
+[#161](https://github.com/IABTechLab/trusted-server/issues/161).
+
+The current compile-time input audit is recorded in the
+[specification's Phase 1 input audit](https://github.com/IABTechLab/trusted-server/blob/main/docs/superpowers/specs/2026-10-09-1235-release-attestation-design.md#phase-1-input-audit-and-operator-evidence).
 It includes Rust 1.98.1, tracked logical IDs, the private JS build path and its
 indirect build-module options, and the locked native dependencies. It does not
 claim a complete native tool closure or hermetic build.
 
-The tools and consumer policy files are carried unchanged. The cohort retains
-its original four entries and adds the three Axum entries documented in the
-[release PR’s compatibility audit](https://github.com/IABTechLab/trusted-server/pull/1435).
-All three have **no Phase 1 readers** and do not authorize these builds or replace
-the workflow's explicit selections.
-
-| Policy                                          | Current use                                                            | Additive later adoption                                                                          |
-| ----------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `scripts/release/release-cohort.json`           | Original four plus three descriptive Axum entries; no reader           | Checked fixed cohort selection, original assurance profiles and compatibility qualification      |
-| `scripts/release/release-tools.json`            | Retained pending/null qualification records; no reader                 | Checked tool identities, authenticated acquisition, image/SDK measurements and qualified recipes |
-| `crates/trusted-server-cli/release-policy.json` | Retained signer/caller and SPDX contract; no reader or custom verifier | Embedded consumer policy, bounds, historical-policy acceptance and complete index/evidence joins |
+`scripts/release/release-cohort.json` retains its original four entries and
+adds the three Axum entries documented in the
+[Phase 1 compatibility audit](https://github.com/IABTechLab/trusted-server/blob/main/docs/superpowers/plans/binary-attestations-phase1-compatibility.md).
+It has **no Phase 1 reader** and does not authorize these builds or replace the
+workflow's explicit selections. Later phases adopt it for checked cohort
+selection, assurance profiles and compatibility qualification. The later tool
+and consumer policy files are not part of Phase 1.
 
 Phase 1 does not ship `release-index.json`, `tsjs-inventory.json`, build-evidence,
 build-recipe or rebuild-check placeholders. Their frozen schemas and names
@@ -335,7 +353,7 @@ tags and approve tag-push authority and required checks. Immutability remains a
 human precondition. Set repository variable `RELEASE_PUBLICATION_ENABLED=true` only after confirming those settings with the read-only commands below. Without it, both signing and publication are skipped; an early tag push creates no public attestations. There is no repository-administration token or prepublication settings API call, following the reviewed decision to check the published release instead. A
 violation can expose a mutable release before the workflow reports failure.
 
-Tags containing `-` publish as prereleases and never become Latest. Stable tags publish as normal releases with `make_latest: legacy`; GitHub chooses Latest by version/date rather than forcing a backport release to Latest. Whether to authorize tags from rc branches is a maintainer decision; the Phase 2 ancestry/ruleset validator is not implemented here.
+Tags with a SemVer prerelease part (such as `-rc.1`) publish as prereleases and never become Latest. Stable tags publish as normal releases with `make_latest: legacy`; GitHub chooses Latest by version/date rather than forcing a backport release to Latest. Whether to authorize tags from rc branches is a maintainer decision; the Phase 2 ancestry/ruleset validator is not implemented here.
 
 Publication lists releases, including drafts, and refuses every existing
 matching tag. It creates one draft, retains its release ID, and binds uploads
@@ -354,14 +372,15 @@ after 10s, except bulk asset downloads, which have up to 60s capped by the remai
 Retries require a recognized transport error, timeout, HTTP 5xx or 429.
 GitHub CLI errors are classified conservatively: an otherwise empty-output
 HTTP 5xx/429 diagnostic or a recognized transport/timeout code may retry;
-ambiguous failures stop. Successful responses with wrong identity, immutability,
-membership or digests, and definitive verification failures stop immediately.
+ambiguous failures stop, except the release verification described below.
+Successful responses with wrong identity, immutability, membership or digests
+stop immediately.
 Release listing before creation and every create/upload/publish mutation remain
 single-shot. Every API read, including that listing, times out after 10s. Mutations
 have no client-side timeout and are bounded by the 15-minute job limit: aborting a
 create, upload or publish cannot cancel a change GitHub already accepted.
 
-Before cryptographic release verification, the availability check makes at most five release-attestation GETs, with 2s/5s/10s/20s backoff (37s total waiting). Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with no current-tag record may also wait. Each GET times out after at most 4s, and a separate 60s deadline bounds availability checking within the shared three-minute scheduling window. Every other non-200 status fails immediately. Malformed records, duplicate current-tag records, identity/source/asset mismatches and definitive cryptographic failures stop immediately. Other-tag records are logged and ignored by the publisher's own availability check, but GitHub CLI still fetches all returned bundle URLs before filtering by tag. An unavailable older bundle can therefore fail the current release's read-only verification. Preserve the immutable release and follow the read-only recovery procedure below. Filter-before-fetch behavior remains a dependency follow-up: track it upstream and qualify a GitHub CLI version that supplies it before claiming isolation from other tags. Current-tag cryptographic verification is single-shot. Logs show every wait or availability on the first check. No mutation is retried.
+Before cryptographic release verification, the availability check makes at most five release-attestation reads, with 2s/5s/10s/20s backoff (37s total waiting). Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with no current-tag record may also wait. Each read times out after at most 4s and, like the other post-publish reads, retries transient failures; a separate 60s deadline bounds availability checking within the shared three-minute scheduling window. Other non-200 statuses fail. A record may carry its bundle inline or only a `bundle_url`; without an inline bundle its tag is unknown until GitHub CLI fetches it. GitHub CLI reports a bundle-fetch, trusted-root or network failure the same way as a record that is not yet listed, so any failed `gh release verify` is retried at the next availability check and the last error is reported after the fifth. A fetched result is then checked: its decoded bundle must equal the statement GitHub CLI verified, name this release, commit and exact asset digests, and equal the inline bundle when the API supplied one. Malformed records, duplicate current-tag records and identity/source/asset mismatches stop immediately. Other-tag records are logged and ignored by the publisher's own availability check, but GitHub CLI still fetches all returned bundle URLs before filtering by tag. An unavailable older bundle can therefore fail the current release's read-only verification. Preserve the immutable release and follow the read-only recovery procedure below. Filter-before-fetch behavior remains a dependency follow-up: track it upstream and qualify a GitHub CLI version that supplies it before claiming isolation from other tags. Logs show every wait or availability on the first check. No mutation is retried.
 
 The publisher re-downloads all 29 assets into a fresh temporary directory, checks the exact file set and byte-compares them with the validated signed handoff, including identical SHA256SUMS. Only transport download failures may retry; any missing, extra or different file fails immediately. Temporary downloads are removed after each attempt.
 
@@ -376,12 +395,14 @@ the release job log; retain the reviewed `REPO`, `TAG`, `COMMIT` and `ASSETS`
 values from the verification procedure above.
 
 ```bash
+set -euo pipefail
+test "${#ASSETS[@]}" -eq 7
 gh api "repos/$REPO/releases/$RELEASE_ID" \
   --jq '{id, tag_name, draft, immutable, assets: [.assets[] | {name, size, digest}]}'
 test "$(gh api "repos/$REPO/releases/tags/$TAG" --jq '.id')" = "$RELEASE_ID"
 test "$(gh api "repos/$REPO/releases/$RELEASE_ID" --jq '.immutable')" = true
-gh api "repos/$REPO/attestations/sha1:$COMMIT?per_page=100&predicate_type=release" \
-  --jq '[.attestations[] | select(.initiator == "github") | .bundle.dsseEnvelope.payload | @base64d | fromjson | .predicate.tag]'
+test "$(gh release verify "$TAG" --repo "$REPO" --format json \
+  --jq '.verificationResult.statement.predicate.tag')" = "$TAG"
 gh release verify "$TAG" --repo "$REPO"
 for asset in "${ASSETS[@]}"; do
   for suffix in '' .spdx.json .provenance.sigstore.json .sbom.sigstore.json; do
@@ -459,12 +480,16 @@ repository settings.
 The reusable caller declares the maximum signing permissions required by its
 called workflow. GitHub does not allow a read-only caller to invoke a nested
 workflow that declares greater permissions, even for conditionally skipped jobs.
-Actual build/check jobs narrow permissions to contents-read; signing remains
-tag-only and requires the publication enablement variable. Splitting a new build-only workflow is deferred to preserve this slice.
+The release workflow therefore runs only on pushes to `main` and `v*` tags,
+never on pull requests, so fork and Dependabot pull requests never invoke it;
+pull requests run the release Node suite in the format workflow instead. Actual
+build/check jobs narrow permissions to contents-read; signing remains tag-only
+and requires the publication enablement variable.
 
-The configuration scanner covers literal/raw/concatenated macros and literal
-build-script deployment prefixes. It is a best-effort source regression audit,
-not Rust expansion or dataflow analysis: `include!`, raw byte strings (`br"…"` /
-`rb"…"`), computed names, procedural macros and third-party build scripts are not
-completely analyzed. Planted canary scans and
+The configuration scanner covers literal, raw, byte-raw and C-raw strings,
+concatenated macros, and literal deployment prefixes in build scripts, in every
+module a build script loads (including `#[path]` helpers) and under each crate's
+`build/` and `build_support/` directories. It is a best-effort source regression
+audit, not Rust expansion or dataflow analysis: `include!`, computed names,
+procedural macros and third-party build scripts are not completely analyzed. Planted canary scans and
 clean inherited environments provide additional checks, not hermeticity.

@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process'
 import { createServer } from 'node:net'
 import { once } from 'node:events'
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 /** Check minimal wasm headers and final Linux loader requirements. */
@@ -235,7 +235,7 @@ function rustTokens(source) {
       }
       continue
     }
-    const raw = source.slice(i).match(/^r(#{0,255})"/)
+    const raw = source.slice(i).match(/^[bc]?r(#{0,255})"/)
     if (raw) {
       const start = i + raw[0].length,
         end = source.indexOf('"' + raw[1], start)
@@ -246,7 +246,7 @@ function rustTokens(source) {
     }
     const character = source
       .slice(i)
-      .match(/^'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\r\n])'/)
+      .match(/^'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\r\n])'/u)
     if (character) {
       i += character[0].length
       continue
@@ -285,7 +285,55 @@ function rustTokens(source) {
   return tokens
 }
 
-export function checkSource(file, source) {
+/**
+ * Returns the module files a Rust file loads with `mod name;`, honoring
+ * `#[path = "..."]`, relative to that file's directory.
+ */
+export function moduleFiles(file, source) {
+  const tokens = rustTokens(source)
+  const directory = dirname(file)
+  const files = []
+  let path
+  for (let i = 0; i < tokens.length; i++) {
+    if (
+      tokens[i] === '#' &&
+      tokens[i + 1] === '[' &&
+      tokens[i + 2] === 'path' &&
+      tokens[i + 3] === '=' &&
+      tokens[i + 4]?.string !== undefined &&
+      tokens[i + 5] === ']'
+    ) {
+      path = tokens[i + 4].string
+      i += 5
+    } else if (
+      tokens[i] === 'mod' &&
+      typeof tokens[i + 1] === 'string' &&
+      tokens[i + 2] === ';'
+    ) {
+      files.push(
+        ...(path === undefined
+          ? [
+              join(directory, `${tokens[i + 1]}.rs`),
+              join(directory, tokens[i + 1], 'mod.rs'),
+            ]
+          : [join(directory, path)])
+      )
+      path = undefined
+    } else if (tokens[i] === 'mod' || tokens[i] === ';') path = undefined
+  }
+  return files
+}
+
+/**
+ * Rejects deployment configuration read at compile time. `buildScript`
+ * applies the stricter rule for code that runs during the build: `build.rs`
+ * and every module it loads.
+ */
+export function checkSource(
+  file,
+  source,
+  buildScript = basename(file) === 'build.rs'
+) {
   const tokens = rustTokens(source)
   const deployment = (value) => /^(?:TRUSTED_SERVER__|EDGEZERO__)/.test(value)
   // Only release control and Cargo-owned target facts are additional build-time inputs.
@@ -347,11 +395,17 @@ export function checkSource(file, source) {
       )
         throw Error(`${file}: deployment compile-time input`)
     }
-    if (file.endsWith('build.rs')) {
+    if (buildScript) {
       const value = expression(i)?.value
+      // Judge the leading variable name, so an error message that names an
+      // allowed control still passes while a padded or templated name fails.
       if (
         value !== undefined &&
-        ((deployment(value) && !allowedBuild.has(value)) || operatorPath(value))
+        ((deployment(value) &&
+          !allowedBuild.has(
+            value.match(/^(?:TRUSTED_SERVER__|EDGEZERO__)\w*/)[0]
+          )) ||
+          operatorPath(value))
       )
         throw Error(`${file}: operator compile-time build input`)
     }
@@ -428,15 +482,48 @@ export function mergeSboms(cargo, npm, binary, name, version) {
   }
 }
 
-function audit(root) {
+function rustFiles(root, files = []) {
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (['node_modules', 'target', 'dist', '.git'].includes(entry.name))
       continue
     const file = join(root, entry.name)
-    if (entry.isDirectory()) audit(file)
-    else if (entry.isFile() && file.endsWith('.rs'))
-      checkSource(file, readFileSync(file, 'utf8'))
+    if (entry.isDirectory()) rustFiles(file, files)
+    else if (entry.isFile() && file.endsWith('.rs')) files.push(file)
   }
+  return files
+}
+
+/**
+ * Audits every Rust file under `root`. Build scripts, every module they reach
+ * and every file under a crate's `build/` or `build_support/` directory get the
+ * build-script rule. Module resolution is simplified (no inline-module nesting,
+ * `cfg_attr` paths or `include!`), so build-time helpers belong in those two
+ * directories.
+ */
+export function audit(root) {
+  const files = rustFiles(root)
+  const sources = new Map(
+    files.map((file) => [file, readFileSync(file, 'utf8')])
+  )
+  const buildTime = new Set(
+    files.filter(
+      (file) =>
+        basename(file) === 'build.rs' ||
+        /^[^/\\]+[/\\](?:build|build_support)[/\\]/.test(relative(root, file))
+    )
+  )
+  const pending = [...buildTime]
+  while (pending.length) {
+    const file = pending.pop()
+    for (const module of moduleFiles(file, sources.get(file))) {
+      if (!buildTime.has(module) && sources.has(module)) {
+        buildTime.add(module)
+        pending.push(module)
+      }
+    }
+  }
+  for (const file of files)
+    checkSource(file, sources.get(file), buildTime.has(file))
 }
 
 async function smokeRelease(file, target) {

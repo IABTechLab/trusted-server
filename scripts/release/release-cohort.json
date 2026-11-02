@@ -75,7 +75,7 @@
     {
       "assurance_profile": "provenance-sbom",
       "bin": "trusted-server-axum",
-      "capabilities": ["axum-production"],
+      "capabilities": ["axum-evaluation"],
       "compatibility": {
         "architecture": "x86_64",
         "minimum_version": "glibc-2.34",
@@ -93,7 +93,7 @@
     {
       "assurance_profile": "provenance-sbom",
       "bin": "trusted-server-axum",
-      "capabilities": ["axum-production"],
+      "capabilities": ["axum-evaluation"],
       "compatibility": {
         "architecture": "x86_64",
         "minimum_version": "static",
@@ -111,7 +111,7 @@
     {
       "assurance_profile": "provenance-sbom",
       "bin": "trusted-server-axum",
-      "capabilities": ["axum-production"],
+      "capabilities": ["axum-evaluation"],
       "compatibility": {
         "architecture": "aarch64",
         "minimum_version": "glibc-2.34",

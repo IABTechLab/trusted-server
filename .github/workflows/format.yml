@@ -224,6 +224,9 @@ jobs:
       - name: Run shellcheck
         run: shellcheck scripts/docs-proposal/*.sh scripts/release/phase1-build.sh
 
+      - name: Test release producer scripts
+        run: node --test scripts/release/phase1.test.mjs
+
       - name: Test hunk review builder
         run: node --test scripts/docs-proposal/hunks.test.mjs
 
