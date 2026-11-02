@@ -5,7 +5,7 @@ pub use crate::config_payload::DEFAULT_CONFIG_STORE_ID;
 use crate::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob_with};
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationBuilder;
-use crate::platform::{PlatformConfigStore, PlatformSecretStore, StoreName};
+use crate::platform::{PlatformConfigStore, PlatformSecretStore, PolicyOrigin, StoreName};
 use crate::settings::Settings;
 
 /// Resolves the `EdgeZero` app-config store name from runtime configuration.
@@ -49,7 +49,8 @@ pub fn default_secret_store_name() -> StoreName {
 }
 
 /// Loads [`Settings`] from a platform config store and key, validating
-/// against the built-in integrations only.
+/// against the built-in integrations only, with the permission policy they
+/// name read from `policy_origin`.
 ///
 /// A deployment that composes builders of its own calls
 /// [`get_settings_from_config_store_with`] instead, because validation runs
@@ -60,13 +61,15 @@ pub fn default_secret_store_name() -> StoreName {
 ///
 /// Returns [`TrustedServerError::Configuration`] when the config blob is
 /// missing, cannot be read, fails envelope verification, secret resolution,
-/// or Trusted Server settings validation.
+/// or Trusted Server settings validation, or when its permission policy does
+/// not load.
 pub fn get_settings_from_config_store(
     config_store: &dyn PlatformConfigStore,
     secret_store: &dyn PlatformSecretStore,
     store_name: &StoreName,
     key: &str,
     default_secret_store_name: &StoreName,
+    policy_origin: PolicyOrigin<'_>,
 ) -> Result<Settings, Report<TrustedServerError>> {
     get_settings_from_config_store_with(
         config_store,
@@ -74,12 +77,14 @@ pub fn get_settings_from_config_store(
         store_name,
         key,
         default_secret_store_name,
+        policy_origin,
         &[],
     )
 }
 
 /// Loads [`Settings`] from a platform config store and key, validating
-/// against the built-in integrations followed by `extra_integrations`.
+/// against the built-in integrations followed by `extra_integrations`, with
+/// the permission policy they name read from `policy_origin`.
 ///
 /// The entry is read as the platform's config store returns it, whole. A
 /// platform that stores a long document in parts reassembles it in its own
@@ -89,13 +94,15 @@ pub fn get_settings_from_config_store(
 ///
 /// Returns [`TrustedServerError::Configuration`] when the config blob is
 /// missing, cannot be read, fails envelope verification, secret resolution,
-/// or Trusted Server settings validation.
+/// or Trusted Server settings validation, or when its permission policy does
+/// not load.
 pub fn get_settings_from_config_store_with(
     config_store: &dyn PlatformConfigStore,
     secret_store: &dyn PlatformSecretStore,
     store_name: &StoreName,
     key: &str,
     default_secret_store_name: &StoreName,
+    policy_origin: PolicyOrigin<'_>,
     extra_integrations: &[IntegrationBuilder],
 ) -> Result<Settings, Report<TrustedServerError>> {
     let envelope_json = read_config_entry(config_store, store_name, key)?;
@@ -103,6 +110,7 @@ pub fn get_settings_from_config_store_with(
         &envelope_json,
         secret_store,
         default_secret_store_name,
+        policy_origin,
         extra_integrations,
     )
 }
@@ -126,7 +134,7 @@ mod tests {
     use crate::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
     use crate::platform::{PlatformError, StoreId};
     use crate::settings::Settings;
-    use crate::test_support::tests::crate_test_settings_str;
+    use crate::test_support::tests::{crate_test_settings_str, sample_permissions};
     use edgezero_core::blob_envelope::BlobEnvelope;
     use std::collections::BTreeMap;
 
@@ -184,8 +192,12 @@ mod tests {
         }
     }
 
+    /// The blob envelope `ts config push` writes for `settings`, naming the
+    /// repository's sample policy.
     fn envelope_json(settings: &Settings) -> String {
-        let data = serde_json::to_value(settings).expect("should serialize settings to JSON");
+        let mut settings = settings.clone();
+        settings.permissions = sample_permissions();
+        let data = serde_json::to_value(&settings).expect("should serialize settings to JSON");
         let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
         serde_json::to_string(&envelope).expect("should serialize envelope")
     }
@@ -201,6 +213,7 @@ mod tests {
             store_name,
             key,
             &StoreName::from("trusted_server_secrets"),
+            PolicyOrigin::Blob,
         )
     }
 

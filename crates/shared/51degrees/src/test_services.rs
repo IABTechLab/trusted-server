@@ -395,9 +395,10 @@ impl PlatformHttpClient for ScriptedHttpClient {
     }
 }
 
-/// The loading cache a test's services hold answers in: the stock module's,
-/// so what one call holds is what the next one reads, with a memory copy of
-/// its own for each set of services, as each instance has.
+/// The loading cache a test's services hold answers in: the 51Degrees
+/// module's, which a deployment links, so what one call holds is what the
+/// next one reads, with a memory copy of its own for each set of services, as
+/// each instance has.
 fn loading_caches() -> Arc<trusted_server_core::platform::LoadingCaches> {
     Arc::new(trusted_server_core::platform::LoadingCaches::every(
         Arc::new(trusted_server_loading_cache_51degrees::LoadingCaches::new()),
@@ -410,6 +411,7 @@ pub fn services_with(
     store: Arc<MemoryKvStore>,
 ) -> RuntimeServices {
     RuntimeServices::builder()
+        .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
         .config_store(Arc::new(StubStore))
         .secret_store(Arc::new(StubStore))
         .kv_store(store)
@@ -435,6 +437,7 @@ pub fn services_with_value_cache(
     cache: Arc<MemoryValueCache>,
 ) -> RuntimeServices {
     RuntimeServices::builder()
+        .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
         .config_store(Arc::new(StubStore))
         .secret_store(Arc::new(StubStore))
         .kv_store(Arc::new(UnavailableKvStore))

@@ -1,11 +1,9 @@
 use std::sync::Arc;
 
-use base64::Engine as _;
 use bytes::Bytes;
 use edgezero_core::body::Body as EdgeBody;
-use futures::StreamExt as _;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, header};
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 use super::test_support::{Behavior, MANIFEST_LINK, SIGNED_SUFFIX, StubSigner};
 use super::*;
@@ -120,6 +118,36 @@ fn claim_shared(
         shared,
     )
     .expect("should claim a media path")
+}
+
+#[test]
+fn retained_media_uses_its_declared_cache_lifetimes() {
+    let mut settings = create_test_settings();
+    settings.cache.declared.insert(
+        ASSETS_CACHE.to_owned(),
+        crate::settings::LoadingCacheConfig {
+            memory_seconds: Some(2),
+            store_seconds: Some(120),
+            store_idle_seconds: Some(240),
+            ..Default::default()
+        },
+    );
+    let signer = StubSigner::new(Behavior::Sign, 1024);
+    let services = signer.installed_in(noop_services());
+    let claim = MediaClaim::of_request(
+        &settings,
+        &services,
+        &Method::GET,
+        PATH,
+        &image_request(&[]),
+        true,
+    )
+    .expect("should claim a media request");
+
+    assert_eq!(claim.spec.name, ASSETS_CACHE);
+    assert_eq!(claim.spec.lifetimes.memory, Duration::from_secs(2));
+    assert_eq!(claim.spec.lifetimes.store, Duration::from_secs(120));
+    assert_eq!(claim.spec.lifetimes.store_idle, Duration::from_secs(240));
 }
 
 fn claim(services: &RuntimeServices, method: &Method, headers: &HeaderMap) -> MediaClaim {
@@ -1167,7 +1195,7 @@ fn a_kept_copy_ages_and_is_refused_when_its_body_is_not_the_one_signed() {
     let digest = Sha256::digest(signed_bytes());
     headers.insert(
         header::ETAG,
-        HeaderValue::from_str(&signed_entity_tag(digest.as_slice())).expect("should build tag"),
+        HeaderValue::from_str(&signed_entity_tag(&digest)).expect("should build tag"),
     );
     let body = Bytes::from(signed_bytes());
     let encoded = encode_kept(&KeptRecord {

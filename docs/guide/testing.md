@@ -25,7 +25,7 @@ The aliases in `.cargo/config.toml` select the correct target and feature set:
 Fastly tests require the Viceroy version recorded in `.tool-versions`:
 
 ```bash
-cargo install viceroy --version 0.17.0 --locked --force
+cargo install viceroy --version 0.21.0 --locked --force
 rustup target add wasm32-wasip1 wasm32-unknown-unknown
 ```
 

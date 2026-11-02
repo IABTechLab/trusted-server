@@ -29,9 +29,11 @@ jobs:
       - name: Set up shared integration build environment
         uses: ./.github/actions/setup-integration-test-env
         with:
-          origin-port: ${{ env.ORIGIN_PORT }}
           install-viceroy: "false"
           build-cloudflare: "true"
+
+      - name: Check that no permission policy is compiled into the Cloudflare WASM
+        run: ./scripts/check-no-compiled-policy.sh crates/trusted-server-adapter-cloudflare/build/index_bg.wasm
 
       - name: Generate integration Viceroy configs
         run: ./scripts/generate-integration-viceroy-configs.sh
@@ -67,7 +69,6 @@ jobs:
         id: shared-setup
         uses: ./.github/actions/setup-integration-test-env
         with:
-          origin-port: ${{ env.ORIGIN_PORT }}
           install-viceroy: "true"
           build-wasm: "false"
           build-axum: "false"
@@ -126,7 +127,6 @@ jobs:
         id: shared-setup
         uses: ./.github/actions/setup-integration-test-env
         with:
-          origin-port: ${{ env.ORIGIN_PORT }}
           install-viceroy: "true"
           build-wasm: "false"
           build-test-images: "false"
@@ -155,7 +155,13 @@ jobs:
   browser-tests:
     name: browser integration tests
     needs: prepare-artifacts
-    runs-on: ubuntu-latest
+    # Pinned rather than floating on ubuntu-latest, which moved to 26.04 and
+    # fails at `playwright install` with "Playwright does not support chromium
+    # on ubuntu26.04-x64". Every browser test then fails in milliseconds because
+    # no browser was installed. Other jobs are unaffected: the Axum job obtains
+    # Chrome through browser-actions/setup-chrome, which works on 26.04. Unpin
+    # once the pinned Playwright version supports the newer image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -164,7 +170,6 @@ jobs:
         id: shared-setup
         uses: ./.github/actions/setup-integration-test-env
         with:
-          origin-port: ${{ env.ORIGIN_PORT }}
           install-viceroy: "true"
           build-wasm: "false"
           build-test-images: "false"

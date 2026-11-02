@@ -17,7 +17,7 @@ For a local Fastly run, write the validated envelope into Viceroy state before
 starting the adapter:
 
 ```bash
-ts config push --adapter fastly --local
+ts config push --adapter fastly --local --permissions standard.yaml
 fastly compute serve
 ```
 

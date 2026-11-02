@@ -13,6 +13,8 @@ ARTIFACTS_DIR="${ARTIFACTS_DIR:-$REPO_ROOT/target/integration-test-artifacts}"
 CONFIG_DIR="$ARTIFACTS_DIR/configs"
 TEMPLATE_PATH="crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml"
 APP_CONFIG_PATH="crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml"
+# The policy file the integration config names, as `ts config push` supplies it.
+POLICY_PATH="config/permissions/sample.yaml"
 INTEGRATION_TARGET_DIR="crates/trusted-server-integration-tests/target"
 ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT"
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
@@ -39,5 +41,6 @@ fi
 "$GENERATOR_BIN" \
     --template "$TEMPLATE_PATH" \
     --app-config "$APP_CONFIG_PATH" \
+    --permissions "$POLICY_PATH" \
     --output "$CONFIG_DIR/viceroy.toml" \
     --origin-url "$ORIGIN_URL"

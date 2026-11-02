@@ -36,6 +36,9 @@ pub const PERMISSIONS_PATHS: [&str; 2] = [PERMISSIONS_PAGE_PATH, PERMISSIONS_JSO
 /// - `storageWithdrawn`: whether the request explicitly withdrew device storage.
 /// - `modules.contributed`: the signal modules that produced a signal used here.
 /// - `modules.configured`: the signal modules the publisher named, or `null`.
+/// - `policy`: the permission policy file whose rules the answer resolved,
+///   by the name `[permissions] policy` gives it, or `null` for settings that
+///   name none, which no loaded domain has.
 /// - `version`: the version of the core crate that answered.
 #[must_use]
 pub fn permissions_payload(state: &PermissionState, settings: &Settings) -> Value {
@@ -62,6 +65,7 @@ pub fn permissions_payload(state: &PermissionState, settings: &Settings) -> Valu
                 "configured": configured,
             }),
         );
+        fields.insert("policy".to_owned(), json!(settings.permissions.policy));
     }
     payload
 }
@@ -226,6 +230,18 @@ mod tests {
             payload["modules"]["configured"].is_null(),
             "should not guess which modules the adapter offers"
         );
+    }
+
+    /// A name is a file's stem, which the configuration page shows with the
+    /// file's SHA-256, so a publisher matches the answer to one exact file.
+    #[test]
+    fn the_payload_names_the_policy_whose_rules_it_resolved() {
+        let mut settings = create_test_settings();
+        settings.permissions.policy = Some("standard".to_owned());
+
+        let payload = permissions_payload(&state_with_signal(), &settings);
+
+        assert_eq!(payload["policy"], json!("standard"));
     }
 
     /// "No signal was found" is itself the answer somebody came for.

@@ -16,7 +16,6 @@ use lol_html::{
     text,
 };
 
-use crate::attestation::PlatformIdentity;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry, IntegrationRequestState,
     ScriptRewriteAction,
@@ -25,7 +24,7 @@ use crate::middleware::{
     ElementHandler, MatchedAttribute, MiddlewareChain, MiddlewareContext, MiddlewarePlan, Prepared,
     ResponseHeader, TextHandler,
 };
-use crate::platform::RuntimeServices;
+use crate::platform::{PlatformIdentity, RuntimeServices};
 use crate::prefix::{PUBLIC_PREFIX_ATTRIBUTE, PublicPrefix};
 use crate::publisher::build_empty_bids_script;
 use crate::rehost::{Decision, PageAddress, PageRehost, Reference};

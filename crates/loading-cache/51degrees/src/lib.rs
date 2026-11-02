@@ -36,8 +36,7 @@ use crate::stores::WebClock;
 pub const MODULE: &str = "loading-cache.51degrees";
 
 /// The builder a deployment hands to an adapter, which offers this loading
-/// cache whatever the settings say. Each adapter in this repository links
-/// it.
+/// cache whatever the settings say. No stock build links it.
 #[must_use]
 pub fn builder() -> IntegrationBuilder {
     IntegrationBuilder::implementations(MODULE, env!("CARGO_PKG_NAME")).with_loading_cache(factory)

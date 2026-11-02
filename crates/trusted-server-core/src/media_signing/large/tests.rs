@@ -1,13 +1,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use base64::Engine as _;
 use error_stack::Report;
 use futures::FutureExt as _;
-use futures::StreamExt as _;
 use futures::channel::oneshot;
 use futures::executor::block_on;
-use sha2::Digest as _;
 
 use super::*;
 use crate::error::TrustedServerError;

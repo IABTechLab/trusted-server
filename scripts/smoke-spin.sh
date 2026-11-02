@@ -12,6 +12,7 @@ smoke_require_command curl
 smoke_require_command python3
 smoke_require_command spin
 smoke_require_command pgrep
+smoke_require_spin_version
 
 WORKSPACE=$(smoke_make_workspace spin)
 ORIGIN_PORT=${SPIN_SMOKE_ORIGIN_PORT:-19189}
@@ -91,7 +92,9 @@ run_case() {
     smoke_stop_process "$APP_PID"
     APP_PID=""
 
-    if [ -n "$expected_diagnostic" ]; then
+    if [ "$expected_status" != 200 ]; then
+        [ -n "$expected_diagnostic" ] ||
+            smoke_die "negative case $case_name names no log line to wait for"
         grep --fixed-strings --quiet "Serving http://127.0.0.1:$port" "$log_path" ||
             smoke_die "Spin launcher did not reach the requested listener"
         if [ "$case_name" = "missing-config" ]; then
@@ -101,6 +104,9 @@ run_case() {
             [ "$CONFIG_PUSHED" = true ] ||
                 smoke_die "missing-secret case ran before the config push"
         fi
+        # The component's log must name the missing input, so a failure of
+        # another kind cannot pass the case. Spin keeps the component's
+        # standard error under --log-dir.
         smoke_assert_failure \
             "$expected_status" \
             "$expected_diagnostic" \
@@ -110,7 +116,7 @@ run_case() {
     fi
 }
 
-run_case missing-config "$BASE_PORT" "" 503 \
+run_case missing-config "$BASE_PORT" "" 500 \
     'failed to read Spin Trusted Server app-config blob'
 
 EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default \
@@ -119,13 +125,14 @@ EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default \
     --local \
     --manifest "$WORKSPACE/edgezero.toml" \
     --app-config "$SMOKE_APP_CONFIG" \
+    --permissions "$SMOKE_POLICY_FILE" \
     --yes \
     --no-diff
 CONFIG_PUSHED=true
 
-run_case missing-proxy "$((BASE_PORT + 1))" "$SPIN_PROXY_VAR" 503 \
+run_case missing-proxy "$((BASE_PORT + 1))" "$SPIN_PROXY_VAR" 500 \
     "resolved secret at \`publisher.proxy_secret\` must not be empty"
-run_case missing-ec "$((BASE_PORT + 2))" "$SPIN_EC_VAR" 503 \
+run_case missing-ec "$((BASE_PORT + 2))" "$SPIN_EC_VAR" 500 \
     "resolved secret at \`ec.hmac.passphrase\` must not be empty"
 run_case positive "$((BASE_PORT + 3))" "" 200
 

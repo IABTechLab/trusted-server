@@ -7,7 +7,6 @@ use axum::body::to_bytes;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use base64::Engine as _;
 use serde_json::{Value, json};
 
 use super::*;

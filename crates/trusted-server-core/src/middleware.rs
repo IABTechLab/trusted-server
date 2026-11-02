@@ -49,10 +49,10 @@ use std::time::Duration;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::attestation::PlatformIdentity;
 use crate::integrations::{AttributeRewriteAction, IntegrationDocumentState, ScriptRewriteAction};
 use crate::module_context::{ModuleCall, ModuleContext};
 use crate::permissions::PermissionSet;
+use crate::platform::PlatformIdentity;
 use crate::streaming_processor::StreamProcessor;
 
 /// The media type a document is matched as, and the one a middleware runs on
@@ -1144,9 +1144,9 @@ pub mod test_support {
     use std::sync::OnceLock;
 
     use super::{MiddlewareContext, MiddlewarePhase};
-    use crate::attestation::PlatformIdentity;
     use crate::html_processor::test_support::{ORIGIN_HOST, REQUEST_HOST};
     use crate::integrations::IntegrationDocumentState;
+    use crate::platform::PlatformIdentity;
 
     /// The platform a test page is served from, which reports its name and
     /// nothing else.

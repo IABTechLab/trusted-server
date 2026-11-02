@@ -13,7 +13,7 @@ loaded by a separate tag.
 | `axum`       | development    | real       | `500`          | no             | multiple         | outermost sanitize             | none                             |
 | `cloudflare` | development    | absent     | `500`          | no             | single           | outermost sanitize             | none                             |
 | `fastly`     | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
-| `spin`       | experimental   | real       | `503`          | yes            | single           | outermost sanitize             | innermost Spin-header derivation |
+| `spin`       | experimental   | real       | `500`          | yes            | single           | outermost sanitize             | innermost Spin-header derivation |
 
 This table summarizes the adapter implementations. “Startup health” means the
 degraded startup router still serves `/health`; it does not

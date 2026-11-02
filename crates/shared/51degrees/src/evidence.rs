@@ -2,9 +2,9 @@
 //! the `Sec-CH-UA` client hints the browser sent with it.
 //!
 //! Which hints the service asks for depends on the browser alone, so nothing
-//! else is sent, neither the address nor a cookie. The answer is held by the
-//! evidence, so every reader whose browser sends the same values shares one
-//! answer and one call.
+//! else is sent, neither the address nor a cookie. An answer is keyed by the
+//! evidence, so where a loading cache module holds it, every reader whose
+//! browser sends the same values shares one answer and one call.
 
 use trusted_server_core::evidence::RequestInfo;
 

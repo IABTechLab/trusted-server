@@ -70,6 +70,7 @@ license_key = "fiftyone_degrees_license_key"
 # critical = true
 
 # [cache.51degrees-answers]
+# Refused unless the build links crates/loading-cache/51degrees.
 # module = "51degrees"
 
 [[serve]]
@@ -91,10 +92,12 @@ The middleware's own table, `[middleware.51degrees.client_hints]`, has one
 field, `critical`, on by default. Each table refuses a field it does not
 read.
 
-The service's answers are held in the cache `51degrees-answers`, which a
-stock build holds with its one loading cache module without a line in the
-document, and `[cache.51degrees-answers]` names a module and sizes the
-copies, as for every declared cache. An answer is held for an hour at most.
+The service's answers load through the cache `51degrees-answers`, and
+`[cache.51degrees-answers]` names a module and sizes the copies, as for every
+declared cache. A deployment that links one loading cache module holds the
+answers there with no line in the document, each for an hour at most. A stock
+build links none, so it asks the service on every page navigation the
+middleware is placed for.
 
 ## Placing the middleware
 
@@ -114,10 +117,11 @@ request a module leaves a value on. That page is never read from a shared
 template and never stored as one, and is sent `private, no-store`.
 
 The call sends the browser's `User-Agent` and its `Sec-CH-UA` hints, and
-neither the reader's address nor a cookie. The first call for a `User-Agent`
-and set of those hints costs one round trip to the service before the page,
-and every reader whose browser sends the same values then reads the held
-answer. On Fastly the call fails after one second if it cannot connect, and
+neither the reader's address nor a cookie. A call costs one round trip to the
+service before the page. Where a loading cache module holds the answers, only
+the first call for a `User-Agent` and set of those hints is made, and every
+reader whose browser sends the same values then reads the held answer. On
+Fastly the call fails after one second if it cannot connect, and
 once connected it waits `timeout_ms` for the first byte and again for each gap
 between bytes. On Axum, Cloudflare and Spin the adapter's HTTP client applies
 no `timeout_ms`, so a call waits up to 30 seconds on Axum and for the runtime's

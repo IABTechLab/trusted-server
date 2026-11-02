@@ -13,7 +13,7 @@ use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use edgezero_core::body::Body as EdgeBody;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, header};
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 use super::test_support::{Behavior, StubSigner};
 use super::*;

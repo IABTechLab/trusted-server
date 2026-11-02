@@ -272,6 +272,9 @@ fn settings(loopback: SocketAddr) -> Settings {
         base = crate_test_settings_str(),
     ))
     .expect("should load the asynchronous prepared settings")
+    // A loaded domain carries its policy, and this test decides under the
+    // repository's sample.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 fn router(origin: &HeldOrigin) -> RouterService {

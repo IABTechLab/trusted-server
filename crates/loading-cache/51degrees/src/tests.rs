@@ -173,6 +173,7 @@ fn services_builder(
     kv: Arc<impl KvStore + 'static>,
 ) -> trusted_server_core::platform::RuntimeServicesBuilder {
     RuntimeServices::builder()
+        .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(kv)

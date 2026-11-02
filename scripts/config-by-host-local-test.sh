@@ -198,6 +198,19 @@ data = "fictional-local-ec-passphrase-secret-value"
 SECRETSEOF
 
 "$TS" config init --app-config "$WORK/app.toml" >/dev/null
+# The example names no permission policy, so the blobs name the repository's
+# sample, and every push supplies its file.
+POLICY_FILE="$REPO_ROOT/config/permissions/sample.yaml"
+sed -e 's/^# \[permissions\]$/[permissions]/' \
+  -e 's/^# policy = "standard"$/policy = "sample"/' \
+  "$WORK/app.toml" > "$WORK/app.policy.toml"
+mv "$WORK/app.policy.toml" "$WORK/app.toml"
+for line in '[permissions]' 'policy = "sample"'; do
+  grep --fixed-strings --line-regexp --quiet -- "$line" "$WORK/app.toml" || {
+    echo "could not name the sample policy in $WORK/app.toml" >&2
+    exit 1
+  }
+done
 # Every response then says which sandbox served it and how many applications
 # that sandbox had built.
 printf '\n[debug]\nsandbox_metrics_enabled = true\n' >> "$WORK/app.toml"
@@ -212,11 +225,13 @@ push_blob() { # push_blob <publisher domain> <origin port> [--key <key>]
       TRUSTED_SERVER__SOURCE__ORIGIN__URL="http://127.0.0.1:$port" \
       "$TS" config push --adapter fastly --local \
       --manifest "$WORK/edgezero.toml" --app-config "$WORK/app.toml" \
-      --no-diff --yes "$@" >/dev/null
+      --permissions "$POLICY_FILE" --no-diff --yes "$@" >/dev/null
   )
 }
 # One blob at the logical store ID, one under each publisher's host, and one
-# under publisher A's host with a suffix.
+# under publisher A's host with a suffix. The blob at the logical store ID
+# carries the policy file, and the keyed pushes keep it once, in its shared
+# entry.
 push_blob "shared.example" "$PORT_SHARED"
 push_blob "$HOST_A" "$PORT_A" --key "$HOST_A"
 push_blob "$HOST_B" "$PORT_B" --key "$HOST_B"

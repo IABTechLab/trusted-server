@@ -53,7 +53,6 @@ trusted-server-framework-nextjs = { workspace = true }
 trusted-server-headers-geo = { workspace = true }
 trusted-server-identity-lockr = { workspace = true }
 trusted-server-provenance-encypher = { workspace = true }
-trusted-server-loading-cache-51degrees = { workspace = true }
 trusted-server-shared-aws = { workspace = true }
 trusted-server-permission-signal-gpc = { workspace = true }
 trusted-server-permission-signal-gpp = { workspace = true }
@@ -74,3 +73,6 @@ base64 = { workspace = true }
 edgezero-core = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Test fixture only. It proves the integration seam from outside core and must
+# never reach a production build, so it stays a dev-dependency.
+trusted-server-testing-iabtl = { path = "../testing/iabtl" }

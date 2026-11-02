@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::geo::GeoInfo;
 use crate::module_context::ModuleContext;
 use crate::permission_signal::PermissionSignalModule;
-use crate::permissions::{Permission, PermissionState};
+use crate::permissions::{Permission, PermissionMaps, PermissionState};
 
 static MISSING_GEO_WARNING_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -49,8 +49,9 @@ pub fn read_consent(
     consent
 }
 
-/// The jurisdiction for a request: detected from its location when one
-/// resolved, otherwise the declaration the caller supplied.
+/// The jurisdiction for a request: detected from its location, in the
+/// policy whose rules are `maps`, when one resolved, otherwise the
+/// declaration the caller supplied.
 ///
 /// Jurisdiction is detected from geolocation, so with no location every
 /// request would be [`Jurisdiction::Unknown`](jurisdiction::Jurisdiction::Unknown)
@@ -61,11 +62,12 @@ pub fn read_consent(
 /// geo lookup.
 #[must_use]
 pub fn request_jurisdiction(
+    maps: &PermissionMaps,
     geo: Option<&GeoInfo>,
     default: jurisdiction::Jurisdiction,
 ) -> jurisdiction::Jurisdiction {
     match geo {
-        Some(_) => jurisdiction::detect_jurisdiction(geo),
+        Some(_) => jurisdiction::detect_jurisdiction(maps, geo),
         None => {
             log_missing_geo_warning_once();
             default
@@ -312,7 +314,11 @@ mod tests {
             asn: None,
         };
         assert_eq!(
-            request_jurisdiction(Some(&geo), jurisdiction::Jurisdiction::Unknown),
+            request_jurisdiction(
+                PermissionMaps::sample(),
+                Some(&geo),
+                jurisdiction::Jurisdiction::Unknown
+            ),
             jurisdiction::Jurisdiction::Gdpr,
             "the place decides, not the default"
         );
@@ -321,12 +327,20 @@ mod tests {
     #[test]
     fn an_unlocated_request_takes_the_default_jurisdiction() {
         assert_eq!(
-            request_jurisdiction(None, jurisdiction::Jurisdiction::Unknown),
+            request_jurisdiction(
+                PermissionMaps::sample(),
+                None,
+                jurisdiction::Jurisdiction::Unknown
+            ),
             jurisdiction::Jurisdiction::Unknown,
             "missing geo should keep the default the caller supplied"
         );
         assert_eq!(
-            request_jurisdiction(None, jurisdiction::Jurisdiction::Gdpr),
+            request_jurisdiction(
+                PermissionMaps::sample(),
+                None,
+                jurisdiction::Jurisdiction::Gdpr
+            ),
             jurisdiction::Jurisdiction::Gdpr
         );
     }
@@ -348,7 +362,7 @@ mod tests {
         granted: &[Permission],
         revoked: &[Permission],
     ) -> PermissionState {
-        PermissionMaps::standard().resolve_with(Some(country), region, |permission, _| {
+        PermissionMaps::sample().resolve_with(Some(country), region, |permission, _| {
             if granted.contains(&permission) {
                 ConsentSignal::Grant
             } else if revoked.contains(&permission) {
@@ -550,7 +564,7 @@ mod tests {
         // US maps to us-opt-out, where necessary.operations.storage and
         // advertising_marketing.first_party.targeted are granted with no
         // signal, so bidstream EIDs are transmitted.
-        let permissions = PermissionMaps::standard().resolve(Some("US"), |_| false);
+        let permissions = PermissionMaps::sample().resolve(Some("US"), |_| false);
         let eids = Some(vec!["eid-1".to_owned()]);
         assert!(
             gate_eids_by_permissions(eids, &permissions).is_some(),
@@ -562,7 +576,7 @@ mod tests {
     fn gate_eids_strips_eids_when_a_required_permission_is_unset() {
         // FR maps to gdpr-eu, where every purpose is requires_signal, so with no
         // signal neither required permission is set and EIDs are stripped.
-        let permissions = PermissionMaps::standard().resolve(Some("FR"), |_| false);
+        let permissions = PermissionMaps::sample().resolve(Some("FR"), |_| false);
         let eids = Some(vec!["eid-1".to_owned()]);
         assert!(
             gate_eids_by_permissions(eids, &permissions).is_none(),
@@ -572,7 +586,7 @@ mod tests {
 
     #[test]
     fn gate_eids_returns_none_for_empty_input() {
-        let permissions = PermissionMaps::standard().resolve(Some("US"), |_| false);
+        let permissions = PermissionMaps::sample().resolve(Some("US"), |_| false);
         assert!(
             gate_eids_by_permissions::<String>(None, &permissions).is_none(),
             "no EIDs should resolve to None"

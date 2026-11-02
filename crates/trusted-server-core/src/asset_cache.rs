@@ -1,426 +1,293 @@
-//! What the asset cache keeps for a response that is not a page, being the
-//! response as the fetch phase left it, and the address it is kept under.
+//! Where a module may answer for a file before core asks the file's origin.
 //!
-//! A copy holds the headers a reader is served and the body, as the origin
-//! sent them. Every copy is kept under what the origin's own `Vary` names, see
-//! `crate::source_cache`.
+//! The publisher path and the asset routes each offer a `GET` for a file to
+//! the asset cache module that `[asset-cache]` selects, at the one point
+//! where core is about to ask the file's origin. The module answers with a
+//! response, with the failure of the origin request it made, or by passing
+//! the file back to core. Core keeps no copy, no key and no gate of its own,
+//! so a deployment that selects no asset cache module has every file asked
+//! of its origin.
 
 use edgezero_core::body::Body as EdgeBody;
-use http::{HeaderName, HeaderValue, Response, StatusCode, header};
-use sha2::{Digest as _, Sha256};
+use error_stack::Report;
+use http::{HeaderMap, Method, Request, Response, Uri, header};
 
-/// Version of what a kept copy holds and how it is written. Bump on any change
-/// to either, so a copy written by another build is never read.
-pub const ASSET_SCHEMA_VERSION: u32 = 1;
+use crate::platform::{PlatformCacheIntent, PlatformError, PlatformHttpRequest, RuntimeServices};
 
-/// The most bytes a kept copy's body holds. A larger response is served as it
-/// streams from the origin, because every copy is held whole, in memory and in
-/// the shared store.
-pub const MAX_ASSET_COPY_BYTES: usize = 1024 * 1024;
+/// The type folder, and the section, that selects the asset cache module.
+pub const MODULE_TYPE: &str = "asset-cache";
 
-/// Response headers never kept with a copy, being those describing one
-/// connection, one reader's cookies, or the length and age, which are set again
-/// for each reader.
-const NOT_KEPT: &[&str] = &[
-    "age",
-    "connection",
-    "content-length",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "proxy-connection",
-    "set-cookie",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-];
-
-/// Inputs that select one asset's address.
-///
-/// Every field changes the bytes the fetch phase makes of the same response.
-/// What the origin's response varies on is not here, because it is read from
-/// the address's record once the origin has said it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssetCacheKey {
-    /// The URL asked of the origin, with its query.
-    pub url: String,
-    /// The host the reader asked, which the fetch phase writes into the body
-    /// in place of the origin's.
-    pub request_host: String,
-    /// The scheme the reader asked over, written into the body with the host.
-    pub request_scheme: String,
-    /// The origin URL and the `Host` it is asked for.
-    pub origin_identity: String,
-    /// Digest of every setting and module that can shape the fetch phase,
-    /// and of the build, so a build that rewrites bodies differently never
-    /// serves a copy an earlier one made. Empty for an asset route's answer.
-    pub fingerprint: String,
+/// A module that may answer for a file before core asks the file's origin.
+#[async_trait::async_trait(?Send)]
+pub trait AssetCacheModule: Send + Sync {
+    /// The answer for `file`, at the point core is about to ask its origin.
+    async fn answer(&self, services: &RuntimeServices, file: AssetFile<'_>) -> AssetAnswer;
 }
 
-impl AssetCacheKey {
-    /// A fixed-size key naming no part of the request.
+/// What core does with the module's answer.
+#[derive(Debug)]
+pub enum AssetAnswer {
+    /// Serves this in place of the origin's response, processed as that
+    /// response would be. Where the adapter does not stream responses, the
+    /// body must be whole, as the origin's would be.
+    Serve(Response<EdgeBody>),
+    /// The module asked the origin through [`AssetFile::origin`] and could
+    /// not reach it, so core answers as it does when its own origin request
+    /// fails.
+    OriginFailed(Report<PlatformError>),
+    /// Core asks the origin itself, as it does with no module selected.
+    AskOrigin,
+}
+
+/// Which of core's two paths offers a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetVia {
+    /// [`handle_publisher_request`](crate::publisher::handle_publisher_request),
+    /// for a file the publisher's origin sends.
+    Publisher,
+    /// [`handle_asset_proxy_request`](crate::proxy::handle_asset_proxy_request),
+    /// for a file an asset route fetches.
+    Route,
+}
+
+/// A `GET` core is about to send to a file's origin, with what core knows of
+/// the reader's request. Core makes it, and a module reads its fields.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct AssetFile<'a> {
+    /// The path that offers the file.
+    pub via: AssetVia,
+    /// Whether the reader's request carries `Authorization`.
+    pub carries_authorization: bool,
+    /// Whether the reader's request carries `Cookie`.
+    pub carries_cookie: bool,
+    /// The host the reader asked, empty when the request names none.
+    pub host: &'a str,
+    /// The scheme the reader asked over.
+    pub scheme: &'a str,
+    /// Whether the reader's request is for a document, such as a page or a
+    /// frame.
+    pub is_document: bool,
+    /// Whether the request, as core will send it, asks for the origin's own
+    /// answer, by a range, a conditional header, or a `Cache-Control` or
+    /// `Pragma` that asks for the origin. On the publisher path also when a
+    /// module left state on the request or an integration marked its
+    /// response personalized.
+    pub asks_for_origin: bool,
+    /// The URL core asks of the origin, with its query.
+    pub origin_url: &'a str,
+    /// What names the origin beyond the URL, so one origin's file is never
+    /// taken for another's.
+    pub origin_identity: &'a str,
+    /// The request core would send to the origin.
+    pub origin: OriginRequest,
+}
+
+/// The request core would send to the file's origin, a `GET` with no body.
+#[derive(Debug, Clone)]
+pub struct OriginRequest {
+    uri: Uri,
+    headers: HeaderMap,
+    backend_name: String,
+    cache_intent: PlatformCacheIntent,
+    stream_response: bool,
+}
+
+impl OriginRequest {
+    /// What `request` asks for, being the request core sends itself when the
+    /// module passes the file back, or `None` when it is not a `GET` with no
+    /// body.
     ///
-    /// Each input is written with its length before it, so no two sets of
-    /// inputs run together into the same key.
+    /// A request that describes a body, by `Content-Length` or
+    /// `Transfer-Encoding`, is never offered, because a module's load sends
+    /// it with no body, and a load the origin refuses is the answer to every
+    /// request waiting on it.
+    pub(crate) fn of(request: &PlatformHttpRequest) -> Option<Self> {
+        let headers = request.request.headers();
+        if request.request.method() != Method::GET
+            || headers.contains_key(header::CONTENT_LENGTH)
+            || headers.contains_key(header::TRANSFER_ENCODING)
+        {
+            return None;
+        }
+        Some(Self {
+            uri: request.request.uri().clone(),
+            headers: headers.clone(),
+            backend_name: request.backend_name.clone(),
+            cache_intent: request.cache_intent.clone(),
+            stream_response: request.stream_response,
+        })
+    }
+
+    /// The request core would send, built anew for each call.
     #[must_use]
-    pub fn to_cache_key(&self) -> String {
-        use crate::platform::hash_length_prefixed as push;
-
-        let mut hasher = Sha256::new();
-        push(&mut hasher, b"ts-asset-cache");
-        push(&mut hasher, &ASSET_SCHEMA_VERSION.to_be_bytes());
-        push(&mut hasher, self.request_scheme.as_bytes());
-        push(&mut hasher, self.request_host.as_bytes());
-        push(&mut hasher, self.origin_identity.as_bytes());
-        push(&mut hasher, self.url.as_bytes());
-        push(&mut hasher, self.fingerprint.as_bytes());
-        format!(
-            "ts-asset-cache-v{ASSET_SCHEMA_VERSION}-{}",
-            hex::encode(hasher.finalize())
-        )
+    pub fn platform_request(&self) -> PlatformHttpRequest {
+        let mut request = Request::new(EdgeBody::empty());
+        *request.method_mut() = Method::GET;
+        *request.uri_mut() = self.uri.clone();
+        *request.headers_mut() = self.headers.clone();
+        let mut platform_request = PlatformHttpRequest::new(request, self.backend_name.clone());
+        platform_request.cache_intent = self.cache_intent.clone();
+        platform_request.stream_response = self.stream_response;
+        platform_request
     }
-}
 
-/// One kept response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssetCopy {
-    /// The headers a reader is served, as the fetch phase left them.
-    pub headers: Vec<(String, String)>,
-    /// Whether the body is kept without its `Content-Encoding`. Every copy is
-    /// kept as the origin sent it today, so this is false.
-    pub decoded: bool,
-    /// When the copy was made, in seconds since the Unix epoch.
-    pub made_at: u64,
-    /// The response's age when the copy was made, in seconds.
-    pub age_at_made: u64,
-    /// The body.
-    pub body: Vec<u8>,
-}
-
-impl AssetCopy {
-    /// The headers of `response_headers` a copy keeps, or `None` when one
-    /// cannot be written down, as a value that is not visible text cannot.
-    ///
-    /// `Content-Encoding` is left out of a decoded copy, which holds identity
-    /// bytes.
+    /// The URI the request asks for.
     #[must_use]
-    pub fn kept_headers(
-        response_headers: &http::HeaderMap,
-        decoded: bool,
-    ) -> Option<Vec<(String, String)>> {
-        let mut kept = Vec::new();
-        for (name, value) in response_headers {
-            if NOT_KEPT.contains(&name.as_str()) || (decoded && name == header::CONTENT_ENCODING) {
-                continue;
-            }
-            let value = value.to_str().ok()?;
-            kept.push((name.as_str().to_owned(), value.to_owned()));
-        }
-        Some(kept)
+    pub fn uri(&self) -> &Uri {
+        &self.uri
     }
 
-    /// The response this copy is served as, `now` seconds since the Unix
-    /// epoch, its `Age` counting the time it has been kept.
-    pub fn into_response(self, now: u64) -> Response<EdgeBody> {
-        let mut response = Response::new(EdgeBody::empty());
-        *response.status_mut() = StatusCode::OK;
-        for (name, value) in &self.headers {
-            // Both were checked when the copy was read.
-            if let (Ok(name), Ok(value)) = (
-                HeaderName::from_bytes(name.as_bytes()),
-                HeaderValue::from_str(value),
-            ) {
-                response.headers_mut().append(name, value);
-            }
-        }
-        let age = self
-            .age_at_made
-            .saturating_add(now.saturating_sub(self.made_at));
-        response
-            .headers_mut()
-            .insert(header::AGE, HeaderValue::from(age));
-        response.headers_mut().insert(
-            header::CONTENT_LENGTH,
-            HeaderValue::from(self.body.len() as u64),
-        );
-        *response.body_mut() = EdgeBody::from(self.body);
-        response
-    }
-}
-
-/// What the asset cache holds for one request's values.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AssetEntry {
-    /// A response every request with the same values may be served.
-    Copy(AssetCopy),
-    /// The origin's response for these values may not be shared, so each
-    /// request fetches its own. Held briefly, so the requests that follow do
-    /// not wait on a load that ends the same way.
-    NotShareable,
-}
-
-/// The first byte of a held [`AssetEntry`].
-const ENTRY_NOT_SHAREABLE: u8 = 0;
-const ENTRY_COPY: u8 = 1;
-
-/// Why a held asset entry could not be read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
-pub enum AssetCacheMiss {
-    /// Written by a build keeping another format.
-    #[display("the kept asset was written in another format")]
-    OtherFormat,
-    /// Unreadable, or shorter than it says it is.
-    #[display("the kept asset is unreadable")]
-    Unreadable,
-}
-
-impl core::error::Error for AssetCacheMiss {}
-
-impl AssetEntry {
-    /// The bytes the cache holds for this entry, being a kind byte, then for a
-    /// copy the length of its description as a little-endian `u32`, the
-    /// description, one line per field, and the body.
+    /// The headers the request carries, which hold the values `Vary` names.
     #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
-        match self {
-            Self::NotShareable => vec![ENTRY_NOT_SHAREABLE],
-            Self::Copy(copy) => {
-                let mut description = format!(
-                    "v={ASSET_SCHEMA_VERSION}\nd={}\nt={}\na={}\nlen={}",
-                    u8::from(copy.decoded),
-                    copy.made_at,
-                    copy.age_at_made,
-                    copy.body.len()
-                );
-                for (name, value) in &copy.headers {
-                    description.push_str(&format!("\nh={name}:{value}"));
-                }
-                let length = u32::try_from(description.len()).unwrap_or(u32::MAX);
-                let mut bytes = Vec::with_capacity(5 + description.len() + copy.body.len());
-                bytes.push(ENTRY_COPY);
-                bytes.extend_from_slice(&length.to_le_bytes());
-                bytes.extend_from_slice(description.as_bytes());
-                bytes.extend_from_slice(&copy.body);
-                bytes
-            }
-        }
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
     }
+}
 
-    /// The entry `bytes` hold.
-    ///
-    /// # Errors
-    ///
-    /// When the bytes are not an entry this build wrote.
-    pub fn decode(bytes: &[u8]) -> Result<Self, AssetCacheMiss> {
-        match bytes.split_first() {
-            Some((&ENTRY_NOT_SHAREABLE, [])) => Ok(Self::NotShareable),
-            Some((&ENTRY_COPY, rest)) => {
-                let (length, rest) = rest
-                    .split_first_chunk::<4>()
-                    .ok_or(AssetCacheMiss::Unreadable)?;
-                let length = usize::try_from(u32::from_le_bytes(*length))
-                    .map_err(|_| AssetCacheMiss::Unreadable)?;
-                if rest.len() < length {
-                    return Err(AssetCacheMiss::Unreadable);
-                }
-                let (description, body) = rest.split_at(length);
-                let description =
-                    std::str::from_utf8(description).map_err(|_| AssetCacheMiss::Unreadable)?;
-                decode_copy(description, body).map(Self::Copy)
-            }
-            _ => Err(AssetCacheMiss::Unreadable),
+#[cfg(any(test, feature = "test-utils"))]
+impl<'a> AssetFile<'a> {
+    /// A file offered on `via` for `origin_url`, with nothing set that keeps
+    /// it from a copy, which a module's test changes field by field.
+    #[must_use]
+    pub fn for_test(
+        via: AssetVia,
+        host: &'a str,
+        origin_url: &'a str,
+        origin: OriginRequest,
+    ) -> Self {
+        Self {
+            via,
+            carries_authorization: false,
+            carries_cookie: false,
+            host,
+            scheme: "https",
+            is_document: false,
+            asks_for_origin: false,
+            origin_url,
+            origin_identity: origin_url,
+            origin,
         }
     }
 }
 
-fn decode_copy(description: &str, body: &[u8]) -> Result<AssetCopy, AssetCacheMiss> {
-    let unreadable = AssetCacheMiss::Unreadable;
-    let mut version = None;
-    let mut decoded = None;
-    let mut made_at = None;
-    let mut age_at_made = None;
-    let mut length = None;
-    let mut headers = Vec::new();
-    for line in description.split('\n') {
-        let (field, value) = line.split_once('=').ok_or(unreadable)?;
-        let once = |held: Option<u64>| held.is_none().then_some(()).ok_or(unreadable);
-        match field {
-            "v" => {
-                once(version)?;
-                version = Some(value.parse::<u64>().map_err(|_| unreadable)?);
-            }
-            "d" => {
-                decoded = Some(match value {
-                    "0" if decoded.is_none() => false,
-                    "1" if decoded.is_none() => true,
-                    _ => return Err(unreadable),
-                });
-            }
-            "t" => {
-                once(made_at)?;
-                made_at = Some(value.parse().map_err(|_| unreadable)?);
-            }
-            "a" => {
-                once(age_at_made)?;
-                age_at_made = Some(value.parse().map_err(|_| unreadable)?);
-            }
-            "len" => {
-                once(length)?;
-                length = Some(value.parse().map_err(|_| unreadable)?);
-            }
-            "h" => {
-                let (name, header_value) = value.split_once(':').ok_or(unreadable)?;
-                let parsed = HeaderName::from_bytes(name.as_bytes()).map_err(|_| unreadable)?;
-                if parsed.as_str() != name || NOT_KEPT.contains(&name) {
-                    return Err(unreadable);
-                }
-                HeaderValue::from_str(header_value).map_err(|_| unreadable)?;
-                headers.push((name.to_owned(), header_value.to_owned()));
-            }
-            _ => return Err(unreadable),
+#[cfg(any(test, feature = "test-utils"))]
+impl OriginRequest {
+    /// A `GET` of `uri` with `headers` to `backend_name`, with the platform's
+    /// default cache behavior, for a module's tests.
+    #[must_use]
+    pub fn for_test(
+        uri: Uri,
+        headers: HeaderMap,
+        backend_name: &str,
+        stream_response: bool,
+    ) -> Self {
+        Self {
+            uri,
+            headers,
+            backend_name: backend_name.to_owned(),
+            cache_intent: PlatformCacheIntent::Default,
+            stream_response,
         }
     }
-    if version.ok_or(unreadable)? != u64::from(ASSET_SCHEMA_VERSION) {
-        return Err(AssetCacheMiss::OtherFormat);
-    }
-    if length.ok_or(unreadable)? != body.len() as u64 {
-        return Err(unreadable);
-    }
-    Ok(AssetCopy {
-        headers,
-        decoded: decoded.ok_or(unreadable)?,
-        made_at: made_at.ok_or(unreadable)?,
-        age_at_made: age_at_made.ok_or(unreadable)?,
-        body: body.to_vec(),
-    })
 }
 
+/// Asset cache modules for core's own tests of the two paths.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
-    fn key() -> AssetCacheKey {
-        AssetCacheKey {
-            url: "https://origin.example.com/assets/site.css".to_owned(),
-            request_host: "www.example.com".to_owned(),
-            request_scheme: "https".to_owned(),
-            origin_identity: "https://origin.example.com\0origin.example.com".to_owned(),
-            fingerprint: "abc123".to_owned(),
+    /// What a module was offered, kept beyond the call that offered it.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Offered {
+        pub(crate) via: AssetVia,
+        pub(crate) carries_authorization: bool,
+        pub(crate) carries_cookie: bool,
+        pub(crate) host: String,
+        pub(crate) scheme: String,
+        pub(crate) is_document: bool,
+        pub(crate) asks_for_origin: bool,
+        pub(crate) origin_url: String,
+        pub(crate) origin_identity: String,
+        pub(crate) origin: OriginRequest,
+    }
+
+    impl Offered {
+        fn of(file: &AssetFile<'_>) -> Self {
+            Self {
+                via: file.via,
+                carries_authorization: file.carries_authorization,
+                carries_cookie: file.carries_cookie,
+                host: file.host.to_owned(),
+                scheme: file.scheme.to_owned(),
+                is_document: file.is_document,
+                asks_for_origin: file.asks_for_origin,
+                origin_url: file.origin_url.to_owned(),
+                origin_identity: file.origin_identity.to_owned(),
+                origin: file.origin.clone(),
+            }
         }
     }
 
-    fn copy() -> AssetCopy {
-        AssetCopy {
-            headers: vec![
-                ("content-type".to_owned(), "text/css".to_owned()),
-                ("vary".to_owned(), "Accept-Encoding".to_owned()),
-            ],
-            decoded: true,
-            made_at: 1_000,
-            age_at_made: 5,
-            body: b"body { color: red }".to_vec(),
+    /// How a test module answers every file it is offered.
+    enum Answering {
+        AskOrigin,
+        Serve(fn() -> Response<EdgeBody>),
+        OriginFailed,
+    }
+
+    /// An asset cache module that records each file it is offered and
+    /// answers every one the same way.
+    pub(crate) struct TestAssetCache {
+        answering: Answering,
+        offered: Mutex<Vec<Offered>>,
+    }
+
+    impl TestAssetCache {
+        fn answering(answering: Answering) -> Arc<Self> {
+            Arc::new(Self {
+                answering,
+                offered: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// A module that passes every file back to core.
+        pub(crate) fn asking_the_origin() -> Arc<Self> {
+            Self::answering(Answering::AskOrigin)
+        }
+
+        /// A module that serves what `response` makes for every file.
+        pub(crate) fn serving(response: fn() -> Response<EdgeBody>) -> Arc<Self> {
+            Self::answering(Answering::Serve(response))
+        }
+
+        /// A module whose own request to the origin fails for every file.
+        pub(crate) fn failing_to_reach_the_origin() -> Arc<Self> {
+            Self::answering(Answering::OriginFailed)
+        }
+
+        /// Every file offered so far, in order.
+        pub(crate) fn offered(&self) -> Vec<Offered> {
+            self.offered.lock().expect("should lock the offers").clone()
         }
     }
 
-    #[test]
-    fn every_input_changes_the_key_and_none_appears_in_it() {
-        let base = key().to_cache_key();
-        let changes: [fn(&mut AssetCacheKey); 5] = [
-            |key| key.url.push_str("?v=2"),
-            |key| key.request_host = "other.example.com".to_owned(),
-            |key| key.request_scheme = "http".to_owned(),
-            |key| key.origin_identity.push('x'),
-            |key| key.fingerprint = "def456".to_owned(),
-        ];
-        for change in changes {
-            let mut changed = key();
-            change(&mut changed);
-            assert_ne!(changed.to_cache_key(), base);
+    #[async_trait::async_trait(?Send)]
+    impl AssetCacheModule for TestAssetCache {
+        async fn answer(&self, _services: &RuntimeServices, file: AssetFile<'_>) -> AssetAnswer {
+            self.offered
+                .lock()
+                .expect("should lock the offers")
+                .push(Offered::of(&file));
+            match self.answering {
+                Answering::AskOrigin => AssetAnswer::AskOrigin,
+                Answering::Serve(response) => AssetAnswer::Serve(response()),
+                Answering::OriginFailed => {
+                    AssetAnswer::OriginFailed(Report::new(PlatformError::HttpClient))
+                }
+            }
         }
-        assert!(base.starts_with("ts-asset-cache-v1-"));
-        for named in ["example.com", "site.css", "abc123"] {
-            assert!(!base.contains(named), "the key names `{named}`: {base}");
-        }
-    }
-
-    #[test]
-    fn an_entry_reads_back_as_written() {
-        for entry in [AssetEntry::Copy(copy()), AssetEntry::NotShareable] {
-            assert_eq!(AssetEntry::decode(&entry.encode()), Ok(entry));
-        }
-    }
-
-    #[test]
-    fn a_short_foreign_or_other_format_entry_is_not_read() {
-        let bytes = AssetEntry::Copy(copy()).encode();
-        assert_eq!(
-            AssetEntry::decode(&bytes[..bytes.len() - 1]),
-            Err(AssetCacheMiss::Unreadable)
-        );
-        for foreign in [&b""[..], b"\x07", b"\x01\xff\xff", b"\x00extra"] {
-            assert!(AssetEntry::decode(foreign).is_err(), "{foreign:?}");
-        }
-        let other_version = String::from_utf8(bytes.clone())
-            .expect("the test copy is text")
-            .replacen("v=1", "v=9", 1);
-        assert_eq!(
-            AssetEntry::decode(other_version.as_bytes()),
-            Err(AssetCacheMiss::OtherFormat)
-        );
-    }
-
-    #[test]
-    fn a_copy_keeps_no_connection_cookie_or_length_header() {
-        let mut response = http::HeaderMap::new();
-        for (name, value) in [
-            ("content-type", "image/png"),
-            ("content-encoding", "gzip"),
-            ("set-cookie", "a=b"),
-            ("content-length", "10"),
-            ("age", "3"),
-            ("connection", "keep-alive"),
-            ("cache-control", "public, max-age=60"),
-        ] {
-            response.append(
-                HeaderName::from_static(name),
-                HeaderValue::from_static(value),
-            );
-        }
-
-        let raw = AssetCopy::kept_headers(&response, false).expect("should keep the headers");
-        let decoded = AssetCopy::kept_headers(&response, true).expect("should keep the headers");
-
-        let names = |kept: &[(String, String)]| -> Vec<String> {
-            kept.iter().map(|(name, _)| name.clone()).collect()
-        };
-        assert_eq!(
-            names(&raw),
-            ["content-type", "content-encoding", "cache-control"]
-        );
-        assert_eq!(
-            names(&decoded),
-            ["content-type", "cache-control"],
-            "a decoded copy's encoding is set for each reader"
-        );
-    }
-
-    #[test]
-    fn a_served_copy_counts_its_age_from_when_it_was_made() {
-        let response = copy().into_response(1_030);
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::AGE),
-            Some(&HeaderValue::from_static("35"))
-        );
-        assert_eq!(
-            response.headers().get(header::CONTENT_LENGTH),
-            Some(&HeaderValue::from_static("19"))
-        );
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE),
-            Some(&HeaderValue::from_static("text/css"))
-        );
     }
 }

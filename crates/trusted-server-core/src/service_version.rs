@@ -4,15 +4,13 @@
 //! when the build knows one, and `X-TS-Service-Version`, the version the
 //! adapter reports for the service, when it reports one, on every page the
 //! entry covers. A deployment that does not name it sends nothing about its
-//! versions on a page, because no adapter writes either header. What the
-//! build was made from and the platform's version are always in the
-//! attestation document, under `build` and `platform.serviceVersion`.
+//! versions on a page, because no adapter writes either header.
 
 use http::HeaderValue;
 
-use crate::attestation::UNKNOWN;
 use crate::constants::{HEADER_X_TS_SERVICE_VERSION, HEADER_X_TS_VERSION, TS_GIT_VERSION};
 use crate::middleware::{Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase};
+use crate::platform::UNKNOWN;
 
 /// The name an entry writes, and the integration the registry lists the
 /// middleware under.
@@ -76,9 +74,9 @@ fn header_value(what: &str, version: Option<&str>) -> Option<HeaderValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attestation::PlatformIdentity;
     use crate::integrations::IntegrationDocumentState;
     use crate::middleware::test_support;
+    use crate::platform::PlatformIdentity;
 
     fn action_for(git_version: Option<&'static str>, service_version: &str) -> MiddlewareAction {
         let platform = PlatformIdentity {

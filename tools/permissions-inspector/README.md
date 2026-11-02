@@ -4,10 +4,10 @@ A single-page tool that answers the question a policy owner actually
 has about a `permissions.yaml`: for a visitor in a given place, with given
 consent signals, which Data Uses are set?
 
-No policy ever ships with Trusted Server: the builder of a deployment
-chooses the `permissions.yaml` baked into their compiled image, the
-operator of that image can overlay another, and the visitor's own
-signals decide the rest at runtime. The repository carries sample
+No policy ships with Trusted Server and no adapter build carries one. A domain's
+settings name the publisher's own `permissions.yaml`, the file is
+supplied when the service is deployed, and the visitor's own signals
+decide the rest at runtime. The repository carries sample
 permissions files in `config/permissions/`, each naming itself with a
 top-level `name:` line, and the page lists whatever that directory
 holds. Choosing one is always explicit.
@@ -20,10 +20,11 @@ gets, the resulting permission per Data Use with the reason for each.
 
 ## The engine is the real code
 
-Step 3 is computed by trusted-server-core itself, compiled to
-WebAssembly and run in the page. The wrapper crate in `wasm/` exposes
-the production path (`build_context_from_signals` decodes the raw
-signals, `assemble_permissions` resolves the policy, and
+Step 3 is computed by trusted-server-core and the permission signal
+modules every adapter offers by default, compiled to WebAssembly and
+run in the page. The wrapper crate in `wasm/` exposes the production
+path (`read_consent` asks those modules to read the signals the page
+enters, `assemble_permissions` resolves the policy, and
 `PermissionMaps::from_yaml` validates files with the server's own error
 messages), so what the page shows is what the server does, and the page
 states the trusted-server version, branch, commit and date the engine

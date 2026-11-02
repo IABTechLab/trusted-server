@@ -132,7 +132,6 @@ export default withMermaid(
             { text: 'Request Signing', link: '/guide/request-signing' },
             { text: 'Key Rotation', link: '/guide/key-rotation' },
             { text: 'Proxy Signing', link: '/guide/proxy-signing' },
-            { text: 'Attestation', link: '/guide/attestation' },
           ],
         },
         {

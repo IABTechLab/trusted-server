@@ -1360,7 +1360,7 @@ fn render(
 ) -> Result<String, embed::ApplyError> {
     let manifest = manifest_url
         .filter(|url| !url.is_empty())
-        .and_then(|url| article.head_close.map(|offset| (url, offset)));
+        .zip(article.head_close);
     embed::apply_plan(html, &article.boundary, plan, manifest, max_output_bytes)
 }
 

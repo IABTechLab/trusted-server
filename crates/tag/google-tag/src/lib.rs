@@ -1912,13 +1912,13 @@ mod tests {
     #[test]
     fn a_page_for_a_reader_who_has_not_agreed_carries_no_google_loader() {
         // Arrange
-        // Under the policy core ships, a reader in Germany whose request
-        // carries no signal is still waiting to allow storage on the device,
-        // and a reader in California who sends an opt-out, such as Global
-        // Privacy Control, has it revoked. The page carries its own loader for
-        // the configured tag as well.
+        // Under the repository's sample policy, a reader in Germany whose
+        // request carries no signal is still waiting to allow storage on the
+        // device, and a reader in California who sends an opt-out, such as
+        // Global Privacy Control, has it revoked. The page carries its own
+        // loader for the configured tag as well.
         let settings = settings_with_every_id();
-        let policy = PermissionMaps::standard();
+        let policy = PermissionMaps::sample();
         let readers = [
             ("not yet agreed", policy.baseline(Some("DE"), None)),
             (

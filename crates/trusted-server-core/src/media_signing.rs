@@ -99,7 +99,7 @@ use crate::integrations::IntegrationRequestState;
 use crate::middleware::{ResponseHeader, media_type_of};
 use crate::platform::{CacheSpec, LoadError, LoadedValue, RuntimeServices, StoreKey};
 use crate::response_privacy::cache_control_forbids_shared_storage;
-use crate::settings::{ASSETS_CACHE, Settings};
+use crate::settings::Settings;
 
 mod large;
 
@@ -107,6 +107,19 @@ pub(crate) use large::{LargeAnswer, PinnedOrigin};
 pub use large::{
     LargeMediaJob, LargeMediaSigning, LargeSignedMedia, MediaSourceError, SourceVersion,
     VersionedMediaSource,
+};
+
+/// The loading cache a media signer declares for kept signed representations.
+///
+/// A signer builder declares this feature through `with_cache_features`;
+/// `[cache.assets]` selects its loading cache and lifetimes. Raw origin files
+/// belong to the separate cache declared by the selected asset cache module.
+pub const ASSETS_CACHE: &str = "assets";
+
+const ASSET_DEFAULT_LIFETIMES: crate::platform::CacheLifetimes = crate::platform::CacheLifetimes {
+    memory: Duration::from_secs(5),
+    store: Duration::from_secs(60 * 60),
+    store_idle: Duration::from_secs(24 * 60 * 60),
 };
 
 /// A module that signs the exact bytes of a binary representation.
@@ -794,8 +807,11 @@ impl MediaClaim {
                 name: ASSETS_CACHE,
                 lifetimes: settings
                     .cache
-                    .assets
-                    .lifetimes(crate::publisher::ASSET_DEFAULT_LIFETIMES),
+                    .declared
+                    .get(ASSETS_CACHE)
+                    .map_or(ASSET_DEFAULT_LIFETIMES, |config| {
+                        config.lifetimes(ASSET_DEFAULT_LIFETIMES)
+                    }),
                 memory_entries: KEPT_MEMORY_ENTRIES,
             },
             shared,
@@ -1330,10 +1346,10 @@ impl MediaClaim {
             parts.headers.remove(name);
         }
         let digest = Sha256::digest(&signed.bytes);
-        let etag = signed_entity_tag(digest.as_slice());
+        let etag = signed_entity_tag(&digest);
         let repr_digest = format!(
             "sha-256=:{}:",
-            base64::engine::general_purpose::STANDARD.encode(digest.as_slice())
+            base64::engine::general_purpose::STANDARD.encode(digest)
         );
         let mut representation = HeaderMap::new();
         representation.insert(header::CONTENT_TYPE, signed.content_type);
@@ -1557,7 +1573,7 @@ impl MediaClaim {
         StoreKey::new(
             services.server_key_prefix(),
             ASSETS_CACHE,
-            format!("media-{}", hex::encode(digest.finalize().as_slice())),
+            format!("media-{}", hex::encode(digest.finalize())),
         )
     }
 
@@ -1771,7 +1787,7 @@ fn decode_kept(bytes: &Bytes, now: u64) -> Option<Response<EdgeBody>> {
         headers.append(name, value);
     }
     let body = bytes.slice(bytes.len() - reader.rest.len()..);
-    let expected = signed_entity_tag(Sha256::digest(&body).as_slice());
+    let expected = signed_entity_tag(&Sha256::digest(&body));
     if header_text(&headers, &header::ETAG) != expected {
         return None;
     }

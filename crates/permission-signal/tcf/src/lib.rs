@@ -506,9 +506,9 @@ mod tests {
     use trusted_server_core::permission_signal::SignalInput;
     use trusted_server_core::permissions::{Acquisition, PermissionMaps, SignalPolicy};
 
-    /// The shipped policy, under which a TCF record answers.
-    fn shipped_policy() -> &'static SignalPolicy {
-        PermissionMaps::standard().signals()
+    /// The repository's sample policy, under which a TCF record answers.
+    fn sample_policy() -> &'static SignalPolicy {
+        PermissionMaps::sample().signals()
     }
 
     /// A decoded record consenting to the given 1-indexed purposes, with
@@ -742,7 +742,7 @@ mod tests {
         let consent = ConsentContext::default().with_record(read);
         for permission in mapped().iter() {
             assert_eq!(
-                answer(&consent, shipped_policy(), permission),
+                answer(&consent, sample_policy(), permission),
                 ConsentSignal::Revoke,
                 "every purpose the module maps is refused, {} included",
                 permission.as_str()
@@ -780,7 +780,7 @@ mod tests {
         let consent = ConsentContext::default().with_record(read);
         for permission in mapped().iter() {
             assert_eq!(
-                answer(&consent, shipped_policy(), permission),
+                answer(&consent, sample_policy(), permission),
                 ConsentSignal::Revoke,
                 "every purpose the module maps is refused, {} included",
                 permission.as_str()
@@ -965,7 +965,7 @@ mod tests {
         assert_eq!(
             answer(
                 &with_record(&[1]),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             ConsentSignal::Grant,
@@ -978,7 +978,7 @@ mod tests {
         assert_eq!(
             answer(
                 &with_record(&[1]),
-                shipped_policy(),
+                sample_policy(),
                 Permission::SelectPersonalisedAds
             ),
             ConsentSignal::Revoke,
@@ -991,7 +991,7 @@ mod tests {
         let sale = Permission::from_identifier("disclosure.sale")
             .expect("should be a known Data Use with no TCF purpose");
         assert_eq!(
-            answer(&with_record(&[1]), shipped_policy(), sale),
+            answer(&with_record(&[1]), sample_policy(), sale),
             ConsentSignal::Neutral,
             "TCF has nothing to say about a Data Use none of its purposes grant"
         );
@@ -1002,7 +1002,7 @@ mod tests {
         assert_eq!(
             answer(
                 &ConsentContext::default(),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             ConsentSignal::Neutral,
@@ -1014,7 +1014,7 @@ mod tests {
     fn an_unreadable_tc_string_is_this_modules_refusal_and_an_expired_one_is_not() {
         let unreadable = with_status(SignalStatus::Unreadable);
         assert_eq!(
-            answer(&unreadable, shipped_policy(), Permission::StoreOnDevice),
+            answer(&unreadable, sample_policy(), Permission::StoreOnDevice),
             ConsentSignal::Revoke,
             "an unreadable record refuses the Data Uses this scheme covers"
         );
@@ -1022,7 +1022,7 @@ mod tests {
             .find(|permission| permission.as_str() == "advertising_marketing.communications.email")
             .expect("the taxonomy should carry the email channel");
         assert_eq!(
-            answer(&unreadable, shipped_policy(), email),
+            answer(&unreadable, sample_policy(), email),
             ConsentSignal::Neutral,
             "and says nothing about a Data Use no purpose maps to"
         );
@@ -1038,7 +1038,7 @@ mod tests {
         assert_eq!(
             answer(
                 &with_status(SignalStatus::NotDecoded),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             ConsentSignal::Revoke,
@@ -1047,7 +1047,7 @@ mod tests {
         assert_eq!(
             answer(
                 &with_status(SignalStatus::Expired),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             ConsentSignal::Neutral,
@@ -1091,7 +1091,7 @@ mod tests {
 
     #[test]
     fn declares_exactly_the_data_uses_a_purpose_maps_to() {
-        let declared = TcfModule::new().grants(shipped_policy());
+        let declared = TcfModule::new().grants(sample_policy());
         assert!(
             declared.contains(Permission::StoreOnDevice),
             "purpose 1 maps to storage, so storage is grantable"
@@ -1143,7 +1143,7 @@ mod tests {
         assert!(
             withdraws(
                 &with_record(&[4]),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             "refusing Purpose 1 withdraws storage"
@@ -1151,7 +1151,7 @@ mod tests {
         assert!(
             !withdraws(
                 &with_record(&[1]),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             "consenting to Purpose 1 is not a withdrawal"
@@ -1159,7 +1159,7 @@ mod tests {
         assert!(
             !withdraws(
                 &with_record(&[]),
-                shipped_policy(),
+                sample_policy(),
                 Permission::SelectPersonalisedAds
             ),
             "no other permission is ever withdrawn, refused or not"
@@ -1167,7 +1167,7 @@ mod tests {
         assert!(
             !withdraws(
                 &ConsentContext::default(),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             "and no record is never a withdrawal"
@@ -1175,7 +1175,7 @@ mod tests {
         assert!(
             !withdraws(
                 &with_status(SignalStatus::Expired),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             "an expired record is no record"

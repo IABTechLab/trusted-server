@@ -60,16 +60,16 @@ use sha2::{Digest as _, Sha256};
 use web_time::Instant;
 
 use super::{
-    Delivery, KeptReader, MediaClaim, MediaSigner, MediaSigningFailure, OriginFacts, Outcome,
-    VariantIdentity, carries_manifest_link, digits, evaluate, header_text, is_reserved_header,
-    single_entity_tag, source_reference, strip_representation_preconditions, to_u64,
+    ASSETS_CACHE, Delivery, KeptReader, MediaClaim, MediaSigner, MediaSigningFailure, OriginFacts,
+    Outcome, VariantIdentity, carries_manifest_link, digits, evaluate, header_text,
+    is_reserved_header, single_entity_tag, source_reference, strip_representation_preconditions,
+    to_u64,
 };
 use crate::middleware::ResponseHeader;
 use crate::origin_auth::OriginSigning;
 use crate::platform::{
     LoadError, LoadedValue, Loader, PlatformHttpRequest, RuntimeServices, StoreKey,
 };
-use crate::settings::ASSETS_CACHE;
 
 /// What [`MediaSigner::sign_large`](super::MediaSigner::sign_large) returns.
 pub type LargeMediaSigning<'a> =
@@ -1697,7 +1697,7 @@ impl MediaClaim {
         StoreKey::new(
             services.server_key_prefix(),
             ASSETS_CACHE,
-            format!("media-large-{}", hex::encode(digest.finalize().as_slice())),
+            format!("media-large-{}", hex::encode(digest.finalize())),
         )
     }
 }

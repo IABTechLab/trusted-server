@@ -1619,7 +1619,9 @@ impl crate::streaming_processor::StreamProcessor for DocumentSeal {
         self.0.update(chunk);
         let mut output = chunk.to_vec();
         if is_last {
-            output.extend_from_slice(format!("\nsha256:{:x}", self.0.finalize_reset()).as_bytes());
+            output.extend_from_slice(
+                format!("\nsha256:{}", hex::encode(self.0.finalize_reset())).as_bytes(),
+            );
         }
         Ok(output)
     }
@@ -1672,7 +1674,7 @@ fn finalizing_document_sees_every_transform_even_when_registered_first() {
         let (document, seal) = output
             .rsplit_once("\nsha256:")
             .expect("should carry a seal");
-        assert_eq!(seal, format!("{:x}", Sha256::digest(document.as_bytes())));
+        assert_eq!(seal, hex::encode(Sha256::digest(document.as_bytes())));
         assert!(document.ends_with("\nfirst\nsecond"));
         assert!(document.contains("<meta name=\"final-input\">"));
     }

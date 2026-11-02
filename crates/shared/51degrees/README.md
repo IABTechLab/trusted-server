@@ -10,8 +10,10 @@ one and on none of the others, and none of it is in core.
 - `license`: the license key every server side call presents, and the
   refusal when the table has none.
 - `client`: the one call to the cloud service for a request's evidence and
-  the answer it gives, held in the loading cache so a question many requests
-  ask at once is asked once.
+  the answer it gives, loaded through the loading cache. Where a deployment
+  links a loading cache module the answer is held there, so a question many
+  requests ask at once is asked once. A stock build links none, so there
+  every call asks the service.
 - `evidence`: the evidence a request gives the call, being the `User-Agent`
   and the `Sec-CH-UA` hints alone.
 - `engine_cache`: the cache the answers are held in, `51degrees-answers`,

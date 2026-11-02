@@ -30,13 +30,14 @@ fn reply(
         .expect("should build probe response"))
 }
 
-/// The services the request path builds for `ctx`, with default settings and
-/// no permission signal module.
+/// The services the request path builds for `ctx`, with default settings, no
+/// permission signal module and the sample permission policy.
 fn services_for(ctx: &RequestContext) -> trusted_server_core::platform::RuntimeServices {
     build_runtime_services(
         ctx,
         &trusted_server_core::settings::Settings::default(),
         &std::sync::Arc::default(),
+        &trusted_server_core::permissions::PermissionPolicy::sample(),
     )
 }
 
@@ -154,7 +155,10 @@ fn open_kv_handle_rejects_a_path_that_cannot_be_created() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn application_serves_requests_with_and_without_runtime_kv() {
-    let settings = trusted_server_core::html_processor::test_support::page_settings("");
+    // A loaded domain carries its policy, and this test decides under the
+    // repository's sample.
+    let settings = trusted_server_core::html_processor::test_support::page_settings("")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
     let dir = tempfile::tempdir().expect("should create temp dir");
     let handle = open_kv_handle(&dir.path().join("kv.redb")).expect("should open KV");
 

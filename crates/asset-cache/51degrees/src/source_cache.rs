@@ -1,5 +1,5 @@
-//! The cache that holds what the fetch phase made of a source's response,
-//! keyed the way the source says its responses vary.
+//! The cache that holds a source's responses, keyed the way the source says
+//! its responses vary.
 //!
 //! A request's address is what it asks the source for. The first response for
 //! an address records the request headers its `Vary` names, and that record is
@@ -29,10 +29,11 @@ use http::HeaderMap;
 use http::header::{self, HeaderName};
 use sha2::{Digest as _, Sha256};
 
-use crate::platform::{
+use trusted_server_core::platform::{
     CacheSpec, LoadError, LoadedValue, Loader, RuntimeServices, ServerKeyPrefix, StoreKey,
-    hash_length_prefixed as push,
 };
+
+use crate::hash::hash_length_prefixed as push;
 
 /// What a source's response says it varies on, read from its `Vary`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +83,7 @@ impl SourceVary {
     /// The same, leaving out `name`, a header whose value never selects a
     /// different copy, such as `Accept-Encoding` for a copy kept decoded and
     /// encoded for each reader as it is served.
+    #[cfg(test)]
     #[must_use]
     pub fn without(self, name: &HeaderName) -> Self {
         match self {
@@ -162,22 +164,12 @@ impl SourceAddress {
             format!("{}-{variant}", self.key),
         )
     }
-
-    /// The key this address's record is held under in `cache`, for a test.
-    #[cfg(test)]
-    #[must_use]
-    pub fn record_key_for_test(&self, cache: &SourceCache) -> StoreKey {
-        self.record_key(cache)
-    }
-
-    /// The key one of this address's copies is held under in `cache`, for a
-    /// test.
-    #[cfg(test)]
-    #[must_use]
-    pub fn copy_key_for_test(&self, cache: &SourceCache, variant: &str) -> StoreKey {
-        self.copy_key(cache, variant)
-    }
 }
+
+/// The bytes of a variant's digest its key holds, half the digest. 128 bits
+/// keeps two variants of one address from ever sharing a key, and a key is
+/// read by stores that refuse long ones.
+const VARIANT_DIGEST_BYTES: usize = 16;
 
 /// Which copy a request is served, as a digest of its values for `names` and
 /// of what the publisher's rule declared for it.
@@ -187,7 +179,7 @@ impl SourceAddress {
 /// different order.
 fn variant(names: &[String], headers: &HeaderMap, declared: Option<&str>) -> String {
     let mut hasher = Sha256::new();
-    push(&mut hasher, b"torque-variant-v1");
+    push(&mut hasher, b"ts-asset-variant-v1");
     push(&mut hasher, &(names.len() as u64).to_be_bytes());
     for name in names {
         push(&mut hasher, name.as_bytes());
@@ -213,9 +205,7 @@ fn variant(names: &[String], headers: &HeaderMap, declared: Option<&str>) -> Str
             push(&mut hasher, token.as_bytes());
         }
     }
-    // Half the digest. 128 bits keeps two variants of one address from ever
-    // sharing a key, and a key is read by stores that refuse long ones.
-    hex::encode(&hasher.finalize()[..16])
+    hex::encode(&hasher.finalize()[..VARIANT_DIGEST_BYTES])
 }
 
 /// The two loading caches one kind of response uses, one holding each
@@ -357,7 +347,7 @@ pub async fn get_or_fetch(lookup: &Lookup<'_>, fetch: Fetch) -> Result<Found, Lo
 /// varies on. The fetching request's copy is written under its own values
 /// first, so every request waiting on the record finds it.
 fn record_loader(lookup: &Lookup<'_>, fetch: Fetch, own: Own) -> Loader {
-    let services = lookup.services.clone();
+    let services = lookup.services.clone().without_connection();
     let cache = lookup.cache.clone();
     let address = lookup.address.clone();
     let headers = lookup.headers.clone();
@@ -396,7 +386,7 @@ fn record_loader(lookup: &Lookup<'_>, fetch: Fetch, own: Own) -> Loader {
 /// it, and the record is dropped so the next request learns what the source
 /// varies on now.
 fn copy_loader(lookup: &Lookup<'_>, names: Vec<String>, fetch: Fetch, own: Own) -> Loader {
-    let services = lookup.services.clone();
+    let services = lookup.services.clone().without_connection();
     let cache = lookup.cache.clone();
     let address = lookup.address.clone();
     let not_shareable = lookup.not_shareable.clone();
@@ -427,7 +417,7 @@ mod tests {
     use http::HeaderValue;
 
     use super::*;
-    use crate::platform::{
+    use trusted_server_core::platform::{
         CacheLifetimes,
         test_support::{MemoryLoadingCache, StubHttpClient, build_services_with_http_client},
     };
@@ -520,7 +510,7 @@ mod tests {
 
     #[test]
     fn record_and_copy_keys_follow_the_publisher() {
-        crate::prefix::test_support::assert_keys_follow_the_publisher(|domain| {
+        trusted_server_core::prefix::test_support::assert_keys_follow_the_publisher(|domain| {
             let address =
                 SourceAddress::new(ServerKeyPrefix::new("ts", domain), "address".to_owned());
             format!(

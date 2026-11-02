@@ -10,11 +10,13 @@ compatibility_flags = ["nodejs_compat", "cache_option_enabled"]
 binding = "TRUSTED_SERVER_KV"
 id = "ci-local-kv"
 
-[vars]
-# Placeholder replaced by the integration test harness with a JSON object that
-# contains the runtime Trusted Server app-config blob envelope.
-TRUSTED_SERVER_CONFIG = "{}"
+# The config store, which the integration harness seeds with the settings
+# blob before `wrangler dev` starts.
+[[kv_namespaces]]
+binding = "trusted_server_config"
+id = "ci-local-config"
 
+[vars]
 # Fictitious integration-only secret values. `worker::Env::secret` reads these
 # string bindings in local Wrangler runs; production values are provisioned with
 # `wrangler secret put` instead of being committed to a manifest.

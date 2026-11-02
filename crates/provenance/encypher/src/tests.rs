@@ -123,6 +123,22 @@ fn a_selected_and_placed_module_registers_its_middleware_and_media_signer() {
 }
 
 #[test]
+fn the_signer_declares_its_retained_media_cache() {
+    let mut settings = placed();
+    settings.cache.declared.insert(
+        "assets".to_owned(),
+        trusted_server_core::settings::LoadingCacheConfig {
+            store_seconds: Some(120),
+            ..Default::default()
+        },
+    );
+    let builders = [builder()];
+    assert_eq!(builders[0].cache_features(), &["assets"]);
+    trusted_server_core::integrations::loading_caches_from(&settings, &builders)
+        .expect("should accept the signer's existing retained-cache configuration");
+}
+
+#[test]
 fn a_module_named_in_no_serve_entry_is_refused() {
     let settings = page_settings(&module_settings(&table(), false));
 

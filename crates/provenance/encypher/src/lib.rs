@@ -346,6 +346,7 @@ const SUPPLIED_MIDDLEWARE: &[SuppliedMiddleware] = &[
 pub fn builder() -> IntegrationBuilder {
     IntegrationBuilder::new(INTEGRATION_ID, env!("CARGO_PKG_NAME"), register, validate)
         .with_module_name(MODULE)
+        .with_cache_features(&[trusted_server_core::media_signing::ASSETS_CACHE])
         .with_secret_settings(SECRET_SETTINGS)
         .with_middleware(SUPPLIED_MIDDLEWARE)
         // Removes every preparation snapshot capability from every request,

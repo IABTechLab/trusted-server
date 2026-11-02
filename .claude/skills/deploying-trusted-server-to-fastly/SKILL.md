@@ -28,7 +28,7 @@ For each shared-name store a service needs:
    `fastly resource-link create --service-id <SID> --version <v> --resource-id <store-id> --name trusted_server_config`
 3. Push config into the scoped store with the name override, so the write cannot
    land in the shared default:
-   `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<service>_ts_config ts config push --adapter fastly --app-config <file>`
+   `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<service>_ts_config ts config push --adapter fastly --app-config <file> --permissions <policy file>`
 
 At runtime the service opens `trusted_server_config` and gets the linked physical
 store, so no other service is touched. Apply the same physical-name-per-service

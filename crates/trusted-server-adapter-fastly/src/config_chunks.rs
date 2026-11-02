@@ -7,6 +7,8 @@
 //! checks every length and hash, so the rest of the service only ever sees
 //! whole documents.
 
+use core::fmt::Write as _;
+
 use error_stack::Report;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -133,7 +135,12 @@ pub(crate) fn whole_entry(
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(hex, "{byte:02x}").expect("should write hex digit to string");
+    }
+    hex
 }
 
 fn refused<T>(message: String) -> Result<T, Report<PlatformError>> {

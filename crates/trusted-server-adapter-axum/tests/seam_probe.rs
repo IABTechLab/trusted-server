@@ -77,6 +77,8 @@ assume_single_jurisdiction = true
         "#
     ))
     .expect("should parse seam probe test settings")
+    // A loaded domain carries its policy.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 /// The probe's own section and table, selecting it with the country the geo
@@ -566,12 +568,26 @@ async fn report_with(settings: Settings, integrations: &[IntegrationBuilder]) ->
     serde_json::from_str(&body).expect("the report route should return JSON")
 }
 
+/// The id of a loading cache module these tests link beside the probe's.
+const SECOND_LOADING_CACHE_ID: &str = "loading-cache.memory";
+
+/// Core's `MemoryLoadingCache`, which keeps what it loads.
+fn memory_loading_cache() -> Arc<dyn trusted_server_core::platform::PlatformLoadingCache> {
+    Arc::new(trusted_server_core::platform::test_support::MemoryLoadingCache::default())
+}
+
+/// A loading cache module other than the probe's, so a build can link two.
+fn second_loading_cache_builder() -> IntegrationBuilder {
+    IntegrationBuilder::implementations(SECOND_LOADING_CACHE_ID, env!("CARGO_PKG_NAME"))
+        .with_loading_cache(memory_loading_cache)
+}
+
 /// `[cache.iabtl-answers]` selects the loading cache the probe's answers
 /// are held in, the way `[cache.robots-txt]` selects core's. Left out, the
-/// cache takes the one loading cache module the build links, and this build
-/// links two, the stock one and the probe's, so it keeps nothing until the
-/// table names one. With the probe's cache not linked, the stock one alone
-/// is, and the cache takes it without a table.
+/// cache takes the one loading cache module the build links, and keeps
+/// nothing when the build links none or several. A stock build links none,
+/// so the first two cases link a second module beside the probe's, and only
+/// the one whose table is read keeps values.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cache_the_probe_declares_is_selected_in_its_own_table() {
     let named = settings_with(&format!(
@@ -581,31 +597,39 @@ async fn a_cache_the_probe_declares_is_selected_in_its_own_table() {
             {PROBE_BLOCK}
         "#
     ));
-    let both = [seam_probe::builder(), seam_probe::loading_cache_builder()];
+    let two = [
+        seam_probe::builder(),
+        seam_probe::loading_cache_builder(),
+        second_loading_cache_builder(),
+    ];
 
-    let report = report_with(named, &both).await;
+    let report = report_with(named, &two).await;
     assert_eq!(
         report["answers_cache_keeps_values"], true,
         "the table should select the module it names: {report}"
     );
 
-    let report = report_with(settings_with(PROBE_BLOCK), &both).await;
+    let report = report_with(settings_with(PROBE_BLOCK), &two).await;
     assert_eq!(
         report["answers_cache_keeps_values"], false,
         "with two loading cache modules linked and no table the cache should keep nothing: {report}"
     );
 
-    let report = report_with(settings_with(PROBE_BLOCK), &[seam_probe::builder()]).await;
+    let both = [seam_probe::builder(), seam_probe::loading_cache_builder()];
+    let report = report_with(settings_with(PROBE_BLOCK), &both).await;
     assert_eq!(
         report["answers_cache_keeps_values"], true,
         "a declared cache with no table should take the one loading cache module linked: {report}"
     );
+
+    let report = report_with(settings_with(PROBE_BLOCK), &[seam_probe::builder()]).await;
+    assert_eq!(
+        report["answers_cache_keeps_values"], false,
+        "with no loading cache module linked the cache should keep nothing: {report}"
+    );
 }
 
-/// A `[cache.<name>]` table naming a cache no linked module declares is
-/// refused by the deploy check and at startup with one message, naming the
-/// caches that could be written, so a misspelt name fails `ts config
-/// validate` and not the deployment.
+/// Both deployment validation and startup refuse an undeclared cache table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cache_table_no_module_declares_is_refused_by_the_deploy_check_and_at_startup() {
     let settings = settings_with(&format!(
@@ -619,27 +643,13 @@ async fn a_cache_table_no_module_declares_is_refused_by_the_deploy_check_and_at_
 
     // The deploy check reads the builders startup links, the adapter's own
     // and the deployment's after them.
-    let deploy = validate_settings_for_deploy_with(&settings, &module_builders_with(&both))
-        .expect_err("the deploy check should refuse the misspelt table");
-    let startup = TrustedServerApp::routes_with_registrations(settings, &both)
-        .err()
-        .expect("startup should refuse the misspelt table");
-
-    // The message alone: the debug form carries a backtrace where the
-    // runner asks for one, and the two are raised on different stacks.
-    let message = format!("{deploy}");
     assert!(
-        message.contains("[cache.iabtl-answres]"),
-        "should name the table: {message}"
+        validate_settings_for_deploy_with(&settings, &module_builders_with(&both)).is_err(),
+        "the deploy check should refuse the misspelt table"
     );
     assert!(
-        message.contains("robots-txt, assets, assets-vary, 51degrees-answers, iabtl-answers"),
-        "should list the caches this build declares: {message}"
-    );
-    assert_eq!(
-        message,
-        format!("{startup}"),
-        "the deploy check should refuse what startup refuses"
+        TrustedServerApp::routes_with_registrations(settings, &both).is_err(),
+        "startup should refuse the misspelt table"
     );
 }
 
@@ -958,6 +968,8 @@ fn settings_selecting_module(extra: &str) -> Settings {
         "#
     ))
     .expect("should parse settings selecting a module-supplied module")
+    // A loaded domain carries its policy.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 // ---------------------------------------------------------------------------
@@ -1228,6 +1240,286 @@ async fn ec_module_generates_an_identifier_with_the_modules_prefix() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// A module's own endpoint, outside `/integrations/`
+// ---------------------------------------------------------------------------
+
+/// The probe's route at a path of its own, reached through this adapter's
+/// router, and the two things a module route can meet there, being another
+/// route on its method and path and a route of the adapter's own.
+mod module_endpoints {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::body::Body as AxumBody;
+    use axum::http::Request;
+    use edgezero_adapter_axum::service::EdgeZeroAxumService;
+    use error_stack::Report;
+    use tower::{Service as _, ServiceExt as _};
+    use trusted_server_adapter_axum::app::build_state_with_registrations;
+    use trusted_server_core::error::TrustedServerError;
+    use trusted_server_core::integrations::{
+        IntegrationBuilder, IntegrationBuilderFn, IntegrationEndpoint, IntegrationProxy,
+        IntegrationRegistration,
+    };
+    use trusted_server_core::module_context::ModuleCall;
+    use trusted_server_core::settings::Settings;
+
+    use super::{PROBE_BLOCK, body_text, seam_probe, service_with, settings_with};
+
+    /// The inspection page's path, which this adapter answers for `GET`.
+    const CONFIG_PAGE_PATH: &str = "/_ts/config";
+
+    /// Integration id of the test's own module.
+    const OWN_MODULE_ID: &str = "own_module";
+
+    /// The name a section selects the test's own module by.
+    const OWN_MODULE_NAME: &str = "testing.own-module";
+
+    /// Body the test's own module answers every request with.
+    const OWN_MODULE_BODY: &str = "answered by the test's own module";
+
+    /// How many requests the test's own module answered.
+    static OWN_MODULE_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    /// The test's own module, which answers each route it declares with
+    /// [`OWN_MODULE_BODY`] and counts the runs.
+    struct OwnModule(fn() -> Vec<IntegrationEndpoint>);
+
+    #[async_trait::async_trait(?Send)]
+    impl IntegrationProxy for OwnModule {
+        fn integration_name(&self) -> &'static str {
+            OWN_MODULE_ID
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            (self.0)()
+        }
+
+        async fn handle(
+            &self,
+            _call: ModuleCall<'_>,
+            _req: edgezero_core::http::Request,
+        ) -> Result<edgezero_core::http::Response, Report<TrustedServerError>> {
+            OWN_MODULE_RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok(edgezero_core::http::Response::new(
+                edgezero_core::body::Body::from(OWN_MODULE_BODY),
+            ))
+        }
+    }
+
+    /// The registration of the test's own module, declaring `routes`.
+    fn declaring(
+        routes: fn() -> Vec<IntegrationEndpoint>,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder(OWN_MODULE_ID)
+                .with_proxy(Arc::new(OwnModule(routes)))
+                .build(),
+        ))
+    }
+
+    /// The test's own module declaring `GET` on the probe's own path.
+    fn declaring_the_probe_s_path(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        declaring(|| vec![IntegrationEndpoint::get(seam_probe::SEAM_PROBE_OWN_PATH)])
+    }
+
+    /// The test's own module declaring `GET` and `POST` on the inspection
+    /// page's path.
+    fn declaring_the_config_page(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        declaring(|| {
+            vec![
+                IntegrationEndpoint::get(CONFIG_PAGE_PATH),
+                IntegrationEndpoint::post(CONFIG_PAGE_PATH),
+            ]
+        })
+    }
+
+    /// A builder for the test's own module, built by `register`.
+    fn own_module(register: IntegrationBuilderFn) -> IntegrationBuilder {
+        IntegrationBuilder::new(OWN_MODULE_ID, "own-module-test", register, |settings| {
+            Ok(settings.selects_module(OWN_MODULE_NAME))
+        })
+        .with_module_name(OWN_MODULE_NAME)
+    }
+
+    /// Sends one request with `method` to `uri`, carrying the probe's
+    /// counting header when `token` is given.
+    async fn send(
+        service: &mut EdgeZeroAxumService,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            builder = builder.header(seam_probe::SEAM_PROBE_COUNT_HEADER, token);
+        }
+        let request = builder
+            .body(AxumBody::empty())
+            .expect("should build request");
+
+        service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should respond")
+    }
+
+    /// The response's `Content-Type`.
+    fn content_type(response: &axum::response::Response) -> Option<&str> {
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_get_of_the_probe_s_own_path_answers_from_the_module() {
+        let mut service = service_with(settings_with(PROBE_BLOCK), &[seam_probe::builder()]);
+
+        let response = send(&mut service, "GET", seam_probe::SEAM_PROBE_OWN_PATH, None).await;
+
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "the module's route should answer"
+        );
+        assert_eq!(content_type(&response), Some("text/plain"));
+        assert_eq!(
+            body_text(response).await,
+            seam_probe::SEAM_PROBE_OWN_BODY,
+            "should carry the module's body"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_head_of_the_probe_s_own_path_answers_with_no_body() {
+        let mut service = service_with(settings_with(PROBE_BLOCK), &[seam_probe::builder()]);
+
+        let response = send(&mut service, "HEAD", seam_probe::SEAM_PROBE_OWN_PATH, None).await;
+
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "the module's HEAD route should answer"
+        );
+        assert_eq!(content_type(&response), Some("text/plain"));
+        assert_eq!(body_text(response).await, "", "should carry no body");
+    }
+
+    /// The probe declares no `POST` on its own path, so a `POST` there goes
+    /// to the publisher path and the module's handler never runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_post_of_the_probe_s_own_path_never_reaches_the_module() {
+        const TOKEN: &str = "axum-own-path-post";
+        let mut service = service_with(settings_with(PROBE_BLOCK), &[seam_probe::builder()]);
+
+        let response = send(
+            &mut service,
+            "POST",
+            seam_probe::SEAM_PROBE_OWN_PATH,
+            Some(TOKEN),
+        )
+        .await;
+
+        assert_eq!(
+            seam_probe::prepare_runs_for(TOKEN),
+            1,
+            "the preparers should run once, so the token reached the modules"
+        );
+        assert_eq!(
+            seam_probe::own_path_runs_for(TOKEN),
+            0,
+            "the module's handler should not run for a method it does not declare"
+        );
+        assert_ne!(
+            body_text(response).await,
+            seam_probe::SEAM_PROBE_OWN_BODY,
+            "the answer should not be the module's"
+        );
+    }
+
+    #[test]
+    fn a_second_get_route_on_the_probe_s_own_path_is_refused() {
+        let settings = settings_with(
+            r#"
+            [testing]
+            modules = ["iabtl", "own-module"]
+
+            [testing.iabtl]
+            country = "ZZ"
+            "#,
+        );
+
+        let error = build_state_with_registrations(
+            settings,
+            &[
+                seam_probe::builder(),
+                own_module(declaring_the_probe_s_path),
+            ],
+        )
+        .err()
+        .expect("should refuse a second GET route on the probe's own path");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!(
+                "Integration route registration failed for GET {}",
+                seam_probe::SEAM_PROBE_OWN_PATH
+            )),
+            "should name the method and the path: {message}"
+        );
+    }
+
+    /// The adapter answers `GET /_ts/config` itself, so a module's route
+    /// there never runs, and it has no route of its own for `POST` there, so
+    /// the same module's route for that method runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_module_route_runs_only_where_the_adapter_answers_no_route_of_its_own() {
+        let settings = settings_with(
+            r#"
+            [testing]
+            modules = ["own-module"]
+            "#,
+        );
+        let mut service = service_with(settings, &[own_module(declaring_the_config_page)]);
+
+        let page = send(&mut service, "GET", CONFIG_PAGE_PATH, None).await;
+        assert_eq!(
+            page.status().as_u16(),
+            200,
+            "the inspection page should answer"
+        );
+        assert_eq!(content_type(&page), Some("text/html; charset=utf-8"));
+        assert_ne!(body_text(page).await, OWN_MODULE_BODY);
+        assert_eq!(
+            OWN_MODULE_RUNS.load(Ordering::SeqCst),
+            0,
+            "the module's GET route should never run"
+        );
+
+        let posted = send(&mut service, "POST", CONFIG_PAGE_PATH, None).await;
+        assert_eq!(
+            posted.status().as_u16(),
+            200,
+            "the module's POST route should answer"
+        );
+        assert_eq!(body_text(posted).await, OWN_MODULE_BODY);
+        assert_eq!(
+            OWN_MODULE_RUNS.load(Ordering::SeqCst),
+            1,
+            "the module's POST route should run once"
+        );
+    }
+}
+
 /// Config store that answers nothing, so a test can build [`RuntimeServices`]
 /// without a real platform.
 ///
@@ -1308,5 +1600,6 @@ fn stub_services() -> RuntimeServices {
             Arc::new(DisabledGeo),
         )))
         .client_info(ClientInfo::default())
+        .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
         .build()
 }

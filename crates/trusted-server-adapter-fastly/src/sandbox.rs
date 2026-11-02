@@ -588,6 +588,8 @@ mod tests {
             "#,
         )
         .expect("should parse sandbox test settings")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
     }
 
     /// A real `AppState`, so retention is exercised against the type the
