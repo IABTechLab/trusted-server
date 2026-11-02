@@ -75,6 +75,7 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         ("creative.rs", include_str!("creative.rs")),
         ("ec/auth.rs", include_str!("ec/auth.rs")),
         ("ec/batch_sync.rs", include_str!("ec/batch_sync.rs")),
+        ("ec/client_eids.rs", include_str!("ec/client_eids.rs")),
         ("ec/consent.rs", include_str!("ec/consent.rs")),
         ("ec/cookies.rs", include_str!("ec/cookies.rs")),
         ("ec/device.rs", include_str!("ec/device.rs")),

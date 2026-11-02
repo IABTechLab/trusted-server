@@ -1981,7 +1981,10 @@ pub fn register_providers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auction::test_support::canonical_parity_auction_request;
+    use crate::auction::test_support::{
+        canonical_parity_auction_request, repeated_source_provenance_eids,
+        repeated_source_provenance_eids_json,
+    };
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, PublisherInfo, UserInfo,
     };
@@ -2314,6 +2317,36 @@ mod tests {
                 .to_string()
                 .contains("deployment.example"),
             "should not leak the deployment host in any Site field"
+        );
+    }
+
+    #[test]
+    fn aps_request_forwards_eid_provenance_fields_and_repeated_sources() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut auction_request = canonical_parity_auction_request();
+        auction_request.user.eids = Some(repeated_source_provenance_eids());
+        let settings = create_test_settings();
+        let services = noop_services();
+        let downstream = http::Request::builder()
+            .uri("https://publisher.example/auction")
+            .body(EdgeBody::empty())
+            .expect("should build downstream request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &downstream,
+            timeout_ms: 321,
+            transport_timeout_ms: 321,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let openrtb = provider.build_openrtb_request(&auction_request, &context);
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize request");
+        assert_eq!(
+            serialized["user"]["ext"]["eids"],
+            repeated_source_provenance_eids_json(),
+            "APS should receive both entries with their own EID-level fields"
         );
     }
 

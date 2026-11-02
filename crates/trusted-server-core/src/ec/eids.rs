@@ -64,13 +64,15 @@ pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<R
 pub fn to_eids(resolved: &[ResolvedPartnerId]) -> Vec<Eid> {
     resolved
         .iter()
-        .map(|item| Eid {
-            source: item.source_domain.clone(),
-            uids: vec![Uid {
-                id: item.uid.clone(),
-                atype: Some(item.openrtb_atype),
-                ext: None,
-            }],
+        .map(|item| {
+            Eid::new(
+                item.source_domain.clone(),
+                vec![Uid {
+                    id: item.uid.clone(),
+                    atype: Some(item.openrtb_atype),
+                    ext: None,
+                }],
+            )
         })
         .collect()
 }

@@ -1479,6 +1479,33 @@ mod tests {
     }
 
     #[test]
+    fn eids_lookup_reports_non_array_cookie_as_parse_error() {
+        let payload = BASE64.encode(br#"{"a":1}"#);
+        let req = get_request_with_cookie("/_ts/admin/eids", &format!("ts-eids={payload}"));
+
+        let response =
+            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+
+        let json = response_json(response);
+        assert_eq!(json["cookie_present"], true);
+        assert!(
+            json["parse_error"]
+                .as_str()
+                .expect("should have parse_error")
+                .contains("ts-eids"),
+            "should describe the parse failure"
+        );
+        assert!(json.get("eids").is_none(), "should omit unparsed eids");
+        assert!(
+            json["ingest"]["matched"]
+                .as_array()
+                .expect("should have matched list")
+                .is_empty(),
+            "non-array cookie should preview no matches"
+        );
+    }
+
+    #[test]
     fn eids_lookup_reports_parse_error() {
         let req = get_request_with_cookie("/_ts/admin/eids", "ts-eids=!!!not-base64!!!");
 

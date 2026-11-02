@@ -213,6 +213,49 @@ curl -X POST https://edge.example.com/auction \
   -d '{"adUnits":[{"code":"banner","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}'
 ```
 
+#### Browser EIDs (`eids`)
+
+The optional `eids` array carries OpenRTB 2.6 EID objects from the browser:
+
+```json
+{
+  "eids": [
+    {
+      "source": "ids.example.com",
+      "inserter": "inserter.example.com",
+      "matcher": "ids.example.com",
+      "mm": 4,
+      "ext": { "segments": ["s1"] },
+      "uids": [
+        { "id": "fictional-uid", "atype": 1, "ext": { "partner": "example" } }
+      ]
+    }
+  ]
+}
+```
+
+Each entry is validated on its own. A malformed entry or field is dropped and
+the request proceeds; only a malformed body outside `eids` rejects the request.
+
+| Field                 | Rule                                                     |
+| --------------------- | -------------------------------------------------------- |
+| entry                 | JSON object that parses on its own                       |
+| `source`              | string, not blank, at most 255 UTF-8 bytes               |
+| `uids`                | at least one valid UID; the first 32 valid UIDs are kept |
+| `uids[].id`           | string, not blank, at most 512 bytes                     |
+| `uids[].atype`, `mm`  | integer from 0 to 2,147,483,647                          |
+| `uids[].ext`, `ext`   | JSON object, at most 2,048 bytes as compact JSON         |
+| `inserter`, `matcher` | string, not blank, at most 255 bytes                     |
+| array                 | duplicates dropped, then the first 64 entries kept       |
+
+Entries keep their order and a source may repeat. When the body has no valid
+entry, the `ts-eids` cookie is used with the same rules. Browser EIDs are used
+only for a request with an allowed EC.
+
+The response's `x-ts-eids` header carries the consent-gated EIDs sent to
+providers, base64-encoded JSON including EID-level fields, capped at 4,096
+bytes. `x-ts-eids-truncated: true` marks a truncated value.
+
 #### PBS stored-request intent
 
 The reserved `trustedServer` bid accepts `storedRequest` inside `params`, beside
@@ -903,7 +946,7 @@ curl -u 'admin:<resolved-admin-password>' \
 
 ### GET /\_ts/admin/eids
 
-Parses the request's `ts-eids` and `sharedId` cookies and previews which configured partner IDs cookie ingestion would match or drop. It performs request inspection only: it does not read or write KV and is available on every adapter. The preview lists candidate matches from the cookies alone; it does not apply the TCF Purpose 1 + 4 consent gate on identity-graph writes, does not see `/auction` request-body EIDs, and does not account for partner UIDs already stored in KV.
+Parses the request's `ts-eids` and `sharedId` cookies and previews which configured partner IDs cookie ingestion would match or drop. It performs request inspection only: it does not read or write KV and is available on every adapter. The preview lists candidate matches from the cookies alone; it does not apply the TCF Purpose 1 + 4 consent gate on identity-graph writes, does not see `/auction` request-body EIDs, and does not account for partner UIDs already stored in KV. Cookie entries are validated one by one with the `/auction` body rules, so a mistyped field drops only that field, and the returned `eids` include `inserter`, `matcher` and `mm` when present. The `ingest.unmatched` diagnostics still read the raw cookie, before validation.
 
 After successful authentication this endpoint always returns `200 OK`; missing or malformed cookies are represented by `cookie_present`, `sharedid_present`, and `parse_error`. The `ingest.matched` and `ingest.unmatched` arrays show the ingestion preview. Each unmatched entry contains its `source` and either a `no_partner` reason when no configured partner recognizes it or `no_valid_uid` when the partner exists but every supplied UID is empty or exceeds the storage limit.
 
