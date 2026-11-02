@@ -1,3 +1,7 @@
+import type { TraceCollector } from '../trace/collector';
+import type { TraceGptIdentity } from '../trace/types';
+import type { TraceGptBridge } from '../trace/gpt';
+
 // Shared TypeScript types for the tsjs core API and extensions.
 export type Size = readonly [number, number];
 
@@ -27,6 +31,10 @@ export interface AuctionSlot {
   div_id: string;
   formats: Array<[number, number]>;
   targeting?: Record<string, string>;
+  ext?: {
+    trusted_server?: { trace_slot_ref?: unknown; [key: string]: unknown };
+    [key: string]: unknown;
+  };
 }
 
 /** Debug-only copy of server-side bid fields exposed for pipeline inspection. */
@@ -214,12 +222,42 @@ export type GptDiagnosticsTrustedServerOpportunity =
   | 'unrenderable_candidate'
   | 'no_candidate';
 
+/**
+ * Every safe failure category observed while obtaining or posting creative markup.
+ *
+ * This array is the single source of truth: `GptDiagnosticsCreativeFailure` is
+ * derived from it, and the diagnostics store validates against it at runtime.
+ * Adding a member here is sufficient for the store to accept it; a
+ * compile-time union and a hand-written runtime allowlist would otherwise
+ * drift, and a dropped reason is silent. An `aps_` member also needs a wire
+ * name in the render path's reason map to be reachable, and every member needs
+ * a case in the overlay's exhaustive switch, which is a compile error by design.
+ *
+ * The `aps_` members cover the APS render path, where a blank slot is otherwise
+ * indistinguishable from a filled one: Ad Manager reports a non-empty 1x1
+ * render whether or not the creative ever drew.
+ */
+export const GPT_DIAGNOSTICS_CREATIVE_FAILURES = [
+  'missing_render_source',
+  'cache_fetch_failed',
+  'invalid_cache_payload',
+  'response_post_failed',
+  // Reported by the sandboxed renderer document and relayed by the creative.
+  'aps_bad_hash',
+  'aps_nonce_mismatch',
+  'aps_descriptor_keys',
+  'aps_descriptor_fields',
+  'aps_descriptor_envelope',
+  'aps_runner_script_error',
+  // Observed by the Universal Creative source around its renderer frame.
+  'aps_frame_timeout',
+  'aps_frame_load_error',
+  'aps_frame_reported_failure',
+  'aps_unknown',
+] as const;
+
 /** A safe failure category observed while obtaining or posting creative markup. */
-export type GptDiagnosticsCreativeFailure =
-  | 'missing_render_source'
-  | 'cache_fetch_failed'
-  | 'invalid_cache_payload'
-  | 'response_post_failed';
+export type GptDiagnosticsCreativeFailure = (typeof GPT_DIAGNOSTICS_CREATIVE_FAILURES)[number];
 
 /** Delivery evidence derived for a GPT request cycle. */
 export type GptDiagnosticsDelivery =
@@ -374,7 +412,8 @@ export interface GptDiagnosticsRecorder {
     opportunity: GptDiagnosticsTrustedServerOpportunity,
     trustedServerAuctionId?: string,
     requestedSlotSizes?: ReadonlyArray<Size>,
-    auctionFacts?: GptDiagnosticsAuctionFacts
+    auctionFacts?: GptDiagnosticsAuctionFacts,
+    traceIdentity?: TraceGptIdentity
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
@@ -468,6 +507,10 @@ export interface FirstImpressionState {
 }
 
 export interface TsjsApi {
+  /** Internal trace observations, installed only for a literal activated document. */
+  traceEvidence?: TraceCollector;
+  /** Internal active-only bridge shared with the early GPT bootstrap. */
+  traceGpt?: TraceGptBridge;
   version: string;
   que: Array<() => void>;
   addAdUnits(units: AdUnit | AdUnit[]): void;
@@ -582,6 +625,7 @@ export interface TsjsApi {
   scheduleInitialAdInit?: (
     initialBids?: Record<string, AuctionBidData>,
     initialSlots?: AuctionSlot[],
+    traceAuctionTransport?: unknown,
     initialAuctionDiagnostics?: AuctionDiagnosticsData
   ) => void;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */

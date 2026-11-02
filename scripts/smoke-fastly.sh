@@ -31,7 +31,27 @@ trap cleanup EXIT INT TERM
 
 mkdir -p "$FASTLY_PROJECT"
 cp "$REPO_ROOT/edgezero.toml" "$EDGEZERO_MANIFEST"
-cp "$REPO_ROOT/fastly.toml" "$FASTLY_MANIFEST"
+# The base manifest defines the same secret keys this smoke appends. Drop its
+# entries on copy, or removing an appended block would still leave a resolvable
+# value and the missing-secret cases could not fail.
+# The base manifest indents its table headers; the blocks this smoke appends
+# are unindented. Match either form.
+awk '
+    /^[[:space:]]*\[\[local_server\.secret_stores\.trusted_server_secrets\]\][[:space:]]*$/ {
+        if ((getline key_line) <= 0 || (getline data_line) <= 0) {
+            exit 2
+        }
+        removed++
+        next
+    }
+    { print }
+    END {
+        if (removed < 1) {
+            print "expected at least one base secret block to strip; found 0" > "/dev/stderr"
+            exit 1
+        }
+    }
+' "$REPO_ROOT/fastly.toml" >"$FASTLY_MANIFEST"
 ln -s "$REPO_ROOT/crates" "$FASTLY_PROJECT/crates"
 
 smoke_resolve_ts_binary "$REPO_ROOT"
@@ -90,7 +110,7 @@ write_without_secret() {
     local destination="$2"
     local missing_key="$3"
     awk -v missing_key="$missing_key" '
-        $0 == "[[local_server.secret_stores.ts_secrets]]" {
+        /^[[:space:]]*\[\[local_server\.secret_stores\.trusted_server_secrets\]\][[:space:]]*$/ {
             header = $0
             if ((getline key_line) <= 0 || (getline data_line) <= 0) {
                 exit 2
@@ -131,15 +151,15 @@ run_case missing-config "$BASE_PORT" 500 \
 )
 cat >>"$FASTLY_MANIFEST" <<EOF
 
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "handler_password"
 data = "$SMOKE_HANDLER_VALUE"
 
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "publisher_proxy_secret"
 data = "$SMOKE_PROXY_VALUE"
 
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "ec_passphrase"
 data = "$SMOKE_EC_VALUE"
 EOF

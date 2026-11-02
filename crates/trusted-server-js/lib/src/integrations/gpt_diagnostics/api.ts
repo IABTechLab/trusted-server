@@ -8,6 +8,7 @@ import type {
   GptDiagnosticsSlotHandle,
   GptDiagnosticsTrustedServerOpportunity,
 } from '../../core/types';
+import type { TraceGptIdentity } from '../../trace/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
 import { clonePrebidAuctionEvidence } from './evidence';
@@ -22,7 +23,8 @@ interface ApiStore {
     opportunity: GptDiagnosticsTrustedServerOpportunity,
     trustedServerAuctionId?: string,
     requestedSlotSizes?: ReadonlyArray<readonly [number, number]>,
-    auctionFacts?: GptDiagnosticsAuctionFacts
+    auctionFacts?: GptDiagnosticsAuctionFacts,
+    traceIdentity?: TraceGptIdentity
   ): void;
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
   recordPrebidAuction(
@@ -179,7 +181,8 @@ export class GptDiagnosticsApiController {
         opportunity,
         trustedServerAuctionId,
         requestedSlotSizes,
-        auctionFacts
+        auctionFacts,
+        traceIdentity
       ) =>
         safelyRecord(() => {
           this.store.recordTrustedServerOpportunity(
@@ -188,7 +191,8 @@ export class GptDiagnosticsApiController {
             opportunity,
             trustedServerAuctionId,
             requestedSlotSizes,
-            auctionFacts
+            auctionFacts,
+            ...(traceIdentity ? ([traceIdentity] as const) : [])
           );
         }),
       recordPrebidRefresh: (slots) => safelyRecord(() => this.store.recordPrebidRefresh(slots)),

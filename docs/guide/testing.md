@@ -25,7 +25,7 @@ The aliases in `.cargo/config.toml` select the correct target and feature set:
 Fastly tests require the Viceroy version recorded in `.tool-versions`:
 
 ```bash
-cargo install viceroy --version 0.17.0 --locked --force
+cargo install viceroy --version "$(awk '$1 == "viceroy" { print $2 }' .tool-versions)" --locked --force
 rustup target add wasm32-wasip1 wasm32-unknown-unknown
 ```
 
@@ -41,6 +41,41 @@ source test instead of copying it into another document; for example, EC ID
 tests are in `crates/trusted-server-core/src/edge_cookie.rs`, creative rewrite
 tests are in `crates/trusted-server-core/src/creative.rs`, and proxy tests are
 in `crates/trusted-server-core/src/proxy.rs`.
+
+## HTML EOF runtime checks
+
+The EOF harness builds fresh `test-utils` artifacts, creates isolated configuration
+and runs disabled, successful, hung and enabled-auction controls against a loopback
+origin. It uses the native Rust integration-test target and requires Rust and pinned Node. Compiler/profile
+settings and an explicit `CARGO_TARGET_DIR` are preserved; operator configuration and `CARGO_BUILD_TARGET` are
+not inherited because the harness selects native and adapter targets. Logs, bodies, headers and timing JSON remain in its printed temporary
+directory. Owned process groups are stopped on normal exit, failure, SIGTERM and SIGINT.
+The auction control deliberately uses an unreachable bidder; it checks empty-bid
+script assembly after finalized output, rather than successful or delayed bids.
+
+```bash
+cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime
+./scripts/async-html-finalization-local-test.sh axum --auction
+./scripts/async-html-finalization-local-test.sh cloudflare --release --auction
+./scripts/async-html-finalization-local-test.sh spin --release --auction
+```
+
+Workers requires `worker-build` and `wasm-bindgen` matching the locked SDK plus Wrangler.
+Spin requires the Spin CLI. `--release` selects production-profile fixture artifacts.
+
+The Fastly EOF timeout fixture requires **Viceroy 0.19 or newer** for backend timeout
+simulation. The repository-pinned Viceroy meets this requirement and is shared with
+ordinary WASI tests. Install it with the command above, then run:
+
+```bash
+./scripts/async-html-finalization-local-test.sh fastly --release --auction
+```
+
+The harness checks this prerequisite before building adapter fixtures. Fastly additionally proves
+that an actual body byte arrives before a non-retaining EOF lookup completes.
+CI runs Axum, native Rust helper tests and lint, and an isolated Fastly EOF job. Workers/Spin
+actual EOF timeout controls remain local commands; their target builds, native tests
+and shared parity controls run in CI. Hosted results are separate from local runs.
 
 ## Documentation checks
 

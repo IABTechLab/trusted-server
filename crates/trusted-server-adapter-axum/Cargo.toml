@@ -31,6 +31,7 @@ simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tower = { workspace = true, features = ["util"] }
 trusted-server-core = { workspace = true }
+web-time = { workspace = true }
 
 [dev-dependencies]
 trusted-server-core = { workspace = true, features = ["test-utils"] }

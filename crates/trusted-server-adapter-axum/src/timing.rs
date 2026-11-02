@@ -38,6 +38,7 @@ use axum::body::Body as AxumBody;
 use axum::http::{Request, Response};
 use tower::Service;
 use trusted_server_core::request_timing::{RequestTimings, append_server_timing_if_private};
+use trusted_server_core::trace::TraceTerminalResponse;
 
 /// Path excluded from timing collection and `Server-Timing` emission: health
 /// checks bypass this wrapper for every method.
@@ -95,7 +96,13 @@ where
 
         Box::pin(async move {
             let mut response = inner.call(req).await?;
-            append_server_timing_if_private(&mut response, &timings, server_timing_enabled);
+            if response
+                .extensions()
+                .get::<TraceTerminalResponse>()
+                .is_none()
+            {
+                append_server_timing_if_private(&mut response, &timings, server_timing_enabled);
+            }
             Ok(response)
         })
     }
@@ -216,6 +223,48 @@ mod tests {
             .get(name)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn axum_preserves_trace_response_without_terminal_timing() {
+        let router = RouterService::builder()
+            .get("/_ts/trace", |mut ctx: RequestContext| async move {
+                match trusted_server_core::trace::preflight(
+                    &trusted_server_core::settings::Settings::default(),
+                    ctx.request_mut(),
+                ) {
+                    trusted_server_core::trace::TracePreflight::Response(response) => Ok(response),
+                    _ => panic!("should reject disabled trace locally"),
+                }
+            })
+            .build();
+        let response = TimingService::new(EdgeZeroAxumService::new(router), true)
+            .oneshot(
+                Request::builder()
+                    .uri("/_ts/trace")
+                    .body(AxumBody::empty())
+                    .expect("should build trace request"),
+            )
+            .await
+            .expect("should serve trace response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            response
+                .extensions()
+                .get::<TraceTerminalResponse>()
+                .is_some(),
+            "should preserve the terminal trace marker through conversion"
+        );
+        assert_eq!(
+            header(&response, "cache-control").as_deref(),
+            Some("no-store, private"),
+            "should preserve hardened trace cache policy"
+        );
+        assert!(
+            header(&response, "server-timing").is_none(),
+            "should bypass ordinary timing finalization even when enabled"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -23,6 +23,8 @@
 # env
 .env*
 trusted-server.toml
+# partial copies left if the ts CLI config writer is killed mid-write
+.ts-write-*
 js-assets.toml
 
 # backup
@@ -64,6 +66,8 @@ src/*.html
 /crates/js/
 /crates/integration-tests/
 
+# Documentation proposal workflow scratch space
+/.docs-proposal/
 # Wrangler config rendered by the Cloudflare integration-test harness from
 # wrangler.ci.toml for CI or test-specific configuration overrides.
 wrangler.integration.generated.toml

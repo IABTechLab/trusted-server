@@ -39,24 +39,63 @@ jobs:
             exit 1
           fi
 
+  check-ci-node-pin:
+    name: CI Node pin guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The guard's tests check the tree before the guard landed; fetch only
+      # that commit instead of the full history.
+      - name: Fetch the pre-guard commit
+        run: git fetch --no-tags --depth=1 origin 7a0ecb4cbfa39af3d83f7e1ed2733d7eabdc4cb1
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+
+      - name: Test the guard
+        run: node --test scripts/check-ci-node-pin.test.mjs
+
+      # Every job that compiles trusted-server-core also runs the TSJS build, so
+      # it must set up the `.tool-versions` Node first (see issue #1204).
+      - name: Verify jobs pin Node before compiling Rust
+        run: node scripts/check-ci-node-pin.mjs
+
   format-rust:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+      # Rust jobs must set up the toolchain through ./.github/actions/setup-rust,
+      # which removes the image's stable and only saves caches from main. A
+      # direct setup-rust-toolchain or rust-cache step skips both silently.
+      - name: Require the shared Rust setup action
         shell: bash
+        run: |
+          if grep -rnE "uses:[[:space:]]*[\"']?(actions-rust-lang/setup-rust-toolchain|Swatinem/rust-cache)@" .github \
+              | grep -v '^\.github/actions/setup-rust/action\.yml:'; then
+            echo "::error::Set up Rust with ./.github/actions/setup-rust, not setup-rust-toolchain or rust-cache directly."
+            exit 1
+          fi
 
       - name: Set up rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1,wasm32-unknown-unknown
           components: "clippy, rustfmt"
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-clippy
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1
@@ -165,3 +204,28 @@ jobs:
 
       - name: Build with VitePress (fails on dead links)
         run: npm run build
+
+  docs-proposal-scripts:
+    name: docs-proposal scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve Node.js version
+        id: node-version
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.node-version }}
+
+      - name: Run shellcheck
+        run: shellcheck scripts/docs-proposal/*.sh
+
+      - name: Test hunk review builder
+        run: node --test scripts/docs-proposal/hunks.test.mjs
+
+      - name: Test proposal scripts
+        run: scripts/docs-proposal/test.sh

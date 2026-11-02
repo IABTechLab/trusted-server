@@ -784,7 +784,7 @@ describe('gpt_bootstrap.js fallback', () => {
     ts.auctionDiagnostics = { auctionResolvedMs: 10 };
     ts.navGeneration = 1;
 
-    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } }, undefined, {
+    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } }, undefined, undefined, {
       auctionResolvedMs: 99,
     });
     expect(ts.bids).toEqual({ live_slot: { hb_pb: '2.50' } });
@@ -818,7 +818,12 @@ describe('gpt_bootstrap.js fallback', () => {
     };
 
     const auctionDiagnostics = { auctionResolvedMs: 84 };
-    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } }, [ssrSlot], auctionDiagnostics);
+    ts.scheduleInitialAdInit!(
+      { ssr_slot: { hb_pb: '1.00' } },
+      [ssrSlot],
+      undefined,
+      auctionDiagnostics
+    );
     expect(ts.adSlots).toEqual([ssrSlot]);
     expect(ts.auctionDiagnostics).toEqual(auctionDiagnostics);
 

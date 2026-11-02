@@ -116,7 +116,7 @@ zero-cost drop-in on native and JS-backed on WASM."
 In `Cargo.toml` `[workspace.dependencies]`:
 
 ```toml
-edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", rev = "38198f9839b70aef03ab971ae5876982773fc2a1", default-features = false }
+edgezero-adapter-cloudflare = { git = "https://github.com/IABTechLab/edgezero", rev = "38198f9839b70aef03ab971ae5876982773fc2a1", default-features = false }
 ```
 
 (Same `rev` as the other edgezero deps already in the workspace.)

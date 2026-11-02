@@ -33,4 +33,7 @@ if [ -z "$WORKER_VERSION" ]; then
   echo "error: could not determine the worker crate version from Cargo.lock" >&2
   exit 1
 fi
-cargo install -q --force --version "=$WORKER_VERSION" worker-build && worker-build --release
+# --locked builds from worker-build's published Cargo.lock. Without it, cargo
+# re-resolves dependencies, and a yanked transitive release (zip 2.x) fails the
+# install.
+cargo install -q --force --locked --version "=$WORKER_VERSION" worker-build && worker-build --release

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "source_sha256": "4e49d17fe2ec718c3507d666c9351a24e6fd67a3c2f40a7b79bc26d02d66b110",
+  "assets": [
+    {
+      "path": "/_ts/trace/assets/v1.js",
+      "file": "v1.js",
+      "sha256": "5f52f94ae50cdcd93d838c10441b72263001615c92f830a32f1e7ab22b9cf009"
+    },
+    {
+      "path": "/_ts/trace/assets/v1.css",
+      "file": "v1.css",
+      "sha256": "d3289f4dab38cf1321a07aa6c8e7989eb1c96a6885656a68d7faab8b94a1006b"
+    }
+  ]
+}

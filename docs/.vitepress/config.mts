@@ -150,6 +150,10 @@ export default withMermaid(
             },
             { text: 'Development Guide', link: '/guide/integration-guide' },
             {
+              text: 'Cookie Forwarding',
+              link: '/guide/integrations/cookie-forwarding',
+            },
+            {
               text: 'Ad Server Mock',
               link: '/guide/integrations/adserver_mock',
             },

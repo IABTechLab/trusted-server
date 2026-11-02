@@ -3,15 +3,24 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const GUIDE: &str = include_str!("../../../docs/guide/integration-guide.md");
-const START: &str = "<!-- documentation-snippet:runtime-services:start -->";
-const END: &str = "<!-- documentation-snippet:runtime-services:end -->";
 
 #[test]
 fn integration_guide_runtime_services_fixture_compiles() {
+    check_guide_snippet("runtime-services");
+}
+
+#[test]
+fn integration_guide_html_eof_fixture_compiles() {
+    check_guide_snippet("html-eof");
+}
+
+fn check_guide_snippet(name: &str) {
+    let start = format!("<!-- documentation-snippet:{name}:start -->");
+    let end = format!("<!-- documentation-snippet:{name}:end -->");
     let marked = GUIDE
-        .split_once(START)
-        .and_then(|(_, tail)| tail.split_once(END).map(|(body, _)| body))
-        .expect("should contain one bounded runtime-services snippet");
+        .split_once(&start)
+        .and_then(|(_, tail)| tail.split_once(&end).map(|(body, _)| body))
+        .expect("should contain one bounded integration snippet");
     let source = marked
         .trim()
         .strip_prefix("```rust\n")
@@ -49,7 +58,7 @@ fn integration_guide_runtime_services_fixture_compiles() {
         })
         .expect("should find the workspace error-stack requirement");
     let manifest = format!(
-        "[package]\nname = \"documentation-snippet\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\nerror-stack = \"{error_stack_requirement}\"\ntrusted-server-core = {{ path = {:?} }}\n",
+        "[package]\nname = \"documentation-snippet\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\nerror-stack = \"{error_stack_requirement}\"\nfutures = \"0.3\"\ntrusted-server-core = {{ path = {:?} }}\n",
         core_path
     );
     fs::write(fixture_root.join("Cargo.toml"), manifest)

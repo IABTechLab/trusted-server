@@ -119,7 +119,8 @@ describe('GptDiagnosticsApiController', () => {
       'renderable_candidate',
       undefined,
       undefined,
-      { auctionType: 'ssat' }
+      { auctionType: 'ssat' },
+      { diagnostic_auction_id: 'ts-auc-example', slot_ref: 'ts-slot-example' }
     );
     controller.recorder.recordPrebidRefresh(slots);
     const attemptId =
@@ -134,7 +135,8 @@ describe('GptDiagnosticsApiController', () => {
       'renderable_candidate',
       undefined,
       undefined,
-      { auctionType: 'ssat' }
+      { auctionType: 'ssat' },
+      { diagnostic_auction_id: 'ts-auc-example', slot_ref: 'ts-slot-example' }
     );
     expect(store.recordPrebidRefresh).toHaveBeenCalledTimes(1);
     expect(store.recordPrebidRefresh).toHaveBeenCalledWith(slots);

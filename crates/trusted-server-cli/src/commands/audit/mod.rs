@@ -12,12 +12,14 @@ pub mod collector;
 pub mod generate;
 pub mod page;
 
+use std::io::IsTerminal as _;
+
 use clap::{Args, Subcommand};
 
 use crate::app_config::AppConfigArgs;
 use crate::commands::audit::collector::{BrowserOpts, GenerateBrowserOpts};
 use crate::commands::audit::page::PageAuditArgs;
-use crate::error::{CliResult, cli_error};
+use crate::error::{CliResult, cli_error, toml_error_location};
 use crate::run::RunOutcome;
 
 /// Parses and validates an `http`/`https` URL, rejecting all other schemes.
@@ -208,6 +210,13 @@ pub(crate) struct AuditAdTemplatesGenerateArgs {
     /// Preview the updated config on stdout instead of writing it.
     #[arg(long)]
     pub dry_run: bool,
+    /// Apply changes to the config without asking for confirmation.
+    ///
+    /// Without it, a run that would change the config shows the target path
+    /// and the managed-field diff, then waits for an explicit `yes`. Required
+    /// when stdin or stderr is not a terminal, so automation must opt in.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub yes: bool,
     /// Perform a deterministic scroll pass after each page initially settles.
     #[arg(long)]
     pub scroll: bool,
@@ -356,6 +365,13 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
             let mut out = stdout.lock();
             let stderr = std::io::stderr();
             let mut err = stderr.lock();
+            let stdin = std::io::stdin();
+            // The prompt is written to stderr and answered on stdin, so both
+            // must reach a person for an answer to mean anything.
+            let interactive = stdin.is_terminal() && stderr.is_terminal();
+            // Locks stdin per read rather than for the whole crawl; only the
+            // confirmation prompt reads it.
+            let mut input = std::io::BufReader::new(stdin);
             generate::run_update_slots(
                 &generate::UpdateSlotsRequest {
                     url: gen_args.url.as_str(),
@@ -365,12 +381,15 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
                     replace: gen_args.replace,
                     cookies: &gen_args.cookies,
                     dry_run: gen_args.dry_run,
+                    yes: gen_args.yes,
+                    interactive,
                     scroll: gen_args.scroll,
                     budget: gen_args.budget(),
                 },
                 &selected,
                 &mut out,
                 &mut err,
+                &mut input,
             )
             .map(|()| RunOutcome::Success)
         }
@@ -427,10 +446,7 @@ fn creative_config(
     // Parser messages can quote literal secrets from the operator's config.
     // Keep the path and location, but never include the source or error text.
     let value = toml::from_str::<toml::Value>(document).map_err(|error| {
-        let location = error
-            .span()
-            .map(|span| format!(" at byte offset {}", span.start))
-            .unwrap_or_default();
+        let location = toml_error_location(document, error.span());
         format!(
             "failed to parse {}{location} before generating slots; fix the TOML syntax and re-run",
             path.display()
@@ -527,10 +543,7 @@ mod tests {
             error.contains("fix the TOML syntax and re-run"),
             "should retain repair guidance, got {error}"
         );
-        assert!(
-            error.contains("byte offset"),
-            "should retain parser location"
-        );
+        assert!(error.contains("at line "), "should retain parser location");
         assert!(!error.contains('\n'), "should not include a source excerpt");
     }
 

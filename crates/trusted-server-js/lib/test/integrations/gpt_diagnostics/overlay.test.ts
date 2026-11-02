@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { log } from '../../../src/core/log';
 import type { GptDiagnosticsBinding } from '../../../src/core/types';
+import { GPT_DIAGNOSTICS_CREATIVE_FAILURES } from '../../../src/core/types';
 import type { GptDiagnosticsBindingView } from '../../../src/integrations/gpt_diagnostics/binding';
 import {
   GPT_DIAGNOSTICS_HOST_ID,
@@ -86,6 +87,102 @@ afterEach(() => {
 });
 
 describe('GptDiagnosticsOverlay', () => {
+  it.each(['View trace results', 'Download trace report'])(
+    'retains focused %s and the live region across GPT updates',
+    (label) => {
+      const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+      let root: ShadowRoot | undefined;
+      const overlay = new GptDiagnosticsOverlay(store, new FakeBindings(), {
+        scheduleFrame: (callback) => callback(),
+        onShadowRoot: (created) => {
+          root = created;
+        },
+        onViewTrace: vi.fn(),
+        onDownloadTrace: vi.fn(),
+      });
+      if (!root) throw new Error('should mount diagnostics');
+      try {
+        overlay.setTraceState({ kind: 'storage_unavailable', downloadAvailable: true });
+        const control = button(root, label);
+        const status = root.querySelector('[aria-live="polite"]');
+        control.focus();
+        expect(root.activeElement).toBe(control);
+        store.recordSlotRequested(slot('example-slot'));
+        expect(button(root, label)).toBe(control);
+        expect(root.activeElement).toBe(control);
+        expect(root.querySelector('[aria-live="polite"]')).toBe(status);
+      } finally {
+        overlay.destroy();
+      }
+    }
+  );
+
+  it('allows an explicit retry when navigation did not depart from the document', () => {
+    let root: ShadowRoot | undefined;
+    const onViewTrace = vi.fn();
+    const overlay = new GptDiagnosticsOverlay(new GptDiagnosticsStore(), new FakeBindings(), {
+      scheduleFrame: (callback) => callback(),
+      onShadowRoot: (created) => {
+        root = created;
+      },
+      onViewTrace,
+    });
+    if (!root) throw new Error('should mount diagnostics');
+    try {
+      overlay.setTraceState({ kind: 'navigating', downloadAvailable: true });
+      button(root, 'View trace results').click();
+      expect(onViewTrace).toHaveBeenCalledTimes(1);
+    } finally {
+      overlay.destroy();
+    }
+  });
+
+  it('adds an optional prominent trace action and independent storage recovery without replacing GPT export', () => {
+    let root: ShadowRoot | undefined;
+    const onViewTrace = vi.fn();
+    const onDownloadTrace = vi.fn();
+    const onExport = vi.fn();
+    const overlay = new GptDiagnosticsOverlay(new GptDiagnosticsStore(), new FakeBindings(), {
+      scheduleFrame: (callback) => callback(),
+      onShadowRoot: (created) => {
+        root = created;
+      },
+      onViewTrace,
+      onDownloadTrace,
+      onExport,
+    });
+    if (!root) throw new Error('should mount diagnostics');
+    const view = button(root, 'View trace results');
+    expect(view.className).toContain('tsgd-trace-action');
+    expect(root.querySelector('style')?.textContent).toContain('min-height: 44px');
+    view.click();
+    expect(onViewTrace).toHaveBeenCalledTimes(1);
+    button(root, 'Export JSON').click();
+    expect(onExport).toHaveBeenCalledTimes(1);
+    expect(root.textContent).not.toContain('Download trace report');
+    overlay.setTraceState({ kind: 'storage_unavailable', downloadAvailable: true });
+    expect(root.querySelector('[aria-live="polite"]')?.textContent).toContain('could not be saved');
+    button(root, 'Download trace report').click();
+    expect(onDownloadTrace).toHaveBeenCalledTimes(1);
+    overlay.setTraceState({ kind: 'capture_failed', downloadAvailable: false });
+    expect(root.textContent).not.toContain('Download trace report');
+    expect(root.querySelector('[aria-live="polite"]')?.textContent).toContain(
+      'could not be captured'
+    );
+    overlay.destroy();
+  });
+  it('does not create trace controls when optional trace callbacks are absent', () => {
+    let root: ShadowRoot | undefined;
+    const overlay = new GptDiagnosticsOverlay(new GptDiagnosticsStore(), new FakeBindings(), {
+      scheduleFrame: (callback) => callback(),
+      onShadowRoot: (created) => {
+        root = created;
+      },
+    });
+    expect(root?.textContent).not.toContain('View trace results');
+    expect(root?.querySelector('[aria-live="polite"]')).toBeNull();
+    overlay.destroy();
+  });
   it('waits for document completion and two animation frames before mounting', () => {
     const frames: Array<() => void> = [];
     const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
@@ -851,5 +948,43 @@ describe('GptDiagnosticsOverlay', () => {
     overlay.show();
     expect(document.querySelectorAll(`#${GPT_DIAGNOSTICS_HOST_ID}`)).toHaveLength(1);
     overlay.destroy();
+  });
+  // The doc comment on GPT_DIAGNOSTICS_CREATIVE_FAILURES relies on the overlay's
+  // switch having no `default`, so a new category is a compile error there. No CI
+  // gate compiles this file with that check, so a missing case would render the
+  // text `undefined` instead. Drive every declared category through the overlay.
+  it('renders a fact for every declared creative failure category', () => {
+    for (const reason of GPT_DIAGNOSTICS_CREATIVE_FAILURES) {
+      const frames: Array<() => void> = [];
+      let now = 0;
+      const store = new GptDiagnosticsStore({
+        now: () => now,
+        schedule: (callback) => callback(),
+        defer: () => undefined,
+      });
+      const bindings = new FakeBindings();
+      const target = slot(`category-${reason}`);
+      store.recordTrustedServerOpportunity(target, `auction-${reason}`, 'renderable_candidate');
+      store.recordSlotRequested(target);
+      const attemptId = store.recordTrustedServerCreativeRequest(`auction-${reason}`);
+      expect(attemptId, `should open an attempt for \`${reason}\``).toEqual(expect.any(Number));
+      now += 1;
+      store.recordTrustedServerCreativeFailure(attemptId as number, reason);
+
+      let root: ShadowRoot | undefined;
+      const overlay = new GptDiagnosticsOverlay(store, bindings, {
+        scheduleFrame: (callback) => frames.push(callback),
+        onShadowRoot: (createdRoot) => {
+          root = createdRoot;
+        },
+      });
+      runNextFrame(frames);
+      runNextFrame(frames);
+
+      const article = slotArticle(root!, `category-${reason}`).textContent ?? '';
+      expect(article, `should record \`${reason}\` in the store`).toContain('failure');
+      expect(article, `should render a fact for \`${reason}\``).not.toContain('undefined');
+      overlay.destroy();
+    }
   });
 });

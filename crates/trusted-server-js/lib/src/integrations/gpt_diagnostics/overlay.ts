@@ -1,5 +1,6 @@
 import { log } from '../../core/log';
 import type { GptDiagnosticsRequestCycle } from '../../core/types';
+import type { TraceHandoffState } from '../../trace/handoff';
 
 import type { GptDiagnosticsBindingManager } from './binding';
 import { unhandledCase } from './exhaustive';
@@ -34,6 +35,8 @@ interface OverlayOptions {
   document?: Document;
   scheduleFrame?: (callback: () => void) => void;
   onExport?: () => void;
+  onViewTrace?: () => void;
+  onDownloadTrace?: () => void;
   onShadowRoot?: (root: ShadowRoot) => void;
   onBadgeLayerChange?: (layer: HTMLElement | undefined) => void;
 }
@@ -76,6 +79,9 @@ const PANEL_STYLES = `
   button { cursor: pointer; }
   button:focus-visible, select:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; }
   .tsgd-toolbar { display: flex; gap: 8px; align-items: center; border-bottom: 1px solid #334155; }
+  .tsgd-toolbar { flex-wrap: wrap; }
+  .tsgd-trace-action { min-height: 44px; background: #1d4ed8; font-weight: 700; }
+  .tsgd-trace-status { margin: 0; padding: 0 12px 10px; color: #cbd5e1; }
   .tsgd-toolbar label { color: #cbd5e1; }
   .tsgd-summary { color: #cbd5e1; border-bottom: 1px solid #334155; }
   .tsgd-coverage { margin: 6px 0 0; padding: 0; list-style: none; font-size: 12px; }
@@ -225,6 +231,26 @@ function creativeFailureFact(
       return 'Creative bridge failure: invalid cache payload';
     case 'response_post_failed':
       return 'Creative bridge failure: response post failed';
+    case 'aps_bad_hash':
+      return 'APS render failure: renderer frame received no nonce';
+    case 'aps_nonce_mismatch':
+      return 'APS render failure: renderer nonce mismatch';
+    case 'aps_descriptor_keys':
+      return 'APS render failure: descriptor key set rejected';
+    case 'aps_descriptor_fields':
+      return 'APS render failure: descriptor fields rejected';
+    case 'aps_descriptor_envelope':
+      return 'APS render failure: descriptor envelope rejected';
+    case 'aps_runner_script_error':
+      return 'APS render failure: Amazon runner script failed to load';
+    case 'aps_frame_timeout':
+      return 'APS render failure: renderer frame never acknowledged';
+    case 'aps_frame_load_error':
+      return 'APS render failure: renderer frame raised a load error (rare; an HTTP error on the renderer route reports a timeout instead)';
+    case 'aps_frame_reported_failure':
+      return 'APS render failure: renderer frame reported an unlabelled failure';
+    case 'aps_unknown':
+      return 'APS render failure: unknown';
   }
 }
 
@@ -479,6 +505,9 @@ export class GptDiagnosticsOverlay {
   private readonly document: Document;
   private readonly scheduleFrame: (callback: () => void) => void;
   private readonly onExport: () => void;
+  private readonly onViewTrace?: () => void;
+  private readonly onDownloadTrace?: () => void;
+  private traceState: TraceHandoffState = { kind: 'ready', downloadAvailable: false };
   private readonly onShadowRoot?: (root: ShadowRoot) => void;
   private readonly onBadgeLayerChange?: (layer: HTMLElement | undefined) => void;
   private readonly unsubscribeStore: () => void;
@@ -508,6 +537,8 @@ export class GptDiagnosticsOverlay {
     this.scheduleFrame =
       options.scheduleFrame ?? ((callback) => scheduleFrame(this.window, callback));
     this.onExport = options.onExport ?? (() => undefined);
+    this.onViewTrace = options.onViewTrace;
+    this.onDownloadTrace = options.onDownloadTrace;
     this.onShadowRoot = options.onShadowRoot;
     this.onBadgeLayerChange = options.onBadgeLayerChange;
     this.unsubscribeStore = this.store.subscribe(() => this.scheduleRender());
@@ -527,6 +558,13 @@ export class GptDiagnosticsOverlay {
     if (this.destroyed) return;
     this.dismissed = true;
     this.removeHost();
+  }
+
+  /** Updates the optional trace action without changing the GPT-only snapshot. */
+  setTraceState(state: TraceHandoffState): void {
+    if (this.destroyed || !this.onViewTrace) return;
+    this.traceState = state;
+    this.scheduleRender();
   }
 
   /** Open and focus the exact retained request selected from an on-page badge. */
@@ -687,7 +725,16 @@ export class GptDiagnosticsOverlay {
     );
     const historySlotToOpenOnce = this.historySlotToOpenOnce;
     this.historySlotToOpenOnce = undefined;
-    panel.replaceChildren();
+    const retainedToolbar =
+      this.onViewTrace && !this.collapsed
+        ? panel.querySelector<HTMLElement>('.tsgd-toolbar')
+        : null;
+    const retainedTraceStatus = retainedToolbar
+      ? panel.querySelector<HTMLElement>('.tsgd-trace-status')
+      : null;
+    for (const child of Array.from(panel.children)) {
+      if (child !== retainedToolbar && child !== retainedTraceStatus) child.remove();
+    }
 
     const header = this.document.createElement('header');
     header.className = 'tsgd-header';
@@ -704,46 +751,93 @@ export class GptDiagnosticsOverlay {
     collapse.setAttribute('aria-expanded', String(!this.collapsed));
     const close = this.button('Close', () => this.hide());
     header.append(title, status, collapse, close);
-    panel.append(header);
+    panel.prepend(header);
 
     if (this.collapsed) return;
 
-    const toolbar = this.document.createElement('div');
+    const toolbar = retainedToolbar ?? this.document.createElement('div');
     toolbar.className = 'tsgd-toolbar';
-    const filterLabel = this.document.createElement('label');
-    filterLabel.textContent = 'Filter';
-    const select = this.document.createElement('select');
-    select.setAttribute('aria-label', 'Filter diagnostic slots');
-    const filters: Array<[GptDiagnosticsFilter, string]> = [
-      ['all', 'All'],
-      ['visible', 'Visible'],
-      ['filled', 'Filled'],
-      ['empty', 'Empty'],
-      ['pending', 'Pending/Incomplete'],
-      ['unbound', 'Unbound/Ambiguous'],
-    ];
-    for (const [value, label] of filters) {
-      const option = this.document.createElement('option');
-      option.value = value;
-      option.textContent = label;
-      option.selected = this.filter === value;
-      select.append(option);
+    const retainedFilter = retainedToolbar?.querySelector('select');
+    if (retainedFilter) retainedFilter.value = this.filter;
+    if (!retainedToolbar) {
+      const filterLabel = this.document.createElement('label');
+      filterLabel.textContent = 'Filter';
+      const select = this.document.createElement('select');
+      select.setAttribute('aria-label', 'Filter diagnostic slots');
+      const filters: Array<[GptDiagnosticsFilter, string]> = [
+        ['all', 'All'],
+        ['visible', 'Visible'],
+        ['filled', 'Filled'],
+        ['empty', 'Empty'],
+        ['pending', 'Pending/Incomplete'],
+        ['unbound', 'Unbound/Ambiguous'],
+      ];
+      for (const [value, label] of filters) {
+        const option = this.document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        option.selected = this.filter === value;
+        select.append(option);
+      }
+      select.addEventListener('change', () => {
+        this.filter = select.value as GptDiagnosticsFilter;
+        this.render();
+      });
+      const exportButton = this.button('Export JSON', () => this.onExport());
+      filterLabel.append(select);
+      const dictionaryLink = this.document.createElement('a');
+      dictionaryLink.href =
+        'https://iabtechlab.github.io/trusted-server/guide/integrations/gpt-diagnostics-dictionary';
+      dictionaryLink.target = '_blank';
+      dictionaryLink.rel = 'noopener noreferrer';
+      dictionaryLink.textContent = 'Label dictionary';
+      dictionaryLink.setAttribute('aria-label', 'Open GPT diagnostics label dictionary');
+      toolbar.append(filterLabel, exportButton, dictionaryLink);
     }
-    select.addEventListener('change', () => {
-      this.filter = select.value as GptDiagnosticsFilter;
-      this.render();
-    });
-    const exportButton = this.button('Export JSON', () => this.onExport());
-    const dictionaryLink = this.document.createElement('a');
-    dictionaryLink.href =
-      'https://iabtechlab.github.io/trusted-server/guide/integrations/gpt-diagnostics-dictionary';
-    dictionaryLink.target = '_blank';
-    dictionaryLink.rel = 'noopener noreferrer';
-    dictionaryLink.textContent = 'Label dictionary';
-    dictionaryLink.setAttribute('aria-label', 'Open GPT diagnostics label dictionary');
-    filterLabel.append(select);
-    toolbar.append(filterLabel, exportButton, dictionaryLink);
-    panel.append(toolbar);
+    if (this.onViewTrace) {
+      const viewTrace =
+        toolbar.querySelector<HTMLButtonElement>('[data-trace-action="view"]') ??
+        this.button('View trace results', this.onViewTrace);
+      viewTrace.className = 'tsgd-trace-action';
+      viewTrace.dataset.traceAction = 'view';
+      viewTrace.disabled = this.traceState.kind === 'capturing';
+      if (!viewTrace.parentNode) toolbar.prepend(viewTrace);
+      const existingDownload = toolbar.querySelector<HTMLButtonElement>(
+        '[data-trace-action="download"]'
+      );
+      if (this.traceState.downloadAvailable && this.onDownloadTrace) {
+        const download =
+          existingDownload ?? this.button('Download trace report', this.onDownloadTrace);
+        download.className = 'tsgd-trace-action';
+        download.dataset.traceAction = 'download';
+        if (!download.parentNode) toolbar.append(download);
+      } else {
+        existingDownload?.remove();
+      }
+    }
+    if (!retainedToolbar) panel.append(toolbar);
+    if (this.onViewTrace) {
+      const messages: Record<TraceHandoffState['kind'], string> = {
+        ready: 'Capture the current page, then view its trace in this tab.',
+        capturing: 'Capturing trace results…',
+        capture_failed: 'Trace results could not be captured. Stay on this page and retry.',
+        storage_unavailable:
+          'Trace results could not be saved in this tab. Download this report or retry.',
+        navigation_unavailable:
+          'The report was saved, but the viewer could not be opened. Download it or retry.',
+        navigating: 'Opening trace results in this tab…',
+        download_failed:
+          'The download could not be started. Your report remains available for retry.',
+        downloaded: 'The download was started. Your report remains available.',
+      };
+      const traceStatus = retainedTraceStatus ?? this.document.createElement('p');
+      traceStatus.className = 'tsgd-trace-status';
+      traceStatus.setAttribute('role', 'status');
+      traceStatus.setAttribute('aria-live', 'polite');
+      const message = messages[this.traceState.kind];
+      if (traceStatus.textContent !== message) traceStatus.textContent = message;
+      if (!retainedTraceStatus) panel.append(traceStatus);
+    }
 
     const help = this.document.createElement('details');
     help.className = 'tsgd-help';

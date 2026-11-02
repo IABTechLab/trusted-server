@@ -62,14 +62,14 @@ impl IntegrationScriptRewriter for NextJsNextDataRewriter {
     }
 
     fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
-        if self.config.rewrite_attributes.is_empty() {
-            return ScriptRewriteAction::keep();
-        }
-
         let state = document_state(ctx.document_state);
         let mut state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.next_data_fragment = true;
+        if self.config.rewrite_attributes.is_empty() {
+            return ScriptRewriteAction::keep();
+        }
 
         match capture_fragment(
             &mut state.next_data,

@@ -22,8 +22,33 @@ import type {
   GptDiagnosticsTrustedServerOpportunity,
   Size,
 } from '../../core/types';
+import { GPT_DIAGNOSTICS_CREATIVE_FAILURES } from '../../core/types';
+import type { TraceGptIdentity, TraceSlotCorrelationV1 } from '../../trace/types';
+import { validDiagnosticAuctionId, validTraceSlotRef } from '../../trace/validation';
 
 import { clonePrebidAuctionEvidence } from './evidence';
+
+function normalizedTraceIdentity(
+  value: TraceGptIdentity | undefined
+): TraceGptIdentity | undefined {
+  try {
+    if (!value || Reflect.ownKeys(value).length !== 2) return undefined;
+    const auction = Object.getOwnPropertyDescriptor(value, 'diagnostic_auction_id');
+    const slot = Object.getOwnPropertyDescriptor(value, 'slot_ref');
+    if (
+      !auction ||
+      !slot ||
+      !Object.prototype.hasOwnProperty.call(auction, 'value') ||
+      !Object.prototype.hasOwnProperty.call(slot, 'value') ||
+      !validDiagnosticAuctionId(auction.value) ||
+      !validTraceSlotRef(slot.value)
+    )
+      return undefined;
+    return Object.freeze({ diagnostic_auction_id: auction.value, slot_ref: slot.value });
+  } catch {
+    return undefined;
+  }
+}
 
 export const MAX_DIAGNOSTIC_SLOTS = 64;
 export const MAX_REQUEST_CYCLES_PER_SLOT = 10;
@@ -107,6 +132,7 @@ interface StoreOptions {
   schedule?: (callback: () => void) => void;
   /** Deferred marker cleanup and diagnostic-window re-notification. */
   defer?: (callback: () => void, delayMs: number) => void;
+  onTraceCorrelation?: (value: TraceSlotCorrelationV1) => void;
 }
 
 type RequestIntentSource = 'trusted_server_direct' | 'prebid_refresh' | 'publisher_refresh';
@@ -116,6 +142,7 @@ interface PendingSourceEvidence {
   trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity;
   trustedServerAuctionId?: string;
   requestedSlotSizes?: ReadonlyArray<Size>;
+  traceIdentity?: TraceGptIdentity;
   auctionType?: Extract<GptDiagnosticsAuctionType, 'ssat' | 'trusted_server'>;
   auctionWinner?: GptDiagnosticsAuctionWinner;
   prebidAuction?: GptDiagnosticsPrebidAuctionEvidence;
@@ -177,13 +204,10 @@ function isTrustedServerOpportunity(
   );
 }
 
+const CREATIVE_FAILURES: ReadonlySet<string> = new Set(GPT_DIAGNOSTICS_CREATIVE_FAILURES);
+
 function isCreativeFailure(reason: unknown): reason is GptDiagnosticsCreativeFailure {
-  return (
-    reason === 'missing_render_source' ||
-    reason === 'cache_fetch_failed' ||
-    reason === 'invalid_cache_payload' ||
-    reason === 'response_post_failed'
-  );
+  return typeof reason === 'string' && CREATIVE_FAILURES.has(reason);
 }
 
 function validDuration(start: number | undefined, end: number | undefined): number | undefined {
@@ -389,6 +413,7 @@ export class GptDiagnosticsStore {
   private readonly now: () => number;
   private readonly schedule: (callback: () => void) => void;
   private readonly defer: (callback: () => void, delayMs: number) => void;
+  private readonly onTraceCorrelation?: (value: TraceSlotCorrelationV1) => void;
   /** Auction slot ID → GPT slot, established by the Trusted Server integration. */
   private readonly trustedServerSlots = new Map<string, GptDiagnosticsSlotLike>();
   private readonly pendingRequestIntents = new WeakMap<object, PendingRequestIntent>();
@@ -420,6 +445,7 @@ export class GptDiagnosticsStore {
     this.now = options.now ?? (() => performance.now());
     this.schedule = options.schedule ?? ((callback) => queueMicrotask(callback));
     this.defer = options.defer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+    this.onTraceCorrelation = options.onTraceCorrelation;
   }
 
   /** Record Trusted Server's opportunity evidence for a GPT slot's next request. */
@@ -429,7 +455,8 @@ export class GptDiagnosticsStore {
     opportunity: GptDiagnosticsTrustedServerOpportunity,
     trustedServerAuctionId?: string,
     requestedSlotSizes?: ReadonlyArray<Size>,
-    auctionFacts?: GptDiagnosticsAuctionFacts
+    auctionFacts?: GptDiagnosticsAuctionFacts,
+    traceIdentity?: TraceGptIdentity
   ): void {
     if (
       !isSlotObject(slot) ||
@@ -448,10 +475,19 @@ export class GptDiagnosticsStore {
       this.trustedServerSlots.delete(oldest);
     }
 
+    const auctionId = normalizedAuctionId(trustedServerAuctionId);
+    const identity = this.onTraceCorrelation ? normalizedTraceIdentity(traceIdentity) : undefined;
+    const correlatedIdentity =
+      identity &&
+      validDiagnosticAuctionId(auctionId) &&
+      auctionId === identity.diagnostic_auction_id
+        ? identity
+        : undefined;
     this.recordRequestIntentSource(slot, 'trusted_server_direct', {
       trustedServerOpportunity: opportunity,
-      trustedServerAuctionId: normalizedAuctionId(trustedServerAuctionId),
+      trustedServerAuctionId: auctionId,
       requestedSlotSizes: normalizedRequestedSlotSizes(requestedSlotSizes),
+      ...(correlatedIdentity ? { traceIdentity: correlatedIdentity } : {}),
       ...normalizedAuctionFacts(auctionFacts),
     });
   }
@@ -768,6 +804,23 @@ export class GptDiagnosticsStore {
           }
         : {}),
     });
+    if (
+      trustedServerEvidence?.traceIdentity &&
+      this.onTraceCorrelation &&
+      Number.isSafeInteger(record.runtimeSlotNumber) &&
+      Number.isSafeInteger(requestNumber)
+    ) {
+      try {
+        this.onTraceCorrelation({
+          schema_version: 1,
+          ...trustedServerEvidence.traceIdentity,
+          runtime_slot_number: record.runtimeSlotNumber,
+          request_number: requestNumber,
+        });
+      } catch {
+        // A failed trace callback must not interrupt the actual GPT cycle.
+      }
+    }
     this.incrementDisposition('slotRequested', 'matched');
     this.notify();
   }

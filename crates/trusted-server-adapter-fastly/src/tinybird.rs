@@ -637,7 +637,7 @@ mod tests {
         TinybirdSettings {
             enabled: true,
             auction_enabled: true,
-            api_host: "api.us-east.aws.tinybird.co".to_owned(),
+            api_host: "api.tinybird.example.com".to_owned(),
             secret_store: None,
             auction_dataset: "auction_events_raw".to_owned(),
             auction_token_secret: Some(Redacted::new("append-token".to_owned())),
@@ -725,7 +725,7 @@ mod tests {
 
         let specs = backend.specs.lock().expect("should lock specs");
         assert_eq!(specs.len(), 1, "should ensure one backend");
-        assert_eq!(specs[0].host, "api.us-east.aws.tinybird.co");
+        assert_eq!(specs[0].host, "api.tinybird.example.com");
         drop(specs);
 
         let requests = http_client
@@ -737,7 +737,7 @@ mod tests {
         assert_eq!(requests[0].method, Method::POST.to_string());
         assert_eq!(
             requests[0].uri,
-            "https://api.us-east.aws.tinybird.co/v0/events?name=auction_events_raw"
+            "https://api.tinybird.example.com/v0/events?name=auction_events_raw"
         );
         assert_eq!(
             header_value(&requests[0].headers, header::CONTENT_TYPE.as_str()),
@@ -968,7 +968,7 @@ mod tests {
         assert_eq!(requests.len(), 1, "should send exactly one request");
         assert_eq!(
             requests[0].uri,
-            "https://api.us-east.aws.tinybird.co/v0/events?name=access_logs_v2"
+            "https://api.tinybird.example.com/v0/events?name=access_logs_v2"
         );
         assert_eq!(requests[0].method, Method::POST.to_string());
         assert_eq!(
