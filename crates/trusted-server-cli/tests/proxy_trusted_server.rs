@@ -341,6 +341,12 @@ async fn send(
     request: Request<Full<Bytes>>,
 ) -> (StatusCode, HeaderMap, Bytes) {
     tokio::time::timeout(Duration::from_secs(5), async {
+        // Collecting the previous body can finish before Hyper's connection
+        // task makes the HTTP/1 dispatcher ready for another request.
+        browser
+            .ready()
+            .await
+            .expect("should ready the browser connection before sending");
         let response = browser
             .send_request(request)
             .await
