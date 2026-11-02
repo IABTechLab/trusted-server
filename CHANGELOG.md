@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** Known `[integrations.*]` tables, `[tester_cookie]`, and `[tinybird]` now reject unknown fields, including in disabled integration blocks. Integration parse errors name the offending key. `ts config validate` and `ts config push` also reject unknown integration IDs and list the supported IDs; runtime startup warns and ignores unknown IDs for compatibility with stored configs. Before deploying the new binary, use the new CLI to run `ts config validate` on the current config, correct the reported fields and IDs, then push the cleaned config while the old binary is still running. On Fastly, wait for the config-store propagation window to elapse before activating the new binary; a successful push does not mean every point of presence (POP) has the new config. Stored unknown fields can otherwise prevent startup. Intentionally open payload maps remain supported. Lockr uses `app_id`; remove unsupported `organization_id` and `project_id` fields.
 - Auction response collection now bounds network waiting by `[auction].timeout_ms`
   measured from dispatch, including delayed headers and trickling bodies on all
   adapters. Complete available responses survive a slow publisher origin;

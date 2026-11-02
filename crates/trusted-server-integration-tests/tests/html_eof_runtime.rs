@@ -173,6 +173,8 @@ impl<'a> Harness<'a> {
                 "build",
                 "-p",
                 "trusted-server-cli",
+                "--features",
+                "trusted-server-core/test-utils",
                 "--bin",
                 "ts",
                 "--locked",

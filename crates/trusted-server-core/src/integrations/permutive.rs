@@ -28,6 +28,7 @@ const PERMUTIVE_INTEGRATION_ID: &str = "permutive";
 
 /// Configuration for Permutive integration.
 #[derive(Debug, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct PermutiveConfig {
     /// Enable/disable the integration
     #[serde(default = "default_enabled")]
