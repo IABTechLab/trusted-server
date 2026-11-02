@@ -77,6 +77,38 @@ describe('explicit GPT public projection', () => {
       ).toBe(false);
     }
   );
+  it('projects combined server and Prebid evidence without widening the mobile report schema', () => {
+    const store = new GptDiagnosticsStore({ now: () => 1 });
+    const slot = { getSlotElementId: () => 'example' };
+    store.recordTrustedServerOpportunity(slot, 'example', 'no_candidate', undefined, undefined, {
+      auctionType: 'ssat',
+      winner: { bidder: 'private-server-bidder', priceBucket: '1.00' },
+      serverTimings: { auctionResolvedMs: 84 },
+    });
+    store.recordPrebidAuction(slot, 'private-prebid-auction', {
+      bidder: 'private-prebid-bidder',
+      priceBucket: '2.00',
+    });
+    store.recordSlotRequested(slot);
+    const source = observedGptSource(store);
+    expect(source.slots[0]!.requests[0]).toMatchObject({
+      auctionType: 'competing',
+      serverAuctionTimingOrigin: 'navigation',
+    });
+    const projected = projectTraceGptDiagnostics(source, TRACE_ORIGIN);
+    expect(projected.ok).toBe(true);
+    if (!projected.ok) throw new Error('should project combined diagnostics');
+    const cycle = projected.value.slots[0]!.requests[0]!;
+    for (const key of [
+      'auctionType',
+      'auctionWinner',
+      'prebidAuction',
+      'serverAuctionTimings',
+      'serverAuctionTimingOrigin',
+    ])
+      expect(cycle).not.toHaveProperty(key);
+    expect(JSON.stringify(projected.value)).not.toContain('private-');
+  });
   it('classifies inspection failures without reading caller-controlled errors', () => {
     let reads = 0;
     const failure = Object.defineProperty(new Error('private-message'), 'message', {

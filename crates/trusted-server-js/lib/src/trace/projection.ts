@@ -86,7 +86,17 @@ function cycleProjection(value: unknown, omissions: { value: number }): Record<s
   const source = sourceObject(
     value,
     ['requestNumber', 'durations', 'incompleteSequence'],
-    [...TRACE_CYCLE_KEYS, 'adManager', 'previousCreativeId']
+    [
+      ...TRACE_CYCLE_KEYS,
+      'adManager',
+      'previousCreativeId',
+      // GPT-only auction evidence is recognized but excluded from the v1 mobile report.
+      'auctionType',
+      'auctionWinner',
+      'prebidAuction',
+      'serverAuctionTimings',
+      'serverAuctionTimingOrigin',
+    ]
   );
   const output: Record<string, unknown> = {
     requestNumber: data(source, 'requestNumber'),

@@ -1,10 +1,13 @@
-# Auction Telemetry
+# Auction and access telemetry
 
-Trusted Server can emit bounded auction observations directly to Tinybird.
-Emission is currently wired only by the Fastly adapter. Other adapters use the
-core no-op sink even if they can parse the shared settings.
+Trusted Server can emit bounded auction observations and sampled request-timing
+rows directly to Tinybird. Both sinks are opt-in and currently wired only by the
+Fastly adapter. Axum can emit the `Server-Timing` response header, but not Tinybird
+rows. Cloudflare and Spin collect timings for GPT diagnostics only; their
+`server_timing_enabled` and `tinybird.access_enabled` settings have no effect on
+header or access-row emission.
 
-## Data path
+## Auction data path
 
 The request entry point derives coarse `DeviceSignals`. Auction execution
 combines those signals with request and navigation facts in an
@@ -19,7 +22,7 @@ after dispatch; it does not wait for Tinybird's response. Each batch is limited
 to 512 rows and `tinybird.max_body_bytes` bytes. The Fastly backend uses
 two-second first-byte and between-byte timeouts.
 
-## Privacy boundary
+## Auction privacy boundary
 
 Telemetry records operational auction facts, not the EC identifier. The event
 model includes coarse device classification, auction source and outcome,
@@ -33,19 +36,133 @@ clients produce no value. Edge, Opera, and iOS-specific tokens are matched
 before generic Chrome or Safari tokens so embedded UA tokens do not
 misclassify them.
 
-## Configuration
+## Access data path
 
-Set `tinybird.enabled = true`, provide the regional API host, select the
-auction datasource, and set `auction_token_secret` to the key holding that
-datasource's APPEND token in the default app-config secret store. The default
-datasource is `auction_events_raw`; the default body limit is 1 MiB and the
-minimum accepted limit is 1 KiB.
+Fastly attaches one request clock, records phases, and stamps the headers-ready
+boundary after applying terminal response effects. Access sampling is uniform per
+response: one random draw is made before constructing the snapshot, using the
+configured `access_sample_rate`. Each selected response emits one row after its
+buffered response has been handed to the client transport or its stream has been
+finished. The row stores the same sample rate; joins to auction rows therefore
+represent only the sampled access population.
 
-`tinybird.access_enabled = true` is rejected because no access-log emitter is
-wired. `access_dataset` and `access_sample_rate` are reserved.
-`access_token_secret` is deprecated input and is normalized away; it cannot
-enable access telemetry.
+```mermaid
+flowchart TB
+    A[Request clock and recorded phases] --> B[Terminal response effects]
+    B --> C[Headers-ready boundary and sampling]
+    C --> D[Capture selected response dimensions]
+    D --> E[Send or finish client response]
+    E --> F[Dispatch one access row]
+    F --> G[Fastly host continues ingest after callback return]
+```
+
+Auction-wait duration measures the actual collection interval after a provider or
+mediator request started. `/auction` and `/_ts/page-bids` record this interval with
+`pre_header` placement. Publisher HTML records `pre_header` or `in_stream` according
+to where collection runs. A measured wait under one millisecond is `0`, with its
+placement retained. Empty plans, routing-only or immediate outcomes with no network
+work, and failures before collection leave wait timing null with `none` placement.
+
+`auction_dispatched_ms` records provider dispatch only. Mediator-only collection
+can therefore have a wait, `auction_collected_ms` and commit offset while provider
+dispatch is null. A configured mediator alone is not launch evidence; a pending
+request or explicit started-request error is required. Instrumentation does not
+start new mediator requests on paths that otherwise return without dispatch.
+Page-bids browser diagnostics use the same measured wait, not R minus D. Browser
+wire fields retain the name `auctionResolvedMs`; the persisted access column is
+`auction_collected_ms` to describe the collection-return point accurately.
+
+Emission is best effort. Serialization, body-size, backend-registration and request
+start failures are logged without changing the delivered response. Like the auction
+sink, access telemetry starts `send_async` and drops the pending handle. Fastly's
+host continues transmission after the callback returns, so a reusable sandbox does
+not wait for the ingest reply. Dispatch preparation still costs work. Ingest is not
+included in `request_elapsed_ms`.
+
+Successful dispatch is not confirmed ingestion. Later transport/TLS failures,
+non-2xx responses and quarantined rows are unobserved by the emitter; there is no
+retry or durability guarantee. Check workspace ingestion and quarantine during
+rollout. The SDK lifetime contract was exercised with delayed local Viceroy backends,
+including sandbox reuse, not a production Tinybird deployment.
+
+## Access privacy boundary
+
+The new `access_logs_v2` datasource has a configured 30-day TTL. Its 31 columns
+contain:
+
+- Event timestamp, normalized HTTP method, response status, and sampling rate.
+- Fastly service ID, publisher domain, deployment environment, POP, country, and
+  `ts_version`, which matches the Trusted Server build identifier in `x-ts-version`.
+  It uses the build-pipeline override, exact Git tag, branch name, then six-character
+  commit SHA, in that order; absent metadata is `unknown`. It is not the numeric
+  Fastly activation version from `x-ts-fastly-version`. A branch name is not an
+  immutable source fingerprint.
+- Coarse route class and bounded route template, body mode, and template-cache
+  state. Publisher paths collapse to `/`, `/other/*`, or an operator-allowlisted
+  section such as `/news/*`; named routes retain parameter placeholders. Asset
+  routes report `<configured prefix>/*`; responses without route metadata report
+  `unknown`.
+- App-build, filter, geo, KV, origin, template-cache, auction-wait, and stream
+  durations, plus headers-ready and request-completion offsets and response bytes
+  accepted by the transport. When origin dispatch overlaps other work, `origin_ms`
+  measures only the remaining origin wait after overlap, not full origin latency.
+  A template-cache hit skips the origin span. Unrecorded timings are null.
+- `delivery_result` is `complete`, `partial`, or `error`. It describes local body
+  handoff to the transport, not confirmed client receipt. `partial` means bytes
+  were accepted before a drive error, or transport finish failed; `error` means a
+  drive failed before any body byte was accepted. A status of 200 can accompany
+  either failure result.
+- Auction wait placement, dispatch/collection/commit offsets, and a random auction
+  UUID. The UUID joins to `auction_events_raw.auction_id`, where coarse device
+  class and browser family can also be present. Disabled auctions have no access
+  UUID; active consent-denied observations retain their join key without launch
+  milestones.
+
+`appbuild_ms` measures Fastly per-request setup, including config-store opening and,
+on cold requests, application construction. A warm sample can be non-null; this is
+not a cold-start flag. Axum builds its state at startup and records no per-request
+app-build phase. Adapter entry points start their clocks at different boundaries,
+so compare timings within one adapter rather than treating their T0 values as equal.
+
+Access rows contain no raw path, query string, IP address, User-Agent, cookie,
+EC ID, or creative content. Configuring a route section preserves that operator
+value, so allowlist only content categories, not usernames or other identifiers.
+The legacy `access_logs_raw` dataset is preserved separately, without backfilling
+its raw paths into the new privacy-bounded dataset.
+
+## Configuration and rollout
+
+Both sinks require `tinybird.enabled = true` and the regional API host.
+`auction_enabled` defaults to true for existing configurations. Set it to false
+for access-only telemetry. The auction sink defaults to `auction_events_raw` and
+requires that datasource's APPEND token key in `auction_token_secret`.
+
+To enable access telemetry, deploy `access_logs_v2` first, create its
+`ts_access_v2_ingest` APPEND token, and store the token value in the platform's
+default app-config secret store. Set `access_enabled = true`,
+`access_dataset = "access_logs_v2"`, `access_token_secret` to the stored key name,
+and a positive `access_sample_rate`, such as `0.05`. Token values are resolved
+when runtime settings load; only key names belong in config. Existing configs
+that explicitly name `access_logs_raw` must change their dataset and token before
+enabling this sink. Validation rejects exactly the normalized `access_logs_raw`
+name when access is enabled. Custom dataset names remain allowed, and disabled
+legacy configurations remain accepted. The default body limit is 1 MiB and the
+minimum accepted limit is 1 KiB; an individual row exceeding the configured limit
+is dropped.
+
+Deploy the datasource before the emitting binary, then push the opt-in config
+only after every serving binary understands it. Check ingestion freshness and
+workspace quarantine before switching dashboards to the new datasource. Remote
+deployment checks are required; source/schema alignment alone does not validate
+a workspace cutover.
+
+Before rolling back to a pre-observability binary, disable access telemetry,
+remove the non-default `[observability]` table, and re-push compatible config. An
+access-only deployment must also disable the Tinybird master switch. Keep both
+datasources during rollback; do not drop or recreate the legacy dataset or redeploy
+an older Tinybird project that omits `access_logs_v2`.
 
 The exact settings and secret-handling dispositions are in
-[Configuration](/guide/configuration#tinybird). The tracked Tinybird project is
-described in [`tinybird/README.md`](https://github.com/IABTechLab/trusted-server/blob/main/tinybird/README.md).
+[Configuration](/guide/configuration#tinybird). Token provisioning and the
+versioned cutover are described in
+[`tinybird/README.md`](https://github.com/IABTechLab/trusted-server/blob/main/tinybird/README.md).

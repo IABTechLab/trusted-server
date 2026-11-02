@@ -22,6 +22,7 @@ use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
+use crate::request_timing::RequestTimings;
 use crate::settings::Settings;
 use crate::trace::{
     TraceAuctionCarry, TraceAuctionSource, TraceAuctionTerminalReason, TraceAuctionTerminalStatus,
@@ -150,6 +151,12 @@ pub async fn handle_auction(
     }
 
     let (parts, body) = req.into_parts();
+    // T0-anchored timeline (spec section 18). This route is the auction, so
+    // dispatch and resolve bracket `run_auction` rather than the origin
+    // fetch, and the commit mark lands once the OpenRTB response carrying the
+    // targeting has been built. A defaulted handle records into nothing that
+    // is ever read, so direct-handler tests are unaffected.
+    let timings = RequestTimings::from_extensions(&parts.extensions).unwrap_or_default();
     let body_bytes = body.into_bytes().unwrap_or_default();
     if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
         return Response::builder()
@@ -281,6 +288,7 @@ pub async fn handle_auction(
             &auction_request,
             ec_context,
         );
+        timings.set_auction_id(observation.auction_id);
         emit_auction_events_best_effort_lazy(services, || {
             build_auction_events(
                 observation,
@@ -403,24 +411,27 @@ pub async fn handle_auction(
         ec_context,
     );
 
-    // Run the auction
-    let result = match orchestrator.run_auction(&auction_request, &context).await {
-        Ok(result) => result,
-        Err(err) => {
-            let elapsed_ms = observation.elapsed_ms();
+    timings.set_auction_id(observation.auction_id);
+
+    let (result, auction_work_started) = match orchestrator
+        .run_auction_with_timings(&auction_request, &context, &timings)
+        .await
+    {
+        Ok(completed) => completed,
+        Err(failure) => {
             emit_auction_events_best_effort_lazy(services, || {
                 build_auction_events(
                     observation,
                     AuctionTerminalOutcome::ExecutionFailed {
                         request: Some(&auction_request),
-                        provider_responses: &[],
+                        provider_responses: &failure.provider_responses,
                         reason: "execution_failed",
-                        elapsed_ms,
+                        elapsed_ms: failure.elapsed_ms,
                     },
                 )
             })
             .await;
-            return Err(err.change_context(TrustedServerError::Auction {
+            return Err(failure.error.change_context(TrustedServerError::Auction {
                 message: "Auction orchestration failed".to_string(),
             }));
         }
@@ -451,6 +462,12 @@ pub async fn handle_auction(
             return Err(error);
         }
     };
+
+    // For this route the response body is the commit, since there is no
+    // page state to write into. Routing-only results cannot commit an auction.
+    if auction_work_started {
+        timings.mark_auction_committed();
+    }
 
     emit_auction_events_best_effort_lazy(services, || {
         build_auction_events(
@@ -695,6 +712,7 @@ pub(crate) fn merge_auction_eids(
 mod tests {
     use super::*;
     use crate::auction::config::AuctionConfig;
+    use crate::auction::provider::test_support::LaunchEvidenceProvider as Mediator;
     use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
     use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
     use crate::auction::types::{AuctionRequest, AuctionResponse};
@@ -707,7 +725,10 @@ mod tests {
         NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubBackend,
         StubHttpClient, noop_services,
     };
-    use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
+    use crate::platform::{
+        ClientInfo, PlatformBackend, PlatformHttpClient, PlatformHttpRequest, PlatformResponse,
+    };
+    use crate::request_timing::AuctionWaitPlacement;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use crate::trace::TracePreDispatchHook;
     use base64::Engine as _;
@@ -737,13 +758,21 @@ mod tests {
     }
 
     fn services_with_telemetry(sink: Arc<RecordingTelemetrySink>) -> RuntimeServices {
+        services_with_http_and_telemetry(Arc::new(NoopHttpClient), Arc::new(NoopBackend), sink)
+    }
+
+    fn services_with_http_and_telemetry(
+        http: Arc<dyn PlatformHttpClient>,
+        backend: Arc<dyn PlatformBackend>,
+        sink: Arc<RecordingTelemetrySink>,
+    ) -> RuntimeServices {
         let telemetry_sink: Arc<dyn AuctionTelemetrySink> = sink;
         RuntimeServices::builder()
             .config_store(Arc::new(NoopConfigStore))
             .secret_store(Arc::new(NoopSecretStore))
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(NoopBackend))
-            .http_client(Arc::new(NoopHttpClient))
+            .backend(backend)
+            .http_client(http)
             .geo(Arc::new(NoopGeo))
             .auction_telemetry_sink(telemetry_sink)
             .client_info(ClientInfo::default())
@@ -1143,13 +1172,15 @@ mod tests {
                 "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
             }]
         });
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method("POST")
             .uri("https://test-publisher.example/auction")
             .body(EdgeBody::from(
                 serde_json::to_vec(&body).expect("should serialize disabled-auction body"),
             ))
             .expect("should build disabled-auction request");
+        let timings = RequestTimings::new();
+        request.extensions_mut().insert(timings.handle().clone());
 
         let response = handle_auction(
             &settings,
@@ -1168,6 +1199,10 @@ mod tests {
             StatusCode::OK,
             "disabled auction should return a 200 no-bid response"
         );
+        assert!(
+            timings.snapshot().auction_id.is_none(),
+            "should keep the disabled /auction access join key null"
+        );
         let batches = telemetry_sink
             .batches
             .lock()
@@ -1182,6 +1217,262 @@ mod tests {
             Some("auction_disabled"),
             "should identify the disabled auction policy"
         );
+    }
+
+    #[tokio::test]
+    async fn planned_endpoint_preserves_installed_collector_across_terminal_states() {
+        for (provider_configured, transport_failure, metadata_missing) in [
+            (true, false, false),
+            (true, true, false),
+            (false, false, false),
+            (true, false, true),
+        ] {
+            let provider = if provider_configured {
+                "[auction.providers.example]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example.com/auction\"\nrouting = \"all_eligible\"\n"
+            } else {
+                ""
+            };
+            let settings = Settings::from_toml(&format!(
+                "{}\n[auction]\nenabled = true\n{provider}",
+                crate_test_settings_str()
+            ))
+            .expect("should parse planned endpoint settings");
+            let plan = Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile endpoint plan"),
+            );
+            let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+            let http = Arc::new(StubHttpClient::new());
+            http.push_response(204, Vec::new());
+            if transport_failure {
+                http.push_select_error();
+            }
+            if metadata_missing {
+                http.push_pending_backend_name_override(None);
+            }
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services =
+                services_with_http_and_telemetry(http.clone(), Arc::new(StubBackend), sink.clone());
+            let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+            let body = json!({ "adUnits": [{
+                "code": "example-slot",
+                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+            }] });
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("https://publisher.example.com/auction")
+                .body(EdgeBody::from(
+                    serde_json::to_vec(&body).expect("should serialize endpoint request"),
+                ))
+                .expect("should build endpoint request");
+            let timings = RequestTimings::new();
+            timings.record(
+                crate::request_timing::Phase::Filter,
+                std::time::Duration::from_millis(11),
+            );
+            request.extensions_mut().insert(timings.handle().clone());
+
+            let response = handle_auction(
+                &settings,
+                &orchestrator,
+                None,
+                None,
+                &mut ec_context,
+                &services,
+                request,
+            )
+            .await;
+
+            if metadata_missing {
+                assert_eq!(
+                    response
+                        .expect_err("should fail closed after losing pending metadata")
+                        .current_context()
+                        .status_code(),
+                    StatusCode::BAD_GATEWAY
+                );
+            } else {
+                assert_eq!(
+                    response
+                        .expect("should return a completed or no-bid response")
+                        .status(),
+                    StatusCode::OK,
+                    "should preserve the no-bid HTTP contract"
+                );
+            }
+            let snapshot = timings.snapshot();
+            let auction_id = snapshot
+                .auction_id
+                .expect("should record the attempted auction UUID");
+            let batches = sink.batches.lock().expect("should lock telemetry batches");
+            assert!(
+                batches[0]
+                    .rows()
+                    .iter()
+                    .all(|row| row.auction_id == auction_id.to_string()),
+                "should join the original collector to every emitted auction row"
+            );
+            assert_eq!(
+                snapshot.filter_ms,
+                Some(11),
+                "should retain adapter-recorded phases"
+            );
+            assert_eq!(
+                http.recorded_backend_names().len(),
+                usize::from(provider_configured),
+                "should distinguish a real request launch from the empty plan"
+            );
+            assert_eq!(
+                snapshot.auction_wait_ms.is_some(),
+                provider_configured && !metadata_missing
+            );
+            assert_eq!(
+                snapshot.auction_wait_placement,
+                (provider_configured && !metadata_missing)
+                    .then_some(crate::request_timing::AuctionWaitPlacement::PreHeader)
+            );
+            if metadata_missing {
+                assert!(
+                    snapshot.auction_dispatched_ms.is_some(),
+                    "should retain evidence of the request already launched"
+                );
+                assert!(
+                    snapshot.auction_resolved_ms.is_none(),
+                    "should not fabricate collection after dispatch failure"
+                );
+                assert!(
+                    snapshot.auction_committed_ms.is_none(),
+                    "should not commit a failed dispatch"
+                );
+            } else if provider_configured {
+                let dispatched = snapshot
+                    .auction_dispatched_ms
+                    .expect("should mark a real launch");
+                let resolved = snapshot
+                    .auction_resolved_ms
+                    .expect("should mark collection even after transport failure");
+                let committed = snapshot
+                    .auction_committed_ms
+                    .expect("should commit the no-bid response");
+                assert!(
+                    dispatched <= resolved && resolved <= committed,
+                    "should preserve milestone ordering"
+                );
+            } else {
+                assert!(
+                    snapshot.auction_dispatched_ms.is_none(),
+                    "should omit zero-launch dispatch"
+                );
+                assert!(
+                    snapshot.auction_resolved_ms.is_none(),
+                    "should omit zero-launch resolution"
+                );
+                assert!(
+                    snapshot.auction_committed_ms.is_none(),
+                    "should omit zero-launch commit"
+                );
+            }
+            timings.mark_headers_ready();
+            timings.mark_request_elapsed();
+            assert!(
+                timings
+                    .handle()
+                    .snapshot(
+                        |inner| inner.headers_ready.is_some() && inner.request_complete.is_some()
+                    )
+                    .expect("should snapshot original handle"),
+                "should retain the same collector through response commitment"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_mediator_collection_requires_launch_evidence_and_preserves_not_started() {
+        for configured_provider in [false, true] {
+            for (mediator, wait_failure) in [
+                (Mediator::Immediate, false),
+                (Mediator::FailBeforeStart, false),
+                (Mediator::FailAfterStart, false),
+                (Mediator::Pending, false),
+                (Mediator::Pending, true),
+            ] {
+                // Explicit routing without bidders produces the existing routing-only
+                // Dispatched path. An empty provider set must remain NotStarted.
+                let provider = if configured_provider {
+                    "[auction.providers.example]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example.com/auction\"\nrouting = \"explicit\"\n"
+                } else {
+                    ""
+                };
+                let settings = Settings::from_toml(&format!(
+                    "{}\n[auction]\nenabled = true\nmediator = \"adserver_mock\"\n{provider}",
+                    crate_test_settings_str()
+                ))
+                .expect("should parse mediator endpoint settings");
+                let orchestrator = AuctionOrchestrator::from_plan(
+                    Arc::new(
+                        crate::auction::compile_auction_plan(&settings)
+                            .expect("should compile mediator plan"),
+                    ),
+                    Some(Arc::new(mediator)),
+                );
+                let http = Arc::new(StubHttpClient::new());
+                http.push_response(204, Vec::new());
+                if wait_failure {
+                    http.push_wait_error();
+                }
+                let sink = Arc::new(RecordingTelemetrySink::default());
+                let services =
+                    services_with_http_and_telemetry(http.clone(), Arc::new(StubBackend), sink);
+                let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri("https://publisher.example.com/auction")
+                    .body(EdgeBody::from(
+                        serde_json::to_vec(&json!({"adUnits": [{
+                            "code": "slot", "mediaTypes": {"banner": {"sizes": [[300, 250]]}}
+                        }]}))
+                        .expect("should serialize mediator endpoint request"),
+                    ))
+                    .expect("should construct mediator endpoint request");
+                let timings = RequestTimings::new();
+                request.extensions_mut().insert(timings.handle().clone());
+                let response = handle_auction(
+                    &settings,
+                    &orchestrator,
+                    None,
+                    None,
+                    &mut ec_context,
+                    &services,
+                    request,
+                )
+                .await
+                .expect("should return no-bid response");
+                assert_eq!(response.status(), StatusCode::OK);
+                let launched = configured_provider
+                    && matches!(mediator, Mediator::Pending | Mediator::FailAfterStart);
+                assert_eq!(
+                    http.recorded_backend_names().len(),
+                    usize::from(launched),
+                    "{configured_provider} {mediator:?}"
+                );
+                let snapshot = timings.snapshot();
+                assert!(
+                    snapshot.auction_dispatched_ms.is_none(),
+                    "mediator collection must not fabricate provider dispatch"
+                );
+                assert_eq!(
+                    snapshot.auction_wait_ms.is_some(),
+                    launched,
+                    "{configured_provider} {mediator:?}"
+                );
+                assert_eq!(
+                    snapshot.auction_wait_placement,
+                    launched.then_some(AuctionWaitPlacement::PreHeader)
+                );
+                assert_eq!(snapshot.auction_resolved_ms.is_some(), launched);
+                assert_eq!(snapshot.auction_committed_ms.is_some(), launched);
+            }
+        }
     }
 
     #[tokio::test]
@@ -1539,13 +1830,15 @@ mod tests {
                 "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
             }]
         });
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method("POST")
             .uri("https://test-publisher.example/auction")
             .body(EdgeBody::from(
                 serde_json::to_vec(&body).expect("should serialize launch-failure body"),
             ))
             .expect("should build launch-failure request");
+        let timings = RequestTimings::new();
+        request.extensions_mut().insert(timings.handle().clone());
 
         let error = handle_auction(
             &settings,
@@ -1569,10 +1862,25 @@ mod tests {
             .expect("should lock telemetry batches");
         assert_eq!(batches.len(), 1, "should emit one telemetry batch");
         let rows = batches[0].rows();
-        assert_eq!(rows.len(), 1, "should emit one execution-failure summary");
-        assert_eq!(rows[0].event_kind, "summary");
-        assert_eq!(rows[0].terminal_status.as_deref(), Some("execution_failed"));
-        assert_eq!(rows[0].terminal_reason.as_deref(), Some("execution_failed"));
+        assert_eq!(
+            rows.len(),
+            2,
+            "should emit provider failure and summary rows"
+        );
+        let summary = rows
+            .iter()
+            .find(|row| row.event_kind == "summary")
+            .expect("should emit an execution-failure summary");
+        assert_eq!(summary.terminal_status.as_deref(), Some("execution_failed"));
+        assert_eq!(summary.terminal_reason.as_deref(), Some("execution_failed"));
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            Some(summary.auction_id.clone()),
+            snapshot.auction_id.map(|id| id.to_string())
+        );
+        assert!(snapshot.auction_dispatched_ms.is_none());
+        assert!(snapshot.auction_resolved_ms.is_none());
+        assert!(snapshot.auction_committed_ms.is_none());
     }
 
     #[tokio::test]
@@ -1604,13 +1912,15 @@ mod tests {
                 }
             ]
         });
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method("POST")
             .uri("https://test-publisher.com/auction")
             .body(EdgeBody::from(
                 serde_json::to_vec(&body).expect("should serialize body"),
             ))
             .expect("should build auction request");
+        let timings = RequestTimings::new();
+        req.extensions_mut().insert(timings.handle().clone());
 
         let response = handle_auction(
             &settings,
@@ -1651,6 +1961,18 @@ mod tests {
         assert_eq!(rows[0].event_kind, "summary");
         assert_eq!(rows[0].terminal_status.as_deref(), Some("skipped"));
         assert_eq!(rows[0].terminal_reason.as_deref(), Some("consent_denied"));
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            rows[0].auction_id,
+            snapshot
+                .auction_id
+                .expect("should record the consent-denied auction UUID")
+                .to_string(),
+            "should retain the skipped-summary join key"
+        );
+        assert!(snapshot.auction_dispatched_ms.is_none());
+        assert!(snapshot.auction_resolved_ms.is_none());
+        assert!(snapshot.auction_committed_ms.is_none());
         let ndjson = batches[0]
             .to_ndjson(16 * 1024)
             .expect("should serialize telemetry");

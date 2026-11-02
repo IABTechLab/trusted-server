@@ -66,6 +66,8 @@ function fakeApiStore() {
     subscribe: vi.fn(() => () => undefined),
     recordTrustedServerOpportunity: vi.fn(),
     recordPrebidRefresh: vi.fn(),
+    recordPrebidAuction: vi.fn(),
+    recordPrebidWin: vi.fn(),
     recordTrustedServerCreativeRequest: vi.fn((_auctionSlotId: string) => 41),
     recordTrustedServerCreativeResponse: vi.fn(),
     recordTrustedServerCreativeFailure: vi.fn(),
@@ -92,7 +94,9 @@ describe('GptDiagnosticsApiController', () => {
       'subscribe',
     ]);
     expect(Object.keys(controller.recorder).sort()).toEqual([
+      'recordPrebidAuction',
       'recordPrebidRefresh',
+      'recordPrebidWin',
       'recordTrustedServerCreativeFailure',
       'recordTrustedServerCreativeRequest',
       'recordTrustedServerCreativeResponse',
@@ -112,7 +116,10 @@ describe('GptDiagnosticsApiController', () => {
     controller.recorder.recordTrustedServerOpportunity(
       slot,
       'auction-slot-example',
-      'renderable_candidate'
+      'renderable_candidate',
+      undefined,
+      undefined,
+      { auctionType: 'ssat' }
     );
     controller.recorder.recordPrebidRefresh(slots);
     const attemptId =
@@ -126,7 +133,8 @@ describe('GptDiagnosticsApiController', () => {
       'auction-slot-example',
       'renderable_candidate',
       undefined,
-      undefined
+      undefined,
+      { auctionType: 'ssat' }
     );
     expect(store.recordPrebidRefresh).toHaveBeenCalledTimes(1);
     expect(store.recordPrebidRefresh).toHaveBeenCalledWith(slots);
@@ -159,6 +167,7 @@ describe('GptDiagnosticsApiController', () => {
       'auction-slot-example',
       'renderable_candidate',
       'auction-123',
+      undefined,
       undefined
     );
   });
@@ -225,6 +234,9 @@ describe('GptDiagnosticsApiController', () => {
                 yieldGroupIds: [10],
                 companyIds: [20],
               },
+              auctionWinner: { bidder: 'example', priceBucket: '1.20' },
+              serverAuctionTimings: { auctionResolvedMs: 84 },
+              serverAuctionTimingOrigin: 'spa_auction' as const,
               trustedServerCreativeFailures: ['cache_fetch_failed' as const],
             },
           ],
@@ -280,6 +292,13 @@ describe('GptDiagnosticsApiController', () => {
     expect(cycle?.adManager?.companyIds).not.toBe(
       source.slots[0]?.requests[0]?.adManager.companyIds
     );
+    expect(cycle?.auctionWinner).toEqual({ bidder: 'example', priceBucket: '1.20' });
+    expect(cycle?.auctionWinner).not.toBe(source.slots[0]?.requests[0]?.auctionWinner);
+    expect(cycle?.serverAuctionTimings).toEqual({ auctionResolvedMs: 84 });
+    expect(cycle?.serverAuctionTimings).not.toBe(
+      source.slots[0]?.requests[0]?.serverAuctionTimings
+    );
+    expect(cycle?.serverAuctionTimingOrigin).toBe('spa_auction');
     expect(snapshot.metadata).not.toBe(source.metadata);
     expect(snapshot.metadata.droppedAttributionIssues).toBe(2);
   });

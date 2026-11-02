@@ -10,3 +10,6 @@ pub mod app;
 pub mod middleware;
 /// Platform-trait implementations backed by env vars and `reqwest`.
 pub mod platform;
+/// Terminal timing layer wrapping the Axum dev server's tower `Service`
+/// boundary with the request-phase `Server-Timing` freeze point.
+pub mod timing;

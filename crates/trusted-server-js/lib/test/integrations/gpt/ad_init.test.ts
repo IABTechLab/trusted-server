@@ -21,7 +21,6 @@ import {
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
   RENDERER_READY_TIMEOUT_MS,
 } from '../../../src/integrations/aps/render';
-import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 
 let publisherNativeScript: HTMLScriptElement | undefined;
 
@@ -410,6 +409,58 @@ describe('installTsAdInit', () => {
     try {
       const recordTrustedServerOpportunity = vi.fn();
       const { mockPubads, mockSlot } = configureOpportunityDiagnostics(
+        {
+          hb_pb: '1.10',
+          hb_bidder: 'example-bidder',
+          hb_adid: 'example-fallback-ad',
+          hb_auction_id: 'example-fallback-auction',
+          adm: '<div>Fallback</div>',
+        },
+        recordTrustedServerOpportunity
+      );
+      const ts = (window as TestWindow).tsjs as TsjsApi;
+      ts.navGeneration = 1;
+      ts.auctionDiagnostics = { auctionDispatchedMs: 17, auctionResolvedMs: 93 };
+      registerPublisherFirstImpressionAuctions(ts, ['div-atf-sidebar']);
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      ts.adInit!();
+
+      expect(mockPubads.refresh).not.toHaveBeenCalled();
+      ts.auctionDiagnostics = { auctionDispatchedMs: 31, auctionResolvedMs: 144 };
+      vi.advanceTimersByTime(5001);
+
+      expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
+      expect(mockPubads.refresh).toHaveBeenCalledOnce();
+      expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledOnce();
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+        mockSlot,
+        'atf_sidebar_ad',
+        'renderable_candidate',
+        'example-fallback-auction',
+        [[300, 250]],
+        {
+          auctionType: 'trusted_server',
+          winner: { bidder: 'example-bidder', priceBucket: '1.10' },
+          serverTimings: { auctionDispatchedMs: 17, auctionResolvedMs: 93 },
+        }
+      );
+
+      vi.advanceTimersByTime(10_000);
+      expect(mockPubads.refresh).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps fallback delivery when the diagnostics recorder throws', async () => {
+    vi.useFakeTimers();
+    try {
+      const recordTrustedServerOpportunity = vi.fn(() => {
+        throw new Error('fallback diagnostics unavailable');
+      });
+      const { mockPubads, mockSlot } = configureOpportunityDiagnostics(
         { hb_pb: '1.10', hb_adid: 'example-fallback-ad', adm: '<div>Fallback</div>' },
         recordTrustedServerOpportunity
       );
@@ -419,13 +470,11 @@ describe('installTsAdInit', () => {
       installTsAdInit();
       ts.adInit!();
 
-      expect(mockPubads.refresh).not.toHaveBeenCalled();
-      vi.advanceTimersByTime(5001);
-
+      expect(() => vi.advanceTimersByTime(5001)).not.toThrow();
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledOnce();
       expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
       expect(mockPubads.refresh).toHaveBeenCalledOnce();
       expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
-      expect(recordTrustedServerOpportunity).toHaveBeenCalledOnce();
 
       vi.advanceTimersByTime(10_000);
       expect(mockPubads.refresh).toHaveBeenCalledOnce();
@@ -534,6 +583,7 @@ describe('installTsAdInit', () => {
         'atf_sidebar_ad',
         expectedOpportunity,
         undefined,
+        undefined,
         undefined
       );
     }
@@ -560,6 +610,99 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'unrenderable_candidate',
       'auction-123',
+      undefined,
+      {
+        auctionType: 'ssat',
+        winner: { bidder: 'example', priceBucket: '1.00' },
+      }
+    );
+  });
+
+  it('classifies a winning SPA auction and snapshots its server timings', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(
+      {
+        hb_pb: '1.00',
+        hb_bidder: 'example',
+        hb_adid: 'creative-1',
+        hb_auction_id: 'auction-spa-123',
+      },
+      recordTrustedServerOpportunity
+    );
+    const ts = (window as TestWindow).tsjs!;
+    ts.navGeneration = 1;
+    ts.auctionDiagnostics = { auctionDispatchedMs: 12, auctionResolvedMs: 84 };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    ts.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'unrenderable_candidate',
+      'auction-spa-123',
+      undefined,
+      {
+        auctionType: 'trusted_server',
+        winner: { bidder: 'example', priceBucket: '1.00' },
+        serverTimings: { auctionDispatchedMs: 12, auctionResolvedMs: 84 },
+      }
+    );
+  });
+
+  it('snapshots auction timing with the bids before queued GPT work runs', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(
+      { hb_pb: '1.00', hb_bidder: 'example', hb_adid: 'creative-1' },
+      recordTrustedServerOpportunity
+    );
+    const ts = (window as TestWindow).tsjs!;
+    ts.auctionDiagnostics = { auctionResolvedMs: 84 };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    let queued: (() => void) | undefined;
+    const googletag = (window as TestWindow).googletag as {
+      cmd: { push(callback: () => void): void };
+    };
+    googletag.cmd.push = (callback) => {
+      queued = callback;
+    };
+
+    ts.adInit!();
+    ts.auctionDiagnostics.auctionResolvedMs = 99;
+    queued?.();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'unrenderable_candidate',
+      undefined,
+      undefined,
+      {
+        auctionType: 'ssat',
+        winner: { bidder: 'example', priceBucket: '1.00' },
+        serverTimings: { auctionResolvedMs: 84 },
+      }
+    );
+  });
+
+  it('does not infer an SPA auction from navigation generation alone', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(undefined, recordTrustedServerOpportunity);
+    (window as TestWindow).tsjs!.navGeneration = 1;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'no_candidate',
+      undefined,
+      undefined,
       undefined
     );
   });
@@ -597,7 +740,8 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'no_candidate',
       undefined,
-      formats
+      formats,
+      undefined
     );
   });
 
@@ -623,7 +767,8 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'no_candidate',
       undefined,
-      formats
+      formats,
+      undefined
     );
   });
 
@@ -662,6 +807,7 @@ describe('installTsAdInit', () => {
       mockSlot,
       'atf_sidebar_ad',
       'no_candidate',
+      undefined,
       undefined,
       undefined
     );
