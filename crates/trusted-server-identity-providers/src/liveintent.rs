@@ -5,6 +5,9 @@
 //! to one configured `OpenRTB` source. The lookup is anonymous: no hashed
 //! email and no first-party `LiveIntent` cookie are sent.
 //!
+//! As in Prebid's `LiveIntent` module, every attribute other than `nonId` is
+//! a partner ID and its UID carries `ext.provider` naming `LiveIntent`.
+//!
 //! This kind has no Lockr capability: Lockr AIM is not documented to
 //! deliver `LiveIntent` IDs, so a `lockr` settings table is rejected.
 
@@ -34,6 +37,15 @@ use crate::common::{bounded_expiry, is_routable_ip, join_section_ids};
 /// `atype` `LiveIntent` IDs carry: a person-based ID.
 const LIVEINTENT_ATYPE: i32 = 3;
 
+/// The attribute holding `LiveIntent`'s own ID; the others are partner IDs.
+const NON_ID_ATTRIBUTE: &str = "nonId";
+
+/// UID `ext` Prebid puts on partner IDs that `LiveIntent` resolved.
+const PARTNER_UID_EXT: &str = r#"{"provider":"liveintent.com"}"#;
+
+/// Prefix of a `LiveIntent`-issued distributor ID, such as `did-0123`.
+const DISTRIBUTOR_ID_PREFIX: &str = "did-";
+
 /// Most UIDs accepted per `LiveIntent` EID.
 const MAX_UIDS_PER_EID: NonZeroUsize = NonZeroUsize::new(1).expect("should be non-zero");
 
@@ -47,7 +59,8 @@ pub struct LiveIntentSettings {
     /// The `LiveIntent` publisher ID; `LiveIntent` accepts `any`.
     #[serde(default = "default_publisher_id")]
     pub publisher_id: String,
-    /// The distributor ID, when the publisher has one.
+    /// The `LiveIntent`-issued distributor ID, such as `did-0123`, when the
+    /// publisher has one.
     #[serde(default)]
     pub distributor_id: Option<String>,
     /// Map of `LiveIntent` attribute name to the source it is stored under.
@@ -67,6 +80,15 @@ pub struct LiveIntentProvider {
     url: Url,
     distributor_id: Option<String>,
     attributes: Box<[(String, SourceDomain)]>,
+    partner_uid_ext: &'static RawValue,
+}
+
+/// Whether `id` has the `did-` form `LiveIntent` accepts; it answers any
+/// other distributor ID with `400 Malformed did`.
+fn is_distributor_id(id: &str) -> bool {
+    id.strip_prefix(DISTRIBUTOR_ID_PREFIX).is_some_and(|rest| {
+        !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
 }
 
 impl ProviderKind for LiveIntent {
@@ -98,6 +120,17 @@ impl ProviderKind for LiveIntent {
             Report::new(ProviderConfigError::Invalid)
                 .attach("a liveintent provider needs at least one attribute")
         })?;
+        if let Some(id) = settings
+            .distributor_id
+            .as_deref()
+            .filter(|id| !is_distributor_id(id))
+        {
+            return Err(Report::new(ProviderConfigError::Invalid).attach(format!(
+                "distributor_id `{id}` is not a LiveIntent `did-` distributor ID"
+            )));
+        }
+        let partner_uid_ext = serde_json::from_str::<&'static RawValue>(PARTNER_UID_EXT)
+            .change_context(ProviderConfigError::Invalid)?;
         let distributor = settings.distributor_id.as_deref().unwrap_or("prebid");
         let mut url = common
             .endpoint
@@ -131,6 +164,7 @@ impl ProviderKind for LiveIntent {
             url,
             distributor_id: settings.distributor_id,
             attributes,
+            partner_uid_ext,
         })
     }
 }
@@ -238,7 +272,7 @@ impl IdentityProvider for LiveIntentProvider {
                     uids: vec![ProviderUid {
                         id,
                         atype: Some(LIVEINTENT_ATYPE),
-                        ext: None,
+                        ext: (attribute != NON_ID_ATTRIBUTE).then_some(self.partner_uid_ext),
                         expiry,
                     }],
                 })
@@ -407,9 +441,78 @@ mod tests {
             matches!(eids[0].uids[0].expiry, ProviderExpiry::After(d) if d == Duration::from_secs(7200)),
             "should use Expires relative to Date"
         );
+        assert!(
+            eids[0].uids[0].ext.is_none(),
+            "should keep nonId without ext"
+        );
         assert_eq!(
             eids[1].source, "li-partner.example.com",
             "should map partner"
+        );
+        assert_eq!(
+            eids[1].uids[0].ext.map(RawValue::get),
+            Some(r#"{"provider":"liveintent.com"}"#),
+            "should name LiveIntent as the provider of a partner ID"
+        );
+    }
+
+    #[test]
+    fn rejects_a_distributor_id_liveintent_did_not_issue() {
+        for distributor_id in ["prebid", "did-", "did-01/2"] {
+            let mut config = config(&json!({ "nonId": "li.example.com" }));
+            config
+                .settings
+                .insert("distributor_id".to_owned(), json!(distributor_id));
+
+            let error = build_kind::<LiveIntent>(&config, &ProviderSecrets::default())
+                .err()
+                .expect("should reject the distributor ID");
+
+            assert!(
+                matches!(error.current_context(), ProviderConfigError::Invalid),
+                "should report invalid config for `{distributor_id}`"
+            );
+        }
+    }
+
+    #[test]
+    fn calls_the_distributor_path_with_a_did_distributor_id() {
+        let mut config = config(&json!({ "nonId": "li.example.com" }));
+        config
+            .settings
+            .insert("distributor_id".to_owned(), json!("did-0123"));
+        let provider = build_kind::<LiveIntent>(&config, &ProviderSecrets::default())
+            .expect("should build provider");
+        let consent = ConsentContext::default();
+        let due = due();
+        let lookup = LookupInput {
+            ec_id: "ec-example",
+            consent: &consent,
+            client: ClientSignals {
+                ip: None,
+                user_agent: None,
+            },
+            publisher_domain: "www.example.com",
+            due_sources: &due,
+            current: OwnedEntries::new(None, &[]),
+            hashed_email: None,
+        };
+
+        let request = provider
+            .build_request(&lookup)
+            .expect("should build request");
+
+        assert_eq!(
+            request.url.path(),
+            "/idex/did-0123/12345",
+            "should call the distributor path"
+        );
+        assert!(
+            request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "did" && value == "did-0123"),
+            "should send the distributor ID"
         );
     }
 
