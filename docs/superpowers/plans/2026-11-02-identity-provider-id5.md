@@ -27,7 +27,7 @@
 - A non-2xx status or an unparseable body is `ProviderError::InvalidResponse`.
 - `ids.<key>.eid` entries whose source is configured become `ProviderEid`s; every field, including `ext`, is borrowed from the body.
 - `cache_control.max_age_sec` becomes `ProviderExpiry::After` for every UID.
-- With no EID for the first source, a non-empty, non-`0` `universal_uid` becomes an EID with `atype = 1`.
+- With no EID for the first source, a non-empty, non-`0` `universal_uid` becomes an EID with `atype = 1` and, when the reply has `ext.linkType`, UID `ext` `{"linkType": ...}`, as in the reference provider and Prebid.
 
 ## First-party cookie
 
@@ -35,7 +35,7 @@ ID5's source is provider-owned, so the browser `ts-eids` copy is dropped. Prebid
 
 - Setting `cookie_names` (default `["id5id"]`), tried in order.
 - `id5` declares the Lockr capability (see `2026-11-02-identity-provider-lockr-capability.md`): with `[settings.lockr] enabled = true`, the Lockr cookies (default `["id5id"]`) are read after `cookie_names` and before the lookup, with the same parser.
-- A value that is JSON after percent-decoding is parsed with the same code as a lookup response (lenient entries, opt-out `0` dropped, normalized sources, `cache_control.max_age_sec` bounded). `ext` objects are dropped when the value was percent-encoded, since they borrow from the decoded copy.
+- A value that is JSON after percent-decoding is parsed with the same code as a lookup response (lenient entries, opt-out `0` dropped, normalized sources, `cache_control.max_age_sec` bounded). When the value was percent-encoded, entries, `ext` objects included, are copied out of the decoded text.
 - Any other value is a bare ID: one UID on the first source with `atype = 1` and the default TTL.
 - `signature` is never stored as a UID. A cookie that yields no usable UID is ignored, and the lookup runs as usual; a kept UID skips the lookup.
 
