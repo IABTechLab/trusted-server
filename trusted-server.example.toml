@@ -203,6 +203,20 @@ pull_sync_concurrency = 3
 # enabled = false
 # sources = ["connectid.example.com"]
 # tcf_vendor_id = 9999
+#
+# UID2 (kind "uid2"): no lookup and no endpoint. Reads the advertising token
+# from the UID2 SDK's `__uid_2` cookie until its `identity_expires`, falling
+# back to Prebid's raw `__uid2_advertising_token` cookie. Never stores or uses
+# the refresh token. Takes exactly one source. Set `token_cookie_name` to the
+# cookie Lockr AIM writes the token into, if you use Lockr.
+# [[ec.identity_providers]]
+# id = "uid2"
+# kind = "uid2"
+# enabled = false
+# sources = ["uid2.example.com"]
+# [ec.identity_providers.settings]
+# identity_cookie_name = "__uid_2"
+# token_cookie_name = "__uid2_advertising_token"
 
 
 # =============================================================================
