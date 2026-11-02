@@ -363,6 +363,8 @@ pub trait ProviderKind {
 /// Shared configuration every provider receives at build time.
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderCommon<'a> {
+    /// Configured provider ID, for logs that must tell instances apart.
+    pub id: &'a str,
     /// Configured lookup endpoint, absent for cookie-only kinds.
     pub endpoint: Option<&'a Url>,
     /// Configured sources.
@@ -401,6 +403,7 @@ pub fn build_kind<K: ProviderKind>(
     let endpoint = parse_endpoint(config)?;
     let sources = parse_sources(config)?;
     let common = ProviderCommon {
+        id: &config.id,
         endpoint: endpoint.as_ref(),
         sources: &sources,
         secrets,
