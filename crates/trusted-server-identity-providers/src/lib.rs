@@ -12,6 +12,7 @@ mod common;
 
 pub use common::LockrSettings;
 pub mod connectid;
+pub mod criteo;
 pub mod id5;
 pub mod liveintent;
 pub mod liveramp;
@@ -42,6 +43,7 @@ pub fn is_registered_kind(kind: &str) -> bool {
             | connectid::ConnectId::KIND
             | uid2::Uid2::KIND
             | sharedid::SharedId::KIND
+            | criteo::Criteo::KIND
     )
 }
 
@@ -85,6 +87,7 @@ pub fn build(
         connectid::ConnectId::KIND => build_kind::<connectid::ConnectId>(config, secrets),
         uid2::Uid2::KIND => build_kind::<uid2::Uid2>(config, secrets),
         sharedid::SharedId::KIND => build_kind::<sharedid::SharedId>(config, secrets),
+        criteo::Criteo::KIND => build_kind::<criteo::Criteo>(config, secrets),
         kind => Err(Report::new(ProviderConfigError::UnknownKind)
             .attach(format!("kind `{kind}` is not registered"))),
     }
@@ -185,6 +188,7 @@ mod tests {
             ),
             ("uid2", None, json!(["uid2.example.com"]), json!({})),
             ("sharedid", None, json!(["sharedid.example.com"]), json!({})),
+            ("criteo", None, json!(["criteo.example.com"]), json!({})),
             (
                 "unifiedid",
                 None,
