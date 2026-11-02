@@ -169,28 +169,35 @@ pull_sync_concurrency = 3
 # enabled = true
 # cookie_names = ["id5id"]
 #
-# LiveIntent (kind "liveintent"): anonymous lookup, no secrets. Each attribute
-# LiveIntent returns is stored under the source it maps to; every mapped
-# source must be listed in `sources`. `nonId` is LiveIntent's own ID; the other
-# attributes (Prebid's names, such as `bidswitch`, `triplelift`, `magnite`,
-# `index`, `openx`, `pubmatic`, `sovrn` and `nexxen`) are partner IDs, sent
-# with UID `ext.provider` naming LiveIntent. `distributor_id` is optional and
-# must be a LiveIntent-issued `did-...` ID; without it the lookup uses the
-# `prebid` path, as Prebid does.
+# LiveIntent (kind "liveintent"): no hashed email, no secrets. Sends the
+# visitor's first-party LiveIntent cookie (the first present one of
+# `cookie_names`, default `_lc2_fpi`) as `duid`. `resolve` lists the attributes
+# to ask for (default `nonId`); each one is stored under LiveIntent's fixed
+# source for it, which must be listed in `sources`: nonId liveintent.com,
+# bidswitch bidswitch.net, medianet media.net, magnite rubiconproject.com,
+# index liveintent.indexexchange.com, openx openx.net, pubmatic pubmatic.com,
+# sovrn liveintent.sovrn.com, sharethrough sharethrough.com, sonobi
+# liveintent.sonobi.com, triplelift liveintent.triplelift.com, zetassp
+# zeta-ssp.liveintent.com, vidazoo liveintent.vidazoo.com, nexxen
+# liveintent.unrulymedia.com, uid2 uidapi.com, thetradedesk adserver.org.
+# `nonId` is LiveIntent's own ID and carries the reply's `segments` as EID
+# `ext`; the others are partner IDs, sent with UID `ext.provider` naming
+# LiveIntent (the Trade Desk ID also with `rtiPartner` and EID `matcher`).
+# `distributor_id` is optional and must be a LiveIntent-issued `did-...` ID;
+# without it the lookup uses the `prebid` path, as Prebid does.
 # [[ec.identity_providers]]
 # id = "liveintent"
 # kind = "liveintent"
 # enabled = false
 # endpoint = "https://liveintent.example.com/idex"
 # allowed_domains = ["liveintent.example.com"]
-# sources = ["liveintent.example.com", "ssp.example.com"]
+# sources = ["liveintent.com", "rubiconproject.com"]
 # tcf_vendor_id = 9999
 # [ec.identity_providers.settings]
 # publisher_id = "any"
 # distributor_id = "did-0123"
-# [ec.identity_providers.settings.attributes]
-# nonId = "liveintent.example.com"
-# magnite = "ssp.example.com"
+# resolve = ["nonId", "magnite"]
+# cookie_names = ["_lc2_fpi"]
 #
 # LiveRamp (kind "liveramp"): no lookup and no endpoint. Reads the RampID
 # envelope from LiveRamp's own first-party `_lr_env` cookie and keeps it for
