@@ -183,8 +183,10 @@ pull_sync_concurrency = 3
 # `nonId` is LiveIntent's own ID and carries the reply's `segments` as EID
 # `ext`; the others are partner IDs, sent with UID `ext.provider` naming
 # LiveIntent (the Trade Desk ID also with `rtiPartner` and EID `matcher`).
-# `distributor_id` is optional and must be a LiveIntent-issued `did-...` ID;
-# without it the lookup uses the `prebid` path, as Prebid does.
+# `distributor_id` must be a LiveIntent-issued `did-...` ID; without it the
+# lookup uses the `prebid` path, as Prebid does. Set it to the publisher's own
+# distributor ID (its Prebid `liveIntentId` `distributorId`) to get partner
+# IDs: on the `prebid` path LiveIntent returns only `nonId`.
 # [[ec.identity_providers]]
 # id = "liveintent"
 # kind = "liveintent"
