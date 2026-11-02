@@ -5,6 +5,12 @@
 //! under `ids`, or the legacy `universal_uid`, which is given to the first
 //! configured source.
 //!
+//! Parsing is lenient per entry: an entry of `ids`, `universal_uid` or
+//! `cache_control` with an unexpected shape is skipped rather than failing
+//! the whole response. The opt-out UID `"0"` is never stored or forwarded.
+//! `cache_control.max_age_sec` is bounded by [`bounded_expiry`]: a missing
+//! value gets the default TTL and a zero or tiny one the minimum TTL.
+//!
 //! The request field names for the client IP and user agent follow ID5's
 //! server-to-server integration and should be confirmed with ID5 for each
 //! partner account.
@@ -22,14 +28,16 @@ use serde::{Deserialize, Serialize};
 use trusted_server_core::ec::eid_types::SourceDomain;
 use trusted_server_core::ec::provider::{
     EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities,
-    ProviderCommon, ProviderConfigError, ProviderEid, ProviderError, ProviderExpiry, ProviderKind,
-    ProviderRequest, ProviderResponse, ProviderUid, SourceCapability, SourceInput,
+    ProviderCommon, ProviderConfigError, ProviderEid, ProviderError, ProviderKind, ProviderRequest,
+    ProviderResponse, ProviderUid, SourceCapability, SourceInput,
 };
 use url::Url;
 
-use crate::common::{VendorEid, is_routable_ip, join_section_ids};
+use serde_json::value::RawValue;
 
-/// The `universal_uid` ID5 returns for a visitor who opted out.
+use crate::common::{VendorEid, bounded_expiry, is_routable_ip, join_section_ids};
+
+/// The UID ID5 returns for a visitor who opted out.
 const OPTED_OUT_UID: &str = "0";
 
 /// Most EIDs accepted from one ID5 response.
@@ -122,14 +130,16 @@ struct FetchBody<'a> {
     ip: Option<String>,
 }
 
+/// The top-level reply; each field is parsed separately so one bad shape
+/// does not fail the rest.
 #[derive(Deserialize)]
 struct FetchReply<'body> {
     #[serde(default, borrow)]
-    universal_uid: Option<Cow<'body, str>>,
+    universal_uid: Option<&'body RawValue>,
     #[serde(default, borrow)]
-    ids: BTreeMap<Cow<'body, str>, Id5Id<'body>>,
-    #[serde(default)]
-    cache_control: Option<CacheControl>,
+    ids: Option<&'body RawValue>,
+    #[serde(default, borrow)]
+    cache_control: Option<&'body RawValue>,
 }
 
 #[derive(Deserialize)]
@@ -148,11 +158,15 @@ impl Id5Provider {
         &self.capabilities.sources[0].source
     }
 
-    fn is_known(&self, source: &str) -> bool {
+    /// Returns the configured source matching `source` after normalization
+    /// (case and trailing dot).
+    fn known_source(&self, source: &str) -> Option<&SourceDomain> {
+        let source = SourceDomain::try_from(source).ok()?;
         self.capabilities
             .sources
             .iter()
-            .any(|known| known.source.as_str() == source)
+            .map(|known| &known.source)
+            .find(|known| **known == source)
     }
 }
 
@@ -210,26 +224,35 @@ impl IdentityProvider for Id5Provider {
         }
         let reply: FetchReply<'body> =
             serde_json::from_slice(response.body).change_context(ProviderError::InvalidResponse)?;
-        let expiry = reply
+        let max_age = reply
             .cache_control
+            .and_then(|raw| serde_json::from_str::<CacheControl>(raw.get()).ok())
             .and_then(|cache| cache.max_age_sec)
-            .map_or(ProviderExpiry::Unspecified, |seconds| {
-                ProviderExpiry::After(Duration::from_secs(seconds))
-            });
+            .map(Duration::from_secs);
+        let expiry = bounded_expiry(max_age);
 
-        let mut eids: Vec<ProviderEid<'body>> = reply
+        let entries: BTreeMap<String, &'body RawValue> = reply
             .ids
+            .and_then(|raw| serde_json::from_str(raw.get()).ok())
+            .unwrap_or_default();
+        let mut eids: Vec<ProviderEid<'body>> = entries
             .into_values()
+            .filter_map(|raw| serde_json::from_str::<Id5Id<'body>>(raw.get()).ok())
             .filter_map(|id| id.eid)
-            .filter(|eid| self.is_known(&eid.source))
-            .map(|eid| eid.into_provider_eid(expiry))
+            .filter_map(|mut eid| {
+                let source = self.known_source(&eid.source)?;
+                eid.source = Cow::Owned(source.as_str().to_owned());
+                eid.uids.retain(|uid| is_usable_uid(&uid.id));
+                (!eid.uids.is_empty()).then(|| eid.into_provider_eid(expiry))
+            })
             .collect();
         let primary = self.primary_source().as_str();
-        if !eids.iter().any(|eid| eid.source == primary)
-            && let Some(uid) = reply
-                .universal_uid
-                .filter(|uid| !uid.is_empty() && uid != OPTED_OUT_UID)
-        {
+        let has_primary = eids.iter().any(|eid| eid.source == primary);
+        let universal_uid = reply
+            .universal_uid
+            .and_then(|raw| serde_json::from_str::<Cow<'body, str>>(raw.get()).ok())
+            .filter(|uid| is_usable_uid(uid));
+        if !has_primary && let Some(uid) = universal_uid {
             eids.push(ProviderEid {
                 source: Cow::Owned(primary.to_owned()),
                 inserter: None,
@@ -252,12 +275,19 @@ impl IdentityProvider for Id5Provider {
     }
 }
 
+/// Returns whether `id` is a real UID: not empty and not the opt-out UID.
+fn is_usable_uid(id: &str) -> bool {
+    !id.is_empty() && id != OPTED_OUT_UID
+}
+
 #[cfg(test)]
 mod tests {
     use http::StatusCode;
     use serde_json::json;
     use trusted_server_core::consent::types::ConsentContext;
-    use trusted_server_core::ec::provider::{ClientSignals, OwnedEntries, build_kind};
+    use trusted_server_core::ec::provider::{
+        ClientSignals, OwnedEntries, ProviderExpiry, build_kind,
+    };
     use trusted_server_core::settings::{IdentityProviderConfig, ProviderSecrets};
 
     use super::*;
@@ -301,7 +331,7 @@ mod tests {
             ec_id: "ec-example",
             consent: &consent,
             client: ClientSignals {
-                ip: Some("192.0.2.10".parse().expect("should parse ip")),
+                ip: Some("11.22.33.44".parse().expect("should parse ip")),
                 user_agent: Some("ExampleBrowser/1.0"),
             },
             publisher_domain: "www.example.com",
@@ -331,7 +361,7 @@ mod tests {
         assert_eq!(body["gdpr"], 0, "should send that GDPR does not apply");
         assert_eq!(body["us_privacy"], "1YNN", "should send US privacy");
         assert_eq!(body["gpp_sid"], "7,8", "should join GPP section IDs");
-        assert_eq!(body["ip"], "192.0.2.10", "should send the client IP");
+        assert_eq!(body["ip"], "11.22.33.44", "should send the client IP");
         assert_eq!(
             body["ua"], "ExampleBrowser/1.0",
             "should send the user agent"
@@ -395,9 +425,17 @@ mod tests {
     fn falls_back_to_the_legacy_universal_uid() {
         let provider = provider();
         let headers = HeaderMap::new();
-        let body = br#"{"universal_uid":"legacy-example"}"#;
+        let body = serde_json::to_vec(&json!({
+            "universal_uid": "legacy-example",
+            "ids": {
+                "id5": { "eid": { "source": "id5.example.com", "uids": [{ "id": "0" }] } },
+                "broken": { "eid": "not an object" },
+            },
+            "cache_control": "not an object",
+        }))
+        .expect("should encode body");
 
-        let LookupOutcome::Found(eids) = respond(&*provider, &headers, body) else {
+        let LookupOutcome::Found(eids) = respond(&*provider, &headers, &body) else {
             panic!("should find an EID");
         };
 
@@ -405,7 +443,43 @@ mod tests {
             eids[0].source, "id5.example.com",
             "should use the first source"
         );
+        assert_eq!(eids.len(), 1, "should drop the opted-out EID");
         assert_eq!(eids[0].uids[0].id, "legacy-example", "should keep the UID");
+        assert!(
+            matches!(eids[0].uids[0].expiry, ProviderExpiry::After(d) if d == crate::common::DEFAULT_TTL),
+            "should use the default TTL without a cache max age"
+        );
+    }
+
+    #[test]
+    fn normalizes_sources_skips_bad_entries_and_bounds_expiry() {
+        let provider = provider();
+        let headers = HeaderMap::new();
+        let body = serde_json::to_vec(&json!({
+            "ids": {
+                "a": { "eid": { "source": "ID5.Example.com.", "uids": [{ "id": "id5-example" }, { "id": "0" }] } },
+                "b": { "eid": { "source": 7 } },
+                "c": { "eid": { "source": "id5-link.example.com", "uids": [{ "id": "0" }] } },
+            },
+            "cache_control": { "max_age_sec": 0 },
+        }))
+        .expect("should encode body");
+
+        let LookupOutcome::Found(eids) = respond(&*provider, &headers, &body) else {
+            panic!("should find an EID");
+        };
+
+        assert_eq!(eids.len(), 1, "should skip bad and opted-out entries");
+        assert_eq!(
+            eids[0].source, "id5.example.com",
+            "should store the configured source"
+        );
+        assert_eq!(eids[0].uids.len(), 1, "should drop the opt-out UID");
+        assert_eq!(eids[0].uids[0].id, "id5-example", "should keep the UID");
+        assert!(
+            matches!(eids[0].uids[0].expiry, ProviderExpiry::After(d) if d == crate::common::MIN_TTL),
+            "should keep a zero max age for the minimum TTL"
+        );
     }
 
     #[test]
@@ -413,9 +487,10 @@ mod tests {
         let provider = provider();
         let headers = HeaderMap::new();
 
-        for body in [&br#"{"universal_uid":"0"}"#[..], b"{}"] {
+        for body in [json!({ "universal_uid": "0" }), json!({})] {
+            let body = serde_json::to_vec(&body).expect("should encode body");
             assert!(
-                matches!(respond(&*provider, &headers, body), LookupOutcome::NoMatch),
+                matches!(respond(&*provider, &headers, &body), LookupOutcome::NoMatch),
                 "should report no match"
             );
         }

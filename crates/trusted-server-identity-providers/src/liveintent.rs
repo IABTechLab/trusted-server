@@ -8,17 +8,17 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use error_stack::{Report, ResultExt as _};
-use http::header::{EXPIRES, ORIGIN};
+use http::header::{DATE, EXPIRES, ORIGIN};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use trusted_server_core::ec::eid_types::{SourceDomain, UnixSeconds};
+use trusted_server_core::ec::eid_types::SourceDomain;
 use trusted_server_core::ec::provider::{
     EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities,
     ProviderCommon, ProviderConfigError, ProviderEid, ProviderError, ProviderExpiry, ProviderKind,
@@ -26,7 +26,7 @@ use trusted_server_core::ec::provider::{
 };
 use url::Url;
 
-use crate::common::{is_routable_ip, join_section_ids};
+use crate::common::{bounded_expiry, is_routable_ip, join_section_ids};
 
 /// `atype` `LiveIntent` IDs carry: a person-based ID.
 const LIVEINTENT_ATYPE: i32 = 3;
@@ -126,16 +126,22 @@ impl ProviderKind for LiveIntent {
     }
 }
 
-/// Reads the `Expires` header as an absolute expiry.
+/// Reads the `Expires` header as a bounded TTL.
+///
+/// The TTL is `Expires` minus the response's `Date`, so it needs no local
+/// clock. It is bounded by [`bounded_expiry`]: a missing or unparseable
+/// `Expires` or `Date` gets the default TTL, so a UID never lives forever,
+/// and an `Expires` at or before `Date` keeps the UID for the minimum TTL
+/// instead of dropping a valid ID.
 fn expiry(headers: &HeaderMap) -> ProviderExpiry {
-    headers
-        .get(EXPIRES)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| httpdate::parse_http_date(value).ok())
-        .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
-        .map_or(ProviderExpiry::Unspecified, |since| {
-            ProviderExpiry::At(UnixSeconds::new(since.as_secs()))
-        })
+    let date = |name| -> Option<SystemTime> {
+        let value = headers.get(name)?.to_str().ok()?;
+        httpdate::parse_http_date(value).ok()
+    };
+    let ttl = date(EXPIRES)
+        .zip(date(DATE))
+        .map(|(expires, date)| expires.duration_since(date).unwrap_or(Duration::ZERO));
+    bounded_expiry(ttl)
 }
 
 impl IdentityProvider for LiveIntentProvider {
@@ -203,7 +209,7 @@ impl IdentityProvider for LiveIntentProvider {
             return Err(Report::new(ProviderError::InvalidResponse)
                 .attach(format!("LiveIntent returned status {}", response.status)));
         }
-        let reply: HashMap<&'body str, &'body RawValue> =
+        let reply: HashMap<String, &'body RawValue> =
             serde_json::from_slice(response.body).change_context(ProviderError::InvalidResponse)?;
         let expiry = expiry(response.headers);
         let eids: Vec<ProviderEid<'body>> = self
@@ -300,7 +306,7 @@ mod tests {
             ec_id: "ec-example",
             consent: &consent,
             client: ClientSignals {
-                ip: Some("192.0.2.10".parse().expect("should parse ip")),
+                ip: Some("11.22.33.44".parse().expect("should parse ip")),
                 user_agent: None,
             },
             publisher_domain: "www.example.com",
@@ -340,7 +346,7 @@ mod tests {
         );
         assert_eq!(
             value("pip"),
-            [URL_SAFE_NO_PAD.encode("192.0.2.10").as_str()],
+            [URL_SAFE_NO_PAD.encode("11.22.33.44").as_str()],
             "should send the encoded IP"
         );
         assert_eq!(
@@ -356,15 +362,28 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             EXPIRES,
+            HeaderValue::from_static("Sun, 06 Nov 1994 10:49:37 GMT"),
+        );
+        headers.insert(
+            DATE,
             HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
         );
-        let body = br#"{"nonId":"li-example","partner":"partner-example","unknown":"x"}"#;
+        // Escape the `nonId` key as `LiveIntent` may, which a borrowed key
+        // cannot hold.
+        let body = json!({
+            "nonId": "li-example",
+            "partner": "partner-example",
+            "unknown": "x",
+        })
+        .to_string()
+        .replace("\"nonId\"", "\"non\\u0049d\"")
+        .into_bytes();
 
         let outcome = provider
             .parse_response(ProviderResponse {
                 status: StatusCode::OK,
                 headers: &headers,
-                body,
+                body: &body,
             })
             .expect("should parse response");
         let LookupOutcome::Found(eids) = outcome else {
@@ -376,8 +395,8 @@ mod tests {
         assert_eq!(eids[0].uids[0].id, "li-example", "should keep the ID");
         assert_eq!(eids[0].uids[0].atype, Some(3), "should set atype 3");
         assert!(
-            matches!(eids[0].uids[0].expiry, ProviderExpiry::At(at) if at.get() == 784_111_777),
-            "should use the Expires header"
+            matches!(eids[0].uids[0].expiry, ProviderExpiry::After(d) if d == Duration::from_secs(7200)),
+            "should use Expires relative to Date"
         );
         assert_eq!(
             eids[1].source, "li-partner.example.com",
@@ -386,13 +405,37 @@ mod tests {
     }
 
     #[test]
+    fn bounds_a_missing_or_past_expires() {
+        let mut past = HeaderMap::new();
+        past.insert(
+            EXPIRES,
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        past.insert(
+            DATE,
+            HeaderValue::from_static("Mon, 07 Nov 1994 08:49:37 GMT"),
+        );
+
+        for (headers, expected) in [
+            (HeaderMap::new(), crate::common::DEFAULT_TTL),
+            (past, crate::common::MIN_TTL),
+        ] {
+            assert!(
+                matches!(expiry(&headers), ProviderExpiry::After(d) if d == expected),
+                "should bound the expiry to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
     fn reports_no_match_for_no_content_and_empty_ids() {
         let provider = provider();
         let headers = HeaderMap::new();
 
+        let empty_id = serde_json::to_vec(&json!({ "nonId": "" })).expect("should encode body");
         for (status, body) in [
             (StatusCode::NO_CONTENT, &b""[..]),
-            (StatusCode::OK, br#"{"nonId":""}"#),
+            (StatusCode::OK, &empty_id[..]),
         ] {
             let outcome = provider
                 .parse_response(ProviderResponse {
