@@ -16,6 +16,9 @@ use super::{
 // Bound payload retained across all partial bodies, as well as each response.
 const MAX_TOTAL_BUFFERED_BODY_BYTES: usize = MAX_PLATFORM_RESPONSE_BODY_BYTES;
 
+/// Longest host wait an expired snapshot spends surfacing one arrived body.
+const SNAPSHOT_SURFACE_TIMEOUT_MS: u32 = 1;
+
 // Keep partially buffered responses alongside requests still awaiting headers so
 // an early header with a slow body cannot hold up a completed sibling response.
 struct DeadlinePending {
@@ -215,7 +218,9 @@ fn body_is_ready(body: &BodyHandle) -> Result<bool, Report<PlatformError>> {
 /// Dropping response bodies closes their host handles. Fastly has no pending
 /// request cancellation ABI: unfinished header requests are abandoned and
 /// never waited on past the auction deadline. If collection starts after the
-/// deadline, one nonblocking snapshot preserves already available responses.
+/// deadline, one snapshot preserves already available responses; it may spend
+/// at most [`SNAPSHOT_SURFACE_TIMEOUT_MS`] per pending body letting the host
+/// surface bytes that already arrived.
 ///
 /// Partial bodies share a 10 MiB payload budget. If a chunk exceeds that
 /// capacity, the largest partial response fails with an attributed HTTP client
@@ -260,12 +265,22 @@ pub(super) fn select_until(
         // Take one nonblocking snapshot. Fully buffered results are cached;
         // responses that would require a wait are abandoned, never retried.
         for index in 0..pending.len() {
+            let mut surfaced = false;
             loop {
                 let previous = pending[index].buffered_bytes();
                 let was_headers = matches!(pending[index].state, Some(PendingState::Headers(_)));
                 let result = pending[index].poll();
                 let progressed = matches!(result, Ok(None))
                     && snapshot_progressed(was_headers, previous, &pending[index]);
+                if matches!(result, Ok(None))
+                    && !progressed
+                    && !surfaced
+                    && let Some(PendingState::Body { body, .. }) = &pending[index].state
+                {
+                    surfaced = true;
+                    surface_arrived_body(body);
+                    continue;
+                }
                 match result {
                     Ok(None) if progressed => {}
                     Ok(None) => {
@@ -335,6 +350,34 @@ pub(super) fn select_until(
             return Ok(None);
         }
         wait_for_progress(&pending, deadline)?;
+    }
+}
+
+/// Lets the host surface body bytes that have already arrived.
+///
+/// A body whose bytes the host holds can still report not ready until the
+/// host services async I/O once, so an expired snapshot would abandon a
+/// response that fully arrived before the deadline. One select capped at
+/// [`SNAPSHOT_SURFACE_TIMEOUT_MS`] runs at most once per pending body; a
+/// failure leaves the body not ready.
+fn surface_arrived_body(body: &BodyHandle) {
+    let handles = [
+        // SAFETY: the live owned body retains the handle while select borrows it.
+        unsafe { body.as_u32() },
+    ];
+    let mut ready_index = 0;
+    // SAFETY: handles is a live slice, and ready_index is writable. The
+    // timeout is positive: the host interprets zero as an unbounded wait.
+    let status = unsafe {
+        fastly_sys::fastly_async_io::select(
+            handles.as_ptr(),
+            handles.len(),
+            SNAPSHOT_SURFACE_TIMEOUT_MS,
+            &mut ready_index,
+        )
+    };
+    if let Err(status) = status.result() {
+        log::debug!("Expired snapshot: body surface select failed: {status:?}");
     }
 }
 
