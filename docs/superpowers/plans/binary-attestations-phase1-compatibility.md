@@ -12,7 +12,7 @@ without build metadata (`vMAJOR.MINOR.PATCH[-pre]`); the earlier tag-validation 
 audit table describe its recorded baseline. Fork rehearsal `.22` passed at
 `5f0139b167cd0619cccd9563e8aadca4436281ae`; the
 [rehearsal coverage](#rehearsal-coverage-of-the-current-head) section lists what
-it covers beyond `.15` and the later documentation-only change. Other-tag bundle availability remains a GitHub CLI dependency limit,
+it covers beyond `.15` and the later changes it does not cover. Other-tag bundle availability remains a GitHub CLI dependency limit,
 as described in the [operator guide](../../guide/release-verification.md).
 
 Frozen source references below mean:
@@ -36,7 +36,7 @@ below describe #1262, not current Phase 1 implementation status.
 
 Current tool pins: Rust 1.98.1, Node 24.20.0, Fastly CLI 16.0.0, Viceroy 0.21.0;
 verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer. Rehearsals use GitHub CLI 2.102.0, Fastly CLI 16.0.0 and Viceroy 0.21.0; the carried destination spec/plan still mention GitHub CLI 2.97.0 and Fastly CLI 15.1.0. Those carried versions are unchanged.
-[Rehearsal `.9`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6364827112) passed at exact implementation SHA `149754d357901ec874eab6140e92bce3d8613085` and covers only that source. Later commits changed release inputs: `34e7e9e9f` (release workflow and Axum `main.rs`), `ab6e54936` (release build-fact and gate tests) and the main merge `afdc928a8`, all included in the fork rehearsal `.15` at `68eef902a`; `79b118858` and later changes are covered by no rehearsal (see [rehearsal coverage](#rehearsal-coverage-of-the-current-head)). Rehearsal `.8` remains historical evidence for its own implementation. Rehearsal `.6` at `39a769c3e` failed after immutable publication despite successful independent verification; `.7` at `7a05940e2` was cancelled before signing/publication because GitHub could not assign a macOS ARM runner. The compatibility audit retains those failed outcomes.
+[Rehearsal `.9`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6364827112) passed at exact implementation SHA `149754d357901ec874eab6140e92bce3d8613085` and covers only that source. Later commits changed release inputs: `34e7e9e9f` (release workflow and Axum `main.rs`), `ab6e54936` (release build-fact and gate tests) and the main merge `afdc928a8`, all included in the fork rehearsal `.15` at `68eef902a`; `79b118858` through `5f0139b16` are covered by fork rehearsal `.22`, and the later main merge `029f20467` and the publisher availability-deadline fix are covered by no rehearsal (see [rehearsal coverage](#rehearsal-coverage-of-the-current-head)). Rehearsal `.8` remains historical evidence for its own implementation. Rehearsal `.6` at `39a769c3e` failed after immutable publication despite successful independent verification; `.7` at `7a05940e2` was cancelled before signing/publication because GitHub could not assign a macOS ARM runner. The compatibility audit retains those failed outcomes.
 
 Slice 2.3 immutable build facts are reused from introducing commit
 `bfb697404551a28217af8906024506095bcd9559` and revision
@@ -52,7 +52,8 @@ not deployment values. CLI source-resource cleanup remains deferred.
 Axum binding is runtime-only: `EDGEZERO__ADAPTER__HOST` defaults to loopback;
 containers can set `0.0.0.0`, with runtime `EDGEZERO__ADAPTER__PORT` or the compatible `PORT` override. Both values are validated, and conflicting values fail startup. The smoke uses
 bridge networking and reaches the process through a published host port.
-TLS termination, graceful shutdown and request/resource limits remain follow-up.
+Ctrl-C initiates graceful request draining. TLS termination, graceful SIGTERM
+shutdown and request/resource limits remain follow-up.
 
 Publication requires `RELEASE_PUBLICATION_ENABLED=true` only after maintainers
 confirm immutable releases and the v\* tag ruleset. There is no settings token or
@@ -71,7 +72,7 @@ following corrections are implemented in this slice, with verification and
 rehearsal tracked in the PR description at its current commit. Signing and
 immutable publication rehearsal `.9` passed at `149754d357901ec874eab6140e92bce3d8613085`; see the
 [full verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6364827112).
-The latest passing fork rehearsal is `.22` at `5f0139b16`; it covers the current release workflows, scripts and binaries (see [rehearsal coverage](#rehearsal-coverage-of-the-current-head)).
+The latest passing fork rehearsal is `.22` at `5f0139b16`; it covers that source only, not binaries built from the later main merge or the later publisher change (see [rehearsal coverage](#rehearsal-coverage-of-the-current-head)).
 
 The current correction aligns the local input-free `release-build.yml` signer
 with the `release.yml` caller/publisher, real SPDX 2.3 documents, fourteen
@@ -346,8 +347,13 @@ were first rehearsed by `.22`:
   deleted (their frozen copies remain at `122b78664b1235c717e9208fd200f9a9b0c335df`).
 - `5f0139b16`, a merge of main (CI, adapter, core, CLI and JS sources).
 
-The only later change is this documentation-only update to the compatibility
-record. Every rehearsal ran in the author's fork; none qualifies the IAB
+Rehearsal `.22` covers source `5f0139b167cd0619cccd9563e8aadca4436281ae`.
+Subsequent merge `029f20467` changed release binary inputs, including Cargo
+dependencies, adapter implementations, auction deadlines and cookie forwarding.
+A later review response bounds the publisher's release-attestation availability
+reads, proof fetches and their retries by the 60-second availability deadline
+in `scripts/release/publish.mjs`. The release workflows are unchanged, but `.22`
+does not establish current-head binary or publisher qualification. Every rehearsal ran in the author's fork; none qualifies the IAB
 repository's own signer identity, settings or immutable-release state.
 
 ### Phase 1 review boundary notes

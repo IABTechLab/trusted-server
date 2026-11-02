@@ -40,8 +40,9 @@ and `EDGEZERO__ADAPTER__PORT=8080` for evaluation containers and publish that po
 is a legacy alias. Ports must be 1–65535; zero is rejected. When both are set, they must agree; both values are
 validated and any invalid explicit value fails startup. This runtime setting is never compiled into the executable.
 The smoke reaches a bridge-networked container through a host-published port;
-loopback-only binding cannot pass it. TLS termination, graceful shutdown and
-request/resource limits are not provided.
+loopback-only binding cannot pass it. Ctrl-C initiates graceful request
+draining. TLS termination, graceful SIGTERM shutdown and request/resource
+limits are not provided.
 
 Axum's TLS client requires a runtime CA certificate bundle, including for health
 request initialization. Every Axum smoke mounts the runner's system CA

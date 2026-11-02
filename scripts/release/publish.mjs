@@ -385,16 +385,28 @@ export async function publish({
     )
       throw Error('Current release attestation identity or assets mismatch')
   }
+  // The release attestation can be created after the immutable release
+  // becomes visible. Every availability read and proof fetch, including its
+  // transient retries and command timeout, ends at this deadline.
+  const availabilityDeadline = Math.min(retryDeadline, now() + 60000)
+  const availabilityRemaining = (limit) =>
+    Math.max(1, Math.min(limit, availabilityDeadline - now()))
+  const retryAvailabilityRead = readRetrier({
+    deadline: availabilityDeadline,
+    now,
+    sleep,
+    warn,
+  })
   // `gh release verify` fetches the bundle itself (inline or via bundle_url)
   // and returns it with the statement it verified. Check both, and compare
   // with the inline record when the API supplied one.
   const fetchProof = () =>
-    retryRead(() =>
+    retryAvailabilityRead(() =>
       JSON.parse(
         execFileSync(
           'gh',
           ['release', 'verify', '--repo', repo, '--format', 'json', '--', tag],
-          { timeout: remaining(10000), stdio: 'pipe' }
+          { timeout: availabilityRemaining(10000), stdio: 'pipe' }
         )
       )
     )
@@ -409,9 +421,6 @@ export async function publish({
     if (inline && !isDeepStrictEqual(bundle, inline.bundle))
       throw Error('Verified release attestation bundle mismatch')
   }
-  // The release attestation can be created after the immutable release
-  // becomes visible.
-  const availabilityDeadline = Math.min(retryDeadline, now() + 60000)
   // GitHub CLI reports a bundle-fetch, trusted-root or network failure the
   // same way as a record that is not yet listed, so any failed proof fetch is
   // retried until the availability checks run out. A fetched proof that fails
@@ -426,12 +435,12 @@ export async function publish({
     let page,
       missing = false
     try {
-      page = await retryRead(() =>
+      page = await retryAvailabilityRead(() =>
         api(
           `attestations/sha1:${source}?per_page=100&predicate_type=release`,
           'GET',
           undefined,
-          Math.max(1, Math.min(4000, availabilityDeadline - now()))
+          availabilityRemaining(4000)
         )
       )
     } catch (error) {

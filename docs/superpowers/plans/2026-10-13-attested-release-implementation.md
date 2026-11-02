@@ -57,7 +57,8 @@ not deployment values. CLI source-resource cleanup remains deferred.
 Axum binding is runtime-only: `EDGEZERO__ADAPTER__HOST` defaults to loopback;
 containers can set `0.0.0.0`, with runtime `EDGEZERO__ADAPTER__PORT` or the compatible `PORT` override. Both values are validated, and conflicting values fail startup. The smoke uses
 bridge networking and reaches the process through a published host port.
-TLS termination, graceful shutdown and request/resource limits remain follow-up.
+Ctrl-C initiates graceful request draining. TLS termination, graceful SIGTERM
+shutdown and request/resource limits remain follow-up.
 
 Publication requires `RELEASE_PUBLICATION_ENABLED=true` only after maintainers
 confirm immutable releases and the v\* tag ruleset. There is no settings token or

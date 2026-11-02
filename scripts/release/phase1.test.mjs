@@ -407,6 +407,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'attestation-statement-mismatch',
     'attestation-verification-failure',
     'attestation-verify-transient',
+    'attestation-verify-past-deadline',
     'attestation-null-bundle',
     'attestation-null-bundle-late',
     'attestation-null-bundle-never',
@@ -619,7 +620,9 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
                 ? 2
                 : mode === 'attestation-404-never'
                   ? 5
-                  : 0
+                  : mode === 'attestation-verify-past-deadline'
+                    ? 4
+                    : 0
           if (polls <= delay && mode !== 'attestation-other-tag-before-current')
             return response({ message: 'Not Found' }, 404)
           observed = polls <= delay ? [] : [attestation()]
@@ -716,10 +719,19 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         verifies++
         const verifiedTag = args[1].at(-1)
         assert.equal(verifiedTag, tag, 'should verify only the current tag')
+        assert.ok(
+          now + args[2].timeout <= 60000,
+          'should bound proof verification by the availability deadline'
+        )
         if (mode === 'attestation-verify-transient' && verifies === 1)
           throw Object.assign(Error('gh failed'), {
             stderr: Buffer.from('HTTP 503: Service Unavailable'),
           })
+        // Each proof fetch runs until its command timeout.
+        if (mode === 'attestation-verify-past-deadline' && verifies <= 2) {
+          now += args[2].timeout
+          throw Object.assign(Error('timeout'), { code: 'ETIMEDOUT' })
+        }
         if (
           mode === 'attestation-verification-failure' ||
           mode === 'attestation-null-bundle-never' ||
@@ -810,6 +822,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'published-asset-digest': /Published asset digest mismatch/,
         'published-asset-extra': /Published asset set mismatch/,
         'attestation-404-never': /unavailable after five checks/,
+        'attestation-verify-past-deadline': /retry window exhausted/,
         'attestation-statement-mismatch': /statement mismatch/,
         'attestation-substituted-bundle': /bundle mismatch/,
         'attestation-null-bundle-never': /Signature verification failed/,
@@ -923,6 +936,10 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         // Transient read retries wait inside one availability check.
         const retried = {
           'attestation-verify-transient': [[2000], 1],
+          'attestation-verify-past-deadline': [
+            [2000, 5000, 10000, 20000, 2000],
+            5,
+          ],
           'attestation-list-transient': [[2000], 2],
           'attestation-non-200': [[2000, 5000], 3],
         }[mode]
