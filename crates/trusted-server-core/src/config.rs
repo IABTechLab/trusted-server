@@ -125,8 +125,7 @@ impl Validate for TrustedServerAppConfig {
         // EdgeZero prunes after this call. Do not gate the warning on them.
         if self.settings.publisher.public_origin.is_none() {
             log::warn!(
-                "publisher.public_origin is unset; generated first-party URLs use {}, not the serving page's scheme, host or port. Verify this endpoint before deployment, or configure publisher.public_origin.",
-                self.settings.publisher.effective_public_origin()
+                "publisher.public_origin is unset; generated first-party URLs use https://{{publisher.domain}}, not the serving page's scheme, host or port. Verify this endpoint before deployment, or configure publisher.public_origin."
             );
         }
         let mut errors = self.settings.validate().err().unwrap_or_default();

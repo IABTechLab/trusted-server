@@ -176,6 +176,7 @@ fn public_origin_omission_warns_during_validate_but_explicit_origin_does_not() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("publisher.public_origin is unset")
+            && stderr.contains("https://{publisher.domain}")
             && stderr.contains("not the serving page's scheme, host or port"),
         "should explain the omitted-origin routing change: {stderr}"
     );
