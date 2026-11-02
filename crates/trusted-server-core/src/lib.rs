@@ -50,6 +50,7 @@ pub mod creative_opportunities;
 pub mod ec;
 pub(crate) mod edge_cookie;
 pub mod error;
+pub mod forwarder;
 pub mod geo;
 pub mod host_header;
 pub(crate) mod host_rewrite;
@@ -75,6 +76,7 @@ pub mod streaming_processor;
 pub mod streaming_replacer;
 pub mod test_support;
 pub mod tester_cookie;
+pub mod trace;
 pub mod tsjs;
 pub mod version_header;
 
