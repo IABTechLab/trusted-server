@@ -63,15 +63,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install yq
-        shell: bash
-        run: |
-          curl --fail --location --silent --show-error \
-            https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_amd64 \
-            --output "$RUNNER_TEMP/yq"
-          chmod +x "$RUNNER_TEMP/yq"
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-
       # The guard's tests check the tree before the guard landed; fetch only
       # that commit instead of the full history.
       - name: Fetch the pre-guard commit
@@ -82,19 +73,13 @@ jobs:
         with:
           node-version-file: .tool-versions
 
-      - name: Test the Node pin guard
+      - name: Test the guard
         run: node --test scripts/check-ci-node-pin.test.mjs
 
       # Every job that compiles trusted-server-core also runs the TSJS build, so
       # it must set up the `.tool-versions` Node first (see issue #1204).
       - name: Verify jobs pin Node before compiling Rust
         run: node scripts/check-ci-node-pin.mjs
-
-      - name: Test the CI concurrency policy guard
-        run: node --test scripts/check-ci-concurrency.test.mjs
-
-      - name: Require per-PR cancellation, per-author job queues and timeouts
-        run: scripts/check-ci-concurrency.sh
 
   format-rust:
     name: cargo fmt
@@ -133,6 +118,25 @@ jobs:
           node-version-file: .tool-versions
           cache: npm
           cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
+      # The concurrency guard runs here because `cargo fmt` is a required check.
+      # Pin the yq binary by checksum, so a replaced release asset cannot run in
+      # CI with this job's token.
+      - name: Install yq
+        shell: bash
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_amd64 \
+            --output "$RUNNER_TEMP/yq"
+          echo "8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f  $RUNNER_TEMP/yq" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/yq"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Test the CI concurrency policy guard
+        run: node --test scripts/check-ci-concurrency.test.mjs
+
+      - name: Require per-PR cancellation, per-author job queues and timeouts
+        run: scripts/check-ci-concurrency.sh
 
       - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1

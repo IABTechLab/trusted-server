@@ -70,7 +70,9 @@ job_value() {
   YQ_JOB=$job "$yq_bin" -r ".jobs[strenv(YQ_JOB)].${expression}" "$file"
 }
 
-validate_matrix_segment() {
+# Prints each matrix key used by the segment, one per line. Fails when the
+# segment is anything other than a run of `${{ matrix.<key> }}-` parts.
+matrix_segment_keys() {
   local remaining=$1
   local matrix_key
 
@@ -79,6 +81,7 @@ validate_matrix_segment() {
     [[ "$remaining" == *"$matrix_suffix"* ]] || return 1
     matrix_key=${remaining%%"$matrix_suffix"*}
     [[ "$matrix_key" =~ $matrix_key_pattern ]] || return 1
+    printf '%s\n' "$matrix_key"
     remaining=${remaining#*"$matrix_suffix"}
   done
 
@@ -93,6 +96,8 @@ validate_job_group() {
   local prefix="${workflow_prefix}-${job}-"
   local remainder
   local matrix_segment
+  local used_keys
+  local matrix_key
 
   if [[ "$group" != "$prefix"* ]]; then
     report_error "$file" "Job '$job' concurrency group must start with the workflow name and its own job ID."
@@ -106,9 +111,18 @@ validate_job_group() {
   matrix_segment=${remainder%"$expected_author_suffix"}
 
   if [[ "$has_matrix" == true ]]; then
-    if [[ -z "$matrix_segment" ]] || ! validate_matrix_segment "$matrix_segment"; then
+    if [[ -z "$matrix_segment" ]] || ! used_keys=$(matrix_segment_keys "$matrix_segment"); then
       report_error "$file" "Matrix job '$job' concurrency group must include each matrix leg before the per-author suffix."
+      return
     fi
+    # Every matrix dimension must key the group, or legs that share one value
+    # queue behind each other. Include-only matrices have no dimensions here.
+    while IFS= read -r matrix_key; do
+      [[ -n "$matrix_key" ]] || continue
+      if ! grep -qxF -- "$matrix_key" <<<"$used_keys"; then
+        report_error "$file" "Matrix job '$job' concurrency group must include matrix.$matrix_key before the per-author suffix."
+      fi
+    done < <(job_value "$file" "$job" 'strategy.matrix | select(tag == "!!map") | keys | .[] | select(. != "include" and . != "exclude")')
   elif [[ -n "$matrix_segment" ]]; then
     report_error "$file" "Non-matrix job '$job' concurrency group must not add a shared queue segment."
   fi
@@ -138,12 +152,9 @@ check_workflow() {
 
   while IFS= read -r job; do
     [[ -n "$job" ]] || continue
-    if [[ "$(job_value "$file" "$job" "uses")" != null ]]; then
-      continue
-    fi
 
     timeout=$(job_value "$file" "$job" '"timeout-minutes" // 0')
-    if [[ ! "$timeout" =~ ^[1-9][0-9]*$ ]]; then
+    if [[ ! "$timeout" =~ ^[1-9][0-9]*$ && "$timeout" != "\${{ "*" }}" ]]; then
       report_error "$file" "Job '$job' must set a positive timeout-minutes value."
     fi
 

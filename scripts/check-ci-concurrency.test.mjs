@@ -231,3 +231,126 @@ test('requires the exact per-PR cancellation group on every PR workflow', () => 
     assertRejected(root, /workflow concurrency group/)
   })
 })
+
+test('requires cancellation and rejects queue max on the workflow block', () => {
+  withFixture(({ root, workflowsPath }) => {
+    const formatPath = path.join(workflowsPath, 'format.yml')
+    const source = workflow('format-rust', authorGroup('format-rust'))
+    writeFileSync(
+      formatPath,
+      source.replace('cancel-in-progress: true', 'cancel-in-progress: false')
+    )
+    assertRejected(root, /workflow concurrency group/)
+    writeFileSync(
+      formatPath,
+      source.replace(
+        'cancel-in-progress: true',
+        'cancel-in-progress: true\n  queue: max'
+      )
+    )
+    assertRejected(root, /workflow concurrency group/)
+  })
+})
+
+test('checks workflows with string and list pull_request triggers', () => {
+  withFixture(({ root, workflowsPath }) => {
+    const formatPath = path.join(workflowsPath, 'format.yml')
+    const source = workflow('format-rust', authorGroup('format-rust'), {
+      timeout: false,
+    })
+    writeFileSync(
+      formatPath,
+      source.replace('on:\n  pull_request:', 'on: pull_request')
+    )
+    assertRejected(root, /timeout-minutes/)
+    writeFileSync(
+      formatPath,
+      source.replace('on:\n  pull_request:', 'on: [push, pull_request]')
+    )
+    assertRejected(root, /timeout-minutes/)
+  })
+})
+
+test('rejects an extra segment in a non-matrix job group', () => {
+  withFixture(({ root, workflowsPath }) => {
+    const formatPath = path.join(workflowsPath, 'format.yml')
+    writeFileSync(
+      formatPath,
+      workflow('format-rust', authorGroup('format-rust', 'extra'))
+    )
+    assertRejected(root, /must not add a shared queue segment/)
+  })
+})
+
+test('rejects a matrix segment that is not a plain matrix value', () => {
+  withFixture(({ root, workflowsPath }) => {
+    const formatPath = path.join(workflowsPath, 'format.yml')
+    const segment = '$' + "{{ matrix.os || 'linux' }}"
+    writeFileSync(
+      formatPath,
+      workflow('format-rust', authorGroup('format-rust', segment), {
+        matrix: true,
+      })
+    )
+    assertRejected(root, /matrix job/i)
+  })
+})
+
+test('requires every matrix dimension in the job group', () => {
+  withFixture(({ root, workflowsPath }) => {
+    const formatPath = path.join(workflowsPath, 'format.yml')
+    const osSegment = '$' + '{{ matrix.os }}'
+    const nodeSegment = '$' + '{{ matrix.node }}'
+    const addNodeDimension = (source) =>
+      source.replace(
+        '        os: [ubuntu-latest]',
+        '        os: [ubuntu-latest]\n        node: [22, 24]'
+      )
+    writeFileSync(
+      formatPath,
+      addNodeDimension(
+        workflow('format-rust', authorGroup('format-rust', osSegment), {
+          matrix: true,
+        })
+      )
+    )
+    assertRejected(root, /matrix\.node/)
+
+    writeFileSync(
+      formatPath,
+      addNodeDimension(
+        workflow(
+          'format-rust',
+          authorGroup('format-rust', osSegment + '-' + nodeSegment),
+          { matrix: true }
+        )
+      )
+    )
+    const passing = runGuard(root)
+    assert.equal(passing.status, 0, passing.stdout + '\n' + passing.stderr)
+  })
+})
+
+test('accepts expression timeouts and rejects a zero timeout', () => {
+  withFixture(({ root, workflowsPath }) => {
+    const formatPath = path.join(workflowsPath, 'format.yml')
+    const source = workflow('format-rust', authorGroup('format-rust'))
+    writeFileSync(
+      formatPath,
+      source.replace(
+        'timeout-minutes: 5',
+        'timeout-minutes: ' +
+          '$' +
+          "{{ matrix.os == 'windows-latest' && 65 || 30 }}"
+      )
+    )
+    const passing = runGuard(root)
+    assert.equal(passing.status, 0, passing.stdout + '\n' + passing.stderr)
+
+    writeFileSync(
+      formatPath,
+      source.replace('timeout-minutes: 5', 'timeout-minutes: 0')
+    )
+    assertRejected(root, /timeout-minutes/)
+  })
+})
