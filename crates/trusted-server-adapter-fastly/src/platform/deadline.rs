@@ -423,6 +423,11 @@ mod tests {
 
     use super::super::{FastlyPlatformHttpClient, MAX_PLATFORM_RESPONSE_BODY_BYTES};
     use super::{DeadlinePending, PendingState, host_select_timeout_ms};
+    use edgezero_core::body::Body;
+    use trusted_server_core::platform::{
+        PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+    };
+    use web_time::Instant;
 
     #[test]
     fn sub_millisecond_budget_never_requests_an_unbounded_host_wait() {
@@ -442,11 +447,6 @@ mod tests {
             "should saturate budgets beyond the hostcall range"
         );
     }
-    use edgezero_core::body::Body;
-    use trusted_server_core::platform::{
-        PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
-    };
-    use web_time::Instant;
 
     #[test]
     fn expired_deadline_attributes_an_invalid_pending_handle() {
