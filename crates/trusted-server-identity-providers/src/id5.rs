@@ -3,7 +3,8 @@
 //! Posts the request's consent and network signals to ID5's fetch endpoint.
 //! It needs no login and sends no hashed email. ID5 returns complete EIDs
 //! under `ids`, or the legacy `universal_uid`, which is given to the first
-//! configured source.
+//! configured source with the reply's `ext.linkType` as UID `ext`, as
+//! Prebid's ID5 module does.
 //!
 //! Parsing is lenient per entry: an entry of `ids`, `universal_uid` or
 //! `cache_control` with an unexpected shape is skipped rather than failing
@@ -17,9 +18,9 @@
 //! writes (`[settings.lockr]`, default key `id5id`). A cookie holding the ID5 fetch response JSON
 //! (plain or percent-encoded) is parsed exactly like a lookup response, and
 //! a bare ID string becomes one UID on the first source with agent type 1
-//! and the default TTL. The response `signature` is never stored. When a
-//! percent-encoded JSON cookie is read, its `ext` objects are dropped,
-//! since they cannot outlive the decoded copy. A cookie that yields no
+//! and the default TTL. The response `signature` is never stored. A
+//! percent-encoded JSON cookie is decoded and its entries, `ext` objects
+//! included, are copied out of the decoded text. A cookie that yields no
 //! usable UID is ignored and the lookup runs as usual.
 //!
 //! The request field names for the client IP and user agent follow ID5's
@@ -182,6 +183,14 @@ struct FetchReply<'body> {
     ids: Option<&'body RawValue>,
     #[serde(default, borrow)]
     cache_control: Option<&'body RawValue>,
+    #[serde(default, borrow)]
+    ext: Option<&'body RawValue>,
+}
+
+#[derive(Deserialize)]
+struct ReplyExt<'body> {
+    #[serde(rename = "linkType", default, borrow)]
+    link_type: Option<&'body RawValue>,
 }
 
 #[derive(Deserialize)]
@@ -246,6 +255,13 @@ impl Id5Provider {
             .and_then(|raw| serde_json::from_str::<Cow<'body, str>>(raw.get()).ok())
             .filter(|uid| is_usable_uid(uid));
         if !has_primary && let Some(uid) = universal_uid {
+            let link_type = reply
+                .ext
+                .and_then(|raw| serde_json::from_str::<ReplyExt<'_>>(raw.get()).ok())
+                .and_then(|ext| ext.link_type)
+                .and_then(|link_type| {
+                    RawValue::from_string(format!(r#"{{"linkType":{}}}"#, link_type.get())).ok()
+                });
             eids.push(ProviderEid {
                 source: Cow::Owned(primary.to_owned()),
                 inserter: None,
@@ -255,7 +271,7 @@ impl Id5Provider {
                 uids: vec![ProviderUid {
                     id: uid,
                     atype: Some(1),
-                    ext: None,
+                    ext: link_type.map(Cow::Owned),
                     expiry,
                 }],
             });
@@ -273,7 +289,7 @@ impl Id5Provider {
                 .parse_reply(value.as_bytes())
                 .ok()?
                 .into_iter()
-                .map(owned_without_ext)
+                .map(owned)
                 .collect(),
             value => {
                 let id = value.trim();
@@ -369,22 +385,21 @@ impl IdentityProvider for Id5Provider {
     }
 }
 
-/// Copies an EID parsed from a temporary string, dropping its `ext`
-/// objects, which cannot be copied out of the borrowed JSON.
-fn owned_without_ext<'any>(eid: ProviderEid<'_>) -> ProviderEid<'any> {
+/// Copies an EID parsed from a temporary string so it outlives that string.
+fn owned<'any>(eid: ProviderEid<'_>) -> ProviderEid<'any> {
     ProviderEid {
         source: Cow::Owned(eid.source.into_owned()),
         inserter: eid.inserter.map(|value| Cow::Owned(value.into_owned())),
         matcher: eid.matcher.map(|value| Cow::Owned(value.into_owned())),
         mm: eid.mm,
-        ext: None,
+        ext: eid.ext.map(|ext| Cow::Owned(ext.into_owned())),
         uids: eid
             .uids
             .into_iter()
             .map(|uid| ProviderUid {
                 id: Cow::Owned(uid.id.into_owned()),
                 atype: uid.atype,
-                ext: None,
+                ext: uid.ext.map(|ext| Cow::Owned(ext.into_owned())),
                 expiry: uid.expiry,
             })
             .collect(),
@@ -545,6 +560,7 @@ mod tests {
         let headers = HeaderMap::new();
         let body = serde_json::to_vec(&json!({
             "universal_uid": "legacy-example",
+            "ext": { "linkType": 2 },
             "ids": {
                 "id5": { "eid": { "source": "id5.example.com", "uids": [{ "id": "0" }] } },
                 "broken": { "eid": "not an object" },
@@ -563,6 +579,11 @@ mod tests {
         );
         assert_eq!(eids.len(), 1, "should drop the opted-out EID");
         assert_eq!(eids[0].uids[0].id, "legacy-example", "should keep the UID");
+        assert_eq!(
+            eids[0].uids[0].ext.as_deref().map(RawValue::get),
+            Some(r#"{"linkType":2}"#),
+            "should carry the reply linkType as UID ext"
+        );
         assert!(
             matches!(eids[0].uids[0].expiry, ProviderExpiry::After(d) if d == crate::common::DEFAULT_TTL),
             "should use the default TTL without a cache max age"
@@ -708,10 +729,10 @@ mod tests {
                 "id5.example.com".to_owned(),
                 "id5-example".to_owned(),
                 Some(1),
-                false,
+                true,
                 Duration::from_secs(7200)
             )],
-            "should decode the reply and drop ext objects"
+            "should decode the reply and keep ext objects"
         );
     }
 
