@@ -70,6 +70,20 @@ pub trait IdentityProvider: Send + Sync {
         let _ = lookup;
         None
     }
+
+    /// Reads IDs from the vendor's own first-party cookies on the request.
+    ///
+    /// Runs before any lookup for providers with due sources. Returned
+    /// entries go through the same validation, consent gates and write plan
+    /// as lookup results, and a kept UID makes the provider skip its lookup
+    /// for this navigation. The default reads nothing.
+    fn read_request_cookies<'cookie>(
+        &self,
+        cookies: RequestCookies<'cookie>,
+    ) -> Option<Vec<ProviderEid<'cookie>>> {
+        let _ = cookies;
+        None
+    }
 }
 
 impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
@@ -93,6 +107,39 @@ impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
 
     fn generate(&self, lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
         (**self).generate(lookup)
+    }
+
+    fn read_request_cookies<'cookie>(
+        &self,
+        cookies: RequestCookies<'cookie>,
+    ) -> Option<Vec<ProviderEid<'cookie>>> {
+        (**self).read_request_cookies(cookies)
+    }
+}
+
+/// The request's `Cookie` header, lent to providers that read their own
+/// first-party cookies.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestCookies<'a>(&'a str);
+
+impl<'a> RequestCookies<'a> {
+    /// Wraps a `Cookie` header value (pairs separated by `;`).
+    #[must_use]
+    pub fn new(header: &'a str) -> Self {
+        Self(header)
+    }
+
+    /// Returns the first value of cookie `name`, undecoded and unquoted.
+    ///
+    /// An empty value reads as absent.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&'a str> {
+        self.0
+            .split(';')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(key, _)| key.trim() == name)
+            .map(|(_, value)| value.trim().trim_matches('"'))
+            .filter(|value| !value.is_empty())
     }
 }
 
@@ -404,8 +451,8 @@ pub trait ProviderKind {
 /// Shared configuration every provider receives at build time.
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderCommon<'a> {
-    /// Configured lookup endpoint.
-    pub endpoint: &'a Url,
+    /// Configured lookup endpoint, absent for cookie-only kinds.
+    pub endpoint: Option<&'a Url>,
     /// Configured sources.
     pub sources: &'a [SourceDomain],
     /// Resolved secrets.
@@ -439,17 +486,30 @@ pub fn build_kind<K: ProviderKind>(
     let settings = K::Settings::deserialize(serde_json::Value::Object(config.settings.clone()))
         .change_context(ProviderConfigError::Invalid)
         .attach_with(|| format!("settings for provider `{}` are invalid", config.id))?;
-    let endpoint = Url::parse(&config.endpoint)
-        .change_context(ProviderConfigError::Invalid)
-        .attach_with(|| format!("endpoint for provider `{}` is not a URL", config.id))?;
+    let endpoint = parse_endpoint(config)?;
     let sources = parse_sources(config)?;
     let common = ProviderCommon {
-        endpoint: &endpoint,
+        endpoint: endpoint.as_ref(),
         sources: &sources,
         secrets,
     };
     let provider = K::build(&common, settings)?;
     Ok(Box::new(provider))
+}
+
+/// Parses a provider's configured endpoint, when one is set.
+fn parse_endpoint(
+    config: &IdentityProviderConfig,
+) -> Result<Option<Url>, Report<ProviderConfigError>> {
+    config
+        .endpoint
+        .as_deref()
+        .map(|endpoint| {
+            Url::parse(endpoint)
+                .change_context(ProviderConfigError::Invalid)
+                .attach_with(|| format!("endpoint for provider `{}` is not a URL", config.id))
+        })
+        .transpose()
 }
 
 /// Parses and normalizes a provider's configured sources.
@@ -478,7 +538,7 @@ pub(crate) fn destination_allowed<S: AsRef<str>>(url: &Url, allowed_domains: &[S
 }
 
 /// Checks the configuration rules core owns for every enabled provider
-/// (spec §12.1): the endpoint is an `https` URL whose host is in
+/// (spec §12.1): a configured endpoint is an `https` URL whose host is in
 /// `allowed_domains`, it claims at least one source, every source has an
 /// `[[ec.partners]]` entry, no source is claimed by two enabled providers, and
 /// every enabled provider has a non-empty id of its own.
@@ -507,10 +567,9 @@ pub fn validate_enabled_configs<'a>(
                 config.id
             )));
         }
-        let endpoint = Url::parse(&config.endpoint)
-            .change_context(ProviderConfigError::Invalid)
-            .attach_with(|| format!("endpoint for provider `{}` is not a URL", config.id))?;
-        if !destination_allowed(&endpoint, &config.allowed_domains) {
+        let endpoint = parse_endpoint(config)?;
+        if endpoint.is_some_and(|endpoint| !destination_allowed(&endpoint, &config.allowed_domains))
+        {
             return Err(Report::new(ProviderConfigError::Invalid).attach(format!(
                 "endpoint for provider `{}` must be https with a host in allowed_domains",
                 config.id
@@ -758,9 +817,9 @@ mod tests {
     #[test]
     fn validate_enabled_configs_rejects_endpoint_outside_allowlist() {
         let mut outside = config(&json!({}));
-        outside.endpoint = "https://other.example.com/".to_owned();
+        outside.endpoint = Some("https://other.example.com/".to_owned());
         let mut plain_http = config(&json!({}));
-        plain_http.endpoint = "http://ids.example.com/".to_owned();
+        plain_http.endpoint = Some("http://ids.example.com/".to_owned());
 
         for rejected in [outside, plain_http] {
             let error = validate_enabled_configs([&rejected], &partners())
@@ -856,10 +915,33 @@ mod tests {
         let first = config(&json!({}));
         let mut disabled = config(&json!({}));
         disabled.enabled = false;
-        disabled.endpoint = "https://other.example.com/".to_owned();
+        disabled.endpoint = Some("https://other.example.com/".to_owned());
 
         validate_enabled_configs([&first, &disabled], &partners())
             .expect("should ignore disabled provider");
+    }
+
+    #[test]
+    fn validate_enabled_configs_accepts_cookie_only_provider_without_endpoint() {
+        let mut cookie_only = config(&json!({}));
+        cookie_only.endpoint = None;
+
+        validate_enabled_configs([&cookie_only], &partners())
+            .expect("should accept a provider without endpoint");
+    }
+
+    #[test]
+    fn request_cookies_finds_named_values() {
+        let cookies = RequestCookies::new("a=1; vendor_id=\"v-1\" ;empty=; vendor_id=v-2");
+
+        assert_eq!(
+            cookies.get("vendor_id"),
+            Some("v-1"),
+            "should find first value"
+        );
+        assert_eq!(cookies.get("a"), Some("1"), "should find leading cookie");
+        assert_eq!(cookies.get("empty"), None, "should ignore empty values");
+        assert_eq!(cookies.get("missing"), None, "should miss absent cookies");
     }
 
     #[test]
