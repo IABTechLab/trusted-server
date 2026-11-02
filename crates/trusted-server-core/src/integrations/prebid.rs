@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
@@ -36,7 +37,8 @@ use crate::auction::types::{AuctionContext, AuctionRequest, MediaType};
 use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
 use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
-use crate::cookies::{CONSENT_COOKIE_NAMES, strip_cookies};
+use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
+use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
@@ -462,9 +464,9 @@ pub struct LegacyPrebidServerConfig {
     pub bid_param_override_rules: Vec<BidParamOverrideRule>,
     /// How consent signals are forwarded to Prebid Server.
     ///
-    /// - `openrtb_only` — consent in `OpenRTB` body only, consent cookies stripped
-    /// - `cookies_only` — consent cookies forwarded, body consent fields omitted
-    /// - `both` — consent in both cookies and body (default)
+    /// - `openrtb_only` — consent in `OpenRTB` body only, no `Cookie` header
+    /// - `cookies_only` — allowlisted consent cookies, with body fallback for unsafe values
+    /// - `both` — allowlisted consent cookies and body consent (default)
     #[serde(default)]
     pub consent_forwarding: ConsentForwardingMode,
     /// Strip `nurl` and `burl` from PBS bids before they reach `window.tsjs.bids`.
@@ -2016,9 +2018,8 @@ fn non_empty_override_object(
 /// synthesized from `client_ip` — the platform-attested client address —
 /// matching the trusted IP already sent in `OpenRTB` `device.ip`.
 ///
-/// In [`ConsentForwardingMode::OpenrtbOnly`] mode, consent cookies are
-/// stripped from the `Cookie` header since consent travels exclusively
-/// through the `OpenRTB` body.
+/// Only allowlisted consent cookies can reach PBS. In
+/// [`ConsentForwardingMode::OpenrtbOnly`] mode, the `Cookie` header is omitted.
 #[cfg(test)]
 fn copy_request_headers(
     from: &http::Request<EdgeBody>,
@@ -2027,7 +2028,7 @@ fn copy_request_headers(
     client_ip: Option<std::net::IpAddr>,
 ) {
     apply_prebid_header_values(
-        from.headers().get(header::COOKIE),
+        &PrebidConsentCookies::from_header(from.headers().get(header::COOKIE)),
         from.headers().get(header::USER_AGENT),
         from.headers().get(header::REFERER),
         from.headers().get(header::ACCEPT_LANGUAGE),
@@ -2037,7 +2038,7 @@ fn copy_request_headers(
     );
 }
 
-/// Apply the common raw-header transport policy for a planned PBS request.
+/// Applies the common browser-header and consent-cookie policy for PBS.
 pub(crate) fn apply_prebid_transport_headers(
     from: &PrebidTransportHeaders,
     to: &mut http::Request<EdgeBody>,
@@ -2045,7 +2046,7 @@ pub(crate) fn apply_prebid_transport_headers(
     client_ip: Option<std::net::IpAddr>,
 ) {
     apply_prebid_header_values(
-        from.cookie(),
+        from.consent_cookies(),
         from.user_agent(),
         from.referer(),
         from.accept_language(),
@@ -2057,10 +2058,10 @@ pub(crate) fn apply_prebid_transport_headers(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the helper preserves four independently optional raw headers plus transport policy"
+    reason = "the helper preserves selected consent cookies, three independently optional raw headers, and transport policy"
 )]
 fn apply_prebid_header_values(
-    cookie: Option<&HeaderValue>,
+    consent_cookies: &PrebidConsentCookies,
     user_agent: Option<&HeaderValue>,
     referer: Option<&HeaderValue>,
     accept_language: Option<&HeaderValue>,
@@ -2085,28 +2086,177 @@ fn apply_prebid_header_values(
             .insert(header::HeaderName::from_static("x-forwarded-for"), value);
     }
 
-    let Some(cookie_value) = cookie else {
-        return;
-    };
-    if !consent_forwarding.strips_consent_cookies() {
-        to.headers_mut()
-            .insert(header::COOKIE, cookie_value.clone());
+    // Rebuild the destination header so no stale or arbitrary cookies survive.
+    to.headers_mut().remove(header::COOKIE);
+    if consent_forwarding == ConsentForwardingMode::OpenrtbOnly {
         return;
     }
-    match cookie_value.to_str() {
-        Ok(value) => {
-            let stripped = strip_cookies(value, CONSENT_COOKIE_NAMES);
-            if !stripped.is_empty()
-                && let Ok(cookie_header) = HeaderValue::from_str(&stripped)
-            {
-                to.headers_mut().insert(header::COOKIE, cookie_header);
+    if let Some(value) = consent_cookies.header() {
+        to.headers_mut().insert(header::COOKIE, value.clone());
+    }
+}
+
+/// Consent cookies selected with the same parser used during consent extraction.
+///
+/// Unsafe values remain available only through the JSON body fallback. No raw
+/// cookie bytes are forwarded on a parsing or framing failure.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PrebidConsentCookies {
+    header: Option<HeaderValue>,
+    unsafe_tc: bool,
+    unsafe_gpp: bool,
+    unsafe_us_privacy: bool,
+}
+
+impl PrebidConsentCookies {
+    pub(crate) fn from_header(header: Option<&HeaderValue>) -> Self {
+        let mut result = Self::default();
+        let Some(header) = header else {
+            return result;
+        };
+        let Ok(header) = header.to_str() else {
+            result.unsafe_tc = true;
+            result.unsafe_gpp = true;
+            result.unsafe_us_privacy = true;
+            return result;
+        };
+        let jar = parse_cookies_to_jar(header);
+        let mut pairs = Vec::new();
+        for name in CONSENT_COOKIE_NAMES {
+            let Some(cookie) = jar.get(name) else {
+                continue;
+            };
+            if let Some(value) = prebid_cookie_value(name, cookie.value()) {
+                pairs.push(format!("{name}={value}"));
+            } else {
+                match *name {
+                    COOKIE_EUCONSENT_V2 => result.unsafe_tc = true,
+                    COOKIE_GPP | COOKIE_GPP_SID => result.unsafe_gpp = true,
+                    COOKIE_US_PRIVACY => result.unsafe_us_privacy = true,
+                    _ => {
+                        log::warn!(
+                            "Preserves body consent for unrecognized allowlisted cookie {name}"
+                        );
+                        result.unsafe_tc = true;
+                        result.unsafe_gpp = true;
+                        result.unsafe_us_privacy = true;
+                    }
+                }
             }
         }
-        Err(_) => {
-            to.headers_mut()
-                .insert(header::COOKIE, cookie_value.clone());
+        if !pairs.is_empty() {
+            result.header = HeaderValue::from_str(&pairs.join("; ")).ok();
+            if result.header.is_none() {
+                result.unsafe_tc = true;
+                result.unsafe_gpp = true;
+                result.unsafe_us_privacy = true;
+            }
         }
+        result
     }
+
+    /// The allowlisted consent `Cookie` header, if any consent cookie is safe to forward.
+    pub(crate) fn header(&self) -> Option<&HeaderValue> {
+        self.header.as_ref()
+    }
+
+    fn requires_body(&self) -> bool {
+        self.unsafe_tc || self.unsafe_gpp || self.unsafe_us_privacy
+    }
+
+    /// Selects only the consent signals whose cookies need a JSON fallback.
+    ///
+    /// GPP and its section IDs travel together. This subset is used only for
+    /// serialization; the original context remains intact for consent gating.
+    pub(crate) fn body_consent<'a>(
+        &self,
+        context: Option<&'a crate::consent::ConsentContext>,
+        mode: ConsentForwardingMode,
+    ) -> Option<Cow<'a, crate::consent::ConsentContext>> {
+        let context = context?;
+        if mode.includes_body_consent()
+            || !matches!(context.source, crate::consent::ConsentSource::Cookie)
+        {
+            return Some(Cow::Borrowed(context));
+        }
+        if !self.requires_body() {
+            return None;
+        }
+        let carries_gdpr = self.unsafe_tc || self.unsafe_gpp;
+        Some(Cow::Owned(crate::consent::ConsentContext {
+            raw_tc_string: self
+                .unsafe_tc
+                .then(|| context.raw_tc_string.clone())
+                .flatten(),
+            raw_gpp_string: self
+                .unsafe_gpp
+                .then(|| context.raw_gpp_string.clone())
+                .flatten(),
+            gpp_section_ids: self
+                .unsafe_gpp
+                .then(|| context.gpp_section_ids.clone())
+                .flatten(),
+            raw_us_privacy: self
+                .unsafe_us_privacy
+                .then(|| context.raw_us_privacy.clone())
+                .flatten(),
+            gdpr_applies: carries_gdpr && context.gdpr_applies,
+            jurisdiction: if carries_gdpr {
+                context.jurisdiction.clone()
+            } else {
+                crate::consent::jurisdiction::Jurisdiction::Unknown
+            },
+            source: crate::consent::ConsentSource::Cookie,
+            ..Default::default()
+        }))
+    }
+}
+
+/// Preserves safe values and normalizes decimal GPP section whitespace.
+fn prebid_cookie_value<'a>(name: &str, value: &'a str) -> Option<Cow<'a, str>> {
+    if valid_prebid_cookie_value(name, value) {
+        return Some(Cow::Borrowed(value));
+    }
+    if name != COOKIE_GPP_SID {
+        return None;
+    }
+    let quoted = value.len() >= 2 && value.starts_with('"') && value.ends_with('"');
+    let unquoted = if quoted {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    let sections = unquoted.split(',').map(str::trim).collect::<Vec<_>>();
+    if sections
+        .iter()
+        .any(|section| section.is_empty() || !section.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let normalized = sections.join(",");
+    Some(Cow::Owned(if quoted {
+        format!("\"{normalized}\"")
+    } else {
+        normalized
+    }))
+}
+
+/// Validates cookie framing without interpreting or modifying consent signals.
+fn valid_prebid_cookie_value(name: &str, value: &str) -> bool {
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value);
+    // GPP section IDs use comma-separated decimals, already accepted by consent extraction.
+    if name == COOKIE_GPP_SID && value.contains(',') {
+        return value.split(',').all(|section| {
+            !section.is_empty() && section.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    }
+    // RFC 6265 cookie-octet excludes whitespace, quotes, commas, semicolons and backslashes.
+    value
+        .bytes()
+        .all(|byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e))
 }
 
 /// Appends query parameters to a URL, handling both URLs with and without existing query strings.
@@ -2704,15 +2854,16 @@ impl PrebidAuctionProvider {
             }
         });
 
-        // Build user object — populate consent at both OpenRTB 2.6 top-level
-        // and Prebid ext-based locations (dual placement).
-        // In cookies_only mode, cookie-sourced consent travels through the
-        // forwarded Cookie header. Policy-sourced consent has no inbound cookie
-        // to forward, so carry it in the OpenRTB body instead.
-        let consent_ctx = request.user.consent.as_ref().filter(|ctx| {
-            self.config.consent_forwarding.includes_body_consent()
-                || !matches!(ctx.source, crate::consent::ConsentSource::Cookie)
-        });
+        // Select consent independently per signal: safely forwarded cookies
+        // remain omitted in cookies_only, while unsafe GPP and its IDs fall
+        // back together. Identity gating still uses the original context.
+        let body_consent =
+            PrebidConsentCookies::from_header(context.request.headers().get(header::COOKIE))
+                .body_consent(
+                    request.user.consent.as_ref(),
+                    self.config.consent_forwarding,
+                );
+        let consent_ctx = body_consent.as_deref();
         let raw_tc = consent_ctx.and_then(|c| c.raw_tc_string.clone());
         let user = Some(User {
             id: request.user.id.clone(),
@@ -9733,7 +9884,7 @@ set = { networkId = 42 }
     }
 
     #[test]
-    fn planned_transport_preserves_malformed_cookie_bytes_and_attested_xff() {
+    fn planned_transport_omits_malformed_cookie_bytes_and_preserves_attested_xff() {
         let inbound = http::Request::builder()
             .uri("https://publisher.example/auction")
             .header(
@@ -9777,8 +9928,8 @@ set = { networkId = 42 }
                 .headers()
                 .get(header::COOKIE)
                 .map(HeaderValue::as_bytes),
-            Some(b"session=fictional;\xffbroken".as_slice()),
-            "should forward malformed cookie bytes unchanged"
+            None,
+            "should omit malformed cookie bytes"
         );
         assert_eq!(
             outbound
@@ -9788,6 +9939,201 @@ set = { networkId = 42 }
             Some("203.0.113.9"),
             "should use only attested XFF"
         );
+    }
+
+    #[test]
+    fn prebid_cookie_policy_rebuilds_only_valid_consent_pairs() {
+        for mode in [
+            ConsentForwardingMode::Both,
+            ConsentForwardingMode::CookiesOnly,
+            ConsentForwardingMode::OpenrtbOnly,
+        ] {
+            for (input, allowed) in [
+                (None, None),
+                (Some(""), None),
+                (
+                    Some("ts-ec=secret; ts-eids=secret; sharedId=secret; session=secret"),
+                    None,
+                ),
+                (
+                    Some(
+                        "EUCONSENT-V2=secret; x__gpp=secret; __gpp_sid_extra=secret; us_privacy_extra=secret",
+                    ),
+                    None,
+                ),
+                (
+                    Some(
+                        "euconsent-v2; =secret; __gpp=bad value; __gpp_sid=2,session=secret; us_privacy=bad,session=secret; __gpp_sid=\"unterminated",
+                    ),
+                    None,
+                ),
+                (
+                    Some("euconsent-v2=bad\\value; __gpp=bad\"quote; us_privacy=bad\tvalue"),
+                    None,
+                ),
+                (
+                    Some(
+                        " session=secret ; euconsent-v2=TC==; __gpp=GPP; __gpp_sid=2,6; us_privacy=1YNN",
+                    ),
+                    Some("euconsent-v2=TC==; __gpp=GPP; __gpp_sid=2,6; us_privacy=1YNN"),
+                ),
+                (
+                    Some("euconsent-v2=\"TC==\"; __gpp=; __gpp_sid=2; us_privacy=1YNN"),
+                    Some("euconsent-v2=\"TC==\"; __gpp=; __gpp_sid=2; us_privacy=1YNN"),
+                ),
+                (
+                    Some("__gpp=first; session=secret; __gpp=second"),
+                    Some("__gpp=second"),
+                ),
+            ] {
+                let mut inbound = http::Request::new(EdgeBody::empty());
+                if let Some(input) = input {
+                    inbound.headers_mut().insert(
+                        header::COOKIE,
+                        HeaderValue::from_str(input).expect("should build cookie header"),
+                    );
+                }
+                let mut outbound = http::Request::new(EdgeBody::empty());
+                outbound
+                    .headers_mut()
+                    .append(header::COOKIE, HeaderValue::from_static("stale=secret"));
+                outbound
+                    .headers_mut()
+                    .append(header::COOKIE, HeaderValue::from_static("another=secret"));
+
+                copy_request_headers(&inbound, &mut outbound, mode, None);
+
+                let expected = if mode == ConsentForwardingMode::OpenrtbOnly {
+                    None
+                } else {
+                    allowed
+                };
+                assert_eq!(
+                    outbound
+                        .headers()
+                        .get(header::COOKIE)
+                        .and_then(|value| value.to_str().ok()),
+                    expected,
+                    "should rebuild only valid allowed pairs for {mode:?} with {input:?}"
+                );
+                assert_eq!(
+                    outbound.headers().get_all(header::COOKIE).iter().count(),
+                    usize::from(expected.is_some()),
+                    "should remove stale destination cookies"
+                );
+            }
+            for bytes in [
+                b"euconsent-v2=TC; session=secret;\xffbroken".as_slice(),
+                b"__gpp=GPP;\xc3\xa9=secret".as_slice(),
+            ] {
+                let mut inbound = http::Request::new(EdgeBody::empty());
+                inbound.headers_mut().insert(
+                    header::COOKIE,
+                    HeaderValue::from_bytes(bytes).expect("should build non-ASCII header"),
+                );
+                let mut outbound = http::Request::new(EdgeBody::empty());
+
+                copy_request_headers(&inbound, &mut outbound, mode, None);
+
+                assert!(
+                    !outbound.headers().contains_key(header::COOKIE),
+                    "should omit unreadable headers in {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prebid_cookie_selection_matches_extraction_and_preserves_safe_framing() {
+        for (input, expected, requires_body) in [
+            ("us_privacy = 1YYN", Some("us_privacy=1YYN"), false),
+            (
+                "euconsent-v2=\"TC==\"; __gpp_sid=\"2, 6\"",
+                Some("euconsent-v2=\"TC==\"; __gpp_sid=\"2,6\""),
+                false,
+            ),
+            (
+                "__gpp_sid=2, 6; __gpp_sid=7, 8",
+                Some("__gpp_sid=7,8"),
+                false,
+            ),
+            (
+                "__gpp=first; __gpp=bad\\value; us_privacy=1YYN",
+                Some("us_privacy=1YYN"),
+                true,
+            ),
+            ("__gpp_sid=\"", None, true),
+            (
+                "__gpp_sid=2, session=secret; us_privacy=1YYN",
+                Some("us_privacy=1YYN"),
+                true,
+            ),
+            (
+                "__gpp_sid=2,; us_privacy=1YYN",
+                Some("us_privacy=1YYN"),
+                true,
+            ),
+            (
+                "__gpp=bad\"quote; us_privacy=1YYN",
+                Some("us_privacy=1YYN"),
+                true,
+            ),
+        ] {
+            let header = HeaderValue::from_str(input).expect("should build cookie header");
+            let selected = PrebidConsentCookies::from_header(Some(&header));
+            assert_eq!(
+                selected
+                    .header
+                    .as_ref()
+                    .and_then(|value| value.to_str().ok()),
+                expected,
+                "should select safe last consent values from {input:?}"
+            );
+            assert_eq!(
+                selected.requires_body(),
+                requires_body,
+                "should retain unrepresentable consent in the body for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prebid_cookie_fallback_carries_gdpr_applicability_only_with_tc_or_gpp() {
+        let context = crate::consent::ConsentContext {
+            raw_tc_string: Some("fictional-tcf".to_string()),
+            raw_gpp_string: Some("fictional-gpp".to_string()),
+            gpp_section_ids: Some(vec![2]),
+            raw_us_privacy: Some("1YNN".to_string()),
+            gdpr_applies: true,
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
+            source: crate::consent::ConsentSource::Cookie,
+            ..Default::default()
+        };
+        for (input, carries_gdpr) in [
+            ("euconsent-v2=bad\\value; __gpp=GPP; us_privacy=1YNN", true),
+            ("euconsent-v2=TC; __gpp=bad\\value; us_privacy=1YNN", true),
+            ("euconsent-v2=TC; __gpp_sid=2,; us_privacy=1YNN", true),
+            ("euconsent-v2=TC; __gpp=GPP; us_privacy=bad\\value", false),
+        ] {
+            let header = HeaderValue::from_str(input).expect("should build cookie header");
+            let selected = PrebidConsentCookies::from_header(Some(&header))
+                .body_consent(Some(&context), ConsentForwardingMode::CookiesOnly)
+                .expect("should fall back for the unsafe signal");
+
+            assert_eq!(
+                selected.gdpr_applies, carries_gdpr,
+                "should carry GDPR applicability only with TC or GPP for {input:?}"
+            );
+            assert_eq!(
+                selected.jurisdiction,
+                if carries_gdpr {
+                    crate::consent::jurisdiction::Jurisdiction::Gdpr
+                } else {
+                    crate::consent::jurisdiction::Jurisdiction::Unknown
+                },
+                "should carry jurisdiction only with TC or GPP for {input:?}"
+            );
+        }
     }
 
     #[test]
@@ -9859,17 +10205,17 @@ set = { networkId = 42 }
             (
                 ConsentForwardingMode::Both,
                 HeaderValue::from_static("session=fictional; euconsent-v2=fictional-tcf"),
-                Some(b"session=fictional; euconsent-v2=fictional-tcf".as_slice()),
+                Some(b"euconsent-v2=fictional-tcf".as_slice()),
             ),
             (
                 ConsentForwardingMode::CookiesOnly,
                 HeaderValue::from_static("session=fictional; euconsent-v2=fictional-tcf"),
-                Some(b"session=fictional; euconsent-v2=fictional-tcf".as_slice()),
+                Some(b"euconsent-v2=fictional-tcf".as_slice()),
             ),
             (
                 ConsentForwardingMode::OpenrtbOnly,
                 HeaderValue::from_static("session=fictional; euconsent-v2=fictional-tcf"),
-                Some(b"session=fictional".as_slice()),
+                None,
             ),
             (
                 ConsentForwardingMode::OpenrtbOnly,
@@ -9880,7 +10226,7 @@ set = { networkId = 42 }
                 ConsentForwardingMode::OpenrtbOnly,
                 HeaderValue::from_bytes(b"session=fictional;\xffbroken")
                     .expect("should build malformed cookie header"),
-                Some(b"session=fictional;\xffbroken".as_slice()),
+                None,
             ),
         ] {
             let stub = Arc::new(StubHttpClient::new());
