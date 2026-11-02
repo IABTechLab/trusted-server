@@ -8,6 +8,9 @@
 //! drops it once that time has passed. A missing `ttl` uses the shared
 //! default TTL. No server call is made.
 //!
+//! This kind has no Lockr capability: Lockr AIM is not documented to
+//! deliver `ConnectID`, so a `lockr` settings table is rejected.
+//!
 //! The cookie's `he` and `puid` fields are never read, so they are never
 //! stored. Parsing is lenient: an undecodable cookie, a missing
 //! `connectId` or `lastSynced`, or a blank or opt-out ID reads as no ID.
@@ -24,7 +27,9 @@ use trusted_server_core::ec::provider::{
     ProviderResponse, RequestCookies,
 };
 
-use crate::common::{DEFAULT_TTL, cookie_capabilities, cookie_eid, is_usable_id, percent_decoded};
+use crate::common::{
+    CookieReader, DEFAULT_TTL, cookie_capabilities, cookie_eid, is_usable_id, percent_decoded,
+};
 
 /// Longest time a `ConnectID` is kept after its last sync.
 pub const MAX_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
@@ -53,7 +58,7 @@ impl ConnectIdSettings {
 pub struct ConnectIdProvider {
     capabilities: ProviderCapabilities,
     source: SourceDomain,
-    cookie_names: Box<[String]>,
+    cookies: CookieReader,
 }
 
 impl ProviderKind for ConnectId {
@@ -73,7 +78,7 @@ impl ProviderKind for ConnectId {
         Ok(ConnectIdProvider {
             capabilities,
             source,
-            cookie_names: settings.cookie_names.into_boxed_slice(),
+            cookies: CookieReader::own(common, settings.cookie_names),
         })
     }
 }
@@ -132,11 +137,7 @@ impl IdentityProvider for ConnectIdProvider {
         &self,
         cookies: RequestCookies<'cookie>,
     ) -> Option<Vec<ProviderEid<'cookie>>> {
-        let (id, expiry) = self
-            .cookie_names
-            .iter()
-            .filter_map(|name| cookies.get(name))
-            .find_map(connect_id)?;
+        let (id, expiry) = self.cookies.read(cookies, connect_id)?;
         Some(vec![cookie_eid(&self.source, Cow::Owned(id), expiry)])
     }
 }

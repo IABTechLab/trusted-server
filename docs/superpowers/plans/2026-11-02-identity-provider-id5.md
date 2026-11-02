@@ -31,9 +31,10 @@
 
 ## First-party cookie
 
-ID5's source is provider-owned, so the browser `ts-eids` copy is dropped. Prebid's ID5 module and Lockr AIM store the ID in a first-party cookie instead, which `read_request_cookies` reads before any lookup.
+ID5's source is provider-owned, so the browser `ts-eids` copy is dropped. Prebid's ID5 module stores the ID in a first-party cookie instead, which `read_request_cookies` reads before any lookup.
 
-- Setting `cookie_names` (default `["id5id"]`), tried in order; Lockr's key name is configurable, so operators list it.
+- Setting `cookie_names` (default `["id5id"]`), tried in order.
+- `id5` declares the Lockr capability (see `2026-11-02-identity-provider-lockr-capability.md`): with `[settings.lockr] enabled = true`, the Lockr cookies (default `["id5id"]`) are read after `cookie_names` and before the lookup, with the same parser.
 - A value that is JSON after percent-decoding is parsed with the same code as a lookup response (lenient entries, opt-out `0` dropped, normalized sources, `cache_control.max_age_sec` bounded). `ext` objects are dropped when the value was percent-encoded, since they borrow from the decoded copy.
 - Any other value is a bare ID: one UID on the first source with `atype = 1` and the default TTL.
 - `signature` is never stored as a UID. A cookie that yields no usable UID is ignored, and the lookup runs as usual; a kept UID skips the lookup.

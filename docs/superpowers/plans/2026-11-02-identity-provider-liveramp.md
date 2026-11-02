@@ -22,7 +22,7 @@
 
 ## Lockr
 
-Lockr AIM writes the LiveRamp envelope into a cookie named by its own configuration. List that name in `cookie_names`; no separate Lockr kind is needed.
+`liveramp` declares the Lockr capability (see `2026-11-02-identity-provider-lockr-capability.md`). With `[settings.lockr] enabled = true`, the Lockr cookies (default `["_lr_env"]`) are read after `cookie_names` with the same envelope parser. `cookie_names` may be empty only when Lockr is enabled.
 
 ## Tasks
 

@@ -24,6 +24,8 @@
 | `distributor_id` | none          | Sent as `did`; the path uses `prebid` when unset. |
 | `attributes`     | required, ≥ 1 | `LiveIntent` attribute name → stored source.      |
 
+No Lockr capability: Lockr AIM is not documented to deliver LiveIntent IDs, and the lookup uses LiveIntent's own signals, so a `[settings.lockr]` table is rejected.
+
 ## Request
 
 - `GET <endpoint>/<distributor or prebid>/<publisher_id>` with `Origin: https://<publisher_domain>`.

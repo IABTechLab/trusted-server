@@ -15,6 +15,8 @@
 - Only `connectId`, `lastSynced` and `ttl` are read. `he` and `puid` are never deserialized, so they are never stored.
 - A missing `connectId` or `lastSynced`, a non-string ID, a blank or opt-out ID, or malformed JSON reads as no ID.
 
+No Lockr capability: Lockr AIM is not documented to deliver ConnectID, so a `[settings.lockr]` table is rejected.
+
 ## Stored ID
 
 - One EID for the single configured source, one UID with `atype = 3`.

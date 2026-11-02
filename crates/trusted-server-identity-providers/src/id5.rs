@@ -12,8 +12,9 @@
 //! value gets the default TTL and a zero or tiny one the minimum TTL.
 //!
 //! Before any lookup, the provider reads ID5's first-party cookies listed
-//! in `cookie_names` (default `id5id`), in order. Prebid's ID5 module and
-//! Lockr AIM write them: a cookie holding the ID5 fetch response JSON
+//! in `cookie_names` (default `id5id`, written by Prebid's ID5 module), in
+//! order, then, when the Lockr capability is enabled, the cookies Lockr AIM
+//! writes (`[settings.lockr]`, default key `id5id`). A cookie holding the ID5 fetch response JSON
 //! (plain or percent-encoded) is parsed exactly like a lookup response, and
 //! a bare ID string becomes one UID on the first source with agent type 1
 //! and the default TTL. The response `signature` is never stored. When a
@@ -46,7 +47,8 @@ use url::Url;
 use serde_json::value::RawValue;
 
 use crate::common::{
-    VendorEid, bounded_expiry, is_routable_ip, is_usable_id, join_section_ids, percent_decoded,
+    CookieReader, LockrSettings, ReadsLockr, VendorEid, bounded_expiry, is_routable_ip,
+    is_usable_id, join_section_ids, percent_decoded,
 };
 
 /// The UID ID5 returns for a visitor who opted out.
@@ -71,6 +73,9 @@ pub struct Id5Settings {
     /// yielding a usable UID wins.
     #[serde(default = "Id5Settings::default_cookie_names")]
     pub cookie_names: Vec<String>,
+    /// The Lockr capability; see [`LockrSettings`].
+    #[serde(default)]
+    pub lockr: LockrSettings,
 }
 
 impl Id5Settings {
@@ -85,7 +90,11 @@ pub struct Id5Provider {
     capabilities: ProviderCapabilities,
     url: Url,
     partner_id: u32,
-    cookie_names: Box<[String]>,
+    cookies: CookieReader,
+}
+
+impl ReadsLockr for Id5 {
+    const LOCKR_COOKIE_NAMES: &'static [&'static str] = &["id5id"];
 }
 
 impl ProviderKind for Id5 {
@@ -131,7 +140,11 @@ impl ProviderKind for Id5 {
             },
             url,
             partner_id: settings.partner_id,
-            cookie_names: settings.cookie_names.into_boxed_slice(),
+            cookies: CookieReader::with_lockr::<Self>(
+                common,
+                settings.cookie_names,
+                settings.lockr,
+            )?,
         })
     }
 }
@@ -352,10 +365,7 @@ impl IdentityProvider for Id5Provider {
         &self,
         cookies: RequestCookies<'cookie>,
     ) -> Option<Vec<ProviderEid<'cookie>>> {
-        self.cookie_names
-            .iter()
-            .filter_map(|name| cookies.get(name))
-            .find_map(|value| self.cookie_eids(value))
+        self.cookies.read(cookies, |value| self.cookie_eids(value))
     }
 }
 
@@ -731,6 +741,43 @@ mod tests {
             )],
             "should store the bare ID on the first source with the default TTL"
         );
+    }
+
+    #[test]
+    fn reads_lockr_after_own_cookies_and_falls_back_to_the_lookup() {
+        let config: IdentityProviderConfig = serde_json::from_value(json!({
+            "id": "id5",
+            "kind": "id5",
+            "endpoint": "https://id5.example.com/g/v2",
+            "allowed_domains": ["id5.example.com"],
+            "sources": ["id5.example.com"],
+            "settings": {
+                "partner_id": 1234,
+                "lockr": { "enabled": true, "cookie_names": ["example_lockr_id5"] },
+            },
+        }))
+        .expect("should parse provider config");
+        let provider =
+            build_kind::<Id5>(&config, &ProviderSecrets::default()).expect("should build provider");
+
+        let own_first = read(
+            &provider,
+            "example_lockr_id5=lockr-example; id5id=own-example",
+        );
+        let lockr = read(&provider, "id5id=0; example_lockr_id5=lockr-example");
+        let neither = read(&provider, "example_lockr_id5=0");
+
+        assert_eq!(
+            own_first.map(|uids| uids[0].1.clone()).as_deref(),
+            Some("own-example"),
+            "should prefer the own cookie"
+        );
+        assert_eq!(
+            lockr.map(|uids| uids[0].1.clone()).as_deref(),
+            Some("lockr-example"),
+            "should read the Lockr cookie when the own cookie yields nothing"
+        );
+        assert!(neither.is_none(), "should leave the ID to the lookup");
     }
 
     #[test]
