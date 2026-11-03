@@ -137,7 +137,7 @@ impl HtmlEofDriver {
         Ok(Self {
             response_status: params.response_status,
             input,
-            encoder: BodyStreamEncoder::new(compression),
+            encoder: BodyStreamEncoder::new(params.transform_compression()),
             processor,
             replay: VecDeque::new(),
             hold,
