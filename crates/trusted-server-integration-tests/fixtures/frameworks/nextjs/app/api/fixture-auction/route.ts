@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { FixtureAuctionControl } from "../../publisher-registration-real-gpt/provider-control";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -18,18 +19,32 @@ type Exchange = {
   path: string;
   request: AuctionRequest;
   response: object;
+  mode: ReturnType<FixtureAuctionControl["forPath"]>;
 };
 
 // Module state belongs to this isolated fixture container, not a browser bid map.
 const exchanges: Exchange[] = [];
+const control = new FixtureAuctionControl();
 
 export async function GET() {
-  return NextResponse.json({ exchanges });
+  return NextResponse.json({ exchanges, control: control.snapshot() });
+}
+
+export async function PUT(request: NextRequest) {
+  try {
+    return NextResponse.json({ control: control.set(await request.json()) });
+  } catch {
+    return NextResponse.json(
+      { error: "fixture control must be exactly {noBid:boolean}" },
+      { status: 400 },
+    );
+  }
 }
 
 export async function DELETE() {
   exchanges.length = 0;
-  return NextResponse.json({ exchanges });
+  control.reset();
+  return NextResponse.json({ exchanges, control: control.snapshot() });
 }
 
 export async function POST(request: NextRequest) {
@@ -54,7 +69,8 @@ export async function POST(request: NextRequest) {
   const pagePath = new URL(
     auction.site?.page || "https://publisher.example.com/",
   ).pathname;
-  const noBid = pagePath.endsWith("/no-bid");
+  const mode = control.forPath(pagePath);
+  const noBid = mode.noBid;
   const height = pagePath.endsWith("/tall") ? 600 : 250;
   const response = {
     id: auction.id,
@@ -82,6 +98,7 @@ export async function POST(request: NextRequest) {
     path: request.nextUrl.pathname,
     request: auction,
     response,
+    mode,
   });
   console.log(
     JSON.stringify({ fixtureAuction: exchanges[exchanges.length - 1] }),

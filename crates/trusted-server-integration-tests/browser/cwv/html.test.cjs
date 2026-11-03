@@ -5,6 +5,7 @@ const {
   scriptBlocks,
   withoutScripts,
   withoutEarlyRenderer,
+  withoutRuntimeDefer,
   rendererAsset,
 } = require("./html.cjs");
 
@@ -162,4 +163,19 @@ test("CSS-only control copies only the exact production reservation stylesheet",
     '<script>const iframe="<style>%NORMALIZE_CSS%</style>";</script><style>body{margin:0}</style></head>';
   assert.deepEqual(reservationStyles(html), [css]);
   assert.deepEqual(reservationStyles("<style>body{margin:0}</style>"), []);
+});
+
+test("parser-blocking control removes only the actual runtime defer attribute", () => {
+  const prefix =
+    '<!-- <script id=trustedserver-js defer> -->\r\n<script defer src="/other.js"></script>';
+  const suffix =
+    '<script>const text=" defer";</script><main id=article>Keep bytes</main>';
+  for (const attribute of ["defer", 'DEFER=""', "defer='defer'"]) {
+    const tag = `<script id=trustedserver-js data-note=" defer" ${attribute} src=/runtime.js></script>`;
+    assert.equal(
+      withoutRuntimeDefer(prefix + tag + suffix),
+      prefix + tag.replace(` ${attribute} src=`, "  src=") + suffix,
+    );
+  }
+  assert.equal(withoutRuntimeDefer("<p>No runtime</p>"), "<p>No runtime</p>");
 });

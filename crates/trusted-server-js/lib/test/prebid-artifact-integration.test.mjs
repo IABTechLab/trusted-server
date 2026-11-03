@@ -331,11 +331,11 @@ describe('tsjs-prebid production artifacts', () => {
     expect(shimCode).not.toContain(analyticsArtifact.manifest.prebidVersion);
     expect(shimCode).not.toContain('_pbjsGlobals');
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
-    // The original shim measures 40,354 characters. Shared strict trace JSON
-    // validation, request-ID hook association, and bounded pending lifecycle add
-    // 11,676 characters (52,030 total). Keep a narrow 52.5 KB guard: Prebid remains a separate artifact above 200 KB, and importing
-    // its runtime or private rendering helpers must still fail this regression.
-    expect(shimCode.length).toBeLessThan(52_500);
+    // With matching dependencies, main 51730bdaf measures 52,462 characters.
+    // The null-prototype first-impression maps add 135 characters, for 52,597.
+    // Preserve main's 38-character headroom; importing Prebid or its private
+    // rendering helpers must still fail this regression.
+    expect(shimCode.length).toBeLessThan(52_635);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 

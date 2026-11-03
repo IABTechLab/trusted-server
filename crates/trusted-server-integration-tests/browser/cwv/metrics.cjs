@@ -44,12 +44,29 @@ function observePage() {
     lcp: [],
     shifts: [],
     resources: [],
+    scriptLoads: [],
     geometry: [],
     firstVisibleEstimateMs: null,
     delivered: false,
     errors: [],
     cspViolations: [],
   });
+  // Capturing native load events distinguishes parser-blocking from defer even
+  // when a 0ms response or a cache hit finishes before the first paint.
+  document.addEventListener(
+    "load",
+    (event) => {
+      if (event.target?.tagName !== "SCRIPT") return;
+      state.scriptLoads.push({
+        id: event.target.id,
+        src: event.target.src,
+        time: performance.now(),
+        readyState: document.readyState,
+        articlePresent: !!document.getElementById("article"),
+      });
+    },
+    true,
+  );
   const observers = [];
   const identifier = (node) => node?.id || node?.tagName || null;
   const record = (type, entries) => {
@@ -69,6 +86,7 @@ function observePage() {
           hadRecentInput: entry.hadRecentInput,
           sources: (entry.sources || []).map((source) => ({
             node: identifier(source.node),
+            withinArticle: !!source.node?.closest?.("#article"),
             previousRect: source.previousRect.toJSON(),
             currentRect: source.currentRect.toJSON(),
           })),
@@ -116,6 +134,25 @@ function observePage() {
         creatives: fixture.creatives,
       },
       early: window.fixtureEarly,
+      apis: {
+        methods: Object.fromEntries(
+          [
+            "setConfig",
+            "getConfig",
+            "requestAds",
+            "addAdUnits",
+            "renderAdUnit",
+            "renderAllAdUnits",
+            "adInit",
+            "scheduleInitialAdInit",
+            "registerPublisherSlot",
+          ].map((name) => [name, typeof window.tsjs?.[name]]),
+        ),
+        shim: typeof window.__tsjs_installGptShim,
+        registrationVersion:
+          window.tsjs?.publisherSlotRegistrationVersion ?? null,
+        rendererVersion: window.tsjs?.tsRenderBridgeVersion ?? null,
+      },
       registration: window.fixtureHandle?.getStatus(),
       rendererVersion: window.tsjs?.tsRenderBridgeVersion,
       candidateAdId: window.tsjs?.bids?.["fixture-header"]?.hb_adid,

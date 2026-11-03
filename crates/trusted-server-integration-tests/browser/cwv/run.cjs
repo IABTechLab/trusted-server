@@ -4,44 +4,85 @@ const http = require("node:http");
 const crypto = require("node:crypto");
 const zlib = require("node:zlib");
 const assert = require("node:assert/strict");
-const { parseArgs } = require("node:util");
-const { chromium } = require("playwright");
-const { JSDOM } = require("jsdom");
-const { sessionCls, distribution, observePage } = require("./metrics.cjs");
+const { parseOptions, conditions } = require("./options.cjs");
 const {
-  reservationStyles,
-  withoutEarlyRenderer,
-  withoutScripts,
-  rendererAsset,
-} = require("./html.cjs");
-
-const { values: options } = parseArgs({
-  options: {
-    baseline: { type: "string" },
-    loading: { type: "string" },
-    combined: { type: "string" },
-    out: { type: "string" },
-    runs: { type: "string", default: "5" },
-    "correctness-only": { type: "boolean" },
-    "regressions-only": { type: "boolean" },
-  },
-});
-assert(
-  options.loading && options.combined && options.out,
-  "Required: --loading CHANGED_UNRESERVED --combined CHANGED_RESERVED --out DIR; --baseline enables four-way measurement",
-);
-assert(
-  options.baseline ||
-    options["correctness-only"] ||
-    options["regressions-only"],
-  "Measurement requires --baseline; CI may use --correctness-only",
-);
-const runs = Number(options.runs);
-assert(Number.isInteger(runs) && runs > 0, "--runs must be a positive integer");
+  assertRuntimeOrdering,
+  assertCacheUse,
+  assertReservationControl,
+  assertCspRuntimeApis,
+  assertCandidateRendererVersion,
+  assertVisibleCreative,
+} = require("./evidence.cjs");
+const { sessionCls, distribution, observePage } = require("./metrics.cjs");
+const { fixtureProxy } = require("./proxy.cjs");
+const options = parseOptions();
+const settings = conditions(options);
+const runs = options.runs;
 const out = path.resolve(options.out);
 fs.mkdirSync(out, { recursive: true });
 const save = (name, value) =>
   fs.writeFileSync(path.join(out, name), JSON.stringify(value, null, 2));
+const acceptance = {
+  schemaVersion: 1,
+  status: "running",
+  scope: options["regressions-only"]
+    ? "regressions"
+    : options["correctness-only"]
+      ? "correctness"
+      : "measurement-and-correctness",
+  startedAt: new Date().toISOString(),
+  conditions: settings,
+  samples: 0,
+  profileSamples: {},
+  negativeControls: Object.fromEntries(
+    ["parser-blocking", "reservation-removed"].map((id) => [
+      id,
+      {
+        status: options["regressions-only"] ? "not-requested" : "pending",
+        ...(options["regressions-only"]
+          ? {
+              reason:
+                "--regressions-only selects the four review regressions, not the negative controls",
+            }
+          : {}),
+      },
+    ]),
+  ),
+};
+let evidence;
+const saveOutcome = () => {
+  save("acceptance.json", acceptance);
+  save("artifacts.json", { ...evidence, outcome: acceptance });
+};
+const recordFailure = (error) => {
+  acceptance.status =
+    ["ENOENT", "MODULE_NOT_FOUND"].includes(error.code) ||
+    /Executable doesn't exist/.test(error.message)
+      ? "blocked"
+      : "failed";
+  acceptance.finishedAt = new Date().toISOString();
+  acceptance.error = {
+    name: error.name,
+    message: error.message,
+    stack: error.stack,
+  };
+  for (const control of Object.values(acceptance.negativeControls))
+    if (control.status === "running") control.status = acceptance.status;
+  saveOutcome();
+};
+// Persist before reading exports/dependencies so a failed rerun cannot leave an
+// older successful outcome in the same output directory.
+saveOutcome();
+process.on("uncaughtExceptionMonitor", recordFailure);
+const { chromium } = require("playwright");
+const { JSDOM } = require("jsdom");
+const {
+  reservationStyles,
+  withoutEarlyRenderer,
+  withoutRuntimeDefer,
+  withoutScripts,
+  rendererAsset,
+} = require("./html.cjs");
 const sha256 = (value) =>
   crypto.createHash("sha256").update(value).digest("hex");
 const sizes = (bytes) => ({
@@ -103,17 +144,22 @@ const profiles = {
   combined,
   ...(baseline ? { baseline, reservation: baseline } : {}),
 };
-const evidence = {
+evidence = {
   node: process.version,
   platform: process.platform,
   architecture: process.arch,
   command: process.argv,
   startedAt: new Date().toISOString(),
   settings: {
-    cpuThrottling: "none; shared host may run concurrent builds",
-    network: "loopback; runtime response held 750ms",
-    cache: "fresh contexts, no-store",
+    ...settings,
     runs,
+    hostContention: "Shared host may run concurrent builds",
+    cacheSemantics:
+      options.cache === "warm"
+        ? "Fresh per-sample context, prime then navigate again in same page; static assets cacheable for 3600 seconds; documents and creatives no-store"
+        : "Fresh contexts, HTTP cache disabled, all responses no-store",
+    externalNetwork:
+      "HTTP proxy forwards only exact publisher/creative origins; all other origins and CONNECT rejected; no browser bypass or Playwright routing",
   },
   inputs: {
     loading: loading.evidence,
@@ -128,11 +174,20 @@ const evidence = {
   runnerSha256: sha256(fs.readFileSync(__filename)),
   metricsSha256: sha256(fs.readFileSync(path.join(__dirname, "metrics.cjs"))),
   htmlSha256: sha256(fs.readFileSync(path.join(__dirname, "html.cjs"))),
-  interventions: [],
+  optionsSha256: sha256(fs.readFileSync(path.join(__dirname, "options.cjs"))),
+  evidenceSha256: sha256(fs.readFileSync(path.join(__dirname, "evidence.cjs"))),
+  proxySha256: sha256(fs.readFileSync(path.join(__dirname, "proxy.cjs"))),
+  proxyRequests: [],
+  interventions: [
+    {
+      type: "runtime delay, CPU/network and HTTP cache configuration",
+      ...settings,
+    },
+  ],
   boundary:
     "Controlled loopback lab fixture, simulated GPT and fictional bids. First-visible is an animation-frame/DOM estimate, not hardware paint, GAM impression time or field CWV.",
 };
-save("artifacts.json", evidence);
+saveOutcome();
 
 function documentInput(profile, name) {
   const source = profiles[profile];
@@ -191,11 +246,28 @@ let publisherOrigin;
 let creativeOrigin;
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function respond(request, response) {
-  const url = new URL(request.url, publisherOrigin);
+  const url = new URL(request.url, `http://${request.headers.host}`);
   const send = (type, bytes, status = 200) => {
+    const cacheable =
+      status === 200 &&
+      (active.input.source.manifest.assets[request.url] ||
+        ["/hero.svg", "/fixture-puc.js"].includes(url.pathname));
+    active.responses.push({
+      url: url.href,
+      status,
+      cacheable: !!cacheable,
+      phase: active.phase,
+      runtimeDelayMs:
+        request.url === active.input.runtimeSrc && active.runtimeAttempts === 1
+          ? settings.runtimeDelayMs
+          : 0,
+    });
     response.writeHead(status, {
       "Content-Type": type,
-      "Cache-Control": "no-store",
+      "Cache-Control":
+        options.cache === "warm" && cacheable
+          ? "public, max-age=3600"
+          : "no-store",
       ...(url.pathname === active.input.requestPath
         ? active.responseHeaders
         : {}),
@@ -227,7 +299,8 @@ async function respond(request, response) {
   if (request.url === active.input.runtimeSrc) {
     active.runtimeAttempts++;
     const retry = active.runtimeAttempts > 1;
-    if (!retry) await wait(750);
+    if (!retry && settings.runtimeDelayMs > 0)
+      await wait(settings.runtimeDelayMs);
     if (!retry && ["failed", "late-runtime"].includes(active.mode))
       return send("text/plain", "Deliberate fixture runtime failure", 404);
   }
@@ -318,15 +391,26 @@ async function sample(
   viewport,
   mode = "slow",
   noFill = false,
+  control = null,
 ) {
+  if (control) {
+    acceptance.negativeControls[control].status = "running";
+    saveOutcome();
+  }
   const input = documentInput(profile, name);
+  const cspRuntimeUnavailable = input.enforcedCsp && mode === "failed";
+  // Keep the existing publisher-side probe. Its core call deliberately fails
+  // when the synchronous runtime is unavailable; no other page error is allowed.
+  const expectedErrors = cspRuntimeUnavailable
+    ? ["tsjs.setConfig is not a function"]
+    : [];
   assert.equal(
     input.deferred,
     !input.enforcedCsp && (profile === "loading" || profile === "combined"),
     `${profile} must exercise its intended production loading mode`,
   );
   const index = samples.length;
-  const label = `${index}-${profile}-${name}-${viewport.width}-${mode}${noFill ? "-nofill" : ""}`;
+  const label = `${index}-${profile}-${name}-${viewport.width}-${mode}${noFill ? "-nofill" : ""}${control ? "-" + control : ""}`;
   active = {
     input,
     mode,
@@ -334,8 +418,38 @@ async function sample(
     unexpected: [],
     blockedRenderer: [],
     responseHeaders: {},
+    responses: [],
+    phase: options.cache === "warm" ? "warmup" : "measurement",
     html: input.html,
   };
+  if (control === "parser-blocking") {
+    active.html = withoutRuntimeDefer(input.html);
+    assert.notEqual(
+      active.html,
+      input.html,
+      "Parser negative control must remove defer",
+    );
+  }
+  if (control === "reservation-removed") {
+    const styles = reservationStyles(input.html);
+    assert(
+      styles.length > 0,
+      "Reservation negative control requires production CSS",
+    );
+    for (const style of styles) active.html = active.html.replace(style, "");
+  }
+  if (control) {
+    const file = label + ".html";
+    fs.writeFileSync(path.join(out, file), active.html);
+    evidence.interventions.push({
+      index,
+      profile,
+      name,
+      type: control,
+      file,
+      htmlSha256: sha256(active.html),
+    });
+  }
   if (input.enforcedCsp) {
     const legacy = baseline ?? input.source;
     const legacyDoc = legacy.manifest.documents.find(
@@ -373,6 +487,18 @@ async function sample(
       !input.html.includes('id="trustedserver-bootstrap"'),
       "Enforced CSP must use synchronous production fallback",
     );
+    assert(
+      !input.html.includes("// Edge-injected GPT auction bootstrap."),
+      "Enforced CSP must not depend on the provisional raw bootstrap's inline hash",
+    );
+    if (cspRuntimeUnavailable)
+      evidence.interventions.push({
+        index,
+        profile,
+        name,
+        type: "enforced-CSP synchronous runtime failure; no provisional fallback",
+        expectedErrors,
+      });
   }
   if (mode === "renderer-absent") {
     active.html = withoutEarlyRenderer(input.html);
@@ -420,6 +546,10 @@ async function sample(
   let traceStarted = false;
   let result;
   let page;
+  let warmup = null;
+  const requests = new Map();
+  const errors = [];
+  const network = [];
   try {
     await context.tracing.start({
       screenshots: true,
@@ -437,25 +567,80 @@ async function sample(
     }`,
     });
     page = await context.newPage();
-    const errors = [];
-    const network = [];
+    const cdp = await context.newCDPSession(page);
+    await cdp.send("Network.enable");
+    await cdp.send("Network.setCacheDisabled", {
+      cacheDisabled: options.cache === "cold",
+    });
+    await cdp.send("Emulation.setCPUThrottlingRate", {
+      rate: settings.cpuRate,
+    });
+    await cdp.send("Network.emulateNetworkConditions", settings.network);
+    cdp.on("Network.requestWillBeSent", ({ requestId, request }) => {
+      requests.set(requestId, { url: request.url, method: request.method });
+    });
+    cdp.on("Network.requestServedFromCache", ({ requestId }) => {
+      const entry = requests.get(requestId);
+      if (entry) entry.servedFromCache = true;
+    });
+    cdp.on("Network.responseReceived", ({ requestId, response }) => {
+      const entry = requests.get(requestId);
+      if (entry)
+        Object.assign(entry, {
+          status: response.status,
+          fromDiskCache: response.fromDiskCache ?? false,
+          fromServiceWorker: response.fromServiceWorker ?? false,
+          headers: response.headers,
+        });
+    });
     page.on("pageerror", (error) => errors.push(error.message));
-    await context.route("**/*", (route) => {
-      const url = route.request().url();
-      network.push({ url, method: route.request().method() });
+    page.on("request", (request) => {
+      const url = request.url();
+      network.push({ url, method: request.method() });
       if (
-        url.startsWith(publisherOrigin + "/") ||
-        url.startsWith(creativeOrigin + "/")
+        !url.startsWith(publisherOrigin + "/") &&
+        !url.startsWith(creativeOrigin + "/")
       )
-        return route.continue();
-      errors.push("Unexpected external request: " + url);
-      return route.abort();
+        errors.push("Unexpected external request: " + url);
     });
-    await page.goto(publisherOrigin + input.requestPath, {
-      waitUntil: "load",
-      timeout: 15000,
-    });
-    if (input.matched)
+    const navigate = () =>
+      page.goto(publisherOrigin + input.requestPath, {
+        waitUntil: "load",
+        timeout: 15000,
+      });
+    if (options.cache === "warm") {
+      await navigate();
+      if (input.matched && !cspRuntimeUnavailable)
+        await page.waitForFunction(() => cwv.delivered, null, {
+          timeout: 10000,
+        });
+      await wait(250);
+      assert.deepEqual(
+        errors,
+        expectedErrors,
+        "Cache priming must have only declared fixture errors",
+      );
+      assert.deepEqual(
+        active.unexpected,
+        [],
+        "Cache priming URLs must be declared",
+      );
+      warmup = {
+        requests: [...requests.values()],
+        network: [...network],
+        responses: [...active.responses],
+        raw: await page.evaluate(() => cwv.finish()),
+      };
+      requests.clear();
+      network.length = 0;
+      errors.length = 0;
+      active.runtimeAttempts = 0;
+      active.blockedRenderer = [];
+      active.responses = [];
+      active.phase = "measurement";
+    }
+    await navigate();
+    if (input.matched && !cspRuntimeUnavailable)
       await page.waitForFunction(() => cwv.delivered, null, { timeout: 10000 });
     if (mode === "late-runtime") {
       await page.evaluate(
@@ -488,7 +673,12 @@ async function sample(
       assert(raw.supported.includes(type), `Missing ${type} observer support`);
     assert(Number.isFinite(fcp), "FCP must be observed");
     assert(Number.isFinite(lcp), "LCP must be observed");
-    assert.equal(errors.length, 0, "No unexpected page or network errors");
+    assert.deepEqual(
+      errors,
+      expectedErrors,
+      "Only declared fixture page errors are allowed",
+    );
+    if (input.enforcedCsp) assertCspRuntimeApis(raw, !cspRuntimeUnavailable);
     if (input.enforcedCsp)
       assert.deepEqual(
         raw.cspViolations,
@@ -516,23 +706,19 @@ async function sample(
         [new URL(input.runtimeSrc, publisherOrigin).pathname],
         "Actual standalone GPT renderer must be blocked",
       );
-    } else {
+    } else if (!cspRuntimeUnavailable) {
       assert(
         raw.early.core && raw.early.queued,
         "Direct core API and queued publisher callback must work before deferred runtime",
       );
-      assert.equal(
-        raw.rendererVersion,
-        1,
-        "Real renderer must remain installed when only deferred runtime fails",
-      );
+      assertCandidateRendererVersion(raw, profile);
     }
     assert.equal(
       raw.fixture.requests.length,
-      input.matched ? 1 : 0,
-      "Exactly one native initial request for a matched slot",
+      input.matched && !cspRuntimeUnavailable ? 1 : 0,
+      "Exactly one native initial request requires a matched slot and available runtime or early bridge",
     );
-    if (input.matched) {
+    if (input.matched && !cspRuntimeUnavailable) {
       assert.equal(
         raw.fixture.trace.filter((entry) => entry.event === "nativeDefine")
           .length,
@@ -590,17 +776,10 @@ async function sample(
             .frames()
             .map((frame) => frame.locator(".marker").allTextContents()),
         );
-        assert(
-          text
-            .flat()
-            .includes(
-              mode === "renderer-absent" ? "Publisher result" : "Server result",
-            ),
-          "Actual creative iframe DOM must contain server creative",
-        );
-        assert(
-          Number.isFinite(raw.firstVisibleEstimateMs),
-          "Visible ad estimate must be observed",
+        assertVisibleCreative(
+          text,
+          raw.firstVisibleEstimateMs,
+          mode === "renderer-absent" ? "Publisher result" : "Server result",
         );
       }
     }
@@ -615,22 +794,44 @@ async function sample(
         Number.isFinite(responseEnd),
         "Runtime resource timing must exist",
       );
-      if (input.deferred)
-        assert(
-          fcp < responseEnd,
-          "Changed content must paint while runtime response is held",
-        );
-      else
+      assertRuntimeOrdering(
+        raw,
+        new URL(input.runtimeSrc, publisherOrigin).href,
+        input.deferred && control !== "parser-blocking",
+      );
+      if (!input.deferred || control === "parser-blocking")
         assert(
           fcp >= responseEnd,
-          "Baseline must exercise parser-blocking runtime",
+          "Parser-blocking runtime must finish before FCP",
         );
+      if (
+        input.deferred &&
+        control !== "parser-blocking" &&
+        options.cache === "cold" &&
+        settings.runtimeDelayMs === 750
+      )
+        assert(
+          fcp < responseEnd,
+          "Changed content must paint during the default 750ms runtime hold",
+        );
+      // A deferred cache hit or 0ms response may legitimately finish before FCP.
+      // Native script-load/parser observations above are the ordering gate.
     }
+    const cacheRequests = [...requests.values()];
+    const cacheHits =
+      options.cache === "warm"
+        ? assertCacheUse(
+            cacheRequests,
+            new URL(input.runtimeSrc, publisherOrigin).href,
+            mode === "slow",
+          )
+        : [];
     const before = raw.geometry.find((entry) => entry.phase === "before-fill");
     const after = raw.geometry.at(-1);
     const expectedHeight = viewport.width >= 1024 ? 600 : 250;
     const reserved =
       ["combined", "reservation"].includes(profile) &&
+      control !== "reservation-removed" &&
       input.matched &&
       !input.absentWrapper;
     if (reserved) {
@@ -639,7 +840,13 @@ async function sample(
         expectedHeight,
         "Responsive reservation must match viewport",
       );
-      if (noFill || input.creativeHeight <= expectedHeight) {
+      if (cspRuntimeUnavailable) {
+        assert.equal(
+          cls,
+          0,
+          "Unavailable CSP runtime must not cause ad-induced layout shift",
+        );
+      } else if (noFill || input.creativeHeight <= expectedHeight) {
         assert.equal(
           after.article.top,
           before.article.top,
@@ -664,8 +871,19 @@ async function sample(
         "Unmatched and unreserved wrappers must remain untouched",
       );
     }
+    if (control === "reservation-removed") assertReservationControl(raw, cls);
     result = {
       index,
+      control,
+      runtimeUnavailableBoundary: cspRuntimeUnavailable,
+      conditions: settings,
+      cache: {
+        mode: options.cache,
+        hits: cacheHits,
+        requests: cacheRequests,
+        warmup,
+      },
+      responses: active.responses,
       stage,
       profile,
       name,
@@ -699,7 +917,17 @@ async function sample(
       blockedRenderer: active.blockedRenderer,
     };
     samples.push(result);
+    acceptance.samples = samples.length;
+    acceptance.profileSamples[profile] =
+      (acceptance.profileSamples[profile] ?? 0) + 1;
+    if (control)
+      Object.assign(acceptance.negativeControls[control], {
+        status: "passed",
+        sampleIndex: index,
+        htmlFile: label + ".html",
+      });
     save("samples.json", samples);
+    saveOutcome();
     console.log(JSON.stringify({ label, ...result.metrics }));
     await page.screenshot({
       path: path.join(out, label + ".png"),
@@ -717,7 +945,12 @@ async function sample(
       error: error.stack,
       sample: result,
       raw: await page?.evaluate(() => window.cwv?.finish()).catch(() => null),
+      conditions: settings,
+      cache: { mode: options.cache, requests: [...requests.values()], warmup },
+      errors,
+      network,
       server: {
+        responses: active.responses,
         runtimeAttempts: active.runtimeAttempts,
         unexpected: active.unexpected,
       },
@@ -737,7 +970,28 @@ async function sample(
   creativeOrigin = await listen();
   let browser;
   try {
-    browser = await chromium.launch({ headless: true });
+    const allowedOrigins = [publisherOrigin, creativeOrigin];
+    evidence.interventions.push({
+      type: "exact-origin forwarding HTTP proxy",
+      allowedOrigins,
+      rejected: "all other origins and CONNECT; no browser bypass",
+    });
+    const proxy = fixtureProxy(allowedOrigins, (entry) => {
+      evidence.proxyRequests.push(
+        Object.assign(entry, {
+          sampleIndex: samples.length,
+          phase: active?.phase ?? "startup",
+        }),
+      );
+    });
+    servers.push(proxy);
+    await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    browser = await chromium.launch({
+      headless: true,
+      proxy: {
+        server: `http://127.0.0.1:${proxy.address().port}`,
+      },
+    });
     evidence.browser = browser.version();
     evidence.origins = { publisherOrigin, creativeOrigin };
     const mobile = { width: 390, height: 844 };
@@ -772,7 +1026,26 @@ async function sample(
     await sample(browser, "combined", "registered", mobile, "renderer-absent");
     await sample(browser, "combined", "registered", mobile, "failed");
     await sample(browser, "combined", "csp", mobile);
+    await sample(browser, "combined", "csp", mobile, "failed");
     if (!options["regressions-only"]) {
+      await sample(
+        browser,
+        "combined",
+        "inline",
+        mobile,
+        "slow",
+        false,
+        "parser-blocking",
+      );
+      await sample(
+        browser,
+        "combined",
+        "inline",
+        mobile,
+        "slow",
+        false,
+        "reservation-removed",
+      );
       for (const mode of ["slow", "failed", "absent", "late-runtime"]) {
         await sample(browser, "combined", "inline", mobile, mode);
         await sample(browser, "combined", "registered", mobile, mode);
@@ -793,7 +1066,7 @@ async function sample(
     }
     const groups = {};
     for (const entry of samples) {
-      const key = `${entry.stage}/${entry.profile}/${entry.name}/${entry.viewport.width}/${entry.mode}/${entry.noFill ? "nofill" : "fill"}`;
+      const key = `${entry.stage}/${entry.profile}/${entry.name}/${entry.viewport.width}/${entry.mode}/${entry.noFill ? "nofill" : "fill"}${entry.control ? "/" + entry.control : ""}`;
       (groups[key] ??= []).push(entry.metrics);
     }
     const summary = Object.fromEntries(
@@ -846,13 +1119,23 @@ async function sample(
     );
   } finally {
     evidence.finishedAt = new Date().toISOString();
-    save("artifacts.json", evidence);
+    saveOutcome();
     await browser?.close();
     await Promise.all(
       servers.map((server) => new Promise((resolve) => server.close(resolve))),
     );
   }
+  acceptance.status = "passed";
+  acceptance.finishedAt = new Date().toISOString();
+  acceptance.reports = {
+    artifacts: "artifacts.json",
+    samples: "samples.json",
+    summary: "summary.json",
+    comparisons: "comparisons.json",
+  };
+  saveOutcome();
 })().catch((error) => {
+  recordFailure(error);
   console.error(error);
   process.exitCode = 1;
 });

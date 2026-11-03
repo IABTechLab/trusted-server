@@ -75,14 +75,14 @@ trap 'exit 130' INT TERM
 
 fingerprint() {
     git ls-files --cached --others --exclude-standard -z -- "$@" ':!**/node_modules' ':!**/node_modules/**' |
-        sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
+        LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
 }
 RUNTIME_SOURCE="$(fingerprint Cargo.toml Cargo.lock rust-toolchain.toml .tool-versions .cargo crates/trusted-server-core crates/trusted-server-adapter-fastly crates/trusted-server-js crates/trusted-server-openrtb ':!crates/trusted-server-js/lib/test/**')"
 BUNDLE_SOURCE=build-rs
 BUNDLE_DIRECTORY="${DIST:-${TSJS_PREBUILT_DIR:-}}"
 if [[ -n "$BUNDLE_DIRECTORY" ]]; then
-    BUNDLE_SOURCE="$(cd "$BUNDLE_DIRECTORY" && find . -maxdepth 1 -name 'tsjs-*.js' -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
-    (cd "$BUNDLE_DIRECTORY" && find . -maxdepth 1 -name 'tsjs-*.js' -type f -print0 | sort -z | xargs -0 sha256sum) > "$OUT/bundles.sha256"
+    BUNDLE_SOURCE="$(cd "$BUNDLE_DIRECTORY" && find . -maxdepth 1 -name 'tsjs-*.js' -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
+    (cd "$BUNDLE_DIRECTORY" && find . -maxdepth 1 -name 'tsjs-*.js' -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) > "$OUT/bundles.sha256"
 fi
 PREBUILT_SOURCE="$BUNDLE_SOURCE"
 if [[ "$BUNDLE_MODE" == build-rs ]]; then PREBUILT_SOURCE=build-rs; fi

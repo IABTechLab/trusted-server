@@ -57,6 +57,19 @@ function withoutEarlyRenderer(html) {
   );
 }
 
+function withoutRuntimeDefer(html) {
+  const dom = new JSDOM(html, { includeNodeLocations: true });
+  try {
+    const script = dom.window.document.querySelector("script#trustedserver-js");
+    const location = script && dom.nodeLocation(script)?.attrs?.defer;
+    return location
+      ? html.slice(0, location.startOffset) + html.slice(location.endOffset)
+      : html;
+  } finally {
+    dom.window.close();
+  }
+}
+
 function rendererAsset(pathname) {
   return /^\/static\/tsjs=tsjs-(?:gpt|unified)(?:\.min)?\.js$/.test(pathname);
 }
@@ -66,5 +79,6 @@ module.exports = {
   scriptBlocks,
   withoutScripts,
   withoutEarlyRenderer,
+  withoutRuntimeDefer,
   rendererAsset,
 };

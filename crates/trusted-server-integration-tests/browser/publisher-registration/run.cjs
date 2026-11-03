@@ -12,6 +12,7 @@ const { values: options } = parseArgs({
     implementation: { type: "string", default: "all" },
     out: { type: "string" },
     prebid: { type: "string" },
+    dist: { type: "string" },
   },
 });
 assert(
@@ -58,7 +59,9 @@ const manifest = JSON.parse(
   fs.readFileSync(path.join(prebidDirectory, "manifest.json"), "utf8"),
 );
 const external = path.join(prebidDirectory, manifest.filename);
-const dist = path.join(repo, "crates/trusted-server-js/dist");
+const dist = options.dist
+  ? path.resolve(options.dist)
+  : path.join(repo, "crates/trusted-server-js/dist");
 const bootstrap = path.join(
   repo,
   "crates/trusted-server-core/src/integrations/gpt_bootstrap.js",
@@ -119,6 +122,7 @@ const artifacts = {
     encoding: "utf8",
   }),
   node: process.version,
+  selectedDist: dist,
   externalPrebidManifest: manifest,
   pucVersion: require(
     path.join(

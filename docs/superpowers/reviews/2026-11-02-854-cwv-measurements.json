@@ -1,0 +1,4507 @@
+{
+  "schemaVersion": 1,
+  "status": "blocked",
+  "blockers": [
+    "Material slower warm-cache paint and ad-startup regression; loading design needs revision.",
+    "Dedicated real GPT/GAM inventory absent; no live acceptance or original-main live reproduction."
+  ],
+  "baselineRevision": "51730bdaf841e4d7bb96c2258e5e98169bdff9a7",
+  "candidateInputRevision": "2168a75fcfd98662b3f468412cabc88fc2ff0726",
+  "candidateState": "Measured dirty working tree is identified by the retained source-file fingerprints; subsequent live-runner/provenance/type-only changes are separately validated.",
+  "node": "v24.20.0",
+  "browser": "145.0.7632.6",
+  "boundary": "Controlled fictional loopback fixture; no real GPT/GAM/bidder transport or field-CWV claim. HTTP documents/assets served uncompressed; gzip/Brotli values are estimates only. Shared host, five alternating samples per group.",
+  "inputs": {
+    "loading": {
+      "manifestSha256": "54623615f61fe2fb1cf31f2e4ad7b1a2f3642a14cccc6d64bcb4f08bb4dda069",
+      "sourceFingerprints": "550a4adb3d7199a73585886ce9fe01f1f66e3c1670e92deb7e78aa8a8420c00c  Cargo.lock\n95961a65cd44ee0b7d97243bdc87d3b35d2b8d710d86e850bc8da64bcbd51491  rust-toolchain.toml\n273b277448d6ea76639e75ed0af0260f24c80b34b711970747e7e9b9524383c4  .tool-versions\n3e944d3b695f8b21d08032ff7bcc43cbe0f77d1ef5f4181d7ce97adc7ade5c67  crates/trusted-server-core/src/html_processor.rs\n94a3602f2d9f40f78cb72566f39f75e273bf0db6b123894f08da41e7e6c15667  crates/trusted-server-core/src/publisher.rs\nd081dbbf16f19174dc1dbe4a4cc429ba3f9c925765ddf502e13eaaa38d23e225  crates/trusted-server-core/src/integrations/registry.rs\n81c5a8833a0c820c7de7adbde530b1c2098c5f738bad551cf40fa93cb38e745a  crates/trusted-server-core/src/creative_opportunities.rs\n25aa765897a66c9e75ef646ebf96fc1139f152915336e0a4b5fb5a438b6e55e6  crates/trusted-server-core/src/tsjs.rs\nd5e8f1c52006bcff59d1decbaa9620be32ccc34fe5773821268a7c1cf2864f0e  crates/trusted-server-js/lib/build-module-options.mjs\n692f2f36201bff185ca8259e3c80ed1929690ee8af046b7c4839bc6476a38e27  crates/trusted-server-js/lib/build-all.mjs\n1bf4cffcd9a2de3ec42ff7b3f7fb7645ec125c3b3866ae0789269c8c4aa29820  crates/trusted-server-core/src/integrations/gpt_bootstrap.js\ne9dabc46ca3ab50b08b20cd98088183de710abf25e196afe49515f6b1f05b44b  crates/trusted-server-integration-tests/examples/cwv_html.rs",
+      "files": {
+        "inline.html": {
+          "sha256": "384da77420d692858bf3f57d1736fe10729e117f5f9bf91f3f5825f0999ad58b",
+          "raw": 128792,
+          "gzip": 36419,
+          "brotli": 31772
+        },
+        "csp.html": {
+          "sha256": "2aaf9560bd27a6ec6c9329d1aed4c30c2b843149198254675837d16faa8fa4b8",
+          "raw": 1955,
+          "gzip": 1017,
+          "brotli": 771
+        },
+        "shared.html": {
+          "sha256": "5edcb1a6b3c6cef44366c86a83fca4b2036e616ad257eb71bd9bd797e8032cdb",
+          "raw": 128758,
+          "gzip": 36381,
+          "brotli": 31788
+        },
+        "registered.html": {
+          "sha256": "00af7c6c4d7be52e5ae8be9ce4db9bcf53b8b37ed07252fb773d8b460107b8a0",
+          "raw": 129280,
+          "gzip": 36615,
+          "brotli": 31970
+        },
+        "tall.html": {
+          "sha256": "5c5ab8f3653ea6809b80aaea015cdc56e728bf1b37b1c7fa1686493afd65488c",
+          "raw": 128792,
+          "gzip": 36418,
+          "brotli": 31803
+        },
+        "unknown-height.html": {
+          "sha256": "d979d51618de4b318136bfe2de82bfbe65e2d8ec1a618724c434e59d518a6eb2",
+          "raw": 128772,
+          "gzip": 36407,
+          "brotli": 31778
+        },
+        "absent-wrapper.html": {
+          "sha256": "0913aeb4ee9653af3c82ce11a73bfbc179ce53deaeb31bbe3ab2749d2f0b4c00",
+          "raw": 128759,
+          "gzip": 36416,
+          "brotli": 31789
+        },
+        "unmatched.html": {
+          "sha256": "e6fb5771a8beb3b310483140324978d4e165d54cd51344732bcfd794888e5f4b",
+          "raw": 127898,
+          "gzip": 36005,
+          "brotli": 31460
+        },
+        "child-replacement.html": {
+          "sha256": "895e5674d75d900e8f03fd9c957ed1db5332dc53bc7dbf82726d764d103f7977",
+          "raw": 128876,
+          "gzip": 36443,
+          "brotli": 31807
+        },
+        "assets/0.js": {
+          "sha256": "c6fd0895a70f5f23734245d7e54dcd966d4b9d94c78bbe158213f4fe8ea8f372",
+          "raw": 58738,
+          "gzip": 18439,
+          "brotli": 16421
+        },
+        "assets/1.js": {
+          "sha256": "79d7792bfbbcb918bfd49c9fca59f4b14f8cfb1723455c2d66c68d48eeebc0fa",
+          "raw": 106931,
+          "gzip": 33155,
+          "brotli": 27508
+        },
+        "app.toml": {
+          "sha256": "e57f0fa799b7c22eba359a12d842688a6355097dac566f31d06975e5892eb75c",
+          "raw": 794,
+          "gzip": 412,
+          "brotli": 330
+        }
+      }
+    },
+    "combined": {
+      "manifestSha256": "f200c599f700f0b7872d2cb3701f50df39188b78b855cdb1c70f3b3903e3c504",
+      "sourceFingerprints": "550a4adb3d7199a73585886ce9fe01f1f66e3c1670e92deb7e78aa8a8420c00c  Cargo.lock\n95961a65cd44ee0b7d97243bdc87d3b35d2b8d710d86e850bc8da64bcbd51491  rust-toolchain.toml\n273b277448d6ea76639e75ed0af0260f24c80b34b711970747e7e9b9524383c4  .tool-versions\n3e944d3b695f8b21d08032ff7bcc43cbe0f77d1ef5f4181d7ce97adc7ade5c67  crates/trusted-server-core/src/html_processor.rs\n94a3602f2d9f40f78cb72566f39f75e273bf0db6b123894f08da41e7e6c15667  crates/trusted-server-core/src/publisher.rs\nd081dbbf16f19174dc1dbe4a4cc429ba3f9c925765ddf502e13eaaa38d23e225  crates/trusted-server-core/src/integrations/registry.rs\n81c5a8833a0c820c7de7adbde530b1c2098c5f738bad551cf40fa93cb38e745a  crates/trusted-server-core/src/creative_opportunities.rs\n25aa765897a66c9e75ef646ebf96fc1139f152915336e0a4b5fb5a438b6e55e6  crates/trusted-server-core/src/tsjs.rs\nd5e8f1c52006bcff59d1decbaa9620be32ccc34fe5773821268a7c1cf2864f0e  crates/trusted-server-js/lib/build-module-options.mjs\n692f2f36201bff185ca8259e3c80ed1929690ee8af046b7c4839bc6476a38e27  crates/trusted-server-js/lib/build-all.mjs\n1bf4cffcd9a2de3ec42ff7b3f7fb7645ec125c3b3866ae0789269c8c4aa29820  crates/trusted-server-core/src/integrations/gpt_bootstrap.js\ne9dabc46ca3ab50b08b20cd98088183de710abf25e196afe49515f6b1f05b44b  crates/trusted-server-integration-tests/examples/cwv_html.rs",
+      "files": {
+        "inline.html": {
+          "sha256": "27bdaa1eef5378e6e9e40e535294982e11f7ad18283800580fab9a469294dc75",
+          "raw": 128941,
+          "gzip": 36499,
+          "brotli": 31897
+        },
+        "csp.html": {
+          "sha256": "58cadbc1116135811f64ed1593fbd130d44df39464bab0f753b606d2fa9a453f",
+          "raw": 2104,
+          "gzip": 1072,
+          "brotli": 823
+        },
+        "shared.html": {
+          "sha256": "7dff2a667f391019f838255120b3458018829271b2e7e07e70def091113c627c",
+          "raw": 128907,
+          "gzip": 36468,
+          "brotli": 31846
+        },
+        "registered.html": {
+          "sha256": "d05d02593888c3e2a6af8f9015d2bede253d0970169d434e2e6610e0982e889d",
+          "raw": 129429,
+          "gzip": 36694,
+          "brotli": 31969
+        },
+        "tall.html": {
+          "sha256": "a1c9a8070d7deb9776089f8983795f90ca411a27e2ec3acc7c7d01c5a8ff5e3d",
+          "raw": 128941,
+          "gzip": 36498,
+          "brotli": 31866
+        },
+        "unknown-height.html": {
+          "sha256": "0e24bcdb1f121d3212a8abcfd327be93251f566367ffe832578c73e5bee810ed",
+          "raw": 128921,
+          "gzip": 36487,
+          "brotli": 31832
+        },
+        "absent-wrapper.html": {
+          "sha256": "d00492acc6a8eafaf59ba5fe63ba4cb229d8c81848a629716a45e7c812040daa",
+          "raw": 128908,
+          "gzip": 36496,
+          "brotli": 31849
+        },
+        "unmatched.html": {
+          "sha256": "e6fb5771a8beb3b310483140324978d4e165d54cd51344732bcfd794888e5f4b",
+          "raw": 127898,
+          "gzip": 36005,
+          "brotli": 31460
+        },
+        "child-replacement.html": {
+          "sha256": "0026e165cfdfcf36c8de45d22c4762f945771715cc692c374342b0adbcebbd8f",
+          "raw": 129025,
+          "gzip": 36523,
+          "brotli": 31841
+        },
+        "assets/0.js": {
+          "sha256": "c6fd0895a70f5f23734245d7e54dcd966d4b9d94c78bbe158213f4fe8ea8f372",
+          "raw": 58738,
+          "gzip": 18439,
+          "brotli": 16421
+        },
+        "assets/1.js": {
+          "sha256": "79d7792bfbbcb918bfd49c9fca59f4b14f8cfb1723455c2d66c68d48eeebc0fa",
+          "raw": 106931,
+          "gzip": 33155,
+          "brotli": 27508
+        },
+        "app.toml": {
+          "sha256": "9f89c834c3dc56847a30f5d1c9b4094c65d8db860ce6992b41d0bacb4c3083d4",
+          "raw": 976,
+          "gzip": 468,
+          "brotli": 375
+        }
+      }
+    },
+    "baseline": {
+      "manifestSha256": "9902a61a39cbdbb9c9d8a66f247c16ac78cdfa73c4d1ad39be93a592e66212b2",
+      "sourceFingerprints": "550a4adb3d7199a73585886ce9fe01f1f66e3c1670e92deb7e78aa8a8420c00c  Cargo.lock\n95961a65cd44ee0b7d97243bdc87d3b35d2b8d710d86e850bc8da64bcbd51491  rust-toolchain.toml\n273b277448d6ea76639e75ed0af0260f24c80b34b711970747e7e9b9524383c4  .tool-versions\nf0142d05d153603f3ac96a002fb625a73485ce9125194d5852f1628bd6941a2c  crates/trusted-server-core/src/html_processor.rs\nd9ac0be479b4422aee40d6d5064c57d25678f61357da56d66fdf1ecd448be075  crates/trusted-server-core/src/publisher.rs\n89aeb37bc77ba597f0863efb6abfeb21bde02cb1d9493a328840cdf7ff61cacd  crates/trusted-server-core/src/integrations/registry.rs\n307c87bdb8b09d5e92d789be1ddcba93b4449bf196254ac9278de54bd41debc0  crates/trusted-server-core/src/creative_opportunities.rs\nd431d59f523f2ac3d22f497a3e67a6bfb77fa69b8e645a057286233ebafc4a26  crates/trusted-server-core/src/tsjs.rs\n91447df59ba11ae40e918a461bfba6ea24784985f167bb43ee53525fa08a7111  crates/trusted-server-js/lib/build-module-options.mjs\n692f2f36201bff185ca8259e3c80ed1929690ee8af046b7c4839bc6476a38e27  crates/trusted-server-js/lib/build-all.mjs\nac5f89676ae9d6d7ee6a74feab2f70948e9ad59860192cc82a03a8d965580110  crates/trusted-server-core/src/integrations/gpt_bootstrap.js\n4d06cc79afe5d7f098e3359d7ce9a02f36b490f55c57973fb2f140088eaf9cd9  crates/trusted-server-integration-tests/examples/cwv_html.rs",
+      "files": {
+        "inline.html": {
+          "sha256": "f9b3213f0dfb0a437442f37a84317b2eb06381809cab95e22c274b9e9b797671",
+          "raw": 38728,
+          "gzip": 10018,
+          "brotli": 8511
+        },
+        "csp.html": {
+          "sha256": "f9b3213f0dfb0a437442f37a84317b2eb06381809cab95e22c274b9e9b797671",
+          "raw": 38728,
+          "gzip": 10018,
+          "brotli": 8511
+        },
+        "shared.html": {
+          "sha256": "6d3e09243b766c1b2d70951397f520d3854ec8163f259757eff4a891d598ee53",
+          "raw": 38694,
+          "gzip": 9980,
+          "brotli": 8505
+        },
+        "tall.html": {
+          "sha256": "d176c1854eda99b12860ce89af7dbb113056fa73b8b8f9325c57b8451d6d1953",
+          "raw": 38728,
+          "gzip": 10017,
+          "brotli": 8504
+        },
+        "unknown-height.html": {
+          "sha256": "93602b0f9fde618f9a9ce16ec817c63594424d8c4437c4c8288e1a79121ac594",
+          "raw": 38708,
+          "gzip": 10007,
+          "brotli": 8483
+        },
+        "absent-wrapper.html": {
+          "sha256": "aac49e6af2684970aee186745a48db7264ec96b76226f1f4805df125cca13ace",
+          "raw": 38695,
+          "gzip": 10015,
+          "brotli": 8500
+        },
+        "unmatched.html": {
+          "sha256": "2b12ea3fb35b80f85f501bd84c99498b25a8761b0c084acf56834c4efe0d8a13",
+          "raw": 37834,
+          "gzip": 9614,
+          "brotli": 8173
+        },
+        "child-replacement.html": {
+          "sha256": "9248b6b2c50a66cd099cb3839f105c0d2acc4605ac32675ca78ebb55a39e0e63",
+          "raw": 38812,
+          "gzip": 10040,
+          "brotli": 8506
+        },
+        "assets/0.js": {
+          "sha256": "af0daac10f0bde94fc7432655d2cf6cfc4ad18084e7af9fd467487ffa197c5f2",
+          "raw": 97116,
+          "gzip": 30318,
+          "brotli": 25253
+        },
+        "app.toml": {
+          "sha256": "e57f0fa799b7c22eba359a12d842688a6355097dac566f31d06975e5892eb75c",
+          "raw": 794,
+          "gzip": 412,
+          "brotli": 330
+        }
+      }
+    }
+  },
+  "bytes": {
+    "baseline": {
+      "html": {
+        "raw": 38728,
+        "gzip": 10018,
+        "brotli": 8511
+      },
+      "inlineScript": {
+        "raw": 37877,
+        "gzip": 9550,
+        "brotli": 8196
+      },
+      "inlineTags": [
+        {
+          "id": "anonymous-0",
+          "raw": 207,
+          "gzip": 174,
+          "brotli": 135
+        },
+        {
+          "id": "anonymous-1",
+          "raw": 92,
+          "gzip": 75,
+          "brotli": 61
+        },
+        {
+          "id": "anonymous-2",
+          "raw": 36756,
+          "gzip": 9023,
+          "brotli": 7744
+        },
+        {
+          "id": "anonymous-3",
+          "raw": 164,
+          "gzip": 132,
+          "brotli": 93
+        },
+        {
+          "id": "anonymous-4",
+          "raw": 0,
+          "gzip": 20,
+          "brotli": 1
+        },
+        {
+          "id": "anonymous-5",
+          "raw": 653,
+          "gzip": 402,
+          "brotli": 312
+        }
+      ],
+      "runtime": {
+        "raw": 97116,
+        "gzip": 30318,
+        "brotli": 25253
+      }
+    },
+    "loading": {
+      "html": {
+        "raw": 128792,
+        "gzip": 36419,
+        "brotli": 31772
+      },
+      "inlineScript": {
+        "raw": 127894,
+        "gzip": 35939,
+        "brotli": 31443
+      },
+      "inlineTags": [
+        {
+          "id": "anonymous-0",
+          "raw": 207,
+          "gzip": 174,
+          "brotli": 135
+        },
+        {
+          "id": "anonymous-1",
+          "raw": 92,
+          "gzip": 75,
+          "brotli": 61
+        },
+        {
+          "id": "anonymous-2",
+          "raw": 57260,
+          "gzip": 13209,
+          "brotli": 11369
+        },
+        {
+          "id": "trustedserver-bootstrap",
+          "raw": 69512,
+          "gzip": 22459,
+          "brotli": 19878
+        },
+        {
+          "id": "anonymous-4",
+          "raw": 164,
+          "gzip": 132,
+          "brotli": 93
+        },
+        {
+          "id": "anonymous-5",
+          "raw": 0,
+          "gzip": 20,
+          "brotli": 1
+        },
+        {
+          "id": "anonymous-6",
+          "raw": 653,
+          "gzip": 402,
+          "brotli": 312
+        }
+      ],
+      "runtime": {
+        "raw": 58738,
+        "gzip": 18439,
+        "brotli": 16421
+      }
+    },
+    "reservation": {
+      "html": {
+        "raw": 38877,
+        "gzip": 10096,
+        "brotli": 8561
+      },
+      "inlineScript": {
+        "raw": 37877,
+        "gzip": 9550,
+        "brotli": 8196
+      },
+      "inlineTags": [
+        {
+          "id": "anonymous-0",
+          "raw": 207,
+          "gzip": 174,
+          "brotli": 135
+        },
+        {
+          "id": "anonymous-1",
+          "raw": 92,
+          "gzip": 75,
+          "brotli": 61
+        },
+        {
+          "id": "anonymous-2",
+          "raw": 36756,
+          "gzip": 9023,
+          "brotli": 7744
+        },
+        {
+          "id": "anonymous-3",
+          "raw": 164,
+          "gzip": 132,
+          "brotli": 93
+        },
+        {
+          "id": "anonymous-4",
+          "raw": 0,
+          "gzip": 20,
+          "brotli": 1
+        },
+        {
+          "id": "anonymous-5",
+          "raw": 653,
+          "gzip": 402,
+          "brotli": 312
+        }
+      ],
+      "runtime": {
+        "raw": 97116,
+        "gzip": 30318,
+        "brotli": 25253
+      }
+    },
+    "combined": {
+      "html": {
+        "raw": 128941,
+        "gzip": 36499,
+        "brotli": 31897
+      },
+      "inlineScript": {
+        "raw": 127894,
+        "gzip": 35939,
+        "brotli": 31443
+      },
+      "inlineTags": [
+        {
+          "id": "anonymous-0",
+          "raw": 207,
+          "gzip": 174,
+          "brotli": 135
+        },
+        {
+          "id": "anonymous-1",
+          "raw": 92,
+          "gzip": 75,
+          "brotli": 61
+        },
+        {
+          "id": "anonymous-2",
+          "raw": 57260,
+          "gzip": 13209,
+          "brotli": 11369
+        },
+        {
+          "id": "trustedserver-bootstrap",
+          "raw": 69512,
+          "gzip": 22459,
+          "brotli": 19878
+        },
+        {
+          "id": "anonymous-4",
+          "raw": 164,
+          "gzip": 132,
+          "brotli": 93
+        },
+        {
+          "id": "anonymous-5",
+          "raw": 0,
+          "gzip": 20,
+          "brotli": 1
+        },
+        {
+          "id": "anonymous-6",
+          "raw": 653,
+          "gzip": 402,
+          "brotli": 312
+        }
+      ],
+      "runtime": {
+        "raw": 58738,
+        "gzip": 18439,
+        "brotli": 16421
+      }
+    }
+  },
+  "profiles": [
+    {
+      "name": "normal-cold",
+      "conditions": {
+        "runtimeDelayMs": 0,
+        "cpuRate": 1,
+        "cache": "cold",
+        "network": {
+          "offline": false,
+          "latency": 0,
+          "downloadThroughput": -1,
+          "uploadThroughput": -1
+        }
+      },
+      "sourceEvidence": {
+        "samplesSha256": "a018321cdc06beee433631eaa414ab0ddb2de7942dc973635a192642acbabacf",
+        "artifactsSha256": "8514d9de0603a378d542894f75b4be9386311ddf9b76c14baaa06a47aab031a8",
+        "runnerSha256": "6cc475663feb947ee532b5bcb89734b08926210e65567af22cccc739ec1caaf5",
+        "metricsSha256": "886359ad58e86f8baca93b178898148992ca5d897906cc081c720a9d099e4118",
+        "htmlSha256": "6c842586f4060f871e74080243152707a3ea49c9f63ca4e695b316c92fc71500",
+        "optionsSha256": "69aa6cbaef2cf2dfa375baa1baa8e752dd023624d4ad84409714a24054d1be1c",
+        "evidenceSha256": "25d21e7e061e68281eaf41b5306f533915ef92257257439216050a0a2d1506e5"
+      },
+      "functionalSamples": 64,
+      "negativeControls": {
+        "parser-blocking": {
+          "status": "passed",
+          "sampleIndex": 44,
+          "htmlFile": "44-combined-inline-390-slow-parser-blocking.html"
+        },
+        "reservation-removed": {
+          "status": "passed",
+          "sampleIndex": 45,
+          "htmlFile": "45-combined-inline-390-slow-reservation-removed.html"
+        }
+      },
+      "measurements": [
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 60,
+            "lcp": 60,
+            "cls": 0.20706520518407043,
+            "domInteractive": 54.400000005960464,
+            "domContentLoaded": 54.900000005960464,
+            "requestMs": 70,
+            "firstVisibleEstimateMs": 268,
+            "runtimeResponseEnd": 25.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 44,
+            "lcp": 44,
+            "cls": 0.20706520518407043,
+            "domInteractive": 22.5,
+            "domContentLoaded": 26.799999997019768,
+            "requestMs": 45,
+            "firstVisibleEstimateMs": 243.70000000298023,
+            "runtimeResponseEnd": 10.200000002980232
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 44,
+            "lcp": 44,
+            "cls": 0,
+            "domInteractive": 31.30000001192093,
+            "domContentLoaded": 33.400000005960464,
+            "requestMs": 58,
+            "firstVisibleEstimateMs": 239.20000000298023,
+            "runtimeResponseEnd": 13.600000008940697
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0,
+            "domInteractive": 21.200000002980232,
+            "domContentLoaded": 24.299999997019768,
+            "requestMs": 52,
+            "firstVisibleEstimateMs": 233.79999999701977,
+            "runtimeResponseEnd": 10.400000005960464
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0,
+            "domInteractive": 25.399999991059303,
+            "domContentLoaded": 27,
+            "requestMs": 57,
+            "firstVisibleEstimateMs": 238.5,
+            "runtimeResponseEnd": 10.299999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 40,
+            "lcp": 40,
+            "cls": 0,
+            "domInteractive": 26,
+            "domContentLoaded": 28,
+            "requestMs": 50,
+            "firstVisibleEstimateMs": 231.5,
+            "runtimeResponseEnd": 9.599999994039536
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.20706520518407043,
+            "domInteractive": 24.700000002980232,
+            "domContentLoaded": 26.200000002980232,
+            "requestMs": 57,
+            "firstVisibleEstimateMs": 255.20000000298023,
+            "runtimeResponseEnd": 11.599999994039536
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 40,
+            "lcp": 40,
+            "cls": 0.20706520518407043,
+            "domInteractive": 33.8999999910593,
+            "domContentLoaded": 34.29999999701977,
+            "requestMs": 65,
+            "firstVisibleEstimateMs": 263.59999999403954,
+            "runtimeResponseEnd": 11.399999991059303
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 44,
+            "lcp": 44,
+            "cls": 0.20706520518407043,
+            "domInteractive": 39.5,
+            "domContentLoaded": 40,
+            "requestMs": 60,
+            "firstVisibleEstimateMs": 242.20000000298023,
+            "runtimeResponseEnd": 14.600000008940697
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 48,
+            "lcp": 48,
+            "cls": 0.20706520518407043,
+            "domInteractive": 26.899999991059303,
+            "domContentLoaded": 30.599999994039536,
+            "requestMs": 51,
+            "firstVisibleEstimateMs": 249.5,
+            "runtimeResponseEnd": 13.599999994039536
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 48,
+            "lcp": 48,
+            "cls": 0,
+            "domInteractive": 25.700000002980232,
+            "domContentLoaded": 27.299999997019768,
+            "requestMs": 56,
+            "firstVisibleEstimateMs": 254.20000000298023,
+            "runtimeResponseEnd": 10.900000005960464
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0,
+            "domInteractive": 28.400000005960464,
+            "domContentLoaded": 30.299999997019768,
+            "requestMs": 63,
+            "firstVisibleEstimateMs": 257.90000000596046,
+            "runtimeResponseEnd": 11.700000002980232
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 48,
+            "lcp": 48,
+            "cls": 0,
+            "domInteractive": 26,
+            "domContentLoaded": 29.5,
+            "requestMs": 59,
+            "firstVisibleEstimateMs": 252.90000000596046,
+            "runtimeResponseEnd": 12.799999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 48,
+            "lcp": 48,
+            "cls": 0,
+            "domInteractive": 21.799999997019768,
+            "domContentLoaded": 24.299999997019768,
+            "requestMs": 54,
+            "firstVisibleEstimateMs": 235.5,
+            "runtimeResponseEnd": 9.299999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0.20706520518407043,
+            "domInteractive": 18.900000005960464,
+            "domContentLoaded": 21.5,
+            "requestMs": 37,
+            "firstVisibleEstimateMs": 235.59999999403954,
+            "runtimeResponseEnd": 9
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 44,
+            "lcp": 44,
+            "cls": 0.20706520518407043,
+            "domInteractive": 21.599999994039536,
+            "domContentLoaded": 23.200000002980232,
+            "requestMs": 51,
+            "firstVisibleEstimateMs": 249.70000000298023,
+            "runtimeResponseEnd": 8.200000002980232
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0.20706520518407043,
+            "domInteractive": 23.5,
+            "domContentLoaded": 23.80000001192093,
+            "requestMs": 49,
+            "firstVisibleEstimateMs": 247.20000000298023,
+            "runtimeResponseEnd": 8.600000008940697
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 56,
+            "lcp": 56,
+            "cls": 0.20706520518407043,
+            "domInteractive": 30.100000008940697,
+            "domContentLoaded": 34.5,
+            "requestMs": 55,
+            "firstVisibleEstimateMs": 251.6000000089407,
+            "runtimeResponseEnd": 13.600000008940697
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 44,
+            "lcp": 44,
+            "cls": 0,
+            "domInteractive": 27.600000008940697,
+            "domContentLoaded": 29.5,
+            "requestMs": 54,
+            "firstVisibleEstimateMs": 252.20000000298023,
+            "runtimeResponseEnd": 10.799999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0,
+            "domInteractive": 17.700000002980232,
+            "domContentLoaded": 20,
+            "requestMs": 40,
+            "firstVisibleEstimateMs": 221.90000000596046,
+            "runtimeResponseEnd": 10
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 44,
+            "lcp": 44,
+            "cls": 0.11113281249999998,
+            "domInteractive": 26.099999994039536,
+            "domContentLoaded": 28,
+            "requestMs": 50,
+            "firstVisibleEstimateMs": 248.29999999701977,
+            "runtimeResponseEnd": 11.299999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 60,
+            "lcp": 60,
+            "cls": 0.11113281249999998,
+            "domInteractive": 28.700000002980232,
+            "domContentLoaded": 32.400000005960464,
+            "requestMs": 49,
+            "firstVisibleEstimateMs": 244.70000000298023,
+            "runtimeResponseEnd": 13.900000005960464
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 40,
+            "lcp": 40,
+            "cls": 0,
+            "domInteractive": 17.5,
+            "domContentLoaded": 17.799999997019768,
+            "requestMs": 47,
+            "firstVisibleEstimateMs": 229.29999999701977,
+            "runtimeResponseEnd": 6.899999991059303
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0,
+            "domInteractive": 22.900000005960464,
+            "domContentLoaded": 24.400000005960464,
+            "requestMs": 53,
+            "firstVisibleEstimateMs": 244.90000000596046,
+            "runtimeResponseEnd": 10
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 40,
+            "lcp": 40,
+            "cls": 0,
+            "domInteractive": 21.30000001192093,
+            "domContentLoaded": 22.700000002980232,
+            "requestMs": 44,
+            "firstVisibleEstimateMs": 226.40000000596046,
+            "runtimeResponseEnd": 8.900000005960464
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 48,
+            "lcp": 48,
+            "cls": 0,
+            "domInteractive": 20.5,
+            "domContentLoaded": 21.899999991059303,
+            "requestMs": 52,
+            "firstVisibleEstimateMs": 234.3999999910593,
+            "runtimeResponseEnd": 7.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 40,
+            "lcp": 40,
+            "cls": 0.11113281249999998,
+            "domInteractive": 18.700000002980232,
+            "domContentLoaded": 21.299999997019768,
+            "requestMs": 41,
+            "firstVisibleEstimateMs": 236.90000000596046,
+            "runtimeResponseEnd": 8.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0.11113281249999998,
+            "domInteractive": 25.200000002980232,
+            "domContentLoaded": 25.400000005960464,
+            "requestMs": 45,
+            "firstVisibleEstimateMs": 243.79999999701977,
+            "runtimeResponseEnd": 8.299999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0.11113281249999998,
+            "domInteractive": 26.799999997019768,
+            "domContentLoaded": 27.099999994039536,
+            "requestMs": 45,
+            "firstVisibleEstimateMs": 226.90000000596046,
+            "runtimeResponseEnd": 9.099999994039536
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 40,
+            "lcp": 40,
+            "cls": 0.11113281249999998,
+            "domInteractive": 28.19999998807907,
+            "domContentLoaded": 30.099999994039536,
+            "requestMs": 56,
+            "firstVisibleEstimateMs": 237.79999999701977,
+            "runtimeResponseEnd": 13.399999991059303
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 52,
+            "lcp": 52,
+            "cls": 0,
+            "domInteractive": 24.299999997019768,
+            "domContentLoaded": 26.299999997019768,
+            "requestMs": 54,
+            "firstVisibleEstimateMs": 250.40000000596046,
+            "runtimeResponseEnd": 9.299999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 40,
+            "lcp": 40,
+            "cls": 0,
+            "domInteractive": 22.200000002980232,
+            "domContentLoaded": 25.200000002980232,
+            "requestMs": 54,
+            "firstVisibleEstimateMs": 235.5,
+            "runtimeResponseEnd": 11.200000002980232
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0,
+            "domInteractive": 21.400000005960464,
+            "domContentLoaded": 24.200000002980232,
+            "requestMs": 41,
+            "firstVisibleEstimateMs": 237.59999999403954,
+            "runtimeResponseEnd": 9.599999994039536
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0,
+            "domInteractive": 16.299999997019768,
+            "domContentLoaded": 17.399999991059303,
+            "requestMs": 35,
+            "firstVisibleEstimateMs": 217.29999999701977,
+            "runtimeResponseEnd": 7.5999999940395355
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0.11113281249999998,
+            "domInteractive": 13.899999991059303,
+            "domContentLoaded": 15.399999991059303,
+            "requestMs": 47,
+            "firstVisibleEstimateMs": 230.20000000298023,
+            "runtimeResponseEnd": 9.299999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0.11113281249999998,
+            "domInteractive": 23.600000008940697,
+            "domContentLoaded": 23.900000005960464,
+            "requestMs": 41,
+            "firstVisibleEstimateMs": 223.30000001192093,
+            "runtimeResponseEnd": 8.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 48,
+            "lcp": 48,
+            "cls": 0.11113281249999998,
+            "domInteractive": 21.5,
+            "domContentLoaded": 22.900000005960464,
+            "requestMs": 51,
+            "firstVisibleEstimateMs": 249,
+            "runtimeResponseEnd": 8.100000008940697
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0.11113281249999998,
+            "domInteractive": 18.599999994039536,
+            "domContentLoaded": 20.700000002980232,
+            "requestMs": 52,
+            "firstVisibleEstimateMs": 233.70000000298023,
+            "runtimeResponseEnd": 11.400000005960464
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 40,
+            "lcp": 40,
+            "cls": 0,
+            "domInteractive": 19.399999991059303,
+            "domContentLoaded": 19.599999994039536,
+            "requestMs": 46,
+            "firstVisibleEstimateMs": 227.79999999701977,
+            "runtimeResponseEnd": 7.799999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0,
+            "domInteractive": 21.5,
+            "domContentLoaded": 23.599999994039536,
+            "requestMs": 45,
+            "firstVisibleEstimateMs": 238.59999999403954,
+            "runtimeResponseEnd": 8.700000002980232
+          },
+          "nativeRequests": 1
+        }
+      ]
+    },
+    {
+      "name": "normal-warm",
+      "conditions": {
+        "runtimeDelayMs": 0,
+        "cpuRate": 1,
+        "cache": "warm",
+        "network": {
+          "offline": false,
+          "latency": 0,
+          "downloadThroughput": -1,
+          "uploadThroughput": -1
+        }
+      },
+      "sourceEvidence": {
+        "samplesSha256": "31cee924374e0917b3301784d9c5f31cea304f213d2cfbb0d9fb54b5ee7d4736",
+        "artifactsSha256": "8ded96ebd07a82b7bae1cf03938be1ee2f7f8af6803029241d8be0601c3cd79b",
+        "runnerSha256": "6cc475663feb947ee532b5bcb89734b08926210e65567af22cccc739ec1caaf5",
+        "metricsSha256": "886359ad58e86f8baca93b178898148992ca5d897906cc081c720a9d099e4118",
+        "htmlSha256": "6c842586f4060f871e74080243152707a3ea49c9f63ca4e695b316c92fc71500",
+        "optionsSha256": "69aa6cbaef2cf2dfa375baa1baa8e752dd023624d4ad84409714a24054d1be1c",
+        "evidenceSha256": "25d21e7e061e68281eaf41b5306f533915ef92257257439216050a0a2d1506e5"
+      },
+      "functionalSamples": 64,
+      "negativeControls": {
+        "parser-blocking": {
+          "status": "passed",
+          "sampleIndex": 44,
+          "htmlFile": "44-combined-inline-390-slow-parser-blocking.html"
+        },
+        "reservation-removed": {
+          "status": "passed",
+          "sampleIndex": 45,
+          "htmlFile": "45-combined-inline-390-slow-reservation-removed.html"
+        }
+      },
+      "measurements": [
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.20706520518407043,
+            "domInteractive": 17.5,
+            "domContentLoaded": 18.100000008940697,
+            "requestMs": 45,
+            "firstVisibleEstimateMs": 227.79999999701977,
+            "runtimeResponseEnd": 6.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 24,
+            "lcp": 24,
+            "cls": 0.20706520518407043,
+            "domInteractive": 13.600000008940697,
+            "domContentLoaded": 14.900000005960464,
+            "requestMs": 36,
+            "firstVisibleEstimateMs": 218.90000000596046,
+            "runtimeResponseEnd": 6.800000011920929
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0,
+            "domInteractive": 16.399999991059303,
+            "domContentLoaded": 17,
+            "requestMs": 40,
+            "firstVisibleEstimateMs": 222.8999999910593,
+            "runtimeResponseEnd": 6.399999991059303
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0,
+            "domInteractive": 14.5,
+            "domContentLoaded": 16.100000008940697,
+            "requestMs": 38,
+            "firstVisibleEstimateMs": 220.79999999701977,
+            "runtimeResponseEnd": 6.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0,
+            "domInteractive": 14.599999994039536,
+            "domContentLoaded": 16,
+            "requestMs": 39,
+            "firstVisibleEstimateMs": 221.70000000298023,
+            "runtimeResponseEnd": 7.200000002980232
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 24,
+            "lcp": 24,
+            "cls": 0,
+            "domInteractive": 15,
+            "domContentLoaded": 15.5,
+            "requestMs": 37,
+            "firstVisibleEstimateMs": 220.20000000298023,
+            "runtimeResponseEnd": 5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0.20706520518407043,
+            "domInteractive": 13.199999988079071,
+            "domContentLoaded": 14.5,
+            "requestMs": 41,
+            "firstVisibleEstimateMs": 224.19999998807907,
+            "runtimeResponseEnd": 6
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 24,
+            "lcp": 24,
+            "cls": 0.20706520518407043,
+            "domInteractive": 16,
+            "domContentLoaded": 16.700000002980232,
+            "requestMs": 38,
+            "firstVisibleEstimateMs": 221.09999999403954,
+            "runtimeResponseEnd": 5.9000000059604645
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0.20706520518407043,
+            "domInteractive": 15.5,
+            "domContentLoaded": 16.100000008940697,
+            "requestMs": 39,
+            "firstVisibleEstimateMs": 222.1000000089407,
+            "runtimeResponseEnd": 5.800000011920929
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0.20706520518407043,
+            "domInteractive": 13.899999991059303,
+            "domContentLoaded": 15.299999997019768,
+            "requestMs": 39,
+            "firstVisibleEstimateMs": 221.59999999403954,
+            "runtimeResponseEnd": 6.799999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 24,
+            "lcp": 24,
+            "cls": 0,
+            "domInteractive": 14.900000005960464,
+            "domContentLoaded": 15.400000005960464,
+            "requestMs": 38,
+            "firstVisibleEstimateMs": 220.70000000298023,
+            "runtimeResponseEnd": 5.299999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0,
+            "domInteractive": 13.600000008940697,
+            "domContentLoaded": 14.900000005960464,
+            "requestMs": 39,
+            "firstVisibleEstimateMs": 221.90000000596046,
+            "runtimeResponseEnd": 6.100000008940697
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0,
+            "domInteractive": 13.900000005960464,
+            "domContentLoaded": 15.5,
+            "requestMs": 39,
+            "firstVisibleEstimateMs": 222.20000000298023,
+            "runtimeResponseEnd": 6.4000000059604645
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 24,
+            "lcp": 24,
+            "cls": 0,
+            "domInteractive": 15.5,
+            "domContentLoaded": 15.899999991059303,
+            "requestMs": 37,
+            "firstVisibleEstimateMs": 220.3999999910593,
+            "runtimeResponseEnd": 5.799999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0.20706520518407043,
+            "domInteractive": 12.799999997019768,
+            "domContentLoaded": 14.099999994039536,
+            "requestMs": 38,
+            "firstVisibleEstimateMs": 221.5,
+            "runtimeResponseEnd": 6.0999999940395355
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0.20706520518407043,
+            "domInteractive": 16,
+            "domContentLoaded": 16.700000002980232,
+            "requestMs": 38,
+            "firstVisibleEstimateMs": 221.09999999403954,
+            "runtimeResponseEnd": 5.799999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0.20706520518407043,
+            "domInteractive": 14.700000002980232,
+            "domContentLoaded": 15.200000002980232,
+            "requestMs": 40,
+            "firstVisibleEstimateMs": 222.80000001192093,
+            "runtimeResponseEnd": 5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0.20706520518407043,
+            "domInteractive": 13.700000002980232,
+            "domContentLoaded": 15.200000002980232,
+            "requestMs": 39,
+            "firstVisibleEstimateMs": 222.3999999910593,
+            "runtimeResponseEnd": 6
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0,
+            "domInteractive": 15.299999997019768,
+            "domContentLoaded": 15.799999997019768,
+            "requestMs": 41,
+            "firstVisibleEstimateMs": 224.69999998807907,
+            "runtimeResponseEnd": 5.699999988079071
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0,
+            "domInteractive": 13.400000005960464,
+            "domContentLoaded": 14.800000011920929,
+            "requestMs": 39,
+            "firstVisibleEstimateMs": 221.6000000089407,
+            "runtimeResponseEnd": 6.100000008940697
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.11113281249999998,
+            "domInteractive": 17.099999994039536,
+            "domContentLoaded": 17.900000005960464,
+            "requestMs": 38,
+            "firstVisibleEstimateMs": 220.59999999403954,
+            "runtimeResponseEnd": 6.200000002980232
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.11113281249999998,
+            "domInteractive": 12.900000005960464,
+            "domContentLoaded": 14.299999997019768,
+            "requestMs": 40,
+            "firstVisibleEstimateMs": 223.1000000089407,
+            "runtimeResponseEnd": 5.9000000059604645
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0,
+            "domInteractive": 16.700000002980232,
+            "domContentLoaded": 17.299999997019768,
+            "requestMs": 41,
+            "firstVisibleEstimateMs": 224.1000000089407,
+            "runtimeResponseEnd": 5.9000000059604645
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0,
+            "domInteractive": 15.099999994039536,
+            "domContentLoaded": 17,
+            "requestMs": 39,
+            "firstVisibleEstimateMs": 222.40000000596046,
+            "runtimeResponseEnd": 6.700000002980232
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0,
+            "domInteractive": 12.5,
+            "domContentLoaded": 13.800000011920929,
+            "requestMs": 40,
+            "firstVisibleEstimateMs": 222.80000001192093,
+            "runtimeResponseEnd": 5.600000008940697
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0,
+            "domInteractive": 16.599999994039536,
+            "domContentLoaded": 17.400000005960464,
+            "requestMs": 39,
+            "firstVisibleEstimateMs": 221.79999999701977,
+            "runtimeResponseEnd": 6.200000002980232
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.11113281249999998,
+            "domInteractive": 14.900000005960464,
+            "domContentLoaded": 16.400000005960464,
+            "requestMs": 39,
+            "firstVisibleEstimateMs": 221.6000000089407,
+            "runtimeResponseEnd": 6.700000002980232
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.11113281249999998,
+            "domInteractive": 14.799999997019768,
+            "domContentLoaded": 15.299999997019768,
+            "requestMs": 40,
+            "firstVisibleEstimateMs": 222.8999999910593,
+            "runtimeResponseEnd": 5.299999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.11113281249999998,
+            "domInteractive": 13.5,
+            "domContentLoaded": 14.200000002980232,
+            "requestMs": 40,
+            "firstVisibleEstimateMs": 223.20000000298023,
+            "runtimeResponseEnd": 4.4000000059604645
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.11113281249999998,
+            "domInteractive": 14.099999994039536,
+            "domContentLoaded": 16.099999994039536,
+            "requestMs": 41,
+            "firstVisibleEstimateMs": 224,
+            "runtimeResponseEnd": 6.4000000059604645
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0,
+            "domInteractive": 14.699999988079071,
+            "domContentLoaded": 15.299999997019768,
+            "requestMs": 40,
+            "firstVisibleEstimateMs": 222.59999999403954,
+            "runtimeResponseEnd": 4.899999991059303
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0,
+            "domInteractive": 14.200000002980232,
+            "domContentLoaded": 15.600000008940697,
+            "requestMs": 40,
+            "firstVisibleEstimateMs": 222.90000000596046,
+            "runtimeResponseEnd": 6.9000000059604645
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0,
+            "domInteractive": 16.900000005960464,
+            "domContentLoaded": 18.80000001192093,
+            "requestMs": 36,
+            "firstVisibleEstimateMs": 219.30000001192093,
+            "runtimeResponseEnd": 7.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0,
+            "domInteractive": 15.200000002980232,
+            "domContentLoaded": 15.700000002980232,
+            "requestMs": 39,
+            "firstVisibleEstimateMs": 221.90000000596046,
+            "runtimeResponseEnd": 5.5999999940395355
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.11113281249999998,
+            "domInteractive": 12.400000005960464,
+            "domContentLoaded": 13.700000002980232,
+            "requestMs": 40,
+            "firstVisibleEstimateMs": 223.30000001192093,
+            "runtimeResponseEnd": 5.700000002980232
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0.11113281249999998,
+            "domInteractive": 17.799999997019768,
+            "domContentLoaded": 18.399999991059303,
+            "requestMs": 36,
+            "firstVisibleEstimateMs": 218.20000000298023,
+            "runtimeResponseEnd": 7
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.11113281249999998,
+            "domInteractive": 14.300000011920929,
+            "domContentLoaded": 14.900000005960464,
+            "requestMs": 41,
+            "firstVisibleEstimateMs": 223.70000000298023,
+            "runtimeResponseEnd": 5.100000008940697
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.11113281249999998,
+            "domInteractive": 12.799999997019768,
+            "domContentLoaded": 14.200000002980232,
+            "requestMs": 40,
+            "firstVisibleEstimateMs": 223.1000000089407,
+            "runtimeResponseEnd": 6
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0,
+            "domInteractive": 14.5,
+            "domContentLoaded": 15,
+            "requestMs": 41,
+            "firstVisibleEstimateMs": 224.29999999701977,
+            "runtimeResponseEnd": 4.799999997019768
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0,
+            "domInteractive": 13.400000005960464,
+            "domContentLoaded": 14.799999997019768,
+            "requestMs": 38,
+            "firstVisibleEstimateMs": 221.40000000596046,
+            "runtimeResponseEnd": 6.5
+          },
+          "nativeRequests": 1
+        }
+      ]
+    },
+    {
+      "name": "mobile-cold",
+      "conditions": {
+        "runtimeDelayMs": 0,
+        "cpuRate": 4,
+        "cache": "cold",
+        "network": {
+          "offline": false,
+          "latency": 100,
+          "downloadThroughput": 200000,
+          "uploadThroughput": 93750
+        }
+      },
+      "sourceEvidence": {
+        "samplesSha256": "d7aac719372c779b414b4c44ec5fc5a333465cd667d386106e232f88d2c49780",
+        "artifactsSha256": "fbed590bf9480377471835a770360789588d5c37274845212e7076077f1d400a",
+        "runnerSha256": "6cc475663feb947ee532b5bcb89734b08926210e65567af22cccc739ec1caaf5",
+        "metricsSha256": "886359ad58e86f8baca93b178898148992ca5d897906cc081c720a9d099e4118",
+        "htmlSha256": "6c842586f4060f871e74080243152707a3ea49c9f63ca4e695b316c92fc71500",
+        "optionsSha256": "69aa6cbaef2cf2dfa375baa1baa8e752dd023624d4ad84409714a24054d1be1c",
+        "evidenceSha256": "25d21e7e061e68281eaf41b5306f533915ef92257257439216050a0a2d1506e5"
+      },
+      "functionalSamples": 64,
+      "negativeControls": {
+        "parser-blocking": {
+          "status": "passed",
+          "sampleIndex": 44,
+          "htmlFile": "44-combined-inline-390-slow-parser-blocking.html"
+        },
+        "reservation-removed": {
+          "status": "passed",
+          "sampleIndex": 45,
+          "htmlFile": "45-combined-inline-390-slow-reservation-removed.html"
+        }
+      },
+      "measurements": [
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 960,
+            "lcp": 960,
+            "cls": 0.20706520518407043,
+            "domInteractive": 954.7000000029802,
+            "domContentLoaded": 956.4000000059605,
+            "requestMs": 979,
+            "firstVisibleEstimateMs": 1343.1000000089407,
+            "runtimeResponseEnd": 897.9000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 824,
+            "lcp": 824,
+            "cls": 0.20706520518407043,
+            "domInteractive": 807.5,
+            "domContentLoaded": 1185.7000000029802,
+            "requestMs": 1202,
+            "firstVisibleEstimateMs": 1575.1000000089407,
+            "runtimeResponseEnd": 1177
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 956,
+            "lcp": 956,
+            "cls": 0,
+            "domInteractive": 950.4000000059605,
+            "domContentLoaded": 952.1000000089407,
+            "requestMs": 1012,
+            "firstVisibleEstimateMs": 1380.5,
+            "runtimeResponseEnd": 891.2000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 792,
+            "lcp": 792,
+            "cls": 0,
+            "domInteractive": 764.7999999970198,
+            "domContentLoaded": 1165.9000000059605,
+            "requestMs": 1202,
+            "firstVisibleEstimateMs": 1549.5,
+            "runtimeResponseEnd": 1159.4000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 800,
+            "lcp": 800,
+            "cls": 0,
+            "domInteractive": 786.7000000029802,
+            "domContentLoaded": 1186.8999999910593,
+            "requestMs": 1209,
+            "firstVisibleEstimateMs": 1565.5,
+            "runtimeResponseEnd": 1175.3999999910593
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 944,
+            "lcp": 944,
+            "cls": 0,
+            "domInteractive": 937.9000000059605,
+            "domContentLoaded": 939.1000000089407,
+            "requestMs": 984,
+            "firstVisibleEstimateMs": 1350,
+            "runtimeResponseEnd": 891.2000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 812,
+            "lcp": 812,
+            "cls": 0.20706520518407043,
+            "domInteractive": 776,
+            "domContentLoaded": 1172.5999999940395,
+            "requestMs": 1195,
+            "firstVisibleEstimateMs": 1579.9000000059605,
+            "runtimeResponseEnd": 1162
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 936,
+            "lcp": 936,
+            "cls": 0.20706520518407043,
+            "domInteractive": 927.6999999880791,
+            "domContentLoaded": 928.5999999940395,
+            "requestMs": 961,
+            "firstVisibleEstimateMs": 1300.8999999910593,
+            "runtimeResponseEnd": 893.3999999910593
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 932,
+            "lcp": 932,
+            "cls": 0.20706520518407043,
+            "domInteractive": 927.7000000029802,
+            "domContentLoaded": 928.7000000029802,
+            "requestMs": 967,
+            "firstVisibleEstimateMs": 1318.7000000029802,
+            "runtimeResponseEnd": 892.7999999970198
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 800,
+            "lcp": 800,
+            "cls": 0.20706520518407043,
+            "domInteractive": 785.7000000029802,
+            "domContentLoaded": 1170.2999999970198,
+            "requestMs": 1209,
+            "firstVisibleEstimateMs": 1552.4000000059605,
+            "runtimeResponseEnd": 1164
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 956,
+            "lcp": 956,
+            "cls": 0,
+            "domInteractive": 948.5999999940395,
+            "domContentLoaded": 950.5999999940395,
+            "requestMs": 976,
+            "firstVisibleEstimateMs": 1347.199999988079,
+            "runtimeResponseEnd": 898
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 796,
+            "lcp": 796,
+            "cls": 0,
+            "domInteractive": 790.5999999940395,
+            "domContentLoaded": 1177.2999999970198,
+            "requestMs": 1199,
+            "firstVisibleEstimateMs": 1574.0999999940395,
+            "runtimeResponseEnd": 1168.8999999910593
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 792,
+            "lcp": 792,
+            "cls": 0,
+            "domInteractive": 789.7000000029802,
+            "domContentLoaded": 1177.7999999970198,
+            "requestMs": 1194,
+            "firstVisibleEstimateMs": 1570.2000000029802,
+            "runtimeResponseEnd": 1167.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 932,
+            "lcp": 932,
+            "cls": 0,
+            "domInteractive": 926.6000000089407,
+            "domContentLoaded": 927.4000000059605,
+            "requestMs": 959,
+            "firstVisibleEstimateMs": 1305.4000000059605,
+            "runtimeResponseEnd": 893.1000000089407
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 796,
+            "lcp": 796,
+            "cls": 0.20706520518407043,
+            "domInteractive": 766.4000000059605,
+            "domContentLoaded": 1170,
+            "requestMs": 1185,
+            "firstVisibleEstimateMs": 1537.5,
+            "runtimeResponseEnd": 1163.0999999940395
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 960,
+            "lcp": 960,
+            "cls": 0.20706520518407043,
+            "domInteractive": 952.6000000089407,
+            "domContentLoaded": 953.6000000089407,
+            "requestMs": 995,
+            "firstVisibleEstimateMs": 1340.1000000089407,
+            "runtimeResponseEnd": 914.1000000089407
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 936,
+            "lcp": 936,
+            "cls": 0.20706520518407043,
+            "domInteractive": 929.9000000059605,
+            "domContentLoaded": 930.5,
+            "requestMs": 968,
+            "firstVisibleEstimateMs": 1333.5,
+            "runtimeResponseEnd": 890.7000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 788,
+            "lcp": 788,
+            "cls": 0.20706520518407043,
+            "domInteractive": 776,
+            "domContentLoaded": 1172,
+            "requestMs": 1199,
+            "firstVisibleEstimateMs": 1557.0999999940395,
+            "runtimeResponseEnd": 1161.8999999910593
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 948,
+            "lcp": 948,
+            "cls": 0,
+            "domInteractive": 940.7999999970198,
+            "domContentLoaded": 942.0999999940395,
+            "requestMs": 990,
+            "firstVisibleEstimateMs": 1354.8999999910593,
+            "runtimeResponseEnd": 894.7999999970198
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 768,
+            "lcp": 768,
+            "cls": 0,
+            "domInteractive": 768.6000000089407,
+            "domContentLoaded": 1166.2999999970198,
+            "requestMs": 1178,
+            "firstVisibleEstimateMs": 1517.2000000029802,
+            "runtimeResponseEnd": 1160
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 944,
+            "lcp": 944,
+            "cls": 0.11113281249999998,
+            "domInteractive": 929,
+            "domContentLoaded": 930.3999999910593,
+            "requestMs": 946,
+            "firstVisibleEstimateMs": 1286.5,
+            "runtimeResponseEnd": 890.7999999970198
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 824,
+            "lcp": 824,
+            "cls": 0.11113281249999998,
+            "domInteractive": 805.6999999880791,
+            "domContentLoaded": 1191.8999999910593,
+            "requestMs": 1239,
+            "firstVisibleEstimateMs": 1594.699999988079,
+            "runtimeResponseEnd": 1182.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 972,
+            "lcp": 972,
+            "cls": 0,
+            "domInteractive": 958,
+            "domContentLoaded": 959.6999999880791,
+            "requestMs": 984,
+            "firstVisibleEstimateMs": 1367.7999999970198,
+            "runtimeResponseEnd": 895.8999999910593
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 792,
+            "lcp": 792,
+            "cls": 0,
+            "domInteractive": 776.2999999970198,
+            "domContentLoaded": 1170.9000000059605,
+            "requestMs": 1201,
+            "firstVisibleEstimateMs": 1571,
+            "runtimeResponseEnd": 1161.5999999940395
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 820,
+            "lcp": 820,
+            "cls": 0,
+            "domInteractive": 782.1000000089407,
+            "domContentLoaded": 1186.2000000029802,
+            "requestMs": 1214,
+            "firstVisibleEstimateMs": 1580.5,
+            "runtimeResponseEnd": 1174.7000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 956,
+            "lcp": 956,
+            "cls": 0,
+            "domInteractive": 945.7000000029802,
+            "domContentLoaded": 948,
+            "requestMs": 1013,
+            "firstVisibleEstimateMs": 1390.9000000059605,
+            "runtimeResponseEnd": 890.4000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 836,
+            "lcp": 836,
+            "cls": 0.11113281249999998,
+            "domInteractive": 789.0999999940395,
+            "domContentLoaded": 1183.0999999940395,
+            "requestMs": 1202,
+            "firstVisibleEstimateMs": 1573.3999999910593,
+            "runtimeResponseEnd": 1174.199999988079
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 952,
+            "lcp": 952,
+            "cls": 0.11113281249999998,
+            "domInteractive": 943.5999999940395,
+            "domContentLoaded": 944.5999999940395,
+            "requestMs": 991,
+            "firstVisibleEstimateMs": 1346.3999999910593,
+            "runtimeResponseEnd": 894.2999999970198
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 936,
+            "lcp": 936,
+            "cls": 0.11113281249999998,
+            "domInteractive": 926.7000000029802,
+            "domContentLoaded": 928,
+            "requestMs": 961,
+            "firstVisibleEstimateMs": 1305.4000000059605,
+            "runtimeResponseEnd": 892.4000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 820,
+            "lcp": 820,
+            "cls": 0.11113281249999998,
+            "domInteractive": 801.2000000029802,
+            "domContentLoaded": 1177.6000000089407,
+            "requestMs": 1193,
+            "firstVisibleEstimateMs": 1573.1000000089407,
+            "runtimeResponseEnd": 1167.9000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 936,
+            "lcp": 936,
+            "cls": 0,
+            "domInteractive": 926.7000000029802,
+            "domContentLoaded": 927.6000000089407,
+            "requestMs": 964,
+            "firstVisibleEstimateMs": 1317.800000011921,
+            "runtimeResponseEnd": 891.3000000119209
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 852,
+            "lcp": 852,
+            "cls": 0,
+            "domInteractive": 794.5999999940395,
+            "domContentLoaded": 1192.199999988079,
+            "requestMs": 1215,
+            "firstVisibleEstimateMs": 1565.199999988079,
+            "runtimeResponseEnd": 1181.2999999970198
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 812,
+            "lcp": 812,
+            "cls": 0,
+            "domInteractive": 790.2000000029802,
+            "domContentLoaded": 1183.5,
+            "requestMs": 1201,
+            "firstVisibleEstimateMs": 1554.2999999970198,
+            "runtimeResponseEnd": 1173.7999999970198
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 960,
+            "lcp": 960,
+            "cls": 0,
+            "domInteractive": 950.8000000119209,
+            "domContentLoaded": 952.1000000089407,
+            "requestMs": 969,
+            "firstVisibleEstimateMs": 1334.6000000089407,
+            "runtimeResponseEnd": 892
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 824,
+            "lcp": 824,
+            "cls": 0.11113281249999998,
+            "domInteractive": 806.6999999880791,
+            "domContentLoaded": 1181.5999999940395,
+            "requestMs": 1201,
+            "firstVisibleEstimateMs": 1567.7999999970198,
+            "runtimeResponseEnd": 1172
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 956,
+            "lcp": 956,
+            "cls": 0.11113281249999998,
+            "domInteractive": 947.8999999910593,
+            "domContentLoaded": 948.8999999910593,
+            "requestMs": 967,
+            "firstVisibleEstimateMs": 1331.2999999970198,
+            "runtimeResponseEnd": 898.5999999940395
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 936,
+            "lcp": 936,
+            "cls": 0.11113281249999998,
+            "domInteractive": 926.2000000029802,
+            "domContentLoaded": 927.2000000029802,
+            "requestMs": 941,
+            "firstVisibleEstimateMs": 1293.3999999910593,
+            "runtimeResponseEnd": 893.2000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 848,
+            "lcp": 848,
+            "cls": 0.11113281249999998,
+            "domInteractive": 827.7000000029802,
+            "domContentLoaded": 1199,
+            "requestMs": 1215,
+            "firstVisibleEstimateMs": 1574.2000000029802,
+            "runtimeResponseEnd": 1189.300000011921
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 952,
+            "lcp": 952,
+            "cls": 0,
+            "domInteractive": 940.6999999880791,
+            "domContentLoaded": 941.5999999940395,
+            "requestMs": 960,
+            "firstVisibleEstimateMs": 1332.2999999970198,
+            "runtimeResponseEnd": 891.5999999940395
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 812,
+            "lcp": 812,
+            "cls": 0,
+            "domInteractive": 791.5,
+            "domContentLoaded": 1184.6000000089407,
+            "requestMs": 1209,
+            "firstVisibleEstimateMs": 1575,
+            "runtimeResponseEnd": 1174.7999999970198
+          },
+          "nativeRequests": 1
+        }
+      ]
+    },
+    {
+      "name": "mobile-warm",
+      "conditions": {
+        "runtimeDelayMs": 0,
+        "cpuRate": 4,
+        "cache": "warm",
+        "network": {
+          "offline": false,
+          "latency": 100,
+          "downloadThroughput": 200000,
+          "uploadThroughput": 93750
+        }
+      },
+      "sourceEvidence": {
+        "samplesSha256": "ae3d33d3f28aeefd1c1a3cbe8cf9aa9f5d8ed41ea0a736085ef72fcb61113814",
+        "artifactsSha256": "7472a17f0ae997f8915ae58f2ee47b1fa3203a156fe1313087526c5d57685d0d",
+        "runnerSha256": "6cc475663feb947ee532b5bcb89734b08926210e65567af22cccc739ec1caaf5",
+        "metricsSha256": "886359ad58e86f8baca93b178898148992ca5d897906cc081c720a9d099e4118",
+        "htmlSha256": "6c842586f4060f871e74080243152707a3ea49c9f63ca4e695b316c92fc71500",
+        "optionsSha256": "69aa6cbaef2cf2dfa375baa1baa8e752dd023624d4ad84409714a24054d1be1c",
+        "evidenceSha256": "25d21e7e061e68281eaf41b5306f533915ef92257257439216050a0a2d1506e5"
+      },
+      "functionalSamples": 64,
+      "negativeControls": {
+        "parser-blocking": {
+          "status": "passed",
+          "sampleIndex": 44,
+          "htmlFile": "44-combined-inline-390-slow-parser-blocking.html"
+        },
+        "reservation-removed": {
+          "status": "passed",
+          "sampleIndex": 45,
+          "htmlFile": "45-combined-inline-390-slow-reservation-removed.html"
+        }
+      },
+      "measurements": [
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 352,
+            "lcp": 352,
+            "cls": 0.20706520518407043,
+            "domInteractive": 318,
+            "domContentLoaded": 320,
+            "requestMs": 355,
+            "firstVisibleEstimateMs": 569,
+            "runtimeResponseEnd": 298.59999999403954
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 764,
+            "lcp": 764,
+            "cls": 0.20706520518407043,
+            "domInteractive": 754.2999999970198,
+            "domContentLoaded": 758.4000000059605,
+            "requestMs": 785,
+            "firstVisibleEstimateMs": 979.6000000089407,
+            "runtimeResponseEnd": 752.2000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 348,
+            "lcp": 348,
+            "cls": 0,
+            "domInteractive": 338.70000000298023,
+            "domContentLoaded": 340.70000000298023,
+            "requestMs": 354,
+            "firstVisibleEstimateMs": 561.2000000029802,
+            "runtimeResponseEnd": 298.90000000596046
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 764,
+            "lcp": 796,
+            "cls": 0,
+            "domInteractive": 781.2999999970198,
+            "domContentLoaded": 789.5999999940395,
+            "requestMs": 835,
+            "firstVisibleEstimateMs": 1061.3999999910593,
+            "runtimeResponseEnd": 751.8999999910593
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 756,
+            "lcp": 756,
+            "cls": 0,
+            "domInteractive": 759.1999999880791,
+            "domContentLoaded": 762.3999999910593,
+            "requestMs": 784,
+            "firstVisibleEstimateMs": 989.0999999940395,
+            "runtimeResponseEnd": 745.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 348,
+            "lcp": 348,
+            "cls": 0,
+            "domInteractive": 338.19999998807907,
+            "domContentLoaded": 339.3999999910593,
+            "requestMs": 357,
+            "firstVisibleEstimateMs": 578.5,
+            "runtimeResponseEnd": 298.79999999701977
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 756,
+            "lcp": 756,
+            "cls": 0.20706520518407043,
+            "domInteractive": 756.5,
+            "domContentLoaded": 760,
+            "requestMs": 784,
+            "firstVisibleEstimateMs": 981.7000000029802,
+            "runtimeResponseEnd": 746.7999999970198
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 348,
+            "lcp": 348,
+            "cls": 0.20706520518407043,
+            "domInteractive": 314.1000000089407,
+            "domContentLoaded": 315.79999999701977,
+            "requestMs": 351,
+            "firstVisibleEstimateMs": 550,
+            "runtimeResponseEnd": 296.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 348,
+            "lcp": 348,
+            "cls": 0.20706520518407043,
+            "domInteractive": 321.40000000596046,
+            "domContentLoaded": 323.40000000596046,
+            "requestMs": 351,
+            "firstVisibleEstimateMs": 559.6000000089407,
+            "runtimeResponseEnd": 299.6000000089407
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 760,
+            "lcp": 760,
+            "cls": 0.20706520518407043,
+            "domInteractive": 759.6000000089407,
+            "domContentLoaded": 764.6000000089407,
+            "requestMs": 799,
+            "firstVisibleEstimateMs": 1000.9000000059605,
+            "runtimeResponseEnd": 747
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 340,
+            "lcp": 340,
+            "cls": 0,
+            "domInteractive": 330.70000000298023,
+            "domContentLoaded": 333.09999999403954,
+            "requestMs": 347,
+            "firstVisibleEstimateMs": 546.5999999940395,
+            "runtimeResponseEnd": 295.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 756,
+            "lcp": 756,
+            "cls": 0,
+            "domInteractive": 763.7999999970198,
+            "domContentLoaded": 767.5,
+            "requestMs": 798,
+            "firstVisibleEstimateMs": 1009.5,
+            "runtimeResponseEnd": 745.2999999970198
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 752,
+            "lcp": 752,
+            "cls": 0,
+            "domInteractive": 756.9000000059605,
+            "domContentLoaded": 759.3000000119209,
+            "requestMs": 779,
+            "firstVisibleEstimateMs": 995.8000000119209,
+            "runtimeResponseEnd": 745.1000000089407
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 348,
+            "lcp": 348,
+            "cls": 0,
+            "domInteractive": 336.40000000596046,
+            "domContentLoaded": 338.90000000596046,
+            "requestMs": 360,
+            "firstVisibleEstimateMs": 558.9000000059605,
+            "runtimeResponseEnd": 299.40000000596046
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 756,
+            "lcp": 756,
+            "cls": 0.20706520518407043,
+            "domInteractive": 758.0999999940395,
+            "domContentLoaded": 761,
+            "requestMs": 783,
+            "firstVisibleEstimateMs": 980.7000000029802,
+            "runtimeResponseEnd": 748.9000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 348,
+            "lcp": 348,
+            "cls": 0.20706520518407043,
+            "domInteractive": 312.5,
+            "domContentLoaded": 313.90000000596046,
+            "requestMs": 347,
+            "firstVisibleEstimateMs": 547.5,
+            "runtimeResponseEnd": 295.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 312,
+            "lcp": 312,
+            "cls": 0.20706520518407043,
+            "domInteractive": 313.79999999701977,
+            "domContentLoaded": 313.79999999701977,
+            "requestMs": 339,
+            "firstVisibleEstimateMs": 536.2999999970198,
+            "runtimeResponseEnd": 298
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 760,
+            "lcp": 760,
+            "cls": 0.20706520518407043,
+            "domInteractive": 761.3999999910593,
+            "domContentLoaded": 766.3999999910593,
+            "requestMs": 804,
+            "firstVisibleEstimateMs": 1027.2999999970198,
+            "runtimeResponseEnd": 747.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 336,
+            "lcp": 336,
+            "cls": 0,
+            "domInteractive": 332.59999999403954,
+            "domContentLoaded": 333.5,
+            "requestMs": 359,
+            "firstVisibleEstimateMs": 589.0999999940395,
+            "runtimeResponseEnd": 294.8999999910593
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 764,
+            "lcp": 764,
+            "cls": 0,
+            "domInteractive": 771.9000000059605,
+            "domContentLoaded": 776.1000000089407,
+            "requestMs": 805,
+            "firstVisibleEstimateMs": 1008.3000000119209,
+            "runtimeResponseEnd": 753.3000000119209
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 360,
+            "lcp": 360,
+            "cls": 0.11113281249999998,
+            "domInteractive": 325.79999999701977,
+            "domContentLoaded": 328,
+            "requestMs": 357,
+            "firstVisibleEstimateMs": 563.7000000029802,
+            "runtimeResponseEnd": 302.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 772,
+            "lcp": 772,
+            "cls": 0.11113281249999998,
+            "domInteractive": 756.2999999970198,
+            "domContentLoaded": 762.5999999940395,
+            "requestMs": 791,
+            "firstVisibleEstimateMs": 990,
+            "runtimeResponseEnd": 753.5999999940395
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 352,
+            "lcp": 352,
+            "cls": 0,
+            "domInteractive": 337.40000000596046,
+            "domContentLoaded": 339.70000000298023,
+            "requestMs": 354,
+            "firstVisibleEstimateMs": 563.7000000029802,
+            "runtimeResponseEnd": 296.70000000298023
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 764,
+            "lcp": 764,
+            "cls": 0,
+            "domInteractive": 771.7999999970198,
+            "domContentLoaded": 778.2999999970198,
+            "requestMs": 820,
+            "firstVisibleEstimateMs": 1034.7000000029802,
+            "runtimeResponseEnd": 747.1000000089407
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 760,
+            "lcp": 760,
+            "cls": 0,
+            "domInteractive": 763.3999999910593,
+            "domContentLoaded": 766.5999999940395,
+            "requestMs": 786,
+            "firstVisibleEstimateMs": 991.7999999970198,
+            "runtimeResponseEnd": 748.7999999970198
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 352,
+            "lcp": 352,
+            "cls": 0,
+            "domInteractive": 332.90000000596046,
+            "domContentLoaded": 334.6000000089407,
+            "requestMs": 349,
+            "firstVisibleEstimateMs": 562.5,
+            "runtimeResponseEnd": 295.40000000596046
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 768,
+            "lcp": 768,
+            "cls": 0.11113281249999998,
+            "domInteractive": 754.4000000059605,
+            "domContentLoaded": 758.2000000029802,
+            "requestMs": 783,
+            "firstVisibleEstimateMs": 980.6000000089407,
+            "runtimeResponseEnd": 752.4000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 356,
+            "lcp": 356,
+            "cls": 0.11113281249999998,
+            "domInteractive": 324.29999999701977,
+            "domContentLoaded": 326.3999999910593,
+            "requestMs": 355,
+            "firstVisibleEstimateMs": 562.7000000029802,
+            "runtimeResponseEnd": 299.70000000298023
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 368,
+            "lcp": 368,
+            "cls": 0.11113281249999998,
+            "domInteractive": 329.80000001192093,
+            "domContentLoaded": 332.1000000089407,
+            "requestMs": 374,
+            "firstVisibleEstimateMs": 575.2000000029802,
+            "runtimeResponseEnd": 300.1000000089407
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 764,
+            "lcp": 764,
+            "cls": 0.11113281249999998,
+            "domInteractive": 750.8000000119209,
+            "domContentLoaded": 755.2000000029802,
+            "requestMs": 783,
+            "firstVisibleEstimateMs": 981.1000000089407,
+            "runtimeResponseEnd": 749
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 348,
+            "lcp": 348,
+            "cls": 0,
+            "domInteractive": 335,
+            "domContentLoaded": 337,
+            "requestMs": 350,
+            "firstVisibleEstimateMs": 562.7999999970198,
+            "runtimeResponseEnd": 298.59999999403954
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 764,
+            "lcp": 764,
+            "cls": 0,
+            "domInteractive": 768.1999999880791,
+            "domContentLoaded": 772.6999999880791,
+            "requestMs": 803,
+            "firstVisibleEstimateMs": 1007.5,
+            "runtimeResponseEnd": 749.2999999970198
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 764,
+            "lcp": 764,
+            "cls": 0,
+            "domInteractive": 768.8999999910593,
+            "domContentLoaded": 774,
+            "requestMs": 807,
+            "firstVisibleEstimateMs": 1018.0999999940395,
+            "runtimeResponseEnd": 747.5999999940395
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 352,
+            "lcp": 352,
+            "cls": 0,
+            "domInteractive": 340,
+            "domContentLoaded": 342.79999999701977,
+            "requestMs": 361,
+            "firstVisibleEstimateMs": 572.3999999910593,
+            "runtimeResponseEnd": 293.29999999701977
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 772,
+            "lcp": 772,
+            "cls": 0.11113281249999998,
+            "domInteractive": 753.2999999970198,
+            "domContentLoaded": 758.0999999940395,
+            "requestMs": 785,
+            "firstVisibleEstimateMs": 981.5,
+            "runtimeResponseEnd": 751
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 352,
+            "lcp": 352,
+            "cls": 0.11113281249999998,
+            "domInteractive": 319.1000000089407,
+            "domContentLoaded": 320.90000000596046,
+            "requestMs": 351,
+            "firstVisibleEstimateMs": 593.8000000119209,
+            "runtimeResponseEnd": 298
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 352,
+            "lcp": 352,
+            "cls": 0.11113281249999998,
+            "domInteractive": 312.90000000596046,
+            "domContentLoaded": 314.90000000596046,
+            "requestMs": 349,
+            "firstVisibleEstimateMs": 559,
+            "runtimeResponseEnd": 294.29999999701977
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 780,
+            "lcp": 844,
+            "cls": 0.11113281249999998,
+            "domInteractive": 812.2000000029802,
+            "domContentLoaded": 819.8000000119209,
+            "requestMs": 839,
+            "firstVisibleEstimateMs": 1053.5,
+            "runtimeResponseEnd": 760.4000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 348,
+            "lcp": 348,
+            "cls": 0,
+            "domInteractive": 334.09999999403954,
+            "domContentLoaded": 335.79999999701977,
+            "requestMs": 350,
+            "firstVisibleEstimateMs": 569.5999999940395,
+            "runtimeResponseEnd": 297
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 768,
+            "lcp": 768,
+            "cls": 0,
+            "domInteractive": 773.7000000029802,
+            "domContentLoaded": 779.0999999940395,
+            "requestMs": 814,
+            "firstVisibleEstimateMs": 1026.7000000029802,
+            "runtimeResponseEnd": 751.4000000059605
+          },
+          "nativeRequests": 1
+        }
+      ]
+    },
+    {
+      "name": "delayed-cold",
+      "conditions": {
+        "runtimeDelayMs": 750,
+        "cpuRate": 1,
+        "cache": "cold",
+        "network": {
+          "offline": false,
+          "latency": 0,
+          "downloadThroughput": -1,
+          "uploadThroughput": -1
+        }
+      },
+      "sourceEvidence": {
+        "samplesSha256": "11999528603313980817d111da36187b41604d063c47c9c2fbd2b11c4843bacb",
+        "artifactsSha256": "78c703221b1306f60c7c1c5e56186ee9b436e1b9f4f38b31bb909bd4153d3928",
+        "runnerSha256": "6cc475663feb947ee532b5bcb89734b08926210e65567af22cccc739ec1caaf5",
+        "metricsSha256": "886359ad58e86f8baca93b178898148992ca5d897906cc081c720a9d099e4118",
+        "htmlSha256": "6c842586f4060f871e74080243152707a3ea49c9f63ca4e695b316c92fc71500",
+        "optionsSha256": "69aa6cbaef2cf2dfa375baa1baa8e752dd023624d4ad84409714a24054d1be1c",
+        "evidenceSha256": "25d21e7e061e68281eaf41b5306f533915ef92257257439216050a0a2d1506e5"
+      },
+      "functionalSamples": 64,
+      "negativeControls": {
+        "parser-blocking": {
+          "status": "passed",
+          "sampleIndex": 44,
+          "htmlFile": "44-combined-inline-390-slow-parser-blocking.html"
+        },
+        "reservation-removed": {
+          "status": "passed",
+          "sampleIndex": 45,
+          "htmlFile": "45-combined-inline-390-slow-reservation-removed.html"
+        }
+      },
+      "measurements": [
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 796,
+            "lcp": 796,
+            "cls": 0.20706520518407043,
+            "domInteractive": 787.9000000059605,
+            "domContentLoaded": 788.3000000119209,
+            "requestMs": 810,
+            "firstVisibleEstimateMs": 1008.7000000029802,
+            "runtimeResponseEnd": 769.6000000089407
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 20,
+            "lcp": 20,
+            "cls": 0.20706520518407043,
+            "domInteractive": 14.400000005960464,
+            "domContentLoaded": 763.8000000119209,
+            "requestMs": 782,
+            "firstVisibleEstimateMs": 978.9000000059605,
+            "runtimeResponseEnd": 759.9000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 784,
+            "lcp": 784,
+            "cls": 0,
+            "domInteractive": 775.9000000059605,
+            "domContentLoaded": 776.2999999970198,
+            "requestMs": 804,
+            "firstVisibleEstimateMs": 985.7999999970198,
+            "runtimeResponseEnd": 762.7999999970198
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0,
+            "domInteractive": 22.200000002980232,
+            "domContentLoaded": 765,
+            "requestMs": 773,
+            "firstVisibleEstimateMs": 971.5999999940395,
+            "runtimeResponseEnd": 761.2000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0,
+            "domInteractive": 20.80000001192093,
+            "domContentLoaded": 763.7000000029802,
+            "requestMs": 769,
+            "firstVisibleEstimateMs": 951.4000000059605,
+            "runtimeResponseEnd": 760.4000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 784,
+            "lcp": 784,
+            "cls": 0,
+            "domInteractive": 776.2999999970198,
+            "domContentLoaded": 776.4000000059605,
+            "requestMs": 802,
+            "firstVisibleEstimateMs": 1000.0999999940395,
+            "runtimeResponseEnd": 763.4000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.20706520518407043,
+            "domInteractive": 21.299999997019768,
+            "domContentLoaded": 762.2999999970198,
+            "requestMs": 779,
+            "firstVisibleEstimateMs": 975.7999999970198,
+            "runtimeResponseEnd": 758.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 780,
+            "lcp": 780,
+            "cls": 0.20706520518407043,
+            "domInteractive": 775.5,
+            "domContentLoaded": 775.7999999970198,
+            "requestMs": 800,
+            "firstVisibleEstimateMs": 999.2000000029802,
+            "runtimeResponseEnd": 761.5999999940395
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 776,
+            "lcp": 776,
+            "cls": 0.20706520518407043,
+            "domInteractive": 771.2999999970198,
+            "domContentLoaded": 771.5,
+            "requestMs": 791,
+            "firstVisibleEstimateMs": 990,
+            "runtimeResponseEnd": 758.5999999940395
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0.20706520518407043,
+            "domInteractive": 18.700000002980232,
+            "domContentLoaded": 764.1000000089407,
+            "requestMs": 770,
+            "firstVisibleEstimateMs": 968.5,
+            "runtimeResponseEnd": 759.4000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 780,
+            "lcp": 780,
+            "cls": 0,
+            "domInteractive": 773.4000000059605,
+            "domContentLoaded": 773.7000000029802,
+            "requestMs": 803,
+            "firstVisibleEstimateMs": 985.0999999940395,
+            "runtimeResponseEnd": 759.2000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0,
+            "domInteractive": 22.200000002980232,
+            "domContentLoaded": 763.3000000119209,
+            "requestMs": 779,
+            "firstVisibleEstimateMs": 975,
+            "runtimeResponseEnd": 758.9000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0,
+            "domInteractive": 21.700000002980232,
+            "domContentLoaded": 764.7000000029802,
+            "requestMs": 780,
+            "firstVisibleEstimateMs": 976.6000000089407,
+            "runtimeResponseEnd": 761.2000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 784,
+            "lcp": 784,
+            "cls": 0,
+            "domInteractive": 776.2000000029802,
+            "domContentLoaded": 776.5,
+            "requestMs": 807,
+            "firstVisibleEstimateMs": 988.5,
+            "runtimeResponseEnd": 762.1000000089407
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0.20706520518407043,
+            "domInteractive": 23.200000002980232,
+            "domContentLoaded": 764,
+            "requestMs": 768,
+            "firstVisibleEstimateMs": 966.6000000089407,
+            "runtimeResponseEnd": 760.8000000119209
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 780,
+            "lcp": 780,
+            "cls": 0.20706520518407043,
+            "domInteractive": 772.7000000029802,
+            "domContentLoaded": 772.9000000059605,
+            "requestMs": 797,
+            "firstVisibleEstimateMs": 995.7999999970198,
+            "runtimeResponseEnd": 760
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 780,
+            "lcp": 780,
+            "cls": 0.20706520518407043,
+            "domInteractive": 771.6999999880791,
+            "domContentLoaded": 772,
+            "requestMs": 796,
+            "firstVisibleEstimateMs": 978,
+            "runtimeResponseEnd": 757.7999999970198
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 28,
+            "lcp": 28,
+            "cls": 0.20706520518407043,
+            "domInteractive": 22.400000005960464,
+            "domContentLoaded": 765.3000000119209,
+            "requestMs": 781,
+            "firstVisibleEstimateMs": 975.4000000059605,
+            "runtimeResponseEnd": 761
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 780,
+            "lcp": 780,
+            "cls": 0,
+            "domInteractive": 775.4000000059605,
+            "domContentLoaded": 775.7000000029802,
+            "requestMs": 806,
+            "firstVisibleEstimateMs": 1004.4000000059605,
+            "runtimeResponseEnd": 760.2000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 390,
+            "height": 844
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0,
+            "domInteractive": 23.100000008940697,
+            "domContentLoaded": 764.3000000119209,
+            "requestMs": 781,
+            "firstVisibleEstimateMs": 974.9000000059605,
+            "runtimeResponseEnd": 760.3000000119209
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 784,
+            "lcp": 784,
+            "cls": 0.11113281249999998,
+            "domInteractive": 772.2000000029802,
+            "domContentLoaded": 772.4000000059605,
+            "requestMs": 792,
+            "firstVisibleEstimateMs": 990.6000000089407,
+            "runtimeResponseEnd": 757.9000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.11113281249999998,
+            "domInteractive": 20.700000002980232,
+            "domContentLoaded": 764.9000000059605,
+            "requestMs": 781,
+            "firstVisibleEstimateMs": 977,
+            "runtimeResponseEnd": 760.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 784,
+            "lcp": 784,
+            "cls": 0,
+            "domInteractive": 771.9000000059605,
+            "domContentLoaded": 772.2000000029802,
+            "requestMs": 793,
+            "firstVisibleEstimateMs": 975.0999999940395,
+            "runtimeResponseEnd": 758.0999999940395
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 48,
+            "lcp": 48,
+            "cls": 0,
+            "domInteractive": 23.099999994039536,
+            "domContentLoaded": 766.5999999940395,
+            "requestMs": 785,
+            "firstVisibleEstimateMs": 966.7999999970198,
+            "runtimeResponseEnd": 762.2999999970198
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 44,
+            "lcp": 44,
+            "cls": 0,
+            "domInteractive": 18.599999994039536,
+            "domContentLoaded": 763.7999999970198,
+            "requestMs": 783,
+            "firstVisibleEstimateMs": 964.5999999940395,
+            "runtimeResponseEnd": 759.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 784,
+            "lcp": 784,
+            "cls": 0,
+            "domInteractive": 773,
+            "domContentLoaded": 773.2000000029802,
+            "requestMs": 797,
+            "firstVisibleEstimateMs": 978.4000000059605,
+            "runtimeResponseEnd": 758.9000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0.11113281249999998,
+            "domInteractive": 20.799999997019768,
+            "domContentLoaded": 765.7999999970198,
+            "requestMs": 771,
+            "firstVisibleEstimateMs": 969.8999999910593,
+            "runtimeResponseEnd": 759.8999999910593
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 784,
+            "lcp": 784,
+            "cls": 0.11113281249999998,
+            "domInteractive": 771.7000000029802,
+            "domContentLoaded": 772.0999999940395,
+            "requestMs": 794,
+            "firstVisibleEstimateMs": 992.5999999940395,
+            "runtimeResponseEnd": 758.2000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 784,
+            "lcp": 784,
+            "cls": 0.11113281249999998,
+            "domInteractive": 772.0999999940395,
+            "domContentLoaded": 772.3999999910593,
+            "requestMs": 795,
+            "firstVisibleEstimateMs": 976.7000000029802,
+            "runtimeResponseEnd": 759.0999999940395
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0.11113281249999998,
+            "domInteractive": 24.900000005960464,
+            "domContentLoaded": 766.2000000029802,
+            "requestMs": 781,
+            "firstVisibleEstimateMs": 973.8000000119209,
+            "runtimeResponseEnd": 761.7000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 784,
+            "lcp": 784,
+            "cls": 0,
+            "domInteractive": 772.7000000029802,
+            "domContentLoaded": 772.8999999910593,
+            "requestMs": 799,
+            "firstVisibleEstimateMs": 997.2000000029802,
+            "runtimeResponseEnd": 758.7000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0,
+            "domInteractive": 15.5,
+            "domContentLoaded": 762.7000000029802,
+            "requestMs": 767,
+            "firstVisibleEstimateMs": 949.8000000119209,
+            "runtimeResponseEnd": 759.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 32,
+            "lcp": 32,
+            "cls": 0,
+            "domInteractive": 18.100000008940697,
+            "domContentLoaded": 761.9000000059605,
+            "requestMs": 767,
+            "firstVisibleEstimateMs": 966,
+            "runtimeResponseEnd": 758
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 788,
+            "lcp": 788,
+            "cls": 0,
+            "domInteractive": 774.7000000029802,
+            "domContentLoaded": 775,
+            "requestMs": 798,
+            "firstVisibleEstimateMs": 980.0999999940395,
+            "runtimeResponseEnd": 760.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 52,
+            "lcp": 52,
+            "cls": 0.11113281249999998,
+            "domInteractive": 27,
+            "domContentLoaded": 767.9000000059605,
+            "requestMs": 773,
+            "firstVisibleEstimateMs": 971.5999999940395,
+            "runtimeResponseEnd": 763.5
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 788,
+            "lcp": 788,
+            "cls": 0.11113281249999998,
+            "domInteractive": 777.1000000089407,
+            "domContentLoaded": 777.3000000119209,
+            "requestMs": 801,
+            "firstVisibleEstimateMs": 999.7000000029802,
+            "runtimeResponseEnd": 762.4000000059605
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "baseline",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 784,
+            "lcp": 784,
+            "cls": 0.11113281249999998,
+            "domInteractive": 771.5999999940395,
+            "domContentLoaded": 771.8999999910593,
+            "requestMs": 791,
+            "firstVisibleEstimateMs": 972.6999999880791,
+            "runtimeResponseEnd": 756.6999999880791
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "loading",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0.11113281249999998,
+            "domInteractive": 21.700000002980232,
+            "domContentLoaded": 764.7999999970198,
+            "requestMs": 773,
+            "firstVisibleEstimateMs": 967.6000000089407,
+            "runtimeResponseEnd": 760.7000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "reservation",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 780,
+            "lcp": 780,
+            "cls": 0,
+            "domInteractive": 769.1000000089407,
+            "domContentLoaded": 769.3000000119209,
+            "requestMs": 798,
+            "firstVisibleEstimateMs": 980.1000000089407,
+            "runtimeResponseEnd": 757.2000000029802
+          },
+          "nativeRequests": 1
+        },
+        {
+          "arm": "combined",
+          "viewport": {
+            "width": 1280,
+            "height": 1000
+          },
+          "metrics": {
+            "fcp": 36,
+            "lcp": 36,
+            "cls": 0,
+            "domInteractive": 21.200000002980232,
+            "domContentLoaded": 763.7999999970198,
+            "requestMs": 780,
+            "firstVisibleEstimateMs": 972.0999999940395,
+            "runtimeResponseEnd": 759.8999999910593
+          },
+          "nativeRequests": 1
+        }
+      ]
+    }
+  ],
+  "postMeasurementValidation": {
+    "originalBaselineProductionSources": {
+      "crates/trusted-server-core/src/html_processor.rs": "f0142d05d153603f3ac96a002fb625a73485ce9125194d5852f1628bd6941a2c",
+      "crates/trusted-server-core/src/tsjs.rs": "d431d59f523f2ac3d22f497a3e67a6bfb77fa69b8e645a057286233ebafc4a26",
+      "crates/trusted-server-core/src/integrations/gpt_bootstrap.js": "ac5f89676ae9d6d7ee6a74feab2f70948e9ad59860192cc82a03a8d965580110"
+    },
+    "typeOnlyCleanup": {
+      "baselineTypeScriptDiagnostics": 321,
+      "beforeCandidateDiagnostics": 323,
+      "afterCandidateDiagnostics": 315,
+      "newOrIncreasedDiagnosticSignatures": 0,
+      "allProductionJsAndTraceBytesIdentical": true,
+      "productionModules": 14,
+      "files": [
+        {
+          "file": "trace/v1.css",
+          "frozenSha256": "d3289f4dab38cf1321a07aa6c8e7989eb1c96a6885656a68d7faab8b94a1006b",
+          "builtSha256": "d3289f4dab38cf1321a07aa6c8e7989eb1c96a6885656a68d7faab8b94a1006b",
+          "byteIdentical": true,
+          "bytes": 6233
+        },
+        {
+          "file": "trace/v1.js",
+          "frozenSha256": "5f52f94ae50cdcd93d838c10441b72263001615c92f830a32f1e7ab22b9cf009",
+          "builtSha256": "5f52f94ae50cdcd93d838c10441b72263001615c92f830a32f1e7ab22b9cf009",
+          "byteIdentical": true,
+          "bytes": 45726
+        },
+        {
+          "file": "tsjs-bootstrap.js",
+          "frozenSha256": "7e39e93e1717d0f2aec4657a2876f648eeaba47d32fadf6f2aa75671db8579f1",
+          "builtSha256": "7e39e93e1717d0f2aec4657a2876f648eeaba47d32fadf6f2aa75671db8579f1",
+          "byteIdentical": true,
+          "bytes": 69512
+        },
+        {
+          "file": "tsjs-core.js",
+          "frozenSha256": "116c4626cb6ff5af932117c99d2926da9bf38d7e36b3258c3dc56c70870e870e",
+          "builtSha256": "116c4626cb6ff5af932117c99d2926da9bf38d7e36b3258c3dc56c70870e870e",
+          "byteIdentical": true,
+          "bytes": 33359
+        },
+        {
+          "file": "tsjs-creative.js",
+          "frozenSha256": "d4fb6562058ca59d14fde1ccf263ab5c85fabe963501aa09c8330b84fbfe5cac",
+          "builtSha256": "d4fb6562058ca59d14fde1ccf263ab5c85fabe963501aa09c8330b84fbfe5cac",
+          "byteIdentical": true,
+          "bytes": 14830
+        },
+        {
+          "file": "tsjs-datadome.js",
+          "frozenSha256": "d3b2166f1dc38cf2183aa0ac6479ab7ccea9fb78433054de0b64f4768971b4b4",
+          "builtSha256": "d3b2166f1dc38cf2183aa0ac6479ab7ccea9fb78433054de0b64f4768971b4b4",
+          "byteIdentical": true,
+          "bytes": 6568
+        },
+        {
+          "file": "tsjs-didomi.js",
+          "frozenSha256": "ca11403af8b24d0ea29c236fdc86f422c6b421fe58e260370f368b48fb6914ad",
+          "builtSha256": "ca11403af8b24d0ea29c236fdc86f422c6b421fe58e260370f368b48fb6914ad",
+          "byteIdentical": true,
+          "bytes": 1682
+        },
+        {
+          "file": "tsjs-google_tag_manager.js",
+          "frozenSha256": "08656a6fdd929fd9802973771a5433c2bc2b4eba02b3a1d7b984fbed1c94d71b",
+          "builtSha256": "08656a6fdd929fd9802973771a5433c2bc2b4eba02b3a1d7b984fbed1c94d71b",
+          "byteIdentical": true,
+          "bytes": 8392
+        },
+        {
+          "file": "tsjs-gpt.js",
+          "frozenSha256": "c6fd0895a70f5f23734245d7e54dcd966d4b9d94c78bbe158213f4fe8ea8f372",
+          "builtSha256": "c6fd0895a70f5f23734245d7e54dcd966d4b9d94c78bbe158213f4fe8ea8f372",
+          "byteIdentical": true,
+          "bytes": 58738
+        },
+        {
+          "file": "tsjs-gpt_diagnostics.js",
+          "frozenSha256": "b1401ad2f4a1ace1818965be094b08ac2d8abd482f2197525f0050d20e30a6c4",
+          "builtSha256": "b1401ad2f4a1ace1818965be094b08ac2d8abd482f2197525f0050d20e30a6c4",
+          "byteIdentical": true,
+          "bytes": 88039
+        },
+        {
+          "file": "tsjs-lockr.js",
+          "frozenSha256": "7bbedcbf07e6aae567c9d753a36144180612095c019605804b0e23f7b619edbc",
+          "builtSha256": "7bbedcbf07e6aae567c9d753a36144180612095c019605804b0e23f7b619edbc",
+          "byteIdentical": true,
+          "bytes": 6653
+        },
+        {
+          "file": "tsjs-osano.js",
+          "frozenSha256": "43f1a0ee70762bf5cda4123e1006d936482400ac9f4f298102e61a7a6bd37780",
+          "builtSha256": "43f1a0ee70762bf5cda4123e1006d936482400ac9f4f298102e61a7a6bd37780",
+          "byteIdentical": true,
+          "bytes": 5725
+        },
+        {
+          "file": "tsjs-permutive.js",
+          "frozenSha256": "5f2a08a296c96fcbec32c5028cab6b22a6f603437919a42d65ae619f8cb3ab03",
+          "builtSha256": "5f2a08a296c96fcbec32c5028cab6b22a6f603437919a42d65ae619f8cb3ab03",
+          "byteIdentical": true,
+          "bytes": 8341
+        },
+        {
+          "file": "tsjs-prebid.js",
+          "frozenSha256": "8359d76a03a6743bf5bd3585d23518b0ae0b010a232e010bd23630a80eed6f08",
+          "builtSha256": "8359d76a03a6743bf5bd3585d23518b0ae0b010a232e010bd23630a80eed6f08",
+          "byteIdentical": true,
+          "bytes": 52599
+        },
+        {
+          "file": "tsjs-sourcepoint.js",
+          "frozenSha256": "df53db3050f851cb8b4d8b2bcdea672288da5f9e3b488b666ffcd56266fd2d9b",
+          "builtSha256": "df53db3050f851cb8b4d8b2bcdea672288da5f9e3b488b666ffcd56266fd2d9b",
+          "byteIdentical": true,
+          "bytes": 9433
+        },
+        {
+          "file": "tsjs-testlight.js",
+          "frozenSha256": "2517e7e6c43d4cd486fe09ee528f63411727125178e47f1040c69bbcd1201a32",
+          "builtSha256": "2517e7e6c43d4cd486fe09ee528f63411727125178e47f1040c69bbcd1201a32",
+          "byteIdentical": true,
+          "bytes": 2164
+        }
+      ]
+    },
+    "servableInputs": {
+      "passed": true,
+      "wasmSha256": "560ff7193bb00871ef97e607e046ae6aeb1a9672c02c488a202a76234b22309c",
+      "profiles": {
+        "loading": {
+          "files": [
+            {
+              "file": "app.toml",
+              "sha256": "e57f0fa799b7c22eba359a12d842688a6355097dac566f31d06975e5892eb75c"
+            },
+            {
+              "file": "inline.html",
+              "sha256": "384da77420d692858bf3f57d1736fe10729e117f5f9bf91f3f5825f0999ad58b"
+            },
+            {
+              "file": "csp.html",
+              "sha256": "2aaf9560bd27a6ec6c9329d1aed4c30c2b843149198254675837d16faa8fa4b8"
+            },
+            {
+              "file": "shared.html",
+              "sha256": "5edcb1a6b3c6cef44366c86a83fca4b2036e616ad257eb71bd9bd797e8032cdb"
+            },
+            {
+              "file": "registered.html",
+              "sha256": "00af7c6c4d7be52e5ae8be9ce4db9bcf53b8b37ed07252fb773d8b460107b8a0"
+            },
+            {
+              "file": "tall.html",
+              "sha256": "5c5ab8f3653ea6809b80aaea015cdc56e728bf1b37b1c7fa1686493afd65488c"
+            },
+            {
+              "file": "unknown-height.html",
+              "sha256": "d979d51618de4b318136bfe2de82bfbe65e2d8ec1a618724c434e59d518a6eb2"
+            },
+            {
+              "file": "absent-wrapper.html",
+              "sha256": "0913aeb4ee9653af3c82ce11a73bfbc179ce53deaeb31bbe3ab2749d2f0b4c00"
+            },
+            {
+              "file": "unmatched.html",
+              "sha256": "e6fb5771a8beb3b310483140324978d4e165d54cd51344732bcfd794888e5f4b"
+            },
+            {
+              "file": "child-replacement.html",
+              "sha256": "895e5674d75d900e8f03fd9c957ed1db5332dc53bc7dbf82726d764d103f7977"
+            },
+            {
+              "file": "assets/0.js",
+              "sha256": "c6fd0895a70f5f23734245d7e54dcd966d4b9d94c78bbe158213f4fe8ea8f372"
+            },
+            {
+              "file": "assets/1.js",
+              "sha256": "79d7792bfbbcb918bfd49c9fca59f4b14f8cfb1723455c2d66c68d48eeebc0fa"
+            }
+          ],
+          "servableFilesIdentical": true,
+          "manifestMetadataChanged": true
+        },
+        "combined": {
+          "files": [
+            {
+              "file": "app.toml",
+              "sha256": "9f89c834c3dc56847a30f5d1c9b4094c65d8db860ce6992b41d0bacb4c3083d4"
+            },
+            {
+              "file": "inline.html",
+              "sha256": "27bdaa1eef5378e6e9e40e535294982e11f7ad18283800580fab9a469294dc75"
+            },
+            {
+              "file": "csp.html",
+              "sha256": "58cadbc1116135811f64ed1593fbd130d44df39464bab0f753b606d2fa9a453f"
+            },
+            {
+              "file": "shared.html",
+              "sha256": "7dff2a667f391019f838255120b3458018829271b2e7e07e70def091113c627c"
+            },
+            {
+              "file": "registered.html",
+              "sha256": "d05d02593888c3e2a6af8f9015d2bede253d0970169d434e2e6610e0982e889d"
+            },
+            {
+              "file": "tall.html",
+              "sha256": "a1c9a8070d7deb9776089f8983795f90ca411a27e2ec3acc7c7d01c5a8ff5e3d"
+            },
+            {
+              "file": "unknown-height.html",
+              "sha256": "0e24bcdb1f121d3212a8abcfd327be93251f566367ffe832578c73e5bee810ed"
+            },
+            {
+              "file": "absent-wrapper.html",
+              "sha256": "d00492acc6a8eafaf59ba5fe63ba4cb229d8c81848a629716a45e7c812040daa"
+            },
+            {
+              "file": "unmatched.html",
+              "sha256": "e6fb5771a8beb3b310483140324978d4e165d54cd51344732bcfd794888e5f4b"
+            },
+            {
+              "file": "child-replacement.html",
+              "sha256": "0026e165cfdfcf36c8de45d22c4762f945771715cc692c374342b0adbcebbd8f"
+            },
+            {
+              "file": "assets/0.js",
+              "sha256": "c6fd0895a70f5f23734245d7e54dcd966d4b9d94c78bbe158213f4fe8ea8f372"
+            },
+            {
+              "file": "assets/1.js",
+              "sha256": "79d7792bfbbcb918bfd49c9fca59f4b14f8cfb1723455c2d66c68d48eeebc0fa"
+            }
+          ],
+          "servableFilesIdentical": true,
+          "manifestMetadataChanged": true
+        }
+      }
+    }
+  }
+}

@@ -1,6 +1,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const { sessionCls, distribution } = require("./metrics.cjs");
+const { JSDOM } = require("jsdom");
+const { sessionCls, distribution, observePage } = require("./metrics.cjs");
 const shift = (startTime, value, hadRecentInput = false) => ({
   startTime,
   value,
@@ -50,4 +51,34 @@ test("distribution retains all finite samples, medians and ranges", () => {
     min: null,
     max: null,
   });
+});
+
+test("script load capture attaches to Document, the resource load event path endpoint", () => {
+  const dom = new JSDOM(
+    '<script id="trustedserver-js" src="/runtime.js"></script><main id="article"></main>',
+    {
+      url: "http://publisher.example.com/",
+      runScripts: "outside-only",
+      pretendToBeVisual: true,
+    },
+  );
+  try {
+    dom.window.PerformanceObserver = class {
+      static supportedEntryTypes = [];
+    };
+    dom.window.eval(`(${observePage.toString()})()`);
+    const script = dom.window.document.getElementById("trustedserver-js");
+    script.dispatchEvent(new dom.window.Event("load"));
+    assert.equal(dom.window.cwv.scriptLoads.length, 1);
+    assert.equal(
+      dom.window.cwv.scriptLoads[0].src,
+      "http://publisher.example.com/runtime.js",
+    );
+    assert.equal(dom.window.cwv.scriptLoads[0].articlePresent, true);
+    dom.window.document.getElementById("article").remove();
+    script.dispatchEvent(new dom.window.Event("load"));
+    assert.equal(dom.window.cwv.scriptLoads[1].articlePresent, false);
+  } finally {
+    dom.window.close();
+  }
 });
