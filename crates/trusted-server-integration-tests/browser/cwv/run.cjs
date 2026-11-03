@@ -16,6 +16,9 @@ const {
 const { sessionCls, distribution, observePage } = require("./metrics.cjs");
 const { fixtureProxy } = require("./proxy.cjs");
 const options = parseOptions();
+const diagnosticScreen = options["diagnostic-screen"];
+const diagnosticOutages = options["diagnostic-outages"];
+const unifiedDiagnostic = diagnosticScreen || diagnosticOutages;
 const settings = conditions(options);
 const runs = options.runs;
 const out = path.resolve(options.out);
@@ -25,11 +28,15 @@ const save = (name, value) =>
 const acceptance = {
   schemaVersion: 1,
   status: "running",
-  scope: options["regressions-only"]
-    ? "regressions"
-    : options["correctness-only"]
-      ? "correctness"
-      : "measurement-and-correctness",
+  scope: diagnosticScreen
+    ? "diagnostic-screen"
+    : diagnosticOutages
+      ? "diagnostic-outages"
+      : options["regressions-only"]
+        ? "regressions"
+        : options["correctness-only"]
+          ? "correctness"
+          : "measurement-and-correctness",
   startedAt: new Date().toISOString(),
   conditions: settings,
   samples: 0,
@@ -38,11 +45,17 @@ const acceptance = {
     ["parser-blocking", "reservation-removed"].map((id) => [
       id,
       {
-        status: options["regressions-only"] ? "not-requested" : "pending",
-        ...(options["regressions-only"]
+        status:
+          unifiedDiagnostic || options["regressions-only"]
+            ? "not-requested"
+            : "pending",
+        ...(unifiedDiagnostic || options["regressions-only"]
           ? {
-              reason:
-                "--regressions-only selects the four review regressions, not the negative controls",
+              reason: diagnosticScreen
+                ? "Diagnostic synchronous-unified measurement only; deferred parser control is inapplicable and reservation-removal correctness is outside this screen. Full acceptance remains unexecuted."
+                : diagnosticOutages
+                  ? "Four critical-runtime availability diagnostics only; parser-defer and reservation-removal controls are not requested. Changed outage behavior is observed, not approved."
+                  : "--regressions-only selects the four review regressions, not the negative controls",
             }
           : {}),
       },
@@ -76,6 +89,39 @@ saveOutcome();
 process.on("uncaughtExceptionMonitor", recordFailure);
 const { chromium } = require("playwright");
 const { JSDOM } = require("jsdom");
+const {
+  baselineRevision,
+  expectedArchitecture,
+  assertScreenDocument,
+  installEarlyProbe,
+  assertEarlyProbe,
+  screenCases,
+  assertScreenSamples,
+  outageCases,
+  assertOutageSamples,
+  assertCriticalOutage,
+} = require("./diagnostic.cjs");
+if (diagnosticScreen) {
+  acceptance.diagnostic = {
+    expectedArchitecture,
+    expectedSamples: 8 * runs,
+    fullAcceptancePassed: false,
+    excluded:
+      "Full correctness, controls, framework lifecycle, CSP/outage matrix and real-GPT acceptance are not executed by this screen. Missing authorized Google inventory remains blocked outside this scope.",
+  };
+  saveOutcome();
+}
+if (diagnosticOutages) {
+  acceptance.diagnostic = {
+    expectedArchitecture,
+    expectedSamples: 4,
+    fullAcceptancePassed: false,
+    changedOutageBehaviorApproved: false,
+    excluded:
+      "Observes successful and failed critical unified loading with and without enforced CSP. Loss of inline fallback is a changed outage boundary, not compatibility approval. No retry/recovery, full correctness, controller, framework or live acceptance is established. Missing authorized Google inventory remains blocked outside this scope.",
+  };
+  saveOutcome();
+}
 const {
   reservationStyles,
   withoutEarlyRenderer,
@@ -139,6 +185,12 @@ function snapshot(directory, label) {
 const loading = snapshot(options.loading, "loading");
 const combined = snapshot(options.combined, "combined");
 const baseline = options.baseline && snapshot(options.baseline, "baseline");
+if (unifiedDiagnostic)
+  assert.equal(
+    baseline.manifest.sourceRevision,
+    baselineRevision,
+    "Diagnostic baseline must remain pinned original-main, not the failing optimized PR snapshot",
+  );
 const profiles = {
   loading,
   combined,
@@ -177,6 +229,9 @@ evidence = {
   optionsSha256: sha256(fs.readFileSync(path.join(__dirname, "options.cjs"))),
   evidenceSha256: sha256(fs.readFileSync(path.join(__dirname, "evidence.cjs"))),
   proxySha256: sha256(fs.readFileSync(path.join(__dirname, "proxy.cjs"))),
+  diagnosticSha256: sha256(
+    fs.readFileSync(path.join(__dirname, "diagnostic.cjs")),
+  ),
   proxyRequests: [],
   interventions: [
     {
@@ -381,7 +436,9 @@ function installDelivery({ height, noFill }) {
 
 const samples = [];
 let stage =
-  options["correctness-only"] || options["regressions-only"]
+  options["correctness-only"] ||
+  options["regressions-only"] ||
+  diagnosticOutages
     ? "correctness"
     : "measurement";
 async function sample(
@@ -398,15 +455,26 @@ async function sample(
     saveOutcome();
   }
   const input = documentInput(profile, name);
-  const cspRuntimeUnavailable = input.enforcedCsp && mode === "failed";
+  if (diagnosticOutages)
+    assert.equal(
+      input.enforcedCsp,
+      name === "csp",
+      "Outage matrix must separately exercise normal and enforced-CSP production documents",
+    );
+  const runtimeUnavailable =
+    (input.enforcedCsp || diagnosticOutages) && mode === "failed";
   // Keep the existing publisher-side probe. Its core call deliberately fails
   // when the synchronous runtime is unavailable; no other page error is allowed.
-  const expectedErrors = cspRuntimeUnavailable
+  const expectedErrors = runtimeUnavailable
     ? ["tsjs.setConfig is not a function"]
     : [];
+  if (unifiedDiagnostic) assertScreenDocument(input.html, profile);
+  const expectedDeferred = unifiedDiagnostic
+    ? false
+    : !input.enforcedCsp && (profile === "loading" || profile === "combined");
   assert.equal(
     input.deferred,
-    !input.enforcedCsp && (profile === "loading" || profile === "combined"),
+    expectedDeferred,
     `${profile} must exercise its intended production loading mode`,
   );
   const index = samples.length;
@@ -491,7 +559,7 @@ async function sample(
       !input.html.includes("// Edge-injected GPT auction bootstrap."),
       "Enforced CSP must not depend on the provisional raw bootstrap's inline hash",
     );
-    if (cspRuntimeUnavailable)
+    if (runtimeUnavailable)
       evidence.interventions.push({
         index,
         profile,
@@ -561,6 +629,7 @@ async function sample(
     await context.addInitScript({
       content: `if(window===window.top){
       (${observePage.toString()})();
+      ${unifiedDiagnostic ? `(${installEarlyProbe.toString()})();` : ""}
       window.publisherFixtureOptions={initialLoad:${JSON.stringify(input.registered ? "disabled" : "enabled")}};
       ${fixtureSource.replaceAll("https://creative.example.com", creativeOrigin)}
       (${installDelivery.toString()})(${JSON.stringify({ height: input.creativeHeight, noFill })});
@@ -610,7 +679,7 @@ async function sample(
       });
     if (options.cache === "warm") {
       await navigate();
-      if (input.matched && !cspRuntimeUnavailable)
+      if (input.matched && !runtimeUnavailable)
         await page.waitForFunction(() => cwv.delivered, null, {
           timeout: 10000,
         });
@@ -640,7 +709,7 @@ async function sample(
       active.phase = "measurement";
     }
     await navigate();
-    if (input.matched && !cspRuntimeUnavailable)
+    if (input.matched && !runtimeUnavailable)
       await page.waitForFunction(() => cwv.delivered, null, { timeout: 10000 });
     if (mode === "late-runtime") {
       await page.evaluate(
@@ -678,7 +747,20 @@ async function sample(
       expectedErrors,
       "Only declared fixture page errors are allowed",
     );
-    if (input.enforcedCsp) assertCspRuntimeApis(raw, !cspRuntimeUnavailable);
+    if (input.enforcedCsp || diagnosticOutages)
+      assertCspRuntimeApis(raw, !runtimeUnavailable);
+    if (diagnosticOutages && runtimeUnavailable) {
+      assertCriticalOutage(
+        raw,
+        active.responses,
+        new URL(input.runtimeSrc, publisherOrigin).href,
+      );
+      assert.equal(
+        active.runtimeAttempts,
+        1,
+        "Critical outage must issue one failed runtime request without retry",
+      );
+    }
     if (input.enforcedCsp)
       assert.deepEqual(
         raw.cspViolations,
@@ -706,19 +788,22 @@ async function sample(
         [new URL(input.runtimeSrc, publisherOrigin).pathname],
         "Actual standalone GPT renderer must be blocked",
       );
-    } else if (!cspRuntimeUnavailable) {
+    } else if (!runtimeUnavailable) {
       assert(
         raw.early.core && raw.early.queued,
-        "Direct core API and queued publisher callback must work before deferred runtime",
+        unifiedDiagnostic
+          ? "Direct core API and queued publisher callback must work at the first publisher script"
+          : "Direct core API and queued publisher callback must work before deferred runtime",
       );
       assertCandidateRendererVersion(raw, profile);
+      if (unifiedDiagnostic) assertEarlyProbe(raw, profile);
     }
     assert.equal(
       raw.fixture.requests.length,
-      input.matched && !cspRuntimeUnavailable ? 1 : 0,
+      input.matched && !runtimeUnavailable ? 1 : 0,
       "Exactly one native initial request requires a matched slot and available runtime or early bridge",
     );
-    if (input.matched && !cspRuntimeUnavailable) {
+    if (input.matched && !runtimeUnavailable) {
       assert.equal(
         raw.fixture.trace.filter((entry) => entry.event === "nativeDefine")
           .length,
@@ -797,15 +882,15 @@ async function sample(
       assertRuntimeOrdering(
         raw,
         new URL(input.runtimeSrc, publisherOrigin).href,
-        input.deferred && control !== "parser-blocking",
+        expectedDeferred && control !== "parser-blocking",
       );
-      if (!input.deferred || control === "parser-blocking")
+      if (!expectedDeferred || control === "parser-blocking")
         assert(
           fcp >= responseEnd,
           "Parser-blocking runtime must finish before FCP",
         );
       if (
-        input.deferred &&
+        expectedDeferred &&
         control !== "parser-blocking" &&
         options.cache === "cold" &&
         settings.runtimeDelayMs === 750
@@ -840,11 +925,13 @@ async function sample(
         expectedHeight,
         "Responsive reservation must match viewport",
       );
-      if (cspRuntimeUnavailable) {
+      if (runtimeUnavailable) {
         assert.equal(
           cls,
           0,
-          "Unavailable CSP runtime must not cause ad-induced layout shift",
+          diagnosticOutages
+            ? "Unavailable critical runtime must not cause ad-induced layout shift"
+            : "Unavailable CSP runtime must not cause ad-induced layout shift",
         );
       } else if (noFill || input.creativeHeight <= expectedHeight) {
         assert.equal(
@@ -875,7 +962,20 @@ async function sample(
     result = {
       index,
       control,
-      runtimeUnavailableBoundary: cspRuntimeUnavailable,
+      runtimeUnavailableBoundary: runtimeUnavailable,
+      ...(diagnosticOutages
+        ? {
+            diagnosticOutage: {
+              policy: input.enforcedCsp
+                ? "enforced-old-hash-self-csp"
+                : "normal",
+              expectedRuntimeAvailable: !runtimeUnavailable,
+              changedOutageBehaviorApproved: false,
+              interpretation:
+                "Observed critical-script availability boundary, not compatibility approval or recovery proof",
+            },
+          }
+        : {}),
       conditions: settings,
       cache: {
         mode: options.cache,
@@ -996,7 +1096,21 @@ async function sample(
     evidence.origins = { publisherOrigin, creativeOrigin };
     const mobile = { width: 390, height: 844 };
     const desktop = { width: 1280, height: 1000 };
-    if (!options["correctness-only"] && !options["regressions-only"]) {
+    if (diagnosticOutages) {
+      for (const { profile, name, viewport, mode } of outageCases())
+        await sample(browser, profile, name, viewport, mode);
+      assertOutageSamples(samples);
+    } else if (diagnosticScreen) {
+      for (const { profile, name, viewport } of screenCases(runs))
+        await sample(browser, profile, name, viewport);
+      assertScreenSamples(samples, runs);
+      assert(
+        samples
+          .filter((entry) => ["baseline", "loading"].includes(entry.profile))
+          .every((entry) => entry.metrics.cls > 0),
+        "Unreserved diagnostic arms must reproduce ad-induced layout shift",
+      );
+    } else if (!options["correctness-only"] && !options["regressions-only"]) {
       for (const viewport of [mobile, desktop]) {
         for (let run = 0; run < runs; run++) {
           const order = ["baseline", "loading", "reservation", "combined"];
@@ -1013,56 +1127,64 @@ async function sample(
         "Unreserved controls must visibly reproduce ad-induced layout shift",
       );
     }
-    stage = "correctness";
-    if (options["correctness-only"]) {
-      for (const viewport of [mobile, desktop]) {
-        const control = await sample(browser, "loading", "inline", viewport);
-        assert(
-          control.metrics.cls > 0,
-          "Unreserved control must visibly shift after fill",
+    if (!unifiedDiagnostic) {
+      stage = "correctness";
+      if (options["correctness-only"]) {
+        for (const viewport of [mobile, desktop]) {
+          const control = await sample(browser, "loading", "inline", viewport);
+          assert(
+            control.metrics.cls > 0,
+            "Unreserved control must visibly shift after fill",
+          );
+        }
+      }
+      await sample(
+        browser,
+        "combined",
+        "registered",
+        mobile,
+        "renderer-absent",
+      );
+      await sample(browser, "combined", "registered", mobile, "failed");
+      await sample(browser, "combined", "csp", mobile);
+      await sample(browser, "combined", "csp", mobile, "failed");
+      if (!options["regressions-only"]) {
+        await sample(
+          browser,
+          "combined",
+          "inline",
+          mobile,
+          "slow",
+          false,
+          "parser-blocking",
         );
+        await sample(
+          browser,
+          "combined",
+          "inline",
+          mobile,
+          "slow",
+          false,
+          "reservation-removed",
+        );
+        for (const mode of ["slow", "failed", "absent", "late-runtime"]) {
+          await sample(browser, "combined", "inline", mobile, mode);
+          await sample(browser, "combined", "registered", mobile, mode);
+        }
+        for (const name of [
+          "shared",
+          "absent-wrapper",
+          "unmatched",
+          "child-replacement",
+          "unknown-height",
+        ])
+          await sample(browser, "combined", name, mobile);
+        await sample(browser, "combined", "shared", desktop);
+        await sample(browser, "loading", "unknown-height", mobile);
+        for (const width of [1023, 1024])
+          await sample(browser, "combined", "tall", { width, height: 1000 });
+        await sample(browser, "combined", "inline", mobile, "slow", true);
       }
-    }
-    await sample(browser, "combined", "registered", mobile, "renderer-absent");
-    await sample(browser, "combined", "registered", mobile, "failed");
-    await sample(browser, "combined", "csp", mobile);
-    await sample(browser, "combined", "csp", mobile, "failed");
-    if (!options["regressions-only"]) {
-      await sample(
-        browser,
-        "combined",
-        "inline",
-        mobile,
-        "slow",
-        false,
-        "parser-blocking",
-      );
-      await sample(
-        browser,
-        "combined",
-        "inline",
-        mobile,
-        "slow",
-        false,
-        "reservation-removed",
-      );
-      for (const mode of ["slow", "failed", "absent", "late-runtime"]) {
-        await sample(browser, "combined", "inline", mobile, mode);
-        await sample(browser, "combined", "registered", mobile, mode);
-      }
-      for (const name of [
-        "shared",
-        "absent-wrapper",
-        "unmatched",
-        "child-replacement",
-        "unknown-height",
-      ])
-        await sample(browser, "combined", name, mobile);
-      await sample(browser, "combined", "shared", desktop);
-      await sample(browser, "loading", "unknown-height", mobile);
-      for (const width of [1023, 1024])
-        await sample(browser, "combined", "tall", { width, height: 1000 });
-      await sample(browser, "combined", "inline", mobile, "slow", true);
     }
     const groups = {};
     for (const entry of samples) {
@@ -1115,7 +1237,11 @@ async function sample(
       }
     save("comparisons.json", comparisons);
     console.log(
-      "CWV functional contracts passed; raw timings and ranges retained, no timing-improvement threshold applied.",
+      diagnosticScreen
+        ? "Diagnostic screen completed; raw timings retained. Full correctness, negative controls, framework/live gates and combined acceptance remain unexecuted."
+        : diagnosticOutages
+          ? "Four availability diagnostics completed. Changed critical-outage behavior is observed, not approved. Full acceptance remains unexecuted."
+          : "CWV functional contracts passed; raw timings and ranges retained, no timing-improvement threshold applied.",
     );
   } finally {
     evidence.finishedAt = new Date().toISOString();

@@ -18103,20 +18103,18 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         }
 
         #[tokio::test]
-        async fn enforced_csp_origin_header_selects_sync_loading_independent_of_admission() {
-            for (policy_header, policy_value, enforced) in [
-                (None, "", false),
+        async fn origin_policy_headers_preserve_unified_loading_independent_of_admission() {
+            for (policy_header, policy_value) in [
+                (None, ""),
                 (
                     Some("content-security-policy-report-only"),
                     "script-src 'none'",
-                    false,
                 ),
-                (Some("content-security-policy"), "", true),
-                (Some("content-security-policy"), "default-src *", true),
+                (Some("content-security-policy"), ""),
+                (Some("content-security-policy"), "default-src *"),
                 (
                     Some("Content-Security-Policy"),
                     "script-src 'self' 'sha256-old-policy'",
-                    true,
                 ),
             ] {
                 for admitted in [false, true] {
@@ -18156,14 +18154,13 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     }
                     let document =
                         String::from_utf8(body_of(response).await).expect("should produce HTML");
-                    assert_eq!(
+                    assert!(
                         document.contains("tsjs-unified.min.js?v="),
-                        enforced,
-                        "origin header presence should control loading, admitted={admitted} header={policy_header:?}"
+                        "should retain cacheable unified loading, admitted={admitted} header={policy_header:?}"
                     );
-                    assert_eq!(
-                        document.contains("id=\"trustedserver-bootstrap\""),
-                        !enforced
+                    assert!(
+                        !document.contains("id=\"trustedserver-bootstrap\""),
+                        "should not embed an uncacheable early bundle"
                     );
                     if !admitted {
                         assert!(
@@ -18176,12 +18173,13 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         }
 
         #[tokio::test]
-        async fn enforced_csp_loading_choice_survives_shared_template_cold_and_warm_paths() {
+        async fn unified_loading_preserves_policy_on_shared_template_cold_and_warm_paths() {
             for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
-                for (policy_header, enforced) in [
-                    ("content-security-policy", true),
-                    ("content-security-policy-report-only", false),
+                for policy_header in [
+                    "content-security-policy",
+                    "content-security-policy-report-only",
                 ] {
+                    let enforced = policy_header == "content-security-policy";
                     let stub = Arc::new(StubHttpClient::new());
                     let cache = Arc::new(MemoryTemplateCache::default());
                     let mut configured = settings_with_mode("esi");
@@ -18221,10 +18219,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                         );
                         let document = String::from_utf8(body_of(response).await)
                             .expect("should produce HTML");
-                        assert_eq!(document.contains("tsjs-unified.min.js?v="), enforced);
-                        assert_eq!(
-                            document.contains("id=\"trustedserver-bootstrap\""),
-                            !enforced
+                        assert!(document.contains("tsjs-unified.min.js?v="));
+                        assert!(
+                            !document.contains("id=\"trustedserver-bootstrap\""),
+                            "should retain cacheable loading on both cold and warm templates"
                         );
                     }
                     assert_eq!(

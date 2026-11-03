@@ -602,13 +602,13 @@ pub trait IntegrationHeadInjector: Send + Sync {
     /// Return HTML snippets to insert at the start of `<head>`.
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
 
-    /// Return head snippets when an enforced response CSP is present.
+    /// Return head snippets with the provisional initializer loading decision.
     ///
-    /// Integrations without a CSP-specific loading dependency retain their existing snippets.
-    fn head_inserts_with_response_csp(
+    /// Integrations without a provisional initializer retain their existing snippets.
+    fn head_inserts_with_provisional_bootstrap(
         &self,
         ctx: &IntegrationHtmlContext<'_>,
-        _enforced_csp: bool,
+        _include_provisional: bool,
     ) -> Vec<String> {
         self.head_inserts(ctx)
     }
@@ -1182,9 +1182,15 @@ impl IntegrationRegistry {
         ctx: &IntegrationHtmlContext<'_>,
         enforced_csp: bool,
     ) -> Vec<String> {
+        // Supported GPT profiles install these APIs from the synchronous unified
+        // bundle. Other profiles retain their provisional initializer unless the
+        // actual enforced response CSP requires the existing no-inline path.
+        let include_provisional =
+            !enforced_csp && !crate::tsjs::supports_unified_gpt(&self.js_module_ids());
         let mut inserts = Vec::new();
         for injector in &self.inner.head_injectors {
-            let mut next = injector.head_inserts_with_response_csp(ctx, enforced_csp);
+            let mut next =
+                injector.head_inserts_with_provisional_bootstrap(ctx, include_provisional);
             if !next.is_empty() {
                 inserts.append(&mut next);
             }
@@ -2379,6 +2385,73 @@ mod tests {
             response.headers().get("x-echo-ts-ec").is_none(),
             "POST integration request should not include x-ts-ec"
         );
+    }
+
+    #[test]
+    fn provisional_gpt_initializer_policy_preserves_other_profiles_and_actual_csp() {
+        for gpt_enabled in [false, true] {
+            for didomi_enabled in [false, true] {
+                let mut settings = crate::test_support::tests::create_test_settings();
+                settings
+                    .integrations
+                    .insert_config(
+                        "gpt",
+                        &serde_json::json!({
+                            "enabled": gpt_enabled,
+                            "slim_prebid_url": "https://assets.example/slim-prebid.js"
+                        }),
+                    )
+                    .expect("should configure GPT");
+                settings
+                    .integrations
+                    .insert_config("didomi", &serde_json::json!({"enabled": didomi_enabled}))
+                    .expect("should configure an order-sensitive integration");
+                let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+                let document_state = IntegrationDocumentState::default();
+                let context = IntegrationHtmlContext {
+                    request_host: "publisher.example.com",
+                    request_scheme: "https",
+                    origin_host: "origin.example.com",
+                    document_state: &document_state,
+                };
+                let legacy: Vec<String> = registry
+                    .inner
+                    .head_injectors
+                    .iter()
+                    .flat_map(|injector| injector.head_inserts(&context))
+                    .collect();
+                for enforced_csp in [false, true] {
+                    let inserts = registry.head_inserts_with_response_csp(&context, enforced_csp);
+                    assert_eq!(
+                        inserts
+                            .join("")
+                            .contains("// Edge-injected GPT auction bootstrap."),
+                        gpt_enabled && didomi_enabled && !enforced_csp,
+                        "should select provisional initialization from real CSP and module dependencies"
+                    );
+                    if !enforced_csp && (!gpt_enabled || didomi_enabled) {
+                        assert_eq!(
+                            inserts, legacy,
+                            "should preserve unrelated profiles byte-for-byte"
+                        );
+                    }
+                    if gpt_enabled {
+                        let activation = inserts
+                            .iter()
+                            .position(|insert| insert.contains("window.__tsjs_gpt_enabled=true;"))
+                            .expect("should retain GPT activation");
+                        let slim_prebid = inserts
+                            .iter()
+                            .position(|insert| insert.contains("window.__tsjs_slim_prebid_url="))
+                            .expect("should retain slim-Prebid configuration");
+                        assert!(
+                            activation < slim_prebid,
+                            "should retain GPT configuration order"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

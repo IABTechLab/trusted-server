@@ -12,6 +12,8 @@ function parseOptions(args = process.argv.slice(2)) {
       runs: { type: "string", default: "5" },
       "correctness-only": { type: "boolean" },
       "regressions-only": { type: "boolean" },
+      "diagnostic-screen": { type: "boolean" },
+      "diagnostic-outages": { type: "boolean" },
       "runtime-delay-ms": { type: "string", default: "750" },
       "cpu-rate": { type: "string", default: "1" },
       "network-latency-ms": { type: "string", default: "0" },
@@ -32,6 +34,22 @@ function parseOptions(args = process.argv.slice(2)) {
     !(values["correctness-only"] && values["regressions-only"]),
     "Choose only one of --correctness-only and --regressions-only",
   );
+  if (values["diagnostic-outages"]) {
+    assert(values.baseline, "--diagnostic-outages requires --baseline");
+    assert(
+      !values["diagnostic-screen"] &&
+        !values["correctness-only"] &&
+        !values["regressions-only"],
+      "--diagnostic-outages cannot select another scope",
+    );
+  }
+  if (values["diagnostic-screen"]) {
+    assert(values.baseline, "--diagnostic-screen requires --baseline");
+    assert(
+      !values["correctness-only"] && !values["regressions-only"],
+      "--diagnostic-screen cannot select full-mode correctness or regressions",
+    );
+  }
   for (const name of [
     "runs",
     "runtime-delay-ms",
@@ -44,6 +62,12 @@ function parseOptions(args = process.argv.slice(2)) {
     values[name] = Number(values[name]);
     assert(Number.isFinite(values[name]), `--${name} must be finite`);
   }
+  if (values["diagnostic-screen"])
+    assert.equal(
+      values["runtime-delay-ms"],
+      0,
+      "--diagnostic-screen requires explicit --runtime-delay-ms 0",
+    );
   assert(
     Number.isSafeInteger(values.runs) && values.runs > 0,
     "--runs must be a positive safe integer",

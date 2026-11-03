@@ -1,9 +1,34 @@
 # Issue 854 closure acceptance
 
-Status: Tests implemented and locally exercised. **Do not merge or close the issue.** The matched comparison reproduces a material warm-cache paint/ad-startup regression, and real-GPT acceptance remains blocked on dedicated test inventory.
+Status, 2026-11-03: The cacheable synchronous candidate improves the reproduced cold/warm lab timings. **Keep the PR draft. Do not merge or close the issue.** Acceptance of synchronous loading and the changed critical-script outage boundary remains pending, and real-GPT inventory is still missing. The November 2 contract and failed inline/deferred measurements below remain historical evidence.
 
 Issue: https://github.com/IABTechLab/trusted-server/issues/854
 PR: https://github.com/IABTechLab/trusted-server/pull/1460
+
+## November 3 recovery candidate
+
+The supported GPT profile now uses the existing versioned synchronous unified bundle, with configuration before execution and neither raw nor compiled early bootstrap embedded in HTML. Other browser-module profiles retain their provisional initializer unless actual enforced CSP requires omission. Diagnostics, trace, attribution/APS metadata, reservation and separately deferred integration order remain intact. No production flag, retry, codec or public registration-protocol change is introduced.
+
+The change has a recorded red/green loader regression. Fresh checks pass 3,376 native core tests, 20 integrations, 30 doctests, 60 Axum tests, 28 parity tests and all 23 selected build/test/lint/runtime gates, including eight target-specific Clippy aliases, adapter test aliases, actual EOF/auction controls and a new stamped WASM. Existing ignored tests remain ignored. The compiled-IIFE startup suite passes 16 tests, including pre-core queue context/configuration and complete GPT API availability after the unified script. The selected Node suite passes 80 tests with zero skips. The previous broad JS result remains evidence for unchanged production JS inputs, not a newly executed full suite.
+
+The identity-transport diagnostic screen executes 40 measurements per cold/warm condition, four alternating arms at two widths with five samples per group. Both successful-runtime cache and single-request/targeting/visible-creative checks pass. Baseline to combined medians are:
+
+| Condition      | Viewport  | FCP/LCP, ms | First visible ad estimate, ms |
+| -------------- | --------- | ----------- | ----------------------------- |
+| Throttled cold | 390x844   | 948 to 824  | 1,345.7 to 1,231.9            |
+| Throttled cold | 1280x1000 | 956 to 828  | 1,350.0 to 1,208.7            |
+| Throttled warm | 390x844   | 348 to 168  | 564.8 to 395.1                |
+| Throttled warm | 1280x1000 | 352 to 152  | 563.0 to 382.2                |
+
+The combined document is 2,104 bytes instead of the previous candidate's 128,941 bytes. All 14 production JS modules remain byte-identical. The actual unified static asset is the same one already exported for the previous CSP path. Controlled reservation still changes mobile/desktop CLS from 0.207065/0.111133 to zero. These are fictional loopback observations with uncompressed HTTP, not field or compressed-delivery CWV.
+
+A separately executed four-case diagnostic covers normal and old-hash/self CSP success plus critical-unified HTTP 404 under each policy. Success has working APIs, one queue callback, one targeted native request and a visible creative. Failure has no initialization/shim/renderer APIs, no queue drain, one 404 with no retry, zero native requests or delivery, completed parsing and only the declared core-dependent publisher error. CSP violations remain zero. This observes the changed outage boundary; it does not approve it.
+
+Both diagnostic scopes explicitly report `fullAcceptancePassed=false`, and the outage scope also reports `changedOutageBehaviorApproved=false`. The unchanged full verifier rejects both scopes. Running the existing full CWV correctness scope on the new export exits 1 before any sample with `loading must exercise its intended production loading mode`. Its deferred-runtime contract has not been rewritten to make this candidate green. Full framework/live consumer migration remains deferred until the architecture and outage decision. Required CI coverage is not replaced by diagnostic passes.
+
+The synchronous candidate does not satisfy outcome 1 of the earlier closure contract below. Issue #854 permits documenting blocking dependencies, but accepting that alternative and the loss of the ordinary-page inline fallback requires an explicit decision. Dedicated real-GPT inventory and genuine original-main reproduction are also still missing. No closing keyword, ready transition or review request is appropriate at this checkpoint.
+
+Evidence is under `/home/pav/.cache/ts-854-acceptance/recovery-2026-11-03/`: `screen-cold/`, `screen-warm/`, `outages/`, `full-contract-rejection/`, `gates/`, `unified-iife.log` and `all-node.log`. The measurement JSON adds `recovery20261103` with all 80 new metric rows, four outage observations, source/report/tooling hashes and the new WASM hash. Its original 200 measurements and historical blocked status are unchanged. The screen used its recorded initial tooling; the later opt-in outage extension is separately tested against the same production bytes, not relabeled as a timing rerun. Both independent read-only cross-reviews found no additional correctness findings in the loader or diagnostic changes.
 
 ## Closure contract
 

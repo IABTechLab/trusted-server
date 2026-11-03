@@ -436,13 +436,7 @@ pub(crate) fn create_html_processor_with_document_state(
                     if let Some(bootstrap) = &trace_bootstrap {
                         snippet.push_str(bootstrap);
                     }
-                    snippet.push_str(&tsjs::publisher_script_tags(
-                        &integrations,
-                        enforced_csp
-                            || gpt_diagnostics
-                                .as_ref()
-                                .is_some_and(GptDiagnosticsRequestDecision::active),
-                    ));
+                    snippet.push_str(&tsjs::publisher_script_tags(&integrations));
                     // Active diagnostics loads synchronously after core so its
                     // GPT listeners precede publisher scripts in the origin head.
                     if let Some(module_tag) = gpt_diagnostics
@@ -1055,8 +1049,8 @@ mod tests {
     }
 
     #[test]
-    fn enforced_csp_fallback_combines_origin_and_configured_response_policy() {
-        for (origin_enforced, configured_header, synchronous) in [
+    fn enforced_csp_input_combines_origin_and_configured_response_policy() {
+        for (origin_enforced, configured_header, enforced) in [
             (false, None, false),
             (true, None, true),
             (false, Some("Content-Security-Policy"), true),
@@ -1070,7 +1064,7 @@ mod tests {
                 settings
                     .integrations
                     .insert_config("gpt", &json!({"enabled": true}))
-                    .expect("should enable the otherwise supported deferred GPT profile");
+                    .expect("should enable the supported GPT profile");
                 if let Some(name) = configured_header {
                     settings
                         .response_headers
@@ -1087,7 +1081,7 @@ mod tests {
                 )
                 .with_enforced_csp(origin_enforced);
                 assert_eq!(
-                    config.enforced_csp, synchronous,
+                    config.enforced_csp, enforced,
                     "should preserve configured policy when origin_enforced={origin_enforced} header={configured_header:?}"
                 );
                 assert!(
@@ -1099,12 +1093,10 @@ mod tests {
                     .process_chunk(b"<html><head></head><body></body></html>", true)
                     .expect("should transform CSP fixture");
                 let output = String::from_utf8(output).expect("should produce HTML");
-                assert_eq!(output.contains("tsjs-unified.min.js?v="), synchronous);
-                assert_eq!(
-                    output.contains("id=\"trustedserver-bootstrap\""),
-                    !synchronous
-                );
-                assert_eq!(output.contains("tsjs-gpt.min.js?v="), !synchronous);
+                assert!(output.contains("tsjs-unified.min.js?v="));
+                assert!(!output.contains("id=\"trustedserver-bootstrap\""));
+                assert!(!output.contains("// Edge-injected GPT auction bootstrap."));
+                assert!(!output.contains("tsjs-gpt.min.js?v="));
             }
         }
     }
@@ -1151,14 +1143,15 @@ mod tests {
     }
 
     #[test]
-    fn supported_gpt_profile_emits_early_bootstrap_and_deferred_runtime() {
-        let mut settings = create_test_settings();
+    fn supported_gpt_profile_emits_configuration_then_cacheable_unified_runtime() {
+        let mut settings = reservation_settings();
         settings
             .integrations
             .insert_config(
                 "gpt",
                 &json!({
-                    "enabled": true, "gam_attribution_enabled": true
+                    "enabled": true, "gam_attribution_enabled": true,
+                    "slim_prebid_url": "https://assets.example/slim-prebid.js"
                 }),
             )
             .expect("should enable GPT with attribution");
@@ -1169,7 +1162,8 @@ mod tests {
             "origin.example.com",
             "publisher.example.com",
             "https",
-        );
+        )
+        .with_request_path("/news/article");
         let mut processor = create_html_processor(config);
         let output = processor
             .process_chunk(
@@ -1178,36 +1172,46 @@ mod tests {
             )
             .expect("should transform supported GPT document");
         let output = String::from_utf8(output).expect("should produce HTML");
-        let early = output
-            .find("id=\"trustedserver-bootstrap\"")
-            .expect("should inline compiled early dependencies");
+        let configuration = output
+            .find("window.__tsjs_gpt_enabled=true;")
+            .expect("should retain GPT configuration");
         let runtime = output
-            .find("tsjs-gpt.min.js?v=")
-            .expect("should emit versioned standalone GPT runtime");
+            .find("tsjs-unified.min.js?v=")
+            .expect("should emit versioned unified runtime");
+        let reservation = output
+            .find("<style data-ts-slot-reservations>")
+            .expect("should preserve reservation before runtime loading");
+        let slim_prebid_config = output
+            .find("window.__tsjs_slim_prebid_url=")
+            .expect("should preserve optional post-load loader configuration");
         assert!(
-            early < runtime
+            reservation < configuration
+                && configuration < slim_prebid_config
+                && slim_prebid_config < runtime
                 && runtime
                     < output
                         .find("<title>")
                         .expect("should preserve origin title")
         );
-        assert!(!output.contains("tsjs-unified.min.js"));
+        assert!(!output.contains("tsjs-gpt.min.js"));
+        assert!(!output.contains("// Edge-injected GPT auction bootstrap."));
         let runtime_tag = output[runtime..]
             .split('>')
             .next()
             .expect("should contain runtime tag");
         assert!(
-            runtime_tag.contains(" defer"),
-            "should defer parser-created GPT runtime"
+            !runtime_tag.contains(" defer") && !runtime_tag.contains(" async"),
+            "should install early APIs before publisher scripts through synchronous classic execution"
         );
         assert!(runtime_tag.contains("data-ts-gam-attribution=\"true\""));
-        assert_eq!(output.matches("id=\"trustedserver-bootstrap\"").count(), 1);
+        assert_eq!(output.matches("id=\"trustedserver-bootstrap\"").count(), 0);
+        assert_eq!(output.matches("id=\"trustedserver-js\"").count(), 1);
         let prebid = output
             .find("tsjs-prebid.min.js")
             .expect("should retain separately deferred Prebid");
         assert!(
             runtime < prebid,
-            "should keep deferred runtime before Prebid"
+            "should keep synchronous runtime before separately deferred Prebid"
         );
     }
 
@@ -1493,7 +1497,7 @@ mod tests {
         settings
             .integrations
             .insert_config("gpt", &json!({"enabled": true}))
-            .expect("should enable GPT to test diagnostics loading fallback");
+            .expect("should enable GPT to test diagnostics loading order");
         settings
             .integrations
             .insert_config("gpt_diagnostics", &json!({ "enabled": true }))
@@ -1537,6 +1541,7 @@ mod tests {
             "should retain synchronous bundle when GPT diagnostics is active"
         );
         assert!(!processed.contains("id=\"trustedserver-bootstrap\""));
+        assert!(!processed.contains("// Edge-injected GPT auction bootstrap."));
         assert!(!processed.contains("/tsjs-gpt.min.js?v="));
         let bootstrap_marker = "__tsjs_gpt_diagnostics_active";
         let bundle_marker = "id=\"trustedserver-js\"";

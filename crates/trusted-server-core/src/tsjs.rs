@@ -1,38 +1,24 @@
-use trusted_server_js::{concatenated_hash, module_bundle, single_module_hash};
+use trusted_server_js::{concatenated_hash, single_module_hash};
 
 use crate::integrations::IntegrationRegistry;
 
 /// Publisher runtime tags, preserving synchronous delivery for early dependencies.
 ///
-/// GPT-only pages install the real early APIs inline and defer the standalone
-/// GPT runtime. Other integrations keep their established execution order until
-/// their early dependencies have equivalent browser coverage. Enforced response
-/// CSP or active diagnostics also requires the established synchronous path.
+/// The cacheable unified bundle installs core and GPT APIs before publisher
+/// scripts. Separately deferred integrations retain their established order.
+/// Supported GPT profiles have no inline initializer if this critical request fails.
 #[must_use]
-pub(crate) fn publisher_script_tags(
-    integrations: &IntegrationRegistry,
-    synchronous_required: bool,
-) -> String {
-    let attributes = integrations.tsjs_script_tag_attributes();
-    if !supports_deferred_gpt(&integrations.js_module_ids(), synchronous_required) {
-        return tsjs_script_tag_with_attributes(
-            &integrations.js_module_ids_immediate(),
-            &attributes,
-        );
-    }
-
-    let bootstrap = module_bundle("bootstrap").expect("should embed the early publisher bootstrap");
-    let attributes = trusted_script_attributes(&attributes);
-    format!(
-        "<script id=\"trustedserver-bootstrap\"{attributes}>{bootstrap}</script>\
-         <script src=\"{}\" id=\"trustedserver-js\"{attributes} defer></script>",
-        tsjs_single_module_script_src("gpt"),
+pub(crate) fn publisher_script_tags(integrations: &IntegrationRegistry) -> String {
+    tsjs_script_tag_with_attributes(
+        &integrations.js_module_ids_immediate(),
+        &integrations.tsjs_script_tag_attributes(),
     )
 }
 
-fn supports_deferred_gpt(module_ids: &[&str], synchronous_required: bool) -> bool {
-    !synchronous_required
-        && module_ids.contains(&"gpt")
+/// GPT profiles whose unified runtime replaces the provisional initializer.
+/// Other integrations retain their existing head snippets pending caller coverage.
+pub(crate) fn supports_unified_gpt(module_ids: &[&str]) -> bool {
+    module_ids.contains(&"gpt")
         && module_ids
             .iter()
             .all(|id| matches!(*id, "creative" | "gpt" | "prebid"))
@@ -148,6 +134,7 @@ pub fn tsjs_deferred_script_tags(module_ids: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trusted_server_js::module_bundle;
 
     fn hash_query_value(src: &str) -> &str {
         src.split_once("?v=")
@@ -164,11 +151,10 @@ mod tests {
     }
 
     #[test]
-    fn deferred_gpt_requires_a_proven_profile_without_active_diagnostics() {
-        assert!(supports_deferred_gpt(&["creative", "gpt"], false));
-        assert!(supports_deferred_gpt(&["creative", "gpt", "prebid"], false));
-        assert!(!supports_deferred_gpt(&["creative"], false));
-        assert!(!supports_deferred_gpt(&["creative", "gpt"], true));
+    fn unified_gpt_initializer_replacement_requires_a_supported_module_profile() {
+        assert!(supports_unified_gpt(&["creative", "gpt"]));
+        assert!(supports_unified_gpt(&["creative", "gpt", "prebid"]));
+        assert!(!supports_unified_gpt(&["creative"]));
         for blocked in [
             "datadome",
             "google_tag_manager",
@@ -181,14 +167,14 @@ mod tests {
             "future_integration",
         ] {
             assert!(
-                !supports_deferred_gpt(&["creative", "gpt", blocked], false),
-                "should retain synchronous loading for {blocked}",
+                !supports_unified_gpt(&["creative", "gpt", blocked]),
+                "should retain provisional initialization for {blocked}",
             );
         }
     }
 
     #[test]
-    fn synchronous_loading_requirement_preserves_the_existing_publisher_tag() {
+    fn publisher_runtime_preserves_the_existing_synchronous_tag() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
             .integrations
@@ -196,17 +182,94 @@ mod tests {
             .expect("should enable GPT");
         let registry = IntegrationRegistry::new(&settings).expect("should build GPT registry");
         assert_eq!(
-            publisher_script_tags(&registry, true),
+            publisher_script_tags(&registry),
             tsjs_script_tag_with_attributes(
                 &registry.js_module_ids_immediate(),
                 &registry.tsjs_script_tag_attributes(),
             ),
             "should retain the exact synchronous tag instead of introducing a CSP hash requirement",
         );
-        assert!(
-            publisher_script_tags(&registry, false).contains("id=\"trustedserver-bootstrap\""),
-            "should still defer a supported profile without a synchronous requirement"
+    }
+
+    #[test]
+    fn supported_gpt_profiles_use_one_versioned_synchronous_unified_runtime() {
+        for prebid_enabled in [false, true] {
+            let mut settings = crate::test_support::tests::create_test_settings();
+            settings
+                .integrations
+                .insert_config(
+                    "gpt",
+                    &serde_json::json!({"enabled": true, "gam_attribution_enabled": true}),
+                )
+                .expect("should enable GPT attribution");
+            settings
+                .integrations
+                .insert_config(
+                    "prebid",
+                    &serde_json::json!({
+                        "enabled": prebid_enabled,
+                        "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
+                    }),
+                )
+                .expect("should configure separately deferred Prebid");
+            let registry = IntegrationRegistry::new(&settings).expect("should build GPT registry");
+            let output = publisher_script_tags(&registry);
+            assert_eq!(
+                output,
+                tsjs_script_tag_with_attributes(
+                    &registry.js_module_ids_immediate(),
+                    &[("data-ts-gam-attribution", "true")],
+                ),
+                "should synchronously load precisely the modules served by the unified route"
+            );
+            assert_eq!(output.matches("<script ").count(), 1);
+            assert!(!output.contains(" defer") && !output.contains("trustedserver-bootstrap"));
+            assert!(!output.contains("tsjs-gpt.min.js"));
+            assert!(!registry.js_module_ids_immediate().contains(&"prebid"));
+            assert_eq!(
+                registry.js_module_ids_deferred().contains(&"prebid"),
+                prebid_enabled
+            );
+        }
+    }
+
+    #[test]
+    fn unified_gpt_runtime_preserves_aps_and_attribution_attributes() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "gpt",
+                &serde_json::json!({
+                    "enabled": true, "gam_attribution_enabled": true
+                }),
+            )
+            .expect("should enable GPT attribution");
+        settings
+            .integrations
+            .insert_config(
+                "aps",
+                &serde_json::json!({
+                    "enabled": true, "rendering_mode": "publisher_native"
+                }),
+            )
+            .expect("should enable publisher-native APS rendering");
+        settings.auction.providers.insert(
+            "aps-main".parse().expect("should parse APS provider ID"),
+            serde_json::from_value(serde_json::json!({
+                "protocol": "openrtb-2.6", "profile": "aps",
+                "endpoint": "https://aps.example/e/pb/bid", "routing": "all_eligible",
+                "profile_config": {"account_id": "example-account"}
+            }))
+            .expect("should parse APS provider configuration"),
         );
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should build GPT and APS registry");
+        let output = publisher_script_tags(&registry);
+        assert!(output.contains("data-ts-gam-attribution=\"true\""));
+        assert!(output.contains("data-ts-aps-rendering-mode=\"publisher_native\""));
+        assert!(supports_unified_gpt(&registry.js_module_ids()));
+        assert_eq!(output.matches("<script ").count(), 1);
     }
 
     #[test]

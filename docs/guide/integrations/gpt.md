@@ -93,36 +93,36 @@ Successful proxy responses include the `X-GPT-Proxy: true` header for debugging.
 
 ## Client-Side Shim
 
-The GPT integration shares early interception and rendering code with its deferred runtime. Other integration combinations retain the synchronous unified TSJS bundle.
+The draft loading candidate uses the existing cacheable unified TSJS bundle. It removes the duplicated inline runtime from the supported GPT profile. This is synchronous loading, not a claim that the main bundle can safely defer. Final acceptance and real-GPT validation remain pending.
 
 ### Loading order
 
-For pages without an enforced response Content Security Policy, GPT with core, creative and optionally the separately deferred Prebid integration uses this order:
-
 ```mermaid
 flowchart TD
-    A[Integration configuration and existing inline GPT bootstrap] --> B[Compiled inline GPT guard, attribution and render bridge]
-    B --> C[Real core APIs and creative guards]
-    C --> D[Publisher scripts continue parsing]
-    D --> E[Deferred standalone GPT runtime]
-    E --> F[Deferred Prebid shim]
+    A[Reservation CSS and integration configuration] --> B[Versioned synchronous unified TSJS bundle]
+    B --> C[Publisher scripts and document parsing]
+    C --> D[Publisher registration and admitted payload]
+    D --> E[Initial registered delivery]
+    C --> F[Existing deferred integrations and window load]
+    F --> G[Existing automatic initializer readiness checks]
+    G --> H[Initial automatic delivery]
 ```
 
-The early entry runs inline, without another synchronous external fetch. It installs the real render bridge before core flushes queued callbacks or publisher scripts can request an eligible creative. Core's direct methods and immediate queue behavior remain available before the runtime arrives. The deferred GPT entry does not initialize core again, so early configuration and registered ad units survive takeover.
+Core, creative and GPT execute in the existing unified module order. Core drains its prequeued callbacks before the GPT IIFE executes. Those callbacks can use core APIs; GPT registration, scheduling and rendering APIs are installed when the complete unified script returns to publisher code. The first publisher script after the runtime can use the installed APIs without waiting for a second GPT asset.
 
-Any enforced `Content-Security-Policy` response header selects the synchronous unified bundle instead of the new inline compiled entry. This path also omits the provisional raw inline GPT bootstrap. The synchronous runtime installs initialization and registration APIs before publisher scripts, without requiring a new inline bootstrap hash. This includes headers from the actual origin response or `Settings.response_headers`, matched case-insensitively, even when empty, permissive or repeated. An origin response without CSP cannot cancel a configured policy. `Content-Security-Policy-Report-Only` alone does not select this fallback. Publishers with unchanged enforced response CSP therefore need no new compiled-script hash for this loading change: they keep the existing loading path. Policies that might permit deferral still use synchronous loading until separately evaluated.
+With GPT, creative and optionally the separately deferred Prebid integration, configuration remains inline but neither the raw provisional GPT initializer nor the compiled early bundle is embedded in HTML. The external unified URL includes its content hash so browsers can cache the runtime independently of each document. No operator loading-mode flag or automatic retry is added.
 
-If the synchronous runtime fails to load on an enforced-CSP page, the omitted provisional bootstrap cannot provide fallback delivery. This preserves script permissions, not delivery during a blocked or failed synchronous bundle fetch.
+Profiles containing another browser integration retain their previous provisional initializer unless an enforced response CSP requires its omission. Their synchronous runtime order is unchanged. The profile allowlist controls omission of the initializer, not permission to defer the whole bundle. The retained implementations and versioned handover helpers are not removed as part of this loading change.
 
-Shared templates retain the loading choice and policy headers selected on the cold response and replay them on warm hits. Settings and core fingerprints invalidate older templates. This fallback checks response headers only; no meta-policy fallback is promised. It does not weaken CSP, add nonce handling or introduce an operator flag.
+Enforced `Content-Security-Policy` response headers retain the existing synchronous loading and script permissions. This includes actual origin headers and `Settings.response_headers`, matched case-insensitively, even when empty, permissive or repeated. An origin response without CSP cannot cancel a configured policy. Report-Only remains Report-Only. No policy is weakened and no new compiled-inline hash is required. Shared templates preserve the actual policy on cold and warm paths; settings and core fingerprints invalidate older templates. There is no new meta-policy evaluator or nonce handling.
 
-On pages without enforced response CSP, the inline GPT bootstrap remains responsible for provisional `adInit`, initial scheduling, publisher registration and navigation generations. The deferred runtime installs the richer initializer, publisher-slot handoff, SPA page-bids fetching and slim-Prebid loader. Both entries share the same guard and rendering implementations. A delayed or failed runtime does not remove the installed early renderer or authorize another initial request.
+If the sole critical unified script fails to load in the supported profile, the page has no TS initialization APIs or TS delivery. Core-dependent publisher code can report an error. There is no inline fallback or retry. This extends the previously tested enforced-CSP outage boundary to supported ordinary pages and remains an explicit acceptance decision. It is not equivalent to the earlier design, where a failed deferred GPT asset left the inline renderer working.
 
-This still executes synchronous JavaScript. The non-CSP path retains the raw GPT bootstrap as well as the compiled early entry; the acceptance report records their exact sizes for the tested revision. Compare parser/paint timing and ad-startup timing with repeatable measurements; deferral is not a guarantee of better field Core Web Vitals.
+The automatic initializer retains its existing load, visibility and animation-frame checks. Registered delivery still requires actual publisher readiness and payload admission. Compare paint and ad-startup separately; a parser-blocking runtime cannot be described as proven deferral, and lab gains do not establish field Core Web Vitals.
 
-The following combinations keep the original synchronous unified bundle. Unknown browser integrations also fall back rather than being silently deferred.
+These integrations retain their early initialization dependencies:
 
-| Integration            | Early dependency retained by synchronous fallback                       |
+| Integration            | Early dependency                                                        |
 | ---------------------- | ----------------------------------------------------------------------- |
 | DataDome               | Dynamic SDK script and preload interception                             |
 | Google Tag Manager     | Script interception plus fetch and beacon rewriting                     |
@@ -135,7 +135,7 @@ The following combinations keep the original synchronous unified bundle. Unknown
 | Active GPT diagnostics | GPT observation before publisher scripts                                |
 | Enforced response CSP  | Existing script permissions and synchronous loading                     |
 
-Rust-only integrations do not add browser modules to this list. Pages without GPT keep synchronous unified loading. Prebid's external bundle and shim retain their existing deferred execution order. Trusted GAM attribution and APS rendering-mode attributes stay on both executing entries, including the inline early tag.
+Rust-only integrations do not add browser modules to this list. Pages without GPT keep synchronous unified loading. Prebid's external bundle and shim retain their existing execution order. Trusted GAM attribution and APS rendering-mode attributes remain on the executing unified tag. Active diagnostics still install their listeners after core and before publisher scripts.
 
 ### Script Guard
 

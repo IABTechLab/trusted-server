@@ -76,6 +76,62 @@ for (const [flag, value] of [
     assert.throws(() => parseOptions([...required, `--${flag}`, value]));
   });
 
+test("diagnostic screen requires baseline, zero hold and its own exclusive scope", () => {
+  const measurement = [...required.slice(0, -1), "--baseline", "baseline"];
+  const screen = [
+    ...measurement,
+    "--diagnostic-screen",
+    "--runtime-delay-ms",
+    "0",
+  ];
+  const options = parseOptions(screen);
+  assert.equal(options["diagnostic-screen"], true);
+  assert.equal(options["runtime-delay-ms"], 0);
+  assert.equal(options.baseline, "baseline");
+  assert.throws(
+    () => parseOptions([...measurement, "--diagnostic-screen"]),
+    /runtime-delay-ms 0/,
+  );
+  assert.throws(
+    () =>
+      parseOptions([
+        ...required.slice(0, -1),
+        "--diagnostic-screen",
+        "--runtime-delay-ms",
+        "0",
+      ]),
+    /baseline/,
+  );
+  for (const mode of ["--correctness-only", "--regressions-only"])
+    assert.throws(() => parseOptions([...screen, mode]), /cannot select/);
+});
+
+test("outage diagnostic requires baseline and is exclusive without changing other defaults", () => {
+  const measurement = [...required.slice(0, -1), "--baseline", "baseline"];
+  const args = [
+    ...measurement,
+    "--diagnostic-outages",
+    "--runtime-delay-ms",
+    "0",
+  ];
+  const options = parseOptions(args);
+  assert.equal(options["diagnostic-outages"], true);
+  assert.equal(options["diagnostic-screen"], undefined);
+  assert.equal(options["runtime-delay-ms"], 0);
+  assert.equal(options.cache, "cold");
+  assert.throws(
+    () => parseOptions([...required.slice(0, -1), "--diagnostic-outages"]),
+    /baseline/,
+  );
+  for (const mode of [
+    "--diagnostic-screen",
+    "--correctness-only",
+    "--regressions-only",
+  ])
+    assert.throws(() => parseOptions([...args, mode]), /another scope/);
+  assert.equal(parseOptions([...measurement, "--diagnostic-outages"]).runs, 5);
+});
+
 test("requires explicit measurement inputs and rejects ambiguous modes/unknown options", () => {
   assert.throws(() => parseOptions([]));
   assert.throws(() => parseOptions(required.slice(0, -1)), /baseline/);

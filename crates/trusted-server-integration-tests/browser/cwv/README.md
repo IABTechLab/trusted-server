@@ -5,6 +5,12 @@ real Rust HTML injection and the exact JS bytes returned by the production stati
 route. GPT transport and bids are fictional. No customer, GAM or bidder request
 is allowed. These are lab results, not field CWV or production fill evidence.
 
+The default, correctness-only and regressions-only modes retain the earlier
+inline/deferred loading contract. They reject the current synchronous-unified
+candidate until its architecture and outage boundary are accepted and the full
+consumers are migrated. Use the explicit diagnostic scopes below for the limited
+candidate experiments, not as a substitute for full acceptance.
+
 ## Export
 
 From the repository root, with current production JS built by the coordinator:
@@ -139,7 +145,123 @@ delivery. It remains a separate sample and never relaxes the successful CSP gate
 Full mode has `8 * runs + 24` samples, correctness-only has 26, and regressions-only
 has 4. The completion schema is unchanged.
 
-## Observations and functional gates
+## Diagnostic synchronous-unified screen
+
+Use `--diagnostic-screen` only for the first identity-transport comparison of the
+cacheable synchronous-unified candidate. It is not combined acceptance and must
+not be passed to the full completion controller as a replacement for its required
+scope. Existing full, correctness-only and regressions-only modes retain their
+inline/deferred expectations for old artifacts. They are not migrated here.
+
+```sh
+for CACHE in cold warm; do
+  node crates/trusted-server-integration-tests/browser/cwv/run.cjs \
+    --diagnostic-screen --baseline /tmp/cwv-baseline \
+    --loading /tmp/cwv-loading --combined /tmp/cwv-combined \
+    --runs 5 --out "/tmp/cwv-diagnostic-$CACHE" \
+    --runtime-delay-ms 0 --cache "$CACHE" --cpu-rate 4 \
+    --network-latency-ms 100 --download-kbps 1600 --upload-kbps 750
+done
+```
+
+The baseline is mandatory and its manifest must identify pinned original main
+`51730bdaf841e4d7bb96c2258e5e98169bdff9a7`, not the failing inline/deferred PR
+snapshot. Keep genuine baseline production HTML and served bytes. Candidate
+exports must come from the production builders, not rewritten head snippets.
+
+The expected architecture is fixed independently of observed HTML. Every arm
+must use one synchronous classic unified runtime. Candidate arms require a
+versioned URL, GPT configuration before it, no `#trustedserver-bootstrap` and no
+raw provisional GPT bootstrap. Native runtime load events must observe parser
+blocking through `assertRuntimeOrdering`; the test does not treat that as safe
+deferral. Warm samples must prove actual runtime HTTP-cache reuse through
+`assertCacheUse`. Identity responses, fail-closed proxy, per-sample contexts,
+priming, observers and raw timing/byte evidence are unchanged. No Playwright
+routes or response codecs are added.
+
+The screen runs exactly `8 * runs` measurement samples, 40 with this command.
+It alternates baseline/loading/reservation/combined forward and reverse at
+390x844 and 1280x1000. Each invocation selects one cache condition, so the pair
+above records 80 samples. There are no skipped or optional cases within that
+scope. The existing inline fixture checks direct early core calls, one initial
+native request, candidate targeting and visible Server creative. The screen also
+queues a test-only callback before production core executes. Evidence captures
+core methods and a real `getConfig()` call when that queue drains, then captures
+GPT registration, scheduling, shim and renderer APIs at the native runtime load.
+The core callback runs before the GPT IIFE, so it does not require those later
+APIs there. This init-script probe does not alter the exported HTML or runtime.
+
+`acceptance.json.scope` is `diagnostic-screen`, with a declared expected sample
+count and `diagnostic.fullAcceptancePassed=false` even if this limited scope
+passes. Both existing negative-control entries are `not-requested` with explicit
+reasons. Removing `defer` would be vacuous for this candidate; the reservation
+negative control and broader correctness suites are outside the first screen.
+The screen retains successful-arm reservation geometry and unreserved CLS gates.
+A zero or incomplete case set fails. A failed rerun still invalidates the previous
+outcome before dependencies or exports are read.
+
+CSP and critical-runtime outages, publisher registration, framework lifecycle,
+full negative controls, deferred-runtime correctness, production compressed
+magnitude and real-GPT acceptance are not established by this screen. Missing
+authorized Google inventory remains blocked outside this diagnostic scope.
+Synchronous loading and loss of the inline critical-script fallback remain
+architecture decisions, not contracts waived by a diagnostic pass. Inspect paint
+and ad-startup regressions before broadening coverage. There is no newly invented
+noise tolerance or timing-improvement threshold.
+
+## Diagnostic critical-runtime outages
+
+After the measurement screen, `--diagnostic-outages` observes four focused
+availability cases at 390x844 using the reserved candidate export. It is mutually
+exclusive with every other scope. It does not change the full-mode deferred-runtime
+failure contract or approve loss of the inline fallback.
+
+```sh
+node crates/trusted-server-integration-tests/browser/cwv/run.cjs \
+  --diagnostic-outages --baseline /tmp/cwv-baseline \
+  --loading /tmp/cwv-loading --combined /tmp/cwv-combined \
+  --out /tmp/cwv-diagnostic-outages --runs 1 \
+  --runtime-delay-ms 0 --cache cold --cpu-rate 1 \
+  --network-latency-ms 0 --download-kbps 0 --upload-kbps 0
+```
+
+The exact cases are normal success, normal critical-unified HTTP 404, enforced
+old-inline-hash/self CSP success, and the same CSP with critical-unified HTTP 404.
+There are always four cases, independent of `--runs`, as in regressions-only mode.
+Baseline remains pinned and supplies the genuine old inline hashes. Production
+HTML and runtime bytes are unchanged. Native observers, cache configuration,
+fail-closed proxy and failure artifacts use the existing sample machinery.
+
+Successful cases require synchronous native runtime ordering, the pre-core queue,
+full runtime APIs, one targeted initial request and visible Server creative.
+Failed cases separately record normal and enforced-CSP behavior. They require
+all core/GPT/shim/renderer APIs unavailable, an undrained pre-core queue, no
+successful runtime load, exactly one runtime 404 without retry, zero native
+requests/delivery/visible ad, and only the existing declared
+`tsjs.setConfig is not a function` publisher error. DOMContentLoaded and article
+geometry must establish that parsing continued after failure. Enforced-CSP cases
+also require zero CSP violations. No late recovery or retry is claimed.
+
+Completion uses `scope=diagnostic-outages`, an exact four-case completeness gate,
+`diagnostic.fullAcceptancePassed=false` and
+`diagnostic.changedOutageBehaviorApproved=false`. Each sample records its policy,
+expected availability and the explicit changed-outage-not-approval interpretation.
+Both existing negative controls are `not-requested` with a reason. A successful
+diagnostic means these observations matched the declared failure boundary, not
+that the changed outage boundary is acceptable for adoption or issue closure.
+The public full-acceptance verifier rejects both diagnostic scopes.
+
+Keep a separate output directory. Prior screen measurements remain evidence for
+their frozen inputs and recorded tooling hashes; this diagnostic does not rerun,
+replace or relabel those 80 samples. Full correctness, registration/framework,
+controller and live gates remain outside this scope. Missing authorized Google
+inventory stays blocked. Start with zero delay; a separately recorded held-response
+run can be requested later if needed.
+
+## Full-mode observations and functional gates
+
+The following describes the retained full modes. Diagnostic scopes run only the
+cases and observations declared in their sections above.
 
 - Pre-navigation buffered `PerformanceObserver` entries capture FCP, every LCP
   candidate, resources and raw layout shifts with source geometry.
@@ -197,7 +319,8 @@ Export input filenames remain `manifest.json`, the declared HTML/assets and
 `failed` for an assertion/runtime failure, or `blocked` for a missing export,
 dependency or Chromium executable. `passed` means the selected scope completed,
 including report writes and browser/server cleanup. The scope is
-`measurement-and-correctness`, `correctness`, or `regressions`. It does not certify
+`measurement-and-correctness`, `correctness`, `regressions`, or the limited
+`diagnostic-screen` and `diagnostic-outages` scopes described above. It does not certify
 any live publisher or real-GPT behavior. `conditions`, `samples`, `profileSamples`,
 timestamps and an error when unsuccessful describe the run.
 
@@ -227,6 +350,7 @@ selected condition set per invocation, not an implicit device/network matrix.
 
 A fast first paint can coexist with later ad startup because the retained
 bootstrap scheduler waits for page load. Report both, including regressions.
-The original GPT bootstrap remains inline; this work does not claim to remove
-its bytes or synchronous execution. Real-GPT staging and live publisher
-activation require separate approval.
+The earlier full-mode exports retain the original inline GPT bootstrap. The
+synchronous candidate omits it and has the separately documented critical-script
+outage boundary. Neither diagnostic scope approves that change or proves full
+acceptance. Real-GPT staging and live publisher activation require separate approval.
