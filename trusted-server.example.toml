@@ -436,6 +436,7 @@ pull_sync_concurrency = 3
 #   "ad-tag.google.loader",
 #   "ad-tag.google.diagnostics",
 #   "headers.geo",
+#   "provenance.encypher",
 #   "51degrees.client_hints",
 #   "service_version",
 # ]
@@ -929,6 +930,47 @@ auction_timeout_ms = 500
 # carrying its hints, and is on unless set to false.
 # [middleware.51degrees.client_hints]
 # critical = true
+
+# Encypher text provenance. Signs the article on each page a [[serve]] entry
+# names `provenance.encypher` for, with invisible markers and a C2PA manifest
+# link, and passes every page it cannot sign through unchanged. Give the
+# entry a `path` for each section of public articles to sign. The article's
+# text and address go to the API; a page whose origin set a cookie or forbade
+# shared caching is never sent, so mark every personalized response private
+# at the origin. `worker_token` is the name of the secret-store entry holding
+# the `cwk_` worker credential. Plans are cached in the runtime KV store;
+# without one, pages pass through.
+# [provenance]
+# module = "encypher"
+#
+# [provenance.encypher]
+# api_base_url = "https://api.example.com"
+# domain = "publisher.example.com"
+# worker_token = "encypher_worker_token"
+#
+# Optional background preparation, instead of signing on reader delivery.
+# Leave this unset for the existing synchronous mode. Async mode never
+# falls back to synchronous signing: a missing result stays unsigned.
+# Run a publisher-owned native worker using
+# crates/trusted-server-preparation-worker/worker.example.toml.
+# execution = "async_prepared"
+#
+# [provenance.encypher.preparation]
+# worker_url = "https://prep.publisher.example.com"
+# loopback_url = "https://publisher.example.com"
+# deployment_id = "publisher-preparation"
+# public_host = "publisher.example.com"
+# signal_secret = "encypher_preparation_signal"
+# publication_secret = "encypher_preparation_publication"
+# routes = ["/news/", "/media/"]
+# reader_trigger = false
+#
+# Register publisher URLs with `ts preparation warm --register`, or put
+# them in the worker's inventory. Publish/update jobs can warm changed URLs.
+# Inventory reconciliation is independent of reader traffic; no eight-page
+# limit applies, but worker capacity is bounded. This does not crawl origins.
+# Set reader_trigger = true only to add best-effort hints on cache misses.
+# The two secret-store values must match the worker's corresponding scopes.
 
 # Permutive DMP. `organization_id` and `workspace_id` are required.
 # [audience]

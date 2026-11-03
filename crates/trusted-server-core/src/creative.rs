@@ -181,11 +181,70 @@ fn rewrite_style_urls_in_context(
     allows_import_rules: bool,
     output_limit: usize,
 ) -> Result<String, CssRewriteError> {
-    let mut rewriter = CssUrlRewriter {
-        settings,
+    rewrite_css_urls(
+        &mut CreativeProxy {
+            settings,
+            base_origin,
+        },
         style,
-        base_origin,
         allows_import_rules,
+        output_limit,
+    )
+}
+
+/// Where in a stylesheet a URL was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CssUrlContext {
+    /// The stylesheet an `@import` loads.
+    Import,
+    /// Anything else the browser fetches: an image, a font, a cursor.
+    Resource,
+}
+
+/// Decides what each URL a stylesheet names becomes, as
+/// [`rewrite_css_urls`] reads them.
+pub(crate) trait CssUrlPolicy {
+    /// The address to write in place of `value`, the URL as the browser reads
+    /// it with its escapes resolved, or `None` to keep its original bytes.
+    fn replace(&mut self, value: &str, context: CssUrlContext) -> Option<String>;
+}
+
+/// The creative policy: an absolute or protocol-relative address goes
+/// through the signed first-party proxy, see [`build_proxy_url`].
+struct CreativeProxy<'a> {
+    settings: &'a Settings,
+    base_origin: &'a str,
+}
+
+impl CssUrlPolicy for CreativeProxy<'_> {
+    fn replace(&mut self, value: &str, _context: CssUrlContext) -> Option<String> {
+        let absolute = to_abs(self.settings, value)?;
+        Some(build_proxy_url(self.settings, &absolute, self.base_origin))
+    }
+}
+
+/// Rewrites every URL `style` names as `policy` decides, within the nesting
+/// and output-size limits, keeping every other byte. A reference keeps the
+/// shape it was read in, see [`rewrite_style_urls`].
+///
+/// `allows_import_rules` says whether `style` is a stylesheet, where
+/// `@import` can begin a rule, rather than a style attribute.
+///
+/// # Errors
+///
+/// When the CSS nests past [`MAX_CSS_NESTING_DEPTH`] or the output would be
+/// larger than `output_limit`.
+pub(crate) fn rewrite_css_urls(
+    policy: &mut dyn CssUrlPolicy,
+    style: &str,
+    allows_import_rules: bool,
+    output_limit: usize,
+) -> Result<String, CssRewriteError> {
+    let mut rewriter = CssUrlRewriter {
+        policy,
+        style,
+        allows_import_rules,
+        in_import: false,
         out: CssOutput {
             value: String::with_capacity(style.len().min(output_limit)),
             limit: output_limit,
@@ -229,13 +288,15 @@ impl fmt::Write for CssOutput {
     }
 }
 
-/// Splices rewritten `url()` values into a copy of the original CSS.
+/// Splices the URLs a policy replaces into a copy of the original CSS.
 struct CssUrlRewriter<'a> {
-    settings: &'a Settings,
+    policy: &'a mut dyn CssUrlPolicy,
     style: &'a str,
-    base_origin: &'a str,
     /// Whether the outermost scope is a stylesheet that may contain `@import`.
     allows_import_rules: bool,
+    /// Whether the walk is inside an `@import` prelude, whose URL names a
+    /// stylesheet.
+    in_import: bool,
     out: CssOutput,
     write_pos: usize,
     /// Any refusal invalidates the entire rewrite.
@@ -340,7 +401,9 @@ impl CssUrlRewriter<'_> {
                     let _ = parser.parse_until_before(
                         cssparser::Delimiter::Semicolon | cssparser::Delimiter::CurlyBracketBlock,
                         |prelude| -> Result<(), cssparser::ParseError<'_, ()>> {
+                            let outer = std::mem::replace(&mut self.in_import, true);
                             self.descend(prelude, depth, BareStringUrls::FirstValue);
+                            self.in_import = outer;
                             Ok(())
                         },
                     );
@@ -390,8 +453,8 @@ impl CssUrlRewriter<'_> {
         self.walk(parser, depth + 1, strings_are_urls);
     }
 
-    /// Replaces the span just consumed with a proxied reference in `shape`, or
-    /// leaves it.
+    /// Replaces the span just consumed with the policy's address in `shape`,
+    /// or leaves it.
     fn rewrite(
         &mut self,
         value: &str,
@@ -399,14 +462,19 @@ impl CssUrlRewriter<'_> {
         parser: &cssparser::Parser<'_, '_>,
         shape: UrlShape,
     ) {
-        let Some(absolute) = to_abs(self.settings, value) else {
+        let context = if self.in_import {
+            CssUrlContext::Import
+        } else {
+            CssUrlContext::Resource
+        };
+        let Some(replacement) = self.policy.replace(value, context) else {
             return;
         };
         let token_end = parser.position().byte_index();
         let result = (|| -> fmt::Result {
             self.out
                 .write_str(&self.style[self.write_pos..token_start])?;
-            let proxied = build_proxy_url(self.settings, &absolute, self.base_origin);
+            let proxied = replacement;
             if let UrlShape::Function(name) = shape {
                 self.out.write_str(name)?;
                 self.out.write_char('(')?;

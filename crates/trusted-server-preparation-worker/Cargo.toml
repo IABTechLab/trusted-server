@@ -1,0 +1,32 @@
+[package]
+name = "trusted-server-preparation-worker"
+description = "Publisher-operated native preparation worker for Encypher asynchronous prepared signing: durable redb admission, claims, retries, reconciliation and retirement, outside reader delivery."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+derive_more = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+rand = { workspace = true }
+redb = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+toml = { workspace = true }
+trusted-server-provenance-encypher = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

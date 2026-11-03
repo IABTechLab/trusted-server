@@ -10,3 +10,5 @@ pub mod app;
 pub mod middleware;
 /// Platform-trait implementations backed by env vars and `reqwest`.
 pub mod platform;
+/// HTTP front end that delivers streamed responses chunk by chunk.
+pub mod server;

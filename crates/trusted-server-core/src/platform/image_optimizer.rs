@@ -68,6 +68,12 @@ pub struct PlatformImageOptimizerOptions {
     pub preserve_query_string_on_origin_request: bool,
     /// Transformation parameters to apply.
     pub params: PlatformImageOptimizerParams,
+    /// Whether the optimizer keeps its input's C2PA manifest and records the
+    /// transformations it performed in a manifest of its own. Core asks for
+    /// it only where a media signer may sign the optimizer's answer. An
+    /// optimizer that cannot record its own transformations must reject a
+    /// request asking for it rather than drop the request.
+    pub preserve_c2pa: bool,
 }
 
 impl PlatformImageOptimizerOptions {
@@ -78,6 +84,7 @@ impl PlatformImageOptimizerOptions {
             region: region.into(),
             preserve_query_string_on_origin_request: false,
             params,
+            preserve_c2pa: false,
         }
     }
 
@@ -89,6 +96,15 @@ impl PlatformImageOptimizerOptions {
     #[must_use]
     pub fn with_preserve_query_string_on_origin_request(mut self, preserve: bool) -> Self {
         self.preserve_query_string_on_origin_request = preserve;
+        self
+    }
+
+    /// Ask the optimizer to keep its input's C2PA manifest and record the
+    /// transformations it performed, see
+    /// [`preserve_c2pa`](Self::preserve_c2pa).
+    #[must_use]
+    pub fn with_c2pa_preserved(mut self) -> Self {
+        self.preserve_c2pa = true;
         self
     }
 }

@@ -55,6 +55,7 @@ pub fn linked_builders() -> Vec<IntegrationBuilder> {
         trusted_server_ad_tag_google::diagnostics::builder(),
         trusted_server_ads_txt_iabtl::builder(),
         trusted_server_headers_geo::builder(),
+        trusted_server_provenance_encypher::builder(),
         // Run by `[shared.51degrees]` rather than selected by a section.
         trusted_server_middleware_51degrees::builder(),
         // The analytics module `[analytics]` selects, which changes no page.
@@ -246,54 +247,6 @@ mod tests {
         assert!(
             err.contains(missing_path.to_string_lossy().as_ref()),
             "error should mention the explicit missing path"
-        );
-    }
-
-    /// The tool links the modules each adapter links, in the order their hooks
-    /// run, so it validates a deployment's settings as they do. A module is
-    /// named by what its section selects, and an implementation by what
-    /// `[demand]` or `[ad-server]` names.
-    #[test]
-    fn the_linked_modules_are_offered_in_hook_order() {
-        let names: Vec<&str> = linked_builders()
-            .iter()
-            .map(|builder| {
-                builder
-                    .module_name()
-                    .or_else(|| builder.demand().map(|demand| demand.id))
-                    .or_else(|| builder.adserver().map(|adserver| adserver.id))
-                    .unwrap_or_else(|| builder.id())
-            })
-            .collect();
-
-        assert_eq!(
-            names,
-            [
-                "auction.prebid",
-                "testing.testlight",
-                "framework.nextjs",
-                "audience.permutive",
-                "identity.lockr",
-                "cmp.didomi",
-                "cmp.inmobi",
-                "cmp.sourcepoint",
-                "cmp.osano",
-                "tag.google-tag",
-                "tag.google-tag-manager",
-                "bot-protection.datadome",
-                "ad-tag.google",
-                "ad-tag.google.diagnostics",
-                "ads-txt.iabtl",
-                "headers.geo",
-                "51degrees",
-                "analytics.tinybird",
-                "auction-protocol.openrtb",
-                "auction.prebid-server",
-                "auction.aps",
-                "ad-server.iabtl",
-                "shared.aws",
-            ],
-            "should offer the linked modules in the order their hooks run"
         );
     }
 

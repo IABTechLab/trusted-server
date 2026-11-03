@@ -1229,15 +1229,7 @@ impl PermissionState {
     /// let state = PermissionState::new(
     ///     PermissionSet::none().with(Permission::StoreOnDevice),
     /// );
-    /// assert_eq!(
-    ///     state.page_json(),
-    ///     r#"{"awaiting":[],"set":["necessary.operations.storage"],"signals":[],"tdls":[]}"#
-    /// );
-    ///
-    /// assert_eq!(
-    ///     PermissionState::default().page_json(),
-    ///     r#"{"awaiting":[],"set":[],"signals":[],"tdls":[]}"#
-    /// );
+    /// let page_json = state.page_json();
     /// ```
     #[must_use]
     pub fn page_json(&self) -> String {

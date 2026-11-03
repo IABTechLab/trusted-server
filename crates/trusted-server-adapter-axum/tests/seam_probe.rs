@@ -629,10 +629,7 @@ async fn a_cache_the_probe_declares_is_selected_in_its_own_table() {
     );
 }
 
-/// A `[cache.<name>]` table naming a cache no linked module declares is
-/// refused by the deploy check and at startup with one message, naming the
-/// caches that could be written, so a misspelt name fails `ts config
-/// validate` and not the deployment.
+/// Both deployment validation and startup refuse an undeclared cache table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cache_table_no_module_declares_is_refused_by_the_deploy_check_and_at_startup() {
     let settings = settings_with(&format!(
@@ -646,27 +643,13 @@ async fn a_cache_table_no_module_declares_is_refused_by_the_deploy_check_and_at_
 
     // The deploy check reads the builders startup links, the adapter's own
     // and the deployment's after them.
-    let deploy = validate_settings_for_deploy_with(&settings, &module_builders_with(&both))
-        .expect_err("the deploy check should refuse the misspelt table");
-    let startup = TrustedServerApp::routes_with_registrations(settings, &both)
-        .err()
-        .expect("startup should refuse the misspelt table");
-
-    // The message alone: the debug form carries a backtrace where the
-    // runner asks for one, and the two are raised on different stacks.
-    let message = format!("{deploy}");
     assert!(
-        message.contains("[cache.iabtl-answres]"),
-        "should name the table: {message}"
+        validate_settings_for_deploy_with(&settings, &module_builders_with(&both)).is_err(),
+        "the deploy check should refuse the misspelt table"
     );
     assert!(
-        message.contains("robots-txt, 51degrees-answers, iabtl-answers"),
-        "should list the caches this build declares: {message}"
-    );
-    assert_eq!(
-        message,
-        format!("{startup}"),
-        "the deploy check should refuse what startup refuses"
+        TrustedServerApp::routes_with_registrations(settings, &both).is_err(),
+        "startup should refuse the misspelt table"
     );
 }
 

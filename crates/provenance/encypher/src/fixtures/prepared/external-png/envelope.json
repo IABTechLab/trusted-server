@@ -1,0 +1,78 @@
+{
+  "deployment_id": "async-prepared-api-fixture",
+  "identity": "bcb02ca8a4fd668d75823760fe036f8cbe7b4a2e2425cf119ff2f787fa9992df",
+  "item": {
+    "kind": "media",
+    "planned": {
+      "digest": "339bfbaa3a2188ec9032d7b3a04e388a6d1668fab9896f362b5190077786a7bd",
+      "geometry": {
+        "binding_recipe": {
+          "algorithm": "sha256",
+          "exclusions": [],
+          "type": "data_hash"
+        },
+        "carrier_output_span": [
+          0,
+          0
+        ],
+        "carrier_recipe": null,
+        "carrier_span": [
+          0,
+          0
+        ],
+        "disposition": "external",
+        "edits": [],
+        "expected_final_size": 205,
+        "planner_options": {
+          "tiff_placement": "main_ifd_when_single"
+        }
+      },
+      "idempotency_key": "async-prepared-fixture:external-png:d243b83eb5d94188ace4ab03b219c8a6",
+      "plan_id": "400be3dc-9766-4eb3-85b9-8a7b9a668ccb",
+      "release": {
+        "abi": 1,
+        "planner_id": "05079ae09f9fc9af0b97683ee52c3fea6e6be0c30c993eb6d30dac36ec811a39",
+        "release": 18,
+        "sha256": "eb0c58b5178500a1fd08e351ab2237582f5a9aedad71871f3580ea722ad10a6f",
+        "signature": "33Dab6p1n5yJpIbXypes+yr6xXalcFonsh5h9YaFzMo18zFMHlNDXzriZNOe5LHZQ03P7Ki0T4ZXT+QNS6okCw=="
+      },
+      "request": {
+        "carrier_requirement": "external_allowed",
+        "contract_version": 2,
+        "expected_policy_digest": "171bf3407b6bb613d78ec55255c2a908acf9f591c2e9aa6e96e4f15e67370cff",
+        "page_url": "https://async-prepared-fixture.publisher.example.com/article",
+        "probe": {
+          "planner_id": "05079ae09f9fc9af0b97683ee52c3fea6e6be0c30c993eb6d30dac36ec811a39",
+          "sha256": "eb0c58b5178500a1fd08e351ab2237582f5a9aedad71871f3580ea722ad10a6f"
+        },
+        "protocol": "encypher-prepared-signing/2",
+        "source": {
+          "byte_length": 205,
+          "mime": "image/png",
+          "origin_host": "async-prepared-fixture.publisher.example.com",
+          "reference": "https://async-prepared-fixture.publisher.example.com/article",
+          "reference_kind": "origin",
+          "sha256": "339bfbaa3a2188ec9032d7b3a04e388a6d1668fab9896f362b5190077786a7bd"
+        },
+        "structure": [
+          {
+            "b64": "iVBORw0KGgoAAAANSUhEUg==",
+            "offset": 0
+          },
+          {
+            "b64": "27ZsSwAAAJRJREFU",
+            "offset": 29
+          },
+          {
+            "b64": "6qgrjgAAAABJRU5ErkJggg==",
+            "offset": 189
+          }
+        ]
+      }
+    },
+    "source_b64": "iVBORw0KGgoAAAANSUhEUgAAADAAAAAgCAIAAADbtmxLAAAAlElEQVR4nO3XywqAIBCFYS8dWsz7v29bJS+Bo3MSYRbRYvz4KSLvnEMQnrni7WMgmp1BwgaiK7Qn6LxlPwOBDcRVCFQgEBbSBQ19N5Bcb1tIJ489KNeIPeg9liCUbp5CzTxmoJrGshARqJFHCzT8v5EYVhfK8pSOXgpCBWEB6p8i80H55vazPLPQ2EIlUG/Jxzwx+AdPEifC6qgrjgAAAABJRU5ErkJggg=="
+  },
+  "protocol": "encypher-preparation/1",
+  "retirement_epoch": 0,
+  "variant": ""
+}

@@ -34,7 +34,10 @@ use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::{BorrowedRequestInfo, HostSignals};
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
-use trusted_server_core::platform::{RuntimeServices, UnavailableKvStore};
+use trusted_server_core::platform::{
+    PlatformHttpClient as _, PlatformHttpRequest, RuntimeServices, UnavailableKvStore,
+    take_after_response_requests,
+};
 use trusted_server_core::prefix::Prefixes;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
@@ -823,6 +826,9 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // Dispatch directly through the EdgeZero router without an intermediate
     // fastly::Response conversion. That preserves duplicate header values such
     // as multiple Set-Cookie headers.
+    // A request a module handed over for an earlier response that never went
+    // out belongs to that request, never to this one.
+    drop(take_after_response_requests());
     let mut response = match into_addressed_core_request(req, removed_prefix) {
         Ok(mut core_req) => {
             core_req.extensions_mut().insert(config_store);
@@ -878,6 +884,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                         counters.as_ref(),
                     );
                     run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
+                    send_after_response_handoffs();
                     return;
                 }
                 Err(e) => {
@@ -905,6 +912,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                                 &partner_registry,
                                 &ec_state,
                             );
+                            send_after_response_handoffs();
                             return;
                         }
                         Err(e) => {
@@ -922,6 +930,30 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     }
 
     send_edgezero_response(response, request_filter_effects.as_ref(), counters.as_ref());
+    send_after_response_handoffs();
+}
+
+/// Sends the bounded requests modules handed over while the response was
+/// made, now the reader has it, so no reader waits on them. Best effort, as
+/// the pull sync after it is: a failed send is logged and dropped, and the
+/// module that handed it over has another path to the same outcome.
+fn send_after_response_handoffs() {
+    for handed in take_after_response_requests() {
+        let (parts, body) = handed.request.into_parts();
+        let request = HttpRequest::from_parts(parts, EdgeBody::from_bytes(body));
+        let sent = futures::executor::block_on(
+            crate::platform::FastlyPlatformHttpClient
+                .send(PlatformHttpRequest::new(request, handed.backend_name)),
+        );
+        match sent {
+            Ok(answer) => log::debug!(
+                "after-response handoff answered status={}",
+                answer.response.status().as_u16()
+            ),
+            // The platform's error may name the address, so it is not logged.
+            Err(_) => log::debug!("after-response handoff failed to send"),
+        }
+    }
 }
 
 fn edge_error_response(error: EdgeError) -> HttpResponse {

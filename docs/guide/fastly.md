@@ -13,6 +13,33 @@ The row above summarizes the
 response does not prove that configuration loaded: Fastly serves `/health`
 before it constructs the application.
 
+## Request deadline boundary
+
+Fastly provides no guest timer to `RuntimeServices`. A module such as
+`provenance.encypher` therefore cannot enforce `max_hold_ms` as a total elapsed
+deadline on this adapter. The configured backend timeout bounds time to the
+first response byte and the gap between response bytes. It does not bound the
+whole exchange: a peer that sends each byte before the gap timeout can keep
+the request open longer than `max_hold_ms`. Fastly KV calls also have no
+module-level elapsed deadline.
+
+Encypher still limits the signing API response while Fastly reads it. The
+buffered path reads the host body into an 8 KiB guest buffer and checks the
+cumulative count before appending. The streaming path checks the count before
+yielding each 8 KiB chunk. Fastly's host `select` operation does not preserve
+the per-request limit metadata, so the adapter rejects bounded or streaming
+pending handles passed to `select`; wait for those handles directly.
+
+With Encypher's `execution = "async_prepared"`, delivery makes no signing
+call. Lookups of published results and the live media policy check have the
+transport bounds above and no elapsed deadline. A large-media lookup needs no
+timer, because the worker already hashed the source. With
+`reader_trigger = true`, a hint is handed to the after-response lifetime: the
+adapter sends at most 8 handed-over requests of at most 8 KiB each after the
+reader's response, best effort and never retried. This hint path has not run
+against a live worker. See
+[Encypher prepared signing](./configuration#encypher-prepared-signing).
+
 ## Create a Fastly Account
 
 1. Go to [manage.fastly.com](https://manage.fastly.com) and create an account if you don't have one

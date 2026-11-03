@@ -48,6 +48,7 @@ trusted-server-core = { workspace = true }
 trusted-server-framework-nextjs = { workspace = true }
 trusted-server-headers-geo = { workspace = true }
 trusted-server-identity-lockr = { workspace = true }
+trusted-server-provenance-encypher = { workspace = true }
 trusted-server-shared-aws = { workspace = true }
 trusted-server-permission-signal-gpc = { workspace = true }
 trusted-server-permission-signal-gpp = { workspace = true }
@@ -66,6 +67,7 @@ js-sys = { workspace = true }
 worker = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 base64 = { workspace = true }
 edgezero-core = { workspace = true }

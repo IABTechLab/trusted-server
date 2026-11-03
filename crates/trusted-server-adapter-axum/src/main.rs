@@ -1,7 +1,11 @@
-use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
+use std::path::Path;
+
+use edgezero_adapter_axum::dev_server::AxumDevServerConfig;
 use edgezero_core::app::Hooks as _;
 use log::LevelFilter;
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_adapter_axum::platform::{KV_PATH_ENV, open_kv_handle};
+use trusted_server_adapter_axum::server;
 
 /// Environment variable that sets the maximum log level.
 const LOG_LEVEL_ENV: &str = "RUST_LOG";
@@ -26,7 +30,25 @@ fn main() {
         eprintln!("warning: logger init failed: {e}");
     }
 
-    let config = match port_from_env() {
+    // The publisher's preparation worker role: a separate long-lived
+    // process with its own exclusively owned store, never a task of the
+    // delivery server. `trusted-server-axum preparation-worker --config
+    // <worker.toml>`.
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.first().map(String::as_str) == Some("preparation-worker") {
+        if arguments.len() != 3 || arguments[1] != "--config" || arguments[2].is_empty() {
+            eprintln!("usage: trusted-server-axum preparation-worker --config <worker.toml>");
+            std::process::exit(2);
+        }
+        let path = &arguments[2];
+        if let Err(err) = trusted_server_preparation_worker::run(Path::new(path)) {
+            log::error!("{err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let mut config = match port_from_env() {
         // When PORT is set, bind to a specific address so integration tests
         // can allocate a fresh OS port each run and avoid TIME_WAIT flakiness.
         Some(port) => AxumDevServerConfig {
@@ -36,10 +58,38 @@ fn main() {
         // Normal development path: read bind address from axum.toml.
         None => AxumDevServerConfig::default(),
     };
+    // An explicit listener address supports a publisher's private control
+    // network and local multi-process staging without changing PORT's
+    // existing loopback-only behavior.
+    if let Some(address) = std::env::var_os("TS_LISTEN_ADDR") {
+        match address.to_str().and_then(|address| address.parse().ok()) {
+            Some(address) => config.addr = address,
+            None => {
+                log::error!("TS_LISTEN_ADDR must be a socket address");
+                std::process::exit(2);
+            }
+        }
+    }
 
     log::info!("Listening on http://{}", config.addr);
     let router = TrustedServerApp::routes();
-    if let Err(err) = AxumDevServer::with_config(router, config).run() {
+    let mut kv_handle = None;
+    if let Some(path) = std::env::var_os(KV_PATH_ENV).filter(|path| !path.is_empty()) {
+        // Construct the store once so every request shares one handle.
+        match open_kv_handle(Path::new(&path)) {
+            Ok(handle) => {
+                log::info!("Runtime KV: {}", Path::new(&path).display());
+                kv_handle = Some(handle);
+            }
+            Err(err) => {
+                log::error!("{KV_PATH_ENV} is set but the KV store cannot be opened: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+    // The adapter's own front end replaces `AxumDevServer`, whose service
+    // collects every streamed response into one buffer before sending it.
+    if let Err(err) = server::run(router, &config, kv_handle) {
         log::error!("trusted-server-adapter-axum failed: {err}");
         std::process::exit(1);
     }

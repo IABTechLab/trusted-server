@@ -418,6 +418,7 @@ mod tests {
             region: "us_east".to_string(),
             profile_set: "default_images".to_string(),
             origin_query: None,
+            signed_source: false,
         });
 
         let err = options_for_asset_request(&settings, &route, "")

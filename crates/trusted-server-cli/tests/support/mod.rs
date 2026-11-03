@@ -18,6 +18,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use trusted_server_cli::commands::dev::proxy::{ca, config, server};
 
+// Reuse process startup's installer without exposing a production API for tests.
+#[path = "../../src/tls.rs"]
+mod tls;
+
 /// The production hostname the matched rule rewrites from (and preserves).
 pub const FROM_HOST: &str = "www.example-publisher.com";
 pub const ALT_FROM_HOST: &str = "shop.example-publisher.com";
@@ -97,6 +101,7 @@ pub struct ObservedCert {
 /// The tempdir is leaked so the CA files outlive the test (they are tiny and
 /// the test process is short-lived).
 pub fn dev_ca() -> ca::CertAuthority {
+    tls::install_crypto_provider();
     let dir = tempfile::tempdir().expect("should create tempdir");
     let ca = ca::CertAuthority::load_or_generate(dir.path()).expect("should generate dev CA");
     // Keep the directory alive for the duration of the process.
@@ -237,6 +242,7 @@ fn upstream_identity() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)
 }
 
 fn upstream_tls_acceptor() -> TlsAcceptor {
+    tls::install_crypto_provider();
     let (chain, key) = upstream_identity();
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -1003,6 +1009,7 @@ impl ServerCertVerifier for AcceptAny {
 }
 
 fn accept_any_connector() -> TlsConnector {
+    tls::install_crypto_provider();
     let mut config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAny))
@@ -1660,6 +1667,7 @@ impl ServerCertVerifier for CapturingVerifier {
 }
 
 fn capturing_connector(slot: Arc<std::sync::Mutex<Option<String>>>) -> TlsConnector {
+    tls::install_crypto_provider();
     let mut config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(CapturingVerifier {

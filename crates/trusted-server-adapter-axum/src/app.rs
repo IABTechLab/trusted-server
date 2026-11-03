@@ -201,6 +201,7 @@ pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
         trusted_server_ad_tag_google::diagnostics::builder(),
         trusted_server_ads_txt_iabtl::builder(),
         trusted_server_headers_geo::builder(),
+        trusted_server_provenance_encypher::builder(),
         // Run by `[shared.51degrees]` rather than selected by a section.
         trusted_server_middleware_51degrees::builder(),
         // The analytics module `[analytics]` selects, which changes no page.
@@ -302,6 +303,9 @@ fn build_state_with_registrations_and_services(
     integrations: &[IntegrationBuilder],
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    // Every request's services carry the Tokio timer, see
+    // `crate::platform::build_runtime_services`.
+    trusted_server_core::platform::declare_platform_timer();
     // The modules this adapter links come first and the deployment's own
     // follow, which is the order their hooks run in.
     let integrations = module_builders_with(integrations);
@@ -448,7 +452,9 @@ impl AppState {
         if let Some(module) = self.registry.device_module() {
             services = services.with_device_module(module);
         }
-        services = services.with_identifier_modules(self.registry.identifier_modules());
+        services = services
+            .with_identifier_modules(self.registry.identifier_modules())
+            .with_media_signer(self.registry.media_signer());
         if let Some(module) = self.registry.asset_cache_module() {
             services = services.with_asset_cache_module(module);
         }
@@ -980,8 +986,15 @@ async fn dispatch_asset_fallback(
     let asset_route = &state.settings.proxy.asset_routes[index];
     let answer = match state.registry.route_source(&state.settings, index) {
         Ok(source) => {
-            handle_asset_proxy_request(&state.settings, services, req, asset_route, source.as_ref())
-                .await
+            handle_asset_proxy_request(
+                &state.settings,
+                services,
+                &state.registry,
+                req,
+                asset_route,
+                source.as_ref(),
+            )
+            .await
         }
         Err(report) => Err(report),
     };
@@ -1769,6 +1782,7 @@ mod tests {
                 "ad-tag.google.diagnostics",
                 "ads-txt.iabtl",
                 "headers.geo",
+                "provenance.encypher",
                 "51degrees",
                 "analytics.tinybird",
                 "auction-protocol.openrtb",
