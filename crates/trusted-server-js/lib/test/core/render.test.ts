@@ -49,9 +49,9 @@ describe('render', () => {
 
   it('stamps the first-party origin ahead of the creative markup', async () => {
     // The srcdoc document has an opaque origin and an about:srcdoc location, so
-    // the creative runtime has no trustworthy origin of its own. This page —
-    // first-party and non-opaque — stamps the real one before any bidder markup
-    // can install a <base> or otherwise influence resolution.
+    // the parent stamps its own origin before any bidder markup can install a
+    // <base>. This pins legacy relative click resolution and the endpoint
+    // fallback, not the higher-priority currentScript endpoint origin.
     const { buildCreativeDocument } = await import('../../src/core/render');
     const creativeHtml = '<div>creative</div>';
     const documentHtml = buildCreativeDocument(creativeHtml);
@@ -64,8 +64,9 @@ describe('render', () => {
 
   it('defines the stamped origin so creative script cannot overwrite it', async () => {
     // Creative markup can carry its own <head> script, whose content executes
-    // before the runtime injected at the top of <body>. A plain assignment
-    // would let it point click and rebuild resolution at an attacker origin.
+    // before the runtime injected at the top of <body>. The stamp stays fixed,
+    // but does not prevent that script from shadowing document.currentScript
+    // and choosing the runtime's higher-priority endpoint origin.
     const { buildCreativeDocument } = await import('../../src/core/render');
     const documentHtml = buildCreativeDocument('<div>creative</div>');
 

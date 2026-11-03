@@ -20,9 +20,10 @@ rejected until replaced.
 
 ```toml
 [publisher]
-domain = "publisher.com"
-cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
+domain = "publisher.example"
+cookie_domain = ".publisher.example"
+origin_url = "https://origin.publisher.example"
+public_origin = "https://ads.publisher.example"
 proxy_secret = "publisher_proxy_secret"
 
 [ec]
@@ -37,8 +38,8 @@ read by the deployed application at request time.
 
 ```bash
 # Format: TRUSTED_SERVER__SECTION__FIELD
-export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
-export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
+export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.example
+export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.example
 # Secret overrides, when needed, are key names—not secret values.
 export TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
 export TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
@@ -314,6 +315,7 @@ Core publisher settings for domain, origin, and proxy configuration.
 | `domain`                       | String  | Yes      | Publisher's apex domain name                                                         |
 | `cookie_domain`                | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                               |
 | `origin_url`                   | String  | Yes      | Full URL of publisher origin server                                                  |
+| `public_origin`                | String  | No       | Browser-facing Trusted Server origin used in rewritten creative URLs                 |
 | `origin_host_header_override`  | String  | No       | Outbound Host header to send while connecting to `origin_url`                        |
 | `proxy_secret`                 | String  | Yes      | Secret-store key name for the proxy URL secret                                       |
 | `max_buffered_body_bytes`      | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB)          |
@@ -327,26 +329,34 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ```toml
 [publisher]
-domain = "publisher.com"
-cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
+domain = "publisher.example"
+cookie_domain = ".publisher.example"
+origin_url = "https://origin.publisher.example"
+# Browser-facing origin within the EC cookie scope .publisher.example.
+public_origin = "https://ads.publisher.example"
 # Optional: connect to origin_url but send this outbound Host header.
-# origin_host_header_override = "www.publisher.com"
+# origin_host_header_override = "www.publisher.example"
 proxy_secret = "publisher_proxy_secret"
 ```
 
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
-TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.com
-TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
+TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.example
+TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.example
+TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.example
+TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=https://ads.publisher.example
+TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.example
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 TRUSTED_SERVER__PUBLISHER__ALLOW_ASYNC_HTML_FINISH=false
 TRUSTED_SERVER__PUBLISHER__HTML_FINALIZATION_TIMEOUT_MS=5000
 ```
+
+Environment overlays replace existing TOML scalar leaves only. In particular,
+add `public_origin` under `[publisher]` before relying on
+`TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN`; an override for a missing leaf is
+silently ignored. The example TOML above includes that leaf.
 
 ### Field Details
 
@@ -400,6 +410,67 @@ TRUSTED_SERVER__PUBLISHER__HTML_FINALIZATION_TIMEOUT_MS=5000
 - ❌ `origin.publisher.com` (missing protocol)
 
 **Port Handling**: Includes port if non-standard (not 80/443).
+
+#### `public_origin` {#public_origin}
+
+**Purpose**: Browser-facing Trusted Server origin used for first-party URLs emitted into rewritten creatives, including proxy, click, and injected TSJS URLs.
+
+This is distinct from `origin_url`, which is only the backend connection target.
+It is static configuration, not a value derived from request headers or
+`[trusted_forwarder]`. General creative rewriting, sign/rebuild responses and
+injected creative runtime URLs use this setting or its HTTPS/domain fallback.
+
+The publisher inline SSAT/page-bids path instead uses its nonempty request
+origin, which can come from an authenticated `[trusted_forwarder]`. Only an empty
+request origin falls back to `publisher.public_origin` or its default. Inline
+creatives do not inject the creative runtime. Configure `publisher.public_origin`
+to match the browser-facing request origin if both paths should emit the same
+authority.
+
+Use `publisher.domain` or one of its subdomains for deployed traffic. The EC
+cookie is scoped to `.{publisher.domain}`, independently of `cookie_domain`.
+Proxy and click requests to a host outside that scope carry no EC cookie and
+cannot forward the EC ID. For example, `domain = "publisher.example"` allows
+`public_origin = "https://ads.publisher.example"` within that cookie scope.
+This does not enable cross-origin credentials: runtime fetches still use
+`credentials: 'same-origin'`, so even an in-scope endpoint on a different origin
+does not receive cookies on those fetches. No CORS grants are added.
+
+**Format**: An `http` or `https` origin with a host and optional port, without userinfo, path, query, fragment, or a trailing slash. HTTPS is recommended for deployed publisher traffic; HTTP is supported for direct localhost development.
+
+After validation, the shared configuration loader normalizes accepted values to
+the URL parser's serialized origin for output and stored config. For example,
+`HTTPS://ADS.EXAMPLE.COM:443` becomes `https://ads.example.com`. Parser-accepted
+shorthand such as `https:ads.example.com` also becomes
+`https://ads.example.com`. Invalid origin components are rejected before
+normalization, not silently discarded.
+
+**Default**: When omitted, Trusted Server uses `https://{publisher.domain}`.
+Omission keeps old configuration files deserializable, not their previous URL
+authority behavior. Previously root-relative creative URLs followed the serving
+page's scheme, host, and port; the new default does not preserve those values.
+`ts config validate` and `ts config push` warn when this field is omitted.
+Set this field to the actual browser-facing Trusted Server endpoint, including
+its port when needed, rather than the backend `origin_url`. For direct local
+development on port 8080, for example, use `http://localhost:8080`.
+
+::: warning Upgrade sequencing and rollback for `public_origin`
+Older publisher schemas deny unknown fields and reject an explicit
+`public_origin`. Deploy the new binary before pushing a config that sets it.
+During a rolling upgrade, omitted `public_origin` emits absolute URLs on
+`https://{publisher.domain}` from new binaries and root-relative URLs from old
+ones. Verify that the fallback endpoint serves the proxy, click, and TSJS routes
+before using that sequence. If it does not, activate the new binary and explicit
+config together.
+
+Before rolling back, remove `public_origin` and its environment override, run
+`ts config validate`, and push the resulting config before restoring the old
+binary. New binaries use the fallback during that interval; coordinate the
+binary and config rollback if that endpoint cannot serve traffic. Old binaries
+resume root-relative output. Omitting the field from a config does not preserve
+an explicit origin's scheme, host, or port. Keep the public endpoint available
+while previously emitted absolute creative URLs may still be used.
+:::
 
 #### `origin_host_header_override`
 
@@ -580,7 +651,13 @@ cannot establish trust. Missing or invalid authentication falls back to the
 runtime transport origin. Hostname case and default ports canonicalize for
 comparison.
 
-The validated public origin supplies URL rewriting and trace Origin checks.
+The validated request origin supplies publisher-page URL rewriting, inline
+SSAT/page-bids creative URLs and trace Origin checks. It does not override the
+static [`publisher.public_origin`](#public_origin) used by general creative
+rewriting, sign/rebuild responses and injected creative runtime URLs. Without
+an explicit `publisher.public_origin`, those paths use
+`https://{publisher.domain}` even when the forwarder establishes a different
+request origin.
 The actual ingress URI, Host, TLS metadata, target provenance and cookie-header
 fidelity remain transport facts. Trace actions still require an exact browser
 Origin, same-origin Fetch Metadata, the action control, no query and an empty
@@ -2219,10 +2296,12 @@ configs too: whenever either setting is on, a bidder-supplied `<base>` element
 loses its `href`; it keeps a `target` and is removed when it has none (before
 this release the whole element was removed). With `sanitize_creatives = true`,
 the sanitizer removes `<base>` entirely before the rewrite pass. The `POST /auction` path emits
-root-relative endpoints and, when either setting is on, injects the creative
-TSJS runtime exactly once, whether or not the bidder supplied a `<body>`, since bare
-fragments are the common `adm` shape. The foreign-origin SSAT renderer emits
-absolute endpoints and does not inject that bundle. With all three disabled,
+absolute endpoints on the [configured public origin](#public_origin) and,
+when either setting is on, injects the
+creative TSJS runtime exactly once, whether or not the bidder supplied a
+`<body>`, since bare fragments are the common `adm` shape. The foreign-origin
+SSAT renderer retains its request-origin override and does not inject that
+bundle. With all three disabled,
 `adm` ships exactly as the bidder returned it, except that a creative larger than the
 1 MiB per-creative cap is rejected in every mode and its `adm` is dropped.
 Accepted external URLs are not host allowlisted by the sanitizer.

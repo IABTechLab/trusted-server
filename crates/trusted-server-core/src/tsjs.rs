@@ -59,17 +59,6 @@ pub fn tsjs_unified_script_src() -> String {
     "/static/tsjs=tsjs-unified.min.js".to_string()
 }
 
-/// `<script>` tag for the unified bundle when exact module IDs are unavailable.
-///
-/// See [`tsjs_unified_script_src`] for details.
-#[must_use]
-pub fn tsjs_unified_script_tag() -> String {
-    format!(
-        "<script src=\"{}\" id=\"trustedserver-js\"></script>",
-        tsjs_unified_script_src()
-    )
-}
-
 /// `/static` URL for one module with its own cache-busting hash.
 #[must_use]
 pub fn tsjs_single_module_script_src(module_id: &str) -> String {
@@ -269,11 +258,6 @@ mod tests {
             src, "/static/tsjs=tsjs-unified.min.js",
             "registry-free unified helper should not emit an unverifiable hash"
         );
-        assert_eq!(
-            tsjs_unified_script_tag(),
-            format!(r#"<script src="{src}" id="trustedserver-js"></script>"#),
-            "should wrap the registry-free unified source"
-        );
     }
 
     #[test]
@@ -336,17 +320,12 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_unified_script_src_and_tag_omit_unverifiable_cache_busting_hash() {
+    fn tsjs_unified_script_src_omits_unverifiable_cache_busting_hash() {
         let src = tsjs_unified_script_src();
 
         assert_eq!(
             src, "/static/tsjs=tsjs-unified.min.js",
             "should use the unified script URL without an unverifiable hash"
-        );
-        assert_eq!(
-            tsjs_unified_script_tag(),
-            format!(r#"<script src="{src}" id="trustedserver-js"></script>"#),
-            "should wrap the unified source in a trusted server script tag"
         );
     }
 
