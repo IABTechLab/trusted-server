@@ -65,6 +65,8 @@ pub struct AppState {
     services: Option<RuntimeServices>,
     #[cfg(feature = "lab-store-check")]
     pub(crate) config_sha256: Option<String>,
+    #[cfg(feature = "lab-store-check")]
+    pub(crate) public_origin: Option<crate::lab_public_origin::LabPublicOrigin>,
     partners: PartnerRegistry,
     ec_graph: Option<Arc<dyn Fn() -> KvIdentityGraph + Send + Sync>>,
 }
@@ -107,6 +109,8 @@ fn build_state_with_services(
         services,
         #[cfg(feature = "lab-store-check")]
         config_sha256: None,
+        #[cfg(feature = "lab-store-check")]
+        public_origin: None,
         partners,
         ec_graph: None,
     }))
@@ -212,7 +216,7 @@ where
         }
     }
     let mut req = ctx.into_request()?;
-    apply_native_ingress(&mut req)?;
+    apply_request_ingress(&state, &mut req)?;
     if req.uri().path() == trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH {
         req = match trusted_server_core::ec::consent_update::prepare_consent_update(&services, req)
             .await
@@ -230,6 +234,14 @@ where
     Ok(handler(state, services, req)
         .await
         .unwrap_or_else(|e| http_error(&e)))
+}
+
+fn apply_request_ingress(_state: &AppState, request: &mut Request) -> Result<(), EdgeError> {
+    #[cfg(feature = "lab-store-check")]
+    if let Some(origin) = &_state.public_origin {
+        return origin.apply(request);
+    }
+    apply_native_ingress(request)
 }
 
 // ---------------------------------------------------------------------------
@@ -949,6 +961,10 @@ impl TrustedServerApp {
         Ok(build_router(Some(state)))
     }
 }
+
+#[cfg(all(test, feature = "lab-store-check"))]
+#[path = "lab_public_origin_tests.rs"]
+mod lab_public_origin_tests;
 
 fn build_router(state: Option<Arc<AppState>>) -> RouterService {
     let fallback = fallback_handler();

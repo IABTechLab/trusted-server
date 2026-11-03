@@ -95,6 +95,14 @@ pub(crate) fn apply_native_ingress(request: &mut Request) -> Result<(), EdgeErro
             .to_owned(),
         scheme: metadata.effective_scheme().as_str().to_owned(),
     };
+    install_public_url(request, info)
+}
+
+/// Keep URL rewriting, direct URI/backend consumers and diagnostics in agreement.
+pub(crate) fn install_public_url(
+    request: &mut Request,
+    info: RequestInfo,
+) -> Result<(), EdgeError> {
     // Some core consumers read URI/Host directly rather than RequestInfo.
     // Normalize all three representations from the same checked facts so an
     // absolute request target cannot override the selected public scheme.

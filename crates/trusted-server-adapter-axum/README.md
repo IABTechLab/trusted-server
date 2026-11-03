@@ -45,8 +45,9 @@ admin handler. PUT accepts `{"value":"proof"}` and checks read-back, GET reads
 without writing, and DELETE checks absence. All use the fixed key
 `ts-lab/store-check`. Success JSON contains `config_sha256`, `scheme`, `host`,
 `key`, and nullable `value`. The checksum is the adopted envelope's payload
-checksum before secret resolution. Scheme/host come only from checked native
-ingress, not raw forwarding headers. Responses are not cacheable. Provider
+checksum before secret resolution. Scheme/host come from the same approved
+URI/Host/RequestInfo facts used by real URL rewriting and backend consumers,
+not raw forwarding headers. Responses are not cacheable. Provider
 failures return non-success without credentials or remote response bodies.
 
 Build the app with the root Dockerfile and
@@ -59,9 +60,25 @@ operator CLI at `/usr/local/bin/ts`; it is not a deployment CLI extension.
 On Linux the pinned celld provider uses reqwest 0.13's platform verifier and
 native CA loader. A deployment-injected public CA can be selected with
 `SSL_CERT_FILE=/etc/ts-lab/ca.pem`; the file must be readable by UID 10001.
-Keep TLS verification enabled. The diagnostic does not add a fixed-public-origin
-option or change trusted proxy policy. Fly HTTPS scheme/host acceptance must be
-proved separately.
+Keep TLS verification enabled.
+
+For a single-host lab behind HTTPS termination, the optional
+`TS_LAB_PUBLIC_ORIGIN=https://lab.example.com` supplies fixed public URL facts
+without enabling forwarding-header trust. It is available only with
+`lab-store-check` and absent by default. Startup requires an HTTPS origin whose
+authority exactly equals the adopted `publisher.domain`. Userinfo, paths including
+a trailing slash, queries and fragments fail startup before listening.
+The origin is captured once; changing it or publisher configuration requires a
+restart.
+
+Application handlers reject a missing, duplicate or mismatched Host. An absolute
+request target must also agree with the configured HTTPS origin. They never
+repair a hostile authority or derive public facts from forwarding headers.
+Approved requests retain their path/query/body and receive the same HTTPS facts
+in URI, Host and RequestInfo. Native ingress client address and geography remain
+unchanged. The local `/health` route does not consume public URL facts. This does
+not authenticate an ingress proxy or change the framework's trusted proxy policy.
+Fly HTTPS acceptance still requires live deployment proof.
 
 Run the actual disposable-service proof with dummy tokens and a native TLS
 scoped service granting config read/write to the operator and config read plus

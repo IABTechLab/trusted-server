@@ -11,6 +11,8 @@ pub mod ec_kv;
 /// Prepared native KV bridge.
 #[cfg(feature = "celld-kv")]
 pub mod kv;
+#[cfg(feature = "lab-store-check")]
+mod lab_public_origin;
 /// Existing-admin-protected lab storage diagnostic.
 #[cfg(feature = "lab-store-check")]
 pub mod lab_store_check;

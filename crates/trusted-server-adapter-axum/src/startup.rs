@@ -278,9 +278,10 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
             serde_json::from_str(envelope.as_ref()).map_err(|_| {
                 configuration_error("verified config envelope could not be decoded")
             })?;
-        Arc::get_mut(&mut state)
-            .expect("should uniquely own initializing app state")
-            .config_sha256 = Some(adopted.sha256);
+        let state = Arc::get_mut(&mut state).expect("should uniquely own initializing app state");
+        state.public_origin =
+            crate::lab_public_origin::LabPublicOrigin::from_env(&state.settings.publisher.domain)?;
+        state.config_sha256 = Some(adopted.sha256);
     }
     // EC records stay live. Only the validated provider handle is shared, never
     // mutable identity rows in the immutable config/secret snapshot.
