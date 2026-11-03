@@ -88,7 +88,7 @@
 
 use std::cell::RefCell;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
@@ -123,6 +123,7 @@ use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::provider::ClientSignals;
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
@@ -151,7 +152,7 @@ use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
-use trusted_server_identity_providers::{build_coordinator, partner_registry};
+use trusted_server_identity_providers::{build_coordinator_with, partner_registry};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -200,6 +201,27 @@ pub(crate) struct AppState {
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
+    /// Partner registry built on first use and reused for the state's lifetime.
+    pub(crate) partner_registry: OnceLock<Arc<PartnerRegistry>>,
+}
+
+impl AppState {
+    /// Returns the partner registry, building it on first use.
+    ///
+    /// A failed build is not cached, so every caller sees its error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`partner_registry`].
+    pub(crate) fn partner_registry(
+        &self,
+    ) -> Result<Arc<PartnerRegistry>, Report<TrustedServerError>> {
+        if let Some(registry) = self.partner_registry.get() {
+            return Ok(Arc::clone(registry));
+        }
+        let registry = Arc::new(partner_registry(&self.settings.ec)?);
+        Ok(Arc::clone(self.partner_registry.get_or_init(|| registry)))
+    }
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -245,6 +267,7 @@ pub(crate) fn build_state_from_settings(
         registry: Arc::new(registry),
         default_kv_store,
         auction_telemetry_sink,
+        partner_registry: OnceLock::new(),
     }))
 }
 
@@ -383,7 +406,23 @@ async fn dispatch_identity_lookups(
     req: &Request,
     ec: &mut EcRequestState,
 ) -> Option<IdentityLookups> {
-    let coordinator = match build_coordinator(&state.settings) {
+    if !state
+        .settings
+        .ec
+        .identity_providers
+        .iter()
+        .any(|config| config.enabled)
+    {
+        return None;
+    }
+    let partners = match state.partner_registry() {
+        Ok(partners) => partners,
+        Err(report) => {
+            log::error!("Identity providers disabled for this request: {report:?}");
+            return None;
+        }
+    };
+    let coordinator = match build_coordinator_with(&state.settings, partners) {
         Ok(Some(coordinator)) => coordinator,
         Ok(None) => return None,
         Err(report) => {
@@ -678,7 +717,8 @@ async fn execute_named(
         handler,
         NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
     ) {
-        let response = partner_registry(&state.settings.ec)
+        let response = state
+            .partner_registry()
             .and_then(|registry| match handler {
                 NamedRouteHandler::AdminEcLookup => {
                     // Deliberately do not use an EC request-state graph: that
@@ -759,7 +799,7 @@ async fn run_named_route(
                 cors_preflight_identify(&state.settings, &req)
             } else {
                 let kv = crate::require_identity_graph(&state.settings)?;
-                let partner_registry = partner_registry(&state.settings.ec)?;
+                let partner_registry = state.partner_registry()?;
                 handle_identify(
                     &state.settings,
                     &kv,
@@ -773,11 +813,11 @@ async fn run_named_route(
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Auction => {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Auction);
-            let partner_registry = partner_registry(&state.settings.ec)?;
+            let partner_registry = state.partner_registry()?;
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
-                Some(&partner_registry)
+                Some(&*partner_registry)
             };
             handle_auction(
                 &state.settings,
@@ -797,11 +837,11 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 return Ok(page_bids_preflight_denied());
             }
-            let partner_registry = partner_registry(&state.settings.ec)?;
+            let partner_registry = state.partner_registry()?;
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
-                Some(&partner_registry)
+                Some(&*partner_registry)
             };
             let auction = AuctionDispatch {
                 integration_registry: &state.registry,
@@ -844,7 +884,7 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
-        let partner_registry = partner_registry(&state.settings.ec)?;
+        let partner_registry = state.partner_registry()?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
         handle_batch_sync(&kv, &partner_registry, &limiter, req)
     });
@@ -985,13 +1025,13 @@ async fn dispatch_fallback(
         // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
         // server-side EIDs, same as the legacy auction.
         let slots = state.settings.creative_opportunity_slots();
-        match partner_registry(&state.settings.ec) {
+        match state.partner_registry() {
             Ok(partner_registry) => {
                 let auction = AuctionDispatch {
                     integration_registry: &state.registry,
                     orchestrator: &state.orchestrator,
                     slots,
-                    registry: Some(&partner_registry),
+                    registry: Some(&*partner_registry),
                 };
                 match handle_publisher_request(
                     &state.settings,
@@ -1749,6 +1789,7 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
+            partner_registry: std::sync::OnceLock::new(),
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -2754,6 +2795,19 @@ mod tests {
     }
 
     #[test]
+    fn partner_registry_is_built_once_per_state() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+
+        let first = state.partner_registry().expect("should build the registry");
+        let second = state.partner_registry().expect("should reuse the registry");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "should return the cached registry"
+        );
+    }
+
+    #[test]
     fn navigation_without_fetch_metadata_mints_no_ec() {
         let router = test_router();
         let mut request = consented_navigation(empty_request(Method::GET, "/article"));
@@ -2993,6 +3047,7 @@ mod tests {
 
         let result = crate::apply_edgezero_ec_finalize(
             &settings,
+            None,
             &mut state,
             Some(super::IdentityLookups {
                 coordinator,

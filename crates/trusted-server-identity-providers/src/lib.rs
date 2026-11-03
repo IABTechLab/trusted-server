@@ -64,37 +64,40 @@ pub fn build(
 pub fn build_coordinator(
     settings: &Settings,
 ) -> Result<Option<ProviderCoordinator>, Report<ProviderConfigError>> {
-    let enabled: Vec<&IdentityProviderConfig> = settings
+    let partners = partner_registry(&settings.ec)
+        .map_err(|report| report.change_context(ProviderConfigError::Invalid))?;
+    build_coordinator_with(settings, Arc::new(partners))
+}
+
+/// Builds the coordinator for every enabled provider in `settings` against an
+/// already built partner registry.
+///
+/// Enabled providers with an unregistered kind are skipped; building the
+/// registry with [`partner_registry`] already warned about them.
+///
+/// # Errors
+///
+/// Returns [`ProviderConfigError`] when a provider cannot be built or fails
+/// the coordinator's configuration checks.
+pub fn build_coordinator_with(
+    settings: &Settings,
+    partners: Arc<PartnerRegistry>,
+) -> Result<Option<ProviderCoordinator>, Report<ProviderConfigError>> {
+    let registered = settings
         .ec
         .identity_providers
         .iter()
-        .filter(|config| config.enabled)
-        .filter(|config| {
-            let registered = is_registered_kind(config.kind());
-            if !registered {
-                log::warn!(
-                    "Identity provider '{}' skipped: kind '{}' is not registered",
-                    config.id,
-                    config.kind()
-                );
-            }
-            registered
-        })
-        .collect();
-    if enabled.is_empty() {
-        return Ok(None);
-    }
-    let registered = enabled
-        .into_iter()
+        .filter(|config| config.enabled && is_registered_kind(config.kind()))
         .map(|config| {
             build(config, &config.secrets)
                 .map(|provider| RegisteredProvider::new(config.clone(), provider))
         })
         .collect::<Result<Vec<_>, Report<ProviderConfigError>>>()?;
-    let partners = partner_registry(&settings.ec)
-        .map_err(|report| report.change_context(ProviderConfigError::Invalid))?;
+    if registered.is_empty() {
+        return Ok(None);
+    }
     let budget = Duration::from_millis(settings.ec.identity_budget_ms);
-    ProviderCoordinator::new(registered, Arc::new(partners), budget).map(Some)
+    ProviderCoordinator::new(registered, partners, budget).map(Some)
 }
 
 #[cfg(test)]

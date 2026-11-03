@@ -553,7 +553,13 @@ fn edgezero_main(
 
     if let Some(mut ec_state) = ec_state {
         if let Some(settings) = settings_snapshot.as_deref() {
-            match apply_edgezero_ec_finalize(settings, &mut ec_state, identity, &mut response) {
+            match apply_edgezero_ec_finalize(
+                settings,
+                app_state.as_deref(),
+                &mut ec_state,
+                identity,
+                &mut response,
+            ) {
                 Ok(partner_registry) => {
                     send_edgezero_response(
                         response,
@@ -574,6 +580,7 @@ fn edgezero_main(
                 Ok(settings) => {
                     match apply_edgezero_ec_finalize(
                         &settings,
+                        None,
                         &mut ec_state,
                         identity,
                         &mut response,
@@ -657,10 +664,11 @@ fn apply_entry_point_finalize_headers(
 /// panics.
 fn apply_edgezero_ec_finalize(
     settings: &Settings,
+    state: Option<&AppState>,
     ec_state: &mut EcFinalizeState,
     identity: Option<IdentityLookups>,
     response: &mut HttpResponse,
-) -> Result<PartnerRegistry, Report<TrustedServerError>> {
+) -> Result<Arc<PartnerRegistry>, Report<TrustedServerError>> {
     // A redirect skips the write, so do not wait for lookups it would discard.
     let identity = identity.filter(|_| {
         let redirect = NavigationPermit::is_redirect(response.status());
@@ -679,7 +687,10 @@ fn apply_edgezero_ec_finalize(
         let results = futures::executor::block_on(coordinator.collect(&transport, pending));
         ec_state.ec_context.set_lookup_results(results);
     }
-    let partner_registry = partner_registry(&settings.ec)?;
+    let partner_registry = match state {
+        Some(state) => state.partner_registry()?,
+        None => Arc::new(partner_registry(&settings.ec)?),
+    };
     let finalize_kv_graph = if ec_state.use_finalize_kv {
         maybe_identity_graph(settings)
     } else {
