@@ -26,9 +26,9 @@ use error_stack::Report;
 use serde::Deserialize;
 use trusted_server_core::ec::eid_types::SourceDomain;
 use trusted_server_core::ec::provider::{
-    IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities, ProviderCommon,
-    ProviderConfigError, ProviderEid, ProviderError, ProviderKind, ProviderRequest,
-    ProviderResponse, RequestCookies,
+    CookieRead, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities, ProviderCommon,
+    ProviderConfigError, ProviderError, ProviderKind, ProviderRequest, ProviderResponse,
+    RequestCookies,
 };
 
 use crate::common::{
@@ -152,9 +152,11 @@ impl IdentityProvider for LiveRampProvider {
     fn read_request_cookies<'cookie>(
         &self,
         cookies: RequestCookies<'cookie>,
-    ) -> Option<Vec<ProviderEid<'cookie>>> {
-        let envelope = self.cookies.read(cookies, envelope)?;
-        Some(vec![cookie_eid(
+    ) -> CookieRead<'cookie> {
+        let Some(envelope) = self.cookies.read(cookies, envelope) else {
+            return CookieRead::Absent;
+        };
+        CookieRead::Found(vec![cookie_eid(
             &self.source,
             Cow::Owned(envelope),
             bounded_expiry(Some(ENVELOPE_TTL)),
@@ -166,6 +168,8 @@ impl IdentityProvider for LiveRampProvider {
 mod tests {
     use serde_json::json;
     use trusted_server_core::consent::types::ConsentContext;
+    use trusted_server_core::ec::eid_types::{EidValidationError, UidValue};
+    use trusted_server_core::ec::kv_types::MAX_UID_LENGTH;
     use trusted_server_core::ec::provider::{
         ClientSignals, OwnedEntries, ProviderExpiry, build_kind,
     };
@@ -189,7 +193,9 @@ mod tests {
     }
 
     fn read(provider: &dyn IdentityProvider, header: &str) -> Option<(String, ProviderExpiry)> {
-        let eids = provider.read_request_cookies(RequestCookies::new(header))?;
+        let eids = provider
+            .read_request_cookies(RequestCookies::new(header))
+            .into_found()?;
         assert_eq!(eids.len(), 1, "should return one EID");
         assert_eq!(
             eids[0].source, "liveramp.example.com",
@@ -218,6 +224,35 @@ mod tests {
                 "should keep for 15 days"
             );
         }
+    }
+
+    #[test]
+    fn collects_envelopes_up_to_the_uid_length_limit_and_drops_longer_ones() {
+        let provider = provider(&json!({}));
+
+        for len in [703, 1000, MAX_UID_LENGTH] {
+            let raw = "A".repeat(len);
+            let ats = encoded(&json!({ "envelope": raw }), &STANDARD);
+            for header in [format!("idl_env={raw}"), format!("_lr_env={ats}")] {
+                let (id, _) = read(&*provider, &header).expect("should read the envelope");
+
+                assert_eq!(id.len(), len, "should keep the whole envelope");
+                assert!(
+                    UidValue::try_from(id).is_ok(),
+                    "should pass validation at {len} bytes"
+                );
+            }
+        }
+
+        let (id, _) = read(
+            &*provider,
+            &format!("idl_env={}", "A".repeat(MAX_UID_LENGTH + 1)),
+        )
+        .expect("should read the oversized envelope");
+        assert!(
+            matches!(UidValue::try_from(id), Err(EidValidationError::UidTooLong)),
+            "should drop an envelope over the UID length limit in validation"
+        );
     }
 
     #[test]

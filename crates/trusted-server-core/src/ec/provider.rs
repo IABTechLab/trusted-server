@@ -60,16 +60,19 @@ pub trait IdentityProvider {
 
     /// Reads IDs from the vendor's own first-party cookies on the request.
     ///
-    /// Runs before any lookup for providers with due sources. Returned
-    /// entries go through the same validation, consent gates and write plan
-    /// as lookup results, and a kept UID makes the provider skip its lookup
-    /// for this navigation. The default reads nothing.
+    /// Runs on every consented navigation, before the due check, so a
+    /// changed cookie or an opt-out is noticed even while the provider's
+    /// sources hold live UIDs. Returned entries go through the same
+    /// validation, consent gates and write plan as lookup results, and a
+    /// kept UID makes the provider skip its lookup for this navigation.
+    /// [`CookieRead::OptedOut`] skips the lookup and removes the provider's
+    /// stored UIDs. The default reads nothing.
     fn read_request_cookies<'cookie>(
         &self,
         cookies: RequestCookies<'cookie>,
-    ) -> Option<Vec<ProviderEid<'cookie>>> {
+    ) -> CookieRead<'cookie> {
         let _ = cookies;
-        None
+        CookieRead::Absent
     }
 }
 
@@ -95,8 +98,36 @@ impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
     fn read_request_cookies<'cookie>(
         &self,
         cookies: RequestCookies<'cookie>,
-    ) -> Option<Vec<ProviderEid<'cookie>>> {
+    ) -> CookieRead<'cookie> {
         (**self).read_request_cookies(cookies)
+    }
+}
+
+/// What a provider found in the vendor's own first-party cookies.
+#[derive(Debug)]
+pub enum CookieRead<'cookie> {
+    /// The cookies hold IDs.
+    Found(Vec<ProviderEid<'cookie>>),
+    /// The cookies record that the user opted out of the vendor.
+    OptedOut,
+    /// The cookies hold no usable ID and no opt-out.
+    Absent,
+}
+
+impl<'cookie> CookieRead<'cookie> {
+    /// The IDs found, or `None` for an opt-out or no ID.
+    #[must_use]
+    pub fn into_found(self) -> Option<Vec<ProviderEid<'cookie>>> {
+        match self {
+            Self::Found(eids) => Some(eids),
+            Self::OptedOut | Self::Absent => None,
+        }
+    }
+}
+
+impl<'cookie> From<Option<Vec<ProviderEid<'cookie>>>> for CookieRead<'cookie> {
+    fn from(eids: Option<Vec<ProviderEid<'cookie>>>) -> Self {
+        eids.map_or(Self::Absent, Self::Found)
     }
 }
 

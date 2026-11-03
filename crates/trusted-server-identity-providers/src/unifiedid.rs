@@ -13,8 +13,8 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use trusted_server_core::ec::eid_types::SourceDomain;
 use trusted_server_core::ec::provider::{
-    EidLevelFields, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities,
-    ProviderCommon, ProviderConfigError, ProviderEid, ProviderError, ProviderKind, ProviderRequest,
+    CookieRead, EidLevelFields, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities,
+    ProviderCommon, ProviderConfigError, ProviderError, ProviderKind, ProviderRequest,
     ProviderResponse, RequestCookies,
 };
 
@@ -119,8 +119,10 @@ impl IdentityProvider for UnifiedIdProvider {
     fn read_request_cookies<'cookie>(
         &self,
         cookies: RequestCookies<'cookie>,
-    ) -> Option<Vec<ProviderEid<'cookie>>> {
-        let id = self.cookies.read(cookies, tdid)?;
+    ) -> CookieRead<'cookie> {
+        let Some(id) = self.cookies.read(cookies, tdid) else {
+            return CookieRead::Absent;
+        };
         let mut eid = device_eid(&self.source, Cow::Owned(id), bounded_expiry(None));
         eid.inserter = Some(Cow::Borrowed(TDID_INSERTER));
         eid.matcher = Some(Cow::Borrowed(TDID_INSERTER));
@@ -128,7 +130,7 @@ impl IdentityProvider for UnifiedIdProvider {
         for uid in &mut eid.uids {
             uid.ext = Some(Cow::Borrowed(self.uid_ext));
         }
-        Some(vec![eid])
+        CookieRead::Found(vec![eid])
     }
 }
 
@@ -169,6 +171,7 @@ mod tests {
 
         let eids = provider()
             .read_request_cookies(RequestCookies::new(&header))
+            .into_found()
             .expect("should read the TDID");
 
         let eid = &eids[0];
@@ -205,6 +208,7 @@ mod tests {
             assert!(
                 provider()
                     .read_request_cookies(RequestCookies::new(&header(&cookie)))
+                    .into_found()
                     .is_none(),
                 "should ignore {cookie}"
             );
@@ -212,6 +216,7 @@ mod tests {
         assert!(
             provider()
                 .read_request_cookies(RequestCookies::new("pbjs-unifiedid={broken"))
+                .into_found()
                 .is_none(),
             "should ignore malformed JSON"
         );

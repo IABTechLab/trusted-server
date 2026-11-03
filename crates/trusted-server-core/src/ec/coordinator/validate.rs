@@ -11,6 +11,10 @@ use crate::ec::kv_types::{KvEid, KvUid};
 use crate::ec::provider::{EidLevelFields, EidShape, ProviderEid, ProviderExpiry, ProviderUid};
 use crate::ec::registry::PartnerRegistry;
 
+/// Longest a provider-stated absolute expiry may lie after the request:
+/// 30 days. Cookie- and vendor-supplied timestamps are clamped to it.
+const MAX_ABSOLUTE_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Policy one response is validated against.
 pub(crate) struct ValidationPolicy<'a> {
     /// Owner recorded on every kept UID.
@@ -128,7 +132,9 @@ fn stored_uid(
     let ext = uid.ext.as_deref().map(RawJson::try_from).transpose()?;
     let expiry = match uid.expiry {
         ProviderExpiry::Unspecified => Expiry::Never,
-        ProviderExpiry::At(at) => Expiry::At(at),
+        ProviderExpiry::At(at) => {
+            Expiry::At(at.min(policy.now.saturating_add_secs(MAX_ABSOLUTE_EXPIRY_SECS)))
+        }
         ProviderExpiry::After(after) => Expiry::At(policy.now.saturating_add_secs(after.as_secs())),
     };
     if !expiry.is_live(policy.now) {
@@ -230,6 +236,35 @@ mod tests {
             uids[1].expiry(),
             Expiry::At(UnixSeconds::new(1060)),
             "should resolve relative expiry"
+        );
+    }
+
+    #[test]
+    fn clamps_absolute_expiry_to_thirty_days() {
+        let partners = registry();
+        let provider = ProviderId::new("example-provider");
+        let claimed = claimed();
+        let mut far = uid("u-far");
+        far.expiry = ProviderExpiry::At(UnixSeconds::new(u64::MAX));
+        let mut near = uid("u-near");
+        near.expiry = ProviderExpiry::At(UnixSeconds::new(5000));
+
+        let (entries, dropped) = validate(
+            vec![eid("ids.example.com", vec![far, near])],
+            &policy(&provider, &claimed, &partners),
+        );
+
+        assert_eq!(dropped, DropCounts::default(), "should drop nothing");
+        let uids = entries[0].1[0].uids();
+        assert_eq!(
+            uids[0].expiry(),
+            Expiry::At(UnixSeconds::new(1000 + MAX_ABSOLUTE_EXPIRY_SECS)),
+            "should clamp a far expiry to now plus 30 days"
+        );
+        assert_eq!(
+            uids[1].expiry(),
+            Expiry::At(UnixSeconds::new(5000)),
+            "should keep a near expiry"
         );
     }
 

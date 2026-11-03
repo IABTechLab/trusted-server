@@ -291,6 +291,16 @@ impl CookieReader {
         self.own.is_empty() && self.lockr.is_empty()
     }
 
+    /// Whether any configured cookie, own or Lockr, has a value matching
+    /// `matches`.
+    pub(crate) fn any(&self, cookies: RequestCookies<'_>, matches: impl Fn(&str) -> bool) -> bool {
+        self.own
+            .iter()
+            .chain(self.lockr.iter())
+            .filter_map(|name| cookies.get(name))
+            .any(matches)
+    }
+
     /// Returns the first value `parse` accepts, trying the own cookies
     /// before the Lockr cookies.
     pub(crate) fn read<'cookie, T>(

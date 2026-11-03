@@ -25,12 +25,12 @@ use crate::consent::{allows_eid_persistence, has_tcf_vendor_consent};
 use crate::ec::EcKvSnapshot;
 use crate::ec::consent::ec_consent_granted;
 use crate::ec::eid_types::{ProviderId, SourceDomain, UnixSeconds};
-use crate::ec::kv_types::KvEntry;
+use crate::ec::kv_types::{KvEid, KvEntry};
 use crate::ec::page_load::RowChange;
 use crate::ec::provider::{
-    ClientSignals, IdentityProvider, LookupInput, LookupOutcome, OwnedEntries, ProviderConfigError,
-    ProviderEid, ProviderResponse, RequestCookies, SourceInput, destination_allowed, parse_sources,
-    validate_enabled_configs,
+    ClientSignals, CookieRead, IdentityProvider, LookupInput, LookupOutcome, OwnedEntries,
+    ProviderConfigError, ProviderEid, ProviderResponse, RequestCookies, SourceInput,
+    destination_allowed, parse_sources, validate_enabled_configs,
 };
 use crate::ec::rate_limiter::RateLimiter;
 use crate::ec::registry::PartnerRegistry;
@@ -338,10 +338,17 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         status: LookupStatus,
         entries: ValidatedEntries,
     ) -> ProviderLookup {
+        let registered = &self.providers[provider.get()];
+        let cleared = if status == LookupStatus::Skipped(SkipReason::OptedOut) {
+            registered.policy.sources.to_vec()
+        } else {
+            Vec::new()
+        };
         ProviderLookup {
-            provider: self.providers[provider.get()].id.clone(),
+            provider: registered.id.clone(),
             status,
             entries,
+            cleared,
         }
     }
 
@@ -474,6 +481,37 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 continue;
             }
             let (due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
+            // The vendor's own first-party cookies are read on every
+            // navigation, so an opt-out or a changed ID is noticed while the
+            // sources still hold live UIDs. Their IDs stand in for a lookup.
+            match registered.provider.read_request_cookies(lookup.cookies) {
+                CookieRead::OptedOut => {
+                    log::debug!(
+                        "Identity lookup: provider={} opted out in its cookies",
+                        registered.id
+                    );
+                    pending.early.push(skip(SkipReason::OptedOut));
+                    continue;
+                }
+                CookieRead::Found(eids) => {
+                    let found = self.validated(provider, eids, lookup.now);
+                    if matches!(found.status, LookupStatus::Found { .. }) {
+                        // A cookie repeating the held UIDs is not rewritten,
+                        // so its relative expiry does not cause a write on
+                        // every navigation.
+                        if due.is_empty() && holds_same_uids(entry, &found, lookup.now) {
+                            pending.early.push(skip(SkipReason::NotDue));
+                        } else {
+                            pending.from_cookies.push(Tagged {
+                                provider,
+                                value: found,
+                            });
+                        }
+                        continue;
+                    }
+                }
+                CookieRead::Absent => {}
+            }
             if due.is_empty() {
                 pending.early.push(skip(if input_blocked {
                     SkipReason::Input
@@ -481,19 +519,6 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                     SkipReason::NotDue
                 }));
                 continue;
-            }
-            // IDs in the vendor's own first-party cookies stand in for a
-            // lookup. Only providers with due sources read them, so a held
-            // live UID is not rewritten on every navigation.
-            if let Some(eids) = registered.provider.read_request_cookies(lookup.cookies) {
-                let found = self.validated(provider, eids, lookup.now);
-                if matches!(found.status, LookupStatus::Found { .. }) {
-                    pending.from_cookies.push(Tagged {
-                        provider,
-                        value: found,
-                    });
-                    continue;
-                }
             }
             if Self::rate_limited(registered, lookup) {
                 pending.early.push(skip(SkipReason::RateLimited));
@@ -583,6 +608,32 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
     }
 }
 
+/// Whether the row already holds exactly the UIDs `found` read from cookies,
+/// for every source `found` returned.
+fn holds_same_uids(entry: Option<&KvEntry>, found: &ProviderLookup, now: UnixSeconds) -> bool {
+    let Some(entry) = entry else {
+        return false;
+    };
+    found.entries.iter().all(|(source, eids)| {
+        let Some(record) = entry.ids.get(source.as_str()) else {
+            return false;
+        };
+        let held: HashSet<&str> = record
+            .eids()
+            .iter()
+            .flat_map(KvEid::uids)
+            .filter(|uid| uid.is_live(now))
+            .map(|uid| uid.id().as_str())
+            .collect();
+        let read: HashSet<&str> = eids
+            .iter()
+            .flat_map(KvEid::uids)
+            .map(|uid| uid.id().as_str())
+            .collect();
+        held == read
+    })
+}
+
 fn log_outcome(lookup: &ProviderLookup) {
     let (kept, dropped) = match lookup.status {
         LookupStatus::Found { kept, dropped } => (kept, dropped.total()),
@@ -666,9 +717,14 @@ mod tests {
         fn read_request_cookies<'cookie>(
             &self,
             cookies: RequestCookies<'cookie>,
-        ) -> Option<Vec<ProviderEid<'cookie>>> {
-            let id = cookies.get(self.1?)?;
-            Some(vec![ProviderEid {
+        ) -> CookieRead<'cookie> {
+            let Some(id) = self.1.and_then(|name| cookies.get(name)) else {
+                return CookieRead::Absent;
+            };
+            if id == "optout" {
+                return CookieRead::OptedOut;
+            }
+            CookieRead::Found(vec![ProviderEid {
                 source: Cow::Borrowed("ids.example.com"),
                 inserter: None,
                 matcher: None,
@@ -836,6 +892,24 @@ mod tests {
         consent: &ConsentContext,
         limiter: &dyn RateLimiter,
     ) -> LookupResults {
+        run_with_cookies(
+            coordinator,
+            transport,
+            snapshot,
+            consent,
+            limiter,
+            "vendor_id=c-1",
+        )
+    }
+
+    fn run_with_cookies(
+        coordinator: &ProviderCoordinator<EchoProvider>,
+        transport: &CannedTransport,
+        snapshot: &EcKvSnapshot,
+        consent: &ConsentContext,
+        limiter: &dyn RateLimiter,
+        cookies: &str,
+    ) -> LookupResults {
         let context = LookupContext {
             ec_id: EC_ID,
             snapshot,
@@ -845,7 +919,7 @@ mod tests {
                 user_agent: None,
             },
             publisher_domain: "www.example.com",
-            cookies: RequestCookies::new("vendor_id=c-1"),
+            cookies: RequestCookies::new(cookies),
             rate_limiter: limiter,
             now: UnixSeconds::new(1000),
         };
@@ -1199,6 +1273,87 @@ mod tests {
             lookup.entries[0].1[0].uids()[0].id().as_str(),
             "c-1",
             "should store the cookie value"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send no lookup");
+    }
+
+    fn cookie_coordinator() -> ProviderCoordinator<EchoProvider> {
+        coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            cookie_provider(SourceInput::Anonymous, Some("vendor_id")),
+        ))
+    }
+
+    fn held_snapshot(id: &str) -> EcKvSnapshot {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry
+            .ids
+            .insert("ids.example.com".to_owned(), provider_record(id));
+        seeded_snapshot(&entry)
+    }
+
+    #[test]
+    fn cookie_opt_out_skips_the_lookup_and_clears_the_sources() {
+        let coordinator = cookie_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        for snapshot in [missing(), held_snapshot("p-1")] {
+            let results = run_with_cookies(
+                &coordinator,
+                &transport,
+                &snapshot,
+                &granting(),
+                &Limiter(false),
+                "vendor_id=optout",
+            );
+
+            let lookup = results.iter().next().expect("should report the provider");
+            assert_eq!(
+                lookup.status,
+                LookupStatus::Skipped(SkipReason::OptedOut),
+                "should skip for the opt-out"
+            );
+            assert_eq!(
+                lookup.cleared,
+                [SourceDomain::try_from("ids.example.com").expect("should parse")],
+                "should clear the provider's sources"
+            );
+        }
+        assert!(transport.sent.borrow().is_empty(), "should send no lookup");
+    }
+
+    #[test]
+    fn changed_cookie_replaces_a_held_live_uid() {
+        let coordinator = cookie_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &held_snapshot("p-1"), &granting());
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            matches!(lookup.status, LookupStatus::Found { kept: 1, .. }),
+            "should read the changed cookie although the source is not due"
+        );
+        assert_eq!(
+            lookup.entries[0].1[0].uids()[0].id().as_str(),
+            "c-1",
+            "should store the new cookie value"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send no lookup");
+    }
+
+    #[test]
+    fn unchanged_cookie_for_a_held_uid_is_not_rewritten() {
+        let coordinator = cookie_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &held_snapshot("c-1"), &granting());
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NotDue),
+            "should skip a cookie repeating the held UID"
         );
         assert!(transport.sent.borrow().is_empty(), "should send no lookup");
     }

@@ -1,7 +1,7 @@
 //! Plans a navigation's single row change.
 //!
 //! Combines browser ingest (fill missing) and validated provider results
-//! (replace the provider's sources), prunes expired UIDs and enforces
+//! (replace the provider's sources, or remove them on an opt-out), prunes expired UIDs and enforces
 //! [`MAX_ENTRY_BYTES`]. Pure: no I/O.
 //!
 //! A provider-owned source takes a browser UID only as a fallback: when the
@@ -68,7 +68,13 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
         input
             .lookups
             .iter()
-            .flat_map(|lookup| lookup.entries.iter().map(|(source, _)| source))
+            .flat_map(|lookup| {
+                lookup
+                    .entries
+                    .iter()
+                    .map(|(source, _)| source)
+                    .chain(&lookup.cleared)
+            })
             .collect()
     } else {
         Vec::new()
@@ -156,6 +162,14 @@ fn apply_lookups(
 ) -> Vec<SourceDomain> {
     let mut written = Vec::new();
     for lookup in lookups.iter() {
+        for source in &lookup.cleared {
+            if entry.ids.remove(source.as_str()).is_some() {
+                log::info!(
+                    "EC write planner: removing '{source}' after provider '{}' opt-out",
+                    lookup.provider
+                );
+            }
+        }
         for (source, eids) in &lookup.entries {
             if let Some(record) = KvPartnerId::from_eids(eids.clone(), now) {
                 entry.ids.insert(source.as_str().to_owned(), record);
@@ -269,6 +283,7 @@ mod tests {
                     SourceDomain::try_from(source).expect("should build source"),
                     vec![KvEid::new(EidFields::default(), uids)],
                 )],
+                cleared: Vec::new(),
             }],
         )
     }
@@ -498,6 +513,7 @@ mod tests {
                 provider: ProviderId::new("example-provider"),
                 status,
                 entries: Vec::new(),
+                cleared: Vec::new(),
             }],
         )
     }
@@ -511,6 +527,36 @@ mod tests {
             KvPartnerId::from_eids(eids, UnixSeconds::new(1000)).expect("should build record"),
         );
         entry
+    }
+
+    #[test]
+    fn opt_out_removes_the_provider_sources_and_blocks_browser_fallback() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let snapshot = present(&provider_entry(&["p-1"]));
+        let ingest = ingest_owned();
+        let lookups = LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::Skipped(SkipReason::OptedOut),
+                entries: Vec::new(),
+                cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
+            }],
+        );
+
+        // Act
+        let change = plan_write(&input(&snapshot, None, &ingest, &lookups, &registry))
+            .expect("should plan update");
+
+        // Assert
+        let RowChange::Update { entry, .. } = change else {
+            panic!("should update existing row")
+        };
+        assert!(
+            !entry.ids.contains_key("ids.example.com"),
+            "should remove the opted-out source without a browser fallback"
+        );
     }
 
     #[test]

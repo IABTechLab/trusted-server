@@ -1065,6 +1065,7 @@ mod tests {
                     SourceDomain::try_from("provider.example.com").expect("should build source"),
                     vec![KvEid::new(EidFields::default(), vec![uid])],
                 )],
+                cleared: Vec::new(),
             }],
         ));
         let graph = KvIdentityGraph::in_memory("test_store");
