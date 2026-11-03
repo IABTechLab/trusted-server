@@ -35,7 +35,8 @@ fi
 
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
 ORIGIN_PID=$SMOKE_ORIGIN_PID
-smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT"
+# The positive case uses the final listener in the case sequence.
+smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT" "$((BASE_PORT + 4))"
 sed \
     -e "s|= \"crates/|= \"$REPO_ROOT/crates/|g" \
     -e "s|manifest = \"fastly.toml\"|manifest = \"$REPO_ROOT/fastly.toml\"|" \

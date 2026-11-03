@@ -64,7 +64,8 @@ origin_url = "https://origin.example.com"
 # Use domain or one of its subdomains to stay within the EC cookie scope.
 # Replace this placeholder before deployment. Keep this leaf for env overlays.
 # Review the fallback and coordinated upgrade/rollback warning before deployment:
-# docs/guide/configuration.md#public_origin
+# See public_origin under Publisher configuration:
+# docs/guide/configuration.md#publisher-configuration
 public_origin = "https://ads.example.com"
 # Secret Store key for the HMAC secret used to sign first-party proxy URLs.
 proxy_secret = "publisher_proxy_secret"
