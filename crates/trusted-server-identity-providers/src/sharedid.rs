@@ -3,7 +3,8 @@
 //!
 //! Prebid stores the ID as a bare UUID in `_sharedid` (the publisher's
 //! configured name) or the legacy `_pubcid`. It is sent as a device-based
-//! (agent type 1) EID. The opt-out cookie `_pubcid_optout` suppresses it.
+//! (agent type 1) EID. The opt-out cookie `_pubcid_optout` reports an
+//! opt-out, which removes a stored `SharedID`.
 //! No server call is made.
 
 use std::borrow::Cow;
@@ -12,9 +13,9 @@ use error_stack::Report;
 use serde::Deserialize;
 use trusted_server_core::ec::eid_types::SourceDomain;
 use trusted_server_core::ec::provider::{
-    IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities, ProviderCommon,
-    ProviderConfigError, ProviderEid, ProviderError, ProviderKind, ProviderRequest,
-    ProviderResponse, RequestCookies,
+    CookieRead, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities, ProviderCommon,
+    ProviderConfigError, ProviderError, ProviderKind, ProviderRequest, ProviderResponse,
+    RequestCookies,
 };
 
 use crate::common::{CookieReader, bounded_expiry, cookie_capabilities, device_eid, is_usable_id};
@@ -92,14 +93,17 @@ impl IdentityProvider for SharedIdProvider {
     fn read_request_cookies<'cookie>(
         &self,
         cookies: RequestCookies<'cookie>,
-    ) -> Option<Vec<ProviderEid<'cookie>>> {
+    ) -> CookieRead<'cookie> {
         if cookies.get(OPT_OUT_COOKIE).is_some() {
-            return None;
+            return CookieRead::OptedOut;
         }
-        let id = self
+        let Some(id) = self
             .cookies
-            .read(cookies, |value| is_usable_id(value).then_some(value.trim()))?;
-        Some(vec![device_eid(
+            .read(cookies, |value| is_usable_id(value).then_some(value.trim()))
+        else {
+            return CookieRead::Absent;
+        };
+        CookieRead::Found(vec![device_eid(
             &self.source,
             Cow::Borrowed(id),
             bounded_expiry(None),
@@ -126,7 +130,9 @@ mod tests {
     }
 
     fn read(header: &str) -> Option<String> {
-        let eids = provider().read_request_cookies(RequestCookies::new(header))?;
+        let eids = provider()
+            .read_request_cookies(RequestCookies::new(header))
+            .into_found()?;
         assert_eq!(
             eids[0].source, "sharedid.example.com",
             "should use the source"
@@ -153,8 +159,13 @@ mod tests {
     #[test]
     fn honours_opt_out_and_ignores_blank_ids() {
         assert!(
-            read("_sharedid=sharedid-example; _pubcid_optout=1").is_none(),
-            "should honour the opt-out cookie"
+            matches!(
+                provider().read_request_cookies(RequestCookies::new(
+                    "_sharedid=sharedid-example; _pubcid_optout=1"
+                )),
+                CookieRead::OptedOut
+            ),
+            "should report the opt-out cookie"
         );
         for header in ["_sharedid=", "_sharedid=0", "other=1"] {
             assert!(read(header).is_none(), "should ignore {header}");

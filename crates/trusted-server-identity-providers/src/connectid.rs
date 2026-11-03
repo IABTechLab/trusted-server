@@ -22,8 +22,8 @@ use error_stack::Report;
 use serde::Deserialize;
 use trusted_server_core::ec::eid_types::{SourceDomain, UnixSeconds};
 use trusted_server_core::ec::provider::{
-    IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities, ProviderCommon,
-    ProviderConfigError, ProviderEid, ProviderError, ProviderExpiry, ProviderKind, ProviderRequest,
+    CookieRead, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities, ProviderCommon,
+    ProviderConfigError, ProviderError, ProviderExpiry, ProviderKind, ProviderRequest,
     ProviderResponse, RequestCookies,
 };
 
@@ -136,9 +136,11 @@ impl IdentityProvider for ConnectIdProvider {
     fn read_request_cookies<'cookie>(
         &self,
         cookies: RequestCookies<'cookie>,
-    ) -> Option<Vec<ProviderEid<'cookie>>> {
-        let (id, expiry) = self.cookies.read(cookies, connect_id)?;
-        Some(vec![cookie_eid(&self.source, Cow::Owned(id), expiry)])
+    ) -> CookieRead<'cookie> {
+        let Some((id, expiry)) = self.cookies.read(cookies, connect_id) else {
+            return CookieRead::Absent;
+        };
+        CookieRead::Found(vec![cookie_eid(&self.source, Cow::Owned(id), expiry)])
     }
 }
 
@@ -163,7 +165,9 @@ mod tests {
 
     fn read(cookie: &serde_json::Value) -> Option<(String, ProviderExpiry)> {
         let header = format!("connectId={}", urlencoding::encode(&cookie.to_string()));
-        let eids = provider().read_request_cookies(RequestCookies::new(&header))?;
+        let eids = provider()
+            .read_request_cookies(RequestCookies::new(&header))
+            .into_found()?;
         assert_eq!(
             eids[0].source, "connectid.example.com",
             "should use the source"
@@ -237,6 +241,7 @@ mod tests {
         assert!(
             provider()
                 .read_request_cookies(RequestCookies::new("connectId={broken"))
+                .into_found()
                 .is_none(),
             "should ignore malformed JSON"
         );

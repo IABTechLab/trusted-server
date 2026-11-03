@@ -11,9 +11,9 @@ use error_stack::Report;
 use serde::Deserialize;
 use trusted_server_core::ec::eid_types::SourceDomain;
 use trusted_server_core::ec::provider::{
-    IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities, ProviderCommon,
-    ProviderConfigError, ProviderEid, ProviderError, ProviderKind, ProviderRequest,
-    ProviderResponse, RequestCookies,
+    CookieRead, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities, ProviderCommon,
+    ProviderConfigError, ProviderError, ProviderKind, ProviderRequest, ProviderResponse,
+    RequestCookies,
 };
 
 use crate::common::{CookieReader, bounded_expiry, cookie_capabilities, device_eid, is_usable_id};
@@ -88,11 +88,14 @@ impl IdentityProvider for CriteoProvider {
     fn read_request_cookies<'cookie>(
         &self,
         cookies: RequestCookies<'cookie>,
-    ) -> Option<Vec<ProviderEid<'cookie>>> {
-        let id = self
+    ) -> CookieRead<'cookie> {
+        let Some(id) = self
             .cookies
-            .read(cookies, |value| is_usable_id(value).then_some(value.trim()))?;
-        Some(vec![device_eid(
+            .read(cookies, |value| is_usable_id(value).then_some(value.trim()))
+        else {
+            return CookieRead::Absent;
+        };
+        CookieRead::Found(vec![device_eid(
             &self.source,
             Cow::Borrowed(id),
             bounded_expiry(None),
@@ -122,6 +125,7 @@ mod tests {
     fn stores_the_bid_id_verbatim() {
         let eids = provider()
             .read_request_cookies(RequestCookies::new("cto_bidid=bidid-example%3D%3D"))
+            .into_found()
             .expect("should read the bid ID");
 
         assert_eq!(
@@ -142,6 +146,7 @@ mod tests {
             assert!(
                 provider()
                     .read_request_cookies(RequestCookies::new(header))
+                    .into_found()
                     .is_none(),
                 "should ignore {header}"
             );

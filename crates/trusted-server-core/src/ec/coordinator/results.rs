@@ -63,8 +63,8 @@ pub enum SkipReason {
     Destination,
     /// The provider's hourly rate limit is reached.
     RateLimited,
-    /// The vendor reports an opt-out; the provider's stored UIDs are
-    /// removed.
+    /// The vendor or its cookies report an opt-out; the provider's stored
+    /// UIDs are removed.
     OptedOut,
 }
 
