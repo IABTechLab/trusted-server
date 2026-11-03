@@ -1,11 +1,31 @@
 # Issue 854 closure acceptance
 
-Status, 2026-11-03: The cacheable synchronous candidate improves the reproduced cold/warm lab timings. **Keep the PR draft. Do not merge or close the issue.** Acceptance of synchronous loading and the changed critical-script outage boundary remains pending, and real-GPT inventory is still missing. The November 2 contract and failed inline/deferred measurements below remain historical evidence.
+Current review follow-up: **Synchronous unified loading and its no-fallback critical-script outage boundary are explicitly accepted. Keep the PR draft; do not merge or close the issue while dedicated real-GPT inventory and live proof are missing.** The earlier deferred-loading contract, diagnostic approval flags and measurements below remain historical evidence, not results for the changed runtime and migrated verifier.
 
 Issue: https://github.com/IABTechLab/trusted-server/issues/854
 PR: https://github.com/IABTechLab/trusted-server/pull/1460
 
-## November 3 recovery candidate
+## Approved loading contract and review follow-up
+
+The supported GPT profile must load its versioned unified runtime synchronously, after configuration and before publisher scripts. A held critical request blocks parser progress until release; release must restore the complete APIs and one eligible initial request. A failed critical request leaves TS APIs and delivery unavailable, without an inline fallback or retry, on ordinary and enforced-CSP pages. These dependencies and outage behavior are accepted instead of the earlier parser-progress requirement. Separately deferred integrations retain their own ordering.
+
+Full CWV, framework and real-GPT consumers now target that contract. A `runtime-deferred` negative control deliberately defers only the critical tag and must expose unavailable early publisher APIs and late execution; reservation removal must still reproduce measured layout shift. Test-only diagnostic scopes remain ineligible for full acceptance.
+
+The review follow-up also repairs registered-slot trace bindings, requires current production-JS source fingerprints and exact exported-runtime/distribution byte agreement, initializes acceptance journals before source capture, and checks creative-marker intersection through the complete frame chain. These changes require fresh compiled artifacts and verification; the earlier byte-equivalence claims do not apply to the changed source.
+
+### Review follow-up verification
+
+Evidence: `~/.cache/ts-854-acceptance/review-follow-up-1apsXh/`. The historical measurement JSON is unchanged.
+
+- All 32 selected verification commands pass: fresh 14-module JS build, 2,195 Vitest tests across 78 files, JS lint/format, docs format/build, Rust formatting, 106 Node tests, native core tests, all eight Clippy aliases, all five adapter test aliases including Fastly reuse, 28 parity cases, native digest test/lint, clock/Node-pin/domain checks, production WASM build/stamp and both production HTML exports. Existing ignored Rust cases remain ignored. Unchanged deadline-runtime, EOF and documentation-proposal fixture commands were not rerun.
+- The five declared CWV conditions each pass all 64 samples, totaling 320 samples and 200 repeated measurement observations. Both `runtime-deferred` and `reservation-removed` controls pass in every profile. Real HTTP cache reuse, normal/CSP failure boundaries and explicit recovery assertions remain enforced.
+- The initial controller journal remains **failed**, not relabeled: its new framework assertions incorrectly treated exclusive source end offsets as inclusive. A subsequent framework attempt also exposed React reporting the expected publisher failure through its console error boundary rather than an uncaught `pageerror`. Both test assumptions are corrected; the final actual Rust/Next.js gate passes all 20 inline and 20 shared-template cases, plus both real-provider preflights. The interrupted attempt's owned worker, Viceroy and container were cleaned up.
+- Passing measurements are reused rather than rerun after these two test-spec corrections. `reuse-proof.json` verifies 523 unchanged captured source files, all 55 immutable input files, current production-JS source/distribution validation and every 64-sample profile. Only the framework/live test specs changed among the captured inputs. The final framework run uses the same frozen WASM, dist, Prebid and prepared configurations. The original failed controller journal remains intact; no new end-to-end controller success is claimed.
+- Standalone TypeScript still reports 315 inherited diagnostics, with no new or increased file/code/message signatures. The configured Vitest type assertions pass. Final Node checks and framework/live-spec formatting also pass after the test refinements.
+
+Dedicated real-GPT inventory remains unavailable. Live delivery, genuine original-main GAM reproduction and deployed behavior are unverified, and `liveAcceptancePassed` remains false. Keep this PR draft and the issue open. No Google traffic, deployment or publisher activation was performed.
+
+## November 3 recovery candidate (historical checkpoint)
 
 The supported GPT profile now uses the existing versioned synchronous unified bundle, with configuration before execution and neither raw nor compiled early bootstrap embedded in HTML. Other browser-module profiles retain their provisional initializer unless actual enforced CSP requires omission. Diagnostics, trace, attribution/APS metadata, reservation and separately deferred integration order remain intact. No production flag, retry, codec or public registration-protocol change is introduced.
 
@@ -30,7 +50,7 @@ The synchronous candidate does not satisfy outcome 1 of the earlier closure cont
 
 Evidence is under `/home/pav/.cache/ts-854-acceptance/recovery-2026-11-03/`: `screen-cold/`, `screen-warm/`, `outages/`, `full-contract-rejection/`, `gates/`, `unified-iife.log` and `all-node.log`. The measurement JSON adds `recovery20261103` with all 80 new metric rows, four outage observations, source/report/tooling hashes and the new WASM hash. Its original 200 measurements and historical blocked status are unchanged. The screen used its recorded initial tooling; the later opt-in outage extension is separately tested against the same production bytes, not relabeled as a timing rerun. Both independent read-only cross-reviews found no additional correctness findings in the loader or diagnostic changes.
 
-## Closure contract
+## Original closure contract (historical)
 
 The PR must demonstrate these outcomes through the production HTML transformation and compiled JavaScript:
 
@@ -98,7 +118,7 @@ node scripts/test-client-cwv-acceptance.mjs \
   --runs 5 --out /absolute/new-acceptance-evidence
 ```
 
-Keep evidence outside Git. The wrapper snapshots all supplied exports, bundles, WASM/stamps and inventory before execution, passes the selected dist to every consumer, verifies candidate source fingerprints and matching baseline toolchain/dependency pins, and checks that source and snapshotted inputs remain unchanged through completion.
+Keep evidence outside Git. The wrapper snapshots all supplied exports, bundles, WASM/stamps and inventory before execution, passes the selected dist to every consumer, verifies complete candidate production-JS source fingerprints, matching baseline toolchain/dependency pins and exact runtime bytes against the selected dist, and checks that source and snapshotted inputs remain unchanged through completion. It invalidates an earlier successful journal before attempting source capture.
 
 It runs:
 
@@ -106,7 +126,7 @@ It runs:
 - Offline registration contracts and explicit legacy automatic-mode diagnostic controls. The latter are not mislabeled as original-main real-GPT evidence.
 - Actual Rust/Next.js inline and shared-template contracts.
 - Four comparison arms in five declared conditions: normal cold/warm, slower mobile cold/warm, and a controlled 750 ms runtime hold. Every arm runs at mobile and desktop widths with alternating repeated samples.
-- Parser-blocking and reservation-removal negative controls. Warm runs must observe genuine HTTP cache reuse, including the successful runtime, without Playwright routing disabling that cache.
+- Critical-runtime deferral and reservation-removal negative controls under the approved synchronous contract. Warm runs must observe genuine HTTP cache reuse, including the successful runtime, without Playwright routing disabling that cache.
 - Original-main and candidate real-GPT acceptance with actual provider admission, per-slot network membership, public lifecycle correlation and visible creative checks.
 
 The slower mobile condition is 4x CPU, 100 ms network latency, 1,600 kbit/s download and 750 kbit/s upload. It is a declared lab condition, not a claim about all mobile visitors. Normal conditions have no artificial runtime hold or throttling. Timing distributions and transfer costs are reported without selecting a favorable sample or introducing an improvement threshold after measurement.

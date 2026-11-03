@@ -12,11 +12,7 @@ import { runtimeUrl } from "../../helpers/state.js";
 import type { PublisherController } from "../../../fixtures/frameworks/nextjs/app/publisher-registration/RegisteredSlot";
 
 const { creative, pucPage } = require("../../publisher-registration/pages.cjs");
-const {
-  scriptBlocks,
-  withoutEarlyRenderer,
-  rendererAsset,
-} = require("../../cwv/html.cjs");
+const { scriptBlocks, rendererAsset } = require("../../cwv/html.cjs");
 const enabled = process.env.PUBLISHER_REGISTRATION_RUN === "1";
 test.skip(
   !enabled,
@@ -40,6 +36,8 @@ interface FixtureWindow extends Window {
   tsjs: {
     publisherSlotRegistrationVersion?: number;
     tsRenderBridgeVersion?: number;
+    registerPublisherSlot?: unknown;
+    scheduleInitialAdInit?: unknown;
     navGeneration?: number;
     adSlots?: Array<{ id: string; initialization?: string }>;
     bids?: Record<string, { hb_adid?: string; debug_bid?: unknown }>;
@@ -73,13 +71,10 @@ interface Session {
   consoleErrors: string[];
   external: string[];
   auctions: string[];
-  mainBundle?: string;
-  blockedRuntime: string[];
-  rendererInterventions: Array<{
-    originalSha256: string;
-    servedSha256: string;
-    removedEarly: boolean;
-  }>;
+  runtimeRequests: string[];
+  runtimeRoutes: Route[];
+  releaseRuntime(): Promise<void>;
+  expectedErrors: string[];
   pending: Promise<void>[];
   held: Route[];
   expectedHydrationFailure?: boolean;
@@ -110,8 +105,8 @@ async function install(
   page: Page,
   options: {
     holdFrames?: boolean;
-    blockRenderer?: boolean;
-    blockRuntime?: boolean;
+    holdRuntime?: boolean;
+    failRuntime?: boolean;
     failHydration?: boolean;
     holdHydration?: boolean;
   } = {},
@@ -123,13 +118,20 @@ async function install(
     consoleErrors: [],
     external: [],
     auctions: [],
-    blockedRuntime: [],
-    rendererInterventions: [],
+    runtimeRequests: [],
+    runtimeRoutes: [],
+    async releaseRuntime() {
+      holdRuntime = false;
+      for (const route of session.runtimeRoutes.splice(0))
+        await route.continue();
+    },
+    expectedErrors: [],
     pending: [],
     held: [],
     expectedHydrationFailure: options.failHydration,
   };
   sessions.set(page, session);
+  let holdRuntime = !!options.holdRuntime;
   let holdHydration = !!options.holdHydration;
   const hydrationRoutes: Route[] = [];
   session.releaseHydration = async () => {
@@ -280,20 +282,19 @@ async function install(
       session.held.push(route);
       return;
     }
-    if (
-      (options.blockRenderer || options.blockRuntime) &&
-      rendererAsset(url.pathname)
-    ) {
-      const response = await route.fetch();
-      session.mainBundle = await response.text();
-      session.blockedRuntime.push(url.pathname);
-      return route.fulfill({ response, body: "" });
+    if (rendererAsset(url.pathname)) {
+      session.runtimeRequests.push(url.pathname);
+      if (holdRuntime) {
+        session.runtimeRoutes.push(route);
+        session.held.push(route);
+        return;
+      }
+      if (options.failRuntime) return route.abort("failed");
     }
     if (url.pathname === "/auction")
       session.auctions.push(route.request().postData() || "");
     if (
-      (process.env.PUBLISHER_REGISTRATION_ASSEMBLY === "shared" ||
-        options.blockRenderer) &&
+      process.env.PUBLISHER_REGISTRATION_ASSEMBLY === "shared" &&
       route.request().resourceType() === "document"
     ) {
       // Request interception adds browser no-cache semantics. Exercise an
@@ -309,23 +310,61 @@ async function install(
         expect(response.headers()["x-ts-template-cache"]).not.toBe(
           "bypass-request",
         );
-      if (options.blockRenderer) {
-        const original = await response.text();
-        const body = withoutEarlyRenderer(original);
-        session.rendererInterventions.push({
-          originalSha256: sha256(original),
-          servedSha256: sha256(body),
-          removedEarly: original !== body,
-        });
-        return route.fulfill({ response, body });
-      }
       return route.fulfill({ response });
     }
     return route.continue();
   });
 }
 
-async function ready(page: Page, renderer = true) {
+function assertRuntimeOrder(html: string) {
+  const scripts = scriptBlocks(html);
+  const runtimes = scripts.filter(
+    (script: { id: string }) => script.id === "trustedserver-js",
+  );
+  expect(runtimes).toHaveLength(1);
+  const runtime = runtimes[0];
+  expect(new URL(runtime.src, runtimeUrl("/")).pathname).toBe(
+    "/static/tsjs=tsjs-unified.min.js",
+  );
+  expect(html.slice(runtime.startOffset, runtime.endOffset)).not.toMatch(
+    /\s(?:async|defer)(?:\s|=|>)/,
+  );
+  for (const config of [
+    "window.__tsjs_gpt_enabled=true",
+    "window.__tsjs_prebid=",
+  ]) {
+    const script = scripts.find((entry: { content: string }) =>
+      entry.content.includes(config),
+    );
+    expect(
+      script,
+      `${config} must precede the synchronous runtime`,
+    ).toBeTruthy();
+    expect(script.endOffset).toBeLessThanOrEqual(runtime.startOffset);
+  }
+  expect(runtime.endOffset).toBeLessThanOrEqual(
+    html.indexOf('id="fixture-header-placeholder"'),
+  );
+  expect(
+    scripts.some(
+      (script: { id: string }) => script.id === "trustedserver-bootstrap",
+    ),
+  ).toBe(false);
+  for (const api of [
+    "publisherSlotRegistrationVersion",
+    "tsRenderBridgeVersion",
+  ]) {
+    expect(
+      scripts.some(
+        (script: { src: string | null; content: string }) =>
+          !script.src && script.content.includes(api),
+      ),
+      `no inline ${api} fallback`,
+    ).toBe(false);
+  }
+}
+
+async function ready(page: Page) {
   // Node-side polling still observes the real readiness conditions when a case
   // deliberately holds the page's animation frames to control dispatch order.
   await expect
@@ -346,7 +385,7 @@ async function ready(page: Page, renderer = true) {
     await page.evaluate(
       () => (window as unknown as FixtureWindow).tsjs.tsRenderBridgeVersion,
     ),
-  ).toBe(renderer ? 1 : undefined);
+  ).toBe(1);
   await page.evaluate(() => {
     const current = window as unknown as FixtureWindow;
     current.pbjs.onEvent("auctionInit", () =>
@@ -526,14 +565,13 @@ async function saveEvidence(page: Page, info: TestInfo) {
       {
         html: session.html,
         htmlSha256: session.html.map(sha256),
-        bootstrapSha256: session.html
-          .map(
-            (html) =>
-              scriptBlocks(html).find((script: { content: string }) =>
-                script.content.includes("publisherSlotRegistrationVersion"),
-              )?.content,
-          )
-          .map((bootstrap) => (bootstrap ? sha256(bootstrap) : null)),
+        runtimeScripts: session.html.map((html) =>
+          scriptBlocks(html).filter(
+            (script: { src: string | null }) =>
+              script.src &&
+              rendererAsset(new URL(script.src, runtimeUrl("/")).pathname),
+          ),
+        ),
         payloads: session.payloads,
       },
       null,
@@ -550,8 +588,8 @@ async function saveEvidence(page: Page, info: TestInfo) {
         consoleErrors: session.consoleErrors,
         external: session.external,
         auctions: session.auctions,
-        blockedRuntime: session.blockedRuntime,
-        rendererInterventions: session.rendererInterventions,
+        runtimeRequests: session.runtimeRequests,
+        expectedErrors: session.expectedErrors,
         expectedHydrationFailure: session.expectedHydrationFailure,
       },
       null,
@@ -604,7 +642,8 @@ test.afterEach(async ({ page }, info) => {
   const session = sessions.get(page);
   if (session) {
     expect(session.external).toEqual([]);
-    if (!session.expectedHydrationFailure) expect(session.errors).toEqual([]);
+    if (!session.expectedHydrationFailure)
+      expect(session.errors).toEqual(session.expectedErrors);
   }
 });
 
@@ -616,10 +655,7 @@ test("actual Rust HTML, admitted payload, delayed mount and later real Prebid re
   const html = (await response!.text()).replaceAll('\\"', '"');
   expect(html).toContain('"initialization":"publisher_registered"');
   expect(html).toContain("scheduleInitialAdInit");
-  expect(html.indexOf("publisherSlotRegistrationVersion")).toBeGreaterThan(-1);
-  expect(html.indexOf("publisherSlotRegistrationVersion")).toBeLessThan(
-    html.indexOf('id="fixture-header-placeholder"'),
-  );
+  assertRuntimeOrder(html);
   if (process.env.PUBLISHER_REGISTRATION_ASSEMBLY === "shared")
     expect(html).toContain('if(typeof s==="function")s(b,a)');
   else expect(html).toContain('if(typeof s==="function")s(b);');
@@ -934,71 +970,126 @@ test("legal no-bid still performs one scoped ordinary GAM delivery", async ({
   ).toBeUndefined();
 });
 
-test("bootstrap-only ordinary fill survives late renderer installation without replacement", async ({
+test("held critical unified runtime blocks parsing and readiness until release", async ({
   page,
 }) => {
-  await install(page, { blockRenderer: true });
-  await page.goto(runtimeUrl("/publisher-registration/registered-only"));
-  await ready(page, false);
+  await install(page, { holdRuntime: true });
+  const session = sessions.get(page)!;
+  const response = await page.goto(
+    runtimeUrl("/publisher-registration/registered-only"),
+    {
+      waitUntil: "commit",
+    },
+  );
+  await expect.poll(() => session.runtimeRoutes.length).toBe(1);
+  expect(
+    await page.evaluate(() => {
+      const current = window as unknown as FixtureWindow;
+      return {
+        state: document.readyState,
+        registration: current.tsjs?.publisherSlotRegistrationVersion,
+        renderer: current.tsjs?.tsRenderBridgeVersion,
+        publisher: !!current.publisherRegistrationFixture,
+        placeholder: !!document.getElementById("fixture-header-placeholder"),
+        requests: current.fixture.requests.length,
+      };
+    }),
+  ).toEqual({
+    state: "loading",
+    registration: undefined,
+    renderer: undefined,
+    publisher: false,
+    placeholder: false,
+    requests: 0,
+  });
+  await session.releaseRuntime();
+  await ready(page);
+  assertRuntimeOrder(await response!.text());
   await mount(page);
   const initial = await delivered(page);
-  expect(initial.targeting.hb_adid).toBeUndefined();
+  expect(initial.targeting.hb_adid).toEqual(["fixture-win-fixture-header"]);
   await assertIdentity(page, initial);
-  await render(page, initial, "Publisher result");
+  await render(page, initial, "Fixture publisher registration winner");
+  expect(session.runtimeRequests).toEqual(["/static/tsjs=tsjs-unified.min.js"]);
+});
+
+test("failed critical unified runtime leaves no TS APIs or registered delivery and never retries", async ({
+  page,
+}) => {
+  await install(page, { failRuntime: true });
   const session = sessions.get(page)!;
-  expect(session.rendererInterventions).toHaveLength(1);
-  expect(session.rendererInterventions[0].removedEarly).toBe(true);
-  expect(
-    session.blockedRuntime.some((url) => url.includes("tsjs-gpt.min.js")),
-  ).toBe(true);
-  expect(session.mainBundle).toBeTruthy();
-  await page.addScriptTag({ content: session.mainBundle! });
-  await page.waitForFunction(
-    () => (window as unknown as FixtureWindow).tsjs.tsRenderBridgeVersion === 1,
+  const response = await page.goto(
+    runtimeUrl("/publisher-registration/registered-only"),
   );
+  assertRuntimeOrder(await response!.text());
+  await expect(page.getByTestId("ssr-placeholder")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          !!(window as unknown as FixtureWindow).publisherRegistrationFixture,
+      ),
+    )
+    .toBe(true);
+  expect(
+    await page.evaluate(() => {
+      const current = window as unknown as FixtureWindow;
+      return {
+        registration: current.tsjs?.publisherSlotRegistrationVersion,
+        renderer: current.tsjs?.tsRenderBridgeVersion,
+        register: typeof current.tsjs?.registerPublisherSlot,
+        scheduler: typeof current.tsjs?.scheduleInitialAdInit,
+        requests: current.fixture.requests.length,
+      };
+    }),
+  ).toEqual({
+    registration: undefined,
+    renderer: undefined,
+    register: "undefined",
+    scheduler: "undefined",
+    requests: 0,
+  });
+  // Separately deferred Prebid can still install its refresh wrapper. It cannot
+  // replace the registration API lost with the sole critical unified request.
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as FixtureWindow).googletag.pubads()
+            .__tsRefreshWrapped,
+      ),
+    )
+    .toBe(true);
+  await page.getByRole("button", { name: "Mount final placement" }).click();
+  // React error boundaries report layout-effect failures to the console rather
+  // than necessarily dispatching an uncaught window error.
+  const registrationError = /registerPublisherSlot is not a function/;
+  await expect
+    .poll(() =>
+      [...session.errors, ...session.consoleErrors].some((message) =>
+        registrationError.test(message),
+      ),
+    )
+    .toBe(true);
+  for (const message of session.errors) {
+    expect(message).toMatch(registrationError);
+    session.expectedErrors.push(message);
+  }
   await page.evaluate(
     () =>
       new Promise<void>((resolve) =>
         requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
       ),
   );
+  expect(await headerRequests(page)).toHaveLength(0);
   expect(
     await page.evaluate(
-      () =>
-        (window as unknown as FixtureWindow).tsjs.bids?.["fixture-header"]
-          ?.hb_adid,
-    ),
-  ).toBe("fixture-win-fixture-header");
-  expect(await headerRequests(page)).toHaveLength(1);
-  expect(
-    await page.evaluate(() =>
-      (window as unknown as FixtureWindow).fixture.nativeSlots
-        .find((slot) => slot.getSlotElementId() === "publisher-final-header")!
-        .getTargeting("hb_adid"),
+      () => (window as unknown as FixtureWindow).fixture.requests,
     ),
   ).toEqual([]);
-  await expect(
-    page.frameLocator("#publisher-final-header > iframe").locator(".marker"),
-  ).toHaveText("Publisher result");
-});
-
-test("failed deferred runtime retains the early renderer and server candidate", async ({
-  page,
-}) => {
-  await install(page, { blockRuntime: true });
-  await page.goto(runtimeUrl("/publisher-registration/registered-only"));
-  await ready(page);
-  expect(sessions.get(page)!.blockedRuntime).toContain(
-    "/static/tsjs=tsjs-gpt.min.js",
-  );
-  expect(sessions.get(page)!.rendererInterventions).toEqual([]);
-  await expect(page.locator("#trustedserver-bootstrap")).toHaveCount(1);
-  await mount(page);
-  const initial = await delivered(page);
-  expect(initial.targeting.hb_adid).toEqual(["fixture-win-fixture-header"]);
-  await assertIdentity(page, initial);
-  await render(page, initial, "Fixture publisher registration winner");
-  expect(await headerRequests(page)).toHaveLength(1);
+  expect(session.auctions).toEqual([]);
+  expect(session.runtimeRequests).toEqual(["/static/tsjs=tsjs-unified.min.js"]);
+  await expect(page.locator("#trustedserver-bootstrap")).toHaveCount(0);
 });
 
 for (const { width, noFill } of [

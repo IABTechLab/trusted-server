@@ -704,6 +704,12 @@
             ts.prevSlotTargetingKeys,
           );
           try {
+            const auctionId =
+              candidate == null ? void 0 : candidate.hb_auction_id;
+            const trace =
+              window.__tsjs_trace_active === true && ts.traceGpt
+                ? ts.traceGpt.opportunity(slot, auctionId)
+                : { auctionId };
             (_e = ts.gptDiagnosticsRecorder) == null
               ? void 0
               : _e.recordTrustedServerOpportunity(
@@ -714,8 +720,9 @@
                       ? "renderable_candidate"
                       : "unrenderable_candidate"
                     : "no_candidate",
-                  candidate == null ? void 0 : candidate.hb_auction_id,
+                  trace.auctionId,
                   record.eligibleFormats,
+                  ...(trace.identity ? [trace.identity] : []),
                 );
           } catch (e) {}
           ts.gptSlotHandoffInternal = true;
@@ -910,22 +917,24 @@
     // would overwrite a committed SPA navigation's slots.
     if (initialSlots !== undefined) ts.adSlots = initialSlots;
     if (initialBids !== undefined) ts.bids = initialBids;
+    // Bind before registered dispatch; the deferred automatic pass must not
+    // re-observe this batch and replace newer trace bindings.
+    try {
+      if (window.__tsjs_trace_active === true && ts.traceGpt) {
+        ts.traceGpt.observeTransport(
+          initialSlots === undefined ? ts.adSlots : initialSlots,
+          traceAuctionTransport,
+          "initial_navigation_ssat",
+        );
+      }
+    } catch (_) {
+      // Trace failure cannot interrupt the initial advertising pass.
+    }
     if (initialBids !== undefined || initialSlots !== undefined) {
       settlePublisherSlotPayload(ts, 0, ts.adSlots || [], ts.bids || {});
     }
     var fire = function () {
       if ((ts.navGeneration || 0) !== 0) return;
-      try {
-        if (window.__tsjs_trace_active === true && ts.traceGpt) {
-          ts.traceGpt.observeTransport(
-            initialSlots === undefined ? ts.adSlots : initialSlots,
-            traceAuctionTransport,
-            "initial_navigation_ssat",
-          );
-        }
-      } catch (_) {
-        // Trace failure cannot interrupt the initial advertising pass.
-      }
       if (typeof ts.adInit === "function") ts.adInit();
     };
     var afterFrames = function () {
@@ -941,7 +950,8 @@
     if (window.__tsjs_trace_active !== true) return;
     try {
       var bridge = ts.traceGpt;
-      if (!bridge || !bridge.identity(slot) || !ts.gptDiagnosticsRecorder) return;
+      if (!bridge || !bridge.identity(slot) || !ts.gptDiagnosticsRecorder)
+        return;
       var trace = bridge.opportunity(slot, bid.hb_auction_id);
       var handoff =
         ts.gptSlotHandoffs && ts.gptSlotHandoffs[gptSlot.getSlotElementId()];

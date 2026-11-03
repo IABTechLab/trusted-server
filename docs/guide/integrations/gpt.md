@@ -93,7 +93,7 @@ Successful proxy responses include the `X-GPT-Proxy: true` header for debugging.
 
 ## Client-Side Shim
 
-The draft loading candidate uses the existing cacheable unified TSJS bundle. It removes the duplicated inline runtime from the supported GPT profile. This is synchronous loading, not a claim that the main bundle can safely defer. Final acceptance and real-GPT validation remain pending.
+The supported loading contract uses the existing cacheable unified TSJS bundle. It removes the duplicated inline runtime from the supported GPT profile. This is synchronous loading, not a claim that the main bundle can safely defer. Synchronous loading and its critical-script outage boundary are explicitly accepted; real-GPT validation and full issue closure remain pending.
 
 ### Loading order
 
@@ -116,7 +116,7 @@ Profiles containing another browser integration retain their previous provisiona
 
 Enforced `Content-Security-Policy` response headers retain the existing synchronous loading and script permissions. This includes actual origin headers and `Settings.response_headers`, matched case-insensitively, even when empty, permissive or repeated. An origin response without CSP cannot cancel a configured policy. Report-Only remains Report-Only. No policy is weakened and no new compiled-inline hash is required. Shared templates preserve the actual policy on cold and warm paths; settings and core fingerprints invalidate older templates. There is no new meta-policy evaluator or nonce handling.
 
-If the sole critical unified script fails to load in the supported profile, the page has no TS initialization APIs or TS delivery. Core-dependent publisher code can report an error. There is no inline fallback or retry. This extends the previously tested enforced-CSP outage boundary to supported ordinary pages and remains an explicit acceptance decision. It is not equivalent to the earlier design, where a failed deferred GPT asset left the inline renderer working.
+If the sole critical unified script fails to load in the supported profile, the page has no TS initialization APIs or TS delivery. Core-dependent publisher code can report an error. There is no inline fallback or retry. This is the accepted outage boundary for supported ordinary and enforced-CSP pages. It is not equivalent to the earlier design, where a failed deferred GPT asset left the inline renderer working.
 
 The automatic initializer retains its existing load, visibility and animation-frame checks. Registered delivery still requires actual publisher readiness and payload admission. Compare paint and ad-startup separately; a parser-blocking runtime cannot be described as proven deferral, and lab gains do not establish field Core Web Vitals.
 
@@ -160,15 +160,17 @@ Takes over `googletag.cmd` so every queued callback is wrapped before GPT execut
 
 ### Server slot handoff
 
-For automatic placements in the initial server-rendered auction, the head bootstrap installs
-`window.tsjs.adInit` before the compiled bundle arrives. It reads the
-server-injected slot and bid state synchronously, defines a fallback GPT slot
+For automatic placements in the initial server-rendered auction, the synchronous
+unified runtime installs `window.tsjs.adInit` before publisher scripts. Profiles
+retaining the provisional head bootstrap can install the same API before the
+compiled bundle arrives. Both implementations read the server-injected slot and
+bid state synchronously and define a fallback GPT slot
 on the actual inner div, and records the slot in `gptSlotHandoffs`. It never
 defines a competing slot on an outer `-container` element. When publisher code
 later calls `googletag.defineSlot` for the same placement, the idempotent wrapper
 hands the existing inner-div binding back to GPT.
 
-The bootstrap observes modern `googletag.setConfig({ disableInitialLoad: ... })`
+Both implementations observe modern `googletag.setConfig({ disableInitialLoad: ... })`
 and the legacy `pubads().disableInitialLoad()` call. If initial load is
 disabled, it refreshes only the newly defined Trusted Server slots. It never
 calls an unbounded `refresh()` that could refresh publisher-owned inventory.
@@ -185,8 +187,8 @@ legacy `GET /__ts/page-bids` alias remains available); it does not use
 Framework publishers can opt individual placements into
 `initialization = "publisher_registered"`. The default, `auto`, retains the
 existing automatic initializer and handoff behavior. Registration requires a
-matched server, head bootstrap, runtime and publisher adapter. Do not enable it
-on older artifacts that ignore the setting.
+matched server, runtime and publisher adapter, plus a compatible bootstrap on
+profiles that retain one. Do not enable it on older artifacts that ignore the setting.
 
 ```toml
 [[creative_opportunities.slot]]
@@ -254,8 +256,8 @@ page-bids fetch do not authorize delivery. An accepted empty payload marks the
 registration inactive. A page that never emits an admitted seam can remain waiting
 until the publisher cancels it.
 
-If the framework changes pathname before the full runtime arrives, the bootstrap
-advances the same navigation generation and retires the old admission. New-route
+On profiles retaining a provisional initializer, if the framework changes pathname
+before the full runtime arrives, the bootstrap advances the same navigation generation and retires the old admission. New-route
 registrations wait without a request. The bootstrap does not fetch page bids.
 When the runtime takes over, it obtains the current route's payload through its
 existing SPA endpoint without cancelling the new generation's waiting handles.
@@ -414,18 +416,20 @@ finite positive dimensions match both configured and declared eligible formats.
 Missing, unknown-size or incompatible bids still permit one ordinary GAM request.
 An empty finite eligibility list permits GAM delivery without TS demand.
 
-The raw inline GPT bootstrap has no creative renderer on its own. Supported
-profiles also install the compiled early renderer before publisher scripts, so
-registration can select eligible TS demand without waiting for the deferred
-runtime. If no renderer was installed, registered delivery omits TS candidate
-targeting and correlation and makes the single ordinary GAM request. GAM can fill it with a publisher creative or return
-no-fill. TS fill is deliberately unavailable on that path. A later runtime load
-does not add the excluded candidate, replace the ad or request it again.
+Supported profiles install the renderer through the synchronous unified bundle
+before publisher scripts. A retained raw GPT bootstrap alone has no creative
+renderer. If no renderer was installed, registered delivery omits TS candidate
+targeting and makes the single ordinary GAM request. GAM can fill it with a
+publisher creative or return no-fill. TS fill is deliberately unavailable on that
+path. A later runtime load does not add the excluded candidate, replace the ad or
+request it again. Optional trace diagnostics can still correlate the validated
+server-auction opportunity with this no-candidate request; that correlation does
+not assert that the excluded bid participated or was selected.
 
 #### Activation and verification
 
 Publish the matched code with the mode unused first. Verify protocol version,
-bootstrap and selected module hashes, publisher setup and explicit ownership.
+selected module hashes, any retained bootstrap, publisher setup and explicit ownership.
 Then activate only selected placements with the matching publisher adapter after
 a separately approved real-GPT staging canary proves one initial request, correct
 targeting, visible rendering, an unaffected unrelated slot and a legitimate later

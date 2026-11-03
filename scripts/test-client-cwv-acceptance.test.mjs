@@ -9,6 +9,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { spawnSync } from 'node:child_process'
 import {
   BASELINE_REVISION,
   conditions,
@@ -16,6 +17,7 @@ import {
   measurementArgs,
   snapshotInputs,
   validateExportSources,
+  validateExportAssets,
   validateMeasurement,
 } from './test-client-cwv-acceptance.mjs'
 
@@ -107,7 +109,7 @@ test('a successful command without completed negative controls is insufficient e
     },
     samples: 64,
     negativeControls: {
-      'parser-blocking': { status: 'passed' },
+      'runtime-deferred': { status: 'passed' },
       'reservation-removed': { status: 'passed' },
     },
   }
@@ -143,10 +145,15 @@ test('candidate exports must match current source and share baseline toolchain/d
       'crates/trusted-server-core/src/tsjs.rs',
       'crates/trusted-server-core/src/html_processor.rs',
       'crates/trusted-server-core/src/integrations/gpt_bootstrap.js',
+      'crates/trusted-server-js/lib/package-lock.json',
+      'crates/trusted-server-js/lib/src/core/index.ts',
+      'crates/trusted-server-js/lib/src/integrations/gpt/publisher_registration.ts',
     ].map((file) => [file, 'a'.repeat(64)])
   )
   const originalSources = Object.fromEntries(
-    Object.entries(files).filter(([file]) => file.startsWith('crates/'))
+    Object.entries(files).filter(([file]) =>
+      file.startsWith('crates/trusted-server-core/')
+    )
   )
   const manifest = {
     sourceRevision: BASELINE_REVISION,
@@ -161,6 +168,57 @@ test('candidate exports must match current source and share baseline toolchain/d
     ])
   )
   validateExportSources(inputs, { files }, originalSources)
+  const jsSource =
+    'crates/trusted-server-js/lib/src/integrations/gpt/publisher_registration.ts'
+  const withoutJs = {
+    ...manifest,
+    sourceFingerprints: manifest.sourceFingerprints
+      .split('\n')
+      .filter((line) => !line.includes('crates/trusted-server-js/lib/src/'))
+      .join('\n'),
+  }
+  assert.throws(
+    () =>
+      validateExportSources(
+        {
+          ...inputs,
+          loading: { manifest: withoutJs },
+          combined: { manifest: withoutJs },
+        },
+        { files },
+        originalSources
+      ),
+    /stale or incomplete/
+  )
+  assert.throws(
+    () =>
+      validateExportSources(
+        inputs,
+        { files: { ...files, [jsSource]: 'b'.repeat(64) } },
+        originalSources
+      ),
+    /stale/
+  )
+  assert.throws(
+    () =>
+      validateExportSources(
+        inputs,
+        {
+          files: {
+            ...files,
+            'crates/trusted-server-js/lib/src/new.ts': 'b'.repeat(64),
+          },
+        },
+        originalSources
+      ),
+    /stale or incomplete/
+  )
+  const deletedSource = 'crates/trusted-server-js/lib/src/deleted.ts'
+  validateExportSources(
+    inputs,
+    { files: { ...files, [deletedSource]: null } },
+    originalSources
+  )
   assert.throws(
     () =>
       validateExportSources(
@@ -201,6 +259,113 @@ test('candidate exports must match current source and share baseline toolchain/d
     () => validateExportSources(inputs, { files }),
     /Trusted original-main/
   )
+})
+
+test('exported runtime bytes must match the selected distribution, not only current source metadata', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'cwv-acceptance-assets-'))
+  try {
+    const dist = join(directory, 'dist')
+    mkdirSync(dist)
+    for (const id of ['core', 'creative', 'gpt', 'prebid'])
+      writeFileSync(join(dist, `tsjs-${id}.js`), `// current ${id}\n`)
+    const inputs = {}
+    for (const name of ['loading', 'combined']) {
+      const out = join(directory, name)
+      mkdirSync(out)
+      writeFileSync(
+        join(out, 'runtime.js'),
+        '// current core\n;\n// current creative\n;\n// current gpt\n'
+      )
+      writeFileSync(join(out, 'prebid.js'), '// current prebid\n')
+      inputs[name] = {
+        path: join(out, 'manifest.json'),
+        manifest: {
+          jsModules: { immediate: ['creative', 'gpt'], deferred: ['prebid'] },
+          assets: {
+            '/static/tsjs=tsjs-unified.min.js?v=fixture': 'runtime.js',
+            '/static/tsjs=tsjs-prebid.min.js?v=fixture': 'prebid.js',
+          },
+        },
+      }
+    }
+    validateExportAssets(inputs, dist)
+    writeFileSync(
+      join(directory, 'loading', 'runtime.js'),
+      '// stale prebuilt runtime'
+    )
+    assert.throws(
+      () => validateExportAssets(inputs, dist),
+      /differs from selected distribution/
+    )
+    writeFileSync(
+      join(directory, 'loading', 'runtime.js'),
+      readFileSync(join(directory, 'combined', 'runtime.js'))
+    )
+    writeFileSync(
+      join(dist, 'tsjs-prebid.js'),
+      '// replacement deferred runtime'
+    )
+    assert.throws(
+      () => validateExportAssets(inputs, dist),
+      /differs from selected distribution/
+    )
+    writeFileSync(join(dist, 'tsjs-prebid.js'), '// current prebid\n')
+    const moduleIds = inputs.loading.manifest.jsModules
+    delete inputs.loading.manifest.jsModules
+    assert.throws(
+      () => validateExportAssets(inputs, dist),
+      /lacks runtime module identities/
+    )
+    inputs.loading.manifest.jsModules = moduleIds
+    delete inputs.loading.manifest.assets[
+      '/static/tsjs=tsjs-prebid.min.js?v=fixture'
+    ]
+    assert.throws(
+      () => validateExportAssets(inputs, dist),
+      /missing runtime asset/
+    )
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('source-capture failure replaces a previous passing acceptance journal', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'cwv-acceptance-journal-'))
+  try {
+    const file = join(directory, 'acceptance.json')
+    writeFileSync(
+      file,
+      JSON.stringify({ status: 'passed', functionalGatesPassed: true })
+    )
+    const controller = new URL(
+      './test-client-cwv-acceptance.mjs',
+      import.meta.url
+    ).href
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `import { runAcceptance } from ${JSON.stringify(controller)};
+         const result = runAcceptance({ out: process.argv[1] });
+         if (result.status !== 'failed') process.exitCode = 1;`,
+        directory,
+      ],
+      {
+        encoding: 'utf8',
+        env: { ...process.env, PATH: join(directory, 'missing-tools') },
+      }
+    )
+    assert.equal(result.status, 0, result.stderr)
+    const report = JSON.parse(readFileSync(file, 'utf8'))
+    assert.equal(report.status, 'failed')
+    assert.equal(report.functionalGatesPassed, false)
+    assert.equal(report.source, null)
+    assert.equal(report.steps[0].name, 'acceptance-inputs')
+    assert.equal(report.steps[0].status, 'failed')
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
 })
 
 test('every external input is frozen, including HTML, runtime, WASM stamps and inventory', () => {

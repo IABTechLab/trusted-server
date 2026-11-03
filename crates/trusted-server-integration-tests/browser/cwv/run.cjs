@@ -42,7 +42,7 @@ const acceptance = {
   samples: 0,
   profileSamples: {},
   negativeControls: Object.fromEntries(
-    ["parser-blocking", "reservation-removed"].map((id) => [
+    ["runtime-deferred", "reservation-removed"].map((id) => [
       id,
       {
         status:
@@ -52,9 +52,9 @@ const acceptance = {
         ...(unifiedDiagnostic || options["regressions-only"]
           ? {
               reason: diagnosticScreen
-                ? "Diagnostic synchronous-unified measurement only; deferred parser control is inapplicable and reservation-removal correctness is outside this screen. Full acceptance remains unexecuted."
+                ? "Diagnostic synchronous-unified measurement only; deferred-runtime and reservation-removal controls are outside this screen. Full acceptance remains unexecuted."
                 : diagnosticOutages
-                  ? "Four critical-runtime availability diagnostics only; parser-defer and reservation-removal controls are not requested. Changed outage behavior is observed, not approved."
+                  ? "Four critical-runtime availability diagnostics only; deferred-runtime and reservation-removal controls are not requested. Full acceptance remains unexecuted."
                   : "--regressions-only selects the four review regressions, not the negative controls",
             }
           : {}),
@@ -99,8 +99,15 @@ const {
   assertScreenSamples,
   outageCases,
   assertOutageSamples,
-  assertCriticalOutage,
 } = require("./diagnostic.cjs");
+const {
+  correctnessCases,
+  assertCorrectnessSamples,
+  unavailableErrors,
+  assertCspDocument,
+  assertUnavailableRuntime,
+  assertDeferredRegression,
+} = require("./contract.cjs");
 if (diagnosticScreen) {
   acceptance.diagnostic = {
     expectedArchitecture,
@@ -116,16 +123,15 @@ if (diagnosticOutages) {
     expectedArchitecture,
     expectedSamples: 4,
     fullAcceptancePassed: false,
-    changedOutageBehaviorApproved: false,
+    changedOutageBehaviorApproved: true,
     excluded:
-      "Observes successful and failed critical unified loading with and without enforced CSP. Loss of inline fallback is a changed outage boundary, not compatibility approval. No retry/recovery, full correctness, controller, framework or live acceptance is established. Missing authorized Google inventory remains blocked outside this scope.",
+      "Checks the approved critical unified availability boundary with and without enforced CSP. This limited diagnostic does not establish retry/recovery, full correctness, controller, framework or live acceptance. Missing authorized Google inventory remains blocked outside this scope.",
   };
   saveOutcome();
 }
 const {
   reservationStyles,
-  withoutEarlyRenderer,
-  withoutRuntimeDefer,
+  withRuntimeDefer,
   withoutScripts,
   rendererAsset,
 } = require("./html.cjs");
@@ -185,11 +191,11 @@ function snapshot(directory, label) {
 const loading = snapshot(options.loading, "loading");
 const combined = snapshot(options.combined, "combined");
 const baseline = options.baseline && snapshot(options.baseline, "baseline");
-if (unifiedDiagnostic)
+if (baseline)
   assert.equal(
     baseline.manifest.sourceRevision,
     baselineRevision,
-    "Diagnostic baseline must remain pinned original-main, not the failing optimized PR snapshot",
+    "Baseline must remain pinned original-main, not the failing optimized PR snapshot",
   );
 const profiles = {
   loading,
@@ -229,6 +235,7 @@ evidence = {
   optionsSha256: sha256(fs.readFileSync(path.join(__dirname, "options.cjs"))),
   evidenceSha256: sha256(fs.readFileSync(path.join(__dirname, "evidence.cjs"))),
   proxySha256: sha256(fs.readFileSync(path.join(__dirname, "proxy.cjs"))),
+  contractSha256: sha256(fs.readFileSync(path.join(__dirname, "contract.cjs"))),
   diagnosticSha256: sha256(
     fs.readFileSync(path.join(__dirname, "diagnostic.cjs")),
   ),
@@ -455,28 +462,24 @@ async function sample(
     saveOutcome();
   }
   const input = documentInput(profile, name);
-  if (diagnosticOutages)
-    assert.equal(
-      input.enforcedCsp,
-      name === "csp",
-      "Outage matrix must separately exercise normal and enforced-CSP production documents",
-    );
-  const runtimeUnavailable =
-    (input.enforcedCsp || diagnosticOutages) && mode === "failed";
-  // Keep the existing publisher-side probe. Its core call deliberately fails
-  // when the synchronous runtime is unavailable; no other page error is allowed.
-  const expectedErrors = runtimeUnavailable
-    ? ["tsjs.setConfig is not a function"]
-    : [];
-  if (unifiedDiagnostic) assertScreenDocument(input.html, profile);
-  const expectedDeferred = unifiedDiagnostic
-    ? false
-    : !input.enforcedCsp && (profile === "loading" || profile === "combined");
-  assert.equal(
-    input.deferred,
-    expectedDeferred,
-    `${profile} must exercise its intended production loading mode`,
-  );
+  if (["loading", "combined"].includes(profile)) assertCspDocument(input);
+  const initiallyUnavailable = [
+    "failed",
+    "absent",
+    "renderer-absent",
+    "late-runtime",
+  ].includes(mode);
+  const runtimeUnavailable = initiallyUnavailable && mode !== "late-runtime";
+  const deliveryExpected =
+    input.matched && !runtimeUnavailable && control !== "runtime-deferred";
+  // Preserve publisher code and declare its exact failures when the sole runtime
+  // is missing. The deferred negative control breaks only the early core probe.
+  const expectedErrors = initiallyUnavailable
+    ? unavailableErrors(input.registered)
+    : control === "runtime-deferred"
+      ? unavailableErrors(false)
+      : [];
+  assertScreenDocument(input.html, profile);
   const index = samples.length;
   const label = `${index}-${profile}-${name}-${viewport.width}-${mode}${noFill ? "-nofill" : ""}${control ? "-" + control : ""}`;
   active = {
@@ -490,12 +493,12 @@ async function sample(
     phase: options.cache === "warm" ? "warmup" : "measurement",
     html: input.html,
   };
-  if (control === "parser-blocking") {
-    active.html = withoutRuntimeDefer(input.html);
+  if (control === "runtime-deferred") {
+    active.html = withRuntimeDefer(input.html);
     assert.notEqual(
       active.html,
       input.html,
-      "Parser negative control must remove defer",
+      "Deferred regression control must add defer to the actual synchronous runtime",
     );
   }
   if (control === "reservation-removed") {
@@ -553,7 +556,7 @@ async function sample(
     });
     assert(
       !input.html.includes('id="trustedserver-bootstrap"'),
-      "Enforced CSP must use synchronous production fallback",
+      "Enforced CSP must use the synchronous production runtime without inline fallback",
     );
     assert(
       !input.html.includes("// Edge-injected GPT auction bootstrap."),
@@ -564,29 +567,20 @@ async function sample(
         index,
         profile,
         name,
-        type: "enforced-CSP synchronous runtime failure; no provisional fallback",
+        type: "enforced-CSP critical runtime failure; no inline fallback",
         expectedErrors,
       });
   }
   if (mode === "renderer-absent") {
-    active.html = withoutEarlyRenderer(input.html);
-    assert.notEqual(
-      active.html,
-      input.html,
-      "Renderer absence must remove the real compiled early entry",
-    );
-    // This fixture-only probe calls core APIs deliberately absent in this case.
-    active.html = withoutScripts(active.html, (script) =>
-      script.content.trimStart().startsWith("window.fixtureEarly="),
-    );
     assert(
-      active.html.includes("publisherSlotRegistrationVersion"),
-      "Raw protocol bootstrap must remain",
+      rendererAsset(
+        new URL(input.runtimeSrc, "http://publisher.example.com").pathname,
+      ),
     );
     evidence.interventions.push({
       profile,
       name,
-      type: "true renderer absence, early entry and core probe removed; GPT/unified requests blocked",
+      type: "true renderer absence; sole unified runtime blocked, no inline renderer or publisher-code removal",
       htmlSha256: sha256(active.html),
     });
   }
@@ -615,6 +609,7 @@ async function sample(
   let result;
   let page;
   let warmup = null;
+  const recovery = [];
   const requests = new Map();
   const errors = [];
   const network = [];
@@ -629,7 +624,7 @@ async function sample(
     await context.addInitScript({
       content: `if(window===window.top){
       (${observePage.toString()})();
-      ${unifiedDiagnostic ? `(${installEarlyProbe.toString()})();` : ""}
+      (${installEarlyProbe.toString()})();
       window.publisherFixtureOptions={initialLoad:${JSON.stringify(input.registered ? "disabled" : "enabled")}};
       ${fixtureSource.replaceAll("https://creative.example.com", creativeOrigin)}
       (${installDelivery.toString()})(${JSON.stringify({ height: input.creativeHeight, noFill })});
@@ -679,7 +674,7 @@ async function sample(
       });
     if (options.cache === "warm") {
       await navigate();
-      if (input.matched && !runtimeUnavailable)
+      if (deliveryExpected && !initiallyUnavailable)
         await page.waitForFunction(() => cwv.delivered, null, {
           timeout: 10000,
         });
@@ -709,13 +704,31 @@ async function sample(
       active.phase = "measurement";
     }
     await navigate();
-    if (input.matched && !runtimeUnavailable)
+    if (deliveryExpected && !initiallyUnavailable)
       await page.waitForFunction(() => cwv.delivered, null, { timeout: 10000 });
     if (mode === "late-runtime") {
+      const before = await page.evaluate(() => cwv.finish());
+      assertUnavailableRuntime(
+        before,
+        active.responses,
+        new URL(input.runtimeSrc, publisherOrigin).href,
+        mode,
+      );
+      assert.deepEqual(
+        errors,
+        expectedErrors,
+        "Before explicit recovery, only declared missing-runtime errors are allowed",
+      );
+      recovery.push({
+        phase: active.phase,
+        raw: before,
+        responses: [...active.responses],
+      });
       await page.evaluate(
         (src) =>
           new Promise((resolve, reject) => {
             const script = document.createElement("script");
+            script.id = "trustedserver-js-recovery";
             script.src = src;
             script.onload = resolve;
             script.onerror = reject;
@@ -723,6 +736,31 @@ async function sample(
           }),
         input.runtimeSrc,
       );
+      if (input.registered)
+        await page.evaluate(() => {
+          // Explicit publisher re-registration after recovery uses the native
+          // object already created before the critical runtime failed.
+          window.fixtureHandle = tsjs.registerPublisherSlot({
+            slotId: "fixture-header",
+            gptSlot: window.fixturePublisherSlot,
+            navigationGeneration: tsjs.navGeneration || 0,
+            eligibleFormats: [[300, 250]],
+          });
+        });
+      // The original body-close scheduling call could not run during outage.
+      // Explicit publisher recovery must retry it, not pretend loading alone
+      // replays failed publisher scripts.
+      await page.evaluate(() => tsjs.scheduleInitialAdInit(tsjs.bids));
+      evidence.interventions.push({
+        index,
+        profile,
+        name,
+        type: "explicit runtime reload, publisher re-registration when applicable, and initial scheduling retry",
+      });
+      if (input.matched)
+        await page.waitForFunction(() => cwv.delivered, null, {
+          timeout: 10000,
+        });
     }
     // Multiple frames include fill-induced layout, then a declared quiet window.
     await page.evaluate(
@@ -747,25 +785,26 @@ async function sample(
       expectedErrors,
       "Only declared fixture page errors are allowed",
     );
-    if (input.enforcedCsp || diagnosticOutages)
+    if (["loading", "combined"].includes(profile))
       assertCspRuntimeApis(raw, !runtimeUnavailable);
-    if (diagnosticOutages && runtimeUnavailable) {
-      assertCriticalOutage(
+    if (runtimeUnavailable) {
+      assertUnavailableRuntime(
         raw,
         active.responses,
         new URL(input.runtimeSrc, publisherOrigin).href,
+        mode,
       );
       assert.equal(
         active.runtimeAttempts,
-        1,
-        "Critical outage must issue one failed runtime request without retry",
+        mode === "absent" ? 0 : 1,
+        "Unavailable critical runtime must not retry implicitly",
       );
     }
     if (input.enforcedCsp)
       assert.deepEqual(
         raw.cspViolations,
         [],
-        "Old-inline-hash/self CSP must permit synchronous fallback without violations",
+        "Old-inline-hash/self CSP must permit the synchronous runtime without violations",
       );
     assert.deepEqual(
       active.unexpected,
@@ -778,32 +817,62 @@ async function sample(
         undefined,
         "No actual render bridge may remain installed",
       );
-      assert.equal(
-        raw.candidateAdId,
-        "fixture-server-ad",
-        "Absent renderer must not erase the admitted candidate",
-      );
       assert.deepEqual(
         active.blockedRenderer,
         [new URL(input.runtimeSrc, publisherOrigin).pathname],
-        "Actual standalone GPT renderer must be blocked",
+        "Actual sole unified renderer must be blocked",
       );
     } else if (!runtimeUnavailable) {
-      assert(
-        raw.early.core && raw.early.queued,
-        unifiedDiagnostic
-          ? "Direct core API and queued publisher callback must work at the first publisher script"
-          : "Direct core API and queued publisher callback must work before deferred runtime",
-      );
+      if (control !== "runtime-deferred" && mode !== "late-runtime")
+        assert(
+          raw.early.core && raw.early.queued,
+          "Direct core API and queued publisher callback must work at the first publisher script",
+        );
+      else if (mode === "late-runtime") {
+        assert.equal(
+          raw.early.core,
+          false,
+          "Recovery must not conceal the original unavailable core probe",
+        );
+        assert.equal(
+          raw.early.queued,
+          false,
+          "Recovery must not invent the failed publisher callback",
+        );
+        assert.deepEqual(
+          active.responses
+            .filter(
+              (entry) =>
+                entry.url === new URL(input.runtimeSrc, publisherOrigin).href,
+            )
+            .map((entry) => entry.status),
+          [404, 200],
+          "Recovery must follow one failure with one explicit successful request",
+        );
+        assert.equal(
+          active.runtimeAttempts,
+          2,
+          "Recovery must not implicitly retry again",
+        );
+        assertRuntimeOrdering(
+          raw,
+          new URL(input.runtimeSrc, publisherOrigin).href,
+          true,
+        );
+      }
       assertCandidateRendererVersion(raw, profile);
-      if (unifiedDiagnostic) assertEarlyProbe(raw, profile);
+      assertEarlyProbe(
+        raw,
+        profile,
+        control === "runtime-deferred" || mode === "late-runtime",
+      );
     }
     assert.equal(
       raw.fixture.requests.length,
-      input.matched && !runtimeUnavailable ? 1 : 0,
-      "Exactly one native initial request requires a matched slot and available runtime or early bridge",
+      deliveryExpected ? 1 : 0,
+      "Exactly one native initial request requires a matched slot and available critical runtime",
     );
-    if (input.matched && !runtimeUnavailable) {
+    if (deliveryExpected) {
       assert.equal(
         raw.fixture.trace.filter((entry) => entry.event === "nativeDefine")
           .length,
@@ -852,7 +921,7 @@ async function sample(
       }
       assert.equal(
         raw.fixture.requests[0].targeting.hb_adid?.[0],
-        mode === "renderer-absent" ? undefined : "fixture-server-ad",
+        "fixture-server-ad",
         "Candidate targeting requires an actual renderer",
       );
       if (!noFill) {
@@ -864,7 +933,7 @@ async function sample(
         assertVisibleCreative(
           text,
           raw.firstVisibleEstimateMs,
-          mode === "renderer-absent" ? "Publisher result" : "Server result",
+          "Server result",
         );
       }
     }
@@ -882,25 +951,21 @@ async function sample(
       assertRuntimeOrdering(
         raw,
         new URL(input.runtimeSrc, publisherOrigin).href,
-        expectedDeferred && control !== "parser-blocking",
+        control === "runtime-deferred",
       );
-      if (!expectedDeferred || control === "parser-blocking")
+      if (control === "runtime-deferred")
+        assertDeferredRegression(
+          raw,
+          new URL(input.runtimeSrc, publisherOrigin).href,
+          fcp,
+          responseEnd,
+          settings,
+        );
+      else
         assert(
           fcp >= responseEnd,
           "Parser-blocking runtime must finish before FCP",
         );
-      if (
-        expectedDeferred &&
-        control !== "parser-blocking" &&
-        options.cache === "cold" &&
-        settings.runtimeDelayMs === 750
-      )
-        assert(
-          fcp < responseEnd,
-          "Changed content must paint during the default 750ms runtime hold",
-        );
-      // A deferred cache hit or 0ms response may legitimately finish before FCP.
-      // Native script-load/parser observations above are the ordering gate.
     }
     const cacheRequests = [...requests.values()];
     const cacheHits =
@@ -925,13 +990,11 @@ async function sample(
         expectedHeight,
         "Responsive reservation must match viewport",
       );
-      if (runtimeUnavailable) {
+      if (!deliveryExpected) {
         assert.equal(
           cls,
           0,
-          diagnosticOutages
-            ? "Unavailable critical runtime must not cause ad-induced layout shift"
-            : "Unavailable CSP runtime must not cause ad-induced layout shift",
+          "Unavailable runtime or deferred-startup regression must not produce ad-induced layout shift",
         );
       } else if (noFill || input.creativeHeight <= expectedHeight) {
         assert.equal(
@@ -963,6 +1026,7 @@ async function sample(
       index,
       control,
       runtimeUnavailableBoundary: runtimeUnavailable,
+      ...(recovery.length ? { recovery } : {}),
       ...(diagnosticOutages
         ? {
             diagnosticOutage: {
@@ -970,9 +1034,9 @@ async function sample(
                 ? "enforced-old-hash-self-csp"
                 : "normal",
               expectedRuntimeAvailable: !runtimeUnavailable,
-              changedOutageBehaviorApproved: false,
+              changedOutageBehaviorApproved: true,
               interpretation:
-                "Observed critical-script availability boundary, not compatibility approval or recovery proof",
+                "Approved no-inline-fallback critical-script boundary; limited diagnostic, not full acceptance or recovery proof",
             },
           }
         : {}),
@@ -1111,14 +1175,9 @@ async function sample(
         "Unreserved diagnostic arms must reproduce ad-induced layout shift",
       );
     } else if (!options["correctness-only"] && !options["regressions-only"]) {
-      for (const viewport of [mobile, desktop]) {
-        for (let run = 0; run < runs; run++) {
-          const order = ["baseline", "loading", "reservation", "combined"];
-          if (run % 2) order.reverse();
-          for (const profile of order)
-            await sample(browser, profile, "inline", viewport);
-        }
-      }
+      for (const { profile, name, viewport } of screenCases(runs))
+        await sample(browser, profile, name, viewport);
+      assertScreenSamples(samples, runs);
       const shiftControls = samples.filter((entry) =>
         ["baseline", "loading"].includes(entry.profile),
       );
@@ -1138,53 +1197,20 @@ async function sample(
           );
         }
       }
-      await sample(
-        browser,
-        "combined",
-        "registered",
-        mobile,
-        "renderer-absent",
+      const correctnessStart = samples.length;
+      for (const {
+        profile,
+        name,
+        viewport,
+        mode,
+        noFill = false,
+        control = null,
+      } of correctnessCases(options["regressions-only"]))
+        await sample(browser, profile, name, viewport, mode, noFill, control);
+      assertCorrectnessSamples(
+        samples.slice(correctnessStart),
+        options["regressions-only"],
       );
-      await sample(browser, "combined", "registered", mobile, "failed");
-      await sample(browser, "combined", "csp", mobile);
-      await sample(browser, "combined", "csp", mobile, "failed");
-      if (!options["regressions-only"]) {
-        await sample(
-          browser,
-          "combined",
-          "inline",
-          mobile,
-          "slow",
-          false,
-          "parser-blocking",
-        );
-        await sample(
-          browser,
-          "combined",
-          "inline",
-          mobile,
-          "slow",
-          false,
-          "reservation-removed",
-        );
-        for (const mode of ["slow", "failed", "absent", "late-runtime"]) {
-          await sample(browser, "combined", "inline", mobile, mode);
-          await sample(browser, "combined", "registered", mobile, mode);
-        }
-        for (const name of [
-          "shared",
-          "absent-wrapper",
-          "unmatched",
-          "child-replacement",
-          "unknown-height",
-        ])
-          await sample(browser, "combined", name, mobile);
-        await sample(browser, "combined", "shared", desktop);
-        await sample(browser, "loading", "unknown-height", mobile);
-        for (const width of [1023, 1024])
-          await sample(browser, "combined", "tall", { width, height: 1000 });
-        await sample(browser, "combined", "inline", mobile, "slow", true);
-      }
     }
     const groups = {};
     for (const entry of samples) {
@@ -1240,7 +1266,7 @@ async function sample(
       diagnosticScreen
         ? "Diagnostic screen completed; raw timings retained. Full correctness, negative controls, framework/live gates and combined acceptance remain unexecuted."
         : diagnosticOutages
-          ? "Four availability diagnostics completed. Changed critical-outage behavior is observed, not approved. Full acceptance remains unexecuted."
+          ? "Four availability diagnostics completed for the approved critical-runtime contract. Full acceptance remains unexecuted."
           : "CWV functional contracts passed; raw timings and ranges retained, no timing-improvement threshold applied.",
     );
   } finally {

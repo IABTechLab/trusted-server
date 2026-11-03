@@ -5,7 +5,7 @@ const {
   scriptBlocks,
   withoutScripts,
   withoutEarlyRenderer,
-  withoutRuntimeDefer,
+  withRuntimeDefer,
   rendererAsset,
 } = require("./html.cjs");
 
@@ -165,17 +165,23 @@ test("CSS-only control copies only the exact production reservation stylesheet",
   assert.deepEqual(reservationStyles("<style>body{margin:0}</style>"), []);
 });
 
-test("parser-blocking control removes only the actual runtime defer attribute", () => {
+test("deferred regression control adds only the actual runtime defer attribute", () => {
   const prefix =
-    '<!-- <script id=trustedserver-js defer> -->\r\n<script defer src="/other.js"></script>';
+    '<!-- <script id=trustedserver-js> -->\r\n<script src="/other.js"></script>';
   const suffix =
     '<script>const text=" defer";</script><main id=article>Keep bytes</main>';
-  for (const attribute of ["defer", 'DEFER=""', "defer='defer'"]) {
-    const tag = `<script id=trustedserver-js data-note=" defer" ${attribute} src=/runtime.js></script>`;
+  for (const tag of [
+    '<script id=trustedserver-js data-note=" defer" src=/runtime.js></script>',
+    '<SCRIPT ID="trustedserver-js" SRC="/runtime.js?x=1&amp;y=2"></SCRIPT >',
+  ]) {
     assert.equal(
-      withoutRuntimeDefer(prefix + tag + suffix),
-      prefix + tag.replace(` ${attribute} src=`, "  src=") + suffix,
+      withRuntimeDefer(prefix + tag + suffix),
+      prefix + tag.slice(0, 7) + " defer" + tag.slice(7) + suffix,
     );
   }
-  assert.equal(withoutRuntimeDefer("<p>No runtime</p>"), "<p>No runtime</p>");
+  for (const attribute of ["defer", 'DEFER=""', "defer='defer'"]) {
+    const html = `<script id=trustedserver-js ${attribute} src=/runtime.js></script>`;
+    assert.equal(withRuntimeDefer(html), html);
+  }
+  assert.equal(withRuntimeDefer("<p>No runtime</p>"), "<p>No runtime</p>");
 });

@@ -60,7 +60,7 @@ function assertCandidateRendererVersion(raw, profile) {
   assert.equal(
     raw.rendererVersion,
     1,
-    "Candidate renderer must remain installed when only deferred runtime fails",
+    "Available candidate unified runtime must install the real renderer",
   );
 }
 

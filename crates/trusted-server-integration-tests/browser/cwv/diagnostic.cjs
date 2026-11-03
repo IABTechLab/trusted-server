@@ -92,14 +92,19 @@ function installEarlyProbe() {
   document.addEventListener(
     "load",
     (event) => {
-      if (event.target?.id !== "trustedserver-js") return;
+      if (
+        !["trustedserver-js", "trustedserver-js-recovery"].includes(
+          event.target?.id,
+        )
+      )
+        return;
       state.runtimeLoads.push({ time: performance.now(), apis: methods() });
     },
     true,
   );
 }
 
-function assertEarlyProbe(raw, profile) {
+function assertEarlyProbe(raw, profile, articlePresent = false) {
   const probe = raw.preCoreQueue;
   assert.equal(
     probe?.callbacks.length,
@@ -109,8 +114,10 @@ function assertEarlyProbe(raw, profile) {
   const callback = probe.callbacks[0];
   assert.equal(
     callback.articlePresent,
-    false,
-    "Queue must drain before body parsing",
+    articlePresent,
+    articlePresent
+      ? "Deferred control or explicit late recovery must drain the queue after article parsing"
+      : "Queue must drain before body parsing",
   );
   assert.equal(
     callback.coreCallSucceeded,
@@ -207,7 +214,7 @@ function assertOutageSamples(samples) {
   );
 }
 
-function assertCriticalOutage(raw, responses, runtimeUrl) {
+function assertCriticalOutage(raw, responses, runtimeUrl, mode = "failed") {
   assert.deepEqual(
     raw.preCoreQueue.callbacks,
     [],
@@ -227,8 +234,10 @@ function assertCriticalOutage(raw, responses, runtimeUrl) {
     responses
       .filter((entry) => entry.url === runtimeUrl)
       .map((entry) => entry.status),
-    [404],
-    "Observe exactly one failed critical runtime response, not a cached runtime or retry",
+    mode === "absent" ? [] : [404],
+    mode === "absent"
+      ? "Absent runtime tag must issue no runtime request"
+      : "Observe exactly one failed critical runtime response, not a cached runtime or retry",
   );
   assert(
     raw.navigation[0].domContentLoadedEventEnd > 0,

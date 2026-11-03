@@ -237,9 +237,17 @@ fn main() -> Result<(), FixtureError> {
         "crates/trusted-server-core/src/tsjs.rs",
         "crates/trusted-server-js/lib/build-module-options.mjs",
         "crates/trusted-server-js/lib/build-all.mjs",
+        "crates/trusted-server-js/lib/package-lock.json",
         "crates/trusted-server-core/src/integrations/gpt_bootstrap.js",
         "crates/trusted-server-integration-tests/examples/cwv_html.rs",
     ];
+    let js_source_files = command(&["find", "crates/trusted-server-js/lib/src", "-type", "f"]);
+    let mut js_source_paths = js_source_files.lines().collect::<Vec<_>>();
+    js_source_paths.sort_unstable();
+    let source_files = source_files
+        .into_iter()
+        .chain(js_source_paths.iter().copied())
+        .collect::<Vec<_>>();
     let manifest = json!({
         "schemaVersion": 1, "reserved": reserved,
         "sourceRevision": env::var("CWV_SOURCE_REVISION").unwrap_or_else(|_| command(&["git", "rev-parse", "HEAD"])),
@@ -249,7 +257,11 @@ fn main() -> Result<(), FixtureError> {
             "status": env::var("CWV_SOURCE_STATUS").ok(),
             "origin": "CWV_SOURCE_REVISION/CWV_SOURCE_STATUS if present, otherwise current git checkout"
         },
-        "jsSourceFiles": command(&["find", "crates/trusted-server-js/lib/src", "-type", "f"]),
+        "jsSourceFiles": js_source_paths.join("\n"),
+        "jsModules": {
+            "immediate": registry.js_module_ids_immediate(),
+            "deferred": registry.js_module_ids_deferred()
+        },
         "sourceFingerprints": command(&["sha256sum"].into_iter().chain(source_files).collect::<Vec<_>>()),
         "rustc": command(&["rustc", "-Vv"]),
         "exporterSource": include_str!("cwv_html.rs"),

@@ -1,4 +1,5 @@
 import { claimFirstImpressionForTrustedServer } from '../../core/first_impression';
+import { getActiveTraceGptBridge } from '../../trace/runtime';
 import type {
   AuctionBidData,
   AuctionSlot,
@@ -389,6 +390,8 @@ export function installPublisherSlotRegistration(
         ) as Record<string, string[]>;
         retainPublisherSlotMappings(ts, ts.divToSlotId, ts.prevSlotTargetingKeys);
         try {
+          const auctionId = candidate?.hb_auction_id;
+          const trace = getActiveTraceGptBridge()?.opportunity(slot, auctionId) ?? { auctionId };
           ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
             native,
             slot.id,
@@ -397,8 +400,9 @@ export function installPublisherSlotRegistration(
                 ? 'renderable_candidate'
                 : 'unrenderable_candidate'
               : 'no_candidate',
-            candidate?.hb_auction_id,
-            record.eligibleFormats
+            trace.auctionId,
+            record.eligibleFormats,
+            ...(trace.identity ? ([trace.identity] as const) : [])
           );
         } catch {
           /* Diagnostics never own delivery. */

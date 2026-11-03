@@ -57,14 +57,13 @@ function withoutEarlyRenderer(html) {
   );
 }
 
-function withoutRuntimeDefer(html) {
+function withRuntimeDefer(html) {
   const dom = new JSDOM(html, { includeNodeLocations: true });
   try {
     const script = dom.window.document.querySelector("script#trustedserver-js");
-    const location = script && dom.nodeLocation(script)?.attrs?.defer;
-    return location
-      ? html.slice(0, location.startOffset) + html.slice(location.endOffset)
-      : html;
+    if (!script || script.hasAttribute("defer")) return html;
+    const offset = dom.nodeLocation(script).startOffset + "<script".length;
+    return html.slice(0, offset) + " defer" + html.slice(offset);
   } finally {
     dom.window.close();
   }
@@ -79,6 +78,6 @@ module.exports = {
   scriptBlocks,
   withoutScripts,
   withoutEarlyRenderer,
-  withoutRuntimeDefer,
+  withRuntimeDefer,
   rendererAsset,
 };

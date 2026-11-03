@@ -352,20 +352,22 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
     ts.initialAdInitScheduled = true;
     if (initialSlots !== undefined) ts.adSlots = initialSlots;
     if (initialBids !== undefined) ts.bids = initialBids;
+    // Bind the accepted batch before settlement can queue registered delivery.
+    // Do not re-observe it in the deferred automatic pass and replace newer bindings.
+    try {
+      getActiveTraceGptBridge()?.observeTransport(
+        initialSlots ?? ts.adSlots,
+        traceAuctionTransport,
+        'initial_navigation_ssat'
+      );
+    } catch {
+      // A diagnostic bridge cannot block the ordinary initial ad pass.
+    }
     if (initialBids !== undefined || initialSlots !== undefined) {
       settlePublisherSlotPayload(ts, 0, ts.adSlots ?? [], ts.bids ?? {});
     }
     const runUnlessNavigated = (): void => {
       if ((ts.navGeneration ?? 0) !== 0) return;
-      try {
-        getActiveTraceGptBridge()?.observeTransport(
-          initialSlots ?? ts.adSlots,
-          traceAuctionTransport,
-          'initial_navigation_ssat'
-        );
-      } catch {
-        // A diagnostic bridge cannot block the ordinary initial ad pass.
-      }
       ts.adInit?.();
     };
     const afterHydrationFrames = (): void => {
@@ -1353,6 +1355,11 @@ export function installSpaAuctionHook(): void {
         ts.adSlots = data.slots;
         ts.bids = data.bids;
       }
+      try {
+        getActiveTraceGptBridge()?.observePageBids(data, data.slots);
+      } catch {
+        // A diagnostic bridge cannot block the accepted navigation.
+      }
       settlePublisherSlotPayload(ts, generation, data.slots, data.bids);
       // Automatic placements retain their existing DOM wait.
       await waitForSlotElements(
@@ -1362,11 +1369,6 @@ export function installSpaAuctionHook(): void {
       if (inflight !== controller || ts.navGeneration !== generation) return;
       ts.adSlots = data.slots;
       ts.bids = data.bids;
-      try {
-        getActiveTraceGptBridge()?.observePageBids(data, data.slots);
-      } catch {
-        // A diagnostic bridge cannot block the accepted navigation.
-      }
       // This route is now the committed, loaded state — a later failed
       // navigation rolls back here, and a return trip no-ops correctly.
       lastAppliedPath = path;

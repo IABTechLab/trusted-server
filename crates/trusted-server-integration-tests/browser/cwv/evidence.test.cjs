@@ -128,6 +128,55 @@ test("CSP API proof distinguishes working compiled runtime from unavailable no-f
   }
 });
 
+test("missing DOM dependency invalidates a stale pass before loading contract helpers", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cwv-dependency-"));
+  try {
+    fs.writeFileSync(
+      path.join(root, "acceptance.json"),
+      JSON.stringify({ status: "passed" }),
+    );
+    const result = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        `const Module = require("node:module");
+       const load = Module._load;
+       Module._load = function(name, ...args) {
+         if (name === "jsdom") {
+           const error = new Error("Deliberately missing jsdom");
+           error.code = "MODULE_NOT_FOUND";
+           throw error;
+         }
+         return load.call(this, name, ...args);
+       };
+       require(process.argv[1]);`,
+        path.join(__dirname, "run.cjs"),
+        "--loading",
+        root,
+        "--combined",
+        root,
+        "--out",
+        root,
+        "--correctness-only",
+      ],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 1, result.stderr);
+    const outcome = JSON.parse(
+      fs.readFileSync(path.join(root, "acceptance.json")),
+    );
+    assert.equal(outcome.status, "blocked");
+    assert.equal(outcome.samples, 0);
+    assert.match(outcome.error.message, /Deliberately missing jsdom/);
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(path.join(root, "artifacts.json"))).outcome,
+      outcome,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 for (const status of ["blocked", "failed"])
   test(`setup ${status} replaces a previous successful outcome without launching a browser`, () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cwv-outcome-"));
@@ -177,7 +226,7 @@ for (const status of ["blocked", "failed"])
       assert(outcome.finishedAt);
       assert.equal(outcome.samples, 0);
       assert.equal(
-        outcome.negativeControls["parser-blocking"].status,
+        outcome.negativeControls["runtime-deferred"].status,
         "pending",
       );
     } finally {

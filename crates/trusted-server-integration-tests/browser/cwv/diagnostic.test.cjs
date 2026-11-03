@@ -59,13 +59,16 @@ test("original-main allows its actual raw bootstrap instead of using candidate H
   assert.throws(() => assertScreenDocument(legacy, "loading"));
 });
 
-function probeFixture() {
+function probeFixture({
+  articlePresent = false,
+  runtimeId = "trustedserver-js",
+} = {}) {
   const listeners = {};
   const context = vm.createContext({
     window: { cwv: {} },
     performance: { now: () => 1 },
     document: {
-      getElementById: () => null,
+      getElementById: () => (articlePresent ? {} : null),
       addEventListener: (name, callback) => {
         listeners[name] = callback;
       },
@@ -93,7 +96,7 @@ function probeFixture() {
   window.__tsjs_installGptShim = () => {};
   window.tsjs.publisherSlotRegistrationVersion = 1;
   window.tsjs.tsRenderBridgeVersion = 1;
-  listeners.load({ target: { id: "trustedserver-js" } });
+  listeners.load({ target: { id: runtimeId } });
   return JSON.parse(JSON.stringify(window.cwv));
 }
 
@@ -109,6 +112,15 @@ test("pre-core queue drain observes core methods without assuming GPT has initia
   );
   assertEarlyProbe(raw, "combined");
   assertEarlyProbe(raw, "baseline");
+});
+
+test("explicit dynamic recovery captures native load and late queue drain without satisfying normal early ordering", () => {
+  const raw = probeFixture({
+    articlePresent: true,
+    runtimeId: "trustedserver-js-recovery",
+  });
+  assertEarlyProbe(raw, "combined", true);
+  assert.throws(() => assertEarlyProbe(raw, "combined"), /before body parsing/);
 });
 
 test("early API evidence fails closed for dropped/duplicate queue callbacks and missing GPT APIs", () => {
@@ -296,7 +308,7 @@ for (const scope of ["diagnostic-screen", "diagnostic-outages"])
         scope === "diagnostic-screen" ? 40 : 4,
       );
       if (scope === "diagnostic-outages")
-        assert.equal(outcome.diagnostic.changedOutageBehaviorApproved, false);
+        assert.equal(outcome.diagnostic.changedOutageBehaviorApproved, true);
       assert.match(outcome.error.message, /ENOENT/);
       for (const control of Object.values(outcome.negativeControls)) {
         assert.equal(control.status, "not-requested");
@@ -304,7 +316,7 @@ for (const scope of ["diagnostic-screen", "diagnostic-outages"])
           control.reason,
           scope === "diagnostic-screen"
             ? /outside this screen/
-            : /observed, not approved/,
+            : /Full acceptance remains unexecuted/,
         );
       }
       assert.deepEqual(

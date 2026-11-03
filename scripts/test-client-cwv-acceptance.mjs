@@ -130,7 +130,7 @@ export function validateMeasurement(report, condition, runs) {
     8 * runs + 24,
     'Every repeated measurement and correctness sample must complete'
   )
-  for (const name of ['parser-blocking', 'reservation-removed']) {
+  for (const name of ['runtime-deferred', 'reservation-removed']) {
     assert.equal(
       report.negativeControls?.[name]?.status,
       'passed',
@@ -273,7 +273,21 @@ export function validateExportSources(inputs, source, originalSources) {
   )
   for (const [file, hash] of Object.entries(loading))
     assert.equal(source.files[file], hash, `Candidate export is stale: ${file}`)
-  for (const file of ['Cargo.lock', 'rust-toolchain.toml', '.tool-versions']) {
+  for (const [file, hash] of Object.entries(source.files)) {
+    if (!file.startsWith('crates/trusted-server-js/lib/src/') || hash === null)
+      continue
+    assert.equal(
+      loading[file],
+      hash,
+      `Candidate export is stale or incomplete: ${file}`
+    )
+  }
+  for (const file of [
+    'Cargo.lock',
+    'rust-toolchain.toml',
+    '.tool-versions',
+    'crates/trusted-server-js/lib/package-lock.json',
+  ]) {
     assert(
       baseline[file] && loading[file],
       `Missing baseline toolchain/dependency fingerprint: ${file}`
@@ -283,6 +297,50 @@ export function validateExportSources(inputs, source, originalSources) {
       loading[file],
       `Baseline and candidate must use matching ${file}`
     )
+  }
+}
+
+/** Bind measured candidate runtime bytes to the same distribution used by framework tests. */
+export function validateExportAssets(inputs, dist) {
+  const moduleBytes = (id) => readFileSync(resolve(dist, `tsjs-${id}.js`))
+  for (const name of ['loading', 'combined']) {
+    const { manifest, path } = inputs[name]
+    assert(
+      manifest.jsModules,
+      `${name}: export lacks runtime module identities`
+    )
+    const immediate = [
+      'core',
+      ...manifest.jsModules.immediate.filter((id) => id !== 'core'),
+    ]
+    const unified = Buffer.concat(
+      immediate.flatMap((id, index) =>
+        index === 0 ? [moduleBytes(id)] : [Buffer.from(';\n'), moduleBytes(id)]
+      )
+    )
+    const expected = new Map([
+      ['/static/tsjs=tsjs-unified.min.js', unified],
+      ...manifest.jsModules.deferred.map((id) => [
+        `/static/tsjs=tsjs-${id}.min.js`,
+        moduleBytes(id),
+      ]),
+    ])
+    const observed = new Set()
+    for (const [src, file] of Object.entries(manifest.assets)) {
+      const pathname = new URL(src, 'https://publisher.example.com').pathname
+      assert(expected.has(pathname), `${name}: unexpected runtime asset ${src}`)
+      assert.equal(
+        sha256(readFileSync(resolve(dirname(path), file))),
+        sha256(expected.get(pathname)),
+        `${name}: exported runtime differs from selected distribution: ${src}`
+      )
+      observed.add(pathname)
+    }
+    for (const pathname of expected.keys())
+      assert(
+        observed.has(pathname),
+        `${name}: missing runtime asset ${pathname}`
+      )
   }
 }
 
@@ -343,12 +401,11 @@ function unitTests() {
 export function runAcceptance(requestedOptions) {
   let options = requestedOptions
   mkdirSync(options.out, { recursive: true })
-  const state = sourceState()
   const report = {
     schemaVersion: 1,
     status: 'running',
     startedAt: new Date().toISOString(),
-    source: state,
+    source: null,
     conditions,
     steps: [],
   }
@@ -395,6 +452,8 @@ export function runAcceptance(requestedOptions) {
     }
   }
   try {
+    const state = sourceState()
+    report.source = state
     const snapshot = snapshotInputs(options)
     options = snapshot.options
     report.requestedInputs = requestedOptions
@@ -432,6 +491,7 @@ export function runAcceptance(requestedOptions) {
           sha256(readFileSync(resolve(options.dist, name))),
         ])
     )
+    validateExportAssets(report.inputs, options.dist)
     save()
     step('units', process.execPath, ['--test', ...unitTests()])
     step('offline-registration', process.execPath, [

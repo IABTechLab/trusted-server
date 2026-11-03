@@ -4,8 +4,6 @@ import {
   expect,
   test,
   type Page,
-  type ElementHandle,
-  type Frame,
   type Route,
   type TestInfo,
 } from "@playwright/test";
@@ -16,7 +14,10 @@ const {
   sha256,
   assertEvidence,
 } = require("../../publisher-registration/real-gpt.cjs");
-const { rendererAsset } = require("../../cwv/html.cjs");
+const { rendererAsset, scriptBlocks } = require("../../cwv/html.cjs");
+const {
+  marker,
+} = require("../../publisher-registration/marker-visibility.cjs");
 const baselineMode =
   process.env.PUBLISHER_REGISTRATION_REAL_GPT_MODE === "legacy";
 const inventory = loadInventory(
@@ -46,6 +47,9 @@ type Session = {
   network: Network[];
   responses: Array<Record<string, unknown>>;
   errors: string[];
+  consoleMessages: string[];
+  expectedErrors: string[];
+  runtimeRequests: string[];
   pending: Promise<void>[];
   captureErrors: string[];
   interventions: Array<Record<string, unknown>>;
@@ -90,6 +94,9 @@ async function install(
     network: [],
     responses: [],
     errors: [],
+    consoleMessages: [],
+    expectedErrors: [],
+    runtimeRequests: [],
     pending: [],
     captureErrors: [],
     interventions: [],
@@ -187,6 +194,7 @@ async function install(
       session.network[index].failure = request.failure()?.errorText;
   });
   page.on("pageerror", (error) => session.errors.push(error.message));
+  page.on("console", (message) => session.consoleMessages.push(message.text()));
   page.on("response", (response) => {
     const url = new URL(response.url());
     if (
@@ -244,23 +252,82 @@ async function install(
         body: bytes,
       });
     }
-    if ((runtime === "failed" || holdRuntime) && rendererAsset(url.pathname)) {
-      session.interventions.push({ type: runtime, url: url.href });
-      if (holdRuntime) {
-        session.runtimeRoutes.push(route);
-        return;
+    if (rendererAsset(url.pathname)) {
+      session.runtimeRequests.push(url.pathname);
+      if (runtime === "failed" || holdRuntime) {
+        session.interventions.push({ type: runtime, url: url.href });
+        if (holdRuntime) {
+          session.runtimeRoutes.push(route);
+          return;
+        }
+        return route.abort("failed");
       }
-      return route.abort("failed");
     }
     return route.continue();
   });
   return session;
 }
 
-async function ready(page: Page, runtime = true, variant = "") {
-  await page.goto(`${baseUrl()}/publisher-registration-real-gpt${variant}`, {
-    waitUntil: "commit",
-  });
+function assertRuntimeOrder(html: string) {
+  const scripts = scriptBlocks(html);
+  const runtimes = scripts.filter(
+    (script: { id: string }) => script.id === "trustedserver-js",
+  );
+  expect(runtimes).toHaveLength(1);
+  const runtime = runtimes[0];
+  expect(new URL(runtime.src, baseUrl()).pathname).toBe(
+    "/static/tsjs=tsjs-unified.min.js",
+  );
+  expect(html.slice(runtime.startOffset, runtime.endOffset)).not.toMatch(
+    /\s(?:async|defer)(?:\s|=|>)/,
+  );
+  for (const config of [
+    "window.__tsjs_gpt_enabled=true",
+    "window.__tsjs_prebid=",
+  ]) {
+    const script = scripts.find((entry: { content: string }) =>
+      entry.content.includes(config),
+    );
+    expect(
+      script,
+      `${config} must precede the synchronous runtime`,
+    ).toBeTruthy();
+    expect(script.endOffset).toBeLessThanOrEqual(runtime.startOffset);
+  }
+  expect(runtime.endOffset).toBeLessThanOrEqual(
+    html.indexOf('id="real-gpt-placeholder"'),
+  );
+  expect(
+    scripts.some(
+      (script: { id: string }) => script.id === "trustedserver-bootstrap",
+    ),
+  ).toBe(false);
+  for (const api of [
+    "publisherSlotRegistrationVersion",
+    "tsRenderBridgeVersion",
+  ]) {
+    expect(
+      scripts.some(
+        (script: { src: string | null; content: string }) =>
+          !script.src && script.content.includes(api),
+      ),
+      `no inline ${api} fallback`,
+    ).toBe(false);
+  }
+}
+
+async function ready(page: Page, variant = "") {
+  const response = await page.goto(
+    `${baseUrl()}/publisher-registration-real-gpt${variant}`,
+    {
+      waitUntil: "commit",
+    },
+  );
+  assertRuntimeOrder(await response!.text());
+  await waitReady(page);
+}
+
+async function waitReady(page: Page) {
   await expect
     .poll(() =>
       page.evaluate(() => {
@@ -273,19 +340,18 @@ async function ready(page: Page, runtime = true, variant = "") {
       }),
     )
     .toBe(true);
-  if (runtime)
-    await expect
-      .poll(() =>
-        page.evaluate(() => {
-          const browser = window as unknown as Browser;
-          return (
-            browser.tsjs?.tsRenderBridgeVersion === 1 &&
-            typeof browser.pbjs?.registerBidAdapter === "function" &&
-            browser.googletag.pubads().__tsRefreshWrapped === true
-          );
-        }),
-      )
-      .toBe(true);
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const browser = window as unknown as Browser;
+        return (
+          browser.tsjs?.tsRenderBridgeVersion === 1 &&
+          typeof browser.pbjs?.registerBidAdapter === "function" &&
+          browser.googletag.pubads().__tsRefreshWrapped === true
+        );
+      }),
+    )
+    .toBe(true);
   expect(
     (await publisher(page)).filter((event) => event.type === "slotRequested"),
   ).toHaveLength(0);
@@ -306,77 +372,6 @@ async function mount(page: Page, eligible = true, id = "real-gpt-final") {
     { id, eligible },
   );
   await expect(page.locator(`#${id}`)).toHaveCount(1);
-}
-
-async function visiblyPainted(element: ElementHandle) {
-  return element.evaluate((node) => {
-    if (!(node instanceof HTMLElement) || !node.isConnected || document.hidden)
-      return false;
-    const rect = node.getBoundingClientRect();
-    let left = Math.max(0, rect.left);
-    let top = Math.max(0, rect.top);
-    let right = Math.min(innerWidth, rect.right);
-    let bottom = Math.min(innerHeight, rect.bottom);
-    for (
-      let ancestor: HTMLElement | null = node;
-      ancestor;
-      ancestor = ancestor.parentElement
-    ) {
-      const css = getComputedStyle(ancestor);
-      if (
-        css.display === "none" ||
-        css.visibility === "hidden" ||
-        css.visibility === "collapse" ||
-        Number(css.opacity) === 0 ||
-        css.contentVisibility === "hidden"
-      )
-        return false;
-      const clip = ancestor.getBoundingClientRect();
-      if (css.overflowX !== "visible") {
-        left = Math.max(left, clip.left);
-        right = Math.min(right, clip.right);
-      }
-      if (css.overflowY !== "visible") {
-        top = Math.max(top, clip.top);
-        bottom = Math.min(bottom, clip.bottom);
-      }
-    }
-    return right > left && bottom > top;
-  });
-}
-
-async function marker(page: Page, text: string, id: string) {
-  for (const element of await page.locator(`#${id} iframe`).elementHandles()) {
-    const root = await element.contentFrame();
-    if (!root) continue;
-    const frames = [root];
-    for (let index = 0; index < frames.length; index++) {
-      const frame = frames[index];
-      frames.push(...frame.childFrames());
-      try {
-        let ancestorsVisible = true;
-        for (
-          let ancestor: Frame | null = frame;
-          ancestor && ancestor !== page.mainFrame();
-          ancestor = ancestor.parentFrame()
-        ) {
-          if (!(await visiblyPainted(await ancestor.frameElement()))) {
-            ancestorsVisible = false;
-            break;
-          }
-        }
-        if (!ancestorsVisible) continue;
-        for (const textElement of await frame
-          .getByText(text, { exact: false })
-          .elementHandles()) {
-          if (await visiblyPainted(textElement)) return true;
-        }
-      } catch {
-        /* Detached, hidden, collapsed and offscreen frames are not evidence. */
-      }
-    }
-  }
-  return false;
 }
 
 async function nativeSlots(page: Page) {
@@ -493,7 +488,7 @@ async function verifyProxy(page: Page) {
           ),
       )
     : session.errors;
-  expect(unexpectedErrors).toEqual([]);
+  expect(unexpectedErrors).toEqual(session.expectedErrors);
 }
 
 test.afterEach(async ({ page }, info) => {
@@ -518,6 +513,9 @@ test.afterEach(async ({ page }, info) => {
       events,
       provider,
       errors: session.errors,
+      consoleMessages: session.consoleMessages,
+      expectedErrors: session.expectedErrors,
+      runtimeRequests: session.runtimeRequests,
       captureErrors: session.captureErrors,
       interventions: session.interventions,
     };
@@ -583,45 +581,152 @@ if (!baselineMode) {
       page,
     }, info) => {
       await install(page, info);
-      await ready(page, true, scenario === "no-bid" ? "/no-bid" : "");
+      await ready(page, scenario === "no-bid" ? "/no-bid" : "");
       await mount(page, scenario !== "ineligible");
       await verify(page, [await delivered(page, false)]);
     });
 
-  for (const runtime of ["failed", "late"] as const)
-    test(`${runtime} deferred runtime preserves eligible early TS delivery without a repeat at takeover`, async ({
-      page,
-    }, info) => {
-      const session = await install(page, info, runtime);
-      await ready(page, false);
-      await mount(page);
-      expect(
-        await page.evaluate(
-          () => (window as unknown as Browser).tsjs?.tsRenderBridgeVersion,
-        ),
-        "actual early renderer must survive the deferred-runtime fault",
-      ).toBe(1);
-      const initial = await delivered(page, true);
-      expect(
-        session.interventions.some((entry) => entry.type === runtime),
-      ).toBe(true);
-      if (runtime === "late") {
-        await session.releaseRuntime();
-        await expect
-          .poll(() =>
-            page.evaluate(() => {
-              const browser = window as unknown as Browser;
-              return (
-                typeof browser.pbjs?.registerBidAdapter === "function" &&
-                browser.googletag.pubads().__tsRefreshWrapped === true
-              );
-            }),
-          )
-          .toBe(true);
-        // The completed main-runtime installation is the observation boundary, not a sleep.
-      }
-      await verify(page, [initial]);
+  test("held critical unified runtime blocks parsing and publisher readiness until release", async ({
+    page,
+  }, info) => {
+    const session = await install(page, info, "late");
+    const response = await page.goto(
+      `${baseUrl()}/publisher-registration-real-gpt`,
+      {
+        waitUntil: "commit",
+      },
+    );
+    await expect.poll(() => session.runtimeRoutes.length).toBe(1);
+    expect(
+      await page.evaluate(() => {
+        const browser = window as unknown as Browser;
+        return {
+          state: document.readyState,
+          registration: browser.tsjs?.publisherSlotRegistrationVersion,
+          renderer: browser.tsjs?.tsRenderBridgeVersion,
+          publisher: !!browser.realGptPublisher,
+          placeholder: !!document.getElementById("real-gpt-placeholder"),
+        };
+      }),
+    ).toEqual({
+      state: "loading",
+      registration: undefined,
+      renderer: undefined,
+      publisher: false,
+      placeholder: false,
     });
+    expect(
+      (await publisher(page)).filter((event) => event.type === "slotRequested"),
+    ).toEqual([]);
+    expect(
+      session.network.filter((entry) =>
+        new URL(entry.url).pathname.endsWith("/gampad/ads"),
+      ),
+    ).toEqual([]);
+    await session.releaseRuntime();
+    assertRuntimeOrder(await response!.text());
+    await waitReady(page);
+    await mount(page);
+    await verify(page, [await delivered(page, true)]);
+    expect(session.runtimeRequests).toEqual([
+      "/static/tsjs=tsjs-unified.min.js",
+    ]);
+  });
+
+  test("failed critical unified runtime has no TS APIs, delivery, inline fallback or retry", async ({
+    page,
+  }, info) => {
+    const session = await install(page, info, "failed");
+    const response = await page.goto(
+      `${baseUrl()}/publisher-registration-real-gpt`,
+    );
+    assertRuntimeOrder(await response!.text());
+    // GPT and React may still initialize. That does not make TS registration ready.
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const browser = window as unknown as Browser;
+          return (
+            browser.googletag.apiReady === true &&
+            browser.realGptPublisher?.ready === true
+          );
+        }),
+      )
+      .toBe(true);
+    const apis = () =>
+      page.evaluate(() => {
+        const browser = window as unknown as Browser;
+        return {
+          registration: browser.tsjs?.publisherSlotRegistrationVersion,
+          renderer: browser.tsjs?.tsRenderBridgeVersion,
+          register: typeof (browser.tsjs as { registerPublisherSlot?: unknown })
+            ?.registerPublisherSlot,
+          scheduler: typeof (
+            browser.tsjs as { scheduleInitialAdInit?: unknown }
+          )?.scheduleInitialAdInit,
+        };
+      });
+    expect(await apis()).toEqual({
+      registration: undefined,
+      renderer: undefined,
+      register: "undefined",
+      scheduler: "undefined",
+    });
+    await expect(page.locator("#real-gpt-placeholder")).toHaveCount(1);
+    const publisherError = "Actual Rust registration bootstrap is unavailable";
+    await page.getByRole("button", { name: "Mount final placement" }).click();
+    // GPT can catch command callbacks and React can catch layout effects. Keep
+    // their actual diagnostic channel instead of requiring a window error.
+    await expect
+      .poll(() =>
+        [...session.errors, ...session.consoleMessages].some((message) =>
+          message.includes(publisherError),
+        ),
+      )
+      .toBe(true);
+    for (const message of session.errors) {
+      expect(message).toBe(publisherError);
+      session.expectedErrors.push(message);
+    }
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+    expect(await apis()).toEqual({
+      registration: undefined,
+      renderer: undefined,
+      register: "undefined",
+      scheduler: "undefined",
+    });
+    expect(
+      (await nativeSlots(page)).filter(
+        (slot) => slot.path === inventory.registered.path,
+      ),
+    ).toEqual([]);
+    assertEvidence({
+      requests: session.network.filter((entry) =>
+        new URL(entry.url).pathname.endsWith("/gampad/ads"),
+      ),
+      events: await publisher(page),
+      expected: [],
+      paths,
+    });
+    expect(
+      session.network.filter(
+        (entry) => new URL(entry.url).pathname === "/auction",
+      ),
+    ).toEqual([]);
+    expect(session.runtimeRequests).toEqual([
+      "/static/tsjs=tsjs-unified.min.js",
+    ]);
+    expect(session.interventions).toHaveLength(1);
+    expect(session.errors).toEqual(session.expectedErrors);
+    await expect(page.locator("#trustedserver-bootstrap")).toHaveCount(0);
+    await Promise.all(session.pending);
+    expect(session.captureErrors).toEqual([]);
+  });
 
   test("eligible TS-first candidate retires on real no-bid publisher refresh with SRA isolation", async ({
     page,
