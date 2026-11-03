@@ -188,11 +188,9 @@ struct RequestEc {
     jar: Option<CookieJar>,
 }
 
-/// Parses EC identity from request cookies in a single pass.
+/// Parses EC identity from valid Cookie pairs in a single pass.
 ///
-/// # Errors
-///
-/// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
+/// Malformed pairs are skipped without losing valid neighbors.
 fn parse_ec_from_request(req: &Request<EdgeBody>) -> Result<RequestEc, Report<TrustedServerError>> {
     let jar = handle_request_cookies(req)?;
     let cookie_ec = jar
@@ -230,7 +228,7 @@ fn request_ec_id_if_allowed(value: &str, source: &str) -> Option<String> {
 ///
 /// # Errors
 ///
-/// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
+/// Malformed Cookie input does not produce an error.
 pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<TrustedServerError>> {
     let parsed = parse_ec_from_request(req)?;
     let ec_id = parsed.cookie_ec.filter(|v| is_valid_ec_id(v));

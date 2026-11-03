@@ -60,7 +60,7 @@ pub fn generate_ec_id(
 ///
 /// # Errors
 ///
-/// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
+/// Malformed Cookie input does not produce an error.
 pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<TrustedServerError>> {
     if let Some(ec_id) = req
         .headers()

@@ -1126,6 +1126,132 @@ async fn adapter_buffers_nextjs_auction_output() {
     }
 }
 
+struct CookieEchoOrigin;
+
+#[async_trait::async_trait(?Send)]
+impl PlatformHttpClient for CookieEchoOrigin {
+    async fn send(
+        &self,
+        request: PlatformHttpRequest,
+    ) -> Result<PlatformResponse, Report<PlatformError>> {
+        let cookie = request
+            .request
+            .headers()
+            .get(http::header::COOKIE)
+            .map(|value| value.as_bytes().to_vec())
+            .unwrap_or_default();
+        Ok(PlatformResponse::new(
+            http::Response::builder()
+                .header("content-type", "text/plain")
+                .body(edgezero_core::body::Body::from(cookie))
+                .expect("should echo forwarded cookie bytes"),
+        ))
+    }
+
+    async fn send_async(
+        &self,
+        _: PlatformHttpRequest,
+    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    async fn select(
+        &self,
+        _: Vec<PlatformPendingRequest>,
+    ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lenient_cookie_sanitation_matches_host_adapters_before_origin_forwarding() {
+    let ec_id = format!("{}.abc123", "a".repeat(64));
+    let expected = format!("ts-ec={ec_id}; keep=one; token=abc==; empty=; last=two");
+    let mut non_utf8 = b"bad=".to_vec();
+    non_utf8.push(0xff);
+    non_utf8.extend_from_slice(
+        format!("; ts-ec={ec_id}; keep=one; __Host-ts-console=1; token=abc==; empty=; last=two")
+            .as_bytes(),
+    );
+    let fields = [
+        vec![non_utf8],
+        vec![
+            format!("bad=é; ts-ec={ec_id}; keep=one").into_bytes(),
+            b"missing-equals; __Host-ts-console=1; token=abc==; empty=; last=two".to_vec(),
+        ],
+        vec![
+            format!("missing-equals; ts-ec={ec_id}; keep=one").into_bytes(),
+            b"bad name=value; __Host-ts-console=1; token=abc==; empty=; last=two".to_vec(),
+        ],
+    ];
+
+    for enabled in [None, Some(false), Some(true)] {
+        let mut settings = test_settings();
+        if let Some(enabled) = enabled {
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({"enabled": enabled}))
+                .expect("should configure diagnostics");
+        }
+        let services = nextjs_auction::services_with_http_client(Arc::new(CookieEchoOrigin));
+        let routers = [
+            (
+                "Axum",
+                AxumApp::routes_with_settings_and_services(settings.clone(), services.clone()),
+            ),
+            (
+                "Cloudflare",
+                CloudflareApp::routes_with_settings_and_services(
+                    settings.clone(),
+                    services.clone(),
+                ),
+            ),
+            (
+                "Spin",
+                SpinApp::routes_with_settings_and_services(settings, services),
+            ),
+        ];
+        for (adapter, router) in routers {
+            let router = router.expect("should build cookie fixture routes");
+            for fields in &fields {
+                let mut request = request_builder()
+                    .method("GET")
+                    .uri("https://test-publisher.example.com/cookie-probe")
+                    .header("host", "test-publisher.example.com")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build cookie probe");
+                for field in fields {
+                    request.headers_mut().append(
+                        http::header::COOKIE,
+                        http::HeaderValue::from_bytes(field)
+                            .expect("should accept cookie field bytes"),
+                    );
+                }
+                let response = router
+                    .clone()
+                    .oneshot(request)
+                    .await
+                    .expect("should route cookie probe");
+                assert_eq!(
+                    response.status(),
+                    200,
+                    "{adapter} should not reject malformed cookie pairs"
+                );
+                let body = response
+                    .into_body()
+                    .into_bytes_bounded(4096)
+                    .await
+                    .expect("should drain cookie echo");
+                assert_eq!(
+                    body.as_ref(),
+                    expected.as_bytes(),
+                    "{adapter} should preserve valid pairs before origin forwarding"
+                );
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct TerminalFixtureOrigin {
     lookup_calls: AtomicUsize,

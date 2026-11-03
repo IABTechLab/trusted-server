@@ -391,44 +391,37 @@ fn console_query(uri: &Uri) -> (QueryDirective, String, bool) {
 
 fn console_cookie_state(request: &Request<EdgeBody>) -> ConsoleCookieState {
     let mut state = ConsoleCookieState::default();
-    for value in request.headers().get_all(header::COOKIE) {
-        let Ok(value) = value.to_str() else {
-            continue;
+    for pair in crate::cookies::cookie_header_pairs(request.headers()) {
+        let (name, value) = match pair.iter().position(|byte| *byte == b'=') {
+            Some(separator) => (&pair[..separator], Some(&pair[separator + 1..])),
+            None => (pair, None),
         };
-        for cookie in value.split(';') {
-            let cookie = cookie.trim();
-            match cookie.split_once('=') {
-                Some((name, value)) if name.trim() == GPT_DIAGNOSTICS_COOKIE => {
-                    state.occurrences += 1;
-                    state.canonical |= value.trim() == "1";
-                }
-                None if cookie == GPT_DIAGNOSTICS_COOKIE => state.occurrences += 1,
-                _ => {}
-            }
+        if name.trim_ascii() == GPT_DIAGNOSTICS_COOKIE.as_bytes() {
+            state.occurrences += 1;
+            state.canonical |= value.is_some_and(|value| value.trim_ascii() == b"1");
         }
     }
     state
 }
 
 fn sanitize_console_cookie(request: &mut Request<EdgeBody>) {
-    let retained = request
-        .headers()
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(';'))
-        .map(str::trim)
-        .filter(|cookie| match cookie.split_once('=') {
-            Some((name, _)) => name.trim() != GPT_DIAGNOSTICS_COOKIE,
-            None => *cookie != GPT_DIAGNOSTICS_COOKIE,
-        })
-        .filter(|cookie| !cookie.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let pairs = crate::cookies::cookie_header_pairs(request.headers()).filter(|pair| {
+        let name = pair
+            .split(|byte| *byte == b'=')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii();
+        name != GPT_DIAGNOSTICS_COOKIE.as_bytes()
+    });
+    let (retained, sanitation) = crate::cookies::parse_cookie_pairs(pairs);
+    let retained = retained.join("; ");
 
+    if sanitation.discarded_textual_pairs() {
+        request.extensions_mut().insert(sanitation);
+    }
     request.headers_mut().remove(header::COOKIE);
     if !retained.is_empty() {
-        let value = HeaderValue::from_str(&retained.join("; "))
+        let value = HeaderValue::from_str(&retained)
             .expect("should preserve already-valid cookie header values");
         request.headers_mut().insert(header::COOKIE, value);
     }
@@ -753,6 +746,87 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn lenient_cookie_preparation_preserves_neighbors_and_header_order() {
+        for enabled in [None, Some(false), Some(true)] {
+            let mut settings = settings(enabled == Some(true));
+            if enabled.is_none() {
+                settings.integrations.remove(GPT_DIAGNOSTICS_INTEGRATION_ID);
+            }
+            let mut request = navigation("https://publisher.example/page", None);
+            request.headers_mut().append(
+                header::COOKIE,
+                HeaderValue::from_bytes(b"first=one; bad=\xff; __Host-ts-console=1; token=abc==")
+                    .expect("should build mixed cookie field"),
+            );
+            request.headers_mut().append(
+                header::COOKIE,
+                HeaderValue::from_static("missing-equals; empty=; last=two"),
+            );
+
+            let decision = prepare_request(&settings, &mut request)
+                .expect("should prepare mixed cookie fields");
+
+            assert_eq!(decision.active(), enabled == Some(true));
+            assert_eq!(
+                request.headers()[header::COOKIE],
+                "first=one; token=abc==; empty=; last=two",
+                "should retain valid pairs in field order and remove only reserved or malformed pairs"
+            );
+            assert_eq!(request.headers().get_all(header::COOKIE).iter().count(), 1);
+            prepare_request(&settings, &mut request).expect("should prepare idempotently");
+            assert_eq!(
+                request.headers()[header::COOKIE],
+                "first=one; token=abc==; empty=; last=two"
+            );
+        }
+    }
+
+    #[test]
+    fn lenient_cookie_preparation_keeps_invalid_reserved_duplicates_fail_closed() {
+        let mut request = navigation("https://publisher.example/page", None);
+        request.headers_mut().append(
+            header::COOKIE,
+            HeaderValue::from_bytes(
+                b"bad=\xff; __Host-ts-console=1; __Host-ts-console; other=value",
+            )
+            .expect("should build ambiguous console cookie field"),
+        );
+
+        let decision = prepare_request(&settings(true), &mut request)
+            .expect("should prepare ambiguous console cookies");
+
+        assert!(
+            !decision.active(),
+            "should count malformed reserved duplicates before removal"
+        );
+        assert_eq!(request.headers()[header::COOKIE], "other=value");
+    }
+
+    #[test]
+    fn lenient_cookie_reserved_removal_does_not_add_a_cache_veto() {
+        let mut request = navigation(
+            "https://publisher.example/page",
+            Some("__Host-ts-console; other=value"),
+        );
+
+        let decision = prepare_request(&settings(false), &mut request)
+            .expect("should remove the malformed reserved cookie");
+
+        assert!(
+            !decision.active(),
+            "should keep disabled diagnostics inactive"
+        );
+        assert_eq!(request.headers()[header::COOKIE], "other=value");
+        assert!(
+            request
+                .extensions()
+                .get::<crate::cookies::CookieSanitation>()
+                .is_none(),
+            "reserved-input removal must not become a new generic Cookie cache veto"
+        );
     }
 
     #[test]

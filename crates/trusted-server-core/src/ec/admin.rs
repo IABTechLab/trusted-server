@@ -1254,6 +1254,28 @@ mod tests {
     }
 
     #[test]
+    fn lenient_cookie_admin_lookup_keeps_ec_beside_malformed_bytes() {
+        let ec_id = test_ec_id();
+        let kv = kv_with_entry(&ec_id, &sample_entry());
+        let mut request = get_request("/_ts/admin/ec");
+        request.headers_mut().append(
+            header::COOKIE,
+            HeaderValue::from_bytes(format!("bad=\u{00ff}; ts-ec={ec_id}").as_bytes())
+                .expect("should build non-ASCII cookie field"),
+        );
+
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &request)
+            .expect("should handle lenient cookie lookup");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should not reject neighboring cookies"
+        );
+        assert_eq!(response_json(response)["ec_id"], ec_id);
+    }
+
+    #[test]
     fn bare_route_uses_last_duplicate_ts_ec_cookie() {
         // `CookieJar` — the parser the live EC lifecycle uses — keeps the last
         // duplicate pair. The diagnostic must inspect that same record, not the

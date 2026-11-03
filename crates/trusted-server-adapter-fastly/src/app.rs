@@ -2704,6 +2704,31 @@ mod tests {
     }
 
     #[test]
+    fn lenient_cookie_dispatch_preserves_existing_ec_beside_malformed_bytes() {
+        let router = test_router();
+        let ec_id = format!("{}.abc123", "a".repeat(64));
+        let mut request = empty_request(Method::GET, "/.well-known/trusted-server.json");
+        let mut field = b"bad=\xff; ts-ec=".to_vec();
+        field.extend_from_slice(ec_id.as_bytes());
+        request.headers_mut().append(
+            header::COOKIE,
+            HeaderValue::from_bytes(&field).expect("should build mixed cookie field"),
+        );
+
+        let response = route(&router, request);
+        let finalize = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("should retain EC finalization state");
+
+        assert_eq!(
+            finalize.ec_context.existing_cookie_ec_id(),
+            Some(ec_id.as_str()),
+            "should preserve the visitor identity through the adapter request path"
+        );
+    }
+
+    #[test]
     fn dispatch_named_route_attaches_ec_finalize_state() {
         // Named routes must also thread EC finalize state, mirroring how the
         // legacy path finalizes every response with the pre-routing EcContext.

@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::{CookieSanitation, is_cookie_name};
 use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EC, COOKIE_TS_EIDS};
 use crate::platform::TemplateCookieValue;
 
@@ -46,6 +47,28 @@ pub(crate) fn validate_cookie_names(
         }
     }
     Ok(())
+}
+
+/// Classifies prepared cookies without erasing an earlier malformed-input veto.
+///
+/// Preparation already discarded opaque fields and empty segments on the baseline.
+/// Newly discarded nonempty textual pairs must still bypass named policies or the
+/// legacy header-presence gate. This provenance contains counts, never Cookie values.
+pub(crate) fn evaluate_request_cookie_policy<B>(
+    request: &http::Request<B>,
+    key_names: &[String],
+    bypass_names: &[String],
+    independent: bool,
+) -> TemplateCookieDecision {
+    if request
+        .extensions()
+        .get::<CookieSanitation>()
+        .is_some_and(CookieSanitation::discarded_textual_pairs)
+        && (!independent || !key_names.is_empty() || !bypass_names.is_empty())
+    {
+        return TemplateCookieDecision::Bypass;
+    }
+    evaluate_cookie_policy(request.headers(), key_names, bypass_names, independent)
 }
 
 /// Classifies all request-cookie fields using validated configuration names.
@@ -107,13 +130,6 @@ pub(crate) fn evaluate_cookie_policy(
             })
             .collect(),
     )
-}
-
-fn is_cookie_name(name: &[u8]) -> bool {
-    !name.is_empty()
-        && name
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(byte))
 }
 
 fn trim_pair(mut pair: &[u8]) -> &[u8] {
@@ -193,6 +209,34 @@ mod tests {
         TemplateCookieValue {
             name: name.to_owned(),
             value: value.map(<[u8]>::to_vec),
+        }
+    }
+
+    #[test]
+    fn lenient_cookie_provenance_preserves_only_existing_policy_vetoes() {
+        let (_, sanitation) = super::super::parse_cookie_pairs([b"broken".as_slice()].into_iter());
+        let mut request = http::Request::new(());
+        request.extensions_mut().insert(sanitation);
+
+        for (key_names, bypass_names, independent, bypass) in [
+            (names(&[]), names(&[]), false, true),
+            (names(&[]), names(&[]), true, false),
+            (names(&["ab_bucket"]), names(&[]), true, true),
+            (names(&[]), names(&["session"]), true, true),
+        ] {
+            assert_eq!(
+                matches!(
+                    evaluate_request_cookie_policy(
+                        &request,
+                        &key_names,
+                        &bypass_names,
+                        independent
+                    ),
+                    TemplateCookieDecision::Bypass
+                ),
+                bypass,
+                "should preserve named-policy and header-presence vetoes without adding one to unconditional independence"
+            );
         }
     }
 
