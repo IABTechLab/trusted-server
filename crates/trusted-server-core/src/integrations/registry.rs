@@ -602,6 +602,17 @@ pub trait IntegrationHeadInjector: Send + Sync {
     /// Return HTML snippets to insert at the start of `<head>`.
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
 
+    /// Return head snippets when an enforced response CSP is present.
+    ///
+    /// Integrations without a CSP-specific loading dependency retain their existing snippets.
+    fn head_inserts_with_response_csp(
+        &self,
+        ctx: &IntegrationHtmlContext<'_>,
+        _enforced_csp: bool,
+    ) -> Vec<String> {
+        self.head_inserts(ctx)
+    }
+
     /// Return attributes to add to the publisher TSJS bundle tag.
     fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
         Vec::new()
@@ -1161,9 +1172,19 @@ impl IntegrationRegistry {
     /// Collect HTML snippets for insertion at the start of `<head>`.
     #[must_use]
     pub fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        self.head_inserts_with_response_csp(ctx, false)
+    }
+
+    /// Collect head snippets using the actual response CSP decision.
+    #[must_use]
+    pub fn head_inserts_with_response_csp(
+        &self,
+        ctx: &IntegrationHtmlContext<'_>,
+        enforced_csp: bool,
+    ) -> Vec<String> {
         let mut inserts = Vec::new();
         for injector in &self.inner.head_injectors {
-            let mut next = injector.head_inserts(ctx);
+            let mut next = injector.head_inserts_with_response_csp(ctx, enforced_csp);
             if !next.is_empty() {
                 inserts.append(&mut next);
             }

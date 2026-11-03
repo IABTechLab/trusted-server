@@ -50,6 +50,8 @@ Document every current integration's early dependency and selection outcome. Ini
 
 An enforced Content-Security-Policy response header from the origin or configured response headers also retains the original synchronous unified path. Presence is sufficient, even for a permissive policy; there is no new general CSP evaluator. Report-Only alone does not force fallback. This choice is independent of visitor/auction admission and retained in shared-template output. Header-only selection does not promise detection of policies introduced later in document markup.
 
+The matched original-main acceptance comparison also exposed a changed hash in the provisional raw GPT bootstrap. On enforced-response-CSP pages, omit that provisional inline bootstrap and let the synchronous unified runtime install the APIs before publisher scripts. Retain the unchanged activation marker. Do not add a new inline permission requirement. This path has no provisional-bootstrap fallback if the synchronous runtime itself fails to load; its browser regression must record that boundary explicitly.
+
 This rule follows an executed review counterexample: an old deployment allowing same-origin external scripts and the old inline hashes lost core APIs when the new default inline entry was denied. Documentation alone did not preserve compatibility. The conservative fallback gives up deferral on some compatible CSP pages rather than silently require new permissions. Do not weaken CSP, add nonce handling or add an operator loading-mode flag.
 
 Do not add parallel experimental loading modes or a new operator flag merely to conceal uncertainty. Keep fallback explicit in source and tests. Adding a newly supported profile later requires ordering coverage.

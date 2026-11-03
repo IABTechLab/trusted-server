@@ -424,7 +424,7 @@ pub(crate) fn create_html_processor_with_document_state(
                     };
                     // First inject integration-specific config (e.g., window.__tsjs_prebid)
                     // so it's available when the bundle's auto-init code reads it.
-                    for insert in integrations.head_inserts(&ctx) {
+                    for insert in integrations.head_inserts_with_response_csp(&ctx, enforced_csp) {
                         snippet.push_str(&insert);
                     }
                     if let Some(bootstrap) = gpt_diagnostics
