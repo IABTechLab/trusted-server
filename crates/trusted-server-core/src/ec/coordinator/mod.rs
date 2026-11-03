@@ -25,7 +25,7 @@ use crate::consent::{allows_eid_persistence, tcf_vendor_consent_denied};
 use crate::ec::EcKvSnapshot;
 use crate::ec::consent::ec_consent_granted;
 use crate::ec::eid_types::{ProviderId, SourceDomain, UnixSeconds};
-use crate::ec::kv_types::{KvEid, KvEntry};
+use crate::ec::kv_types::KvEntry;
 use crate::ec::page_load::RowChange;
 use crate::ec::provider::{
     ClientSignals, IdentityProvider, LookupInput, LookupOutcome, OwnedEntries, ProviderConfigError,
@@ -305,7 +305,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
     }
 
     /// Claimed sources lacking a live provider-written UID (a browser
-    /// fallback does not count; for pull sync, a live owned UID), minus
+    /// fallback does not count; for pull sync, any live UID counts), minus
     /// sources needing input V1
     /// never has; the flag reports whether any source was removed for input.
     fn due_sources(
@@ -327,19 +327,14 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 due.push(source.clone());
                 continue;
             }
-            // Legacy pull sync wrote single-UID records with no owner; a
-            // pull-sync provider treats them as its own and refreshes them so
-            // they gain an owner and are mirrored.
+            // A pull-sync source counts any live UID, owned or not, as held:
+            // like legacy pull sync, it pulls only for sources with no UID, so
+            // an ownerless browser, batch or legacy record does not trigger a
+            // lookup (and an EC ID send) on every navigation. Sources with no
+            // UID stay bounded by the partner's hourly pull rate limit.
             let held = record.is_some_and(|record| {
-                if registered.policy.pull_sync {
-                    record
-                        .eids()
-                        .iter()
-                        .flat_map(KvEid::uids)
-                        .any(|uid| uid.owner().is_some() && uid.is_live(now))
-                } else {
-                    record.is_provider_written() && record.has_live_uid(now)
-                }
+                (registered.policy.pull_sync || record.is_provider_written())
+                    && record.has_live_uid(now)
             });
             if held {
                 continue;
@@ -1098,29 +1093,62 @@ mod tests {
     }
 
     #[test]
-    fn pull_sync_refreshes_ownerless_legacy_uids() {
+    fn pull_sync_holds_ownerless_uids_without_repulling() {
         let coordinator = pull_sync_pair(None);
         let transport = CannedTransport::new(not_found_reply);
         let mut entry = KvEntry::tombstone(1000);
         entry.consent.ok = true;
-        for source in ["a.example.com", "b.example.com"] {
-            entry
-                .ids
-                .insert(source.to_owned(), KvPartnerId::single("legacy"));
-        }
+        entry
+            .ids
+            .insert("a.example.com".to_owned(), KvPartnerId::single("legacy"));
+        let snapshot = seeded_snapshot(&entry);
 
-        run(
-            &coordinator,
-            &transport,
-            &seeded_snapshot(&entry),
-            &granting(),
-        );
+        for _ in 0..2 {
+            run(&coordinator, &transport, &snapshot, &granting());
+        }
 
         assert_eq!(
             transport.sent.borrow().len(),
             2,
-            "should look up sources holding only ownerless legacy UIDs"
+            "should look up only the empty source, once per navigation, after a no-match"
         );
+        assert!(
+            transport
+                .sent
+                .borrow()
+                .iter()
+                .all(|url| url.ends_with("due=1")),
+            "should never include the ownerless source"
+        );
+    }
+
+    #[test]
+    fn pull_sync_drops_oversized_uid() {
+        let config: IdentityProviderConfig = toml::from_str(&format!(
+            "id = \"pull-sync:ids.example.com\"\nkind = \"{PULL_SYNC_KIND}\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]"
+        ))
+        .expect("should parse config");
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            config,
+            echo_provider(SourceInput::Anonymous),
+        ));
+        let transport = CannedTransport::new(|| {
+            Ok(TransportResponse {
+                status: http::StatusCode::OK,
+                headers: http::HeaderMap::new(),
+                body: bytes::Bytes::from("x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1)),
+            })
+        });
+
+        let results = run(&coordinator, &transport, &missing(), &granting());
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert_eq!(
+            lookup.status,
+            LookupStatus::NoMatch,
+            "should treat a pull with only an oversized UID as no match"
+        );
+        assert!(lookup.entries.is_empty(), "should store no oversized UID");
     }
 
     #[test]
