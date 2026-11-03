@@ -208,6 +208,9 @@ jobs:
           cargo test --package trusted-server-release --target x86_64-unknown-linux-gnu --locked --test commands ordinary_comparison_failure_prevents_signing_and_publication_sentinels -- --exact > "$RUNNER_TEMP/ordinary-negative-result.txt"
           cat "$RUNNER_TEMP/ordinary-negative-result.txt"
           grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/ordinary-negative-result.txt"
+          # Reached only after the exact negative test passes. The canary jobs
+          # below check that this workflow's `if:` gating skips on this output;
+          # the release signing gate itself is covered by that Rust test.
           echo 'comparison-succeeded=false' >> "$GITHUB_OUTPUT"
 
       - name: Run checked and ordinary JS release build fixtures
@@ -533,4 +536,4 @@ jobs:
           test "$COMPARISON_SUCCEEDED" = false
           test "$SIGN_RESULT" = skipped
           test "$PUBLISH_RESULT" = skipped
-          echo 'SUCCESS: real negative comparison rejected; read-only signing/publication canaries skipped'
+          echo 'SUCCESS: Rust negative comparison test passed; workflow-gated signing/publication canaries skipped'

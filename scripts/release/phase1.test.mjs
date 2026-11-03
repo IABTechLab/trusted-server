@@ -2165,10 +2165,7 @@ test('ordinary Fastly gate binds dedicated A and B uploads before isolated signi
   }
   assert.match(comparison, /needs: \[fastly-canonical, fastly-reproduction\]/)
   assert.match(comparison, /actions: read/)
-  assert.match(
-    comparison,
-    /ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/
-  )
+  assert.match(comparison, /ref: \$\{\{ github\.sha \}\}/)
   assert.match(
     comparison,
     /test "\$\(git rev-parse HEAD\)" = "\$SOURCE_COMMIT"/

@@ -59,7 +59,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           path: ordinary-canonical-source
       - name: Read pinned toolchains
         id: tools
@@ -83,7 +83,7 @@ jobs:
           cargo build --package trusted-server-release --release --target x86_64-unknown-linux-gnu --locked
       - name: Build and observe the actual canonical Fastly release bytes
         env:
-          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          SOURCE_COMMIT: ${{ github.sha }}
           RELEASE_VERSION: ${{ github.ref_name }}
           RELEASE_ASSET: trusted-server-fastly.wasm
         run: |
@@ -199,7 +199,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           path: ordinary-reproduction-source
       - name: Read pinned toolchains
         id: tools
@@ -223,7 +223,7 @@ jobs:
           cargo build --package trusted-server-release --release --target x86_64-unknown-linux-gnu --locked
       - name: Build and observe the actual reproduction Fastly release bytes
         env:
-          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          SOURCE_COMMIT: ${{ github.sha }}
           RELEASE_VERSION: ${{ github.ref_name }}
           RELEASE_ASSET: trusted-server-fastly.wasm
         run: |
@@ -344,7 +344,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
       - name: Read pinned toolchains
         id: tools
         run: |
@@ -361,7 +361,7 @@ jobs:
       - name: Build the ordinary comparison tool from the expected source
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/ordinary-compare-tool
-          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          SOURCE_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
@@ -369,9 +369,9 @@ jobs:
           cargo build --package trusted-server-release --release --target x86_64-unknown-linux-gnu --locked
       - name: Retain the invocation and all eight direct upload outputs
         env:
-          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          SOURCE_COMMIT: ${{ github.sha }}
           REPOSITORY_ID: ${{ github.repository_id }}
-          HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id || github.repository_id }}
+          HEAD_REPOSITORY_ID: ${{ github.repository_id }}
           A_ARTIFACT_ID: ${{ needs.fastly-canonical.outputs.artifact-id }}
           A_ARTIFACT_DIGEST: ${{ needs.fastly-canonical.outputs.artifact-digest }}
           A_OBSERVATION_ID: ${{ needs.fastly-canonical.outputs.observation-id }}
