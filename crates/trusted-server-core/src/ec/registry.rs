@@ -296,9 +296,18 @@ impl PartnerRegistry {
             }
         }
         let pull_sync_registered = is_registered_kind(PULL_SYNC_KIND);
-        for partner in ec.partners.iter().filter(|partner| {
-            pull_sync_registered && partner.pull_sync_enabled && partner.pull_sync_url.is_some()
-        }) {
+        for partner in ec
+            .partners
+            .iter()
+            .filter(|partner| pull_sync_registered && runs_pull_sync(partner))
+        {
+            if batch_sync_rejected(partner) {
+                log::warn!(
+                    "Partner '{}' runs pull sync and has a batch sync api_token; its source is \
+                     provider-owned, so batch sync rejects every mapping for it",
+                    partner.source_domain
+                );
+            }
             registry.mark_provider_owned(&partner.source_domain, None);
         }
         Ok(registry)
@@ -423,6 +432,18 @@ impl PartnerRegistry {
     pub fn is_empty(&self) -> bool {
         self.by_source_domain.is_empty()
     }
+}
+
+/// Whether the partner runs pull sync as a provider, making its source
+/// provider-owned.
+fn runs_pull_sync(partner: &EcPartner) -> bool {
+    partner.pull_sync_enabled && partner.pull_sync_url.is_some()
+}
+
+/// Whether a pull-sync partner also has a batch `api_token`, whose mappings
+/// batch sync then rejects because the source is provider-owned.
+fn batch_sync_rejected(partner: &EcPartner) -> bool {
+    runs_pull_sync(partner) && partner.api_token.is_some()
 }
 
 fn validate_api_token(
@@ -703,6 +724,27 @@ mod tests {
         assert!(
             partner.owner_vendor_consent_denied(&consent),
             "should withhold the source while the disabled provider's vendor lacks consent"
+        );
+    }
+
+    #[test]
+    fn batch_token_on_pull_sync_partner_is_flagged() {
+        let mut pull = make_partner("pull.example.com", &valid_api_token("pull-partner"));
+
+        assert!(
+            !batch_sync_rejected(&pull),
+            "should not flag a batch-only partner"
+        );
+        pull.pull_sync_enabled = true;
+        pull.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
+        assert!(
+            batch_sync_rejected(&pull),
+            "should flag a pull-sync partner with a batch token"
+        );
+        pull.api_token = None;
+        assert!(
+            !batch_sync_rejected(&pull),
+            "should not flag a pull-sync partner without a batch token"
         );
     }
 

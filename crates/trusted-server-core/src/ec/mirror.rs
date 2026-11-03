@@ -67,26 +67,14 @@ pub fn build_mirror(
             continue;
         };
         let source = partner.source_domain.as_str();
-        // Ownerless UIDs of a pull-sync partner's source were written by
-        // legacy pull sync, so they belong to that partner's provider.
-        let pull_sync_owned =
-            partner.provider_owned && partner.pull_sync_enabled && partner.pull_sync_url.is_some();
-        if record.eids().is_empty() {
-            if pull_sync_owned && !record.uid.is_empty() {
-                let header = legacy_header(source);
-                let uid = serde_json::to_string(&serde_json::json!({
-                    "id": record.uid,
-                    "atype": partner.openrtb_atype,
-                }));
-                mirror.push_eid(source, header, [uid]);
-            }
-            continue;
-        }
+        // Only provider-written UIDs carry an owner. Ownerless records come
+        // from browser ingest, batch sync or legacy pull sync, so they are
+        // never mirrored.
         for eid in record.eids() {
             let uids = eid
                 .uids()
                 .iter()
-                .filter(|uid| (pull_sync_owned || uid.owner().is_some()) && uid.is_live(now))
+                .filter(|uid| uid.owner().is_some() && uid.is_live(now))
                 .map(|uid| serde_json::to_string(&uid_json(uid)));
             mirror.push_eid(source, eid_header(source, eid), uids);
         }
@@ -146,7 +134,7 @@ impl MirrorBuilder {
             let added = if kept == 0 {
                 usize::from(self.eid_count > 0) + header.len() + uid.len() + EID_SUFFIX.len()
             } else {
-                1 + uid.len()
+                1 + uid.len() + EID_SUFFIX.len()
             };
             if encoded_len(self.json.len() + added + JSON_SUFFIX.len()) > MAX_MIRROR_BYTES {
                 continue;
@@ -169,14 +157,6 @@ impl MirrorBuilder {
             self.json.truncate(eid_start);
         }
     }
-}
-
-/// Header for a legacy single-UID record: the source only.
-fn legacy_header(source: &str) -> Option<String> {
-    let mut object = Map::new();
-    object.insert("source".to_owned(), Value::from(source));
-    object.insert("uids".to_owned(), Value::Array(Vec::new()));
-    open_uids_array(serde_json::to_string(&Value::Object(object)).ok()?)
 }
 
 const JSON_PREFIX: &str = r#"{"v":1,"eids":["#;
@@ -353,12 +333,12 @@ mod tests {
     }
 
     #[test]
-    fn mirrors_legacy_uid_of_pull_sync_partner_only() {
+    fn does_not_mirror_browser_ingested_uid_of_pull_sync_source() {
         let mut entry = KvEntry::tombstone(1000);
         entry.consent.ok = true;
         entry
             .ids
-            .insert("ids.example.com".to_owned(), KvPartnerId::single("legacy"));
+            .insert("ids.example.com".to_owned(), KvPartnerId::single("browser"));
         let pull_partner = serde_json::from_value(json!({
             "name": "ids", "source_domain": "ids.example.com", "bidstream_enabled": true,
             "pull_sync_enabled": true, "pull_sync_url": "https://sync.example.com/pull",
@@ -369,21 +349,13 @@ mod tests {
         let mut pull =
             PartnerRegistry::from_config(&[pull_partner]).expect("should build registry");
         pull.mark_provider_owned("ids.example.com", None);
-        let now = UnixSeconds::new(1000);
 
-        let MirrorCookie::Set(value) = build_mirror(Some(&entry), &granting(), &pull, now) else {
-            panic!("should mirror the legacy pull-sync UID");
-        };
+        let mirror = build_mirror(Some(&entry), &granting(), &pull, UnixSeconds::new(1000));
 
         assert_eq!(
-            decode(&value)["eids"][0]["uids"][0]["id"],
-            json!("legacy"),
-            "should attribute the ownerless UID to the pull-sync partner"
-        );
-        assert_eq!(
-            build_mirror(Some(&entry), &granting(), &partners(true), now),
+            mirror,
             MirrorCookie::Expire,
-            "should not mirror ownerless UIDs of other partners"
+            "should not mirror an ownerless browser-ingested UID"
         );
     }
 
@@ -444,5 +416,37 @@ mod tests {
             .expect("should hold uids")
             .len();
         assert!(kept > 0 && kept < 20, "should keep a prefix that fits");
+    }
+
+    #[test]
+    fn several_uids_of_one_eid_respect_the_cap_at_every_boundary() {
+        // Three fixed UIDs fill most of the budget; growing the last UID one
+        // byte at a time crosses the cap at every possible offset.
+        for tail in 1..400 {
+            let mut uids: Vec<KvUid> = (0..3)
+                .map(|i| uid(&format!("{i}{}", "x".repeat(800)), Expiry::Never))
+                .collect();
+            uids.push(uid(&"y".repeat(tail), Expiry::Never));
+            let entry = row(uids);
+
+            let MirrorCookie::Set(value) = build_mirror(
+                Some(&entry),
+                &granting(),
+                &partners(true),
+                UnixSeconds::new(1000),
+            ) else {
+                panic!("should set the mirror");
+            };
+
+            assert!(
+                value.as_str().len() <= MAX_MIRROR_BYTES,
+                "should fit the size limit with tail {tail}"
+            );
+            let kept = decode(&value)["eids"][0]["uids"]
+                .as_array()
+                .expect("should hold uids")
+                .len();
+            assert!(kept >= 3, "should keep the fixed UIDs with tail {tail}");
+        }
     }
 }

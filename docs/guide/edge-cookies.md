@@ -265,7 +265,7 @@ Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source
 
 ### Pull Sync on Navigations
 
-Pull sync runs as an identity provider during top-level page navigations, within the shared identity lookup budget, and its result lands in the navigation's single KV write. A pull-sync partner's source is provider-owned: browser EID ingestion skips it and batch sync rejects its mappings with `provider_owned`.
+Pull sync runs as an identity provider during top-level page navigations, within the shared identity lookup budget, and its result lands in the navigation's single KV write. A pull-sync partner's source is provider-owned: browser EID ingestion stores a fallback UID for it only when the row holds no live UID for that source, and batch sync rejects its mappings with `provider_owned`. Trusted Server logs a warning at config load when a pull-sync partner also has a batch `api_token`, since that token's mappings are all rejected. A source that already holds any live UID, including an ownerless fallback, is not pulled again; a source with no UID is pulled at most `pull_sync_rate_limit` times per hour per EC.
 
 The former `ts-ec-pull-complete` completeness marker is retired. A response to a request that still carries it expires the leftover cookie.
 
@@ -278,7 +278,7 @@ Trusted Server mirrors provider-written UIDs for `bidstream_enabled` partners in
 - **Name**: `__Host-ts-eids-mirror`
 - **Attributes**: `Path=/; Secure; SameSite=Lax; Max-Age=<EC cookie max age>`, host-only (no `Domain`) and not `HttpOnly`
 - **Contents**: unpadded base64url JSON `{"v":1,"eids":[{"source":"ids.example.com","uids":[{"id":"...","atype":1,"exp":1767225600}]}]}`, partners in `[[ec.partners]]` order, at most 3584 bytes; UIDs that do not fit are left out
-- **Contents source**: live UIDs written by an identity provider. UIDs that legacy pull sync stored without an owner count as the pull-sync partner's own.
+- **Contents source**: live UIDs written by an identity provider. Ownerless UIDs, from browser ingest, batch sync or legacy pull sync, are never mirrored.
 - **Updates** (best effort): page navigations rebuild it from the row after that navigation's write. It is expired only when the request carried it, either because no live provider UID qualifies or because EC and EID consent is missing (on any response). Responses to browsers without a mirror get no mirror `Set-Cookie`. When the identity row cannot be read (KV failure) the mirror is left untouched, and a mirror that cannot be built is skipped without failing the response.
 
 Readers must drop UIDs whose `exp` (Unix seconds) has passed and strip `exp` before using a UID.
