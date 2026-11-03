@@ -120,7 +120,7 @@ response.
 - Creatives over the configured hard cap are rejected.
 
 Existing root-relative signed inputs remain accepted. See
-[public origin configuration](../../../../docs/guide/configuration.md#public_origin)
+[`public_origin` under Publisher configuration](../../../../docs/guide/configuration.md#publisher-configuration)
 for the default authority, EC cookie scope, and coordinated upgrade/rollback warning.
 
 ## Example plan

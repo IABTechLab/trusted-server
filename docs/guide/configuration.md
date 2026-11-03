@@ -415,7 +415,17 @@ silently ignored. The example TOML above includes that leaf.
 
 **Purpose**: Browser-facing Trusted Server origin used for first-party URLs emitted into rewritten creatives, including proxy, click, and injected TSJS URLs.
 
-This is distinct from `origin_url`, which is only the backend connection target. Do not derive it from request headers.
+This is distinct from `origin_url`, which is only the backend connection target.
+It is static configuration, not a value derived from request headers or
+`[trusted_forwarder]`. General creative rewriting, sign/rebuild responses and
+injected creative runtime URLs use this setting or its HTTPS/domain fallback.
+
+The publisher inline SSAT/page-bids path instead uses its nonempty request
+origin, which can come from an authenticated `[trusted_forwarder]`. Only an empty
+request origin falls back to `publisher.public_origin` or its default. Inline
+creatives do not inject the creative runtime. Configure `publisher.public_origin`
+to match the browser-facing request origin if both paths should emit the same
+authority.
 
 Use `publisher.domain` or one of its subdomains for deployed traffic. The EC
 cookie is scoped to `.{publisher.domain}`, independently of `cookie_domain`.
@@ -641,7 +651,13 @@ cannot establish trust. Missing or invalid authentication falls back to the
 runtime transport origin. Hostname case and default ports canonicalize for
 comparison.
 
-The validated public origin supplies URL rewriting and trace Origin checks.
+The validated request origin supplies publisher-page URL rewriting, inline
+SSAT/page-bids creative URLs and trace Origin checks. It does not override the
+static [`publisher.public_origin`](#public_origin) used by general creative
+rewriting, sign/rebuild responses and injected creative runtime URLs. Without
+an explicit `publisher.public_origin`, those paths use
+`https://{publisher.domain}` even when the forwarder establishes a different
+request origin.
 The actual ingress URI, Host, TLS metadata, target provenance and cookie-header
 fidelity remain transport facts. Trace actions still require an exact browser
 Origin, same-origin Fetch Metadata, the action control, no query and an empty
