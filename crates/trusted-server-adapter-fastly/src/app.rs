@@ -958,7 +958,10 @@ async fn dispatch_fallback(
             }
         }
         let is_publisher_navigation = ec.is_real_browser && is_navigation;
+        // A new EC is minted only when this request may also write its row,
+        // so a client without Fetch Metadata never receives a throwaway EC.
         if is_publisher_navigation
+            && has_permit
             && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
@@ -2734,6 +2737,58 @@ mod tests {
         assert!(
             state.ec_context.take_navigation_permit_for_test().is_some(),
             "should issue a permit"
+        );
+    }
+
+    fn consented_navigation(mut request: Request) -> Request {
+        // Viceroy geolocates loopback to a US privacy state; a US Privacy
+        // string without a sale opt-out lets the navigation mint an EC.
+        request.extensions_mut().insert(ClientInfo {
+            client_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ..ClientInfo::default()
+        });
+        request
+            .headers_mut()
+            .insert(header::COOKIE, HeaderValue::from_static("us_privacy=1YNN"));
+        request
+    }
+
+    #[test]
+    fn navigation_without_fetch_metadata_mints_no_ec() {
+        let router = test_router();
+        let mut request = consented_navigation(empty_request(Method::GET, "/article"));
+        request
+            .headers_mut()
+            .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+
+        let mut response = route(&router, request);
+
+        let state = take_finalize_state(&mut response);
+        assert!(
+            state.ec_context.ec_value().is_none(),
+            "should not mint an EC that no row can back"
+        );
+    }
+
+    #[test]
+    fn navigation_with_fetch_metadata_mints_an_ec() {
+        let router = test_router();
+
+        let mut response = route(
+            &router,
+            consented_navigation(navigation_request("/article")),
+        );
+
+        let state = take_finalize_state(&mut response);
+        assert!(
+            state.ec_context.ec_value().is_some(),
+            "should mint an EC on a page-load navigation"
         );
     }
 
