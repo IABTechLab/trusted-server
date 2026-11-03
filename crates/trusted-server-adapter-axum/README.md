@@ -58,9 +58,12 @@ configured by the image. `docker build --target cli` builds the matching
 operator CLI at `/usr/local/bin/ts`; it is not a deployment CLI extension.
 
 On Linux the pinned celld provider uses reqwest 0.13's platform verifier and
-native CA loader. A deployment-injected public CA can be selected with
-`SSL_CERT_FILE=/etc/ts-lab/ca.pem`; the file must be readable by UID 10001.
-Keep TLS verification enabled.
+native CA loader. Select a deployment-injected public CA with
+`SSL_CERT_FILE=/etc/ts-lab/ca.pem` and `SSL_CERT_DIR=/etc/ssl/certs` to retain
+system public CAs for outbound HTTPS. The file and directory must be readable
+by UID 10001. The native CA loader uses only the environment-selected paths
+when either variable is set, so a private-only file without the system CA
+directory can break public HTTPS upstreams. Keep TLS verification enabled.
 
 For a single-host lab behind HTTPS termination, the optional
 `TS_LAB_PUBLIC_ORIGIN=https://lab.example.com` supplies fixed public URL facts
