@@ -267,11 +267,19 @@ impl KvIdentityGraph {
         ec_id: &str,
         body_bytes: &[u8],
     ) -> Result<KvEntry, Report<TrustedServerError>> {
-        let entry: KvEntry =
+        let mut entry: KvEntry =
             serde_json::from_slice(body_bytes).change_context(TrustedServerError::KvStore {
                 store_name: store_name.to_owned(),
                 message: format!("Failed to deserialize entry for key '{}'", log_id(ec_id)),
             })?;
+
+        let dropped = entry.drop_unreadable_ids();
+        if dropped > 0 {
+            log::warn!(
+                "Dropped {dropped} unreadable partner IDs loading key '{}'",
+                log_id(ec_id)
+            );
+        }
 
         entry.validate().map_err(|message| {
             Report::new(TrustedServerError::KvStore {
@@ -1289,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_entry_rejects_invalid_legacy_values() {
+    fn deserialize_entry_drops_oversized_ids() {
         let mut entry = KvEntry::tombstone(1000);
         entry.ids.insert(
             "ssp_x".to_owned(),
@@ -1297,14 +1305,19 @@ mod tests {
                 "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
             ),
         );
-        let body = serde_json::to_vec(&entry).expect("should serialize invalid entry payload");
+        entry.ids.insert(
+            "ssp_y".to_owned(),
+            crate::ec::kv_types::KvPartnerId::single("kept"),
+        );
+        let body = serde_json::to_vec(&entry).expect("should serialize oversized entry payload");
 
-        let err = KvIdentityGraph::deserialize_entry("test-store", "ec-id", &body)
-            .expect_err("should reject invalid legacy entry values");
-        let err_text = format!("{err}");
-        assert!(
-            err_text.contains("Loaded invalid entry"),
-            "should report validation failure for loaded entries"
+        let loaded = KvIdentityGraph::deserialize_entry("test-store", "ec-id", &body)
+            .expect("should load an entry holding an oversized ID");
+
+        assert_eq!(
+            loaded.ids.keys().collect::<Vec<_>>(),
+            vec!["ssp_y"],
+            "should drop only the oversized ID"
         );
     }
 

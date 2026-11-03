@@ -1417,7 +1417,7 @@ mod tests {
 
     #[test]
     fn eids_lookup_reports_configured_source_without_valid_uid() {
-        let oversized_uid = "x".repeat(513);
+        let oversized_uid = "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1);
         let cookie = eids_cookie_for(&serde_json::json!([{
             "source": "bidstream.example",
             "uids": [

@@ -6,9 +6,11 @@
 //!
 //! The schema is versioned (`v: 1`) to allow future migrations.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
+use serde_json::value::RawValue;
 
 use super::eid_types::{
     AgentType, EidFields, Expiry, MAX_EID_FIELD_BYTES, MatchMethod, ProviderId, RawJson, UidValue,
@@ -34,9 +36,10 @@ pub const MAX_SEEN_DOMAINS: usize = 50;
 pub const MAX_STORED_DOMAIN_LENGTH: usize = 255;
 
 /// Maximum allowed length (in bytes) for a partner UID across all sync
-/// mechanisms (pixel, batch, pull). Defined centrally to ensure consistent
-/// validation.
-pub const MAX_UID_LENGTH: usize = 512;
+/// mechanisms (pixel, batch, pull) and identity providers. Sized for
+/// `LiveRamp` envelopes (about 700 bytes). Defined centrally to ensure
+/// consistent validation.
+pub const MAX_UID_LENGTH: usize = 1024;
 
 /// Full KV entry stored as the body of an EC identity graph record.
 ///
@@ -187,6 +190,24 @@ impl KvPartnerId {
         *self != before
     }
 
+    /// Drops entries left without UIDs and resyncs `uid`.
+    ///
+    /// Returns whether the record still holds a UID within
+    /// [`MAX_UID_LENGTH`].
+    fn retain_readable(&mut self) -> bool {
+        if self.eids.is_empty() {
+            return self.uid.len() <= MAX_UID_LENGTH;
+        }
+        self.eids.retain(|eid| !eid.uids.is_empty());
+        self.uid = self
+            .eids
+            .first()
+            .and_then(|eid| eid.uids.first())
+            .map(|uid| uid.id().as_str().to_owned())
+            .unwrap_or_default();
+        !self.eids.is_empty()
+    }
+
     /// Removes the last UID of the last entry and resyncs `uid`; used by the
     /// write planner's size cap.
     pub(crate) fn drop_last_uid(&mut self) {
@@ -227,7 +248,37 @@ struct KvEidRepr {
     mm: Option<MatchMethod>,
     #[serde(default)]
     ext: Option<RawJson>,
+    #[serde(deserialize_with = "deserialize_readable_uids")]
     uids: Vec<KvUid>,
+}
+
+/// The `id` of a stored UID, read without validating the rest of it.
+#[derive(Deserialize)]
+struct StoredId<'a> {
+    #[serde(borrow)]
+    id: Cow<'a, str>,
+}
+
+/// Deserializes stored UIDs, skipping any whose `id` exceeds
+/// [`MAX_UID_LENGTH`].
+///
+/// A row written under a higher limit then still loads; an entry left
+/// without UIDs is removed by [`KvEntry::drop_unreadable_ids`]. Any other
+/// invalid UID still fails the row.
+fn deserialize_readable_uids<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<KvUid>, D::Error> {
+    let raw = Vec::<Box<RawValue>>::deserialize(deserializer)?;
+    let mut uids = Vec::with_capacity(raw.len());
+    for value in &raw {
+        let oversized = serde_json::from_str::<StoredId<'_>>(value.get())
+            .is_ok_and(|stored| stored.id.len() > MAX_UID_LENGTH);
+        if oversized {
+            continue;
+        }
+        uids.push(serde_json::from_str(value.get()).map_err(de::Error::custom)?);
+    }
+    Ok(uids)
 }
 
 impl From<KvEidRepr> for KvEid {
@@ -504,6 +555,17 @@ pub(crate) fn validated_stored_domain(domain: &str) -> Option<String> {
 }
 
 impl KvEntry {
+    /// Removes partner records holding no UID this build can serve.
+    ///
+    /// Lets this build load rows written by one with a higher
+    /// [`MAX_UID_LENGTH`] instead of rejecting the whole row. Returns the
+    /// number of records removed.
+    pub fn drop_unreadable_ids(&mut self) -> usize {
+        let before = self.ids.len();
+        self.ids.retain(|_, record| record.retain_readable());
+        before - self.ids.len()
+    }
+
     /// Creates a new live entry from the current request context.
     ///
     /// `domain` is the publisher's apex domain (e.g. `"example.com"`),
@@ -1541,6 +1603,68 @@ mod tests {
                 .expect("should parse");
         entry.ids.insert("ids.example.com".to_owned(), record);
         assert!(entry.validate().is_err(), "should reject EID with no UIDs");
+    }
+
+    #[test]
+    fn validate_accepts_liveramp_sized_uid() {
+        let entry = KvEntry::minimal("liveramp.example.com", &"x".repeat(703), 1);
+        assert!(
+            entry.validate().is_ok(),
+            "should accept a 703-byte envelope-sized UID"
+        );
+    }
+
+    #[test]
+    fn drop_unreadable_ids_removes_oversized_single_uid() {
+        let mut entry = KvEntry::minimal("ids.example.com", "kept", 1);
+        entry.ids.insert(
+            "long.example.com".to_owned(),
+            KvPartnerId::single("x".repeat(MAX_UID_LENGTH + 1)),
+        );
+
+        let dropped = entry.drop_unreadable_ids();
+
+        assert_eq!(dropped, 1, "should drop the oversized record");
+        assert_eq!(
+            entry.ids.keys().collect::<Vec<_>>(),
+            vec!["ids.example.com"],
+            "should keep the readable record"
+        );
+        assert!(entry.validate().is_ok(), "should validate after dropping");
+    }
+
+    #[test]
+    fn deserialize_drops_oversized_provider_uids() {
+        let long = "x".repeat(MAX_UID_LENGTH + 1);
+        let json = serde_json::json!({
+            "v": SCHEMA_VERSION,
+            "created": 1,
+            "consent": { "ok": true, "updated": 1 },
+            "geo": { "country": "US" },
+            "ids": {
+                "partial.example.com": { "uid": long, "eids": [
+                    { "uids": [{ "id": long, "atype": 1 }] },
+                    { "uids": [{ "id": "short", "atype": 1 }] }
+                ] },
+                "gone.example.com": { "uid": long, "eids": [
+                    { "uids": [{ "id": long, "atype": 1 }] }
+                ] }
+            }
+        })
+        .to_string();
+        let mut entry: KvEntry =
+            serde_json::from_str(&json).expect("should parse a row with oversized UIDs");
+
+        let dropped = entry.drop_unreadable_ids();
+
+        assert_eq!(dropped, 1, "should drop the record left without UIDs");
+        let partial = entry
+            .ids
+            .get("partial.example.com")
+            .expect("should keep the record with a readable UID");
+        assert_eq!(partial.uid, "short", "should resync uid to the kept UID");
+        assert_eq!(partial.eids().len(), 1, "should drop the emptied entry");
+        assert!(entry.validate().is_ok(), "should validate after dropping");
     }
 
     #[test]

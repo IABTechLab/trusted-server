@@ -798,12 +798,12 @@ mod tests {
 
     #[test]
     fn extract_pull_uid_rejects_oversized_uid() {
-        let long_uid = "x".repeat(513);
+        let long_uid = "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1);
         let body = format!("{{\"uid\":\"{long_uid}\"}}");
         let response = make_response(200, body.as_bytes());
 
         let uid = extract_pull_uid(response, "ssp.example.com");
-        assert!(uid.is_none(), "should reject uid exceeding 512 bytes");
+        assert!(uid.is_none(), "should reject uid exceeding MAX_UID_LENGTH");
     }
 
     #[test]

@@ -238,7 +238,7 @@ mod tests {
         let partners = registry();
         let provider = ProviderId::new("example-provider");
         let claimed = claimed();
-        let long = "x".repeat(600);
+        let long = "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1);
         let mut expired = uid("u-old");
         expired.expiry = ProviderExpiry::At(UnixSeconds::new(1000));
         let array_ext = RawValue::from_string("[1]".to_owned()).expect("should build raw");
