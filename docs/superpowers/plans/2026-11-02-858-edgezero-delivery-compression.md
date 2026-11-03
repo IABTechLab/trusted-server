@@ -22,7 +22,7 @@ Fastly's final delivery headers.
 ## Implementation
 
 1. Pin all six root workspace EdgeZero dependencies to
-   `1c0f475097a813a3a9cbb7a4a121ca0523d5ed64`. Regenerate only the necessary lock
+   `157f091e42b5c584898a5d0f8a0d3ddc3a4dd5ec`. Regenerate only the necessary lock
    entries and verify all eight EdgeZero packages have one exact git source.
    Do not update Fastly SDK pins or unrelated registry versions.
 2. Read support from the incoming EdgeZero request before encoder selection.
@@ -113,6 +113,20 @@ Fastly alias configurations failed before tests on
 successful SDK, alias and release EOF execution in that hosted environment.
 The current local discrepancy remains unresolved. This follow-up includes no
 runtime workaround and makes no new local WASM-pass claim.
+
+## CI fixture follow-up, 2026-11-03
+
+Framework commit `157f091e` fixes the reusable HTTP smoke probe's
+abort ordering. Its controlled origin now waits for the client to observe body
+bytes before truncating. Immediate aborts remain available for pre-commit faults,
+and the strict status, exact partial-body and correlated-error checks are unchanged.
+No shipping SDK logic or runtime configuration changed.
+
+A new ordering regression failed before the fix. The fixed fixture passed two
+core and 27 harness tests, formatting, strict Clippy and the full Fastly smoke
+suite under pinned Viceroy 0.21.0. All three custom variants observed status 200
+and `partial` followed by the matching guest error. This consumer refreshes the
+same six declarations and eight lock sources to the published fix.
 
 No deployment ran. Real Fastly reader negotiation, progressive CDN delivery,
 service-chain behavior and vCPU/transfer measurements remain staging work.
