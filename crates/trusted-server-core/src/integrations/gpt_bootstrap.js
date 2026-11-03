@@ -365,45 +365,6 @@
       targetingKeys[record.elementId] = record.targetingKeys;
     }
   }
-  function registeredCandidateAllowed(ts, slotId, bid) {
-    var _a, _b, _c, _d, _e, _f, _g, _h;
-    const record =
-      ((_a = ts.publisherSlotRegistrationState) == null
-        ? void 0
-        : _a.generation) === ((_b = ts.navGeneration) != null ? _b : 0)
-        ? ts.publisherSlotRegistrationState.records[slotId]
-        : void 0;
-    if (record) {
-      if (
-        !record.consumed ||
-        record.selectedCandidate !== bid ||
-        !((_c = record.element) == null ? void 0 : _c.isConnected) ||
-        record.element.id !== record.elementId ||
-        document.getElementById(record.elementId) !== record.element
-      )
-        return false;
-      try {
-        return (
-          !!record.gptSlot &&
-          !!((_g =
-            (_e = (_d = registrationTag()) == null ? void 0 : _d.pubads) == null
-              ? void 0
-              : (_f = _e.call(_d)).getSlots) == null
-            ? void 0
-            : _g.call(_f).includes(record.gptSlot))
-        );
-      } catch (e) {
-        return false;
-      }
-    }
-    return !((_h = ts.adSlots) == null
-      ? void 0
-      : _h.some(
-          (slot) =>
-            slot.id === slotId &&
-            slot.initialization === "publisher_registered",
-        ));
-  }
   function observePublisherSlotRender(ts, native) {
     var _a, _b;
     const state = ts.publisherSlotRegistrationState;
