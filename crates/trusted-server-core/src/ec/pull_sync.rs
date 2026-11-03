@@ -1186,7 +1186,7 @@ mod tests {
         let (entry, _) = graph
             .get(&ec_id)
             .expect("should read store")
-            .expect("tombstone should remain");
+            .expect("should keep the tombstone");
         assert!(
             entry.ids.is_empty(),
             "no partner UID may be written back onto a tombstoned row"

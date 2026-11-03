@@ -446,9 +446,7 @@ async fn dispatch_identity_lookups(
         .headers()
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+    let now = trusted_server_core::ec::current_timestamp();
     let pending = coordinator
         .dispatch(
             &transport,

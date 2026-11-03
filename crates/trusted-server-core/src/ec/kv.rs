@@ -1931,7 +1931,7 @@ mod tests {
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read root after rejected hard delete")
-            .expect("rejected hard delete should retain root");
+            .expect("should retain the root after a rejected hard delete");
         assert!(
             !stored.consent.ok,
             "rejected hard delete should leave the tombstoned root in place"
@@ -2520,7 +2520,7 @@ mod tests {
         let (stored, _) = kv
             .get(&ec_id)
             .expect("should read store")
-            .expect("row should remain");
+            .expect("should keep the row");
         assert_eq!(
             stored.ids.get("ssp_x").map(|id| id.uid.as_str()),
             Some("uid-1"),
@@ -2597,7 +2597,7 @@ mod tests {
         let (stored, _) = kv
             .get(&ec_id)
             .expect("should read store")
-            .expect("tombstone should remain");
+            .expect("should keep the tombstone");
         assert!(stored.ids.is_empty(), "no update should reach the store");
     }
 

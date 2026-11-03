@@ -1290,7 +1290,7 @@ mod tests {
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read store")
-            .expect("row should remain");
+            .expect("should keep the row");
         assert!(
             !stored.ids.contains_key("sharedid.org"),
             "a subresource response must not persist request EID cookies"
@@ -1348,7 +1348,7 @@ mod tests {
             let (stored, _) = graph
                 .get(&ec_id)
                 .expect("should read store")
-                .expect("row should remain");
+                .expect("should keep the row");
             assert_eq!(
                 stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
                 permit.then_some(cookie_id),
@@ -1438,7 +1438,7 @@ mod tests {
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read store")
-            .expect("row should remain");
+            .expect("should keep the row");
         assert!(
             stored.ids.is_empty(),
             "an auction request must leave the row unchanged"
@@ -1513,7 +1513,7 @@ mod tests {
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read store")
-            .expect("row should remain");
+            .expect("should keep the row");
         assert!(
             stored.ids.is_empty(),
             "should persist neither the auction body nor the cookie EIDs"
@@ -1575,7 +1575,7 @@ mod tests {
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read store")
-            .expect("row should remain");
+            .expect("should keep the row");
         assert!(
             !stored.ids.contains_key("id5-sync.com"),
             "denying TCF Purpose 4 must keep the EID out of KV even though Purpose 1 \
@@ -1640,7 +1640,7 @@ mod tests {
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read store")
-            .expect("row should remain");
+            .expect("should keep the row");
         assert!(
             !stored.ids.contains_key("id5-sync.com"),
             "should keep the provider-owned fallback out of KV without Purpose 4"

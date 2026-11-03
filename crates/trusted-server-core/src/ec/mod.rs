@@ -780,7 +780,8 @@ impl EcContext {
 /// native and `wasm32-wasip1` targets and to a JS-backed clock on
 /// `wasm32-unknown-unknown` (Cloudflare Workers), where `std::time` is not
 /// available.
-pub(crate) fn current_timestamp() -> u64 {
+#[must_use]
+pub fn current_timestamp() -> u64 {
     checked_current_timestamp().unwrap_or(0)
 }
 
