@@ -22,7 +22,7 @@ Fastly's final delivery headers.
 ## Implementation
 
 1. Pin all six root workspace EdgeZero dependencies to
-   `63c7b63bbbaab7cc1262162d96987e61c146fbf9`. Regenerate only the necessary lock
+   `1c0f475097a813a3a9cbb7a4a121ca0523d5ed64`. Regenerate only the necessary lock
    entries and verify all eight EdgeZero packages have one exact git source.
    Do not update Fastly SDK pins or unrelated registry versions.
 2. Read support from the incoming EdgeZero request before encoder selection.
@@ -75,7 +75,9 @@ replaces the local mechanism, and all four adapter `app.rs` files match the main
 baseline. Independent source review found no blockers and verified all ten runtime
 input hashes.
 
-Local checks passed with Rust 1.98.1, Node 24.20.0 and Viceroy 0.21.0:
+The following records the 2026-11-02 integration checks for consumer `db27e738`
+and framework `63c7b63`, before the test-only review follow-up below. These checks
+passed with Rust 1.98.1, Node 24.20.0 and Viceroy 0.21.0:
 
 - All 32 Rust, adapter, lint, parity, digest, clock, host and documentation gates.
   Native core passed 3,345 tests with two ignored. The normal Fastly alias passed
@@ -96,6 +98,21 @@ not reproduce it. The required `cargo test-fastly` and `cargo test-fastly-reuse`
 configurations, actual deadline fixture and release EOF controls all passed with
 the default runner. Final verification uses no trap override, SDK stub, pin change
 or runtime-source workaround. Earlier trap-mode diagnostics are not final proof.
+
+## Review follow-up, 2026-11-03
+
+Review finding R1 replaces the framework Vary test's copied production predicate
+with literal expected header fields. Framework commit `1c0f4750` changes
+only that test; this consumer refreshes all six declarations and eight lock
+sources without changing registry or SDK versions. The original review and
+integration evidence above remains associated with its original revisions.
+
+During the 2026-11-03 review, local SDK contract execution and both consumer
+Fastly alias configurations failed before tests on
+`fastly_http_req::pending_req_header_insert`. Same-tree hosted CI logs verified
+successful SDK, alias and release EOF execution in that hosted environment.
+The current local discrepancy remains unresolved. This follow-up includes no
+runtime workaround and makes no new local WASM-pass claim.
 
 No deployment ran. Real Fastly reader negotiation, progressive CDN delivery,
 service-chain behavior and vCPU/transfer measurements remain staging work.

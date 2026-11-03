@@ -54,7 +54,7 @@ No Fastly SDK dependency enters core.
 The generic capability, checked identity-response intent, and platform header
 finalizer live in [EdgeZero PR #452](https://github.com/IABTechLab/edgezero/pull/452).
 Pin all six workspace EdgeZero dependencies to exact commit
-`63c7b63bbbaab7cc1262162d96987e61c146fbf9` while the paired PRs are under review.
+`1c0f475097a813a3a9cbb7a4a121ca0523d5ed64` while the paired PRs are under review.
 All eight resolved EdgeZero packages must use that one source. Move to a merged
 EdgeZero release before Trusted Server becomes merge-ready; do not substitute a
 mutable branch or local path.
