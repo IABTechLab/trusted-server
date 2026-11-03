@@ -854,11 +854,9 @@ describe('installSpaAuctionHook', () => {
     expect(adInit).not.toHaveBeenCalled();
   });
 
-  it('retries the same path after a failed page-bids fetch (currentPath rollback)', async () => {
-    // A failed load must roll `currentPath` back so re-navigating to the SAME
-    // path retries instead of being swallowed by the no-op guard at the top of
-    // onNavigate. Without the rollback, currentPath would already equal the
-    // failed path and the second navigation would return early.
+  it('retries the same navigation after a failed page-bids fetch', async () => {
+    // Payload failure must allow a same-path retry without changing the observed
+    // pathname or allocating a new navigation generation.
     document.body.innerHTML = '<div id="div-s1"></div>';
     fetchStub.mockResolvedValueOnce({ ok: false, status: 500 }).mockResolvedValueOnce({
       ok: true,
@@ -888,10 +886,8 @@ describe('installSpaAuctionHook', () => {
   });
 
   it('does not strand a path that was aborted mid-flight then failed on the next nav', async () => {
-    // Rapid A→B where A is aborted mid-flight and B then fails must roll
-    // `currentPath` back to the last *applied* path (here the initial route),
-    // not to A. Rolling back to A — which never loaded — would leave it behind
-    // the no-op guard so a later real navigation to A never re-fetches.
+    // Rapid A→B aborts A before B fails. A later navigation back to A must
+    // fetch again rather than mistake the earlier attempt for applied data.
     document.body.innerHTML = '<div id="div-a"></div>';
     let resolveA: ((value: unknown) => void) | undefined;
     fetchStub
@@ -924,9 +920,8 @@ describe('installSpaAuctionHook', () => {
     await flushAsync();
     expect(ts.adSlots).toBeUndefined();
 
-    // Navigate back to /a. With the rollback keyed to the last applied path
-    // (the initial route) instead of B's previous path (/a), this is NOT
-    // swallowed by the no-op guard and re-fetches.
+    // Returning from B to A is a new navigation, even though neither request
+    // applied a payload.
     history.pushState({}, '', '/a');
     await flushAsync();
 

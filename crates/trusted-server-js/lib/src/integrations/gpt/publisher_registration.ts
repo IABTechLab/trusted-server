@@ -1,5 +1,4 @@
-import { claimFirstImpressionForTrustedServer } from '../../core/first_impression';
-import { getActiveTraceGptBridge } from '../../trace/runtime';
+import type { TraceGptBridge } from '../../trace/gpt';
 import type {
   AuctionBidData,
   AuctionSlot,
@@ -25,10 +24,78 @@ interface RegistrationTag {
   display?(id: string): void;
 }
 
+interface NavigationTargetingSlot {
+  getSlotElementId(): string;
+  clearTargeting?(key?: string): unknown;
+}
+
+interface NavigationTargetingTag {
+  cmd?: RegistrationTag['cmd'];
+  pubads?(): { getSlots?(): NavigationTargetingSlot[] };
+}
+
 const CANDIDATE_KEYS = ['hb_pb', 'hb_bidder', 'hb_adid', 'hb_cache_host', 'hb_cache_path'] as const;
+const BASE_TARGETING_KEYS = [...CANDIDATE_KEYS, 'ts_initial'] as const;
 
 function registrationTag(): RegistrationTag | undefined {
   return (window as unknown as { googletag?: RegistrationTag }).googletag;
+}
+
+function clearPreviousTargetingSnapshot(
+  g: NavigationTargetingTag,
+  snapshot: ReadonlyMap<NavigationTargetingSlot, readonly string[]>
+): boolean {
+  const pubads = g.pubads?.();
+  if (!pubads) return false;
+  const liveSlots = pubads.getSlots?.() ?? [];
+  for (const [slot, keys] of snapshot) {
+    if (!liveSlots.includes(slot)) continue;
+    if (typeof slot.clearTargeting !== 'function') continue;
+    for (const key of new Set(keys)) slot.clearTargeting(key);
+  }
+  return true;
+}
+
+/** Clear owned targeting on exact old native identities before advancing navigation. */
+export function clearPreviousNavigationTargeting(ts: TsjsApi, g: NavigationTargetingTag): void {
+  const previousKeys: Record<string, string[]> = Object.assign(
+    Object.create(null),
+    ts.prevSlotTargetingKeys
+  );
+  const registeredRecords = Object.values(ts.publisherSlotRegistrationState?.records ?? {}).filter(
+    (record) => record.consumed && record.targetingKeys
+  );
+  for (const record of registeredRecords) previousKeys[record.elementId] = record.targetingKeys!;
+  const touchedElementIds = new Set([
+    ...Object.keys(previousKeys),
+    ...Object.keys(ts.divToSlotId ?? {}),
+  ]);
+
+  // Capture exact old native identities before retiring records or advancing navigation.
+  const snapshot = new Map<NavigationTargetingSlot, readonly string[]>();
+  const registeredElementIds = new Set(registeredRecords.map((record) => record.elementId));
+  for (const record of registeredRecords) {
+    if (record.gptSlot) {
+      snapshot.set(record.gptSlot, [...BASE_TARGETING_KEYS, ...record.targetingKeys!]);
+    }
+  }
+  for (const slot of [
+    ...(g.pubads?.().getSlots?.() ?? []),
+    ...((ts.prevGptSlots ?? []) as NavigationTargetingSlot[]),
+  ]) {
+    const elementId = slot.getSlotElementId();
+    if (touchedElementIds.has(elementId) && !registeredElementIds.has(elementId)) {
+      snapshot.set(slot, [...BASE_TARGETING_KEYS, ...(previousKeys[elementId] ?? [])]);
+    }
+  }
+  if (snapshot.size > 0 && !clearPreviousTargetingSnapshot(g, snapshot)) {
+    g.cmd?.push(() => {
+      clearPreviousTargetingSnapshot(g, snapshot);
+    });
+  }
+
+  ts.prevSlotTargetingKeys = Object.create(null) as Record<string, string[]>;
+  ts.divToSlotId = Object.create(null) as Record<string, string>;
 }
 
 /** Retire old records before accepting another navigation's registrations. */
@@ -207,8 +274,8 @@ function registrationHandle(
 /** Install protocol v1 without replacing browser-local records or committed requests. */
 export function installPublisherSlotRegistration(
   ts: TsjsApi,
-  claim: (element: HTMLElement) => FirstImpressionSlotClaim | undefined = (element) =>
-    claimFirstImpressionForTrustedServer(ts, element)
+  claim: (element: HTMLElement) => FirstImpressionSlotClaim | undefined,
+  getTraceBridge?: () => TraceGptBridge | undefined
 ): void {
   registrationState(ts);
   ts.publisherSlotRegistrationVersion = 1;
@@ -369,7 +436,7 @@ export function installPublisherSlotRegistration(
               ? 'renderer_unavailable'
               : 'incompatible_dimensions';
         const previousKeys = ts.prevSlotTargetingKeys?.[record.elementId] ?? [];
-        for (const key of new Set([...CANDIDATE_KEYS, 'ts_initial', ...previousKeys]))
+        for (const key of new Set([...BASE_TARGETING_KEYS, ...previousKeys]))
           native.clearTargeting(key);
         const targeting: Record<string, string | string[]> = { ...slot.targeting, ts_initial: '1' };
         // Configured hb_* values are also candidate keys, never a back door around eligibility.
@@ -391,7 +458,7 @@ export function installPublisherSlotRegistration(
         retainPublisherSlotMappings(ts, ts.divToSlotId, ts.prevSlotTargetingKeys);
         try {
           const auctionId = candidate?.hb_auction_id;
-          const trace = getActiveTraceGptBridge()?.opportunity(slot, auctionId) ?? { auctionId };
+          const trace = getTraceBridge?.()?.opportunity(slot, auctionId) ?? { auctionId };
           ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
             native,
             slot.id,

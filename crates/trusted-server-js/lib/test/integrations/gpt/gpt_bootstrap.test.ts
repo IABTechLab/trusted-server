@@ -381,7 +381,7 @@ describe('gpt_bootstrap.js fallback', () => {
   });
 
   it('keeps the bootstrap lease synchronized with the bundle contract', () => {
-    const bootstrapLease = /var FIRST_IMPRESSION_LEASE_MS = (\d+);/.exec(BOOTSTRAP_SOURCE);
+    const bootstrapLease = /var FIRST_IMPRESSION_LEASE_MS = (\d+(?:e\d+)?);/.exec(BOOTSTRAP_SOURCE);
 
     expect(Number(bootstrapLease?.[1])).toBe(FIRST_IMPRESSION_LEASE_MS);
   });

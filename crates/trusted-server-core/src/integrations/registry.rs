@@ -2423,9 +2423,7 @@ mod tests {
                 for enforced_csp in [false, true] {
                     let inserts = registry.head_inserts_with_response_csp(&context, enforced_csp);
                     assert_eq!(
-                        inserts
-                            .join("")
-                            .contains("// Edge-injected GPT auction bootstrap."),
+                        inserts.join("").contains(include_str!("gpt_bootstrap.js")),
                         gpt_enabled && didomi_enabled && !enforced_csp,
                         "should select provisional initialization from real CSP and module dependencies"
                     );

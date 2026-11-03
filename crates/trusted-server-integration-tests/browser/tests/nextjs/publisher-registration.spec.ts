@@ -13,6 +13,7 @@ import type { PublisherController } from "../../../fixtures/frameworks/nextjs/ap
 
 const { creative, pucPage } = require("../../publisher-registration/pages.cjs");
 const { scriptBlocks, rendererAsset } = require("../../cwv/html.cjs");
+const { assertRuntimeOrder } = require("../../cwv/runtime-order.cjs");
 const enabled = process.env.PUBLISHER_REGISTRATION_RUN === "1";
 test.skip(
   !enabled,
@@ -316,54 +317,6 @@ async function install(
   });
 }
 
-function assertRuntimeOrder(html: string) {
-  const scripts = scriptBlocks(html);
-  const runtimes = scripts.filter(
-    (script: { id: string }) => script.id === "trustedserver-js",
-  );
-  expect(runtimes).toHaveLength(1);
-  const runtime = runtimes[0];
-  expect(new URL(runtime.src, runtimeUrl("/")).pathname).toBe(
-    "/static/tsjs=tsjs-unified.min.js",
-  );
-  expect(html.slice(runtime.startOffset, runtime.endOffset)).not.toMatch(
-    /\s(?:async|defer)(?:\s|=|>)/,
-  );
-  for (const config of [
-    "window.__tsjs_gpt_enabled=true",
-    "window.__tsjs_prebid=",
-  ]) {
-    const script = scripts.find((entry: { content: string }) =>
-      entry.content.includes(config),
-    );
-    expect(
-      script,
-      `${config} must precede the synchronous runtime`,
-    ).toBeTruthy();
-    expect(script.endOffset).toBeLessThanOrEqual(runtime.startOffset);
-  }
-  expect(runtime.endOffset).toBeLessThanOrEqual(
-    html.indexOf('id="fixture-header-placeholder"'),
-  );
-  expect(
-    scripts.some(
-      (script: { id: string }) => script.id === "trustedserver-bootstrap",
-    ),
-  ).toBe(false);
-  for (const api of [
-    "publisherSlotRegistrationVersion",
-    "tsRenderBridgeVersion",
-  ]) {
-    expect(
-      scripts.some(
-        (script: { src: string | null; content: string }) =>
-          !script.src && script.content.includes(api),
-      ),
-      `no inline ${api} fallback`,
-    ).toBe(false);
-  }
-}
-
 async function ready(page: Page) {
   // Node-side polling still observes the real readiness conditions when a case
   // deliberately holds the page's animation frames to control dispatch order.
@@ -655,7 +608,7 @@ test("actual Rust HTML, admitted payload, delayed mount and later real Prebid re
   const html = (await response!.text()).replaceAll('\\"', '"');
   expect(html).toContain('"initialization":"publisher_registered"');
   expect(html).toContain("scheduleInitialAdInit");
-  assertRuntimeOrder(html);
+  assertRuntimeOrder(html, runtimeUrl("/"), "fixture-header-placeholder");
   if (process.env.PUBLISHER_REGISTRATION_ASSEMBLY === "shared")
     expect(html).toContain('if(typeof s==="function")s(b,a)');
   else expect(html).toContain('if(typeof s==="function")s(b);');
@@ -1004,7 +957,11 @@ test("held critical unified runtime blocks parsing and readiness until release",
   });
   await session.releaseRuntime();
   await ready(page);
-  assertRuntimeOrder(await response!.text());
+  assertRuntimeOrder(
+    await response!.text(),
+    runtimeUrl("/"),
+    "fixture-header-placeholder",
+  );
   await mount(page);
   const initial = await delivered(page);
   expect(initial.targeting.hb_adid).toEqual(["fixture-win-fixture-header"]);
@@ -1021,7 +978,11 @@ test("failed critical unified runtime leaves no TS APIs or registered delivery a
   const response = await page.goto(
     runtimeUrl("/publisher-registration/registered-only"),
   );
-  assertRuntimeOrder(await response!.text());
+  assertRuntimeOrder(
+    await response!.text(),
+    runtimeUrl("/"),
+    "fixture-header-placeholder",
+  );
   await expect(page.getByTestId("ssr-placeholder")).toBeVisible();
   await expect
     .poll(() =>

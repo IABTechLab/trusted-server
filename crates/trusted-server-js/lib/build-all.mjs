@@ -23,6 +23,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'vite';
 
+import { checkGptBootstrap } from './build-gpt-bootstrap.mjs';
 import { buildTraceAssets } from './build-trace.mjs';
 import { moduleBuildOptions } from './build-module-options.mjs';
 
@@ -43,6 +44,9 @@ function resolveOutDir(args) {
   }
   return path.resolve(value);
 }
+
+// Check before touching output, including Cargo's private OUT_DIR bundles.
+await checkGptBootstrap();
 
 // Remove only the bundles this script writes, so a wrong --out-dir cannot
 // delete unrelated files.

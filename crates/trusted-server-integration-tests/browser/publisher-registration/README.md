@@ -37,8 +37,10 @@ ordinary bootstrap fill followed by late runtime with no candidate resurrection.
 Real history push/popstate cases keep bootstrap-only A-to-B-to-A registrations
 unadmitted, prove one late-runtime current-path catchup without replacing the
 waiting handle or generation, and reject a forced late B response after C.
-A failed catchup can retry through a same-path history replace with query/hash
-changes while preserving the waiting handle, token, native slot and generation.
+Both an ordinary runtime navigation and a provisional catchup can retry a failed
+page-bids request through a same-path history replace with query/hash changes.
+The retry preserves the waiting handle, token, native slot and generation; a
+successful retry delivers once and later same-path updates do not refetch.
 No-navigation runtime arrival must not fetch or request again.
 
 Every successful initial delivery independently checks the exact native object,

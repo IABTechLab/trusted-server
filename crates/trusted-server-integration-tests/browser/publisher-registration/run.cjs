@@ -594,7 +594,12 @@ function fixedCases(implementation) {
   return [
     ...commonCases,
     ...(implementation !== "bootstrap"
-      ? ["navigation-stale", "mixed-navigation-cleanup", "runtime-reinstall"]
+      ? [
+          "navigation-stale",
+          "mixed-navigation-cleanup",
+          "runtime-reinstall",
+          "history-runtime-failure-retry",
+        ]
       : ["stale-generation", "bootstrap-history-a-b-a"]),
     ...(implementation === "handoff"
       ? [
@@ -658,6 +663,80 @@ async function fixed(page, scenario, implementation, transport) {
   const takeover = async () => {
     if (implementation === "handoff") await runtime(page);
   };
+
+  if (scenario === "history-runtime-failure-retry") {
+    await takeover();
+    await accept(page, data);
+    await page.evaluate(() => history.pushState({}, "", "/ordinary-retry-b"));
+    const failed = await transport.next("/_ts/page-bids");
+    await mount(page);
+    await page.evaluate(() => {
+      window.pendingRetryRecord =
+        tsjs.publisherSlotRegistrationState.records.header;
+      window.pendingRetryHandle = publisherRefs.header.handle;
+    });
+    const response = page.waitForResponse(failed.request().url());
+    await failed.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "fixture-unavailable" }),
+    });
+    await response;
+    await drain(page);
+    assert.equal((await status(page)).status, "waiting_payload");
+    assert.equal(await page.evaluate(() => fixture.requests.length), 0);
+    await page.evaluate(() =>
+      history.replaceState({}, "", "/ordinary-retry-b?retry=1#placement"),
+    );
+    const retried = await transport.next("/_ts/page-bids");
+    const retained = await page.evaluate(() => ({
+      generation: tsjs.navGeneration,
+      sameRecord:
+        tsjs.publisherSlotRegistrationState.records.header ===
+        pendingRetryRecord,
+      sameHandle: publisherRefs.header.handle === pendingRetryHandle,
+      sameNative: publisherRefs.header.native === pendingRetryRecord.gptSlot,
+      sameElement: publisherRefs.header.element === pendingRetryRecord.element,
+      status: pendingRetryHandle.getStatus(),
+    }));
+    assert.equal(retained.generation, 1, "Retry is not a new navigation");
+    assert(
+      retained.sameRecord &&
+        retained.sameHandle &&
+        retained.sameNative &&
+        retained.sameElement,
+      "Same-path retry retains the pending registration and its exact identities",
+    );
+    assert.equal(retained.status.status, "waiting_payload");
+    const bData = structuredClone(data);
+    bData.bids.header.hb_adid = "example-retried-header";
+    await retried.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(bData),
+    });
+    const facts = await assertDelivery(page, "header", true);
+    assert.deepEqual(facts.entries[0].targeting.hb_adid, [
+      "example-retried-header",
+    ]);
+    assert.equal(
+      await page.evaluate(() => pendingRetryHandle.getStatus().status),
+      "rendered",
+    );
+    await page.evaluate(() =>
+      history.replaceState({}, "", "/ordinary-retry-b?after=success"),
+    );
+    await drain(page);
+    assert.equal(await page.evaluate(() => tsjs.navGeneration), 1);
+    assert.equal(await page.evaluate(() => fixture.requests.length), 1);
+    assert.equal(
+      transport.network.filter(
+        (entry) => new URL(entry.url).pathname === "/_ts/page-bids",
+      ).length,
+      2,
+      "Only the failed request and its explicit retry may fetch page-bids",
+    );
+    return { retained, facts };
+  }
 
   if (
     scenario === "bootstrap-history-a-b-a" ||

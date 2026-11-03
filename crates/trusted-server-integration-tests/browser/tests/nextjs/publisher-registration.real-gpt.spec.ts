@@ -14,7 +14,8 @@ const {
   sha256,
   assertEvidence,
 } = require("../../publisher-registration/real-gpt.cjs");
-const { rendererAsset, scriptBlocks } = require("../../cwv/html.cjs");
+const { rendererAsset } = require("../../cwv/html.cjs");
+const { assertRuntimeOrder } = require("../../cwv/runtime-order.cjs");
 const {
   marker,
 } = require("../../publisher-registration/marker-visibility.cjs");
@@ -268,54 +269,6 @@ async function install(
   return session;
 }
 
-function assertRuntimeOrder(html: string) {
-  const scripts = scriptBlocks(html);
-  const runtimes = scripts.filter(
-    (script: { id: string }) => script.id === "trustedserver-js",
-  );
-  expect(runtimes).toHaveLength(1);
-  const runtime = runtimes[0];
-  expect(new URL(runtime.src, baseUrl()).pathname).toBe(
-    "/static/tsjs=tsjs-unified.min.js",
-  );
-  expect(html.slice(runtime.startOffset, runtime.endOffset)).not.toMatch(
-    /\s(?:async|defer)(?:\s|=|>)/,
-  );
-  for (const config of [
-    "window.__tsjs_gpt_enabled=true",
-    "window.__tsjs_prebid=",
-  ]) {
-    const script = scripts.find((entry: { content: string }) =>
-      entry.content.includes(config),
-    );
-    expect(
-      script,
-      `${config} must precede the synchronous runtime`,
-    ).toBeTruthy();
-    expect(script.endOffset).toBeLessThanOrEqual(runtime.startOffset);
-  }
-  expect(runtime.endOffset).toBeLessThanOrEqual(
-    html.indexOf('id="real-gpt-placeholder"'),
-  );
-  expect(
-    scripts.some(
-      (script: { id: string }) => script.id === "trustedserver-bootstrap",
-    ),
-  ).toBe(false);
-  for (const api of [
-    "publisherSlotRegistrationVersion",
-    "tsRenderBridgeVersion",
-  ]) {
-    expect(
-      scripts.some(
-        (script: { src: string | null; content: string }) =>
-          !script.src && script.content.includes(api),
-      ),
-      `no inline ${api} fallback`,
-    ).toBe(false);
-  }
-}
-
 async function ready(page: Page, variant = "") {
   const response = await page.goto(
     `${baseUrl()}/publisher-registration-real-gpt${variant}`,
@@ -323,7 +276,7 @@ async function ready(page: Page, variant = "") {
       waitUntil: "commit",
     },
   );
-  assertRuntimeOrder(await response!.text());
+  assertRuntimeOrder(await response!.text(), baseUrl(), "real-gpt-placeholder");
   await waitReady(page);
 }
 
@@ -624,7 +577,11 @@ if (!baselineMode) {
       ),
     ).toEqual([]);
     await session.releaseRuntime();
-    assertRuntimeOrder(await response!.text());
+    assertRuntimeOrder(
+      await response!.text(),
+      baseUrl(),
+      "real-gpt-placeholder",
+    );
     await waitReady(page);
     await mount(page);
     await verify(page, [await delivered(page, true)]);
@@ -640,7 +597,11 @@ if (!baselineMode) {
     const response = await page.goto(
       `${baseUrl()}/publisher-registration-real-gpt`,
     );
-    assertRuntimeOrder(await response!.text());
+    assertRuntimeOrder(
+      await response!.text(),
+      baseUrl(),
+      "real-gpt-placeholder",
+    );
     // GPT and React may still initialize. That does not make TS registration ready.
     await expect
       .poll(() =>

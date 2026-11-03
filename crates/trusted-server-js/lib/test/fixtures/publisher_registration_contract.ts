@@ -700,6 +700,89 @@ export function publisherRegistrationContract(implementation: Implementation): v
       flush();
       expect(handle.getStatus().status).toBe('requested');
     });
+    it.each(['network', 'http'] as const)(
+      'same-path retry preserves a pending registration after an ordinary %s failure',
+      async (failure) => {
+        await runtime();
+        const responses: Array<(response: Response) => void> = [];
+        const fetch = vi.fn(() => new Promise<Response>((resolve) => responses.push(resolve)));
+        if (failure === 'network') fetch.mockRejectedValueOnce(new Error('example failure'));
+        vi.stubGlobal('fetch', fetch);
+        history.pushState({}, '', '/ordinary-retry-b');
+        const { slot } = mount();
+        const handle = ts.registerPublisherSlot!({ ...options(slot), navigationGeneration: 1 });
+        const record = ts.publisherSlotRegistrationState?.records.header;
+        if (failure === 'http') responses[0](new Response('{}', { status: 503 }));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        flush();
+        expect(handle.getStatus().status).toBe('waiting_payload');
+        expect(ts.publisherSlotRegistrationState?.payload).toBeUndefined();
+        expect(nativeDisplay).not.toHaveBeenCalled();
+        history.replaceState({}, '', '/ordinary-retry-b?retry=1#placement');
+        expect(ts.navGeneration).toBe(1);
+        expect(ts.publisherSlotRegistrationState?.records.header).toBe(record);
+        expect(fetch).toHaveBeenCalledTimes(2);
+        history.replaceState({}, '', '/ordinary-retry-b?retry=2');
+        expect(fetch).toHaveBeenCalledTimes(2);
+        expect(ts.navGeneration).toBe(1);
+        responses[responses.length - 1](
+          new Response(
+            JSON.stringify({
+              slots: [{ ...configured, targeting: { section: 'retried-b' } }],
+              bids: {},
+            }),
+            { headers: { 'Content-Type': 'application/json' } }
+          )
+        );
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        flush();
+        expect(handle.getStatus().status).toBe('requested');
+        expect(nativeDisplay).toHaveBeenCalledTimes(1);
+        expect(nativeRefresh).toHaveBeenCalledTimes(1);
+        expect(snapshots[0].section).toBe('retried-b');
+        history.replaceState({}, '', '/ordinary-retry-b?after=success');
+        expect(fetch).toHaveBeenCalledTimes(2);
+        expect(ts.navGeneration).toBe(1);
+      }
+    );
+    it.each([false, true])(
+      'returning to the last applied path creates a fresh navigation and can retry (failure=%s)',
+      async (failure) => {
+        await runtime();
+        const fetch = vi.fn().mockResolvedValueOnce(new Response('{}', { status: 503 }));
+        vi.stubGlobal('fetch', fetch);
+        history.pushState({}, '', '/failed-departure-b');
+        const { slot: oldSlot } = mount('failed-b-slot');
+        const old = ts.registerPublisherSlot!({ ...options(oldSlot), navigationGeneration: 1 });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(old.getStatus().status).toBe('waiting_payload');
+        const success = () =>
+          new Response(JSON.stringify({ slots: [configured], bids: {} }), {
+            headers: { 'Content-Type': 'application/json' },
+          });
+        fetch.mockResolvedValueOnce(failure ? new Response('{}', { status: 503 }) : success());
+        history.pushState({}, '', '/');
+        expect(ts.navGeneration).toBe(2);
+        expect(old.getStatus()).toEqual({ status: 'cancelled', reason: 'navigation' });
+        const { slot } = mount('returned-a-slot');
+        const current = ts.registerPublisherSlot!({ ...options(slot), navigationGeneration: 2 });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        flush();
+        if (failure) {
+          expect(current.getStatus().status).toBe('waiting_payload');
+          expect(nativeDisplay).not.toHaveBeenCalled();
+          fetch.mockResolvedValueOnce(success());
+          history.replaceState({}, '', '/?retry=returned-a');
+          expect(ts.navGeneration).toBe(2);
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          flush();
+        }
+        expect(fetch).toHaveBeenCalledTimes(failure ? 3 : 2);
+        expect(current.getStatus().status).toBe('requested');
+        expect(nativeDisplay).toHaveBeenCalledExactlyOnceWith('returned-a-slot');
+        expect(nativeRefresh).toHaveBeenCalledExactlyOnceWith([slot]);
+      }
+    );
     it('never admits a failed SPA response or a stale SSR callback', async () => {
       await runtime();
       vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('example fetch failure')));
@@ -1063,19 +1146,14 @@ export function publisherRegistrationContract(implementation: Implementation): v
         expect(ts.publisherSlotRegistrationState?.payload).toBeUndefined();
         history.replaceState({}, '', '/catch-up-result-b?retry=1#placement');
         expect(fetch).toHaveBeenCalledTimes(2);
-        const retryGeneration = implementation === 'runtime' ? 2 : 1;
+        const retryGeneration = 1;
         expect(ts.navGeneration).toBe(retryGeneration);
-        const retry =
-          implementation === 'runtime'
-            ? ts.registerPublisherSlot!({ ...options(slot), navigationGeneration: retryGeneration })
-            : handle;
-        if (implementation !== 'runtime') {
-          expect(ts.publisherSlotRegistrationState?.records.header).toBe(record);
-          expect(record?.token).toBe(token);
-          expect(record?.gptSlot).toBe(slot);
-          expect(record?.element).toBe(document.getElementById(slot.getSlotElementId()));
-          expect(handle.getStatus().status).toBe('waiting_payload');
-        }
+        const retry = handle;
+        expect(ts.publisherSlotRegistrationState?.records.header).toBe(record);
+        expect(record?.token).toBe(token);
+        expect(record?.gptSlot).toBe(slot);
+        expect(record?.element).toBe(document.getElementById(slot.getSlotElementId()));
+        expect(handle.getStatus().status).toBe('waiting_payload');
         // An already-running retry is not another retry or navigation.
         history.replaceState({}, '', '/catch-up-result-b?retry=2#other-placement');
         expect(fetch).toHaveBeenCalledTimes(2);

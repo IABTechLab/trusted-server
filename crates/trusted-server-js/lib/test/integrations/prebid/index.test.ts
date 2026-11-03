@@ -4248,7 +4248,9 @@ describe('prebid/installRefreshHandler', () => {
       return frames.length;
     });
     installRefreshHandler(750);
-    installPublisherSlotRegistration(ts);
+    installPublisherSlotRegistration(ts, (element) =>
+      claimFirstImpressionForTrustedServer(ts, element)
+    );
     const handle = ts.registerPublisherSlot!({
       slotId: 'header',
       gptSlot: slot,

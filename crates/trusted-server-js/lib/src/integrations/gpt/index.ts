@@ -19,6 +19,7 @@ import type {
 } from '../../core/types';
 
 import {
+  clearPreviousNavigationTargeting,
   installPublisherSlotRegistration,
   invalidatePublisherSlotRegistrations,
   observePublisherSlotRender,
@@ -631,64 +632,6 @@ function applyTrustedServerTargeting(
   return Object.keys(slot.targeting ?? {});
 }
 
-function clearPreviousTargetingSnapshot(
-  g: Partial<GoogleTag>,
-  snapshot: ReadonlyMap<GoogleTagSlot, readonly string[]>
-): boolean {
-  const pubads = g.pubads?.();
-  if (!pubads) return false;
-  const liveSlots = pubads.getSlots?.() ?? [];
-  for (const [slot, keys] of snapshot) {
-    if (!liveSlots.includes(slot)) continue;
-    clearTargetingKeys(slot, keys);
-  }
-  return true;
-}
-
-function clearPreviousNavigationTargeting(ts: TsjsApi, g: Partial<GoogleTag>): void {
-  const previousKeys: Record<string, string[]> = Object.assign(
-    Object.create(null),
-    ts.prevSlotTargetingKeys
-  );
-  const registeredRecords = Object.values(ts.publisherSlotRegistrationState?.records ?? {}).filter(
-    (record) => record.consumed && record.targetingKeys
-  );
-  for (const record of registeredRecords) previousKeys[record.elementId] = record.targetingKeys!;
-  const touchedElementIds = new Set([
-    ...Object.keys(previousKeys),
-    ...Object.keys(ts.divToSlotId ?? {}),
-  ]);
-
-  // Capture exact old native identities before retiring records or advancing navigation.
-  const snapshot = new Map<GoogleTagSlot, readonly string[]>();
-  const registeredElementIds = new Set(registeredRecords.map((record) => record.elementId));
-  for (const record of registeredRecords) {
-    if (record.gptSlot) {
-      snapshot.set(record.gptSlot as GoogleTagSlot, [
-        ...TS_BASE_TARGETING_KEYS,
-        ...record.targetingKeys!,
-      ]);
-    }
-  }
-  for (const slot of [
-    ...(g.pubads?.().getSlots?.() ?? []),
-    ...((ts.prevGptSlots ?? []) as GoogleTagSlot[]),
-  ]) {
-    const elementId = slot.getSlotElementId();
-    if (touchedElementIds.has(elementId) && !registeredElementIds.has(elementId)) {
-      snapshot.set(slot, [...TS_BASE_TARGETING_KEYS, ...(previousKeys[elementId] ?? [])]);
-    }
-  }
-  if (snapshot.size > 0 && !clearPreviousTargetingSnapshot(g, snapshot)) {
-    g.cmd?.push(() => {
-      clearPreviousTargetingSnapshot(g, snapshot);
-    });
-  }
-
-  ts.prevSlotTargetingKeys = Object.create(null) as Record<string, string[]>;
-  ts.divToSlotId = Object.create(null) as Record<string, string>;
-}
-
 function schedulePublisherFirstImpressionFallback(
   ts: TsjsApi,
   g: Partial<GoogleTag>,
@@ -805,7 +748,11 @@ function schedulePublisherFirstImpressionFallback(
 export function installTsAdInit(): void {
   const ts = (window.tsjs ??= {} as TsjsApi);
   installInitialLoadDetector(ts);
-  installPublisherSlotRegistration(ts);
+  installPublisherSlotRegistration(
+    ts,
+    (element) => claimFirstImpressionForTrustedServer(ts, element),
+    getActiveTraceGptBridge
+  );
   installScheduleInitialAdInit(ts);
 
   const g = (window as GptWindow).googletag;
@@ -1270,18 +1217,12 @@ export function installSpaAuctionHook(): void {
   const pendingGeneration = ts.gptNavigationBridge?.pendingGeneration;
   const catchingUp = pendingGeneration !== undefined && pendingGeneration === ts.navGeneration;
   let inflight: AbortController | null = null;
-  // Keep the captured path/generation for a failed startup catch-up. Retrying
-  // that still-unapplied navigation must preserve its pending publisher records.
-  const catchUpPath = catchingUp ? location.pathname : undefined;
-  // A provisional navigation is not applied merely because its URL is current.
-  // The null state also permits a later same-path retry after catch-up fails.
-  let currentPath: string | null = catchingUp ? null : location.pathname;
-  // Last path whose slots/bids were actually applied — the initial SSR page
-  // counts. A failed navigation rolls `currentPath` back to this rather than to
-  // the immediately-previous committed value: on rapid A→B where A was aborted
-  // mid-flight and B then fails, rolling back to A (never loaded) would strand
-  // it behind the no-op guard, so we roll back to the last applied route instead.
-  let lastAppliedPath: string | null = catchingUp ? null : location.pathname;
+  // Navigation identity follows the observed URL, not whether its payload loaded.
+  // A failed request leaves its generation and pending registrations current.
+  let currentPath = location.pathname;
+  // The initial SSR page counts as applied unless a provisional navigation needs
+  // catch-up. Same-path history calls retry only an unapplied, idle navigation.
+  let payloadApplied = !catchingUp;
   // Endpoint this session requests. Starts canonical; if the deployment does
   // not serve page-bids there, one navigation retries on the deprecated alias
   // and the session stays on it rather than re-probing every navigation.
@@ -1307,18 +1248,14 @@ export function installSpaAuctionHook(): void {
   }
 
   async function onNavigate(path: string): Promise<void> {
-    if (path === currentPath) return;
-    currentPath = path;
-    if (
-      catchingUp &&
-      path === catchUpPath &&
-      pendingGeneration === ts.navGeneration &&
-      lastAppliedPath === null &&
-      !ts.publisherSlotRegistrationState?.payload
-    ) {
-      await fetchAndApplyPageBids(path, pendingGeneration);
+    if (path === currentPath) {
+      if (!payloadApplied && !inflight) {
+        await fetchAndApplyPageBids(path, ts.navGeneration ?? 0);
+      }
       return;
     }
+    currentPath = path;
+    payloadApplied = false;
     const g = (window as GptWindow).googletag;
     if (g) clearPreviousNavigationTargeting(ts, g);
     ts.navGeneration = (ts.navGeneration ?? 0) + 1;
@@ -1339,15 +1276,7 @@ export function installSpaAuctionHook(): void {
 
     try {
       const data = await requestPageBids(path, controller.signal);
-      if (!data) {
-        // A transient page-bids failure must not strand this route: roll the
-        // committed path back so a later navigation here retries instead of
-        // being skipped by the no-op guard at the top. Only roll back when no
-        // newer navigation has already advanced currentPath.
-        if (inflight === controller && ts.navGeneration === generation)
-          currentPath = lastAppliedPath;
-        return;
-      }
+      if (!data) return;
       if (inflight !== controller || ts.navGeneration !== generation) return;
       // Registered delivery and its renderer need the accepted current payload now.
       // Automatic-only routes retain the existing delayed public assignment below.
@@ -1369,9 +1298,8 @@ export function installSpaAuctionHook(): void {
       if (inflight !== controller || ts.navGeneration !== generation) return;
       ts.adSlots = data.slots;
       ts.bids = data.bids;
-      // This route is now the committed, loaded state — a later failed
-      // navigation rolls back here, and a return trip no-ops correctly.
-      lastAppliedPath = path;
+      // Successful same-path history calls must not request another impression.
+      payloadApplied = true;
       // An empty page-bids response (template switch, auction, or consent gate)
       // carries no TS slots. Only run adInit() when there are slots to apply or
       // prior TS state to sweep — otherwise a gated navigation must not enter
@@ -1385,8 +1313,9 @@ export function installSpaAuctionHook(): void {
       }
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
-      if (inflight === controller && ts.navGeneration === generation) currentPath = lastAppliedPath;
       log.warn('SPA auction hook: fetch failed', err);
+    } finally {
+      if (inflight === controller) inflight = null;
     }
   }
 
