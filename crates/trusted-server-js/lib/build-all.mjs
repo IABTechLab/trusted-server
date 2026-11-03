@@ -23,6 +23,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'vite';
 
+import { buildTraceAssets } from './build-trace.mjs';
 import { moduleBuildOptions } from './build-module-options.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -123,5 +124,8 @@ if (import.meta.main) {
   ) {
     throw new Error('build-all entrypoint identity check failed');
   }
-  await buildAll({ outDir: resolveOutDir(process.argv.slice(2)) });
+  const outDir = resolveOutDir(process.argv.slice(2));
+  await buildAll({ outDir });
+  // The trace viewer is independent of the bundles, so release collection skips it.
+  await buildTraceAssets(outDir);
 }

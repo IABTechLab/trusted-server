@@ -273,7 +273,7 @@ describe('release collector boundaries', () => {
     expect(files).toContain('tsjs-core.js');
     expect(files.length).toBeGreaterThan(1);
     expect(fs.readdirSync(linked).sort()).toEqual(files);
-    for (const file of files)
+    for (const file of files.filter((name) => name.startsWith('tsjs-')))
       expect(fs.readFileSync(path.join(linked, file))).toEqual(
         fs.readFileSync(path.join(direct, file))
       );

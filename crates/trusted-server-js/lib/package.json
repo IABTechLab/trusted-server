@@ -6,6 +6,7 @@
   "description": "Trusted Server tsjs TypeScript library with queue and simple banner rendering.",
   "scripts": {
     "build": "node build-all.mjs",
+    "build:trace-assets": "node build-trace-assets.mjs",
     "build:prebid-external": "node build-prebid-external.mjs",
     "dev": "vite build --watch",
     "test": "vitest run",
@@ -33,7 +34,7 @@
     "jsdom": "^28.0.0",
     "prettier": "^3.2.5",
     "typescript": "^5.5.4",
-    "typescript-eslint": "^8.56.1",
+    "typescript-eslint": "^8.72.1",
     "vite": "^7.3.7",
     "vitest": "^4.1.12"
   }

@@ -1245,7 +1245,7 @@ fn append_ec_id(req: &Request<EdgeBody>, target_url_parsed: &mut url::Url) {
 ///
 /// When `allowed_domains` is empty every host is permitted (open mode).
 /// When non-empty the host must match at least one pattern via [`is_host_allowed`].
-fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
+pub(crate) fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
     allowed_domains.is_empty()
         || allowed_domains
             .iter()
@@ -1692,9 +1692,10 @@ pub async fn handle_first_party_click(
 /// # Errors
 ///
 /// Returns an error if JSON parsing fails, the URL cannot be parsed, the URL uses an
-/// unsupported scheme, the URL lacks a host, the host matches
-/// `rewrite.exclude_domains`, the host violates `proxy.allowed_domains`, or
-/// request metadata needed to determine the scheme contains a malformed host.
+/// unsupported scheme, the URL lacks a host, the host is declined by
+/// `rewrite.exclude_domains` or `rewrite.include_domains`, the host violates
+/// `proxy.allowed_domains`, or request metadata needed to determine the scheme
+/// contains a malformed host.
 pub async fn handle_first_party_proxy_sign(
     settings: &Settings,
     _services: &RuntimeServices,
@@ -1705,17 +1706,18 @@ pub async fn handle_first_party_proxy_sign(
     // Capture the request's own scheme before the body is consumed: a
     // protocol-relative sign target inherits it.
     //
-    // Prefer the URI's explicit scheme, which adapters that deliver absolute
-    // request targets (Fastly, Spin after normalization) always carry, and fall
-    // back to TLS/forwarded metadata otherwise. What must never be used is the
-    // parsed request target: origin-form URIs — what browsers send and the Axum
+    // Prefer the authenticated public scheme, then the URI's explicit scheme
+    // for direct requests, and fall back to runtime ingress/TLS metadata. Avoid
+    // using the parsed request target: origin-form URIs — what browsers send and the Axum
     // adapter forwards verbatim — have no scheme of their own, so parsing would
     // hand back the placeholder base's `https` and make an HTTP dev server sign
     // an HTTPS target it then proxies over TLS against a plaintext service.
-    let request_scheme = if let Some(scheme) = req.uri().scheme_str() {
-        scheme.to_ascii_lowercase()
-    } else {
-        RequestInfo::from_request(&req, _services.client_info())?.scheme
+    let request_scheme = match crate::forwarder::public_origin(&req)
+        .map(|origin| origin.scheme.clone())
+        .or_else(|| req.uri().scheme_str().map(str::to_ascii_lowercase))
+    {
+        Some(scheme) => scheme,
+        None => RequestInfo::from_request(&req, _services.client_info())?.scheme,
     };
 
     let payload = if method == Method::POST {
@@ -1763,7 +1765,9 @@ pub async fn handle_first_party_proxy_sign(
         })
     })?;
     if !settings.rewrite.should_proxy_asset(host) {
-        log::debug!("sign request for `{host}` declined by rewrite policy");
+        log::debug!(
+            "sign request for `{host}` declined: host excluded or not in rewrite.include_domains"
+        );
         return Err(Report::new(TrustedServerError::Proxy {
             message: "unsupported url".to_string(),
         }));
@@ -2819,6 +2823,119 @@ mod tests {
     }
 
     #[test]
+    fn proxy_sign_applies_rewrite_include_domains_for_get_and_post() {
+        struct Case {
+            name: &'static str,
+            include_domains: &'static [&'static str],
+            exclude_domains: &'static [&'static str],
+            allowed_domains: &'static [&'static str],
+            target: &'static str,
+            expected: StatusCode,
+        }
+
+        let cases = [
+            Case {
+                name: "listed absolute",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "https://img.example.com/a.png",
+                expected: StatusCode::OK,
+            },
+            Case {
+                name: "listed protocol-relative",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "//img.example.com/a.png",
+                expected: StatusCode::OK,
+            },
+            Case {
+                name: "off-list absolute",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "https://img.example.net/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "off-list protocol-relative",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "//img.example.net/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "host in both lists",
+                include_domains: &["*.example.com"],
+                exclude_domains: &["img.example.com"],
+                allowed_domains: &[],
+                target: "https://img.example.com/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "off include list and off proxy allowlist",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &["*.example.org"],
+                target: "https://img.example.net/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "listed but off proxy allowlist",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &["*.example.org"],
+                target: "https://img.example.com/a.png",
+                expected: StatusCode::FORBIDDEN,
+            },
+            Case {
+                name: "mixed-case host",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "https://IMG.Example.COM/a.png",
+                expected: StatusCode::OK,
+            },
+        ];
+
+        let to_owned = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| (*value).to_owned()).collect()
+        };
+
+        futures::executor::block_on(async {
+            for case in &cases {
+                for method in [&Method::GET, &Method::POST] {
+                    let label = format!("{} {}", method.as_str(), case.name);
+                    let mut settings = create_test_settings();
+                    settings.rewrite.include_domains = to_owned(case.include_domains);
+                    settings.rewrite.exclude_domains = to_owned(case.exclude_domains);
+                    settings.proxy.allowed_domains = to_owned(case.allowed_domains);
+                    let req = build_proxy_sign_request(
+                        method,
+                        "https://edge.example.com/first-party/sign",
+                        case.target,
+                    );
+
+                    let status =
+                        match handle_first_party_proxy_sign(&settings, &noop_services(), req).await
+                        {
+                            Ok(response) => response.status(),
+                            Err(error) => error.current_context().status_code(),
+                        };
+
+                    assert_eq!(
+                        status, case.expected,
+                        "{label} should return {}",
+                        case.expected
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
     fn proxy_sign_inherits_the_request_scheme_for_protocol_relative_urls() {
         // A protocol-relative target adopts the scheme the visitor is on. It
         // must come from the request, not from the parser's placeholder base:
@@ -2845,6 +2962,43 @@ mod tests {
                     "request `{uri}` should sign a {expected} target: {json}"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn public_origin_proxy_sign_overrides_explicit_transport_scheme() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.publisher.domain = "publisher.example.com".to_owned();
+            settings.trusted_forwarder = Some(crate::settings::TrustedForwarderConfig {
+                auth_header: crate::forwarder::FORWARDER_AUTH_HEADER.to_owned(),
+                shared_secret: crate::redacted::Redacted::new(
+                    "fictional-forwarder-secret-0123456789".to_owned(),
+                ),
+            });
+            let body = serde_json::json!({ "url": "//cdn.example.com/asset.js" });
+            let mut req =
+                build_http_post_json_request("http://internal.example.com/first-party/sign", &body);
+            req.headers_mut().insert(
+                crate::forwarder::FORWARDER_AUTH_HEADER,
+                HeaderValue::from_static("fictional-forwarder-secret-0123456789"),
+            );
+            req.headers_mut().insert(
+                "x-forwarded-host",
+                HeaderValue::from_static("publisher.example.com:8443"),
+            );
+            req.headers_mut()
+                .insert("x-forwarded-proto", HeaderValue::from_static("https"));
+            crate::forwarder::prepare_trusted_forwarder(&mut req, &settings);
+
+            let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                .await
+                .expect("should sign protocol-relative URL");
+            let json = response_body_string(resp);
+            assert!(
+                json.contains("\"base\":\"https://cdn.example.com/asset.js\""),
+                "should inherit authenticated public HTTPS: {json}"
+            );
         });
     }
 

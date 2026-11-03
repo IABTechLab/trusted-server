@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::{Value, json};
@@ -21,6 +21,42 @@ use tempfile::{TempDir, tempdir};
 
 const SOURCE: &str = "0123456789abcdef0123456789abcdef01234567";
 const BYTES: &[u8] = b"console.log('example');";
+const TRACE_ASSETS: [(&str, &[u8]); 2] = [("v1.js", b"trace js"), ("v1.css", b"trace css")];
+/// Shell lines a fake `npm run build` uses to write the trace viewer into `$output`.
+const TRACE_BUILD: &str = "/bin/mkdir -p \"$output/trace\"\nprintf 'trace js' > \"$output/trace/v1.js\"\nprintf 'trace css' > \"$output/trace/v1.css\"\n";
+
+/// Seed self-consistent trace viewer inputs, which `build.rs` embeds on every build.
+fn write_trace_inputs(lib: &Path) {
+    fs::write(
+        lib.join("trace-build-inputs.json"),
+        json!({ "files": [], "source_roots": [], "toolchain_roots": [] }).to_string(),
+    )
+    .expect("should write trace build inputs");
+    fs::write(
+        lib.join("package-lock.json"),
+        json!({ "packages": {} }).to_string(),
+    )
+    .expect("should write package lock");
+    fs::create_dir(lib.join("trace-assets")).expect("should create trace asset directory");
+    let mut assets = Vec::new();
+    for (file, bytes) in TRACE_ASSETS {
+        fs::write(lib.join("trace-assets").join(file), bytes).expect("should write trace asset");
+        assets.push(json!({
+            "path": format!("/_ts/trace/assets/{file}"), "file": file,
+            "sha256": hex::encode(Sha256::digest(bytes)),
+        }));
+    }
+    fs::write(
+        lib.join("trace-assets-manifest.json"),
+        json!({
+            "schema_version": 1,
+            "source_sha256": build_script::trace_sources::trace_source_digest(lib),
+            "assets": assets,
+        })
+        .to_string(),
+    )
+    .expect("should write trace asset manifest");
+}
 
 struct Fixture {
     root: TempDir,
@@ -35,6 +71,7 @@ impl Fixture {
         }
         fs::write(root.path().join("bundles/tsjs-core.js"), BYTES)
             .expect("should write core bundle");
+        write_trace_inputs(&root.path().join("lib"));
         let npm = root.path().join("bin/npm");
         fs::write(
             &npm,
@@ -256,12 +293,15 @@ fn ordinary_release_without_prebuilt_builds_private_bundles() {
         .expect("should write fresh installation marker");
     fs::write(
         fixture.path("bin/npm"),
-        r#"#!/bin/sh
+        format!(
+            r#"#!/bin/sh
 [ "$1" = run ] && [ "$2" = build ] && [ "$3" = -- ] && [ "$4" = --out-dir ] || exit 96
 /bin/mkdir -p "$5"
 printf '%s' 'console.log("ordinary");' > "$5/tsjs-core.js"
-: > "$CARGO_MANIFEST_DIR/npm-called"
-"#,
+output="$5"
+{TRACE_BUILD}: > "$CARGO_MANIFEST_DIR/npm-called"
+"#
+        ),
     )
     .expect("should write the isolated npm build fixture");
     let output = fixture
@@ -728,10 +768,12 @@ fn development_source_build_uses_fresh_npm_output() {
         .expect("should write package fixture");
     fs::create_dir(fixture.path("lib/node_modules"))
         .expect("should create installed dependencies fixture");
+    fs::write(fixture.path("lib/node_modules/.package-lock.json"), b"{}")
+        .expect("should write fresh installation marker");
     fs::create_dir(fixture.path("dist")).expect("should create stale old dist");
     fs::write(fixture.path("dist/tsjs-core.js"), b"stale bytes")
         .expect("should write stale bundle");
-    fs::write(fixture.path("bin/npm"), "#!/bin/sh\n: > \"$CARGO_MANIFEST_DIR/npm-called\"\nfor argument in \"$@\"; do output=\"$argument\"; done\n/bin/mkdir -p \"$output\"\nprintf 'fresh source bytes' > \"$output/tsjs-core.js\"\n").expect("should write source builder fixture");
+    fs::write(fixture.path("bin/npm"), format!("#!/bin/sh\n: > \"$CARGO_MANIFEST_DIR/npm-called\"\nfor argument in \"$@\"; do output=\"$argument\"; done\n/bin/mkdir -p \"$output\"\nprintf 'fresh source bytes' > \"$output/tsjs-core.js\"\n{TRACE_BUILD}")).expect("should write source builder fixture");
     let output = fixture
         .command()
         .env_remove("TRUSTED_SERVER__RELEASE_BUILD")

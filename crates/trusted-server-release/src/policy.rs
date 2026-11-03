@@ -260,7 +260,7 @@ fn ordinary_artifacts() -> Vec<OrdinaryArtifact> {
             kind: "native-executable",
             role: "server",
             assurance_profile: "provenance-sbom",
-            capability: "axum-production",
+            capability: "axum-evaluation",
         });
     }
     artifacts

@@ -146,6 +146,14 @@ link it in the description, and mark it ready for review again.
 - Update the canonical guide or crate README when a user-visible contract
   changes; do not copy volatile matrices into multiple documents.
 
+## Fastly dependency updates
+
+Update the workspace `fastly` and `fastly-sys` dependencies together. The
+Fastly deadline collector uses raw asynchronous I/O readiness calls from
+`fastly-sys` with handles created by `fastly`, so both must use a compatible
+SDK ABI. Check the resolved versions in `Cargo.lock` and run the Fastly
+adapter tests, including the real deadline network fixture, after an SDK update.
+
 ## Verify
 
 Run the target-matched checks in [AGENTS.md](AGENTS.md#ci-gates), the
@@ -178,9 +186,18 @@ To scan on demand, `ts dev lint domains` audits the whole working tree and
 `--changed-vs <ref>` limits it to lines added against a ref. The full audit
 reports pre-existing violations, so a non-zero exit is expected today.
 
+CI runs the same check on every pull request: the `lint-domains` job scans the
+lines the PR adds against its base branch, so `--no-verify` or a missing hook
+does not let a host through. Editing or moving a line that already contains a
+non-allowlisted host counts as adding it. Reproduce the job locally with
+`ts dev lint domains --changed-vs origin/main`, using the PR's base branch in
+place of `main` when it targets another branch.
+
 To allow a new host, add it to the allowlist constants in
 `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`. To suppress a
-single line, append `// allow-domain: <host>` in a comment.
+single line, append `allow-domain: <host>` in the file's comment syntax:
+`// allow-domain: <host>`, `# allow-domain: <host>`,
+`<!-- allow-domain: <host> -->`, or `* allow-domain: <host>`.
 
 ## Commits
 

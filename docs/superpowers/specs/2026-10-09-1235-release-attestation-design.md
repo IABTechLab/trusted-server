@@ -4,7 +4,7 @@
 
 This is the phased rework of [#1262](https://github.com/IABTechLab/trusted-server/pull/1262), frozen at `122b78664b1235c717e9208fd200f9a9b0c335df`. The reviewed contract below is retained as the destination design. This section controls phase applicability; historical statements about first-release gates and PR ownership below refer to the original combined proposal. No new spec approval cycle is introduced by reducing scope.
 
-**Phase 1 contributes to #1235 (D7 settings pending):** tag-triggered builds of Fastly wasm, three native CLI binaries and three production Axum binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the reusable `release-build.yml` signer and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
+**Phase 1 contributes to #1235 (D7 settings pending):** tag-triggered builds of Fastly wasm, three native CLI binaries and three Axum binaries (dev/evaluation builds; Axum is not a production deployment target); SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the reusable `release-build.yml` signer and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
 
 The phase boundaries follow [aram356's round-1 architecture review](https://github.com/IABTechLab/trusted-server/pull/1262#pullrequestreview-5484754857):
 
@@ -64,7 +64,7 @@ For the R-OFFLINE decision below, Phase 1 uses the guide's
 with independently obtained roots and source pins. Offline success is build
 proof, not current official membership or deployment authorization.
 
-For #161, release Fastly `x-ts-version` is the full 40-character source commit;
+For #161, release Fastly and Axum `x-ts-version` is the full 40-character source commit;
 `ts --version` labels package version, source commit, target and variant. The executable
 digest is verified externally; exposing it at runtime remains with #161.
 The [verification guide](../../guide/release-verification.md) records these facts
@@ -76,8 +76,9 @@ not submission to a Fastly service.
 **Phase 1 Axum extension:** the original four asset names remain unchanged;
 three named Axum variants extend this slice to seven binaries and 29 files.
 GNU builds enforce a maximum glibc requirement of 2.34; musl is fully static.
-The cohort records this explicit extension, but tools/policy and the frozen v1
-index schema remain unchanged. Phase 1 emits no index. The later index/consumer
+The cohort records this explicit extension. The destination tools/policy files
+and v1 index schema are not carried by Phase 1; they remain unchanged at the
+frozen source `122b78664b1235c717e9208fd200f9a9b0c335df`. Phase 1 emits no index. The later index/consumer
 slices need a reviewed seven-artifact amendment, including new target/capability
 forms; see the [compatibility audit](../plans/binary-attestations-phase1-compatibility.md)
 and slice-map annotations.
@@ -89,18 +90,19 @@ historical phase applicability, not the retained destination requirements.
 Goals, Non-goals, R-COHORT and R-BOUNDS refer to the original four-artifact design;
 this slice explicitly includes seven binaries / 29 files, including Axum and
 Linux ARM64. Its original four public names stay unchanged; no v1 index is emitted.
-The Node producer helpers and inline publisher are interim exceptions to the
+The Node producer helpers and Node publisher (`scripts/release/publish.mjs`) are interim exceptions to the
 retained Rust-producer constraint, replaced by slices 2.5 (recipes/inspection),
-2.6 (composition/SPDX) and 2.8 (publication). The frozen Status and tool versions
-below describe #1262, not current Phase 1 implementation status.
+2.6 (composition/SPDX) and 2.8 (publication). Tool versions in the retained
+requirements below describe #1262, not current Phase 1 implementation status.
 
 Current tool pins: Rust 1.98.1, Node 24.20.0, Fastly CLI 16.0.0, Viceroy 0.21.0;
 verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer.
 Slice 2.3 immutable build facts are reused from introducing commit
 `bfb697404551a28217af8906024506095bcd9559` and revision
 `6d0efda7210983021ab3c9efe8a0a3190e9eb81b`, as retained at the frozen source.
-Core's resolver and new CLI/Fastly owner build scripts validate
-`TRUSTED_SERVER__RELEASE_BUILD=1` and the full lowercase source SHA.
+Core's build script validates `TRUSTED_SERVER__RELEASE_BUILD=1` and the full
+lowercase source SHA; the CLI and Fastly build scripts only emit their Cargo
+target.
 Cargo supplies the owning target/package; features supply the variant. Tags and
 run IDs stay external. CLI now labels package/source/target/variant; Fastly queues
 the same immutable facts through existing startup diagnostics in reuse mode only; single mode retains the source response header without per-request build-fact logs. The source audit
@@ -110,25 +112,55 @@ not deployment values. CLI source-resource cleanup remains deferred.
 Axum binding is runtime-only: `EDGEZERO__ADAPTER__HOST` defaults to loopback;
 containers can set `0.0.0.0`, with runtime `EDGEZERO__ADAPTER__PORT` or the compatible `PORT` override. Both values are validated, and conflicting values fail startup. The smoke uses
 bridge networking and reaches the process through a published host port.
-TLS termination, graceful shutdown and request/resource limits remain follow-up.
+Ctrl-C initiates graceful request draining. TLS termination, graceful SIGTERM
+shutdown and request/resource limits remain follow-up.
 
 Publication requires `RELEASE_PUBLICATION_ENABLED=true` only after maintainers
 confirm immutable releases and the v\* tag ruleset. There is no settings token or
 prepublication settings API call, following the reviewed signing boundary;
-postpublication immutable=true readback fails loudly. Hyphenated tags are
-prereleases and never Latest. Stable tags are normal releases with `make_latest: legacy`, allowing GitHub to choose Latest by version/date rather than forcing backports to Latest. Eligibility of
-rc-branch tags is an unresolved maintainer decision; Phase 1 does not implement
-the destination branch-ancestry/ruleset validator or authorize rc tags.
+postpublication immutable=true readback fails loudly. SemVer prerelease tags are
+prereleases and never Latest. Stable tags are normal releases with `make_latest: legacy`, allowing GitHub to choose Latest by version/date rather than forcing backports to Latest. Release
+tags must be strict SemVer without build metadata (`vMAJOR.MINOR.PATCH[-pre]`) and lightweight.
+Eligibility of rc-branch tags is an unresolved maintainer decision; Phase 1 does
+not implement the destination branch-ancestry/ruleset validator or authorize rc tags.
+The generated release notes tell operators to take `TAG`, `COMMIT` and `REPO`
+from independent review rather than from the editable notes.
 
-The phase labels on requirement headings below apply only to the reduced Phase 1 subset described above; all additional clauses and requirements marked Phase 2+ remain deferred. The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.
+### Phase 1 scope by requirement
+
+Requirement headings whose **Phase** line says 1 are only partly met by Phase 1.
+The table lists, per requirement, the clauses Phase 1 code actually meets and
+the interim behavior that ships in place of the remaining clauses. Every
+clause not listed under "Phase 1 satisfies" is Phase 2+ and does not block the
+first Phase 1 release. Slice numbers refer to the
+[slice map](../plans/binary-attestations-slice-map.json). Phase 1 code means
+`.github/workflows/release.yml` (caller), `.github/workflows/release-build.yml`
+(builder/signer), `scripts/release/phase1-build.sh`, `scripts/release/phase1.mjs`
+and `scripts/release/publish.mjs` (publisher).
+
+| Requirement | Phase 1 satisfies                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Phase 1 interim deviation (replaced by)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| R-COHORT    | The original four asset names, plus three Axum dev/evaluation binaries, are each built once (Build A), receive build provenance and an SPDX SBOM and are published only in one complete immutable release. A failed build or signing job leaves the publisher unrun; the publisher accepts only the exact seven-binary / 29-file set, so the set cannot shrink after a failure.                                                                                        | `release-cohort.json` does not select anything: it has no Phase 1 reader. The build matrix, signing matrix and publisher hard-code the artifact set; `phase1.test.mjs` only checks that those lists match the cohort file. No composition validation, shared JS input equality, retained-JS coverage or `provenance-sbom-repeatable` check runs; the cohort's profiles and capability labels are descriptive only. (Checked cohort reader: slice 2.1; JS inventory/equality: 2.4; composition: 2.6; Fastly repeatability: Phase 2+.) |
+| R-PLATFORM  | Explicit package/target per build, `--release --locked`. GNU builds run in a digest-pinned UBI 9.6 (glibc 2.34) container and final ELF bytes are rejected above `GLIBC_2.34`; musl output must have no interpreter or `NEEDED` entries. `MACOSX_DEPLOYMENT_TARGET=13.0` is explicit and checked in the final Mach-O; builds and startup smokes run on hosted macOS 15 ARM and Intel. GNU x86 binaries start on Debian 12, Ubuntu 22.04 and UBI 9.                     | No recorded effective-feature/profile record, no rejection of undeclared libraries or runner-only absolute paths, no forbidden-path scan or remapped-prefix check. The GNU build boundary (empty read-only `/tmp` tmpfs, private IPC without `/dev/shm`, write-denial controls) is absent: the container bind-mounts the hosted checkout and target directory. (Native boundary: slice 2.2; recipes/inspection: 2.5.)                                                                                                                |
+| R-CONFIG    | No operator configuration enters the build: `phase1.mjs audit` scans Rust sources for compile-time config reads, fictional canary values are planted in the environment and a temporary `trusted-server.toml` and must be absent from every final binary, and tracked `edgezero.toml` must be unchanged after the build.                                                                                                                                               | Phase 1 code does not address the #1045/#1084 variable-permission reconciliation; it remains a maintainer gate before release enablement. The source audit is a best-effort token scan, not Rust expansion or dataflow analysis.                                                                                                                                                                                                                                                                                                     |
+| R-INPUTS    | The [Phase 1 input audit](#phase-1-input-audit-and-operator-evidence) lists the input classes in prose. Builds fail if `Cargo.lock`, the JS `package-lock.json` or `edgezero.toml` change. The GNU builder image digest and ID are logged.                                                                                                                                                                                                                             | No build-evidence record of the input classes, identities, digests or roles is produced or published; `TEMPLATE_BUILD_DIGEST` and native tool identities are not recorded. (Build evidence and records: slices 2.5–2.7.)                                                                                                                                                                                                                                                                                                             |
+| R-JS        | Extends #1214's private `OUT_DIR` output and expected-module validation; no `TSJS_RELEASE_BUILD` mode is added. `TSJS_SKIP_BUILD`, `TSJS_PREBUILT_DIR` and `TSJS_TEST` are refused; npm comes from the pinned Node and `npm ci` is locked.                                                                                                                                                                                                                             | No release-wide JS job and no two-build comparison: each artifact's build runs its own `npm ci` and Cargo's build script bundles the JS. Vitest and type checks do not run in the release build (`TSJS_TEST` is refused); ordinary CI runs them. No `tsjs-inventory.json` is produced. (Slice 2.4.)                                                                                                                                                                                                                                  |
+| R-SBOM      | One SPDX 2.3 JSON document per executable, published as `<asset>.spdx.json`, whose root checksum equals the final executable SHA-256 and whose signed predicate equals the published file. It covers selected Cargo target dependencies and the installed npm build tree; unknown licenses stay `NOASSERTION`.                                                                                                                                                         | Not generated by `trusted-server-release generate-sbom`: Phase 1 runs checksummed cargo-cyclonedx 0.5.9 and `npm sbom`, merges their CycloneDX output in `phase1.mjs` and converts it with checksummed cyclonedx-cli 0.33.1. No Rollup contribution inventory, host/target unit distinction, native component records (AWS-LC, ring, SQLite) or native selector controls. (Composition/SPDX: slice 2.6; JS contributions: 2.4.)                                                                                                      |
+| R-FACTS     | `TRUSTED_SERVER__RELEASE_BUILD=1` and the full 40-character `TRUSTED_SERVER__GIT_VERSION` are validated by core's build script; target comes from Cargo, variant from the owning product. `ts --version` prints the labelled `package/source/target/variant` line; release `X-TS-Version` is the full source commit; the release tag stays external.                                                                                                                   | The build refuses `TSJS_PREBUILT_DIR` and runs `npm ci`, the opposite of the "absolute prebuilt inventory, no npm" clause; no `TRUSTED_SERVER__TSJS_INVENTORY_SHA256` exists. Fastly emits build facts in startup diagnostics only in reuse mode. (Prebuilt inventory: slice 2.4; remaining facts: 2.3.)                                                                                                                                                                                                                             |
+| R-SOURCE    | Triggers are `push` to `main` (build only, no signing) and `v*` tags. Tags must be strict SemVer, checked before building and again by the publisher; build metadata (`+…`), which R-SOURCE allows, is refused until its release-attestation subject form is rehearsed. The publisher rejects annotated tags (the tag ref must point directly at the source commit) before creating a draft.                                                                           | No eligible-branch ancestry, ruleset or bypass-actor validation; source approval is a maintainer step. The release workflow runs no AGENTS.md repository gates at the tag commit and does not wait for same-commit validation jobs. (Slice 2.9, Task 14.)                                                                                                                                                                                                                                                                            |
+| R-SIGN      | Local reusable `release-build.yml` owns build and signing. Build jobs have `contents: read` only; the signing job does not check out or run source, accepts only the two expected regular, non-symlink, non-empty files per asset and records their digests. Two `actions/attest` calls per binary: provenance over the executable and SPDX file, then SPDX mode with the executable subject. No `artifact-metadata: write`. The publisher has `contents: write` only. | Actions are referenced by major version tag (for example `@v5`), not commit SHA; no `release-tools.json` tool pins (the publisher installs a checksummed GitHub CLI 2.102.0 and Node from `.tool-versions`). No collector job binds run, job and artifact IDs or transfer digests; signing consumes same-run artifacts by name. No GNU tmpfs/IPC boundary. No index signing. (Tool policy: slice 2.1; collection: 2.7; boundary: 2.2.)                                                                                               |
+| R-PUBLISH   | `RELEASE_PUBLICATION_ENABLED` gates publication; no settings token. Tag-scoped concurrency. The publisher refuses any existing release or draft for the tag, creates a draft, uploads the exact set with per-asset digest checks, publishes, then reads `immutable == true`, verifies the release attestation (including records served by `bundle_url` with a null inline bundle) and re-downloads and byte-compares every asset before reporting success.            | A release confirmed mutable fails the job but is not removed, and no incident is raised automatically. Assets are not re-downloaded before publication (upload responses are digest-checked). A matching draft is refused, never resumed or reconciled. (Publication owner: slice 2.8.)                                                                                                                                                                                                                                              |
+| R-MANUAL    | The [verification guide](../../guide/release-verification.md) documents verification, private-directory packing, package inspection and an explicit `fastly compute deploy --version … --no-default-domain` submission command.                                                                                                                                                                                                                                        | No authorized disposable-service production submission has been run; local Viceroy execution proves a local route only. The guide uses Fastly CLI 16.0.0, not the 15.1.0 named in R-MANUAL. (Phase 2+.)                                                                                                                                                                                                                                                                                                                              |
+
+The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.
 
 **Issue:** [#1235 — Publish attested release binaries with build provenance and SBOMs](https://github.com/IABTechLab/trusted-server/issues/1235)
 
 **Date:** 2026-10-09. **Review revision:** 2026-10-12.
 
-**Status:** Draft for maintainer review. As directed on 2026-10-13, this specification, its implementation plans and implementation share PR #1262 on `spec/1235-release-attestation`; no separate implementation PR is opened. Contract/code approval is required before merge and all selected qualification gates remain required before official release enablement. Requirements below describe proposed behavior, not an existing release pipeline. The [feasibility audit](2026-10-12-1235-release-attestation-feasibility.md) records measured prototypes, missing implementations and unresolved hosted/provider qualifications; document review alone is not feasibility proof.
+**Status:** Draft for maintainer review. The original combined proposal, PR #1262 on `spec/1235-release-attestation`, which carried this specification, its plans and implementation together, is closed and frozen at `122b78664b1235c717e9208fd200f9a9b0c335df`. PR #1435 carries this phased specification and implements Phase 1 only, as scoped in [Phase 1 scope by requirement](#phase-1-scope-by-requirement); Phase 2+ slices are separate later PRs. Contract/code approval is required before merge and all selected qualification gates remain required before official release enablement. Requirements below describe the destination behavior; Phase 1 implements only the subset in that table. The frozen [feasibility audit](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/docs/superpowers/specs/2026-10-12-1235-release-attestation-feasibility.md) records measured prototypes, missing implementations and unresolved hosted/provider qualifications; document review alone is not feasibility proof.
 
-**Producer implementation constraint (2026-10-14):** Introduced release producer tooling MUST use the small domain-specific host-only `crates/trusted-server-release` Rust 2024/1.95.0 workspace member, excluded from default members and independent of core/CLI/JS crates. No introduced Python tooling is permitted. Existing Node JS collection and thin POSIX wrappers remain; native approved-source Rust bootstrap is independently authenticated and supplies no official binary proof for itself. `ts` remains the consumer, and the [migration addendum](2026-10-14-release-tooling-rust-migration.md) preserves every qualification, acquisition and evidence gate. The producer is not a fifth canonical asset or a generic attestation/publisher abstraction.
+**Producer implementation constraint (2026-10-14):** Introduced release producer tooling MUST use the small domain-specific host-only `crates/trusted-server-release` Rust 2024/1.95.0 workspace member, excluded from default members and independent of core/CLI/JS crates. No introduced Python tooling is permitted. Existing Node JS collection and thin POSIX wrappers remain; native approved-source Rust bootstrap is independently authenticated and supplies no official binary proof for itself. `ts` remains the consumer, and the [migration addendum](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/docs/superpowers/specs/2026-10-14-release-tooling-rust-migration.md) preserves every qualification, acquisition and evidence gate. The producer is not a fifth canonical asset or a generic attestation/publisher abstraction.
 
 **Implementation baseline:** `44c5b5620bfb1f82e5b959ab5ba8ec69c7091e52` includes #1213 and #1214, both merged on 2026-10-12. Release implementation extends their source-version and isolated JS/prebuilt mechanisms. The feasibility audit used the earlier `7f6056bf83eb96aa4167efca64d43280299fba73` snapshot with then-open PR overlays; those historical probes are not current release qualification.
 
@@ -200,7 +232,7 @@ Build provenance establishes that the constrained workflow produced a digest. Im
 
 ### R-COHORT
 
-**Phase:** 1 for the reduced acceptance subset in Phasing; remaining clauses are Phase 2+.
+**Phase:** 1 — see [Phase 1 scope](#phase-1-scope-by-requirement) for the clauses met and interim deviations; remaining clauses are Phase 2+.
 
 `scripts/release/release-cohort.json` MUST select the complete artifact set and required assurance profile before jobs execute. The first cohort is `phase1-fastly-cli`. Every selected artifact MUST have successful canonical Build A, build provenance, SBOM, composition validation, shared JS input equality, artifact-specific retained-JS coverage and immutable publication. A failure of any selected requirement MUST block publication; the workflow MUST NOT shrink the set or lower a profile after failure.
 
@@ -213,7 +245,7 @@ Build provenance establishes that the constrained workflow produced a digest. Im
 
 ### R-PLATFORM
 
-**Phase:** 1 for the reduced acceptance subset in Phasing; remaining clauses are Phase 2+.
+**Phase:** 1 — see [Phase 1 scope](#phase-1-scope-by-requirement) for the clauses met and interim deviations; remaining clauses are Phase 2+.
 
 Recipes MUST use explicit packages/targets and recorded effective features/release profile. A pinned Linux builder with glibc no newer than 2.34 MUST establish the GNU compatibility floor; scheduling it on Ubuntu 24.04 does not establish a 2.39 floor. Native link inspection MUST validate the actual ELF GLIBC symbol ceiling and reject undeclared libraries and runner-only absolute paths.
 
@@ -237,13 +269,13 @@ Native CLI A/B outcome is reported as `matched`, `mismatched`, `failed` or `unav
 
 ### R-CONFIG
 
-**Phase:** 1 for the reduced acceptance subset in Phasing; remaining clauses are Phase 2+.
+**Phase:** 1 — see [Phase 1 scope](#phase-1-scope-by-requirement) for the clauses met and interim deviations; remaining clauses are Phase 2+.
 
 Operator configuration MUST NOT be compiled into release binaries. Publisher domains, account/service IDs, physical bindings, active settings, secrets, selected integrations, configuration revisions and deployment-variable permission policy MUST enter at runtime. All artifacts MUST use the tracked repository `edgezero.toml` unchanged. Logical store identifiers, product defaults and the fictional CLI scaffold are source-defined product inputs shared by all operators. The scaffold MUST NOT be an active-config fallback. The permission work in #1045/#1084 MUST resolve any conflicting embedded variable-policy design before release enablement; this contract does not choose its distribution protocol.
 
 ### R-INPUTS
 
-**Phase:** 1 for the reduced acceptance subset in Phasing; remaining clauses are Phase 2+.
+**Phase:** 1 — see [Phase 1 scope](#phase-1-scope-by-requirement) for the clauses met and interim deviations; remaining clauses are Phase 2+.
 
 Build evidence MUST record every input class below, with selected identities/digests and roles. Introducing an input requires updating the inventory in the same implementation PR. Generic SLSA provenance is not assumed to enumerate these transitively.
 
@@ -280,7 +312,7 @@ The CLI's compiled developer checkout fallback (`CARGO_MANIFEST_DIR`) MUST be di
 
 ### R-JS
 
-**Phase:** 1 for the reduced acceptance subset in Phasing; remaining clauses are Phase 2+.
+**Phase:** 1 — see [Phase 1 scope](#phase-1-scope-by-requirement) for the clauses met and interim deviations; remaining clauses are Phase 2+.
 
 Release work MUST extend #1214's private output, expected-module validation, checked test failures and `TSJS_PREBUILT_DIR`; it MUST NOT add a parallel `TSJS_RELEASE_BUILD` fallback mode. One release-wide JS job MUST independently run two fresh locked installations/builds with pinned Node/npm. Both MUST reject any skip flag, missing npm, failed `npm ci`, test failure, missing/empty/extra modules or changed source. Both actual A/B Vitest processes MUST unconditionally receive `TRUSTED_SERVER__RELEASE_JS_TESTS=1` and run all registered tests and type checks; a developer opt-out MUST NOT suppress them. Ordinary development skips only the two slow Git collector fixtures by default; ordinary CI opts into the full suite. Each build owns its installation/output directory and includes required build dependencies.
 
@@ -320,7 +352,7 @@ Native records MUST capture compiler, linker, archiver, SDK/sysroot, native sour
 
 ### R-SBOM
 
-**Phase:** 1 for the reduced acceptance subset in Phasing; remaining clauses are Phase 2+.
+**Phase:** 1 — see [Phase 1 scope](#phase-1-scope-by-requirement) for the clauses met and interim deviations; remaining clauses are Phase 2+.
 
 The repository-owned Rust producer command `trusted-server-release generate-sbom`, implemented in `crates/trusted-server-release/src/spdx.rs`, MUST emit SPDX 2.3 JSON for each canonical executable from selected Cargo JSON build messages, an unfiltered Cargo metadata identity catalog and explicit-target Cargo tree evidence, the JS lockfile and Rollup contribution inventory, plus declared-and-validated native inputs. Target-filtered metadata can omit dependencies compiled for the host during a cross-build; catalog membership alone MUST NOT establish contribution. Syft and a `RUSTC_WRAPPER` are not required. This settles the generator; its fixture proof precedes release enablement.
 
@@ -336,7 +368,7 @@ SPDX root checksum MUST equal the final executable SHA-256. Package IDs MUST inc
 
 ### R-FACTS
 
-**Phase:** 1 for the reduced acceptance subset in Phasing; remaining clauses are Phase 2+.
+**Phase:** 1 — see [Phase 1 scope](#phase-1-scope-by-requirement) for the clauses met and interim deviations; remaining clauses are Phase 2+.
 
 One immutable build-fact mechanism MUST extend merged #1213. Absence of `TRUSTED_SERVER__RELEASE_BUILD` selects development behavior; any present value other than exactly `1` MUST fail. The trusted recipe MUST set `TRUSTED_SERVER__RELEASE_BUILD=1` after inherited-environment audit and sanitation.
 
@@ -356,7 +388,7 @@ For the selected default Fastly artifact, settings load per request. Only a futu
 
 ### R-SOURCE
 
-**Phase:** 1 for the reduced acceptance subset in Phasing; remaining clauses are Phase 2+.
+**Phase:** 1 — see [Phase 1 scope](#phase-1-scope-by-requirement) for the clauses met and interim deviations; remaining clauses are Phase 2+.
 
 `.github/workflows/release.yml` MUST accept protected `v*` tag pushes and strict stable/prerelease SemVer, including schema-supported build metadata. Official tags MUST be lightweight, so the verified tag target is the source commit; annotated tags MUST be rejected, not confused with their peeled commits. The current reviewed `eligible_branches` is exactly `["main"]`. Eligibility MUST use the actual remote branch tip and commit ancestry, with governance validation of active branch/tag rulesets and bypass actors. Local remote-ref lookalikes MUST NOT supply that authority.
 
@@ -366,7 +398,7 @@ Eligibility MUST run trusted release validation at the exact tag commit for ever
 
 ### R-SIGN
 
-**Phase:** 1 for the reduced acceptance subset in Phasing; remaining clauses are Phase 2+.
+**Phase:** 1 — see [Phase 1 scope](#phase-1-scope-by-requirement) for the clauses met and interim deviations; remaining clauses are Phase 2+.
 
 The local `.github/workflows/release-build.yml` at the caller's source revision MUST own build orchestration, collector validation and file attestations. Build/lifecycle execution MUST occur without OIDC/attestation writes. Signing MUST consume only validated current-run job outputs and MUST NOT compile untrusted source. The authenticated build boundary is the complete workflow invocation, not just the collector. No caller-supplied command, script, arbitrary path/repository or provenance predicate is accepted. All actions MUST be SHA-pinned; tools MUST have exact version/digest pins in `scripts/release/release-tools.json`.
 
@@ -380,7 +412,7 @@ File attestations MUST NOT request `artifact-metadata: write`; no container stor
 
 ### R-PUBLISH
 
-**Phase:** 1 for the reduced acceptance subset in Phasing; remaining clauses are Phase 2+.
+**Phase:** 1 — see [Phase 1 scope](#phase-1-scope-by-requirement) for the clauses met and interim deviations; remaining clauses are Phase 2+.
 
 Maintainers MUST enable immutable releases and active tag rules before first publication and record approval of release authority. No `RELEASE_SETTINGS_READ_TOKEN` is introduced. A tag-scoped concurrency group MUST serialize publication without cancelling a publishing run. The publication job MUST create/resume a matching draft, upload the complete asset set, re-download and verify it, publish, then read `immutable == true` using `GITHUB_TOKEN` and verify the GitHub release attestation. It MUST NOT report success before that final check.
 
@@ -394,7 +426,7 @@ A rerun MUST refuse an already published tag. A partial draft MAY resume only wh
 
 **Phase:** 2+.
 
-The normative [release-index v1 JSON Schema](schemas/release-index-v1.schema.json) MUST be evaluated with the JSON Schema Draft 2020-12 dialect and defines closed kinds, roles, targets, variants, profiles and capabilities. The governing schema raw bytes MUST remain unchanged absent an explicit reviewed schema amendment. Its retained `$comment` pins Draft 2020-12; Rust `KnownSchema` explicitly selects that dialect with offline evaluation, and committed positive/negative tests exercise the actual governing schema.
+The normative [release-index v1 JSON Schema](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/docs/superpowers/specs/schemas/release-index-v1.schema.json) MUST be evaluated with the JSON Schema Draft 2020-12 dialect and defines closed kinds, roles, targets, variants, profiles and capabilities. The governing schema raw bytes MUST remain unchanged absent an explicit reviewed schema amendment. Its retained `$comment` pins Draft 2020-12; Rust `KnownSchema` explicitly selects that dialect with offline evaluation, and committed positive/negative tests exercise the actual governing schema.
 
 Producer and consumer MUST additionally require `recipe_source_commit` and `cohort_source_commit` to equal the independently approved `source_commit`, and enforce exact cohort membership, unique safe asset names, expected package/target/variant/profile combinations and equality of each size/digest with actual bytes. These repeated v1 source/recipe/cohort equalities intentionally expose the joins; a different revision requires a future reviewed amendment. Structural v1 compatibility may accept `fastly-staging`, but current producer/consumer policy and cohort MUST semantically reject it until reviewed enablement. Tasks 3, 13 and 17 MUST test that rejection. SemVer metadata and schema fields MUST NOT be narrowed without review.
 
@@ -443,7 +475,7 @@ The recipe and rebuild records are authenticated for audit, but consumers do not
 
 Task 17 MUST obtain producer-policy bytes from an independently approved source snapshot or the fixed official GitHub Contents API endpoint `https://api.github.com/repos/IABTechLab/trusted-server/contents/crates/trusted-server-cli/release-policy.json?ref=<independently-approved-40-character-commit>`, using `Accept: application/vnd.github.raw+json`. The ref MUST come from independent full-commit approval, never the index. Fetching MUST use an explicit read-only credential, the 1 MiB policy bound, and the overall verification deadline. Arbitrary hosts/paths and redirects that change that origin/path or forward credentials MUST be rejected. The producer hash/version MUST be computed from those approved-source bytes before applying the consumer's own compiled constraints. Offline checks require an independently transferred approved source-policy snapshot and establish build proof only, never official deployment. [GitHub Contents API](https://docs.github.com/en/rest/repos/contents#get-repository-content) documents raw media and explicit commit refs. <!-- allow-domain: api.github.com -->
 
-The initial verified tool contract is GitHub CLI **2.97.0** and `actions/attest` **4.2.2** (SHA `1e69f48acb82d1966a394da916b4c1698aa569d6`). Implementation MUST record platform gh binary digests in `release-tools.json` and qualify this exact version. Other versions MUST fail with a compatibility diagnostic until a reviewed policy/tools update qualifies them. This is an exact supported version, not an unspecified minimum. Checking the version string is not proof that an executable is trustworthy.
+**Phase 2+ destination (not Phase 1):** the initial verified tool contract for the custom consumer is GitHub CLI **2.97.0** and `actions/attest` **4.2.2** (SHA `1e69f48acb82d1966a394da916b4c1698aa569d6`). Implementation MUST record platform gh binary digests in `release-tools.json` and qualify this exact version. Other versions MUST fail with a compatibility diagnostic until a reviewed policy/tools update qualifies them. This is an exact supported version, not an unspecified minimum. Checking the version string is not proof that an executable is trustworthy. Phase 1 does not use this contract: its publisher installs a checksummed GitHub CLI **2.102.0**, and the operator guide verifies with 2.102.0 or later; moving the destination contract to a qualified version is Phase 2+ work.
 
 | Authenticated expectation               | Required value                                                                                                                                                                |
 | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -617,7 +649,7 @@ ts deploy --adapter fastly --service-id '<service-id>' --staging \
 
 ### R-MANUAL
 
-**Phase:** 1 for the reduced acceptance subset in Phasing; remaining clauses are Phase 2+.
+**Phase:** 1 — see [Phase 1 scope](#phase-1-scope-by-requirement) for the clauses met and interim deviations; remaining clauses are Phase 2+.
 
 Operator guidance MUST provide verification, private-directory packing, R-PACK inspection, observed existing-service binding checks and an explicit production submission command before the first release. A lower-level verified-byte transport can use:
 
@@ -654,7 +686,7 @@ The Cloudflare configuration mismatch and inaccurate configuration comments pred
 
 ## Feasibility evidence and implementation dependencies
 
-The [feasibility audit](2026-10-12-1235-release-attestation-feasibility.md) covers every requirement and identifies concrete implementation boundaries. Local JS/wasm/native builds, application execution and pinned gh primitives were exercised. Hosted production recipes, full real-artifact SBOM coverage, GNU/Intel qualification, actual project signing/publication and live Fastly submission remain unproven release gates. Approval of prose does not waive them. The audit records the known unavailable old-macOS matrix, final-CLI JS distinction, primitive verifier limits, manifest fixture leakage and irreducible first-clone uncertainty corrected here.
+The [feasibility audit](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/docs/superpowers/specs/2026-10-12-1235-release-attestation-feasibility.md) covers every requirement and identifies concrete implementation boundaries. Local JS/wasm/native builds, application execution and pinned gh primitives were exercised. Hosted production recipes, full real-artifact SBOM coverage, GNU/Intel qualification, actual project signing/publication and live Fastly submission remain unproven release gates. Approval of prose does not waive them. The audit records the known unavailable old-macOS matrix, final-CLI JS distinction, primitive verifier limits, manifest fixture leakage and irreducible first-clone uncertainty corrected here.
 
 ## Test plan and requirement traceability
 
@@ -785,21 +817,24 @@ qualification or deployment claims for either adapter.
 
 ## Review log
 
-- **Round 1 (2026-10-28, fresh independent AI source review of `20152315c`):** No
-  blocking Phase 1 findings. Checked the complete phased spec against release
-  workflows, build helpers, operator guidance, configuration/build-facts paths
-  and all four adapters. Identified historical Cloudflare/Spin investigation
-  facts and an older Axum description; the append-only current-baseline note
-  above records their disposition without changing the retained destination
-  requirements. Explicitly deferred phases were assessed as deferred scope.
-  This was a read-only source review, not a new runtime qualification run.
-- **Round 2 (2026-10-28, a second fresh independent AI source review of
-  `20152315c` plus the current-baseline clarification):** No blocking Phase 1
-  findings. Rechecked the complete spec against workflows, producer helpers,
-  configuration/build facts, operator guidance, compatibility notes and all
-  four adapters. Confirmed the seven-binary/29-file contract and its signing,
-  SPDX, failure/recovery, test-scope and adapter boundaries. The baseline
-  clarification matches current source; later destination requirements remain
-  deferred as documented. This was a read-only source review, not a new runtime
-  qualification run. Human maintainer design approval and repository settings
-  remain open gates.
+Both rounds below were author-initiated automated (AI) reviews of source commit
+`20152315c01dd5fddcfc84b969f8e9993b0bfc69`. They are not maintainer reviews
+and do not cover any later commit, including `79b118858` (annotated-tag
+rejection in the publisher, SPDX creation-timestamp normalization and the build
+cleanup trap), the later merges of main or the review-response changes recorded
+in [Phase 1 scope by requirement](#phase-1-scope-by-requirement). Maintainer
+review on PR #1435 subsequently identified the Phase 1 deviations now listed in
+that table.
+
+- **Round 1 (2026-10-28, author-initiated automated source review of
+  `20152315c`):** reported no blocking Phase 1 findings. It compared the phased
+  spec with the release workflows, build helpers, operator guidance,
+  configuration/build-facts paths and all four adapters, and identified the
+  historical Cloudflare/Spin investigation facts and older Axum description
+  recorded in the current-baseline note above. It was a read-only source review,
+  not a runtime qualification run.
+- **Round 2 (2026-10-28, a second author-initiated automated source review of
+  `20152315c` plus the current-baseline clarification):** reported no blocking
+  Phase 1 findings and found the baseline clarification consistent with that
+  source. It was a read-only source review, not a runtime qualification run.
+  Human maintainer design approval and repository settings remain open gates.

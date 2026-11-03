@@ -8,6 +8,8 @@ import {
 } from '../../core/first_impression';
 import { log } from '../../core/log';
 import { resolveSlotElementByDivId } from '../../core/slot_element';
+import { getActiveTraceGptBridge } from '../../trace/runtime';
+import type { TraceGptOpportunity } from '../../trace/gpt';
 import type {
   AuctionSlot,
   AuctionBidData,
@@ -17,8 +19,11 @@ import type {
   TsjsApi,
 } from '../../core/types';
 import {
+  APS_RENDER_FAILED_MESSAGE,
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  RENDERER_READY_TIMEOUT_MS,
+  apsRenderFailureReason,
   apsRendererUrl,
   dispatchApsRendering,
   consumeApsPrebidRenderer,
@@ -799,10 +804,19 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * riding rAF keeps a single code path whose post-hydration-commit guarantee
  * holds whenever the request is actually issued.
  */
+function traceOpportunity(slot: AuctionSlot, auctionId: string | undefined): TraceGptOpportunity {
+  try {
+    return getActiveTraceGptBridge()?.opportunity(slot, auctionId) ?? { auctionId };
+  } catch {
+    return { auctionId };
+  }
+}
+
 function installScheduleInitialAdInit(ts: TsjsApi): void {
   ts.scheduleInitialAdInit = function (
     initialBids?: Record<string, AuctionBidData>,
-    initialSlots?: AuctionSlot[]
+    initialSlots?: AuctionSlot[],
+    traceAuctionTransport?: unknown
   ) {
     if ((ts.navGeneration ?? 0) !== 0 || ts.initialAdInitScheduled) return;
     ts.initialAdInitScheduled = true;
@@ -810,6 +824,15 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
     if (initialBids !== undefined) ts.bids = initialBids;
     const runUnlessNavigated = (): void => {
       if ((ts.navGeneration ?? 0) !== 0) return;
+      try {
+        getActiveTraceGptBridge()?.observeTransport(
+          initialSlots ?? ts.adSlots,
+          traceAuctionTransport,
+          'initial_navigation_ssat'
+        );
+      } catch {
+        // A diagnostic bridge cannot block the ordinary initial ad pass.
+      }
       ts.adInit?.();
     };
     const afterHydrationFrames = (): void => {
@@ -1187,12 +1210,14 @@ function schedulePublisherFirstImpressionFallback(
       if (tsOwned) (ts.prevGptSlots ??= []).push(gptSlot);
 
       try {
+        const trace = traceOpportunity(slot, bid.hb_auction_id);
         ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
           gptSlot,
           slot.id,
           trustedServerOpportunity(bid),
-          bid.hb_auction_id,
-          slot.formats
+          trace.auctionId,
+          slot.formats,
+          ...(trace.identity ? ([trace.identity] as const) : [])
         );
       } catch {
         // Diagnostics must not alter fallback delivery.
@@ -1382,12 +1407,14 @@ export function installTsAdInit(): void {
         try {
           const requestedSlotSizes = ts.gptSlotHandoffs?.[slotDivId2]?.formats;
           const opportunity = trustedServerOpportunity(bid);
+          const trace = traceOpportunity(slot, bid.hb_auction_id);
           ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
             gptSlot,
             slot.id,
             opportunity,
-            bid.hb_auction_id,
-            requestedSlotSizes
+            trace.auctionId,
+            requestedSlotSizes,
+            ...(trace.identity ? ([trace.identity] as const) : [])
           );
         } catch {
           // Diagnostics must not alter ad delivery.
@@ -1490,6 +1517,7 @@ export function installTsAdInit(): void {
 interface PageBidsResponse {
   slots: AuctionSlot[];
   bids: Record<string, AuctionBidData>;
+  trace_auction?: unknown;
 }
 
 /** Canonical SPA re-auction endpoint. Mirrors `PAGE_BIDS_PATH` in Rust. */
@@ -1724,6 +1752,11 @@ export function installSpaAuctionHook(): void {
       if (inflight !== controller) return;
       ts.adSlots = data.slots;
       ts.bids = data.bids;
+      try {
+        getActiveTraceGptBridge()?.observePageBids(data, data.slots);
+      } catch {
+        // A diagnostic bridge cannot block the accepted navigation.
+      }
       // This route is now the committed, loaded state — a later failed
       // navigation rolls back here, and a return trip no-ops correctly.
       lastAppliedPath = path;
@@ -1901,11 +1934,39 @@ function safelyRecordCreativeFailure(
   }
 }
 
+/**
+ * A consumed APS ad ID, retained as a security tombstone.
+ *
+ * `iframe` is the frame the capability was actually served to, so a failure
+ * relayed later is bound to that frame rather than to the ad unit code. An ad
+ * unit code can be a configured prefix matching several slots, and the ad ID is
+ * public targeting, so checking the code alone would let any frame under a
+ * matching slot write a reason onto its own slot.
+ */
+interface ApsConsumedTombstone {
+  expiresAt: number;
+  iframe: HTMLIFrameElement;
+}
+
+/**
+ * A consumed server-side APS capability, tracked per slot.
+ *
+ * `iframe` is the frame the capability was served to, for the same reason the
+ * Prebid tombstone keeps one: the slot outlives the frame. A refresh can place
+ * a different creative in the slot, and the ad ID is public targeting, so
+ * authenticating only against the slot would let that later frame record a
+ * reason against a cycle Trusted Server never served.
+ */
+interface ApsConsumedServerCapability {
+  adId: string;
+  iframe: HTMLIFrameElement;
+}
+
 /** Maximum number of consumed APS Prebid IDs retained as security tombstones. */
 const MAX_CONSUMED_PREBID_APS_IDS = 256;
 
 function pruneConsumedPrebidApsIds(
-  consumedIds: Map<string, { expiresAt: number }>,
+  consumedIds: Map<string, ApsConsumedTombstone>,
   now: number
 ): void {
   for (const [adId, consumed] of consumedIds) {
@@ -1914,7 +1975,7 @@ function pruneConsumedPrebidApsIds(
 }
 
 function hasConsumedPrebidApsIdCapacity(
-  consumedIds: Map<string, { expiresAt: number }>,
+  consumedIds: Map<string, ApsConsumedTombstone>,
   adId: string
 ): boolean {
   if (consumedIds.has(adId) || consumedIds.size < MAX_CONSUMED_PREBID_APS_IDS) return true;
@@ -1924,11 +1985,20 @@ function hasConsumedPrebidApsIdCapacity(
 }
 
 function recordConsumedPrebidApsId(
-  consumedIds: Map<string, { expiresAt: number }>,
+  consumedIds: Map<string, ApsConsumedTombstone>,
   adId: string,
-  expiresAt: number
+  expiresAt: number,
+  iframe: HTMLIFrameElement
 ): void {
-  consumedIds.set(adId, { expiresAt });
+  // A capability consumed with little TTL left would otherwise lose its
+  // tombstone before the renderer frame's timeout relay arrives, dropping the
+  // reason. The frame starts its timer only after the capability round trip, so
+  // the relay lands later than one timeout after consumption: hold the
+  // tombstone for twice that window rather than exactly it. Bounded by the
+  // frame's own timeout so the two cannot drift apart. This also keeps the ad ID
+  // blocked longer, which is the safer direction for a security tombstone.
+  const minimum = Date.now() + 2 * RENDERER_READY_TIMEOUT_MS;
+  consumedIds.set(adId, { expiresAt: Math.max(expiresAt, minimum), iframe });
 }
 
 /**
@@ -1962,10 +2032,10 @@ export function installTsRenderBridge(): void {
   // is scoped to the slot, not the bare adId: hb_adid is not unique per bid, so
   // keying on it alone would let one slot block a distinct slot's render.
   const renderingKeys = new Set<string>();
-  const consumedPrebidApsIds = new Map<string, { expiresAt: number }>();
+  const consumedPrebidApsIds = new Map<string, ApsConsumedTombstone>();
   // One consumed APS ad ID per slot is sufficient: a newer bid replaces the
   // slot's old ad ID in `window.tsjs.bids`, so the ownership guard rejects it.
-  const consumedServerApsBySlot = new Map<string, string>();
+  const consumedServerApsBySlot = new Map<string, ApsConsumedServerCapability>();
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -1975,6 +2045,55 @@ export function installTsRenderBridge(): void {
           ? (e.data as Record<string, unknown>)
           : (JSON.parse(e.data as string) as Record<string, unknown>);
     } catch {
+      return;
+    }
+
+    // Diagnostics relayed by the APS Universal Creative frame. The creative is
+    // cross-origin, so every field is untrusted: the reason resolves through the
+    // allowlist, and the sender must be a frame inside the ad unit the
+    // capability was served to. Recording only; it never answers the sender.
+    if (data['message'] === APS_RENDER_FAILED_MESSAGE) {
+      const failedAdId = data['adId'];
+      const reason = apsRenderFailureReason(data['reason']);
+      if (typeof failedAdId === 'string' && reason !== undefined) {
+        pruneConsumedPrebidApsIds(consumedPrebidApsIds, Date.now());
+        const tombstone = consumedPrebidApsIds.get(failedAdId);
+        let failedSlotId: string | undefined;
+        if (tombstone) {
+          // Bind the report to the frame the capability was served to. An ad
+          // unit code can be a configured prefix matching several slots, and the
+          // ad ID is public targeting, so authenticating against the code alone
+          // would let any frame under a matching slot write a reason onto its
+          // own slot. The frame must also still be the live one for its slot,
+          // so a detached or replaced frame cannot report.
+          const sender = tombstone.iframe;
+          if (e.source && sender.contentWindow === e.source) {
+            failedSlotId = slotFrameForMessageSource(e.source)?.slotId;
+          }
+        } else {
+          // Server-side APS winners are served the same renderer and emit the
+          // same relay, but are tracked per slot. Bind the report to the frame
+          // the capability was served to, as the Prebid path does: the slot
+          // outlives the frame, so a replacement creative in the same slot could
+          // otherwise name the old ad ID and record against a cycle Trusted
+          // Server never served. The slot check stays so the frame must also
+          // still be the live one for that slot.
+          for (const [slotId, consumed] of consumedServerApsBySlot) {
+            if (
+              consumed.adId === failedAdId &&
+              e.source &&
+              consumed.iframe.contentWindow === e.source &&
+              sourceFrameForSlotId(e.source, slotId)
+            ) {
+              failedSlotId = slotId;
+              break;
+            }
+          }
+        }
+        if (failedSlotId !== undefined) {
+          safelyRecordCreativeFailure(safelyRecordCreativeRequest(failedSlotId), reason);
+        }
+      }
       return;
     }
 
@@ -2008,7 +2127,12 @@ export function installTsRenderBridge(): void {
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
       if (!renderer || !hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
       if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
-      recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
+      recordConsumedPrebidApsId(
+        consumedPrebidApsIds,
+        adId,
+        prebidRendererEntry.expiresAt,
+        sourceFrame.iframe
+      );
 
       const markUsed = (): void => {
         try {
@@ -2090,10 +2214,10 @@ export function installTsRenderBridge(): void {
       // This slot and ad ID belong to TS, so fail closed before validating the
       // descriptor and never let native Prebid answer a rejected or replayed request.
       e.stopImmediatePropagation();
-      if (consumedServerApsBySlot.get(slotId) === adId) return;
+      if (consumedServerApsBySlot.get(slotId)?.adId === adId) return;
       const renderer = validateApsRenderer(matchedBid.renderer);
       if (!renderer) return;
-      consumedServerApsBySlot.set(slotId, adId);
+      consumedServerApsBySlot.set(slotId, { adId, iframe: sourceSlotFrame.iframe });
       void Promise.resolve(
         dispatchApsRendering({
           slotId,

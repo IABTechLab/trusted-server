@@ -14,7 +14,14 @@ import {
   realpathSync,
   mkdirSync,
 } from 'node:fs'
-import { join, resolve } from 'node:path'
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 /** Retains CI-only acquisition failure facts without environment or error text. */
@@ -351,6 +358,11 @@ export function completeSpdx(document, binary, original) {
   )
     throw new Error('Unexpected converter root or relationships')
   document.creationInfo ??= {}
+  if (typeof document.creationInfo.created === 'string')
+    document.creationInfo.created = document.creationInfo.created.replace(
+      /\.\d+Z$/,
+      'Z'
+    )
   document.creationInfo.creators = [
     ...new Set([
       ...(document.creationInfo.creators ?? []),
@@ -506,7 +518,7 @@ function rustTokens(source) {
       }
       continue
     }
-    const raw = source.slice(i).match(/^r(#{0,255})"/)
+    const raw = source.slice(i).match(/^[bc]?r(#{0,255})"/)
     if (raw) {
       const start = i + raw[0].length,
         end = source.indexOf('"' + raw[1], start)
@@ -517,7 +529,7 @@ function rustTokens(source) {
     }
     const character = source
       .slice(i)
-      .match(/^'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\r\n])'/)
+      .match(/^'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\r\n])'/u)
     if (character) {
       i += character[0].length
       continue
@@ -556,7 +568,66 @@ function rustTokens(source) {
   return tokens
 }
 
-export function checkSource(file, source) {
+/**
+ * Returns, for each `mod name;` a Rust file declares, the files rustc may load
+ * for it. A `#[path = "..."]` declaration has exactly one candidate, relative
+ * to that file's directory, and is marked `explicit`.
+ */
+export function moduleFiles(file, source) {
+  const tokens = rustTokens(source)
+  const directory = dirname(file)
+  const modules = []
+  let path
+  for (let i = 0; i < tokens.length; i++) {
+    if (
+      tokens[i] === '#' &&
+      tokens[i + 1] === '[' &&
+      tokens[i + 2] === 'path' &&
+      tokens[i + 3] === '=' &&
+      tokens[i + 4]?.string !== undefined &&
+      tokens[i + 5] === ']'
+    ) {
+      path = tokens[i + 4].string
+      i += 5
+    } else if (
+      tokens[i] === 'mod' &&
+      typeof tokens[i + 1] === 'string' &&
+      tokens[i + 2] === ';'
+    ) {
+      modules.push(
+        path === undefined
+          ? {
+              explicit: false,
+              files: [
+                join(directory, `${tokens[i + 1]}.rs`),
+                join(directory, tokens[i + 1], 'mod.rs'),
+                // A non-mod.rs file `y.rs` loads `mod z;` from `y/`.
+                join(directory, basename(file, '.rs'), `${tokens[i + 1]}.rs`),
+                join(directory, basename(file, '.rs'), tokens[i + 1], 'mod.rs'),
+              ],
+            }
+          : {
+              explicit: true,
+              // rustc loads an absolute path as given.
+              files: [isAbsolute(path) ? path : join(directory, path)],
+            }
+      )
+      path = undefined
+    } else if (tokens[i] === 'mod' || tokens[i] === ';') path = undefined
+  }
+  return modules
+}
+
+/**
+ * Rejects deployment configuration read at compile time. `buildScript`
+ * applies the stricter rule for code that runs during the build: `build.rs`
+ * and every module it loads.
+ */
+export function checkSource(
+  file,
+  source,
+  buildScript = basename(file) === 'build.rs'
+) {
   const tokens = rustTokens(source)
   const deployment = (value) => /^(?:TRUSTED_SERVER__|EDGEZERO__)/.test(value)
   // Only release control and Cargo-owned target facts are additional build-time inputs.
@@ -622,11 +693,17 @@ export function checkSource(file, source) {
       )
         throw Error(`${file}: deployment compile-time input`)
     }
-    if (file.endsWith('build.rs')) {
+    if (buildScript) {
       const value = expression(i)?.value
+      // Judge the leading variable name, so an error message that names an
+      // allowed control still passes while a padded or templated name fails.
       if (
         value !== undefined &&
-        ((deployment(value) && !allowedBuild.has(value)) || operatorPath(value))
+        ((deployment(value) &&
+          !allowedBuild.has(
+            value.match(/^(?:TRUSTED_SERVER__|EDGEZERO__)\w*/)[0]
+          )) ||
+          operatorPath(value))
       )
         throw Error(`${file}: operator compile-time build input`)
     }
@@ -703,15 +780,80 @@ export function mergeSboms(cargo, npm, binary, name, version) {
   }
 }
 
-function audit(root) {
+function crateFiles(root, files = []) {
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (['node_modules', 'target', 'dist', '.git'].includes(entry.name))
       continue
     const file = join(root, entry.name)
-    if (entry.isDirectory()) audit(file)
-    else if (entry.isFile() && file.endsWith('.rs'))
-      checkSource(file, readFileSync(file, 'utf8'))
+    if (entry.isDirectory()) crateFiles(file, files)
+    else if (
+      entry.isFile() &&
+      (file.endsWith('.rs') || entry.name === 'Cargo.toml')
+    )
+      files.push(file)
   }
+  return files
+}
+
+/**
+ * Refuses a manifest that names a build script other than `build.rs`, which
+ * the audit would not recognise as one.
+ */
+function checkManifest(file, source) {
+  let section
+  for (const line of source.split(/\r?\n/)) {
+    const header = line.match(/^\s*\[([^\]]*)\]/)
+    if (header) section = header[1].trim()
+    const build =
+      section === 'package'
+        ? line.match(/^\s*build\s*=\s*([^#]*?)\s*(?:#.*)?$/)
+        : line.match(/^\s*package\.build\s*=\s*([^#]*?)\s*(?:#.*)?$/)
+    if (build && !['"build.rs"', "'build.rs'", 'false'].includes(build[1]))
+      throw Error(`${file}: custom build script is not audited`)
+  }
+}
+
+/**
+ * Audits every Rust file under `root`. Build scripts, every module they reach
+ * and every file under a crate's `build/` or `build_support/` directory get the
+ * build-script rule. Module resolution is simplified (no inline-module nesting,
+ * `cfg_attr` paths or `include!`), so build-time helpers belong in those two
+ * directories. A custom `package.build` script and a `#[path]` module outside
+ * the audited `.rs` files are refused.
+ */
+export function audit(root) {
+  const found = crateFiles(root)
+  for (const manifest of found.filter((file) => file.endsWith('Cargo.toml')))
+    checkManifest(manifest, readFileSync(manifest, 'utf8'))
+  const files = found.filter((file) => file.endsWith('.rs'))
+  const sources = new Map(
+    files.map((file) => [file, readFileSync(file, 'utf8')])
+  )
+  for (const file of files)
+    for (const module of moduleFiles(file, sources.get(file)))
+      if (module.explicit && !sources.has(module.files[0]))
+        throw Error(`${file}: #[path] module outside the audited Rust sources`)
+  const buildTime = new Set(
+    files.filter(
+      (file) =>
+        basename(file) === 'build.rs' ||
+        /^[^/\\]+[/\\](?:build|build_support)[/\\]/.test(relative(root, file))
+    )
+  )
+  const pending = [...buildTime]
+  while (pending.length) {
+    const file = pending.pop()
+    for (const module of moduleFiles(file, sources.get(file)).flatMap(
+      (declaration) => declaration.files
+    )) {
+      if (!buildTime.has(module) && sources.has(module)) {
+        buildTime.add(module)
+        pending.push(module)
+      }
+    }
+  }
+  for (const file of files)
+    checkSource(file, sources.get(file), buildTime.has(file))
 }
 
 async function smokeRelease(file, target) {

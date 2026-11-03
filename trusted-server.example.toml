@@ -130,18 +130,33 @@ pull_sync_concurrency = 3
 
 # First-party HTML/CSS rewriting controls.
 # [rewrite]
-# Domains left as-is (not proxied/rewritten). Supports "*.example.com" wildcards.
+# Hosts never rewritten: assets stay direct and click-through links are not
+# wrapped. Supports "*.example.com" wildcards (matches the apex too).
 # exclude_domains = ["*.cdn.example.com"]
+# When non-empty, only asset URLs on these hosts are proxied; other assets load
+# directly. Click-through links are not affected. Set this in TOML; environment
+# overrides cannot replace arrays.
+# include_domains = ["assets.example.com", "*.img.example.com"]
 
 # Trust a fronting CDN's reader IP only when the same request also supplies
 # the matching shared secret. The front door must set both headers on requests
 # it sends here and remove client-supplied copies on its other routes.
 # `shared_secret` is a key in trusted_server_secrets, not the credential itself.
-# Fastly-only; see docs/guide/fastly.md for the required front-door setup.
+# Used by Fastly request handling and trace metadata on every adapter.
+# See docs/guide/fastly.md for the required Fastly front-door setup.
 # [trusted_client_ip]
 # ip_header = "x-ts-client-ip"
 # auth_header = "x-ts-client-ip-auth"
 # shared_secret = "trusted_client_ip_shared_secret"
+
+# Opt-in browser-facing origin forwarding for a trusted development proxy.
+# Forwarded host/proto need a matching secret and stay publisher-domain bounded.
+# shared_secret is a key in trusted_server_secrets, not the credential itself.
+# Configure the forwarder to send the actual secret in auth_header.
+# With x-ts-forwarder-auth, use ts dev proxy --forwarder-secret-file.
+# [trusted_forwarder]
+# auth_header = "x-ts-forwarder-auth"
+# shared_secret = "trusted_forwarder_shared_secret"
 
 # Tester-cookie endpoints: GET /_ts/set-tester sets ts-tester=true and
 # GET /_ts/clear-tester clears it on publisher.cookie_domain.
@@ -491,11 +506,13 @@ auction_timeout_ms = 500
 # OPTIONAL — Integrations
 # =============================================================================
 # Every integration is off by default. Most are fully commented out; uncomment a
-# block and set `enabled = true` to activate it. Four (gpt, didomi, datadome,
-# google_tag_manager) are kept as active `enabled = false` stubs so the `ts audit`
-# CLI can flip them in place — leave those sections present. Integrations whose
-# `enabled` defaults to true (prebid, permutive, lockr, ...) still stay OFF while
-# their section is commented out. Required fields are noted per block.
+# block and set `enabled = true` to activate it. GPT, Didomi, DataDome, and Google
+# Tag Manager are kept as active `enabled = false` stubs — leave those sections
+# present. The `ts audit` CLI can enable GPT, DataDome, and Google Tag Manager;
+# Didomi requires manual review of its trusted geo and loader-caching setup.
+# Integrations whose `enabled` defaults to true (prebid, permutive, lockr, ...)
+# still stay OFF while their section is commented out. Required fields are noted
+# per block.
 # =============================================================================
 
 # Browser-side Prebid.js integration. Server-side bidder routing belongs under
@@ -563,8 +580,9 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # timeout_ms = 1200
 # rewrite_scripts = true
 
-# Didomi CMP SDK/API first-party proxy. Kept active but disabled so `ts audit`
-# can flip `enabled` to true when Didomi is detected on the audited page.
+# Didomi CMP SDK/API first-party proxy. Detection by `ts audit` leaves this
+# disabled and adds a manual-review note. Before enabling it, review trusted geo
+# coverage and the loader-caching rollout requirements in the Didomi guide.
 [integrations.didomi]
 enabled = false
 geo_query_parameters = false
@@ -648,9 +666,11 @@ gam_attribution_enabled = false
 
 # GPT runtime diagnostics browser overlay. Optional and enabled manually (not
 # flipped by `ts audit`); serves a diagnostics module gated behind an activation
-# query param + session cookie.
+# query param + host-only cookie. Explicit activation lasts 30 minutes;
+# ordinary requests do not extend it. Mobile trace remains off by default.
 # [integrations.gpt_diagnostics]
 # enabled = true
+# trace_page_enabled = false
 
 # APS browser renderer ownership. Server-side APS behavior belongs under an
 # [auction.providers] entry with profile = "aps".

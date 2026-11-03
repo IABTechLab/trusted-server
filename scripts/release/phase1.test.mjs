@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { gzipSync, gunzipSync } from 'node:zlib'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { completeSpdx, validateSpdx, checkReleaseFormat } from './phase1.mjs'
 import { test } from 'node:test'
 import {
@@ -16,7 +16,20 @@ import { tmpdir } from 'node:os'
 import * as fs from 'node:fs'
 import vm from 'node:vm'
 import { isDeepStrictEqual } from 'node:util'
-import { checkBinary, checkSource, mergeSboms, sentinels } from './phase1.mjs'
+import { fileURLToPath } from 'node:url'
+import {
+  audit,
+  checkBinary,
+  checkSource,
+  mergeSboms,
+  sentinels,
+} from './phase1.mjs'
+import {
+  publish,
+  readRetrier,
+  releaseAssets,
+  releaseNotes,
+} from './publish.mjs'
 import {
   ordinaryApi,
   ordinaryDownload,
@@ -541,31 +554,174 @@ test('workflow signs only tags, separates privileged jobs, and never checks out 
     /checkout@|cargo |npm |contents: write|artifact-metadata:/
   )
   assert.equal((sign.match(/uses: actions\/attest@/g) ?? []).length, 2)
-  assert.match(
-    readFileSync('.github/workflows/release.yml', 'utf8'),
-    /cancel-in-progress:.*pull_request/
+  const release = readFileSync('.github/workflows/release.yml', 'utf8')
+  const triggers = release.split('\npermissions:')[0]
+  assert.doesNotMatch(
+    triggers,
+    /pull_request/,
+    'should not run release builds or privileged callers on pull requests'
   )
+  assert.match(triggers, /branches: \[main\]/)
+  assert.match(triggers, /tags: \['v\*'\]/)
   assert.doesNotMatch(workflow, /workflow_dispatch|--clobber/)
-  for (const line of [
-    workflow,
-    readFileSync('.github/workflows/release.yml', 'utf8'),
-  ]
+  // The publisher job checks out only its own script, template and tool pins.
+  const publisher = release.split('\n  release:')[1]
+  assert.equal((publisher.match(/actions\/checkout@/g) ?? []).length, 1)
+  assert.match(publisher, /persist-credentials: false/)
+  assert.deepEqual(
+    publisher
+      .match(/sparse-checkout: \|\n((?: {12}\S.*\n)+)/)[1]
+      .trim()
+      .split(/\s+/),
+    [
+      '.tool-versions',
+      'scripts/release/publish.mjs',
+      'scripts/release/release-notes.md',
+    ]
+  )
+  assert.match(publisher, /sparse-checkout-cone-mode: false/)
+  assert.doesNotMatch(publisher, /cargo |npm |phase1-build/)
+  assert.match(publisher, /GH_SHA256: [a-f0-9]{64}\n/)
+  assert.match(publisher, /sha256sum --check/)
+  assert.match(publisher, /node publisher\/scripts\/release\/publish\.mjs\n/)
+  // Match the repository convention: actions are referenced by major tag.
+  for (const line of [workflow, release]
     .join('\n')
     .split('\n')
     .filter((line) => /uses: .*@/.test(line))) {
-    assert.match(line, /@[a-f0-9]{40} # v/)
+    assert.match(line, /uses: actions\/[\w-]+@v\d+$/)
+  }
+  // Every job that runs Node first installs the pinned version.
+  for (const text of [workflow, release])
+    for (const job of text.split(/\n {2}(?=[\w-]+:\n)/).slice(1))
+      if (/^\s*(?:- )?(?:run: )?node /m.test(job))
+        assert.ok(
+          job.indexOf('actions/setup-node@') >= 0 &&
+            job.indexOf('actions/setup-node@') <
+              job.search(/^\s*(?:- )?(?:run: )?node /m),
+          `should set up pinned Node before running it: ${job.split(':')[0]}`
+        )
+})
+const runBlock = (workflow, step) => {
+  const lines = workflow.split('\n')
+  const start = lines.findIndex((line) => line.trim() === `- name: ${step}`)
+  assert.ok(start >= 0, `should define step ${step}`)
+  const run = lines.findIndex(
+    (line, index) => index > start && line.trim() === 'run: |'
+  )
+  const indent = lines[run + 1].match(/^ */)[0]
+  const body = []
+  for (const line of lines.slice(run + 1)) {
+    if (line && !line.startsWith(indent)) break
+    body.push(line.slice(indent.length))
+  }
+  return body.join('\n')
+}
+test('signing job shell refuses symlinked, extra, empty and changed inputs', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const validate = runBlock(
+    workflow,
+    'Validate signing inputs and retain their digests'
+  )
+  const retain = runBlock(
+    workflow,
+    "Retain only this run's real bundles and signed-input digests"
+  )
+  // Use a cohort asset without a companion; the validator rejects unknown names.
+  const asset = 'ts-x86_64-unknown-linux-gnu'
+  for (const mode of [
+    'success',
+    'symlink-binary',
+    'symlink-spdx',
+    'directory-binary',
+    'extra',
+    'missing',
+    'empty',
+    'changed',
+    'empty-bundle',
+    'empty-provenance',
+  ]) {
+    const root = mkdtempSync(join(tmpdir(), 'phase1-sign-'))
+    try {
+      const inputs = join(root, 'release-assets')
+      mkdirSync(inputs)
+      writeFileSync(join(root, 'outside'), 'outside')
+      for (const file of [asset, `${asset}.spdx.json`])
+        writeFileSync(join(inputs, file), `fixture ${file}`)
+      if (mode.startsWith('symlink-')) {
+        const file = join(
+          inputs,
+          mode === 'symlink-binary' ? asset : `${asset}.spdx.json`
+        )
+        rmSync(file)
+        fs.symlinkSync(join(root, 'outside'), file)
+      }
+      if (mode === 'directory-binary') {
+        rmSync(join(inputs, asset))
+        mkdirSync(join(inputs, asset))
+        writeFileSync(join(inputs, asset, 'nested'), 'nested')
+      }
+      if (mode === 'extra') writeFileSync(join(inputs, 'extra'), 'extra')
+      if (mode === 'missing') rmSync(join(inputs, `${asset}.spdx.json`))
+      if (mode === 'empty') writeFileSync(join(inputs, asset), '')
+      const env = {
+        PATH: process.env.PATH,
+        ASSET: asset,
+        SOURCE_COMMIT: 'a'.repeat(40),
+        GITHUB_RUN_ID: '17',
+        GITHUB_RUN_ATTEMPT: '2',
+        GITHUB_OUTPUT: join(root, 'github-output'),
+      }
+      const run = (script, extra = {}) =>
+        spawnSync('bash', ['-c', script], {
+          cwd: root,
+          env: { ...env, ...extra },
+          encoding: 'utf8',
+        })
+      const validated = run(validate)
+      const validFixture = [
+        'success',
+        'changed',
+        'empty-bundle',
+        'empty-provenance',
+      ].includes(mode)
+      assert.equal(validated.status === 0, validFixture, mode)
+      if (!validFixture) continue
+      // Simulate the two attest steps between the shell steps.
+      const provenance = join(root, 'provenance.json')
+      const sbom = join(root, 'sbom.json')
+      writeFileSync(
+        provenance,
+        mode === 'empty-provenance' ? '' : 'provenance bundle'
+      )
+      writeFileSync(sbom, mode === 'empty-bundle' ? '' : 'sbom bundle')
+      if (mode === 'changed') writeFileSync(join(inputs, asset), 'changed')
+      const retained = run(retain, { PROVENANCE: provenance, SBOM: sbom })
+      assert.equal(retained.status === 0, mode === 'success', mode)
+      if (mode !== 'success') continue
+      const signed = join(root, 'signed-assets')
+      assert.deepEqual(fs.readdirSync(signed).sort(), [
+        'SHA256SUMS',
+        `${asset}.provenance.sigstore.json`,
+        `${asset}.sbom.sigstore.json`,
+      ])
+      const sums = readFileSync(join(signed, 'SHA256SUMS'), 'utf8')
+      for (const [file, dir] of [
+        [asset, inputs],
+        [`${asset}.spdx.json`, inputs],
+        [`${asset}.provenance.sigstore.json`, signed],
+        [`${asset}.sbom.sigstore.json`, signed],
+      ])
+        assert.ok(
+          sums.includes(`${hash(readFileSync(join(dir, file)))}  ${file}\n`),
+          `should retain the digest of ${file}`
+        )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   }
 })
-const assets = [
-  'trusted-server-axum-x86_64-unknown-linux-gnu',
-  'trusted-server-axum-x86_64-unknown-linux-musl',
-  'trusted-server-axum-aarch64-unknown-linux-gnu',
-
-  'trusted-server-fastly.wasm',
-  'ts-aarch64-apple-darwin',
-  'ts-x86_64-apple-darwin',
-  'ts-x86_64-unknown-linux-gnu',
-]
+const assets = releaseAssets
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex')
 
 test('isolated signing accepts only bound 3/2 input sets and retains exact provenance subjects', () => {
@@ -734,39 +890,86 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
     }
 })
 
-function publicationScript() {
-  const workflow = readFileSync('.github/workflows/release.yml', 'utf8')
-  const match = workflow.match(
-    /          \/\/ BEGIN PUBLICATION\n([\s\S]*?)          \/\/ END PUBLICATION/
+const canonicalBlock = (markdown) => {
+  const block = markdown.match(
+    /<!-- release-verification:start -->\n\n```bash\n([\s\S]*?)\n```\n\n<!-- release-verification:end -->/
   )
-  assert.ok(
-    match,
-    'should expose the actual inline publication program for failure tests'
-  )
-  return match[1]
-    .split('\n')
-    .map((line) => line.slice(10))
-    .join('\n')
+  assert.ok(block, 'should mark the canonical verification block')
+  return block[1]
 }
-
-test('release verification commands parse in Bash (CI only)', () => {
-  const guide = readFileSync(
-    'docs/guide/release-verification.md',
-    'utf8'
-  ).match(/<!-- release-verification:start -->\s*```bash\n([\s\S]*?)\n```/)
-  assert.ok(
-    guide,
-    'should syntax-check the commands matched by the publisher test'
+const normalizePins = (code) =>
+  code.replace(/^(REPO|TAG|COMMIT|ASSETS)=.*$/gm, '$1=<pin>').trim()
+test('release notes match the guide and never pre-fill reviewed pins', () => {
+  const body = releaseNotes('example/project', 'v1.2.3-rc.1')
+  const code = body.match(/```bash\n([\s\S]*?)\n```/)[1]
+  assert.equal(
+    normalizePins(code),
+    normalizePins(
+      canonicalBlock(readFileSync('docs/guide/release-verification.md', 'utf8'))
+    ),
+    'release commands should match the guide'
   )
-  execFileSync('bash', ['-n'], { input: guide[1] })
+  assert.match(code, /^REPO=$/m, 'should leave REPO for independent review')
+  assert.match(code, /^TAG=$/m, 'should leave TAG for independent review')
+  assert.match(code, /^COMMIT=$/m, 'should leave COMMIT for independent review')
+  assert.match(code, new RegExp(`^ASSETS=\\(${assets.join(' ')}\\)$`, 'm'))
+  assert.match(body, /stay editable after publication/)
+  assert.match(
+    body,
+    /blob\/v1\.2\.3-rc\.1\/docs\/guide\/release-verification\.md/
+  )
+  assert.doesNotMatch(body, /\{\{/)
+  execFileSync('bash', ['-n'], { input: code })
+  // The unset pins must stop the block before any verification runs.
+  const bin = mkdtempSync(join(tmpdir(), 'phase1-notes-'))
+  try {
+    writeFileSync(join(bin, 'gh'), '#!/bin/sh\necho ran >> "$0.log"\n', {
+      mode: 0o755,
+    })
+    // macOS ships bash 3.2, where a failing `[[ ]]` alone does not trigger
+    // `set -e`; check it wherever it is installed.
+    for (const shell of ['bash', '/bin/bash'].filter(
+      (shell) => shell === 'bash' || fs.existsSync(shell)
+    ))
+      for (const input of [
+        code,
+        code
+          .replace(/^REPO=$/m, 'REPO=example/project')
+          .replace(/^TAG=$/m, 'TAG=v1.2.3'),
+      ]) {
+        assert.throws(() =>
+          execFileSync(shell, ['-c', input], {
+            cwd: bin,
+            env: { PATH: `${bin}:${process.env.PATH}` },
+            stdio: 'pipe',
+          })
+        )
+        assert.equal(fs.existsSync(join(bin, 'gh.log')), false, shell)
+      }
+  } finally {
+    rmSync(bin, { recursive: true, force: true })
+  }
 })
-
-test('publication binds exact signing handoffs and refuses drafts, corruption and partial uploads', async () => {
-  const script = publicationScript()
+test('publication binds exact signing handoffs and refuses drafts, corruption and partial uploads', async (t) => {
+  // Record each read's command timeout so availability reads can be bounded.
+  const timeouts = new WeakMap()
+  const timeout = AbortSignal.timeout.bind(AbortSignal)
+  t.mock.method(AbortSignal, 'timeout', (delay) => {
+    const signal = timeout(delay)
+    timeouts.set(signal, delay)
+    return signal
+  })
   for (const mode of [
     'success',
     'idle-socket',
     'stable',
+    'build-metadata-tag',
+    'leading-zero-tag',
+    'non-semver-tag',
+    'annotated-tag',
+    'wrong-tag-commit',
+    'missing-tag',
+    'malformed-tag',
     'download-corrupt',
     'download-missing',
     'download-extra',
@@ -777,6 +980,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'prerelease-mismatch',
     'post-read-error',
     'draft',
+    'draft-page-2',
     'api-error',
     'missing',
     'extra',
@@ -786,13 +990,27 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'changed-companion',
     'extra-companion',
     'unsigned-companion',
+    'symlink-input',
+    'signed-extra',
+    'created-wrong-tag',
+    'created-not-draft',
+    'created-not-prerelease',
     'upload-error',
+    'upload-digest',
+    'upload-size',
     'mutable',
     'wrong-id',
+    'published-asset-digest',
+    'published-asset-extra',
     'attestation-404-then-present',
     'attestation-after-two-waits',
     'attestation-404-never',
     'attestation-non-200',
+    'attestation-list-transient',
+    'attestation-user-initiated',
+    'attestation-truncated',
+    'attestation-duplicate-subject',
+    'attestation-payload-type',
     'attestation-201',
     'attestation-auth-error',
     'attestation-malformed',
@@ -809,15 +1027,37 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'attestation-other-malformed',
     'attestation-other-unverifiable',
     'attestation-substituted-bundle',
+    'attestation-statement-mismatch',
     'attestation-verification-failure',
+    'attestation-verify-transient',
+    'attestation-verify-past-deadline',
+    'attestation-late-reads',
+    'attestation-list-past-deadline',
+    'attestation-null-bundle',
+    'attestation-null-bundle-late',
+    'attestation-null-bundle-never',
+    'attestation-null-bundle-no-url',
+    'attestation-null-bundle-wrong-assets',
   ]) {
     const root = mkdtempSync(join(tmpdir(), 'phase1-publish-'))
     const calls = []
     const uploaded = []
-    const stable = ['stable', 'attestation-other-tag'].includes(mode)
+    const stable = mode.startsWith('stable') || mode === 'attestation-other-tag'
+    const tag =
+      mode === 'build-metadata-tag'
+        ? 'v1.0.0+build-1'
+        : mode === 'leading-zero-tag'
+          ? 'v01.0.0'
+          : mode === 'non-semver-tag'
+            ? 'v1.0'
+            : stable
+              ? 'v1.0.0'
+              : 'v0.0.0-example'
+    const opaque = mode.startsWith('attestation-null-bundle')
     const waits = [],
       ignored = []
     let downloads = 0,
+      verifies = 0,
       now = 0
     let polls = 0,
       observed = []
@@ -867,22 +1107,39 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           join(root, 'signed', assets[0], assets[0] + '.sbom.sigstore.json'),
           ''
         )
+      if (mode === 'signed-extra')
+        writeFileSync(join(root, 'signed', assets[0], 'unexpected'), 'extra')
+      if (mode === 'symlink-input') {
+        const input = join(root, 'build', assets[0], assets[0])
+        fs.renameSync(input, join(root, 'elsewhere'))
+        fs.symlinkSync(join(root, 'elsewhere'), input)
+      }
       const release = (draft) => ({
         id: 42,
-        tag_name: stable ? 'v1.0.0' : 'v0.0.0-example',
+        tag_name: tag,
         prerelease: !stable && mode !== 'prerelease-mismatch',
         draft,
         immutable: mode !== 'mutable',
-        assets: uploaded,
+        assets: uploaded.map((item, index) => ({
+          ...item,
+          digest:
+            mode === 'published-asset-digest' && index === 0
+              ? `sha256:${'0'.repeat(64)}`
+              : item.digest,
+        })),
       })
-      const attestation = (tag = release(false).tag_name) => {
+      const attestation = (attested = tag) => {
         const statement = {
           _type: 'https://in-toto.io/Statement/v1',
           predicateType: 'https://in-toto.io/attestation/release/v0.2',
-          predicate: { databaseId: '42', repository: 'example/project', tag },
+          predicate: {
+            databaseId: '42',
+            repository: 'example/project',
+            tag: attested,
+          },
           subject: [
             {
-              uri: `pkg:github/example/project@${tag}`,
+              uri: `pkg:github/example/project@${attested}`,
               digest: { sha1: 'a'.repeat(40) },
             },
             ...uploaded.map((a) => ({
@@ -897,7 +1154,10 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           statement.predicate.repository = 'example/other'
         if (mode === 'attestation-wrong-source')
           statement.subject[0].digest.sha1 = 'b'.repeat(40)
-        if (mode === 'attestation-wrong-assets')
+        if (
+          mode === 'attestation-wrong-assets' ||
+          mode === 'attestation-null-bundle-wrong-assets'
+        )
           statement.subject[1].digest.sha256 = '0'.repeat(64)
         if (mode === 'attestation-missing-asset') statement.subject.pop()
         if (mode === 'attestation-extra-asset')
@@ -906,13 +1166,18 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             digest: { sha256: '0'.repeat(64) },
           })
         if (mode === 'attestation-wrong-tag-shape') statement.predicate.tag = 42
+        if (mode === 'attestation-duplicate-subject')
+          statement.subject.push(statement.subject[1])
         return {
           initiator: 'github',
           bundle: {
             mediaType: 'application/vnd.dev.sigstore.bundle.v0.3+json',
             verificationMaterial: {},
             dsseEnvelope: {
-              payloadType: 'application/vnd.in-toto+json',
+              payloadType:
+                mode === 'attestation-payload-type'
+                  ? 'application/json'
+                  : 'application/vnd.in-toto+json',
               payload: Buffer.from(JSON.stringify(statement)).toString(
                 'base64'
               ),
@@ -935,23 +1200,68 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             (mode === 'idle-socket' && options.headers.Connection !== 'close'))
         )
           throw new TypeError('other side closed')
-        calls.push([method, u.pathname])
-        const response = (body, status = 200) =>
+        calls.push([method, u.pathname + u.search])
+        const response = (body, status = 200, headers = {}) =>
           new Response(
             typeof body === 'string' || Buffer.isBuffer(body)
               ? body
               : JSON.stringify(body),
-            { status }
+            { status, headers }
           )
+        if (u.pathname.includes('/git/ref/tags/')) {
+          assert.equal(method, 'GET')
+          assert.equal(decodeURIComponent(u.pathname.split('/').at(-1)), tag)
+          if (mode === 'missing-tag') return response({}, 404)
+          if (mode === 'malformed-tag') return response({})
+          return response({
+            object: {
+              type: mode === 'annotated-tag' ? 'tag' : 'commit',
+              sha: ['annotated-tag', 'wrong-tag-commit'].includes(mode)
+                ? 'b'.repeat(40)
+                : 'a'.repeat(40),
+            },
+          })
+        }
         if (u.pathname.includes('/attestations/')) {
           polls++
           assert.equal(method, 'GET')
           assert.equal(u.searchParams.get('predicate_type'), 'release')
-          if (mode === 'attestation-non-200') return response({}, 503)
+          assert.ok(now < 60000, 'should not start a read after the deadline')
+          assert.equal(
+            timeouts.get(options.signal),
+            Math.min(4000, 60000 - now),
+            'should bound every availability read by the availability deadline'
+          )
+          // Two transient failures push the third read close to the deadline.
+          if (mode === 'attestation-late-reads' && [5, 6].includes(polls))
+            return response({}, 503, { 'retry-after': '10' })
+          // The second failure runs until its timeout, so its retry would end
+          // after the availability deadline.
+          if (mode === 'attestation-list-past-deadline' && polls >= 5) {
+            if (polls === 6) now += timeouts.get(options.signal)
+            return response({}, 503, { 'retry-after': '10' })
+          }
+          if (
+            mode === 'attestation-non-200' ||
+            (mode === 'attestation-list-transient' && polls === 1)
+          )
+            return response({}, 503)
           if (mode === 'attestation-201') return response({}, 201)
           if (mode === 'attestation-auth-error') return response({}, 403)
           if (mode === 'attestation-malformed')
             return response({ attestations: null })
+          if (opaque)
+            return response({
+              attestations: [
+                {
+                  initiator: 'github',
+                  bundle: null,
+                  ...(mode === 'attestation-null-bundle-no-url'
+                    ? {}
+                    : { bundle_url: 'https://example.com/bundle' }),
+                },
+              ],
+            })
           const other = attestation('v1.0.0-rc.1')
           if (mode === 'attestation-other-malformed')
             other.bundle.dsseEnvelope.payload = '!invalid!'
@@ -965,42 +1275,51 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
                 ? 2
                 : mode === 'attestation-404-never'
                   ? 5
-                  : 0
+                  : [
+                        'attestation-verify-past-deadline',
+                        'attestation-late-reads',
+                        'attestation-list-past-deadline',
+                      ].includes(mode)
+                    ? 4
+                    : 0
           if (polls <= delay && mode !== 'attestation-other-tag-before-current')
             return response({ message: 'Not Found' }, 404)
           observed = polls <= delay ? [] : [attestation()]
           if (mode === 'attestation-duplicate') observed.push(attestation())
+          if (mode === 'attestation-user-initiated')
+            observed.unshift({ initiator: 'user', bundle: 'not a bundle' })
+          if (mode === 'attestation-truncated')
+            observed = Array(100).fill(observed[0])
           if (mode.startsWith('attestation-other-')) observed.unshift(other)
           return response({ attestations: observed })
         }
-        if (u.pathname.endsWith('/releases') && method === 'GET')
-          return mode === 'api-error'
-            ? response('denied', 503)
-            : response(mode === 'draft' ? [release(true)] : [])
+        if (u.pathname.endsWith('/releases') && method === 'GET') {
+          if (mode === 'api-error') return response('denied', 503)
+          const page = Number(u.searchParams.get('page'))
+          if (mode === 'draft-page-2')
+            return response(
+              page === 1
+                ? Array.from({ length: 100 }, (_, index) => ({
+                    tag_name: `v0.0.${index}`,
+                  }))
+                : [release(true)]
+            )
+          assert.equal(page, 1, 'should stop after a short page')
+          return response(mode === 'draft' ? [release(true)] : [])
+        }
         if (u.pathname.endsWith('/releases') && method === 'POST') {
           const creation = JSON.parse(options.body)
           assert.equal(creation.prerelease, !stable)
           assert.equal(creation.make_latest, stable ? 'legacy' : 'false')
-          const body = creation.body
-          assert.match(body, /--signer-workflow.*release-build\.yml/)
-          assert.match(body, /--cert-identity.*release-build\.yml@refs\/tags/)
-          assert.ok(body.includes('COMMIT=' + 'a'.repeat(40)))
-          for (const asset of assets) assert.ok(body.includes(asset))
-          const normalize = (code) =>
-            code.replace(/^(REPO|TAG|COMMIT|ASSETS)=.*$/gm, '$1=<pin>').trim()
-          const guide = readFileSync(
-            'docs/guide/release-verification.md',
-            'utf8'
-          ).match(
-            /<!-- release-verification:start -->\n\n```bash\n([\s\S]*?)\n```\n\n<!-- release-verification:end -->/
+          assert.equal(creation.body, releaseNotes('example/project', tag))
+          return response(
+            mode === 'created-wrong-tag'
+              ? { ...release(true), tag_name: 'v9.9.9' }
+              : mode === 'created-not-prerelease'
+                ? { ...release(true), prerelease: false }
+                : release(mode !== 'created-not-draft'),
+            201
           )
-          assert.ok(guide, 'should mark the canonical verification block')
-          assert.equal(
-            normalize(body.match(/```bash\n([\s\S]*?)\n```/)[1]),
-            normalize(guide[1]),
-            'release commands should match the guide'
-          )
-          return response(release(true), 201)
         }
         if (u.pathname.endsWith('/assets') && method === 'POST') {
           if (mode === 'upload-error') return response('upload failed', 500)
@@ -1015,124 +1334,130 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             bytes,
           }
           uploaded.push(item)
-          return response(item, 201)
+          return response(
+            mode === 'upload-digest'
+              ? { ...item, digest: `sha256:${'0'.repeat(64)}` }
+              : mode === 'upload-size'
+                ? { ...item, size: item.size + 1 }
+                : item,
+            201
+          )
         }
         if (u.pathname.includes('/releases/tags/'))
           return response({
             ...release(false),
             id: mode === 'wrong-id' ? 43 : 42,
           })
-        if (u.pathname.endsWith('/releases/42'))
-          return response(release(method !== 'PATCH' && uploaded.length === 0))
+        if (u.pathname.endsWith('/releases/42')) {
+          const current = release(method !== 'PATCH' && uploaded.length === 0)
+          if (mode === 'published-asset-extra')
+            current.assets.push({ name: 'unexpected', size: 1 })
+          return response(current)
+        }
         throw Error(`Unexpected ${method} ${url}`)
       }
-      const context = {
-        Buffer,
-        Date: { now: () => now, parse: Date.parse },
-        JSON,
-        AbortSignal,
-        URL,
-        console: {
+      const execFileSync = (...args) => {
+        calls.push(['gh', args])
+        if (args[1][1] === 'download') {
+          downloads++
+          assert.ok(
+            args[2].timeout > 10000 && args[2].timeout <= 60000,
+            'should allow bulk transfers within the shared deadline'
+          )
+          const dir = args[1][args[1].indexOf('--dir') + 1]
+          if (
+            mode === 'download-never' ||
+            (mode === 'download-transient' && downloads === 1)
+          )
+            throw Object.assign(Error('timeout'), { code: 'ETIMEDOUT' })
+          for (const item of uploaded)
+            fs.writeFileSync(join(dir, item.name), item.bytes)
+          if (mode === 'download-corrupt')
+            fs.writeFileSync(join(dir, assets[0]), 'corrupt')
+          if (mode === 'download-manifest')
+            fs.writeFileSync(join(dir, 'SHA256SUMS'), 'corrupt')
+          if (mode === 'download-missing') fs.unlinkSync(join(dir, assets[0]))
+          if (mode === 'download-extra')
+            fs.writeFileSync(join(dir, 'extra'), 'extra')
+          return Buffer.from('downloaded')
+        }
+        if (args[1][1] !== 'verify') return Buffer.from('verified asset')
+        verifies++
+        const verifiedTag = args[1].at(-1)
+        assert.equal(verifiedTag, tag, 'should verify only the current tag')
+        assert.equal(
+          args[2].timeout,
+          Math.min(10000, 60000 - now),
+          'should bound proof verification by the availability deadline'
+        )
+        if (mode === 'attestation-verify-transient' && verifies === 1)
+          throw Object.assign(Error('gh failed'), {
+            stderr: Buffer.from('HTTP 503: Service Unavailable'),
+          })
+        // Each proof fetch runs until its command timeout.
+        if (mode === 'attestation-verify-past-deadline' && verifies <= 2) {
+          now += args[2].timeout
+          throw Object.assign(Error('timeout'), { code: 'ETIMEDOUT' })
+        }
+        if (
+          mode === 'attestation-verification-failure' ||
+          mode === 'attestation-null-bundle-never' ||
+          (mode === 'attestation-null-bundle-late' && verifies === 1)
+        )
+          throw Error('Signature verification failed')
+        assert.ok(
+          polls > 0,
+          'should read release-attestation availability before verification'
+        )
+        const bundle = opaque
+          ? attestation().bundle
+          : structuredClone(
+              observed.find(
+                (r) =>
+                  r.initiator === 'github' &&
+                  JSON.parse(
+                    Buffer.from(r.bundle.dsseEnvelope.payload, 'base64')
+                  ).predicate.tag === verifiedTag
+              ).bundle
+            )
+        if (mode === 'attestation-substituted-bundle')
+          bundle.dsseEnvelope.signatures[0].sig = 'different'
+        const statement = JSON.parse(
+          Buffer.from(bundle.dsseEnvelope.payload, 'base64')
+        )
+        if (mode === 'attestation-statement-mismatch')
+          statement.predicate.databaseId = '99'
+        return Buffer.from(
+          JSON.stringify({
+            attestation: { bundle },
+            verificationResult: { statement },
+          })
+        )
+      }
+      const execute = () =>
+        publish({
+          env: {
+            GH_REPO: 'example/project',
+            GH_TOKEN: 'fixture-token',
+            RELEASE_TAG: tag,
+            RELEASE_PUBLICATION_ENABLED:
+              mode === 'publication-disabled' ? 'false' : 'true',
+            SOURCE_COMMIT: 'a'.repeat(40),
+          },
+          root,
+          fetch,
+          execFileSync,
+          now: () => now,
+          sleep: async (delay) => {
+            waits.push(delay)
+            now += delay
+          },
           log: (...args) => {
             if (args[0] === 'Ignored release attestation for other tag:')
               ignored.push(args[1])
           },
           warn: () => {},
-        },
-        setTimeout: (resolve, delay) => {
-          waits.push(delay)
-          now += delay
-          resolve()
-        },
-        fetch,
-        process: {
-          env: {
-            GH_REPO: 'example/project',
-            RELEASE_TAG: stable ? 'v1.0.0' : 'v0.0.0-example',
-            RELEASE_PUBLICATION_ENABLED:
-              mode === 'publication-disabled' ? 'false' : 'true',
-            SOURCE_COMMIT: 'a'.repeat(40),
-          },
-        },
-        require(name) {
-          if (name === 'node:fs')
-            return {
-              ...fs,
-              mkdtempSync: (prefix) =>
-                fs.mkdtempSync(join(root, prefix)).slice(root.length + 1),
-              rmSync: (path, options) => fs.rmSync(join(root, path), options),
-              readdirSync: (path, ...rest) =>
-                fs.readdirSync(join(root, path), ...rest),
-              lstatSync: (path) => fs.lstatSync(join(root, path)),
-              readFileSync: (path, ...rest) =>
-                fs.readFileSync(join(root, path), ...rest),
-              mkdirSync: (path, ...rest) =>
-                fs.mkdirSync(join(root, path), ...rest),
-              writeFileSync: (path, ...rest) =>
-                fs.writeFileSync(join(root, path), ...rest),
-              copyFileSync: (a, b) =>
-                fs.copyFileSync(join(root, a), join(root, b)),
-            }
-          if (name === 'node:crypto') return { createHash }
-          if (name === 'node:util') return { isDeepStrictEqual }
-          if (name === 'node:child_process')
-            return {
-              execFileSync: (...args) => {
-                calls.push(['gh', args])
-                if (args[1][1] === 'download') {
-                  downloads++
-                  assert.ok(
-                    args[2].timeout > 10000 && args[2].timeout <= 60000,
-                    'should allow bulk transfers within the shared deadline'
-                  )
-                  const dir = args[1][args[1].indexOf('--dir') + 1]
-                  if (
-                    mode === 'download-never' ||
-                    (mode === 'download-transient' && downloads === 1)
-                  )
-                    throw Object.assign(Error('timeout'), { code: 'ETIMEDOUT' })
-                  for (const item of uploaded)
-                    fs.writeFileSync(join(root, dir, item.name), item.bytes)
-                  if (mode === 'download-corrupt')
-                    fs.writeFileSync(join(root, dir, assets[0]), 'corrupt')
-                  if (mode === 'download-manifest')
-                    fs.writeFileSync(join(root, dir, 'SHA256SUMS'), 'corrupt')
-                  if (mode === 'download-missing')
-                    fs.unlinkSync(join(root, dir, assets[0]))
-                  if (mode === 'download-extra')
-                    fs.writeFileSync(join(root, dir, 'extra'), 'extra')
-                  return Buffer.from('downloaded')
-                }
-                if (args[1][1] !== 'verify')
-                  return Buffer.from('verified asset')
-                const tag = args[1].at(-1)
-                if (
-                  mode === 'attestation-verification-failure' ||
-                  (mode === 'attestation-other-unverifiable' &&
-                    tag === 'v1.0.0-rc.1')
-                )
-                  throw Error('Signature verification failed')
-                assert.ok(
-                  polls > 0,
-                  'should read release-attestation availability before verification'
-                )
-                const record = observed.find(
-                  (r) =>
-                    JSON.parse(
-                      Buffer.from(r.bundle.dsseEnvelope.payload, 'base64')
-                    ).predicate.tag === tag
-                )
-                const bundle = structuredClone(record.bundle)
-                if (mode === 'attestation-substituted-bundle')
-                  bundle.dsseEnvelope.signatures[0].sig = 'different'
-                return Buffer.from(JSON.stringify({ attestation: { bundle } }))
-              },
-            }
-          throw Error(name)
-        },
-      }
-      const execute = () =>
-        vm.runInNewContext(`(async()=>{${script}\n})()`, context)
+        })
       const successful = [
         'success',
         'idle-socket',
@@ -1143,21 +1468,70 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'attestation-other-tag',
         'attestation-other-tag-before-current',
         'attestation-other-unverifiable',
+        'attestation-verify-transient',
+        'attestation-list-transient',
+        'attestation-late-reads',
+        'attestation-user-initiated',
+        'attestation-null-bundle',
+        'attestation-null-bundle-late',
       ].includes(mode)
+      const expectedError = {
+        'non-semver-tag': /Invalid repository or tag/,
+        'build-metadata-tag': /Invalid repository or tag/,
+        'leading-zero-tag': /Invalid repository or tag/,
+        'upload-size': /Upload mismatch/,
+        'attestation-verification-failure': /Signature verification failed/,
+        'attestation-truncated': /truncated/,
+        'attestation-duplicate-subject': /Invalid release attestation subjects/,
+        'attestation-payload-type': /Malformed release attestation bundle/,
+        'draft-page-2': /already exists/,
+        'symlink-input': /Invalid file/,
+        'upload-digest': /Upload mismatch/,
+        'published-asset-digest': /Published asset digest mismatch/,
+        'published-asset-extra': /Published asset set mismatch/,
+        'attestation-404-never': /unavailable after five checks/,
+        // The deadline names its window and keeps the failure that caused the
+        // retry.
+        'attestation-verify-past-deadline': (error) =>
+          error.message ===
+            'Release attestation availability retry window exhausted' &&
+          error.cause?.code === 'ETIMEDOUT',
+        'attestation-list-past-deadline': (error) =>
+          error.message ===
+            'Release attestation availability retry window exhausted' &&
+          error.cause?.status === 503,
+        'signed-extra': /Unexpected artifact contents/,
+        'created-wrong-tag': /Invalid created release identity/,
+        'created-not-draft': /Invalid created release identity/,
+        'created-not-prerelease': /Invalid created release identity/,
+        'attestation-statement-mismatch': /statement mismatch/,
+        'attestation-substituted-bundle': /bundle mismatch/,
+        'attestation-null-bundle-never': /Signature verification failed/,
+        'attestation-null-bundle-no-url':
+          /Malformed release attestation bundle/,
+        'attestation-null-bundle-wrong-assets': /identity or assets mismatch/,
+      }[mode]
       if (successful) await execute()
       else
         await assert.rejects(
           execute,
-          mode === 'attestation-404-never'
-            ? /unavailable after five checks/
-            : mode.startsWith('download-') && mode !== 'download-never'
+          expectedError ??
+            (mode.startsWith('download-') && mode !== 'download-never'
               ? /mismatch|Unexpected artifact contents|ENOENT/
-              : undefined,
+              : undefined),
           mode
         )
       if (
         [
           'draft',
+          'draft-page-2',
+          'non-semver-tag',
+          'build-metadata-tag',
+          'leading-zero-tag',
+          'annotated-tag',
+          'wrong-tag-commit',
+          'missing-tag',
+          'malformed-tag',
           'publication-disabled',
           'api-error',
           'missing',
@@ -1168,29 +1542,51 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           'changed-companion',
           'extra-companion',
           'unsigned-companion',
+          'symlink-input',
+          'signed-extra',
         ].includes(mode)
       )
-        assert.ok(!calls.some(([method]) => method === 'POST'), mode)
+        assert.ok(
+          !calls.some(([method]) => ['POST', 'PATCH'].includes(method)),
+          mode
+        )
+      if (mode === 'draft-page-2')
+        assert.ok(
+          calls.some(([, path]) =>
+            /\/releases\?per_page=100&page=2$/.test(path)
+          ),
+          'should read the second release page'
+        )
       if (mode === 'api-error' || mode === 'upload-error')
-        assert.equal(calls.length, mode === 'api-error' ? 1 : 3)
-      if (['upload-error'].includes(mode))
+        assert.equal(calls.length, mode === 'api-error' ? 2 : 4)
+      if (mode.startsWith('created-'))
+        assert.ok(
+          !calls.some(([method, path]) =>
+            String(path).split('?')[0].endsWith('/assets')
+          ),
+          'should upload nothing to a release with the wrong identity'
+        )
+      // Immutability is verified before any availability read.
+      if (mode === 'mutable') assert.equal(polls, 0, mode)
+      if (['upload-error', 'upload-digest', 'upload-size'].includes(mode))
         assert.ok(!calls.some(([method]) => method === 'PATCH'), mode)
       if (successful) {
         assert.equal(uploaded.length, 30)
         assert.equal(
           calls.filter(
-            ([method, args]) => method === 'gh' && args[1][1] !== 'download'
+            ([method, args]) => method === 'gh' && args[1][1] === 'verify-asset'
           ).length,
-          31
+          30
         )
-        assert.ok(
-          !calls.some(
-            ([method, args]) =>
-              method === 'gh' &&
-              args[1][1] === 'verify' &&
-              args[1].at(-1) === 'v1.0.0-rc.1'
-          ),
-          'should not verify another tag release attestation'
+        assert.equal(
+          verifies,
+          [
+            'attestation-verify-transient',
+            'attestation-null-bundle-late',
+          ].includes(mode)
+            ? 2
+            : 1,
+          mode
         )
       }
       assert.equal(
@@ -1215,19 +1611,43 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         )
       }
       if (mode.startsWith('attestation-')) {
-        const expectedWaits =
-          mode === 'attestation-404-never'
-            ? [2000, 5000, 10000, 20000]
-            : mode === 'attestation-404-then-present'
-              ? [2000]
-              : [
-                    'attestation-after-two-waits',
-                    'attestation-other-tag-before-current',
-                  ].includes(mode)
-                ? [2000, 5000]
-                : []
-        assert.deepEqual(waits, expectedWaits, mode)
-        assert.equal(polls, expectedWaits.length + 1, mode)
+        const expectedWaits = [
+          'attestation-404-never',
+          'attestation-null-bundle-never',
+          'attestation-verification-failure',
+        ].includes(mode)
+          ? [2000, 5000, 10000, 20000]
+          : [
+                'attestation-404-then-present',
+                'attestation-null-bundle-late',
+              ].includes(mode)
+            ? [2000]
+            : [
+                  'attestation-after-two-waits',
+                  'attestation-other-tag-before-current',
+                ].includes(mode)
+              ? [2000, 5000]
+              : []
+        // Transient read retries wait inside one availability check.
+        const retried = {
+          'attestation-verify-transient': [[2000], 1],
+          'attestation-verify-past-deadline': [
+            [2000, 5000, 10000, 20000, 2000],
+            5,
+          ],
+          'attestation-list-transient': [[2000], 2],
+          'attestation-late-reads': [
+            [2000, 5000, 10000, 20000, 10000, 10000],
+            7,
+          ],
+          'attestation-list-past-deadline': [
+            [2000, 5000, 10000, 20000, 10000],
+            6,
+          ],
+          'attestation-non-200': [[2000, 5000], 3],
+        }[mode]
+        assert.deepEqual(waits, retried?.[0] ?? expectedWaits, mode)
+        assert.equal(polls, retried?.[1] ?? expectedWaits.length + 1, mode)
         assert.equal(
           calls.filter(
             ([method, path]) => method === 'POST' && path.endsWith('/releases')
@@ -1237,7 +1657,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         )
         assert.equal(
           calls.filter(
-            ([method, path]) => method === 'POST' && path.endsWith('/assets')
+            ([method, path]) =>
+              method === 'POST' && path.split('?')[0].endsWith('/assets')
           ).length,
           30,
           mode
@@ -1262,6 +1683,31 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
+  }
+})
+test('publisher entry point exits non-zero on failure', () => {
+  const root = mkdtempSync(join(tmpdir(), 'phase1-entry-'))
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [fileURLToPath(new URL('./publish.mjs', import.meta.url))],
+      {
+        cwd: root,
+        env: {
+          PATH: process.env.PATH,
+          GH_REPO: 'example/project',
+          RELEASE_TAG: 'v1.0.0',
+          SOURCE_COMMIT: 'a'.repeat(40),
+          RELEASE_PUBLICATION_ENABLED: 'false',
+        },
+        encoding: 'utf8',
+      }
+    )
+    assert.equal(result.status, 1, 'should fail the publication step')
+    assert.match(result.stderr, /not enabled by maintainers/)
+    assert.deepEqual(fs.readdirSync(root), [], 'should not stage any asset')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
   }
 })
 test('acquires the locked workspace graph before offline SBOM resolution', () => {
@@ -1366,6 +1812,17 @@ test('SPDX rejects root/hash ambiguity and lost package identities', () => {
     assert.throws(() => validateSpdx(document, binary, original))
   }
 })
+test('SPDX validation rescans the final binary for planted operator values', () => {
+  const planted = Buffer.concat([binary, Buffer.from(sentinels[0])])
+  const { original, document } = spdxFixture()
+  document.packages[0].checksums[0].checksumValue = createHash('sha256')
+    .update(planted)
+    .digest('hex')
+  assert.throws(
+    () => validateSpdx(document, planted, original),
+    /operator configuration/
+  )
+})
 test('completes real converter package output with a binary-bound root', () => {
   const { original, document } = spdxFixture()
   document.packages.shift()
@@ -1376,11 +1833,113 @@ test('completes real converter package output with a binary-bound root', () => {
   assert.equal(document.packages.at(-1).filesAnalyzed, false)
   assert.throws(() => completeSpdx(document, binary, original), /Unexpected/)
 })
+test('completed SPDX is validated before it is returned', () => {
+  const { original, document } = spdxFixture()
+  document.packages.shift()
+  delete document.documentDescribes
+  delete document.relationships
+  document.packages[0].externalRefs = []
+  assert.throws(
+    () => completeSpdx(document, binary, original),
+    /identity or PURL/
+  )
+})
+test('release command line checks binaries, final bytes and SPDX output', () => {
+  const root = mkdtempSync(join(tmpdir(), 'phase1-cli-'))
+  const run = (...args) =>
+    spawnSync(
+      process.execPath,
+      [fileURLToPath(new URL('./phase1.mjs', import.meta.url)), ...args],
+      { cwd: root, encoding: 'utf8' }
+    )
+  const write = (name, bytes) => {
+    writeFileSync(join(root, name), bytes)
+    return join(root, name)
+  }
+  try {
+    const clean = write('clean', binary)
+    const planted = write(
+      'planted',
+      Buffer.concat([binary, Buffer.from(sentinels.at(-1))])
+    )
+    assert.equal(run('check', clean).status, 0, 'should accept a clean binary')
+    const refused = run('check', clean, planted)
+    assert.equal(refused.status, 1, 'should refuse a planted binary')
+    assert.match(refused.stderr, /planted operator configuration/)
+
+    const wasm = write('valid.wasm', Buffer.from('0061736d01000000', 'hex'))
+    const accepted = run('smoke', wasm, 'wasm32-wasip1')
+    assert.equal(accepted.status, 0, accepted.stderr)
+    assert.match(accepted.stdout, /SUCCESS: final-byte checks wasm32-wasip1/)
+    const invalid = run('smoke', clean, 'wasm32-wasip1')
+    assert.equal(invalid.status, 1, 'should refuse non-wasm final bytes')
+    assert.match(invalid.stderr, /wasm/)
+
+    const { original, document } = spdxFixture()
+    document.packages.shift()
+    delete document.documentDescribes
+    delete document.relationships
+    original.metadata.properties = [
+      { name: 'trusted-server:coverage', value: 'Fixture coverage.' },
+    ]
+    const spdx = write('sbom.spdx.json', JSON.stringify(document))
+    const inventory = write('combined.cdx.json', JSON.stringify(original))
+    const completed = run('validate-spdx', spdx, clean, inventory)
+    assert.equal(completed.status, 0, completed.stderr)
+    const output = JSON.parse(readFileSync(spdx, 'utf8'))
+    assert.deepEqual(output.documentDescribes, ['SPDXRef-Artifact'])
+    assert.match(output.creationInfo.comment, /Fixture coverage\./)
+    write('sbom.spdx.json', JSON.stringify(document))
+    const rescanned = run('validate-spdx', spdx, planted, inventory)
+    assert.equal(rescanned.status, 1, 'should rescan the final binary')
+    assert.match(rescanned.stderr, /planted operator configuration/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+test('every canary the release build plants is a scanned sentinel', () => {
+  const script = readFileSync('scripts/release/phase1-build.sh', 'utf8')
+  const canary = 'phase1-[a-z0-9-]*canary[a-z0-9.-]*'
+  const exported = [
+    ...script.matchAll(new RegExp(`^export (\\w+)=\\S*?(${canary})$`, 'gm')),
+  ].map(([, name, value]) => `${name}=${value}`)
+  const config = script.slice(
+    script.indexOf("cat > trusted-server.toml <<'CONFIG'\n"),
+    script.indexOf('\nCONFIG\n')
+  )
+  const configured = [
+    ...config.matchAll(new RegExp(`^(\\w+) = "\\S*?(${canary})"$`, 'gm')),
+  ].map(([, key, value]) => `${key}=${value}`)
+  assert.deepEqual(
+    exported,
+    [
+      'TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=phase1-origin-canary.example.com',
+      'TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=phase1-secret-canary-32-characters',
+      'EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=phase1-physical-store-canary',
+      'FASTLY_SERVICE_ID=phase1-service-account-canary',
+    ],
+    'should plant every deployment variable canary'
+  )
+  assert.deepEqual(
+    configured,
+    [
+      'origin_url=phase1-origin-canary.example.com',
+      'proxy_secret=phase1-secret-canary-32-characters',
+      'policy=phase1-permission-policy-canary',
+    ],
+    'should plant every config file canary'
+  )
+  assert.deepEqual(
+    [
+      ...new Set(
+        [...exported, ...configured].map((entry) => entry.split('=')[1])
+      ),
+    ].sort(),
+    [...sentinels].sort(),
+    'should scan for exactly the planted canaries'
+  )
+})
 test('post-publish retries distinguish transient failures and cap Retry-After', async () => {
-  const code = publicationScript()
-    .split('// BEGIN READ RETRIES')[1]
-    ?.split('// END READ RETRIES')[0]
-  assert.ok(code, 'should exercise the actual post-publish retry helper')
   for (const [error, failures, expected] of [
     [{ cause: { code: 'UND_ERR_SOCKET' } }, 1, [2000]],
     [{ status: 503 }, 9, [2000, 5000]],
@@ -1398,14 +1957,14 @@ test('post-publish retries distinguish transient failures and cap Retry-After', 
       logs = []
     let attempts = 0,
       now = 0
-    const retry = vm.runInNewContext(`${code}; retryRead`, {
-      Date: { now: () => now, parse: Date.parse },
-      setTimeout: (resolve, ms) => {
+    const retry = readRetrier({
+      deadline: 180000,
+      now: () => now,
+      sleep: async (ms) => {
         waits.push(ms)
         now += ms
-        resolve()
       },
-      console: { warn: (line) => logs.push(line) },
+      warn: (line) => logs.push(line),
     })
     const operation = () => {
       now += error.elapsed ?? 0
@@ -1537,8 +2096,7 @@ test('workflows select exactly the descriptive cohort and restrict actual build 
     names,
     'should validate the same exact input cohort'
   )
-  const published = publicationScript().match(/const names = (\[[^;]+\]);/)[1]
-  assert.deepEqual(Array.from(vm.runInNewContext(published)).sort(), names)
+  assert.deepEqual([...releaseAssets].sort(), names)
   for (const prefix of ['release-', 'signed-'])
     assert.deepEqual(
       [
@@ -1639,7 +2197,7 @@ test('ordinary Fastly gate binds dedicated A and B uploads before isolated signi
         comparison.includes(`needs.fastly-${role}.outputs.${output}`),
         'should carry every direct upload output'
       )
-  assert.match(job('sign'), /needs: \[build, fastly-comparison\]/)
+  assert.match(job('sign'), /needs: \[checks, build, fastly-comparison\]/)
   assert.match(caller.split('\n  release:')[0], /actions: read/)
 })
 
@@ -1800,6 +2358,77 @@ test('negative comparator proof keeps canaries read-only and audits both skipped
   assert.match(audit, /test "\$PUBLISH_RESULT" = skipped/)
 })
 
+test('release build keeps locked builds, pinned generators and final integrity checks', () => {
+  const script = readFileSync('scripts/release/phase1-build.sh', 'utf8')
+  const commands = script.split('\n').filter((line) => !/^\s*#/.test(line))
+  const builds = commands.filter((line) =>
+    /\bcargo (?:--config "\$ordinary_rustflags" )?build\b/.test(line)
+  )
+  assert.equal(
+    builds.length,
+    3,
+    'should build in the GNU container, the ordinary Fastly path and natively'
+  )
+  for (const line of builds) assert.match(line, /--locked/)
+  // Native binaries drop line-level debug info in both build paths.
+  assert.match(
+    script,
+    /if \[\[ "\$build_target" != wasm32-wasip1 \]\]; then\n {2}export CARGO_PROFILE_RELEASE_STRIP=debuginfo\nfi\n/
+  )
+  assert.match(script, /--env CARGO_PROFILE_RELEASE_STRIP /)
+  // The copied release bytes are scanned and smoke-checked before any
+  // inventory is generated for them.
+  const step = (command) => {
+    const index = commands.indexOf(command)
+    assert.ok(index >= 0, `should run: ${command}`)
+    return index
+  }
+  const copied = step(
+    'cp "$CARGO_TARGET_DIR/$build_target/release/$executable" "release-assets/$release_asset"'
+  )
+  const checked = step(
+    'node scripts/release/phase1.mjs check "release-assets/$release_asset"'
+  )
+  const smoked = step(
+    'node scripts/release/phase1.mjs smoke "release-assets/$release_asset" "$build_target"'
+  )
+  assert.ok(
+    copied < checked &&
+      checked < smoked &&
+      smoked < commands.findIndex((line) => line.startsWith('tool_root=')),
+    'should check and smoke the copied binary before generating inventories'
+  )
+  assert.match(script, /cargo install \\\n[^\n]*--locked/)
+  assert.match(script, /cargo metadata --locked/)
+  // Generator crate and every converter binary are checksum-pinned before use.
+  assert.match(
+    script,
+    /printf '%s {2}%s\\n' [a-f0-9]{64} "\$tool_root\/generator\.crate" \| shasum -a 256 --check\n/
+  )
+  assert.equal((script.match(/converter_sha=[a-f0-9]{64} ;;/g) ?? []).length, 4)
+  assert.match(
+    script,
+    /printf '%s {2}%s\\n' "\$converter_sha" "\$tool_root\/converter" \| shasum -a 256 --check\n/
+  )
+  // The released bytes must be unchanged since checks ran, and the build must
+  // not have rewritten the lockfiles or manifest.
+  const integrity = step(
+    'git diff --exit-code -- Cargo.lock crates/trusted-server-js/lib/package-lock.json edgezero.toml'
+  )
+  assert.equal(
+    commands[integrity - 1],
+    'shasum -a 256 --check "$RUNNER_TEMP/binary.sha256"'
+  )
+  // The ordinary Fastly observation re-checks the bytes after measuring them.
+  const tail = commands
+    .filter(Boolean)
+    .slice(-2)
+    .map((line) => line.trim())
+  assert.deepEqual(tail, [
+    'shasum -a 256 --check "$RUNNER_TEMP/binary.sha256"',
+    'fi',
+  ])
+})
 test('release preflight rejects inherited controls in an isolated script fixture', () => {
   const root = mkdtempSync(join(tmpdir(), 'phase1-preflight-'))
   const script = join(root, 'scripts/release/phase1-build.sh')
@@ -1927,16 +2556,144 @@ test('audit handles ordinary char literals and generated include prefixes', () =
   )
 })
 
+test('audit tokenizes byte and C raw strings and astral char literals', () => {
+  const planted = 'env!("TRUSTED_SERVER__EC__PASSPHRASE")'
+  for (const source of [
+    `const A: &[u8] = br#"a"#; ${planted}; const B: &[u8] = br#"b"#;`,
+    `const A: &core::ffi::CStr = cr#"a"#; ${planted}; const B: &core::ffi::CStr = cr#"b"#;`,
+    `const A: [char; 2] = ['😀','"']; ${planted}; const B: char = '"';`,
+    // Each body below holds a quote that ends the literal early if the
+    // tokenizer misses C raw strings, raw-string hash counts, nested block
+    // comments or escapes, which would hide the planted read.
+    `const A: &core::ffi::CStr = cr#"x"y"#; ${planted}; const B: &str = "z";`,
+    `const A: &str = r##"x"#y"##; ${planted}; const B: &str = "z";`,
+    `/* outer /* inner */ " */ ${planted}; const B: &str = "z";`,
+    `const A: &str = "x\\"y"; ${planted}; const B: &str = "z";`,
+  ])
+    assert.throws(
+      () => checkSource('src/lib.rs', source),
+      /compile-time/,
+      source
+    )
+  assert.doesNotThrow(() =>
+    checkSource(
+      'src/lib.rs',
+      'const P: &[u8] = br"C:\\"; const Q: char = \'😀\';'
+    )
+  )
+})
+test('build-script rule covers modules build scripts load and build helper directories', () => {
+  const root = mkdtempSync(join(tmpdir(), 'phase1-audit-'))
+  const write = (file, source) => {
+    mkdirSync(join(root, file, '..'), { recursive: true })
+    writeFileSync(join(root, file), source)
+  }
+  const leak = 'const NAME: &str = "TRUSTED_SERVER__PUBLISHER__ORIGIN_URL";'
+  try {
+    write(
+      'a/build.rs',
+      '#[path = "../b/helper/x.rs"]\nmod x;\nmod y;\nmod sub;\nmod helpers;\nfn main() {}'
+    )
+    write('b/helper/x.rs', 'mod nested;')
+    write('b/helper/nested.rs', '')
+    write('a/y.rs', '')
+    write('a/sub/mod.rs', '')
+    // A non-mod.rs file `helpers.rs` loads `mod names;` from `helpers/`.
+    write('a/helpers.rs', 'pub mod names;\npub mod more;')
+    write('a/helpers/names.rs', '')
+    write('a/helpers/more/mod.rs', '')
+    write('c/build_support/z.rs', '')
+    write('c/build/w.rs', '')
+    write('c/src/lib.rs', leak)
+    audit(root)
+    const restore = {
+      'b/helper/x.rs': 'mod nested;',
+      'a/helpers.rs': 'pub mod names;\npub mod more;',
+    }
+    for (const file of [
+      'b/helper/x.rs',
+      'b/helper/nested.rs',
+      'a/y.rs',
+      'a/sub/mod.rs',
+      'a/helpers/names.rs',
+      'a/helpers/more/mod.rs',
+      'c/build_support/z.rs',
+      'c/build/w.rs',
+    ]) {
+      write(file, leak)
+      assert.throws(
+        () => audit(root),
+        new RegExp(
+          `${file.replaceAll('/', '[/\\\\]')}: operator compile-time build input`
+        ),
+        file
+      )
+      write(file, restore[file] ?? '')
+    }
+    // A build script the audit cannot recognise is refused; `build.rs` is not.
+    for (const build of ['"build.rs"', "'build.rs'", 'false']) {
+      write('c/Cargo.toml', `[package]\nname = "c"\nbuild = ${build}\n`)
+      audit(root)
+    }
+    for (const manifest of [
+      '[package]\nname = "c"\nbuild = "tools/generate.rs"\n',
+      'package.build = "tools/generate.rs"\n',
+    ]) {
+      write('c/Cargo.toml', manifest)
+      assert.throws(() => audit(root), /custom build script/, manifest)
+    }
+    write('c/Cargo.toml', '[package]\nname = "c"\n')
+    // A `#[path]` module that is not an audited `.rs` file is refused, even
+    // when the file exists: a non-`.rs` file inside the root, or a `.rs` file
+    // outside it, reached relatively or absolutely.
+    write('b/helper/x.txt', '')
+    // rustc loads `/x.rs` as given, not the audited `c/src/x.rs`.
+    write('c/src/x.rs', '')
+    const outside = `${root}-outside.rs`
+    writeFileSync(outside, leak)
+    try {
+      for (const target of [
+        '../../b/helper/x.txt',
+        `../../../${root.split(/[/\\]/).at(-1)}-outside.rs`,
+        outside,
+        '/x.rs',
+      ]) {
+        write('c/src/lib.rs', `#[path = "${target}"]\nmod hidden;`)
+        assert.throws(() => audit(root), /#\[path\] module outside/, target)
+      }
+    } finally {
+      rmSync(outside, { force: true })
+    }
+    write('c/src/lib.rs', leak)
+    // Messages that name a variable are not variable names.
+    write(
+      'c/build/w.rs',
+      'const M: &str = "TRUSTED_SERVER__RELEASE_BUILD must be exactly 1";'
+    )
+    audit(root)
+    // A padded or templated deployment name is still a deployment name.
+    for (const name of [
+      'TRUSTED_SERVER__EC__PASSPHRASE ',
+      'TRUSTED_SERVER__EC__PASSPHRASE\\n',
+      'TRUSTED_SERVER__{} must be set',
+    ]) {
+      write('c/build/w.rs', `const M: &str = "${name}";`)
+      assert.throws(
+        () => audit(root),
+        /operator compile-time build input/,
+        name
+      )
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
 test('post-publish reads cannot succeed after the shared deadline', async () => {
-  const code = publicationScript()
-    .split('// BEGIN READ RETRIES')[1]
-    .split('// END READ RETRIES')[0]
   let now = 0
-  const retry = vm.runInNewContext(`${code}; retryRead`, {
-    Date: { now: () => now, parse: Date.parse },
-    console: {
-      warn: () => assert.fail('should not retry deadline exhaustion'),
-    },
+  const retry = readRetrier({
+    deadline: 180000,
+    now: () => now,
+    warn: () => assert.fail('should not retry deadline exhaustion'),
   })
   await assert.rejects(
     () =>
@@ -2011,4 +2768,145 @@ test('ordinary diagnostic remains a failure-only CI artifact outside signing and
   )
   assert.match(fixture, /diagnostic\["outcome"\],\s*"mismatched"/)
   assert.match(fixture, /diagnostic\["stage"\],\s*"bytes"/)
+})
+
+test('SPDX creation timestamps use whole-second UTC without changing the instant second', () => {
+  for (const created of [
+    '2026-01-01T12:34:56.9290415Z',
+    '2026-01-01T12:34:56.000Z',
+    '2026-01-01T12:34:56Z',
+  ]) {
+    const { document, original } = spdxFixture()
+    document.documentDescribes = []
+    document.relationships = []
+    document.packages = document.packages.filter(
+      (p) => p.SPDXID !== 'SPDXRef-Root'
+    )
+    document.creationInfo = { created, creators: ['Tool: example-converter'] }
+    const output = completeSpdx(document, binary, original)
+    assert.equal(output.creationInfo.created, '2026-01-01T12:34:56Z')
+    assert.ok(output.creationInfo.creators.includes('Tool: example-converter'))
+  }
+})
+
+test('release build cleans owned config and inventory on success and failure', () => {
+  for (const mode of [
+    'success',
+    'config-write-failure',
+    'build-failure',
+    'generator-failure',
+    'converter-failure',
+    'existing-config',
+    'existing-inventory',
+    'inventory-symlink',
+    'config-symlink',
+  ]) {
+    const root = mkdtempSync(join(tmpdir(), 'phase1-cleanup-'))
+    const bin = join(root, 'bin')
+    const inventory = join(root, 'crates/trusted-server-cli/phase1.json')
+    const config = join(root, 'trusted-server.toml')
+    try {
+      mkdirSync(bin)
+      mkdirSync(join(root, 'crates/trusted-server-cli'), { recursive: true })
+      const script = join(root, 'build.sh')
+      fs.copyFileSync('scripts/release/phase1-build.sh', script)
+      const stub = (name, body) =>
+        writeFileSync(join(bin, name), '#!/bin/bash\nset -eu\n' + body + '\n', {
+          mode: 0o755,
+        })
+      stub(
+        'git',
+        'if [[ "$1" == rev-parse ]]; then printf "%s\\n" "$SOURCE_COMMIT"; fi'
+      )
+      stub('node', 'exit 0')
+      stub('npm', 'echo "{}"')
+      stub('shasum', 'exit 0')
+      stub('tar', 'exit 0')
+      stub(
+        'cat',
+        'if [[ "$FIXTURE_MODE" == config-write-failure ]]; then printf partial; exit 97; fi; exec /bin/cat "$@"'
+      )
+      stub(
+        'cargo',
+        `case "$1" in
+        build)
+          [[ "$FIXTURE_MODE" != build-failure ]] || exit 97
+          mkdir -p "$CARGO_TARGET_DIR/aarch64-apple-darwin/release"
+          printf binary > "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/ts" ;;
+        install)
+          mkdir -p "$RUNNER_TEMP/phase1-cyclonedx/install/bin"
+          printf '%s\\n' '#!/bin/bash' 'printf "{}" > crates/trusted-server-cli/phase1.json' 'if [[ "$FIXTURE_MODE" == generator-failure ]]; then exit 98; fi' > "$RUNNER_TEMP/phase1-cyclonedx/install/bin/cargo-cyclonedx"
+          chmod +x "$RUNNER_TEMP/phase1-cyclonedx/install/bin/cargo-cyclonedx" ;;
+        metadata) echo '{}' ;;
+        *) exit 96 ;;
+      esac`
+      )
+      stub(
+        'curl',
+        `while [[ "$1" != --output ]]; do shift; done
+        printf '%s\\n' '#!/bin/bash' 'if [[ "$FIXTURE_MODE" == converter-failure ]]; then exit 99; fi' > "$2"`
+      )
+      if (mode === 'existing-config') writeFileSync(config, 'operator config')
+      if (mode === 'config-symlink')
+        fs.symlinkSync('missing-user-config', config)
+      if (mode === 'existing-inventory')
+        writeFileSync(inventory, 'operator inventory')
+      if (mode === 'inventory-symlink')
+        fs.symlinkSync('missing-user-file', inventory)
+      let error
+      try {
+        execFileSync(
+          '/bin/bash',
+          [
+            script,
+            'trusted-server-cli',
+            'aarch64-apple-darwin',
+            'ts-aarch64-apple-darwin',
+          ],
+          {
+            cwd: root,
+            stdio: 'pipe',
+            env: {
+              PATH: `${bin}:/usr/bin:/bin`,
+              RUNNER_TEMP: root,
+              SOURCE_COMMIT: 'a'.repeat(40),
+              FIXTURE_MODE: mode,
+            },
+          }
+        )
+      } catch (failure) {
+        error = failure
+      }
+      const expectedStatus =
+        {
+          success: undefined,
+          'config-write-failure': 97,
+          'build-failure': 97,
+          'generator-failure': 98,
+          'converter-failure': 99,
+        }[mode] ?? (mode === 'success' ? undefined : 1)
+      assert.equal(error?.status, expectedStatus, mode)
+      if (mode === 'config-symlink')
+        assert.equal(fs.readlinkSync(config), 'missing-user-config')
+      assert.equal(
+        fs.existsSync(config),
+        mode === 'existing-config',
+        `${mode}: config cleanup`
+      )
+      if (mode === 'existing-config')
+        assert.equal(readFileSync(config, 'utf8'), 'operator config')
+      if (mode === 'existing-inventory')
+        assert.equal(readFileSync(inventory, 'utf8'), 'operator inventory')
+      else if (mode === 'inventory-symlink')
+        assert.equal(fs.readlinkSync(inventory), 'missing-user-file')
+      else
+        assert.equal(
+          fs.existsSync(inventory),
+          false,
+          `${mode}: inventory cleanup`
+        )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
 })

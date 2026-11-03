@@ -15,6 +15,8 @@ mod inventory;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "build/prebuilt.rs"]
 mod prebuilt;
+#[path = "build/trace_sources.rs"]
+pub(crate) mod trace_sources;
 
 use std::env;
 use std::fmt::Write as _;
@@ -26,6 +28,7 @@ use build_print::info;
 use sha2::{Digest as _, Sha256};
 
 use self::bundle_set::{bundle_file_name, check_bundle_set, expected_module_ids, scan_bundle_dir};
+use self::trace_sources::trace_source_digest;
 
 const PREBUILT_DIR_VAR: &str = "TSJS_PREBUILT_DIR";
 const INVENTORY_VAR: &str = "TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY";
@@ -47,6 +50,12 @@ pub(crate) fn run_with_hook(hook: impl FnMut(&Path, &Path)) {
         "lib/src",
         "lib/build-all.mjs",
         "lib/build-module-options.mjs",
+        "lib/trace-asset-sources.mjs",
+        "lib/build-trace.mjs",
+        "lib/trace-build-inputs.json",
+        "../../.tool-versions",
+        "lib/trace-assets-manifest.json",
+        "lib/trace-assets",
         "lib/build-prebid-external.mjs",
         "lib/release-composition.mjs",
         "lib/vitest.config.ts",
@@ -109,6 +118,7 @@ pub(crate) fn run_with_hook(hook: impl FnMut(&Path, &Path)) {
     let ts_dir = crate_dir.join("lib");
     // Private to this build script run: concurrent builds never share it.
     let bundle_dir = out_dir.join("tsjs-dist");
+    let trace_dir = out_dir.join("tsjs-trace-dist");
 
     let expected = expected_module_ids(&ts_dir.join("src"))
         .unwrap_or_else(|err| panic!("tsjs: failed to discover modules: {err}"));
@@ -162,6 +172,7 @@ pub(crate) fn run_with_hook(hook: impl FnMut(&Path, &Path)) {
         }
     } else {
         build_bundles(&ts_dir, &bundle_dir);
+        move_rebuilt_trace(&bundle_dir, &trace_dir);
     }
 
     validate_bundle_dir(&expected, &bundle_dir);
@@ -172,6 +183,12 @@ pub(crate) fn run_with_hook(hook: impl FnMut(&Path, &Path)) {
     );
 
     write_module_table(&expected, &bundle_dir, &out_dir);
+    embed_trace_assets(
+        &ts_dir,
+        &trace_dir,
+        &out_dir,
+        env::var_os(PREBUILT_DIR_VAR).is_none(),
+    );
 }
 
 fn copy_prebuilt(expected: &[String], source: &Path, destination: &Path) {
@@ -310,6 +327,18 @@ fn ensure_dependencies_fresh(ts_dir: &Path) {
     assert!(hidden_modified >= lockfile_modified, "{stale_message}");
 }
 
+/// Move the trace viewer `npm run build` writes beside the bundles.
+///
+/// The checked bundle directory must hold only the bundles it embeds.
+fn move_rebuilt_trace(bundle_dir: &Path, destination: &Path) {
+    if destination.exists() {
+        fs::remove_dir_all(destination).expect("should clear private rebuilt trace destination");
+    }
+    fs::create_dir_all(destination).expect("should create private rebuilt trace destination");
+    fs::rename(bundle_dir.join("trace"), destination.join("trace"))
+        .unwrap_or_else(|error| panic!("tsjs: failed to move the rebuilt trace viewer: {error}"));
+}
+
 fn validate_bundle_dir(expected: &[String], dir: &Path) {
     let found = scan_bundle_dir(dir).unwrap_or_else(|err| panic!("tsjs: {err}"));
     if let Err(err) = check_bundle_set(expected, &found) {
@@ -366,4 +395,90 @@ fn bundle_sha256(path: &Path) -> String {
         );
     });
     hex::encode(Sha256::digest(&content))
+}
+
+fn embed_trace_assets(ts_dir: &Path, dist_dir: &Path, out_dir: &Path, rebuilt: bool) {
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(ts_dir.join("trace-assets-manifest.json"))
+            .expect("should read the committed trace asset manifest"),
+    )
+    .expect("should parse the trace asset manifest");
+    let object = manifest
+        .as_object()
+        .expect("should use a trace manifest object");
+    assert!(
+        object.len() == 3
+            && object.contains_key("schema_version")
+            && object.contains_key("assets")
+            && object.contains_key("source_sha256"),
+        "tsjs: trace manifest must contain exactly the documented fields"
+    );
+    assert_eq!(
+        manifest["schema_version"].as_u64(),
+        Some(1),
+        "tsjs: trace manifest schema version must be one"
+    );
+    if !rebuilt {
+        assert_eq!(
+            manifest["source_sha256"].as_str(),
+            Some(trace_source_digest(ts_dir).as_str()),
+            "tsjs: trace build inputs changed; run `npm run build:trace-assets` in crates/trusted-server-js/lib and review unpublished assets, or add a version after publication"
+        );
+    }
+    let assets = manifest["assets"]
+        .as_array()
+        .expect("should list the versioned trace assets");
+    assert_eq!(
+        assets.len(),
+        2,
+        "tsjs: version one requires its JS and CSS assets"
+    );
+    let mut generated = String::from("const TRACE_ASSETS: [TraceAsset; 2] = [\n");
+    for (asset, file) in assets.iter().zip(["v1.js", "v1.css"]) {
+        let fields = asset
+            .as_object()
+            .expect("should represent trace asset metadata as an object");
+        assert!(
+            fields.len() == 3
+                && fields.contains_key("path")
+                && fields.contains_key("file")
+                && fields.contains_key("sha256"),
+            "tsjs: trace asset metadata must contain exactly path, file and sha256"
+        );
+        let path = format!("/_ts/trace/assets/{file}");
+        assert_eq!(
+            asset["path"].as_str(),
+            Some(path.as_str()),
+            "tsjs: trace asset path must be exact"
+        );
+        assert_eq!(
+            asset["file"].as_str(),
+            Some(file),
+            "tsjs: trace asset filename must be exact"
+        );
+        let content = fs::read(ts_dir.join("trace-assets").join(file))
+            .expect("should read the committed versioned trace asset bytes");
+        let digest = hex::encode(Sha256::digest(&content));
+        assert_eq!(
+            asset["sha256"].as_str(),
+            Some(digest.as_str()),
+            "tsjs: committed trace asset bytes do not match their manifest digest"
+        );
+        if rebuilt {
+            assert_eq!(
+                fs::read(dist_dir.join("trace").join(file))
+                    .expect("should rebuild both versioned trace assets"),
+                content,
+                "tsjs: rebuilt trace bytes differ from committed assets; run `npm run build:trace-assets` in crates/trusted-server-js/lib and review the unpublished draft or add a version"
+            );
+        }
+        fs::write(out_dir.join(format!("trace-{file}")), &content)
+            .expect("should copy verified trace bytes into the build output");
+        writeln!(generated,
+            "TraceAsset {{ path: \"{path}\", bytes: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/trace-{file}\")), sha256: \"{digest}\" }},")
+            .expect("should generate the verified trace asset entry");
+    }
+    generated.push_str("];\n");
+    fs::write(out_dir.join("trace_assets.rs"), generated)
+        .expect("should generate the trace asset lookup table");
 }

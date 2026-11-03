@@ -1838,6 +1838,14 @@ delta-only enforcement, unbypassable. Requirements:
 - Reuse the host-target CI lane introduced by PR #669 (since `ts`
   binary is host-target only).
 
+As implemented in #1254, Stage 2 differs from the plan above. It is
+its own `lint-domains` job rather than a step in the host-target lane,
+so branch protection can require it by name. It runs
+`--changed-vs HEAD^1` on a `fetch-depth: 2` checkout rather than
+`$GITHUB_BASE_REF` on a full clone: a PR checkout is GitHub's merge
+commit, so its first parent is the exact base commit, and depth 1
+fails closed (exit 2).
+
 **Stage 3 (optional, deferred):** Either (a) clean existing violations
 and add full-repo audit as a CI gate, or (b) snapshot a baseline file
 and run full-repo audit with baseline subtraction. Choice deferred
