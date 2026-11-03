@@ -27,10 +27,10 @@ describe('initial render capacity and diagnostics', () => {
     (id) => {
       document.body.firstElementChild!.id = id;
       const element = document.getElementById(id)!;
-      const ts: TsjsApi = {};
+      const ts = {} as TsjsApi;
       const claim = claimFirstImpressionForTrustedServer(ts, element)!;
       expect(claim.owner).toBe('trusted_server');
-      expect(Object.hasOwn(ts.firstImpression!.slots, id)).toBe(true);
+      expect(Object.prototype.hasOwnProperty.call(ts.firstImpression!.slots, id)).toBe(true);
       expect(Object.getPrototypeOf(ts.firstImpression!.slots)).toBeNull();
       const token = registerPublisherFirstImpressionAuctions(ts, [id]).get(id)!;
       expect(consumePublisherFirstImpressionDelivery(ts, token)).toBe(true);

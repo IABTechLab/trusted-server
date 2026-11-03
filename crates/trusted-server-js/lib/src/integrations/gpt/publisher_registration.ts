@@ -111,7 +111,7 @@ export function registeredCandidateAllowed(
 }
 
 /** Observe only an exact current native registration's render, not an ID alias. */
-export function observePublisherSlotRender(ts: TsjsApi, native: PublisherGptSlot): void {
+export function observePublisherSlotRender(ts: TsjsApi, native: object): void {
   const state = ts.publisherSlotRegistrationState;
   if (state?.generation !== (ts.navGeneration ?? 0)) return;
   for (const record of Object.values(state.records)) {
@@ -379,8 +379,14 @@ export function installPublisherSlotRegistration(
         record.targetingKeys = Object.keys(targeting);
         for (const [key, value] of Object.entries(targeting)) native.setTargeting(key, value);
         first.targeting = targeting;
-        ts.divToSlotId = Object.assign(Object.create(null), ts.divToSlotId);
-        ts.prevSlotTargetingKeys = Object.assign(Object.create(null), ts.prevSlotTargetingKeys);
+        ts.divToSlotId = Object.assign(Object.create(null), ts.divToSlotId) as Record<
+          string,
+          string
+        >;
+        ts.prevSlotTargetingKeys = Object.assign(
+          Object.create(null),
+          ts.prevSlotTargetingKeys
+        ) as Record<string, string[]>;
         retainPublisherSlotMappings(ts, ts.divToSlotId, ts.prevSlotTargetingKeys);
         try {
           ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(

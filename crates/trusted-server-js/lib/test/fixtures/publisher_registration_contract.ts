@@ -256,7 +256,7 @@ export function publisherRegistrationContract(implementation: Implementation): v
         const { slot } = mount();
         const handle = ts.registerPublisherSlot!({
           ...options(slot),
-          eligibleFormats: formats as ReadonlyArray<readonly [number, number]>,
+          eligibleFormats: formats as unknown as ReadonlyArray<readonly [number, number]>,
         });
         expect(handle.getStatus()).toEqual({ status: 'rejected', reason: 'invalid_arguments' });
         expect(nativeDisplay).not.toHaveBeenCalled();
@@ -540,7 +540,7 @@ export function publisherRegistrationContract(implementation: Implementation): v
       const handle = ts.registerPublisherSlot!({ ...options(slot), slotId: '__proto__' });
       await settle();
       expect(handle.getStatus().status).toBe('requested');
-      expect(Object.hasOwn(ts.divToSlotId!, '__proto__')).toBe(true);
+      expect(Object.prototype.hasOwnProperty.call(ts.divToSlotId!, '__proto__')).toBe(true);
       expect(ts.divToSlotId!['__proto__']).toBe('__proto__');
       expect(ts.firstImpression?.slots['__proto__']?.owner).toBe('trusted_server');
       expect(Object.getPrototypeOf(ts.publisherSlotRegistrationState!.records)).toBeNull();

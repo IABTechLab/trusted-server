@@ -179,6 +179,8 @@ interface InjectedPrebidTestConfig {
 interface TestGoogletag {
   cmd: { push: (fn: () => void) => void };
   pubads: () => unknown;
+  getConfig?: () => { disableInitialLoad?: boolean };
+  display?: (id: string) => void;
 }
 
 interface ApsPrebidTestEntry {
@@ -4239,7 +4241,7 @@ describe('prebid/installRefreshHandler', () => {
       ],
       bids: {},
     } as TsjsApi;
-    testWindow.tsjs = ts;
+    window.tsjs = ts;
     const frames: FrameRequestCallback[] = [];
     const raf = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
       frames.push(callback);
