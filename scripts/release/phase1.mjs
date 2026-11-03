@@ -4,7 +4,14 @@ import { execFileSync } from 'node:child_process'
 import { createServer } from 'node:net'
 import { once } from 'node:events'
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join, relative, resolve } from 'node:path'
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 /** Check minimal wasm headers and final Linux loader requirements. */
@@ -286,13 +293,14 @@ function rustTokens(source) {
 }
 
 /**
- * Returns the module files a Rust file loads with `mod name;`, honoring
- * `#[path = "..."]`, relative to that file's directory.
+ * Returns, for each `mod name;` a Rust file declares, the files rustc may load
+ * for it. A `#[path = "..."]` declaration has exactly one candidate, relative
+ * to that file's directory, and is marked `explicit`.
  */
 export function moduleFiles(file, source) {
   const tokens = rustTokens(source)
   const directory = dirname(file)
-  const files = []
+  const modules = []
   let path
   for (let i = 0; i < tokens.length; i++) {
     if (
@@ -310,18 +318,28 @@ export function moduleFiles(file, source) {
       typeof tokens[i + 1] === 'string' &&
       tokens[i + 2] === ';'
     ) {
-      files.push(
-        ...(path === undefined
-          ? [
-              join(directory, `${tokens[i + 1]}.rs`),
-              join(directory, tokens[i + 1], 'mod.rs'),
-            ]
-          : [join(directory, path)])
+      modules.push(
+        path === undefined
+          ? {
+              explicit: false,
+              files: [
+                join(directory, `${tokens[i + 1]}.rs`),
+                join(directory, tokens[i + 1], 'mod.rs'),
+                // A non-mod.rs file `y.rs` loads `mod z;` from `y/`.
+                join(directory, basename(file, '.rs'), `${tokens[i + 1]}.rs`),
+                join(directory, basename(file, '.rs'), tokens[i + 1], 'mod.rs'),
+              ],
+            }
+          : {
+              explicit: true,
+              // rustc loads an absolute path as given.
+              files: [isAbsolute(path) ? path : join(directory, path)],
+            }
       )
       path = undefined
     } else if (tokens[i] === 'mod' || tokens[i] === ';') path = undefined
   }
-  return files
+  return modules
 }
 
 /**
@@ -482,15 +500,37 @@ export function mergeSboms(cargo, npm, binary, name, version) {
   }
 }
 
-function rustFiles(root, files = []) {
+function crateFiles(root, files = []) {
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (['node_modules', 'target', 'dist', '.git'].includes(entry.name))
       continue
     const file = join(root, entry.name)
-    if (entry.isDirectory()) rustFiles(file, files)
-    else if (entry.isFile() && file.endsWith('.rs')) files.push(file)
+    if (entry.isDirectory()) crateFiles(file, files)
+    else if (
+      entry.isFile() &&
+      (file.endsWith('.rs') || entry.name === 'Cargo.toml')
+    )
+      files.push(file)
   }
   return files
+}
+
+/**
+ * Refuses a manifest that names a build script other than `build.rs`, which
+ * the audit would not recognise as one.
+ */
+function checkManifest(file, source) {
+  let section
+  for (const line of source.split(/\r?\n/)) {
+    const header = line.match(/^\s*\[([^\]]*)\]/)
+    if (header) section = header[1].trim()
+    const build =
+      section === 'package'
+        ? line.match(/^\s*build\s*=\s*([^#]*?)\s*(?:#.*)?$/)
+        : line.match(/^\s*package\.build\s*=\s*([^#]*?)\s*(?:#.*)?$/)
+    if (build && !['"build.rs"', "'build.rs'", 'false'].includes(build[1]))
+      throw Error(`${file}: custom build script is not audited`)
+  }
 }
 
 /**
@@ -498,13 +538,21 @@ function rustFiles(root, files = []) {
  * and every file under a crate's `build/` or `build_support/` directory get the
  * build-script rule. Module resolution is simplified (no inline-module nesting,
  * `cfg_attr` paths or `include!`), so build-time helpers belong in those two
- * directories.
+ * directories. A custom `package.build` script and a `#[path]` module outside
+ * the audited `.rs` files are refused.
  */
 export function audit(root) {
-  const files = rustFiles(root)
+  const found = crateFiles(root)
+  for (const manifest of found.filter((file) => file.endsWith('Cargo.toml')))
+    checkManifest(manifest, readFileSync(manifest, 'utf8'))
+  const files = found.filter((file) => file.endsWith('.rs'))
   const sources = new Map(
     files.map((file) => [file, readFileSync(file, 'utf8')])
   )
+  for (const file of files)
+    for (const module of moduleFiles(file, sources.get(file)))
+      if (module.explicit && !sources.has(module.files[0]))
+        throw Error(`${file}: #[path] module outside the audited Rust sources`)
   const buildTime = new Set(
     files.filter(
       (file) =>
@@ -515,7 +563,9 @@ export function audit(root) {
   const pending = [...buildTime]
   while (pending.length) {
     const file = pending.pop()
-    for (const module of moduleFiles(file, sources.get(file))) {
+    for (const module of moduleFiles(file, sources.get(file)).flatMap(
+      (declaration) => declaration.files
+    )) {
       if (!buildTime.has(module) && sources.has(module)) {
         buildTime.add(module)
         pending.push(module)

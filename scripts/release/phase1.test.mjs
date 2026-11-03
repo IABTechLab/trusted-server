@@ -343,7 +343,15 @@ test('release notes match the guide and never pre-fill reviewed pins', () => {
     rmSync(bin, { recursive: true, force: true })
   }
 })
-test('publication binds exact signing handoffs and refuses drafts, corruption and partial uploads', async () => {
+test('publication binds exact signing handoffs and refuses drafts, corruption and partial uploads', async (t) => {
+  // Record each read's command timeout so availability reads can be bounded.
+  const timeouts = new WeakMap()
+  const timeout = AbortSignal.timeout.bind(AbortSignal)
+  t.mock.method(AbortSignal, 'timeout', (delay) => {
+    const signal = timeout(delay)
+    timeouts.set(signal, delay)
+    return signal
+  })
   for (const mode of [
     'success',
     'idle-socket',
@@ -372,6 +380,10 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'changed',
     'empty-bundle',
     'symlink-input',
+    'signed-extra',
+    'created-wrong-tag',
+    'created-not-draft',
+    'created-not-prerelease',
     'upload-error',
     'upload-digest',
     'upload-size',
@@ -408,6 +420,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'attestation-verification-failure',
     'attestation-verify-transient',
     'attestation-verify-past-deadline',
+    'attestation-late-reads',
+    'attestation-list-past-deadline',
     'attestation-null-bundle',
     'attestation-null-bundle-late',
     'attestation-null-bundle-never',
@@ -469,6 +483,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           join(root, 'signed', assets[0], assets[0] + '.sbom.sigstore.json'),
           ''
         )
+      if (mode === 'signed-extra')
+        writeFileSync(join(root, 'signed', assets[0], 'unexpected'), 'extra')
       if (mode === 'symlink-input') {
         const input = join(root, 'build', assets[0], assets[0])
         fs.renameSync(input, join(root, 'elsewhere'))
@@ -561,12 +577,12 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         )
           throw new TypeError('other side closed')
         calls.push([method, u.pathname + u.search])
-        const response = (body, status = 200) =>
+        const response = (body, status = 200, headers = {}) =>
           new Response(
             typeof body === 'string' || Buffer.isBuffer(body)
               ? body
               : JSON.stringify(body),
-            { status }
+            { status, headers }
           )
         if (u.pathname.includes('/git/ref/tags/')) {
           assert.equal(method, 'GET')
@@ -586,6 +602,21 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           polls++
           assert.equal(method, 'GET')
           assert.equal(u.searchParams.get('predicate_type'), 'release')
+          assert.ok(now < 60000, 'should not start a read after the deadline')
+          assert.equal(
+            timeouts.get(options.signal),
+            Math.min(4000, 60000 - now),
+            'should bound every availability read by the availability deadline'
+          )
+          // Two transient failures push the third read close to the deadline.
+          if (mode === 'attestation-late-reads' && [5, 6].includes(polls))
+            return response({}, 503, { 'retry-after': '10' })
+          // The second failure runs until its timeout, so its retry would end
+          // after the availability deadline.
+          if (mode === 'attestation-list-past-deadline' && polls >= 5) {
+            if (polls === 6) now += timeouts.get(options.signal)
+            return response({}, 503, { 'retry-after': '10' })
+          }
           if (
             mode === 'attestation-non-200' ||
             (mode === 'attestation-list-transient' && polls === 1)
@@ -620,7 +651,11 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
                 ? 2
                 : mode === 'attestation-404-never'
                   ? 5
-                  : mode === 'attestation-verify-past-deadline'
+                  : [
+                        'attestation-verify-past-deadline',
+                        'attestation-late-reads',
+                        'attestation-list-past-deadline',
+                      ].includes(mode)
                     ? 4
                     : 0
           if (polls <= delay && mode !== 'attestation-other-tag-before-current')
@@ -653,7 +688,14 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           assert.equal(creation.prerelease, !stable)
           assert.equal(creation.make_latest, stable ? 'legacy' : 'false')
           assert.equal(creation.body, releaseNotes('example/project', tag))
-          return response(release(true), 201)
+          return response(
+            mode === 'created-wrong-tag'
+              ? { ...release(true), tag_name: 'v9.9.9' }
+              : mode === 'created-not-prerelease'
+                ? { ...release(true), prerelease: false }
+                : release(mode !== 'created-not-draft'),
+            201
+          )
         }
         if (u.pathname.endsWith('/assets') && method === 'POST') {
           if (mode === 'upload-error') return response('upload failed', 500)
@@ -719,8 +761,9 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         verifies++
         const verifiedTag = args[1].at(-1)
         assert.equal(verifiedTag, tag, 'should verify only the current tag')
-        assert.ok(
-          now + args[2].timeout <= 60000,
+        assert.equal(
+          args[2].timeout,
+          Math.min(10000, 60000 - now),
           'should bound proof verification by the availability deadline'
         )
         if (mode === 'attestation-verify-transient' && verifies === 1)
@@ -803,6 +846,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'attestation-other-unverifiable',
         'attestation-verify-transient',
         'attestation-list-transient',
+        'attestation-late-reads',
         'attestation-user-initiated',
         'attestation-null-bundle',
         'attestation-null-bundle-late',
@@ -822,7 +866,20 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'published-asset-digest': /Published asset digest mismatch/,
         'published-asset-extra': /Published asset set mismatch/,
         'attestation-404-never': /unavailable after five checks/,
-        'attestation-verify-past-deadline': /retry window exhausted/,
+        // The deadline names its window and keeps the failure that caused the
+        // retry.
+        'attestation-verify-past-deadline': (error) =>
+          error.message ===
+            'Release attestation availability retry window exhausted' &&
+          error.cause?.code === 'ETIMEDOUT',
+        'attestation-list-past-deadline': (error) =>
+          error.message ===
+            'Release attestation availability retry window exhausted' &&
+          error.cause?.status === 503,
+        'signed-extra': /Unexpected artifact contents/,
+        'created-wrong-tag': /Invalid created release identity/,
+        'created-not-draft': /Invalid created release identity/,
+        'created-not-prerelease': /Invalid created release identity/,
         'attestation-statement-mismatch': /statement mismatch/,
         'attestation-substituted-bundle': /bundle mismatch/,
         'attestation-null-bundle-never': /Signature verification failed/,
@@ -858,6 +915,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           'changed',
           'empty-bundle',
           'symlink-input',
+          'signed-extra',
         ].includes(mode)
       )
         assert.ok(
@@ -873,6 +931,15 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         )
       if (mode === 'api-error' || mode === 'upload-error')
         assert.equal(calls.length, mode === 'api-error' ? 2 : 4)
+      if (mode.startsWith('created-'))
+        assert.ok(
+          !calls.some(([method, path]) =>
+            String(path).split('?')[0].endsWith('/assets')
+          ),
+          'should upload nothing to a release with the wrong identity'
+        )
+      // Immutability is verified before any availability read.
+      if (mode === 'mutable') assert.equal(polls, 0, mode)
       if (['upload-error', 'upload-digest', 'upload-size'].includes(mode))
         assert.ok(!calls.some(([method]) => method === 'PATCH'), mode)
       if (successful) {
@@ -941,6 +1008,14 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             5,
           ],
           'attestation-list-transient': [[2000], 2],
+          'attestation-late-reads': [
+            [2000, 5000, 10000, 20000, 10000, 10000],
+            7,
+          ],
+          'attestation-list-past-deadline': [
+            [2000, 5000, 10000, 20000, 10000],
+            6,
+          ],
           'attestation-non-200': [[2000, 5000], 3],
         }[mode]
         assert.deepEqual(waits, retried?.[0] ?? expectedWaits, mode)
@@ -1130,6 +1205,112 @@ test('completes real converter package output with a binary-bound root', () => {
   assert.equal(document.packages.at(-1).filesAnalyzed, false)
   assert.throws(() => completeSpdx(document, binary, original), /Unexpected/)
 })
+test('completed SPDX is validated before it is returned', () => {
+  const { original, document } = spdxFixture()
+  document.packages.shift()
+  delete document.documentDescribes
+  delete document.relationships
+  document.packages[0].externalRefs = []
+  assert.throws(
+    () => completeSpdx(document, binary, original),
+    /identity or PURL/
+  )
+})
+test('release command line checks binaries, final bytes and SPDX output', () => {
+  const root = mkdtempSync(join(tmpdir(), 'phase1-cli-'))
+  const run = (...args) =>
+    spawnSync(
+      process.execPath,
+      [fileURLToPath(new URL('./phase1.mjs', import.meta.url)), ...args],
+      { cwd: root, encoding: 'utf8' }
+    )
+  const write = (name, bytes) => {
+    writeFileSync(join(root, name), bytes)
+    return join(root, name)
+  }
+  try {
+    const clean = write('clean', binary)
+    const planted = write(
+      'planted',
+      Buffer.concat([binary, Buffer.from(sentinels.at(-1))])
+    )
+    assert.equal(run('check', clean).status, 0, 'should accept a clean binary')
+    const refused = run('check', clean, planted)
+    assert.equal(refused.status, 1, 'should refuse a planted binary')
+    assert.match(refused.stderr, /planted operator configuration/)
+
+    const wasm = write('valid.wasm', Buffer.from('0061736d01000000', 'hex'))
+    const accepted = run('smoke', wasm, 'wasm32-wasip1')
+    assert.equal(accepted.status, 0, accepted.stderr)
+    assert.match(accepted.stdout, /SUCCESS: final-byte checks wasm32-wasip1/)
+    const invalid = run('smoke', clean, 'wasm32-wasip1')
+    assert.equal(invalid.status, 1, 'should refuse non-wasm final bytes')
+    assert.match(invalid.stderr, /wasm/)
+
+    const { original, document } = spdxFixture()
+    document.packages.shift()
+    delete document.documentDescribes
+    delete document.relationships
+    original.metadata.properties = [
+      { name: 'trusted-server:coverage', value: 'Fixture coverage.' },
+    ]
+    const spdx = write('sbom.spdx.json', JSON.stringify(document))
+    const inventory = write('combined.cdx.json', JSON.stringify(original))
+    const completed = run('validate-spdx', spdx, clean, inventory)
+    assert.equal(completed.status, 0, completed.stderr)
+    const output = JSON.parse(readFileSync(spdx, 'utf8'))
+    assert.deepEqual(output.documentDescribes, ['SPDXRef-Artifact'])
+    assert.match(output.creationInfo.comment, /Fixture coverage\./)
+    write('sbom.spdx.json', JSON.stringify(document))
+    const rescanned = run('validate-spdx', spdx, planted, inventory)
+    assert.equal(rescanned.status, 1, 'should rescan the final binary')
+    assert.match(rescanned.stderr, /planted operator configuration/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+test('every canary the release build plants is a scanned sentinel', () => {
+  const script = readFileSync('scripts/release/phase1-build.sh', 'utf8')
+  const canary = 'phase1-[a-z0-9-]*canary[a-z0-9.-]*'
+  const exported = [
+    ...script.matchAll(new RegExp(`^export (\\w+)=\\S*?(${canary})$`, 'gm')),
+  ].map(([, name, value]) => `${name}=${value}`)
+  const config = script.slice(
+    script.indexOf("cat > trusted-server.toml <<'CONFIG'\n"),
+    script.indexOf('\nCONFIG\n')
+  )
+  const configured = [
+    ...config.matchAll(new RegExp(`^(\\w+) = "\\S*?(${canary})"$`, 'gm')),
+  ].map(([, key, value]) => `${key}=${value}`)
+  assert.deepEqual(
+    exported,
+    [
+      'TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=phase1-origin-canary.example.com',
+      'TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=phase1-secret-canary-32-characters',
+      'EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=phase1-physical-store-canary',
+      'FASTLY_SERVICE_ID=phase1-service-account-canary',
+    ],
+    'should plant every deployment variable canary'
+  )
+  assert.deepEqual(
+    configured,
+    [
+      'origin_url=phase1-origin-canary.example.com',
+      'proxy_secret=phase1-secret-canary-32-characters',
+      'policy=phase1-permission-policy-canary',
+    ],
+    'should plant every config file canary'
+  )
+  assert.deepEqual(
+    [
+      ...new Set(
+        [...exported, ...configured].map((entry) => entry.split('=')[1])
+      ),
+    ].sort(),
+    [...sentinels].sort(),
+    'should scan for exactly the planted canaries'
+  )
+})
 test('post-publish retries distinguish transient failures and cap Retry-After', async () => {
   for (const [error, failures, expected] of [
     [{ cause: { code: 'UND_ERR_SOCKET' } }, 1, [2000]],
@@ -1300,6 +1481,34 @@ test('release build keeps locked builds, pinned generators and final integrity c
     'should build in the GNU container and natively'
   )
   for (const line of builds) assert.match(line, /--locked/)
+  // Native binaries drop line-level debug info in both build paths.
+  assert.match(
+    script,
+    /if \[\[ "\$build_target" != wasm32-wasip1 \]\]; then\n {2}export CARGO_PROFILE_RELEASE_STRIP=debuginfo\nfi\n/
+  )
+  assert.match(script, /--env CARGO_PROFILE_RELEASE_STRIP /)
+  // The copied release bytes are scanned and smoke-checked before any
+  // inventory is generated for them.
+  const step = (command) => {
+    const index = commands.indexOf(command)
+    assert.ok(index >= 0, `should run: ${command}`)
+    return index
+  }
+  const copied = step(
+    'cp "$CARGO_TARGET_DIR/$build_target/release/$executable" "release-assets/$release_asset"'
+  )
+  const checked = step(
+    'node scripts/release/phase1.mjs check "release-assets/$release_asset"'
+  )
+  const smoked = step(
+    'node scripts/release/phase1.mjs smoke "release-assets/$release_asset" "$build_target"'
+  )
+  assert.ok(
+    copied < checked &&
+      checked < smoked &&
+      smoked < commands.findIndex((line) => line.startsWith('tool_root=')),
+    'should check and smoke the copied binary before generating inventories'
+  )
   assert.match(script, /cargo install \\\n[^\n]*--locked/)
   assert.match(script, /cargo metadata --locked/)
   // Generator crate and every converter binary are checksum-pinned before use.
@@ -1453,6 +1662,13 @@ test('audit tokenizes byte and C raw strings and astral char literals', () => {
     `const A: &[u8] = br#"a"#; ${planted}; const B: &[u8] = br#"b"#;`,
     `const A: &core::ffi::CStr = cr#"a"#; ${planted}; const B: &core::ffi::CStr = cr#"b"#;`,
     `const A: [char; 2] = ['😀','"']; ${planted}; const B: char = '"';`,
+    // Each body below holds a quote that ends the literal early if the
+    // tokenizer misses C raw strings, raw-string hash counts, nested block
+    // comments or escapes, which would hide the planted read.
+    `const A: &core::ffi::CStr = cr#"x"y"#; ${planted}; const B: &str = "z";`,
+    `const A: &str = r##"x"#y"##; ${planted}; const B: &str = "z";`,
+    `/* outer /* inner */ " */ ${planted}; const B: &str = "z";`,
+    `const A: &str = "x\\"y"; ${planted}; const B: &str = "z";`,
   ])
     assert.throws(
       () => checkSource('src/lib.rs', source),
@@ -1476,19 +1692,31 @@ test('build-script rule covers modules build scripts load and build helper direc
   try {
     write(
       'a/build.rs',
-      '#[path = "../b/helper/x.rs"]\nmod x;\nmod y;\nfn main() {}'
+      '#[path = "../b/helper/x.rs"]\nmod x;\nmod y;\nmod sub;\nmod helpers;\nfn main() {}'
     )
     write('b/helper/x.rs', 'mod nested;')
     write('b/helper/nested.rs', '')
     write('a/y.rs', '')
+    write('a/sub/mod.rs', '')
+    // A non-mod.rs file `helpers.rs` loads `mod names;` from `helpers/`.
+    write('a/helpers.rs', 'pub mod names;\npub mod more;')
+    write('a/helpers/names.rs', '')
+    write('a/helpers/more/mod.rs', '')
     write('c/build_support/z.rs', '')
     write('c/build/w.rs', '')
     write('c/src/lib.rs', leak)
     audit(root)
+    const restore = {
+      'b/helper/x.rs': 'mod nested;',
+      'a/helpers.rs': 'pub mod names;\npub mod more;',
+    }
     for (const file of [
       'b/helper/x.rs',
       'b/helper/nested.rs',
       'a/y.rs',
+      'a/sub/mod.rs',
+      'a/helpers/names.rs',
+      'a/helpers/more/mod.rs',
       'c/build_support/z.rs',
       'c/build/w.rs',
     ]) {
@@ -1500,8 +1728,43 @@ test('build-script rule covers modules build scripts load and build helper direc
         ),
         file
       )
-      write(file, file === 'b/helper/x.rs' ? 'mod nested;' : '')
+      write(file, restore[file] ?? '')
     }
+    // A build script the audit cannot recognise is refused; `build.rs` is not.
+    for (const build of ['"build.rs"', "'build.rs'", 'false']) {
+      write('c/Cargo.toml', `[package]\nname = "c"\nbuild = ${build}\n`)
+      audit(root)
+    }
+    for (const manifest of [
+      '[package]\nname = "c"\nbuild = "tools/generate.rs"\n',
+      'package.build = "tools/generate.rs"\n',
+    ]) {
+      write('c/Cargo.toml', manifest)
+      assert.throws(() => audit(root), /custom build script/, manifest)
+    }
+    write('c/Cargo.toml', '[package]\nname = "c"\n')
+    // A `#[path]` module that is not an audited `.rs` file is refused, even
+    // when the file exists: a non-`.rs` file inside the root, or a `.rs` file
+    // outside it, reached relatively or absolutely.
+    write('b/helper/x.txt', '')
+    // rustc loads `/x.rs` as given, not the audited `c/src/x.rs`.
+    write('c/src/x.rs', '')
+    const outside = `${root}-outside.rs`
+    writeFileSync(outside, leak)
+    try {
+      for (const target of [
+        '../../b/helper/x.txt',
+        `../../../${root.split(/[/\\]/).at(-1)}-outside.rs`,
+        outside,
+        '/x.rs',
+      ]) {
+        write('c/src/lib.rs', `#[path = "${target}"]\nmod hidden;`)
+        assert.throws(() => audit(root), /#\[path\] module outside/, target)
+      }
+    } finally {
+      rmSync(outside, { force: true })
+    }
+    write('c/src/lib.rs', leak)
     // Messages that name a variable are not variable names.
     write(
       'c/build/w.rs',

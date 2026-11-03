@@ -29,6 +29,14 @@ jobs:
           import { isReleaseTag } from './scripts/release/publish.mjs'
           if (!isReleaseTag(process.env.RELEASE_TAG)) throw Error('Release tags must be vMAJOR.MINOR.PATCH[-PRERELEASE]')
           "
+      # The publisher requires a lightweight tag at the built commit. Refuse an
+      # annotated tag here, before signing writes public attestations for it.
+      - name: Refuse annotated release tags
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type + " " + .object.sha')" = "commit $GITHUB_SHA"
   build:
     needs: checks
     name: Build ${{ matrix.asset }}
@@ -103,7 +111,10 @@ jobs:
             TMPDIR="${TMPDIR:-/tmp}" RUNNER_TEMP="$RUNNER_TEMP" \
             SOURCE_COMMIT="$SOURCE_COMMIT" RELEASE_VERSION="$RELEASE_VERSION" \
             bash scripts/release/phase1-build.sh "$BUILD_PACKAGE" "$BUILD_TARGET" "$RELEASE_ASSET"
+      # Only the tag-triggered signing job reads these; a main push is a build
+      # and smoke check.
       - uses: actions/upload-artifact@v6
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: release-${{ matrix.asset }}
           path: release-assets/*

@@ -360,11 +360,13 @@ Publication lists releases, including drafts, and refuses every existing
 matching tag. It creates one draft, retains its release ID, and binds uploads
 and the final publish mutation to that ID. It checks the exact signing-approved asset
 set, validates each upload response's size and SHA-256 digest before publication,
-and checks immutable membership after publication. Published assets are then re-downloaded and byte-compared against the signed `SHA256SUMS` and validated handoff. The reviewed publication owner remains additive later work. There are no
+and checks immutable membership after publication. Published assets are then re-downloaded and byte-compared against the validated `SHA256SUMS` and handoff. The reviewed publication owner remains additive later work. There are no
 automatic mutation retries or draft-resume claims.
 
-Only post-publish reads may retry: release/asset metadata GETs and the GitHub
-CLI asset verification calls. Each check has at most three attempts,
+Only post-publish reads may retry: release/asset metadata GETs, the
+release-attestation list read, failed `gh release verify` proof fetches, the
+GitHub CLI asset verification calls and transport failures of the asset
+re-download. Each check has at most three attempts,
 with 2s then 5s backoff. A supplied `Retry-After` can increase a delay, capped
 at 10s (at most 20s waiting per check). A shared three-minute window bounds
 retry scheduling across the job, and individual read requests/commands time out
@@ -381,7 +383,7 @@ single-shot. Every API read, including that listing, times out after 10s. Mutati
 have no client-side timeout and are bounded by the 15-minute job limit: aborting a
 create, upload or publish cannot cancel a change GitHub already accepted.
 
-Before cryptographic release verification, the availability check makes at most five release-attestation reads, with 2s/5s/10s/20s backoff (37s total waiting). Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with no current-tag record may also wait. Each read times out after at most 4s and, like the other post-publish reads, retries transient failures; a separate 60s deadline bounds availability checking within the shared three-minute scheduling window. Other non-200 statuses fail. A record may carry its bundle inline or only a `bundle_url`; without an inline bundle its tag is unknown until GitHub CLI fetches it. GitHub CLI reports a bundle-fetch, trusted-root or network failure the same way as a record that is not yet listed, so any failed `gh release verify` is retried at the next availability check and the last error is reported after the fifth. A fetched result is then checked: its decoded bundle must equal the statement GitHub CLI verified, name this release, commit and exact asset digests, and equal the inline bundle when the API supplied one. Malformed records, duplicate current-tag records and identity/source/asset mismatches stop immediately. Other-tag records are logged and ignored by the publisher's own availability check, but GitHub CLI still fetches all returned bundle URLs before filtering by tag. An unavailable older bundle can therefore fail the current release's read-only verification. Preserve the immutable release and follow the read-only recovery procedure below. Filter-before-fetch behavior remains a dependency follow-up: track it upstream and qualify a GitHub CLI version that supplies it before claiming isolation from other tags. Logs show every wait or availability on the first check. No mutation is retried.
+Before cryptographic release verification, the availability check makes at most five release-attestation reads, with 2s/5s/10s/20s backoff (37s total waiting). Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with no current-tag record may also wait. Each read times out after at most 4s and, like the other post-publish reads, retries transient failures; a separate 60s deadline bounds availability checking within the shared three-minute scheduling window. Other non-200 statuses fail. A record may carry its bundle inline or only a `bundle_url`; without an inline bundle its tag is unknown until GitHub CLI fetches it. GitHub CLI reports a bundle-fetch, trusted-root or network failure the same way as a record that is not yet listed, so any failed `gh release verify` is retried at the next availability check and the last error is reported after the fifth. When the 60s deadline cuts a retry short, the error is `Release attestation availability retry window exhausted`, with the failure that caused the retry as its cause. A fetched result is then checked: its decoded bundle must equal the statement GitHub CLI verified, name this release, commit and exact asset digests, and equal the inline bundle when the API supplied one. Malformed records, duplicate current-tag records and identity/source/asset mismatches stop immediately. Other-tag records are logged and ignored by the publisher's own availability check, but GitHub CLI still fetches all returned bundle URLs before filtering by tag. An unavailable older bundle can therefore fail the current release's read-only verification. Preserve the immutable release and follow the read-only recovery procedure below. Filter-before-fetch behavior remains a dependency follow-up: track it upstream and qualify a GitHub CLI version that supplies it before claiming isolation from other tags. Logs show every wait or availability on the first check. No mutation is retried.
 
 The publisher re-downloads all 29 assets into a fresh temporary directory, checks the exact file set and byte-compares them with the validated signed handoff, including identical SHA256SUMS. Only transport download failures may retry; any missing, extra or different file fails immediately. Temporary downloads are removed after each attempt.
 
@@ -449,10 +451,18 @@ commands below only inspect settings; this workflow applies none of them.
   maintainers' team to the bypass list, with **Always allow** bypass. Record the
   team's name and ID in the maintainer release record; avoid broad role bypasses.
   See [repository ruleset configuration](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository).
-- Optionally require the reviewed release build checks on the source branch
-  before approving a tag. Use actual check names from that commit. A tag-triggered
-  check cannot be required to pass before creating its own tag. Source eligibility
-  and the later policy reader are not enforced by Phase 1.
+- Before tagging, confirm that the release build checks passed on the `main` push
+  of the commit you intend to tag (the `check-runs` command below lists them).
+  Release builds run only on `main` pushes and `v*` tags, so commits on other
+  branches have no such checks, and a tag-triggered check cannot pass before its
+  own tag exists. Source eligibility and the later policy reader are not enforced
+  by Phase 1.
+- Push the commit to a branch, normally `main`, before pushing its lightweight
+  tag. In fork rehearsals, draft creation returned HTTP 403 when the tagged commit
+  was reachable only through the new tag. That failure creates nothing: if the
+  release listing shows no release or draft for the tag, push the commit to a
+  branch and re-run only the failed release job. An annotated tag is refused
+  before building.
 
 ```bash
 REPO=IABTechLab/trusted-server
@@ -464,7 +474,7 @@ gh api "repos/$REPO/rulesets?includes_parents=true" \
 RULESET_ID=12345
 gh api "repos/$REPO/rulesets/$RULESET_ID?includes_parents=true" \
   --jq '{name, target, enforcement, conditions, rules, bypass_actors}'
-gh api "repos/$REPO/commits/$COMMIT/check-runs" \
+gh api --paginate "repos/$REPO/commits/$COMMIT/check-runs?per_page=100" \
   --jq '.check_runs[] | {name, status, conclusion}'
 ```
 

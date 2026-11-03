@@ -94,7 +94,7 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "docs.github.com",
     "help.github.com",
     "token.actions.githubusercontent.com",
-    // GitHub Actions SLSA buildType URI used in the carried release policy:
+    // GitHub Actions SLSA buildType URI cited by the release spec and compatibility record:
     // https://actions.github.io/buildtypes/workflow/v1
     "actions.github.io",
     // Git commit conventions

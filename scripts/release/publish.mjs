@@ -109,10 +109,13 @@ function checkStatement(statement, repo, source) {
 
 /**
  * Returns a reader that retries transient post-publish read failures (at most
- * three attempts) and never returns a result after `deadline`.
+ * three attempts) and never returns a result after `deadline`. `label` names
+ * the window in its errors; a retry cut short by the deadline keeps the failure
+ * that caused it as `cause`.
  */
 export function readRetrier({
   deadline,
+  label = 'Post-publish',
   now = Date.now,
   sleep = (delay) => new Promise((resolve) => setTimeout(resolve, delay)),
   warn = console.warn,
@@ -121,10 +124,10 @@ export function readRetrier({
     for (let attempt = 1; ; attempt++)
       try {
         if (now() >= deadline)
-          throw Error('Post-publish verification window exhausted')
+          throw Error(`${label} verification window exhausted`)
         const result = await operation()
         if (now() >= deadline)
-          throw Error('Post-publish verification window exhausted')
+          throw Error(`${label} verification window exhausted`)
         return result
       } catch (error) {
         const stderr = error.stderr?.toString().trim() ?? ''
@@ -149,9 +152,9 @@ export function readRetrier({
           )
         )
         if (now() + delay >= deadline)
-          throw Error('Post-publish retry window exhausted')
+          throw Error(`${label} retry window exhausted`, { cause: error })
         warn(
-          `Post-publish read retry: attempt ${attempt + 1}/3, transient ${error.status ?? 'transport/CLI'} failure, wait ${delay}ms`
+          `${label} read retry: attempt ${attempt + 1}/3, transient ${error.status ?? 'transport/CLI'} failure, wait ${delay}ms`
         )
         await sleep(delay)
       }
@@ -393,6 +396,7 @@ export async function publish({
     Math.max(1, Math.min(limit, availabilityDeadline - now()))
   const retryAvailabilityRead = readRetrier({
     deadline: availabilityDeadline,
+    label: 'Release attestation availability',
     now,
     sleep,
     warn,

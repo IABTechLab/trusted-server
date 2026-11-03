@@ -675,7 +675,7 @@
     "scripts/release/phase1.mjs": {
       "replaced_by": ["2.5", "2.6"]
     },
-    ".github/workflows/release.yml inline publisher": {
+    "scripts/release/publish.mjs": {
       "replaced_by": ["2.8"]
     }
   }
