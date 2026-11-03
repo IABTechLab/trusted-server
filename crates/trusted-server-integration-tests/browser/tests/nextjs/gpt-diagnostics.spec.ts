@@ -394,7 +394,7 @@ test.describe("GPT runtime diagnostics", () => {
         await page.waitForFunction(() =>
             Boolean(
                 (window as any).__gptDiagnosticsTestRoot?.querySelector(
-                    ".tsgd-badge",
+                    ".tsgd-badge-handle:not([hidden])",
                 ),
             ),
         );
@@ -402,20 +402,24 @@ test.describe("GPT runtime diagnostics", () => {
             const badge = (
                 window as any
             ).__gptDiagnosticsTestRoot.querySelector(
-                ".tsgd-badge",
+                ".tsgd-badge-handle:not([hidden])",
             ) as HTMLButtonElement;
+            const container = badge.closest<HTMLElement>(".tsgd-badge")!;
             badge.focus();
             return {
                 tagName: badge.tagName,
                 text: badge.textContent,
                 ariaLabel: badge.getAttribute("aria-label"),
-                runtimeSlotNumber: badge.dataset.runtimeSlot,
-                requestNumber: badge.dataset.requestNumber,
+                evidence: container.querySelector(".tsgd-badge-evidence")
+                    ?.textContent,
+                runtimeSlotNumber: container.dataset.runtimeSlot,
+                requestNumber: container.dataset.requestNumber,
             };
         });
         expect(badgeIdentity).toMatchObject({
             tagName: "BUTTON",
-            text: expect.stringMatching(/Ad #\d+ · Request #\d+/),
+            text: expect.stringMatching(/^Ad #\d+$/),
+            evidence: expect.stringMatching(/^Request #\d+ · /),
             ariaLabel: expect.stringMatching(/Ad #\d+, Request #\d+/),
         });
         await page.keyboard.press("Enter");

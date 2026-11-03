@@ -12,6 +12,7 @@ use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
 use tower::{Service, ServiceExt as _, service_fn};
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_adapter_axum::ingress::capture_http_ingress;
 use trusted_server_adapter_axum::timing::TimingService;
 
 /// Environment variable that sets the maximum log level.
@@ -127,7 +128,10 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    Router::new().fallback_service(service_fn(move |req| service.clone().oneshot(req)))
+    Router::new().fallback_service(service_fn(move |mut req| {
+        capture_http_ingress(&mut req);
+        service.clone().oneshot(req)
+    }))
 }
 
 /// Parses an optional `RUST_LOG` value into the logger's maximum level.
@@ -260,6 +264,159 @@ mod tests {
                         "should preserve timing configuration and health exclusion"
                     );
                 }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_listener_preserves_trace_action_origin_checks_through_sdk_conversion() {
+        let settings = trusted_server_core::settings::Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "example-user"
+            password = "example-password"
+            [publisher]
+            domain = "publisher.example.com"
+            cookie_domain = ".publisher.example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "fictional-proxy-secret"
+            [ec]
+            passphrase = "fictional-passphrase-at-least-32-bytes"
+            [request_signing]
+            enabled = false
+            config_store_id = "fictional-config"
+            secret_store_id = "fictional-secrets"
+            [integrations.gpt_diagnostics]
+            enabled = true
+            trace_page_enabled = true
+            "#,
+        )
+        .expect("should parse trace settings");
+        let service = TimingService::new(
+            EdgeZeroAxumService::new(
+                TrustedServerApp::routes_with_settings(settings)
+                    .expect("should build trace routes"),
+            ),
+            true,
+        );
+        let listener = dev_server_router(service.clone());
+        for action in ["enable", "end"] {
+            for (target_origin, hosts, origin, site, through_listener, accepted) in [
+                (
+                    "",
+                    vec!["localhost:8787"],
+                    "http://localhost:8787",
+                    "same-origin",
+                    true,
+                    true,
+                ),
+                (
+                    "http://localhost:8787",
+                    vec!["localhost:8787"],
+                    "http://localhost:8787",
+                    "same-origin",
+                    true,
+                    true,
+                ),
+                (
+                    "",
+                    vec!["localhost:8787"],
+                    "https://other.example.com",
+                    "same-origin",
+                    true,
+                    false,
+                ),
+                (
+                    "",
+                    vec!["localhost:8787"],
+                    "http://localhost:8787",
+                    "cross-site",
+                    true,
+                    false,
+                ),
+                (
+                    "http://other.example.com",
+                    vec!["localhost:8787"],
+                    "http://localhost:8787",
+                    "same-origin",
+                    true,
+                    false,
+                ),
+                (
+                    "https://localhost:8787",
+                    vec!["localhost:8787"],
+                    "https://localhost:8787",
+                    "same-origin",
+                    true,
+                    false,
+                ),
+                (
+                    "",
+                    vec![],
+                    "http://localhost:8787",
+                    "same-origin",
+                    true,
+                    false,
+                ),
+                (
+                    "",
+                    vec!["localhost:8787", "localhost:8787"],
+                    "http://localhost:8787",
+                    "same-origin",
+                    true,
+                    false,
+                ),
+                (
+                    "",
+                    vec!["localhost:invalid"],
+                    "http://localhost:8787",
+                    "same-origin",
+                    true,
+                    false,
+                ),
+                (
+                    "",
+                    vec!["localhost:8787"],
+                    "http://localhost:8787",
+                    "same-origin",
+                    false,
+                    false,
+                ),
+            ] {
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri(format!("{target_origin}/_ts/trace/{action}"))
+                    .header("origin", origin)
+                    .header("sec-fetch-site", site)
+                    .header("x-ts-trace-action", action)
+                    // These caller-controlled values must not override transport facts.
+                    .header("forwarded", "proto=https;host=other.example.com")
+                    .header("x-forwarded-proto", "https")
+                    .header("x-forwarded-host", "other.example.com");
+                for host in hosts {
+                    request = request.header("host", host);
+                }
+                let request = request
+                    .body(Body::empty())
+                    .expect("should build trace action");
+                let response = if through_listener {
+                    listener.clone().oneshot(request).await
+                } else {
+                    service.clone().oneshot(request).await
+                }
+                .expect("should serve trace action");
+                assert_eq!(
+                    response.status().as_u16(),
+                    if accepted { 200 } else { 403 },
+                    "should authorize only listener-bound same-origin {action} actions"
+                );
+                assert_eq!(response.headers().contains_key("set-cookie"), accepted);
+                assert_eq!(response.headers()["cache-control"], "no-store, private");
+                assert!(
+                    !response.headers().contains_key("server-timing"),
+                    "should preserve terminal trace hardening outside the timing layer"
+                );
             }
         }
     }

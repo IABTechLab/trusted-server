@@ -42,6 +42,7 @@ use trusted_server_core::settings_data::{
 use trusted_server_core::platform::{ClientInfo, RuntimeServices};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
+use crate::ingress::HttpIngressHook;
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
 
@@ -712,10 +713,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     let trace_state = Arc::clone(state);
 
     let mut router = RouterService::builder()
-        .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
+        .pre_dispatch_hook_arc(Arc::new(HttpIngressHook(TracePreDispatchHook::new(
             Arc::clone(&state.settings),
             Arc::new(move |request| trace_metadata(&trace_state, request)),
-        )))
+        ))))
         // Outermost middleware: strips the configured trusted-client-IP
         // headers before anything else sees the request. Must stay first —
         // any middleware registered ahead of it would observe the
