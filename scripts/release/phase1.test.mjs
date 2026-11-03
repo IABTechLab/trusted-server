@@ -15,7 +15,6 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import * as fs from 'node:fs'
 import vm from 'node:vm'
-import { isDeepStrictEqual } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import {
   audit,
