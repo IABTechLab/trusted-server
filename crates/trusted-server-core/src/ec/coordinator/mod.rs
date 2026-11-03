@@ -23,6 +23,7 @@ use self::validate::{ValidatedEntries, ValidationPolicy, validate};
 use crate::consent::ConsentContext;
 use crate::consent::{allows_eid_persistence, has_tcf_vendor_consent};
 use crate::ec::EcKvSnapshot;
+use crate::ec::consent::ec_consent_granted;
 use crate::ec::eid_types::{ProviderId, SourceDomain, UnixSeconds};
 use crate::ec::kv_types::KvEntry;
 use crate::ec::page_load::RowChange;
@@ -433,9 +434,11 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             return pending;
         }
         let entry = lookup.snapshot.entry_for(lookup.ec_id);
-        // A withdrawal tombstone or missing EID consent skips every provider.
-        let consented =
-            allows_eid_persistence(lookup.consent) && entry.is_none_or(|entry| entry.consent.ok);
+        // Missing EC or EID consent, or a withdrawal tombstone, skips every
+        // provider: a lookup discloses the EC ID before finalize could decline it.
+        let consented = ec_consent_granted(lookup.consent)
+            && allows_eid_persistence(lookup.consent)
+            && entry.is_none_or(|entry| entry.consent.ok);
         let deadline = Deadline::after(self.budget);
         pending.deadline = Some(deadline);
         for (index, registered) in self.providers.iter().enumerate() {
@@ -920,6 +923,53 @@ mod tests {
     }
 
     #[test]
+    fn missing_ec_consent_skips_every_provider() {
+        let coordinator = coordinator("");
+        let cases = [
+            (
+                "GPC opt-out in a US state",
+                ConsentContext {
+                    jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+                    gpc: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "unknown jurisdiction",
+                ConsentContext {
+                    jurisdiction: Jurisdiction::Unknown,
+                    ..Default::default()
+                },
+            ),
+            (
+                "GDPR without a TC string",
+                ConsentContext {
+                    jurisdiction: Jurisdiction::Gdpr,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (label, consent) in cases {
+            let transport = CannedTransport::new(ok_reply);
+            let mut entry = KvEntry::tombstone(1000);
+            entry.consent.ok = true;
+
+            let results = run(&coordinator, &transport, &seeded_snapshot(&entry), &consent);
+
+            assert_eq!(
+                only_status(&results),
+                LookupStatus::Skipped(SkipReason::Consent),
+                "should skip for {label}"
+            );
+            assert!(
+                transport.sent.borrow().is_empty(),
+                "should send nothing for {label}"
+            );
+        }
+    }
+
+    #[test]
     fn missing_tcf_vendor_consent_skips_before_building_a_request() {
         let coordinator = coordinator("tcf_vendor_id = 9999");
         let transport = CannedTransport::new(ok_reply);
@@ -942,6 +992,7 @@ mod tests {
         purposes[0] = true;
         purposes[3] = true;
         let consent = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
             gdpr_applies: true,
             tcf: Some(TcfConsent {
                 version: 2,
