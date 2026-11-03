@@ -959,8 +959,6 @@ async fn dispatch_fallback(
                 method: &method,
                 path: &path,
                 settings: &state.settings,
-                kv: ec.kv_graph.as_ref(),
-                ec_context: &mut ec.ec_context,
                 services,
                 req,
             })

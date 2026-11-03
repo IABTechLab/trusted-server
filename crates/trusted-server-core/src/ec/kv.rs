@@ -62,15 +62,6 @@ pub enum UpsertResult {
     Unchanged,
 }
 
-/// Outcome of atomically creating an identity-graph root when absent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CreateIfAbsentOutcome {
-    /// The candidate entry was persisted.
-    Written,
-    /// A row already exists for the candidate key.
-    AlreadyExists,
-}
-
 /// Partner UID update to apply to a KV identity graph entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartnerIdUpdate {
@@ -338,23 +329,6 @@ impl KvIdentityGraph {
             EcKvWriteOutcome::PreconditionFailed => {
                 Err(self.kv_error(format!("Key '{}' already exists", log_id(ec_id))))
             }
-        }
-    }
-
-    /// Atomically creates an entry while preserving collision as normal control flow.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::KvStore`] when serialization or store I/O fails.
-    pub fn create_if_absent(
-        &self,
-        ec_id: &str,
-        entry: &KvEntry,
-    ) -> Result<CreateIfAbsentOutcome, Report<TrustedServerError>> {
-        let (body, meta_str) = Self::serialize_entry(entry, self.store_name())?;
-        match self.write_entry(ec_id, &body, &meta_str, ENTRY_TTL, EcKvWriteMode::Add)? {
-            EcKvWriteOutcome::Written => Ok(CreateIfAbsentOutcome::Written),
-            EcKvWriteOutcome::PreconditionFailed => Ok(CreateIfAbsentOutcome::AlreadyExists),
         }
     }
 
@@ -1743,34 +1717,6 @@ mod tests {
         assert!(
             format!("{err}").contains("already exists"),
             "should report duplicate key"
-        );
-    }
-
-    #[test]
-    fn create_if_absent_reports_written_and_collision() {
-        let kv = KvIdentityGraph::in_memory("test_store");
-        let ec_id = format!("{}.ABC123", "a".repeat(64));
-
-        assert_eq!(
-            kv.create_if_absent(&ec_id, &live_entry())
-                .expect("should create absent entry"),
-            CreateIfAbsentOutcome::Written
-        );
-        assert_eq!(
-            kv.create_if_absent(&ec_id, &live_entry())
-                .expect("should report collision"),
-            CreateIfAbsentOutcome::AlreadyExists
-        );
-    }
-
-    #[test]
-    fn create_if_absent_propagates_store_error() {
-        let kv = KvIdentityGraph::failing("test_store");
-        let ec_id = format!("{}.ABC123", "a".repeat(64));
-
-        assert!(
-            kv.create_if_absent(&ec_id, &live_entry()).is_err(),
-            "should preserve store failures instead of reporting a collision"
         );
     }
 

@@ -817,15 +817,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
                 handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback)
             } else if state.registry.has_route(&method, &path) {
-                let mut ec_context = EcContext::default();
                 state
                     .registry
                     .handle_proxy(ProxyDispatchInput {
                         method: &method,
                         path: &path,
                         settings: &state.settings,
-                        kv: None,
-                        ec_context: &mut ec_context,
                         services: &services,
                         req,
                     })

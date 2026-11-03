@@ -1,8 +1,8 @@
 //! Shared EID resolution and formatting helpers.
 //!
-//! Used by both `/_ts/api/v1/identify` and `/auction` to resolve source-domain
-//! keyed IDs from KV entries, convert them to `OpenRTB` EID structures, and
-//! build base64-encoded response headers.
+//! Used by both `/_ts/api/v1/identify` and `/auction` to view source-domain
+//! keyed IDs from KV entries as `OpenRTB` EID structures, and to build
+//! base64-encoded response headers.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use error_stack::{Report, ResultExt as _};
@@ -16,67 +16,6 @@ use super::registry::PartnerRegistry;
 
 /// Maximum size (in bytes) for the base64-encoded `x-ts-eids` header value.
 pub const MAX_EIDS_HEADER_BYTES: usize = 4096;
-
-/// A source-domain keyed ID resolved from a KV entry against the partner registry.
-///
-/// Only includes partners with `bidstream_enabled = true` and a non-empty UID.
-pub struct ResolvedPartnerId {
-    /// The partner's identity source domain and EC KV `ids` key.
-    pub source_domain: String,
-    /// The synced user ID value.
-    pub uid: String,
-    /// `OpenRTB` agent type for this partner's identifiers.
-    pub openrtb_atype: i32,
-}
-
-/// Resolves source-domain keyed IDs from a KV entry against the partner registry.
-///
-/// Filters to partners with `bidstream_enabled = true` and non-empty UIDs,
-/// sorted deterministically by source domain.
-#[must_use]
-pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<ResolvedPartnerId> {
-    let mut resolved = Vec::new();
-
-    for (source_domain, partner_uid) in &entry.ids {
-        if partner_uid.uid.is_empty() {
-            continue;
-        }
-
-        let Some(partner) = registry.get(source_domain) else {
-            continue;
-        };
-        if !partner.bidstream_enabled {
-            continue;
-        }
-
-        resolved.push(ResolvedPartnerId {
-            source_domain: partner.source_domain.clone(),
-            uid: partner_uid.uid.clone(),
-            openrtb_atype: partner.openrtb_atype,
-        });
-    }
-
-    resolved.sort_by(|a, b| a.source_domain.cmp(&b.source_domain));
-    resolved
-}
-
-/// Converts resolved partner IDs to `OpenRTB` `Eid` entries.
-#[must_use]
-pub fn to_eids(resolved: &[ResolvedPartnerId]) -> Vec<Eid> {
-    resolved
-        .iter()
-        .map(|item| {
-            Eid::new(
-                item.source_domain.clone(),
-                vec![Uid {
-                    id: item.uid.clone(),
-                    atype: Some(item.openrtb_atype),
-                    ext: None,
-                }],
-            )
-        })
-        .collect()
-}
 
 /// A borrowed EID entry: a single legacy UID or a full-fidelity provider entry.
 #[derive(Debug, Clone, Copy)]
@@ -179,28 +118,11 @@ impl KvEntry {
     }
 }
 
-/// Builds a base64-encoded EID header value, truncating if needed.
-///
-/// Returns `(encoded_value, was_truncated)`. If the full set of EIDs exceeds
-/// [`MAX_EIDS_HEADER_BYTES`] after base64 encoding, partners are removed
-/// from the end of the deterministic partner ordering until it fits.
-///
-/// # Errors
-///
-/// Returns an error if JSON serialization fails.
-pub fn build_eids_header(
-    resolved: &[ResolvedPartnerId],
-) -> Result<(String, bool), Report<TrustedServerError>> {
-    let eids = to_eids(resolved);
-    encode_eids_header(&eids)
-}
-
 /// Encodes a pre-built EID slice into a base64 header value with truncation.
 ///
-/// Like [`build_eids_header`] but operates on already-constructed `Eid` values
-/// (e.g., from `UserInfo.eids` in the auction response path).
-///
-/// Returns `(encoded_value, was_truncated)`.
+/// Returns `(encoded_value, was_truncated)`. If the full set of EIDs exceeds
+/// [`MAX_EIDS_HEADER_BYTES`] after base64 encoding, EIDs are removed from the
+/// end until it fits.
 ///
 /// # Errors
 ///
@@ -273,89 +195,30 @@ mod tests {
         }
     }
 
+    fn header_eid(source_domain: String, uid: String) -> Eid {
+        Eid::new(
+            source_domain,
+            vec![Uid {
+                id: uid,
+                atype: Some(3),
+                ext: None,
+            }],
+        )
+    }
+
     #[test]
-    fn resolve_partner_ids_sorts_by_source_domain() {
-        let partners = vec![
-            make_test_partner("zeta.example.com"),
-            make_test_partner("alpha.example.com"),
-        ];
-        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
-
-        let mut entry = KvEntry::tombstone(1000);
-        entry.consent.ok = true;
-        entry.ids.insert(
-            "zeta.example.com".to_owned(),
-            super::super::kv_types::KvPartnerId::single("uid-z".to_owned()),
-        );
-        entry.ids.insert(
-            "alpha.example.com".to_owned(),
-            super::super::kv_types::KvPartnerId::single("uid-a".to_owned()),
-        );
-
-        let resolved = resolve_partner_ids(&registry, &entry);
-        let source_domains: Vec<&str> = resolved
-            .iter()
-            .map(|item| item.source_domain.as_str())
+    fn encode_eids_header_truncates_when_too_large() {
+        let eids: Vec<Eid> = (0..64)
+            .map(|idx| {
+                header_eid(
+                    format!("partner-{idx}.example.com"),
+                    format!("uid_{}", "x".repeat(100)),
+                )
+            })
             .collect();
 
-        assert_eq!(
-            source_domains,
-            vec!["alpha.example.com", "zeta.example.com"],
-            "should sort deterministically by source domain"
-        );
-    }
-
-    #[test]
-    fn to_eids_maps_resolved_ids_correctly() {
-        let resolved = vec![
-            ResolvedPartnerId {
-                uid: "LR_xyz".to_owned(),
-                source_domain: "liveramp.com".to_owned(),
-                openrtb_atype: 3,
-            },
-            ResolvedPartnerId {
-                uid: "ID5_abc".to_owned(),
-                source_domain: "id5-sync.com".to_owned(),
-                openrtb_atype: 1,
-            },
-            ResolvedPartnerId {
-                uid: "pair-id".to_owned(),
-                source_domain: "google.com".to_owned(),
-                openrtb_atype: 571187,
-            },
-        ];
-
-        let eids = to_eids(&resolved);
-
-        assert_eq!(eids.len(), 3, "should produce one EID per resolved partner");
-        assert_eq!(eids[0].source, "liveramp.com");
-        assert_eq!(eids[0].uids[0].id, "LR_xyz");
-        assert_eq!(eids[0].uids[0].atype, Some(3));
-        assert_eq!(eids[1].source, "id5-sync.com");
-        assert_eq!(eids[1].uids[0].id, "ID5_abc");
-        assert_eq!(eids[1].uids[0].atype, Some(1));
-        assert_eq!(eids[2].source, "google.com", "should preserve PAIR source");
-        assert_eq!(eids[2].uids[0].id, "pair-id", "should preserve PAIR ID");
-        assert_eq!(
-            eids[2].uids[0].atype,
-            Some(571187),
-            "should preserve PAIR vendor-specific atype"
-        );
-    }
-
-    #[test]
-    fn build_eids_header_truncates_when_too_large() {
-        let mut resolved = Vec::new();
-        for idx in 0..64 {
-            resolved.push(ResolvedPartnerId {
-                uid: format!("uid_{}", "x".repeat(100)),
-                source_domain: format!("partner-{idx}.example.com"),
-                openrtb_atype: 3,
-            });
-        }
-
         let (encoded, truncated) =
-            build_eids_header(&resolved).expect("should build truncated header");
+            encode_eids_header(&eids).expect("should build truncated header");
 
         assert!(truncated, "should report truncation for large payload");
         assert!(
@@ -365,15 +228,11 @@ mod tests {
     }
 
     #[test]
-    fn build_eids_header_fits_without_truncation() {
-        let resolved = vec![ResolvedPartnerId {
-            uid: "u1".to_owned(),
-            source_domain: "ssp.com".to_owned(),
-            openrtb_atype: 3,
-        }];
+    fn encode_eids_header_fits_without_truncation() {
+        let eids = vec![header_eid("ssp.example.com".to_owned(), "u1".to_owned())];
 
         let (encoded, truncated) =
-            build_eids_header(&resolved).expect("should build header without truncation");
+            encode_eids_header(&eids).expect("should build header without truncation");
 
         assert!(!truncated, "should not truncate small payload");
         assert!(!encoded.is_empty(), "should produce non-empty value");

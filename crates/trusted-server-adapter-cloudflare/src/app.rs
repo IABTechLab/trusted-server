@@ -535,15 +535,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     EdgeCacheHeader::CloudflareCdnCacheControl,
                 )
             } else if state.registry.has_route(&method, &path) {
-                let mut ec_context = EcContext::default();
                 state
                     .registry
                     .handle_proxy(ProxyDispatchInput {
                         method: &method,
                         path: &path,
                         settings: &state.settings,
-                        kv: None,
-                        ec_context: &mut ec_context,
                         services: &services,
                         req,
                     })
