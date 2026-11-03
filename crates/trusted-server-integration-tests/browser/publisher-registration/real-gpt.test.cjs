@@ -4,6 +4,7 @@ const { mkdtempSync, writeFileSync, rmSync, readFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 const { join } = require("node:path");
 const {
+  GPT_SCRIPT,
   inventory,
   options,
   decodeAdRequest,
@@ -233,14 +234,31 @@ test("generated dedicated app config retains real proxy/provider and excludes fa
     9999,
   );
   assert.match(app, /rewrite_script = true/);
-  assert.match(app, /origin_url = "http:\/\/127.0.0.1:9999"/);
-  assert.match(
-    app,
-    /endpoint = "https:\/\/auction.example.com\/api\/fixture-auction"/,
+  const setting = (name) => {
+    const prefix = `${name} = `;
+    return JSON.parse(
+      app
+        .split("\n")
+        .find((line) => line.startsWith(prefix))
+        .slice(prefix.length),
+    );
+  };
+  assert.equal(setting("origin_url"), "http://127.0.0.1:9999");
+  assert.equal(
+    setting("endpoint"),
+    "https://auction.example.com/api/fixture-auction",
   );
+  assert.equal(setting("script_url"), GPT_SCRIPT);
+  assert.deepEqual(setting("allowed_domains"), [
+    "localhost",
+    "127.0.0.1",
+    "auction.example.com",
+    "assets.example.com",
+    new URL(GPT_SCRIPT).hostname,
+  ]);
   assert.match(app, /publisher-registration-real-gpt/);
   assert.match(app, /initialization = "publisher_registered"/);
-  assert.doesNotMatch(app, /fixture-auto|ads.example.com|debug_bid/);
+  assert.doesNotMatch(app, /fixture-auto|debug_bid/);
   assert.equal(
     (app.match(/\[\[creative_opportunities.slot\]\]/g) || []).length,
     1,

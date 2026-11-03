@@ -359,9 +359,16 @@ function appConfig(template, input, prebid, originPort, legacy = false) {
     );
   text += `[[creative_opportunities.slot]]\nid = "fixture-header"\n${legacy ? "" : 'initialization = "publisher_registered"\n'}gam_unit_path = ${JSON.stringify(config.registered.path)}\ndiv_id = "${legacy ? "real-gpt-ssr" : "real-gpt-"}"\npage_patterns = ["/publisher-registration-real-gpt", "/publisher-registration-real-gpt/*"]\nformats = [{ width = 300, height = 250 }${legacy ? ", { width = 300, height = 600 }" : ""}]\n\n[creative_opportunities.slot.providers.prebid.bidders.fixture-bidder]\nplacement = "fixture-header"\n\n[debug]\ninject_adm_for_testing = false\n`;
   assert.ok(text.includes("rewrite_script = true"));
+  const setting = (name) => {
+    const prefix = `${name} = `;
+    const line = text.split("\n").find((entry) => entry.startsWith(prefix));
+    assert.ok(line, `missing fixture setting ${name}`);
+    return JSON.parse(line.slice(prefix.length));
+  };
+  assert.equal(setting("script_url"), config.gptScriptUrl);
   assert.ok(
-    !text.includes("ads.example.com"),
-    "fake GPT backend must not appear in dedicated config",
+    !setting("allowed_domains").some((host) => host === "ads.example.com"),
+    "fake GPT backend must not appear in configured hosts",
   );
   return text;
 }

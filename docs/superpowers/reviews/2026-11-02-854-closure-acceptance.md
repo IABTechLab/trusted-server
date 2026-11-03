@@ -160,6 +160,12 @@ The final async launcher passes actual no-Google `--prepare` against the stamped
 
 Evidence: `final-all-node.log`, `acceptance-boundary-final.log`, `type-only-final-eslint.log`, `final-servable-byte-proof.json`, `real-gpt-preparation-final/`, `real-gpt-no-browser-cleanup-proof.json`, `runtime-signal-proof.json` and their executable scratch commands. Independent read-only correctness reviews checked the real-GPT observations, provenance controller, type-only boundary and live-runner cleanup changes, with no remaining findings after corrections. Actual Google/GAM delivery remains unverified.
 
+## Hosted fixture findings and focused follow-up
+
+The first hosted JavaScript scan flagged four new fixture operations. The proxy now constructs connection hostname/port only from the server-created exact-origin map, never the incoming URL. Its upstream path remains request-derived and its response/cache semantics remain unchanged. Tests verify exact request method/path/host/body at the upstream separately from a fixed plain-text response, rather than reflecting request data. Real-GPT configuration assertions now parse the generated scalar/host-list values and compare exact endpoints instead of substring/hostname-regex checks. No suppressions or global allowlist changes are added.
+
+All 82 Node checks pass after these changes. Four cold browser regressions and a 32-case warm run pass, including genuine cache reuse and the original-main comparison. Candidate and original-main emitted app configs are byte-identical before/after the assertion changes; production JS, HTML and WASM remain unchanged. Evidence: `codeql-fixture-units.log`, `codeql-cold-regressions/`, `codeql-warm-regressions/` and `codeql-fixture-proof.json`. The original five-condition timings are retained as historical executions, not relabeled as this follow-up. Hosted analysis is separate and must be checked on the pushed head.
+
 Dedicated inventory must provide two distinct test ad-unit paths, known TS and ordinary creative IDs, and their visible markers. No customer inventory or guessed public sample placement substitutes for this setup. See the [real-GPT guide](../../../crates/trusted-server-integration-tests/browser/publisher-registration/real-gpt.README.md).
 
 Do not add an automatic issue-closing keyword, mark the PR ready, or claim closure while a required functional gate is blocked/failed or the measured warm-cache regression remains unresolved. No deployment or publisher activation is part of this local test run.

@@ -3,7 +3,7 @@ const http = require("node:http");
 // Proxy forwarding preserves Chromium's native HTTP cache. Only the two exact
 // fixture origins may reach an upstream connection, regardless of browser bypass.
 function fixtureProxy(origins, record) {
-  const allowed = new Set(origins);
+  const allowed = new Map(origins.map((origin) => [origin, new URL(origin)]));
   const server = http.createServer((request, response) => {
     let target;
     try {
@@ -19,7 +19,8 @@ function fixtureProxy(origins, record) {
       response.end("External network forbidden in CWV fixture");
       return;
     }
-    if (!allowed.has(target.origin) || target.protocol !== "http:") {
+    const destination = allowed.get(target.origin);
+    if (!destination || target.protocol !== "http:") {
       record({
         url: target.href,
         method: request.method,
@@ -36,11 +37,18 @@ function fixtureProxy(origins, record) {
       action: "forwarded",
     };
     record(entry);
-    const headers = { ...request.headers, host: target.host };
+    const headers = { ...request.headers, host: destination.host };
     delete headers["proxy-connection"];
+    // Connection fields come only from the server-created origin map. The
+    // request contributes a path, never an upstream hostname or port.
     const upstream = http.request(
-      target,
-      { method: request.method, headers },
+      {
+        hostname: destination.hostname,
+        port: destination.port,
+        path: target.pathname + target.search,
+        method: request.method,
+        headers,
+      },
       (incoming) => {
         entry.status = incoming.statusCode;
         response.writeHead(incoming.statusCode, incoming.headers);

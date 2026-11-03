@@ -4503,5 +4503,27 @@
         }
       }
     }
+  },
+  "postHostedFixtureValidation": {
+    "measuredProxySha256": "ad6600d2ed80394f79b1eea74c5c945a3e278330f4c10752cc84c51ea5c9cc27",
+    "currentProxySha256": "dcae99e59be2488ea4a3cb946e32ad1e51bcab566eeb9f93a5b2fb21636346fa",
+    "connectionBoundary": "Same exact server-created origin allowlist and wire/cache behavior; connection hostname/port now selected only from trusted origin entries.",
+    "configurationModes": [
+      {
+        "legacy": false,
+        "appConfigByteIdentical": true,
+        "sha256": "bd04c6be7c2ed02f89ef46eadb7352046df5e6c6df6592ba51da48def53c7dbc"
+      },
+      {
+        "legacy": true,
+        "appConfigByteIdentical": true,
+        "sha256": "63dfd3ba4751ec50fca1bcee3646d538c9d4f64ff72a49d06baeb6b04e455bdf"
+      }
+    ],
+    "nodeTestsPassed": 82,
+    "coldBrowserChecks": 4,
+    "warmBrowserChecks": 32,
+    "productionInputsChanged": false,
+    "originalTimingSamplesReexecuted": false
   }
 }
