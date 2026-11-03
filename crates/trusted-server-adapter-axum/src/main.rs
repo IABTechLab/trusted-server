@@ -56,9 +56,12 @@ fn main() {
 /// Capture hosting inputs and validate the final provider selection before startup.
 fn native_options() -> Result<AxumRunOptions, String> {
     let selection = load_selection().map_err(|error| error.to_string())?;
+    #[cfg(feature = "lab-store-check")]
+    let options = trusted_server_adapter_axum::lab_store_check::native_options_from_env()?;
+    #[cfg(not(feature = "lab-store-check"))]
     let options = AxumRunOptions::from_env()
-        .map_err(|_| "native hosting environment is invalid".to_owned())?
-        .with_geo(selection);
+        .map_err(|_| "native hosting environment is invalid".to_owned())?;
+    let options = options.with_geo(selection);
     options
         .geo_capability()
         .map_err(|error| error.to_string())?;

@@ -15,8 +15,8 @@ use trusted_server_core::config_payload::{
 };
 use trusted_server_core::integrations::datadome::{DataDomeConfig, ProtectionMatcherConfig};
 use trusted_server_core::platform::{
-    PlatformConfigStore, PlatformError, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
-    UnavailableHttpClient, UnavailableKvStore,
+    PlatformConfigStore, PlatformError, PlatformKvStore, PlatformSecretStore, RuntimeServices,
+    StoreId, StoreName, UnavailableHttpClient, UnavailableKvStore,
 };
 use trusted_server_core::settings::Settings;
 
@@ -32,6 +32,7 @@ use crate::platform::{AxumPlatformBackend, AxumPlatformGeo, geo_from_outcome};
 pub struct NativeStoreSnapshot {
     pub(crate) config_store: Arc<dyn PlatformConfigStore>,
     pub(crate) secret_store: Arc<dyn PlatformSecretStore>,
+    pub(crate) kv_store: Arc<dyn PlatformKvStore>,
 }
 
 struct ConfigSnapshot {
@@ -185,6 +186,16 @@ fn validate_snapshot_consumers(settings: &Settings) -> Result<(), EdgeError> {
 /// # Panics
 /// Panics if newly constructed application state unexpectedly has another owner.
 pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result<(), EdgeError> {
+    #[cfg(feature = "celld-kv")]
+    let kv_store = stores
+        .kv()
+        .and_then(|registry| registry.named(crate::kv::STATE_STORE_ID))
+        .map(crate::kv::PreparedKvStore::shared)
+        .ok_or_else(|| configuration_error(
+            "required declared KV store trusted_server_state is not prepared; local fallback is disabled",
+        ))?;
+    #[cfg(not(feature = "celld-kv"))]
+    let kv_store: Arc<dyn PlatformKvStore> = Arc::new(UnavailableKvStore);
     let limits = app.config_extraction_limits().validate()?;
     let clock = app.monotonic_clock();
     let deadline = clock.deadline_after(limits.timeout);
@@ -261,6 +272,16 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
         .map_err(settings_error)?;
     validate_snapshot_consumers(&settings)?;
     let mut state = build_state_with_settings(settings).map_err(settings_error)?;
+    #[cfg(feature = "lab-store-check")]
+    {
+        let adopted: edgezero_core::blob_envelope::BlobEnvelope =
+            serde_json::from_str(envelope.as_ref()).map_err(|_| {
+                configuration_error("verified config envelope could not be decoded")
+            })?;
+        Arc::get_mut(&mut state)
+            .expect("should uniquely own initializing app state")
+            .config_sha256 = Some(adopted.sha256);
+    }
     // EC records stay live. Only the validated provider handle is shared, never
     // mutable identity rows in the immutable config/secret snapshot.
     if let Some(provider) = crate::ec_kv::prepare_from_env().await? {
@@ -279,6 +300,7 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
             envelope: envelope.to_string(),
         }),
         secret_store,
+        kv_store,
     });
     let finalize_settings = Arc::clone(&state.settings);
     app.set_admitted_error_response_finalizer(move |outcome, response| {

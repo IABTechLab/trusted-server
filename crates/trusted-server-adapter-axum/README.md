@@ -23,3 +23,61 @@ Run the isolated first-success check with `./scripts/smoke-axum.sh`. See the
 secret handoff, negative cases, success oracle, and cleanup behavior. Shared
 runtime behavior belongs in
 [`trusted-server-core`](../trusted-server-core/README.md), not this adapter.
+
+## Native celld lab variant
+
+The AWS RC's prepared-store startup is also available with the default-off
+`celld-config`, `celld-kv`, and `lab-store-check` features. This variant loads a
+verified config envelope before listening and retains live
+`trusted_server_state` KV through production `RuntimeServices`. It does not
+implement EC conditional storage or enable auctions. Default builds retain the
+previous generic-KV-unavailable behavior.
+
+Use `edgezero.lab.toml` for matching CLI store metadata. Keep the root manifest
+for non-lab builds. `lab-store-check` requires explicit `celld-config` and
+`celld-kv` bindings for `trusted_server_config` and `trusted_server_state` in
+`EDGEZERO__STORE_BINDINGS_FILE`. Incomplete selections fail before preparation;
+there is no local config/redb fallback. Native secret references still use
+`EDGEZERO__SECRETS__*`.
+
+The diagnostic is `/_ts/admin/lab/store-check`, under the existing mandatory
+admin handler. PUT accepts `{"value":"proof"}` and checks read-back, GET reads
+without writing, and DELETE checks absence. All use the fixed key
+`ts-lab/store-check`. Success JSON contains `config_sha256`, `scheme`, `host`,
+`key`, and nullable `value`. The checksum is the adopted envelope's payload
+checksum before secret resolution. Scheme/host come only from checked native
+ingress, not raw forwarding headers. Responses are not cacheable. Provider
+failures return non-success without credentials or remote response bodies.
+
+Build the app with the root Dockerfile and
+`--build-arg NATIVE_FEATURES=celld-config,celld-kv,lab-store-check`. The default
+final target runs the app as UID/GID 10001. Inject the binding file at an
+absolute path readable by that UID. No `/config` or `/data` root is implicitly
+configured by the image. `docker build --target cli` builds the matching
+operator CLI at `/usr/local/bin/ts`; it is not a deployment CLI extension.
+
+On Linux the pinned celld provider uses reqwest 0.13's platform verifier and
+native CA loader. A deployment-injected public CA can be selected with
+`SSL_CERT_FILE=/etc/ts-lab/ca.pem`; the file must be readable by UID 10001.
+Keep TLS verification enabled. The diagnostic does not add a fixed-public-origin
+option or change trusted proxy policy. Fly HTTPS scheme/host acceptance must be
+proved separately.
+
+Run the actual disposable-service proof with dummy tokens and a native TLS
+scoped service granting config read/write to the operator and config read plus
+state read/write/delete/list to the runtime:
+
+```bash
+export TS_TEST_CELLD_ENDPOINT=https://127.0.0.1:7780
+export TS_TEST_CELLD_CA=/path/to/disposable-public-ca.pem
+# Supply TS_TEST_CELLD_RUNTIME_TOKEN and TS_TEST_CELLD_OPERATOR_TOKEN privately.
+cargo test --locked -p trusted-server-adapter-axum \
+  --target x86_64-unknown-linux-gnu \
+  --features celld-config,celld-kv,lab-store-check \
+  --test native_celld -- --include-ignored
+```
+
+This uses service aliases `ts-config` and `ts-state`. It publishes synthetic,
+auction-disabled envelopes and exercises the actual TS binary, immutable
+config adoption, authenticated diagnostic, independent KV read-back, restart
+retention, and failures. It is not a hosted persistence or Fly ingress proof.

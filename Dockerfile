@@ -5,7 +5,7 @@ FROM rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288
 COPY --from=node /usr/local/ /usr/local/
 WORKDIR /src
 COPY . .
-# AWS providers and CloudFront Geo are default-off. Forward them explicitly.
+# Native providers and lab diagnostics are default-off. Forward them explicitly.
 ARG NATIVE_FEATURES=""
 # Optional existing build metadata input; .git never enters the build context.
 ARG TRUSTED_SERVER__GIT_VERSION=""
@@ -19,8 +19,8 @@ feature_ifs=$IFS
 IFS=,
 for feature in $NATIVE_FEATURES; do
   case "$feature" in
-    aws-appconfig-agent|aws-secrets-manager|aws-dynamodb-ec|geo-cloudfront) ;;
-    *) echo 'Only the declared native AWS store and CloudFront Geo features are supported' >&2; exit 1 ;;
+    aws-appconfig-agent|aws-secrets-manager|aws-dynamodb-ec|geo-cloudfront|celld-config|celld-kv|lab-store-check) ;;
+    *) echo 'Only the declared native store, Geo and lab diagnostic features are supported' >&2; exit 1 ;;
   esac
 done
 IFS=$feature_ifs
@@ -44,18 +44,29 @@ SH
 RUN find . -type d \( -name target -o -name node_modules \) -prune -o -type f ! -name .tsjs-npm-ci.lock -print0 \
     | sort -z | xargs -0 sha256sum > /out/build-inputs.sha256
 
-FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
+FROM builder AS cli-builder
+RUN host=$(rustc -vV | awk '$1 == "host:" {print $2}') \
+    && cargo build -p trusted-server-cli --bin ts --release --locked --target "$host" \
+    && cp "target/$host/release/ts" /out/ts \
+    && strip --strip-debug /out/ts
+
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime-base
 RUN apt-get update \
     && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
+# Optional matching operator CLI: --target cli.
+FROM runtime-base AS cli
+COPY --from=cli-builder /out/ts /usr/local/bin/ts
+ENTRYPOINT ["/usr/local/bin/ts"]
+
+# Keep the application as the default final target.
+FROM runtime-base AS runtime
 WORKDIR /app
 COPY --from=builder /out/app /usr/local/bin/app
 COPY --from=builder /out/build-inputs.sha256 /usr/local/share/ts-build-inputs.sha256
 ENV EDGEZERO__ADAPTER__HOST=0.0.0.0 \
-    EDGEZERO__ADAPTER__PORT=8787 \
-    EDGEZERO__ADAPTER__CONFIG_DIR=/config \
-    EDGEZERO__ADAPTER__DATA_DIR=/data
+    EDGEZERO__ADAPTER__PORT=8787
 USER 10001:10001
 EXPOSE 8787
 STOPSIGNAL SIGTERM

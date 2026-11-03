@@ -1,0 +1,28 @@
+# Explicit native lab metadata. Build with celld-config,celld-kv,lab-store-check.
+# Serving requires explicit celld bindings; local export is only an intermediate.
+[app]
+name = "trusted-server"
+entry = "crates/trusted-server-core"
+kind = "http"
+version = "0.1.0"
+
+[stores.config]
+ids = ["trusted_server_config"]
+default = "trusted_server_config"
+
+[stores.secrets]
+ids = ["trusted_server_secrets"]
+default = "trusted_server_secrets"
+
+[stores.kv]
+ids = ["trusted_server_state"]
+default = "trusted_server_state"
+
+[adapters.axum.adapter]
+crate = "crates/trusted-server-adapter-axum"
+manifest = "crates/trusted-server-adapter-axum/axum.toml"
+
+[adapters.axum.build]
+target = "native"
+profile = "release"
+features = ["celld-config", "celld-kv", "lab-store-check"]

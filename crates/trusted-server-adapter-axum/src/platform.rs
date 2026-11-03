@@ -10,7 +10,7 @@ use error_stack::{Report, ResultExt as _};
 use trusted_server_core::http_util::RequestInfo;
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformError,
-    PlatformGeo, PlatformKvStore, RuntimeServices, UnavailableKvStore,
+    PlatformGeo, RuntimeServices,
 };
 
 pub use crate::outbound::AxumPlatformHttpClient;
@@ -124,8 +124,9 @@ pub(crate) fn apply_native_ingress(request: &mut Request) -> Result<(), EdgeErro
 ///
 /// The RC client and application clock come from the incoming request. Only
 /// dependency handles are shared; checked visitor metadata is read afresh.
-/// Generic KV remains unavailable. Geography is captured before converting the
-/// managed context back into an ordinary request and never resolved again.
+/// Generic KV uses the retained prepared handle when selected. Geography is
+/// captured before converting the managed context back into an ordinary request
+/// and never resolved again.
 ///
 /// # Errors
 /// Returns an error when startup has not installed the store snapshot or the
@@ -149,13 +150,12 @@ pub fn build_runtime_services(
         .get::<NativeIngressMetadata>()
         .and_then(NativeIngressMetadata::effective_client);
 
-    static KV: OnceLock<Arc<dyn PlatformKvStore>> = OnceLock::new();
     static BACKEND: OnceLock<Arc<dyn PlatformBackend>> = OnceLock::new();
 
     Ok(RuntimeServices::builder()
         .config_store(Arc::clone(&snapshot.config_store))
         .secret_store(Arc::clone(&snapshot.secret_store))
-        .kv_store(Arc::clone(KV.get_or_init(|| Arc::new(UnavailableKvStore))))
+        .kv_store(Arc::clone(&snapshot.kv_store))
         .backend(Arc::clone(
             BACKEND.get_or_init(|| Arc::new(AxumPlatformBackend)),
         ))

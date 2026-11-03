@@ -8,6 +8,12 @@
 pub mod app;
 /// Native live DynamoDB conditional identity storage and provider selection.
 pub mod ec_kv;
+/// Prepared native KV bridge.
+#[cfg(feature = "celld-kv")]
+pub mod kv;
+/// Existing-admin-protected lab storage diagnostic.
+#[cfg(feature = "lab-store-check")]
+pub mod lab_store_check;
 /// Request middleware (auth, response finalisation).
 pub mod middleware;
 /// Explicit native Geo boot profile and provider composition.

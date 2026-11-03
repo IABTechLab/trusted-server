@@ -13,6 +13,10 @@ entry = "crates/trusted-server-core"
 kind = "http"
 version = "0.1.0"
 
+# The default manifest deliberately preserves the non-lab store set. The
+# celld-enabled Axum variant declares trusted_server_state in Hooks::stores();
+# use edgezero.lab.toml for matching CLI validation/export metadata.
+
 # -- Stores ------------------------------------------------------------------
 # Logical store ids only. These are the portable Trusted Server names; the
 # physical store each adapter binds is overridable out of band (Fastly binds

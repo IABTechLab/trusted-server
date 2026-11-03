@@ -24,9 +24,13 @@ aws-appconfig-agent = ["edgezero-adapter-axum/aws-appconfig-agent"]
 aws-secrets-manager = ["edgezero-adapter-axum/aws-secrets-manager"]
 aws-dynamodb-ec = ["dep:aws-config", "dep:aws-sdk-dynamodb"]
 geo-cloudfront = ["edgezero-adapter-axum/geo-cloudfront"]
+celld-config = ["edgezero-adapter-axum/celld-config"]
+celld-kv = ["edgezero-adapter-axum/celld-kv"]
+lab-store-check = ["celld-config", "celld-kv"]
 
 [dependencies]
 async-trait = { workspace = true }
+bytes = { workspace = true }
 aws-config = { version = "=1.12.0", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
 aws-sdk-dynamodb = { version = "=1.120.0", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 edgezero-adapter-axum = { workspace = true, features = ["axum"] }
@@ -36,6 +40,7 @@ futures = { workspace = true }
 log = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

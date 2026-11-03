@@ -63,6 +63,8 @@ pub struct AppState {
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
     services: Option<RuntimeServices>,
+    #[cfg(feature = "lab-store-check")]
+    pub(crate) config_sha256: Option<String>,
     partners: PartnerRegistry,
     ec_graph: Option<Arc<dyn Fn() -> KvIdentityGraph + Send + Sync>>,
 }
@@ -83,6 +85,15 @@ fn build_state_with_services(
     settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    #[cfg(feature = "lab-store-check")]
+    if settings
+        .handler_for_path(crate::lab_store_check::PATH)?
+        .is_none()
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: "lab store diagnostic requires existing admin handler coverage".to_owned(),
+        }));
+    }
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
@@ -94,6 +105,8 @@ fn build_state_with_services(
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         services,
+        #[cfg(feature = "lab-store-check")]
+        config_sha256: None,
         partners,
         ec_graph: None,
     }))
@@ -175,6 +188,10 @@ where
 {
     let state = AppState::from_request(&ctx)?;
     let services = state.services_for_request(&ctx)?;
+    #[cfg(feature = "lab-store-check")]
+    if ctx.parts().method == Method::PUT && ctx.parts().uri.path() == crate::lab_store_check::PATH {
+        ctx.body_bytes(1_048_576).await?;
+    }
     if ctx.parts().method == Method::POST {
         let limit = match ctx.parts().uri.path() {
             trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH => {
@@ -500,6 +517,8 @@ enum NamedRouteHandler {
     CachePurgeNotSupported,
     AdminEcNotSupported,
     AdminEidsLookup,
+    #[cfg(feature = "lab-store-check")]
+    LabStoreCheck,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
@@ -529,8 +548,14 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 19] {
-    [
+fn named_routes() -> Vec<NamedRoute> {
+    vec![
+        #[cfg(feature = "lab-store-check")]
+        NamedRoute {
+            path: "/_ts/admin/lab/store-check",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::LabStoreCheck,
+        },
         NamedRoute {
             path: trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH,
             primary_methods: &[
@@ -715,6 +740,15 @@ fn named_route_handler(
                         // from the browser/server lifecycle.
                         Ok(admin_ec_lookup_not_supported())
                     }
+                    #[cfg(feature = "lab-store-check")]
+                    NamedRouteHandler::LabStoreCheck => {
+                        crate::lab_store_check::handle(
+                            &services,
+                            state.config_sha256.as_deref(),
+                            req,
+                        )
+                        .await
+                    }
                     NamedRouteHandler::AdminEidsLookup => {
                         handle_admin_eids_lookup(&state.partners, &req)
                     }
@@ -830,6 +864,12 @@ impl Hooks for TrustedServerApp {
                 default: DEFAULT_SECRET_STORE_ID,
                 ids: &[DEFAULT_SECRET_STORE_ID],
             }),
+            #[cfg(feature = "celld-kv")]
+            kv: Some(StoreMetadata {
+                default: crate::kv::STATE_STORE_ID,
+                ids: &[crate::kv::STATE_STORE_ID],
+            }),
+            #[cfg(not(feature = "celld-kv"))]
             kv: None,
         }
     }
