@@ -21,7 +21,7 @@ use self::transport::{
 };
 use self::validate::{ValidatedEntries, ValidationPolicy, validate};
 use crate::consent::ConsentContext;
-use crate::consent::{allows_eid_persistence, has_tcf_vendor_consent};
+use crate::consent::{allows_eid_persistence, tcf_vendor_consent_denied};
 use crate::ec::EcKvSnapshot;
 use crate::ec::consent::ec_consent_granted;
 use crate::ec::eid_types::{ProviderId, SourceDomain, UnixSeconds};
@@ -434,9 +434,12 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             return pending;
         }
         let entry = lookup.snapshot.entry_for(lookup.ec_id);
-        // Missing EC or EID consent, or a withdrawal tombstone, skips every
-        // provider: a lookup discloses the EC ID before finalize could decline it.
-        let consented = ec_consent_granted(lookup.consent)
+        // Missing EC or EID consent, a withdrawal tombstone, or an unreadable
+        // row (which may hide a tombstone) skips every provider: a lookup
+        // discloses the EC ID before finalize could decline it.
+        let readable = !matches!(lookup.snapshot, EcKvSnapshot::Failed { .. });
+        let consented = readable
+            && ec_consent_granted(lookup.consent)
             && allows_eid_persistence(lookup.consent)
             && entry.is_none_or(|entry| entry.consent.ok);
         let deadline = Deadline::after(self.budget);
@@ -450,7 +453,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             let vendor_denied = registered
                 .policy
                 .tcf_vendor_id
-                .is_some_and(|vendor| !has_tcf_vendor_consent(lookup.consent, vendor));
+                .is_some_and(|vendor| tcf_vendor_consent_denied(lookup.consent, vendor));
             if !consented || vendor_denied {
                 pending.early.push(skip(SkipReason::Consent));
                 continue;
@@ -970,28 +973,42 @@ mod tests {
     }
 
     #[test]
-    fn missing_tcf_vendor_consent_skips_before_building_a_request() {
-        let coordinator = coordinator("tcf_vendor_id = 9999");
+    fn failed_snapshot_skips_every_provider() {
+        let coordinator = coordinator("");
         let transport = CannedTransport::new(ok_reply);
+        let snapshot = EcKvSnapshot::Failed {
+            ec_id: EC_ID.to_owned(),
+        };
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &snapshot, &granting());
 
         assert_eq!(
             only_status(&results),
             LookupStatus::Skipped(SkipReason::Consent),
-            "should skip"
+            "should skip when the row could not be read"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
     }
 
     #[test]
-    fn granted_tcf_vendor_consent_allows_the_lookup() {
+    fn tcf_vendor_id_does_not_gate_traffic_without_tcf() {
         let coordinator = coordinator("tcf_vendor_id = 9999");
         let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &missing(), &granting());
+
+        assert!(
+            !matches!(only_status(&results), LookupStatus::Skipped(_)),
+            "should look up when no TCF string applies outside GDPR"
+        );
+        assert_eq!(transport.sent.borrow().len(), 1, "should send one request");
+    }
+
+    fn tcf_consent(vendor_consents: Vec<u16>) -> ConsentContext {
         let mut purposes = vec![false; 24];
         purposes[0] = true;
         purposes[3] = true;
-        let consent = ConsentContext {
+        ConsentContext {
             jurisdiction: Jurisdiction::Gdpr,
             gdpr_applies: true,
             tcf: Some(TcfConsent {
@@ -1006,14 +1023,40 @@ mod tests {
                 last_updated_ds: 0,
                 purpose_consents: purposes,
                 purpose_legitimate_interests: vec![false; 24],
-                vendor_consents: vec![9999],
+                vendor_consents,
                 vendor_legitimate_interests: Vec::new(),
                 special_feature_opt_ins: vec![false; 12],
             }),
             ..ConsentContext::default()
-        };
+        }
+    }
 
-        let results = run(&coordinator, &transport, &missing(), &consent);
+    #[test]
+    fn missing_tcf_vendor_consent_skips_before_building_a_request() {
+        let coordinator = coordinator("tcf_vendor_id = 9999");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &missing(), &tcf_consent(vec![1]));
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Consent),
+            "should skip"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn granted_tcf_vendor_consent_allows_the_lookup() {
+        let coordinator = coordinator("tcf_vendor_id = 9999");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(
+            &coordinator,
+            &transport,
+            &missing(),
+            &tcf_consent(vec![9999]),
+        );
 
         assert!(
             matches!(only_status(&results), LookupStatus::Found { .. }),

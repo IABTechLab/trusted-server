@@ -296,6 +296,15 @@ pub fn has_tcf_vendor_consent(ctx: &ConsentContext, vendor_id: NonZeroU16) -> bo
     effective_tcf(ctx).is_some_and(|tcf| tcf.has_vendor_consent(vendor_id.get()))
 }
 
+/// Whether TCF rules apply and withhold vendor consent from `vendor_id`.
+///
+/// Returns `false` when no TCF string applies and GDPR does not, so a TCF
+/// vendor requirement only gates traffic that TCF governs.
+#[must_use]
+pub fn tcf_vendor_consent_denied(ctx: &ConsentContext, vendor_id: NonZeroU16) -> bool {
+    (ctx.gdpr_applies || effective_tcf(ctx).is_some()) && !has_tcf_vendor_consent(ctx, vendor_id)
+}
+
 /// Returns whether a server-side auction may be dispatched for this request.
 ///
 /// Fails closed for GDPR-relevant traffic: when an EU TCF signal is present
