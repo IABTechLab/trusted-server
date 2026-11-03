@@ -9,14 +9,22 @@
 //! never stored, and no refresh is made server side.
 //!
 //! When `__uid_2` yields nothing, the cookies in `cookie_names` (default
-//! Prebid's `__uid2_advertising_token`) are read as a raw token with the
+//! Prebid's `__uid2_advertising_token`) are read. Prebid's UID2 module
+//! stores percent-encoded JSON there, `{"originalToken":…,"latestToken":…}`:
+//! only `latestToken.advertising_token` is stored, until
+//! `latestToken.identity_expires` (milliseconds) or with the shared default
+//! TTL when that is missing. Any other value is read as a raw token with the
 //! shared default TTL. With the Lockr capability enabled
 //! (`[settings.lockr]`), the cookies Lockr AIM writes the raw token into
 //! (default key `__uid2_advertising_token`) are read last, with the same
 //! parser.
 //!
+//! A `latestToken` of `"optout"` in any of those cookies reports an opt-out:
+//! no lookup is made and stored UID2 UIDs are removed.
+//!
 //! Parsing is lenient: an undecodable cookie, a missing token or expiry,
-//! or a blank or opt-out token reads as no ID.
+//! or a blank or opt-out token reads as no ID. A JSON value is never stored
+//! as a token.
 
 use std::borrow::Cow;
 
@@ -24,8 +32,8 @@ use error_stack::Report;
 use serde::Deserialize;
 use trusted_server_core::ec::eid_types::{SourceDomain, UnixSeconds};
 use trusted_server_core::ec::provider::{
-    IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities, ProviderCommon,
-    ProviderConfigError, ProviderEid, ProviderError, ProviderExpiry, ProviderKind, ProviderRequest,
+    CookieRead, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities, ProviderCommon,
+    ProviderConfigError, ProviderError, ProviderExpiry, ProviderKind, ProviderRequest,
     ProviderResponse, RequestCookies,
 };
 
@@ -117,11 +125,59 @@ fn identity(value: &str) -> Option<(String, ProviderExpiry)> {
     Some((cookie.advertising_token, ProviderExpiry::At(expires)))
 }
 
-/// Decodes one raw advertising token cookie.
-fn raw_token(value: &str) -> Option<(String, ProviderExpiry)> {
-    let token = percent_decoded(value);
-    let token = token.trim();
-    is_usable_id(token).then(|| (token.to_owned(), bounded_expiry(None)))
+/// `latestToken` value Prebid stores after an opt-out.
+const PREBID_OPT_OUT: &str = "optout";
+
+/// The fields of Prebid's stored tokens this provider reads.
+#[derive(Deserialize)]
+struct PrebidTokens {
+    #[serde(rename = "latestToken")]
+    latest_token: serde_json::Value,
+}
+
+/// The fields of Prebid's `latestToken` identity this provider reads.
+#[derive(Deserialize)]
+struct PrebidIdentity {
+    advertising_token: String,
+    #[serde(default)]
+    identity_expires: Option<u64>,
+}
+
+/// One token cookie's reading.
+enum TokenCookie {
+    /// A usable token and its expiry.
+    Token(String, ProviderExpiry),
+    /// Prebid recorded an opt-out.
+    OptedOut,
+}
+
+/// Decodes one token cookie: Prebid's stored tokens JSON or a raw token.
+///
+/// A JSON value is never taken as a raw token.
+fn token_cookie(value: &str) -> Option<TokenCookie> {
+    let decoded = percent_decoded(value);
+    let decoded = decoded.trim();
+    if decoded.starts_with('{') {
+        return prebid_tokens(decoded);
+    }
+    is_usable_id(decoded).then(|| TokenCookie::Token(decoded.to_owned(), bounded_expiry(None)))
+}
+
+/// Reads `latestToken` from Prebid's stored tokens JSON.
+fn prebid_tokens(json: &str) -> Option<TokenCookie> {
+    let tokens: PrebidTokens = serde_json::from_str(json).ok()?;
+    if tokens.latest_token.as_str() == Some(PREBID_OPT_OUT) {
+        return Some(TokenCookie::OptedOut);
+    }
+    let identity: PrebidIdentity = serde_json::from_value(tokens.latest_token).ok()?;
+    if !is_usable_id(&identity.advertising_token) {
+        return None;
+    }
+    let expiry = identity.identity_expires.map_or_else(
+        || bounded_expiry(None),
+        |ms| ProviderExpiry::At(UnixSeconds::new(ms / 1000)),
+    );
+    Some(TokenCookie::Token(identity.advertising_token, expiry))
 }
 
 impl IdentityProvider for Uid2Provider {
@@ -146,12 +202,27 @@ impl IdentityProvider for Uid2Provider {
     fn read_request_cookies<'cookie>(
         &self,
         cookies: RequestCookies<'cookie>,
-    ) -> Option<Vec<ProviderEid<'cookie>>> {
-        let (token, expiry) = cookies
+    ) -> CookieRead<'cookie> {
+        let opted_out = self.cookies.any(cookies, |value| {
+            matches!(token_cookie(value), Some(TokenCookie::OptedOut))
+        });
+        if opted_out {
+            return CookieRead::OptedOut;
+        }
+        let token = cookies
             .get(&self.identity_cookie_name)
             .and_then(identity)
-            .or_else(|| self.cookies.read(cookies, raw_token))?;
-        Some(vec![cookie_eid(&self.source, Cow::Owned(token), expiry)])
+            .or_else(|| {
+                self.cookies
+                    .read(cookies, |value| match token_cookie(value)? {
+                        TokenCookie::Token(token, expiry) => Some((token, expiry)),
+                        TokenCookie::OptedOut => None,
+                    })
+            });
+        let Some((token, expiry)) = token else {
+            return CookieRead::Absent;
+        };
+        CookieRead::Found(vec![cookie_eid(&self.source, Cow::Owned(token), expiry)])
     }
 }
 
@@ -175,7 +246,9 @@ mod tests {
     }
 
     fn read(provider: &dyn IdentityProvider, header: &str) -> Option<(String, ProviderExpiry)> {
-        let eids = provider.read_request_cookies(RequestCookies::new(header))?;
+        let eids = provider
+            .read_request_cookies(RequestCookies::new(header))
+            .into_found()?;
         assert_eq!(eids[0].source, "uid2.example.com", "should use the source");
         let uid = &eids[0].uids[0];
         assert_eq!(uid.atype, Some(3), "should be person-based");
@@ -220,6 +293,84 @@ mod tests {
             matches!(expiry, ProviderExpiry::After(_)),
             "should use the default TTL"
         );
+    }
+
+    fn prebid_cookie(tokens: &serde_json::Value) -> String {
+        format!(
+            "__uid2_advertising_token={}",
+            urlencoding::encode(&tokens.to_string())
+        )
+    }
+
+    #[test]
+    fn reads_the_latest_token_from_prebid_stored_tokens() {
+        let header = prebid_cookie(&json!({
+            "originalToken": {
+                "advertising_token": "AgAAAAoriginaltoken",
+                "identity_expires": 1_600_000_000_000_u64,
+            },
+            "latestToken": {
+                "advertising_token": "AgAAAAlatesttoken",
+                "refresh_token": "example-refresh-token",
+                "refresh_response_key": "example-response-key",
+                "identity_expires": 1_700_000_000_456_u64,
+                "refresh_from": 1_699_990_000_000_u64,
+                "refresh_expires": 1_702_000_000_000_u64,
+            },
+        }));
+
+        let (token, expiry) = read(&*provider(&json!({})), &header).expect("should read");
+
+        assert_eq!(
+            token, "AgAAAAlatesttoken",
+            "should store only the latest advertising token"
+        );
+        assert!(
+            matches!(expiry, ProviderExpiry::At(at) if at.get() == 1_700_000_000),
+            "should expire at the latest identity_expires"
+        );
+    }
+
+    #[test]
+    fn reports_a_prebid_opt_out() {
+        let provider = provider(&json!({}));
+        let own = identity_cookie(&json!({
+            "advertising_token": "AgAAAAowntoken",
+            "identity_expires": 1_700_000_000_000_u64,
+        }));
+        let opt_out = prebid_cookie(&json!({
+            "originalToken": { "advertising_token": "AgAAAAoriginaltoken" },
+            "latestToken": "optout",
+        }));
+
+        let header = format!("{own}; {opt_out}");
+
+        let read = provider.read_request_cookies(RequestCookies::new(&header));
+
+        assert!(
+            matches!(read, CookieRead::OptedOut),
+            "should report the opt-out over any token"
+        );
+    }
+
+    #[test]
+    fn never_stores_json_as_a_token() {
+        let provider = provider(&json!({}));
+        for header in [
+            "__uid2_advertising_token=%7Bbroken".to_owned(),
+            "__uid2_advertising_token={\"latestToken\":{}}".to_owned(),
+            prebid_cookie(&json!({ "originalToken": {} })),
+            prebid_cookie(&json!({ "latestToken": { "advertising_token": "" } })),
+            prebid_cookie(&json!({ "latestToken": 7 })),
+        ] {
+            assert!(
+                matches!(
+                    provider.read_request_cookies(RequestCookies::new(&header)),
+                    CookieRead::Absent
+                ),
+                "should read nothing from {header:?}"
+            );
+        }
     }
 
     #[test]

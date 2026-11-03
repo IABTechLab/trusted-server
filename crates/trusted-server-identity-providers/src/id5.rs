@@ -21,7 +21,10 @@
 //! and the default TTL. The response `signature` is never stored. A
 //! percent-encoded JSON cookie is decoded and its entries, `ext` objects
 //! included, are copied out of the decoded text. A cookie that yields no
-//! usable UID is ignored and the lookup runs as usual.
+//! usable UID is ignored and the lookup runs as usual. A cookie holding
+//! ID5's opt-out (a bare `0`, or a reply whose `universal_uid` is `0`)
+//! reports an opt-out: the lookup is skipped and stored ID5 UIDs are
+//! removed.
 //!
 //! The request field names for the client IP and user agent follow ID5's
 //! server-to-server integration and should be confirmed with ID5 for each
@@ -39,9 +42,10 @@ use http::{HeaderMap, HeaderValue, Method};
 use serde::{Deserialize, Serialize};
 use trusted_server_core::ec::eid_types::SourceDomain;
 use trusted_server_core::ec::provider::{
-    EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities,
-    ProviderCommon, ProviderConfigError, ProviderEid, ProviderError, ProviderKind, ProviderRequest,
-    ProviderResponse, ProviderUid, RequestCookies, SourceCapability, SourceInput,
+    CookieRead, EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
+    ProviderCapabilities, ProviderCommon, ProviderConfigError, ProviderEid, ProviderError,
+    ProviderKind, ProviderRequest, ProviderResponse, ProviderUid, RequestCookies, SourceCapability,
+    SourceInput,
 };
 use url::Url;
 
@@ -380,9 +384,34 @@ impl IdentityProvider for Id5Provider {
     fn read_request_cookies<'cookie>(
         &self,
         cookies: RequestCookies<'cookie>,
-    ) -> Option<Vec<ProviderEid<'cookie>>> {
-        self.cookies.read(cookies, |value| self.cookie_eids(value))
+    ) -> CookieRead<'cookie> {
+        if self.cookies.any(cookies, is_opt_out_cookie) {
+            return CookieRead::OptedOut;
+        }
+        CookieRead::from(self.cookies.read(cookies, |value| self.cookie_eids(value)))
     }
+}
+
+/// The ID5 opt-out UID.
+const OPT_OUT_UID: &str = "0";
+
+/// Whether one ID5 cookie value records an opt-out: a bare `0`, or a reply
+/// whose `universal_uid` is `0`.
+fn is_opt_out_cookie(value: &str) -> bool {
+    let decoded = percent_decoded(value);
+    let decoded = decoded.trim();
+    if !decoded.starts_with('{') {
+        return decoded == OPT_OUT_UID;
+    }
+    serde_json::from_str::<serde_json::Value>(decoded)
+        .ok()
+        .and_then(|reply| {
+            reply
+                .get("universal_uid")
+                .and_then(serde_json::Value::as_str)
+                .map(|uid| uid == OPT_OUT_UID)
+        })
+        .unwrap_or(false)
 }
 
 /// Copies an EID parsed from a temporary string so it outlives that string.
@@ -664,6 +693,7 @@ mod tests {
     fn read(provider: &dyn IdentityProvider, header: &str) -> Option<Vec<ReadUid>> {
         provider
             .read_request_cookies(RequestCookies::new(header))
+            .into_found()
             .map(|eids| {
                 eids.into_iter()
                     .flat_map(|eid| {
@@ -750,7 +780,7 @@ mod tests {
         let provider =
             build_kind::<Id5>(&config, &ProviderSecrets::default()).expect("should build provider");
 
-        let uids = read(&provider, "id5id=0; example_lockr_id5=bare-example")
+        let uids = read(&provider, "id5id=%7Bbroken; example_lockr_id5=bare-example")
             .expect("should read the bare ID");
 
         assert_eq!(
@@ -787,8 +817,11 @@ mod tests {
             &provider,
             "example_lockr_id5=lockr-example; id5id=own-example",
         );
-        let lockr = read(&provider, "id5id=0; example_lockr_id5=lockr-example");
-        let neither = read(&provider, "example_lockr_id5=0");
+        let lockr = read(
+            &provider,
+            "id5id=%7Bbroken; example_lockr_id5=lockr-example",
+        );
+        let neither = read(&provider, "example_lockr_id5=%7Bbroken");
 
         assert_eq!(
             own_first.map(|uids| uids[0].1.clone()).as_deref(),
@@ -804,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_opted_out_and_malformed_cookies_so_the_lookup_runs() {
+    fn reports_an_opt_out_cookie_so_the_lookup_is_skipped() {
         let provider = provider();
         let opted_out = json!({ "universal_uid": "0", "ids": {} }).to_string();
 
@@ -812,12 +845,28 @@ mod tests {
             "id5id=0".to_owned(),
             format!("id5id={opted_out}"),
             format!("id5id={}", urlencoding::encode(&opted_out)),
-            "id5id={not json".to_owned(),
-            "other=bare-example".to_owned(),
         ] {
             assert!(
-                read(&*provider, &header).is_none(),
-                "should read no ID from {header}"
+                matches!(
+                    provider.read_request_cookies(RequestCookies::new(&header)),
+                    CookieRead::OptedOut
+                ),
+                "should report an opt-out from {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_malformed_cookies_so_the_lookup_runs() {
+        let provider = provider();
+
+        for header in ["id5id={not json", "other=bare-example"] {
+            assert!(
+                matches!(
+                    provider.read_request_cookies(RequestCookies::new(header)),
+                    CookieRead::Absent
+                ),
+                "should read nothing from {header}"
             );
         }
     }
