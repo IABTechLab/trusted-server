@@ -567,14 +567,15 @@ pub fn handle_tsjs_dynamic(
     }
 
     if let Some(module_id) = parse_single_module_filename(filename) {
-        // Deferred modules and the conditionally injected diagnostics module
-        // are served as content-addressed standalone assets. Delivery remains
-        // cookie-independent so the static response can stay publicly cached.
+        // Deferred modules, the GPT runtime and conditional diagnostics are
+        // content-addressed standalone assets. Delivery remains cookie-independent
+        // so the static response can stay publicly cached.
         let deferred_ids = integration_registry.js_module_ids_deferred();
         let diagnostics_standalone = module_id
             == crate::integrations::gpt_diagnostics::GPT_DIAGNOSTICS_INTEGRATION_ID
             && integration_registry.integration_enabled(module_id);
-        if !deferred_ids.contains(&module_id) && !diagnostics_standalone {
+        let gpt_standalone = module_id == "gpt" && integration_registry.integration_enabled("gpt");
+        if !deferred_ids.contains(&module_id) && !diagnostics_standalone && !gpt_standalone {
             return Ok(not_found_response());
         }
         if let (Some(content), Some(hash)) = (
@@ -621,7 +622,7 @@ fn request_version_hash(req: &Request<EdgeBody>) -> Option<&str> {
 ///
 /// Returns `Some(&'static str)` if the filename matches a known JS module ID,
 /// `None` otherwise. The caller must additionally verify that the module is
-/// both deferred and enabled via the [`IntegrationRegistry`].
+/// enabled for standalone delivery via the [`IntegrationRegistry`].
 #[must_use]
 fn parse_single_module_filename(filename: &str) -> Option<&'static str> {
     let stem = filename
@@ -639,6 +640,8 @@ struct ProcessResponseParams<'a> {
     content_encoding: &'a str,
     origin_host: &'a str,
     origin_url: &'a str,
+    request_path: &'a str,
+    enforced_csp: bool,
     request_host: &'a str,
     request_scheme: &'a str,
     settings: &'a Settings,
@@ -683,6 +686,8 @@ impl PublisherBodyProcessor {
         );
         let inner: Box<dyn StreamProcessor> = if is_html {
             Box::new(create_html_stream_processor(HtmlStreamProcessorParams {
+                enforced_csp: params.enforced_csp,
+                request_path: &params.request_path,
                 origin_host: &params.origin_host,
                 request_host: &params.request_host,
                 request_scheme: &params.request_scheme,
@@ -771,6 +776,8 @@ fn process_response_streaming<W: Write>(
 
     if is_html {
         let processor = create_html_stream_processor(HtmlStreamProcessorParams {
+            enforced_csp: params.enforced_csp,
+            request_path: params.request_path,
             origin_host: params.origin_host,
             request_host: params.request_host,
             request_scheme: params.request_scheme,
@@ -1351,6 +1358,8 @@ async fn hold_finish_tail_segments(
 /// type capture every input lifetime, forcing callers to keep the settings and
 /// registry alive for as long as the processor.
 struct HtmlStreamProcessorParams<'a> {
+    request_path: &'a str,
+    enforced_csp: bool,
     origin_host: &'a str,
     request_host: &'a str,
     request_scheme: &'a str,
@@ -1550,7 +1559,9 @@ fn create_html_stream_processor_with_document_state(
         params.origin_host,
         params.request_host,
         params.request_scheme,
-    );
+    )
+    .with_request_path(params.request_path)
+    .with_enforced_csp(params.enforced_csp);
 
     let assembly_mode = effective_assembly_mode(params.settings, params.shared_template_authorized);
     // A deliverable skipped trace auction needs the request-only body seam even
@@ -1764,6 +1775,10 @@ pub struct OwnedProcessResponseParams {
     pub(crate) content_encoding: String,
     pub(crate) origin_host: String,
     pub(crate) origin_url: String,
+    /// Original URI pathname, independent of consent-gated slot payloads.
+    pub(crate) request_path: String,
+    /// Whether the actual origin response carries an enforced CSP header.
+    pub(crate) enforced_csp: bool,
     pub(crate) request_host: String,
     pub(crate) request_scheme: String,
     pub(crate) content_type: String,
@@ -2236,6 +2251,12 @@ fn build_template_assembly_params(
     ad_bids_state: AdBidsState,
 ) -> OwnedProcessResponseParams {
     OwnedProcessResponseParams {
+        enforced_csp: entry
+            .metadata
+            .policy_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-security-policy")),
+        request_path: "/".to_owned(),
         response_status: StatusCode::OK,
         range_associated: false,
         csp_nonce_observed: None,
@@ -3104,6 +3125,8 @@ pub fn stream_publisher_body<W: Write>(
         }));
     }
     let borrowed = ProcessResponseParams {
+        enforced_csp: params.enforced_csp,
+        request_path: &params.request_path,
         content_encoding: &params.content_encoding,
         origin_host: &params.origin_host,
         origin_url: &params.origin_url,
@@ -3344,6 +3367,8 @@ pub async fn stream_publisher_body_async<W: Write>(
         true,
     );
     let mut processor = match create_html_stream_processor(HtmlStreamProcessorParams {
+        enforced_csp: params.enforced_csp,
+        request_path: &params.request_path,
         origin_host: &params.origin_host,
         request_host: &params.request_host,
         request_scheme: &params.request_scheme,
@@ -5750,6 +5775,10 @@ pub async fn handle_publisher_request(
         return Ok(PublisherResponse::Buffered(response));
     }
 
+    // Loading policy belongs to the actual origin representation, not consent or
+    // auction admission. Preserve the existing synchronous path for any enforced
+    // CSP, without trying to evaluate its directives or requiring new inline hashes.
+    let enforced_csp = response.headers().contains_key("content-security-policy");
     // Map origin URLs in navigation, preload, and CSP headers to the serving host,
     // matching the body rewrite, on every route. Runs before the template-cache gate
     // so a stored template replays the rewritten policy headers; the cache key is
@@ -6073,6 +6102,8 @@ pub async fn handle_publisher_request(
                 response,
                 body,
                 params: Box::new(OwnedProcessResponseParams {
+                    enforced_csp,
+                    request_path: request_path.clone(),
                     response_status: status,
                     range_associated: false,
                     // The transform writes here; the post-transform gate reads it. Always
@@ -6769,6 +6800,45 @@ pub(crate) fn seam_ad_slots_json(
     )
 }
 
+/// Generate production slot and bid snippets for isolated browser fixtures.
+///
+/// This test-only bridge uses the same path filtering and serializers as publisher
+/// responses. It does not simulate request consent or auction admission.
+///
+/// # Panics
+///
+/// Panics if shared-mode slot JSON is absent after confirming enabled configuration
+/// and matching slots. The current serializer always returns it for those inputs.
+#[cfg(feature = "test-utils")]
+#[must_use]
+pub fn fixture_ad_scripts(
+    settings: &Settings,
+    request_path: &str,
+    mode: AssemblyMode,
+    bids: &serde_json::Map<String, serde_json::Value>,
+) -> (Option<String>, String) {
+    let Some(config) = settings.creative_opportunities.as_ref() else {
+        return (None, String::new());
+    };
+    if !config.enabled {
+        return (None, String::new());
+    }
+    let slots = match_renderable_slots(&config.slot, config, request_path);
+    if slots.is_empty() {
+        return (None, String::new());
+    }
+    let head = template_ad_slots_script(mode, true, settings, &slots, request_path);
+    let body = match mode {
+        AssemblyMode::Inline => build_bids_script(bids),
+        AssemblyMode::Esi => {
+            let slots_json = seam_ad_slots_json(mode, true, settings, &slots, request_path)
+                .expect("should generate shared fixture slot JSON");
+            build_seam_script(&slots_json, bids)
+        }
+    };
+    (head, body)
+}
+
 /// Build the empty-bids `<script>` tag used when no bids were returned.
 ///
 /// Shares the same shape as [`build_bids_script`] so any change to the script
@@ -6783,7 +6853,8 @@ pub(crate) fn build_empty_bids_script() -> String {
 /// [`handle_page_bids`] (SPA navigation) so the slot wire shape has a single
 /// definition and the two paths cannot silently diverge. Property names match
 /// what the client-side TSJS bundle expects: `gam_unit_path`, `div_id`,
-/// `formats`, and `targeting`. Returns `None` when the slot's dynamic GAM unit
+/// `formats`, and `targeting`. Non-default `initialization` is emitted only for
+/// explicitly opted-in slots. Returns `None` when the slot's dynamic GAM unit
 /// path exceeds its rendering limit.
 pub(crate) fn build_slot_json(
     slot: &crate::creative_opportunities::CreativeOpportunitySlot,
@@ -6802,13 +6873,17 @@ pub(crate) fn build_slot_json(
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
-    Some(serde_json::json!({
+    let mut value = serde_json::json!({
         "id": slot.id,
         "gam_unit_path": gam_path,
         "div_id": div_id,
         "formats": formats,
         "targeting": targeting,
-    }))
+    });
+    if !slot.initialization.is_auto() {
+        value["initialization"] = serde_json::json!(slot.initialization);
+    }
+    Some(value)
 }
 
 /// Match creative-opportunity slots and omit dynamic GAM paths that cannot be
@@ -8630,6 +8705,8 @@ mod tests {
 
     fn scheduling_slot() -> CreativeOpportunitySlot {
         CreativeOpportunitySlot {
+            reservation: None,
+            initialization: Default::default(),
             id: "scheduling-slot".to_owned(),
             gam_unit_path: None,
             div_id: None,
@@ -9929,6 +10006,8 @@ mod tests {
         content_encoding: &str,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            enforced_csp: false,
+            request_path: "/".to_owned(),
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -9988,6 +10067,72 @@ mod tests {
             .uri(uri)
             .body(EdgeBody::empty())
             .expect("should build test request")
+    }
+
+    #[tokio::test]
+    async fn enforced_csp_reaches_all_html_stream_constructors() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt", &serde_json::json!({"enabled": true}))
+            .expect("should enable otherwise deferred GPT profile");
+        let registry = IntegrationRegistry::new(&settings).expect("should build GPT registry");
+        let html = b"<html><head></head><body>origin</body></html>";
+        let mut params = make_stream_params(&settings, "");
+        params.content_type = "text/html".to_owned();
+        params.enforced_csp = true;
+        let mut outputs = Vec::new();
+        let mut synchronous = Vec::new();
+        stream_publisher_body(
+            EdgeBody::from(html.as_slice()),
+            &mut synchronous,
+            &params,
+            &settings,
+            &registry,
+        )
+        .expect("should transform buffered origin through borrowed parameters");
+        outputs.push(synchronous);
+        let (mut processor, _) = PublisherBodyProcessor::new(&params, &settings, &registry)
+            .expect("should create owned body processor");
+        outputs.push(
+            processor
+                .process_chunk(html, true)
+                .expect("should transform owned stream chunk"),
+        );
+        for streaming_body in [false, true] {
+            let mut held = make_stream_params(&settings, "");
+            held.content_type = "text/html".to_owned();
+            held.enforced_csp = true;
+            held.ad_slots_script =
+                Some("<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>".to_owned());
+            held.dispatched_auction = Some(DispatchedAuction::empty_for_test(
+                test_auction_request(),
+                10,
+            ));
+            let body = if streaming_body {
+                EdgeBody::stream(futures::stream::iter([bytes::Bytes::copy_from_slice(html)]))
+            } else {
+                EdgeBody::from(html.as_slice())
+            };
+            let mut output = Vec::new();
+            stream_publisher_body_async(
+                body,
+                &mut output,
+                &mut held,
+                &settings,
+                &registry,
+                &AuctionOrchestrator::new(settings.auction.clone()),
+                &noop_services(),
+            )
+            .await
+            .expect("should retain CSP choice while collecting inline bids");
+            outputs.push(output);
+        }
+        for output in outputs {
+            let document = String::from_utf8(output).expect("should produce HTML");
+            assert!(document.contains("tsjs-unified.min.js?v="));
+            assert!(!document.contains("id=\"trustedserver-bootstrap\""));
+        }
     }
 
     #[test]
@@ -10762,6 +10907,8 @@ mod tests {
             let (gate, decision) = gate_and_decision(&settings);
             let registry = IntegrationRegistry::new(&settings).expect("should build registry");
             let mut processor = create_html_stream_processor(HtmlStreamProcessorParams {
+                enforced_csp: false,
+                request_path: "/",
                 origin_host: "origin.example.com",
                 request_host: "publisher.example.com",
                 request_scheme: "https",
@@ -10915,6 +11062,9 @@ mod tests {
                 })));
 
             let config = HtmlProcessorConfig {
+                enforced_csp: false,
+                slot_reservations: Vec::new(),
+                request_path: None,
                 csp_nonce_observed: None,
                 origin_host: "origin.example.com".to_string(),
                 request_host: "example.com".to_string(),
@@ -11957,6 +12107,8 @@ mod tests {
         /// branch that only runs when it is on.
         fn article_slot() -> crate::creative_opportunities::CreativeOpportunitySlot {
             crate::creative_opportunities::CreativeOpportunitySlot {
+                reservation: None,
+                initialization: Default::default(),
                 id: "test-slot".to_string(),
                 gam_unit_path: None,
                 div_id: Some("test-slot".to_string()),
@@ -17951,6 +18103,181 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         }
 
         #[tokio::test]
+        async fn origin_policy_headers_preserve_unified_loading_independent_of_admission() {
+            for (policy_header, policy_value) in [
+                (None, ""),
+                (
+                    Some("content-security-policy-report-only"),
+                    "script-src 'none'",
+                ),
+                (Some("content-security-policy"), ""),
+                (Some("content-security-policy"), "default-src *"),
+                (
+                    Some("Content-Security-Policy"),
+                    "script-src 'self' 'sha256-old-policy'",
+                ),
+            ] {
+                for admitted in [false, true] {
+                    let stub = Arc::new(StubHttpClient::new());
+                    let cache = Arc::new(MemoryTemplateCache::default());
+                    let mut configured = settings_with_mode("inline");
+                    configured
+                        .integrations
+                        .insert_config("gpt", &serde_json::json!({"enabled": true}))
+                        .expect("should enable otherwise deferred GPT profile");
+                    let settings = Arc::new(configured);
+                    let services = services(Arc::clone(&stub), cache);
+                    let mut headers = vec![("content-type", "text/html; charset=utf-8")];
+                    if let Some(name) = policy_header {
+                        headers.push((name, policy_value));
+                    }
+                    stub.push_response_with_headers(
+                        200,
+                        b"<html><head></head><body>origin</body></html>".to_vec(),
+                        headers,
+                    );
+                    let request = if admitted {
+                        navigation_request()
+                    } else {
+                        prefetch_navigation_request()
+                    };
+                    let response = run(&settings, &services, request).await;
+                    if let Some(name) = policy_header {
+                        assert_eq!(
+                            response
+                                .headers()
+                                .get(name)
+                                .and_then(|value| value.to_str().ok()),
+                            Some(policy_value),
+                            "should preserve the actual origin policy unchanged"
+                        );
+                    }
+                    let document =
+                        String::from_utf8(body_of(response).await).expect("should produce HTML");
+                    assert!(
+                        document.contains("tsjs-unified.min.js?v="),
+                        "should retain cacheable unified loading, admitted={admitted} header={policy_header:?}"
+                    );
+                    assert!(
+                        !document.contains("id=\"trustedserver-bootstrap\""),
+                        "should not embed an uncacheable early bundle"
+                    );
+                    if !admitted {
+                        assert!(
+                            !document.contains(".adSlots=JSON.parse"),
+                            "should not use a policy fallback to authorize ad payloads"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn unified_loading_preserves_policy_on_shared_template_cold_and_warm_paths() {
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                for policy_header in [
+                    "content-security-policy",
+                    "content-security-policy-report-only",
+                ] {
+                    let enforced = policy_header == "content-security-policy";
+                    let stub = Arc::new(StubHttpClient::new());
+                    let cache = Arc::new(MemoryTemplateCache::default());
+                    let mut configured = settings_with_mode("esi");
+                    configured
+                        .integrations
+                        .insert_config("gpt", &serde_json::json!({"enabled": true}))
+                        .expect("should enable otherwise deferred GPT profile");
+                    let settings = Arc::new(configured);
+                    let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                    let policy = "script-src 'self' 'sha256-old-policy'";
+                    stub.push_response_with_headers(
+                        200,
+                        b"<html><head></head><body>origin</body></html>".to_vec(),
+                        vec![
+                            ("content-type", "text/html; charset=utf-8"),
+                            ("cache-control", "public, max-age=300"),
+                            (policy_header, policy),
+                        ],
+                    );
+                    for status in ["miss-stored", "hit"] {
+                        let response =
+                            run_via(&settings, &services, navigation_request(), finalizer).await;
+                        assert_eq!(
+                            response
+                                .headers()
+                                .get(HEADER_X_TS_TEMPLATE_CACHE)
+                                .and_then(|value| value.to_str().ok()),
+                            Some(status)
+                        );
+                        assert_eq!(
+                            response
+                                .headers()
+                                .get(policy_header)
+                                .and_then(|value| value.to_str().ok()),
+                            Some(policy),
+                            "should replay the policy that selected the stored template tags"
+                        );
+                        let document = String::from_utf8(body_of(response).await)
+                            .expect("should produce HTML");
+                        assert!(document.contains("tsjs-unified.min.js?v="));
+                        assert!(
+                            !document.contains("id=\"trustedserver-bootstrap\""),
+                            "should retain cacheable loading on both cold and warm templates"
+                        );
+                    }
+                    assert_eq!(
+                        stub.recorded_request_uris().len(),
+                        1,
+                        "warm policy handling must reuse the existing shared template"
+                    );
+                    let entries = cache.entries.lock().expect("should lock cached entries");
+                    let entry = entries
+                        .values()
+                        .next()
+                        .expect("should store shared template");
+                    let hit = build_template_assembly_params(
+                        entry,
+                        &settings,
+                        "ts.example.com",
+                        "https",
+                        Default::default(),
+                        AdBidsState::default(),
+                    );
+                    assert_eq!(
+                        hit.enforced_csp, enforced,
+                        "should preserve origin enforcement in cached-template parameters too"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn configured_enforced_csp_retains_sync_tags_in_shared_templates() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let mut configured = settings_with_mode("esi");
+            configured
+                .integrations
+                .insert_config("gpt", &serde_json::json!({"enabled": true}))
+                .expect("should enable otherwise deferred GPT profile");
+            configured.response_headers.insert(
+                "CoNtEnT-SeCuRiTy-PoLiCy".to_owned(),
+                "script-src 'self'".to_owned(),
+            );
+            let settings = Arc::new(configured);
+            let services = services(Arc::clone(&stub), cache);
+            queue_shareable_html(&stub);
+            for _ in 0..2 {
+                let response = run(&settings, &services, navigation_request()).await;
+                let document =
+                    String::from_utf8(body_of(response).await).expect("should produce HTML");
+                assert!(document.contains("tsjs-unified.min.js?v="));
+                assert!(!document.contains("id=\"trustedserver-bootstrap\""));
+            }
+            assert_eq!(stub.recorded_request_uris().len(), 1);
+        }
+
+        #[tokio::test]
         async fn nonce_bearing_csp_bypasses_the_shared_template_cache() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
@@ -19169,6 +19496,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
         pub(super) fn slot() -> CreativeOpportunitySlot {
             CreativeOpportunitySlot {
+                reservation: None,
+                initialization: Default::default(),
                 id: "atf".to_string(),
                 gam_unit_path: Some("/99999/example/home".to_string()),
                 div_id: Some("ad-atf".to_string()),
@@ -19209,6 +19538,170 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 slot: vec![slot()],
             });
             settings
+        }
+
+        #[test]
+        fn reservation_css_is_independent_of_admission_and_assembly_mode() {
+            let mut settings = settings_with_slots();
+            let config = settings
+                .creative_opportunities
+                .as_mut()
+                .expect("should have slot config");
+            config.slot[0].page_patterns = vec!["/news/*".to_owned()];
+            config.slot[0].reservation = Some(
+                crate::creative_opportunities::CreativeOpportunityReservation {
+                    element_id: "stable-space".to_owned(),
+                    min_height: 250,
+                    breakpoints: vec![
+                        crate::creative_opportunities::CreativeOpportunityReservationBreakpoint {
+                            min_width: 1024,
+                            min_height: 600,
+                        },
+                    ],
+                },
+            );
+            let slots = config.slot.clone();
+            let registry = IntegrationRegistry::empty_for_tests();
+            let expected = "<style data-ts-slot-reservations>[id=\"stable-space\"]{min-height:250px}@media(min-width:1024px){[id=\"stable-space\"]{min-height:600px}}</style>";
+            for mode in [AssemblyMode::Inline, AssemblyMode::Esi] {
+                settings
+                    .creative_opportunities
+                    .as_mut()
+                    .expect("should have config")
+                    .assembly_mode = Some(mode);
+                for admitted in [false, true] {
+                    for shared_template_authorized in [false, true] {
+                        let head = template_ad_slots_script(
+                            mode,
+                            admitted,
+                            &settings,
+                            &slots,
+                            "/news/article",
+                        );
+                        let mut processor =
+                            create_html_stream_processor(HtmlStreamProcessorParams {
+                                enforced_csp: false,
+                                request_path: "/news/article",
+                                origin_host: "origin.example.com",
+                                request_host: "publisher.example.com",
+                                request_scheme: "https",
+                                settings: &settings,
+                                integration_registry: &registry,
+                                ad_slots_script: head,
+                                ad_bids_state: Arc::new(Mutex::new(None)),
+                                suppress_datadome_client_side_tag: false,
+                                gpt_diagnostics: None,
+                                trace_bootstrap: None,
+                                shared_template_authorized,
+                                csp_nonce_observed: None,
+                                deferred_inline_marker: None,
+                            })
+                            .expect("should create reservation-aware HTML processor");
+                        let output = processor.process_chunk(b"<html><head></head><body><div id=\"stable-space\"></div></body></html>", true)
+                            .expect("should transform reservation fixture");
+                        let output = String::from_utf8(output).expect("should produce HTML");
+                        assert!(
+                            output.contains(expected),
+                            "should preserve exact CSS across admission and assembly paths"
+                        );
+                        assert_eq!(output.matches("data-ts-slot-reservations").count(), 1);
+                        if !admitted {
+                            assert!(
+                                !output.contains(".adSlots=") && !output.contains(".bids="),
+                                "should not authorize ad payloads merely because CSS exists"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn reservation_config_changes_template_fingerprint_not_slot_wire() {
+            let mut settings = settings_with_slots();
+            let before = template_fingerprint(&settings);
+            let config = settings
+                .creative_opportunities
+                .as_mut()
+                .expect("should have slot config");
+            let original = build_slot_json(&config.slot[0], config, "example");
+            config.slot[0].reservation = Some(
+                crate::creative_opportunities::CreativeOpportunityReservation {
+                    element_id: "stable-space".to_owned(),
+                    min_height: 250,
+                    breakpoints: Vec::new(),
+                },
+            );
+            assert_eq!(
+                build_slot_json(&config.slot[0], config, "example"),
+                original,
+                "should leave the browser slot contract unchanged"
+            );
+            assert_ne!(
+                template_fingerprint(&settings),
+                before,
+                "should invalidate a shared template after a reservation-only configuration change"
+            );
+        }
+
+        #[test]
+        fn registered_initialization_uses_the_admitted_inline_and_shared_slot_wire() {
+            let settings = settings_with_slots();
+            let mut value = serde_json::to_value(slot()).expect("should serialize slot");
+            value["initialization"] = serde_json::json!("publisher_registered");
+            let registered =
+                serde_json::from_value(value).expect("should deserialize registered slot");
+            let slots = [registered];
+            let config = settings
+                .creative_opportunities
+                .as_ref()
+                .expect("should configure creative opportunities");
+            let wire = build_slot_json(&slots[0], config, "example")
+                .expect("should build registered slot JSON");
+            assert_eq!(
+                wire["initialization"], "publisher_registered",
+                "should emit the explicitly selected initialization mode"
+            );
+            let expected =
+                serde_json::to_string(&vec![wire]).expect("should serialize expected slot wire");
+            let inline =
+                template_ad_slots_script(AssemblyMode::Inline, true, &settings, &slots, "/")
+                    .expect("should emit admitted inline slots");
+            assert_eq!(
+                inline,
+                format!(
+                    "<script>(window.tsjs=window.tsjs||{{}}).adSlots=JSON.parse(\"{}\");</script>",
+                    html_escape_for_script(&expected)
+                ),
+                "should use the same slot serializer for inline documents"
+            );
+            assert_eq!(
+                seam_ad_slots_json(AssemblyMode::Esi, true, &settings, &slots, "/"),
+                Some(expected),
+                "should use the same slot serializer for shared-template seams"
+            );
+            for mode in [AssemblyMode::Inline, AssemblyMode::Esi] {
+                assert_eq!(
+                    template_ad_slots_script(mode, false, &settings, &slots, "/"),
+                    None,
+                    "should not enable a gated head payload for {mode:?}"
+                );
+                assert_eq!(
+                    seam_ad_slots_json(mode, false, &settings, &slots, "/"),
+                    None,
+                    "should not enable a gated seam payload for {mode:?}"
+                );
+            }
+            assert_eq!(
+                seam_ad_slots_json(AssemblyMode::Esi, true, &settings, &[], "/"),
+                Some("[]".to_string()),
+                "should preserve explicitly empty admitted slots"
+            );
+            assert_eq!(
+                template_ad_slots_script(AssemblyMode::Esi, true, &settings, &slots, "/"),
+                None,
+                "should keep shared-template head configuration neutral"
+            );
         }
 
         #[test]
@@ -19889,6 +20382,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
         fn article_slot() -> CreativeOpportunitySlot {
             CreativeOpportunitySlot {
+                reservation: None,
+                initialization: Default::default(),
                 id: "article-slot".to_string(),
                 gam_unit_path: None,
                 div_id: None,
@@ -22640,6 +23135,77 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
     }
 
     #[test]
+    fn tsjs_dynamic_serves_exact_standalone_gpt_only_when_enabled() {
+        for enabled in [false, true] {
+            let mut settings = create_test_settings();
+            settings
+                .integrations
+                .insert_config("gpt", &serde_json::json!({ "enabled": enabled }))
+                .expect("should configure GPT");
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let hash =
+                trusted_server_js::single_module_hash("gpt").expect("should embed the GPT runtime");
+            let request = build_request(
+                Method::GET,
+                &format!("https://publisher.example/static/tsjs=tsjs-gpt.min.js?v={hash}"),
+            );
+            let response =
+                handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SurrogateControl)
+                    .expect("should handle standalone GPT");
+            if enabled {
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("public, max-age=31536000, immutable"),
+                    "should content-address the standalone runtime",
+                );
+                let bytes = response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should serve buffered JavaScript");
+                assert_eq!(
+                    bytes.as_ref(),
+                    trusted_server_js::module_bundle("gpt")
+                        .expect("should embed GPT")
+                        .as_bytes(),
+                    "should serve only the exact GPT IIFE, without core",
+                );
+            } else {
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            }
+        }
+    }
+
+    #[test]
+    fn tsjs_dynamic_does_not_expose_inline_bootstrap_as_an_integration() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt", &serde_json::json!({ "enabled": true }))
+            .expect("should enable GPT");
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        for module in ["bootstrap", "core", "creative"] {
+            let request = build_request(
+                Method::GET,
+                &format!("https://publisher.example/static/tsjs=tsjs-{module}.min.js"),
+            );
+            let response =
+                handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SurrogateControl)
+                    .expect("should handle standalone module request");
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "should not expose {module}"
+            );
+        }
+    }
+
+    #[test]
     fn tsjs_dynamic_serves_diagnostics_standalone_without_cookie_variance() {
         let mut settings = create_test_settings();
         settings
@@ -23048,6 +23614,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
         let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
+            enforced_csp: false,
+            request_path: "/".to_owned(),
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -23110,6 +23678,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         .expect("should create integration registry");
 
         let params = OwnedProcessResponseParams {
+            enforced_csp: false,
+            request_path: "/".to_owned(),
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -23161,6 +23731,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         )
         .expect("should create integration registry");
         let params = OwnedProcessResponseParams {
+            enforced_csp: false,
+            request_path: "/".to_owned(),
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -23290,6 +23862,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                enforced_csp: false,
+                request_path: "/".to_owned(),
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23357,6 +23931,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                enforced_csp: false,
+                request_path: "/".to_owned(),
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23427,6 +24003,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                enforced_csp: false,
+                request_path: "/".to_owned(),
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23497,6 +24075,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                enforced_csp: false,
+                request_path: "/".to_owned(),
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23567,6 +24147,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                enforced_csp: false,
+                request_path: "/".to_owned(),
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23619,6 +24201,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
     fn non_html_stream_params(content_encoding: &str) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            enforced_csp: false,
+            request_path: "/".to_owned(),
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -23839,6 +24423,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                enforced_csp: false,
+                request_path: "/".to_owned(),
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23917,6 +24503,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                enforced_csp: false,
+                request_path: "/".to_owned(),
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -23997,6 +24585,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                enforced_csp: false,
+                request_path: "/".to_owned(),
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -24071,6 +24661,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .body(EdgeBody::empty())
             .expect("should build response");
         let params = OwnedProcessResponseParams {
+            enforced_csp: false,
+            request_path: "/".to_owned(),
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -25390,6 +25982,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 .expect("should replay overflow output");
         let control_registry = IntegrationRegistry::from_html_stream_processors(Vec::new());
         let mut processor = create_html_stream_processor(HtmlStreamProcessorParams {
+            request_path: "/",
+            enforced_csp: false,
             origin_host: "origin.example.com",
             request_host: "proxy.example.com",
             request_scheme: "https",
@@ -26035,6 +26629,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         dispatched_auction: Option<DispatchedAuction>,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            enforced_csp: false,
+            request_path: "/".to_owned(),
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -26751,6 +27347,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let ec_context =
                 EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
             OwnedProcessResponseParams {
+                enforced_csp: false,
+                request_path: "/".to_owned(),
                 response_status: StatusCode::OK,
                 range_associated: false,
                 csp_nonce_observed: None,
@@ -26949,6 +27547,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .map(bytes::Bytes::copy_from_slice)
             .collect();
         let params = OwnedProcessResponseParams {
+            enforced_csp: false,
+            request_path: "/".to_owned(),
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -27033,6 +27633,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{}");</script>"#;
         let state = AdBidsState::with_script(bids_script);
         let params = OwnedProcessResponseParams {
+            enforced_csp: false,
+            request_path: "/".to_owned(),
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -27100,6 +27702,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         // Claim gzip encoding but feed non-gzip bytes. The GzDecoder will
         // error as soon as it tries to read the gzip header.
         let params = OwnedProcessResponseParams {
+            enforced_csp: false,
+            request_path: "/".to_owned(),
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -27221,6 +27825,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         let body = EdgeBody::from(html.to_vec());
 
         let params = OwnedProcessResponseParams {
+            enforced_csp: false,
+            request_path: "/".to_owned(),
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -27291,6 +27897,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         // Small, single-fragment RSC script — placeholder path (not fallback).
         let html = br#"<html><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script></body></html>"#;
         let params = OwnedProcessResponseParams {
+            enforced_csp: false,
+            request_path: "/".to_owned(),
             response_status: StatusCode::OK,
             range_associated: false,
             csp_nonce_observed: None,
@@ -27384,6 +27992,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
         fn make_slot() -> CreativeOpportunitySlot {
             CreativeOpportunitySlot {
+                reservation: None,
+                initialization: Default::default(),
                 id: "atf_sidebar_ad".to_string(),
                 gam_unit_path: Some("/21765378893/publisher/atf-sidebar".to_string()),
                 div_id: Some("div-atf-sidebar".to_string()),
@@ -27432,6 +28042,26 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 cache_path: None,
                 metadata: Default::default(),
             }
+        }
+
+        #[test]
+        fn build_slot_json_preserves_automatic_wire_bytes() {
+            let slot = make_slot();
+            let config = make_config();
+            let wire = crate::publisher::build_slot_json(&slot, &config, "example")
+                .expect("should build automatic slot JSON");
+            let expected = serde_json::json!({
+                "id": "atf_sidebar_ad",
+                "gam_unit_path": "/21765378893/publisher/atf-sidebar",
+                "div_id": "div-atf-sidebar",
+                "formats": [[300, 250]],
+                "targeting": {"pos": "atf"},
+            });
+            assert_eq!(
+                serde_json::to_string(&wire).expect("should serialize automatic wire"),
+                serde_json::to_string(&expected).expect("should serialize expected wire"),
+                "should preserve automatic slot wire byte-for-byte"
+            );
         }
 
         #[test]
@@ -29165,6 +29795,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
         fn article_slot() -> Vec<CreativeOpportunitySlot> {
             vec![CreativeOpportunitySlot {
+                reservation: None,
+                initialization: Default::default(),
                 id: "atf".to_string(),
                 gam_unit_path: None,
                 div_id: None,
@@ -29184,6 +29816,85 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
         fn make_page_bids_request(path: &str) -> Request<EdgeBody> {
             make_page_bids_request_on(PAGE_BIDS_PATH, path)
+        }
+
+        #[tokio::test]
+        async fn page_bids_registered_initialization_preserves_admission_gates() {
+            let mut value =
+                serde_json::to_value(&article_slot()[0]).expect("should serialize article slot");
+            value["initialization"] = serde_json::json!("publisher_registered");
+            let slots =
+                vec![serde_json::from_value(value).expect("should deserialize registered slot")];
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let admitted = run_page_bids_consent_allowed(
+                &settings,
+                &orchestrator,
+                &slots,
+                make_page_bids_request("/2024/article"),
+            )
+            .await;
+            let expected = crate::publisher::build_slot_json(
+                &slots[0],
+                settings
+                    .creative_opportunities
+                    .as_ref()
+                    .expect("should configure slots"),
+                "2024",
+            )
+            .expect("should build registered wire");
+            assert_eq!(
+                expected["initialization"], "publisher_registered",
+                "should emit publisher-registered mode"
+            );
+            assert_eq!(
+                admitted["slots"],
+                serde_json::json!([expected]),
+                "should return the shared slot wire for admitted SPA delivery"
+            );
+
+            let consent_denied = run_page_bids(
+                &settings,
+                &orchestrator,
+                &slots,
+                make_page_bids_request("/2024/article"),
+            )
+            .await;
+            assert_eq!(
+                consent_denied["slots"],
+                serde_json::json!([]),
+                "should not bypass consent admission"
+            );
+            let unmatched = run_page_bids_consent_allowed(
+                &settings,
+                &orchestrator,
+                &slots,
+                make_page_bids_request("/other"),
+            )
+            .await;
+            assert_eq!(
+                unmatched["slots"],
+                serde_json::json!([]),
+                "should not bypass page matching"
+            );
+            for gated in [
+                settings_with_co_auction_disabled(),
+                settings_with_co_templates_disabled(),
+            ] {
+                let orchestrator = AuctionOrchestrator::new(gated.auction.clone());
+                let response = run_page_bids_consent_allowed(
+                    &gated,
+                    &orchestrator,
+                    &slots,
+                    make_page_bids_request("/2024/article"),
+                )
+                .await;
+                assert_eq!(
+                    response["slots"],
+                    serde_json::json!([]),
+                    "should not bypass auction or template admission"
+                );
+            }
         }
 
         #[tokio::test]
@@ -30434,6 +31145,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
         fn article_slot() -> Vec<CreativeOpportunitySlot> {
             vec![CreativeOpportunitySlot {
+                reservation: None,
+                initialization: Default::default(),
                 id: "atf".to_string(),
                 gam_unit_path: None,
                 div_id: None,

@@ -2,6 +2,8 @@ import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./tests",
+  // Real GPT requires dedicated inventory and its explicit acceptance launcher.
+  testIgnore: ["**/publisher-registration.real-gpt.spec.ts"],
   globalSetup: "./global-setup.ts",
   globalTeardown: "./global-teardown.ts",
   timeout: 30_000,

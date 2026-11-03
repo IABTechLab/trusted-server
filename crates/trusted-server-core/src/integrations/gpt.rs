@@ -490,20 +490,33 @@ impl IntegrationHeadInjector for GptIntegration {
     /// auction via `GET /_ts/page-bids` on pushState / replaceState / popstate
     /// route changes (see `auction/endpoints.rs`).
     /// The `POST /auction` endpoint is not involved in scroll or refresh flows.
-    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        // Direct callers retain the legacy initializer as a compatibility reference.
+        // Production composition supplies the actual loading policy through the registry.
+        self.head_inserts_with_provisional_bootstrap(ctx, true)
+    }
+
+    fn head_inserts_with_provisional_bootstrap(
+        &self,
+        _ctx: &IntegrationHtmlContext<'_>,
+        include_provisional: bool,
+    ) -> Vec<String> {
         let gam_attribution_flag = if self.config.gam_attribution_enabled {
             "window.__tsjs_gam_attribution_enabled=true;"
         } else {
             ""
         };
 
-        let mut scripts = vec![
-            format!(
-                "<script>window.__tsjs_gpt_enabled=true;{gam_attribution_flag}\
-                 window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
-            ),
-            format!("<script>{}</script>", GPT_BOOTSTRAP_JS),
-        ];
+        let mut scripts = vec![format!(
+            "<script>window.__tsjs_gpt_enabled=true;{gam_attribution_flag}\
+             window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
+        )];
+        // The supported synchronous unified runtime installs the initializer and
+        // registration APIs before publisher scripts. Retain this compatibility
+        // implementation only where composition still requires it.
+        if include_provisional {
+            scripts.push(format!("<script>{}</script>", GPT_BOOTSTRAP_JS));
+        }
 
         if let Some(ref url) = self.config.slim_prebid_url {
             // JSON-encode the URL, then escape `</` so a configured value
@@ -561,9 +574,14 @@ fn default_rewrite_script() -> bool {
 mod tests {
     use super::*;
     use crate::constants::HEADER_X_FORWARDED_FOR;
-    use crate::integrations::IntegrationDocumentState;
+    use crate::html_processor::{BodyCloseInjection, HtmlProcessorConfig, create_html_processor};
+    use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use crate::streaming_processor::{
+        Compression, PipelineConfig, StreamProcessor as _, StreamingPipeline,
+    };
     use crate::test_support::tests::create_test_settings;
     use http::Method;
+    use std::io::Cursor;
 
     fn test_config() -> GptConfig {
         GptConfig {
@@ -1224,6 +1242,201 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_head_inserts_embed_the_publisher_registration_v1_bootstrap() {
+        let integration = GptIntegration::new(test_config());
+        let document_state = IntegrationDocumentState::default();
+        let context = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            document_state: &document_state,
+        };
+        let inserts = integration.head_inserts(&context);
+
+        assert_eq!(
+            inserts.len(),
+            2,
+            "should preserve the existing head insert count"
+        );
+        assert_eq!(
+            inserts[1],
+            format!("<script>{GPT_BOOTSTRAP_JS}</script>"),
+            "should embed the complete included bootstrap without a new dependency"
+        );
+        assert!(
+            inserts[1].contains("ts.publisherSlotRegistrationVersion = 1;"),
+            "should include protocol version 1 in the shipped bootstrap"
+        );
+        assert!(
+            inserts[1].contains("ts.registerPublisherSlot ="),
+            "should include the publisher registration entrypoint"
+        );
+        // The shared Vitest registration contract executes this retained file.
+        // This is legacy reference coverage, not proof of emitted candidate HTML.
+    }
+
+    #[test]
+    fn publisher_registration_runtime_preserves_document_injection_order() {
+        const PUBLISHER_HEAD: &str = "<script>window.exampleRegistrationApi=window.tsjs.registerPublisherSlot;window.exampleRegistrationVersion=window.tsjs.publisherSlotRegistrationVersion;</script>";
+        const SLOT_SCRIPT: &str = "<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>";
+        const SHARED_SEAM: &str = "<!--example-shared-slot-seam-->";
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt", &serde_json::json!({"enabled": true}))
+            .expect("should enable the production GPT profile");
+        let registry = IntegrationRegistry::new(&settings).expect("should build GPT registry");
+        let html =
+            format!("<html><head>{PUBLISHER_HEAD}</head><body><p>example-body</p></body></html>");
+
+        for (shared, chunk_size) in [(false, 1), (true, 1), (false, 8192), (true, 8192)] {
+            let config = HtmlProcessorConfig::from_settings(
+                &settings,
+                &registry,
+                "origin.example.com",
+                "edge.example.com",
+                "https",
+            )
+            .with_ad_state((!shared).then(|| SLOT_SCRIPT.to_string()), Arc::default())
+            .with_body_close(if shared {
+                BodyCloseInjection::Marker(SHARED_SEAM.to_string())
+            } else {
+                BodyCloseInjection::InlineBids
+            });
+            let processor = create_html_processor(config);
+            let mut pipeline = StreamingPipeline::new(
+                PipelineConfig {
+                    input_compression: Compression::None,
+                    output_compression: Compression::None,
+                    chunk_size,
+                },
+                processor,
+            );
+            let mut output = Vec::new();
+            pipeline
+                .process(Cursor::new(html.as_bytes()), &mut output)
+                .expect("should process publisher HTML with the GPT head injector");
+            let output = String::from_utf8(output).expect("should produce UTF-8 HTML");
+            let enabled = output
+                .find("window.__tsjs_gpt_enabled=true;")
+                .expect("should retain the GPT activation insert");
+            let bundle = output
+                .find("id=\"trustedserver-js\"")
+                .expect("should retain the main bundle tag");
+            let publisher = output
+                .find(PUBLISHER_HEAD)
+                .expect("should retain the original publisher head script");
+            let body = output
+                .find("<p>example-body</p>")
+                .expect("should retain publisher body content");
+            let payload = output
+                .find(if shared {
+                    SHARED_SEAM
+                } else {
+                    "var b=JSON.parse("
+                })
+                .expect("should retain the selected body payload seam");
+            let body_close = output
+                .rfind("</body>")
+                .expect("should retain the body close");
+
+            assert!(
+                enabled < bundle
+                    && bundle < publisher
+                    && publisher < body
+                    && body < payload
+                    && payload < body_close,
+                "should install the complete API before publisher head callbacks while preserving head/body order, shared={shared}"
+            );
+            assert!(
+                !output.contains(GPT_BOOTSTRAP_JS)
+                    && !output.contains("id=\"trustedserver-bootstrap\""),
+                "should install registration from the cacheable runtime, not duplicate inline initializers"
+            );
+            assert!(output.contains("tsjs-unified.min.js?v="));
+            if shared {
+                assert!(
+                    !output.contains(SLOT_SCRIPT),
+                    "should keep shared-template heads slot-neutral"
+                );
+                assert!(
+                    !output.contains("var b=JSON.parse("),
+                    "should leave shared payload assembly to the seam"
+                );
+            } else {
+                assert!(
+                    output
+                        .find(SLOT_SCRIPT)
+                        .expect("should retain initial slot definitions")
+                        < enabled,
+                    "should retain inline slot configuration before activation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn response_csp_uses_the_synchronous_runtime_without_a_new_bootstrap_hash() {
+        const PUBLISHER_HEAD: &str = "<script>window.publisherSawRegistration=typeof window.tsjs.registerPublisherSlot;</script>";
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt", &serde_json::json!({"enabled": true}))
+            .expect("should enable GPT");
+        let registry = IntegrationRegistry::new(&settings).expect("should build GPT registry");
+        for shared in [false, true] {
+            let config = HtmlProcessorConfig::from_settings(
+                &settings,
+                &registry,
+                "origin.example.com",
+                "edge.example.com",
+                "https",
+            )
+            .with_enforced_csp(true)
+            .with_body_close(if shared {
+                BodyCloseInjection::Marker("<!--shared-fixture-->".to_string())
+            } else {
+                BodyCloseInjection::InlineBids
+            });
+            let output = create_html_processor(config)
+                .process_chunk(
+                    format!("<html><head>{PUBLISHER_HEAD}</head><body></body></html>").as_bytes(),
+                    true,
+                )
+                .expect("should transform an enforced-CSP document");
+            let output = String::from_utf8(output).expect("should produce UTF-8 HTML");
+            assert!(
+                !output.contains(GPT_BOOTSTRAP_JS)
+                    && !output.contains("id=\"trustedserver-bootstrap\""),
+                "should require neither the changed provisional nor compiled inline bootstrap hash"
+            );
+            let activation = output
+                .find("window.__tsjs_gpt_enabled=true;")
+                .expect("should retain unchanged GPT activation");
+            let runtime = output
+                .find("id=\"trustedserver-js\"")
+                .expect("should retain the synchronous unified runtime");
+            let publisher = output
+                .find(PUBLISHER_HEAD)
+                .expect("should retain publisher code");
+            assert!(
+                activation < runtime && runtime < publisher,
+                "should install runtime APIs before publisher scripts"
+            );
+            assert!(
+                output.contains("tsjs-unified.min.js")
+                    && output[runtime..]
+                        .split('>')
+                        .next()
+                        .is_some_and(|tag| !tag.contains(" defer")),
+                "should retain synchronous loading under enforced response CSP"
+            );
+        }
+    }
+
+    // These direct-injector tests retain the raw initializer's compatibility
+    // contract. They do not describe the supported production profile's output.
     #[test]
     fn head_inserts_includes_ts_ad_init_with_synchronous_bids_read() {
         let config = test_config();

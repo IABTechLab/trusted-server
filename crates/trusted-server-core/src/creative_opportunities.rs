@@ -4,7 +4,8 @@
 //! it appears on (via glob patterns), what ad formats it supports, and how it
 //! maps to provider-specific identifiers such as GAM unit paths and APS slot IDs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
@@ -622,6 +623,143 @@ impl CreativeOpportunitiesConfig {
     }
 }
 
+/// Controls who establishes the native slot for initial ad delivery.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CreativeOpportunityInitialization {
+    /// Use the existing automatic slot initialization.
+    #[default]
+    Auto,
+    /// Wait for the publisher to register its final native slot.
+    PublisherRegistered,
+}
+
+impl CreativeOpportunityInitialization {
+    /// Whether initial delivery uses the default automatic behavior.
+    pub(crate) const fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+/// Explicit minimum space for a stable publisher-owned element.
+///
+/// Heights are CSS pixels, independent of the auction formats and selected creative.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreativeOpportunityReservation {
+    /// Exact ID of a stable element present in publisher HTML before hydration.
+    pub element_id: String,
+    /// Minimum height below the first viewport breakpoint, in CSS pixels.
+    pub min_height: u32,
+    /// Mobile-first overrides, ordered by strictly increasing positive viewport width.
+    #[serde(default)]
+    pub breakpoints: Vec<CreativeOpportunityReservationBreakpoint>,
+}
+
+/// A viewport-width override for an explicit slot-space reservation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreativeOpportunityReservationBreakpoint {
+    /// Inclusive minimum viewport width, in CSS pixels. Zero is redundant and rejected.
+    pub min_width: u32,
+    /// Minimum element height at this viewport width, in CSS pixels.
+    pub min_height: u32,
+}
+
+impl CreativeOpportunityReservation {
+    fn validate_runtime(&self, slot_id: &str) -> Result<(), String> {
+        if self.element_id.trim().is_empty() || self.element_id.contains('\0') {
+            return Err(format!(
+                "slot `{slot_id}` reservation element_id must be nonempty and contain no NUL"
+            ));
+        }
+        let mut previous_width = 0;
+        for breakpoint in &self.breakpoints {
+            if breakpoint.min_width <= previous_width {
+                return Err(format!(
+                    "slot `{slot_id}` reservation breakpoints must have strictly increasing positive min_width"
+                ));
+            }
+            previous_width = breakpoint.min_width;
+        }
+        Ok(())
+    }
+}
+
+/// Path-matched layout rule prepared from a configured slot.
+///
+/// The HTML processor retains only reservation policy and compiled page patterns,
+/// never targeting, provider identifiers, or request-specific auction state.
+#[derive(Debug, Clone)]
+pub struct SlotReservationRule {
+    patterns: Vec<Pattern>,
+    reservation: CreativeOpportunityReservation,
+}
+
+impl SlotReservationRule {
+    pub(crate) fn from_slot(slot: &CreativeOpportunitySlot) -> Option<Self> {
+        let reservation = slot.reservation.clone()?;
+        let patterns = if slot.compiled_patterns.is_empty() {
+            slot.page_patterns
+                .iter()
+                .filter_map(|pattern| compile_page_pattern(pattern).ok())
+                .collect()
+        } else {
+            slot.compiled_patterns.clone()
+        };
+        Some(Self {
+            patterns,
+            reservation,
+        })
+    }
+}
+
+/// Render visitor-neutral reservation CSS for one initial-document pathname.
+///
+/// The first path-matching slot in configuration order owns the complete policy
+/// for its exact element ID. Later same-ID policies emit no rules.
+/// CSS strings hex-escape every character other than ASCII alphanumerics, `-` and
+/// `_`, including `<`, so configured IDs cannot terminate the HTML style element.
+pub(crate) fn render_slot_reservations(
+    rules: &[SlotReservationRule],
+    request_path: &str,
+) -> Option<String> {
+    let mut css = String::new();
+    let mut seen_elements = HashSet::new();
+    for rule in rules {
+        if !rule
+            .patterns
+            .iter()
+            .any(|pattern| pattern.matches(request_path))
+            || !seen_elements.insert(&rule.reservation.element_id)
+        {
+            continue;
+        }
+        let reservation = &rule.reservation;
+        let mut selector = String::from("[id=\"");
+        for character in reservation.element_id.chars() {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                selector.push(character);
+            } else {
+                write!(selector, "\\{:x} ", u32::from(character))
+                    .expect("should write escaped CSS into a string");
+            }
+        }
+        selector.push_str("\"]");
+        write!(css, "{selector}{{min-height:{}px}}", reservation.min_height)
+            .expect("should write reservation CSS into a string");
+        for breakpoint in &reservation.breakpoints {
+            write!(
+                css,
+                "@media(min-width:{}px){{{selector}{{min-height:{}px}}}}",
+                breakpoint.min_width, breakpoint.min_height
+            )
+            .expect("should write reservation breakpoint CSS into a string");
+        }
+    }
+    (!css.is_empty()).then(|| format!("<style data-ts-slot-reservations>{css}</style>"))
+}
+
 /// A single ad placement opportunity on the publisher's site.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -636,10 +774,19 @@ pub struct CreativeOpportunitySlot {
     ///
     /// Defaults to [`id`](Self::id) when absent.
     pub div_id: Option<String>,
+    /// Optional initial-document space reservation for a stable publisher element.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation: Option<CreativeOpportunityReservation>,
     /// Glob patterns for page paths this slot should appear on.
     pub page_patterns: Vec<String>,
     /// Supported ad formats (size + media type combinations).
     pub formats: Vec<CreativeOpportunityFormat>,
+    /// Initial delivery ownership, defaulting to automatic slot initialization.
+    #[serde(
+        default,
+        skip_serializing_if = "CreativeOpportunityInitialization::is_auto"
+    )]
+    pub initialization: CreativeOpportunityInitialization,
     /// Optional floor price in CPM (USD).
     pub floor_price: Option<f64>,
     /// Slot-level targeting key–value pairs forwarded to the auction.
@@ -685,6 +832,9 @@ impl CreativeOpportunitySlot {
     /// or semantically unusable at runtime.
     pub fn validate_runtime(&self) -> Result<(), String> {
         validate_slot_id(&self.id)?;
+        if let Some(reservation) = &self.reservation {
+            reservation.validate_runtime(&self.id)?;
+        }
 
         if self.page_patterns.is_empty() {
             return Err(format!(
@@ -1448,23 +1598,312 @@ mod tests {
         );
     }
 
+    fn reservation_slot(
+        id: &str,
+        patterns: Vec<&str>,
+        element_id: &str,
+        min_height: u32,
+        breakpoints: Vec<(u32, u32)>,
+    ) -> CreativeOpportunitySlot {
+        let mut slot = make_slot(id, patterns);
+        slot.reservation = Some(CreativeOpportunityReservation {
+            element_id: element_id.to_owned(),
+            min_height,
+            breakpoints: breakpoints
+                .into_iter()
+                .map(
+                    |(min_width, min_height)| CreativeOpportunityReservationBreakpoint {
+                        min_width,
+                        min_height,
+                    },
+                )
+                .collect(),
+        });
+        slot.compile_patterns();
+        slot
+    }
+
+    #[test]
+    fn reservation_omission_preserves_slot_serialization() {
+        let value = serde_json::to_value(make_slot("header", vec!["/news/*"]))
+            .expect("should serialize slot without reservation");
+        assert!(value.get("reservation").is_none());
+        let slot: CreativeOpportunitySlot =
+            serde_json::from_value(value).expect("should parse legacy slot shape");
+        assert!(slot.reservation.is_none());
+    }
+
+    #[test]
+    fn reservation_config_parses_explicit_responsive_policy() {
+        let source = r#"
+            id = "header"
+            page_patterns = ["/news/*"]
+            formats = [{ width = 300, height = 250 }, { width = 300, height = 600 }]
+            [reservation]
+            element_id = "header-ad-space"
+            min_height = 0
+            [[reservation.breakpoints]]
+            min_width = 1024
+            min_height = 600
+        "#;
+        let mut slot: CreativeOpportunitySlot =
+            toml::from_str(source).expect("should parse explicit responsive reservation");
+        slot.compile_patterns();
+        slot.validate_runtime()
+            .expect("should accept zero base height");
+        let rule = SlotReservationRule::from_slot(&slot).expect("should prepare reservation rule");
+        assert_eq!(
+            render_slot_reservations(&[rule], "/news/article").as_deref(),
+            Some(
+                "<style data-ts-slot-reservations>[id=\"header-ad-space\"]{min-height:0px}@media(min-width:1024px){[id=\"header-ad-space\"]{min-height:600px}}</style>"
+            ),
+            "should emit only explicit heights, not infer from format order"
+        );
+    }
+
+    #[test]
+    fn reservation_validation_rejects_unusable_ids_and_breakpoints() {
+        for element_id in ["", " \t\n", "bad\0id"] {
+            let slot = reservation_slot("header", vec!["/*"], element_id, 250, vec![]);
+            assert!(
+                slot.validate_runtime().is_err(),
+                "should reject unusable element ID"
+            );
+        }
+        for breakpoints in [
+            vec![(0, 250)],
+            vec![(768, 250), (768, 600)],
+            vec![(1024, 600), (768, 250)],
+        ] {
+            let slot = reservation_slot("header", vec!["/*"], "space", 0, breakpoints);
+            assert!(
+                slot.validate_runtime().is_err(),
+                "should reject non-increasing widths"
+            );
+        }
+        let slot = reservation_slot("header", vec!["/*"], "space", 0, vec![(1, 0), (1024, 600)]);
+        slot.validate_runtime()
+            .expect("should allow explicit zero heights at positive widths");
+    }
+
+    #[test]
+    fn reservation_schema_rejects_raw_css_and_non_integer_dimensions() {
+        for value in [
+            serde_json::json!({"element_id":"space", "min_height":250, "selector":"*"}),
+            serde_json::json!({"element_id":"space", "min_height":-1}),
+            serde_json::json!({"element_id":"space", "min_height":0.5}),
+            serde_json::json!({"element_id":"space", "min_height":250, "breakpoints":[{"min_width":768,"min_height":600,"css":"display:none"}]}),
+        ] {
+            assert!(
+                serde_json::from_value::<CreativeOpportunityReservation>(value).is_err(),
+                "should reject unsupported CSS inputs and invalid pixel types"
+            );
+        }
+    }
+
+    #[test]
+    fn reservation_css_escapes_selector_and_style_termination() {
+        let slot = reservation_slot(
+            "header",
+            vec!["/*"],
+            "1\"\\\né</style><script>bad</script>]",
+            250,
+            vec![],
+        );
+        let rule = SlotReservationRule::from_slot(&slot).expect("should prepare escaped rule");
+        let style = render_slot_reservations(&[rule], "/article")
+            .expect("should render escaped reservation");
+        assert_eq!(
+            style.matches("</style>").count(),
+            1,
+            "should contain only owned closing tag"
+        );
+        assert!(
+            !style.contains("<script>"),
+            "should not inject HTML from the ID"
+        );
+        assert!(style.contains(r#"[id="1\22 \5c \a \e9 \3c \2f style\3e "#));
+        assert!(style.contains(r"\5d "), "should escape selector delimiters");
+    }
+
+    #[test]
+    fn reservation_first_matching_slot_owns_complete_shared_wrapper_policy() {
+        let slots = [
+            reservation_slot("news", vec!["/news/*"], "space", 250, vec![(1024, 600)]),
+            reservation_slot("overlap", vec!["/*"], "space", 999, vec![(768, 888)]),
+            reservation_slot("reviews", vec!["/reviews/*"], "other-space", 90, vec![]),
+        ];
+        let rules: Vec<_> = slots
+            .iter()
+            .filter_map(SlotReservationRule::from_slot)
+            .collect();
+        let style = render_slot_reservations(&rules, "/news/article")
+            .expect("should render news reservation");
+        assert!(style.contains("min-height:250px"));
+        assert!(style.contains("min-height:600px"));
+        assert!(
+            !style.contains("999") && !style.contains("888") && !style.contains("768"),
+            "should not interleave a later same-wrapper policy"
+        );
+        let disjoint = [
+            reservation_slot("news", vec!["/news/*"], "shared-space", 250, vec![]),
+            reservation_slot("reviews", vec!["/reviews/*"], "shared-space", 600, vec![]),
+        ];
+        for slot in &disjoint {
+            slot.validate_runtime()
+                .expect("should accept shared wrapper IDs on disjoint routes");
+        }
+        let rules: Vec<_> = disjoint
+            .iter()
+            .filter_map(SlotReservationRule::from_slot)
+            .collect();
+        let style = render_slot_reservations(&rules, "/reviews/article")
+            .expect("should use matching disjoint reservation");
+        assert!(style.contains("min-height:600px") && !style.contains("250"));
+        assert!(render_slot_reservations(&rules, "/other/article").is_none());
+    }
+
+    #[test]
+    fn reservation_matching_uses_existing_raw_path_patterns() {
+        let slot = reservation_slot("news", vec!["/new%20s/*"], "space", 250, vec![]);
+        let rule = SlotReservationRule::from_slot(&slot).expect("should prepare path rule");
+        assert!(
+            render_slot_reservations(std::slice::from_ref(&rule), "/new%20s/article").is_some()
+        );
+        assert!(render_slot_reservations(std::slice::from_ref(&rule), "/new s/article").is_none());
+        assert!(render_slot_reservations(&[], "/new%20s/article").is_none());
+    }
+
     fn make_slot(id: &str, patterns: Vec<&str>) -> CreativeOpportunitySlot {
         CreativeOpportunitySlot {
             id: id.to_string(),
             gam_unit_path: None,
             div_id: None,
+            reservation: None,
             page_patterns: patterns.into_iter().map(String::from).collect(),
             formats: vec![CreativeOpportunityFormat {
                 width: 300,
                 height: 250,
                 media_type: crate::auction::types::MediaType::Banner,
             }],
+            initialization: Default::default(),
             floor_price: Some(0.50),
             targeting: Default::default(),
             providers: Default::default(),
             compiled_patterns: Vec::new(),
             compiled_unit: None,
         }
+    }
+
+    #[test]
+    fn slot_initialization_defaults_to_auto_without_changing_serialization() {
+        let original = serde_json::to_value(make_slot("header", vec!["/example/*"]))
+            .expect("should serialize automatic slot");
+        let absent: CreativeOpportunitySlot = serde_json::from_value(original.clone())
+            .expect("should deserialize slot without initialization");
+        assert!(
+            original.get("initialization").is_none(),
+            "should omit initialization from the default serialized slot"
+        );
+        let mut explicit = original.clone();
+        explicit["initialization"] = serde_json::json!("auto");
+        let automatic: CreativeOpportunitySlot = serde_json::from_value(explicit)
+            .expect("should deserialize explicit automatic initialization");
+
+        for slot in [absent, automatic] {
+            assert_eq!(
+                serde_json::to_value(slot).expect("should serialize automatic slot"),
+                original,
+                "should omit default initialization and preserve the existing shape"
+            );
+        }
+    }
+
+    #[test]
+    fn slot_initialization_publisher_registered_round_trips() {
+        let mut value = serde_json::to_value(make_slot("header", vec!["/example/*"]))
+            .expect("should serialize slot");
+        value["initialization"] = serde_json::json!("publisher_registered");
+        let slot: CreativeOpportunitySlot = serde_json::from_value(value.clone())
+            .expect("should deserialize publisher-registered initialization");
+
+        assert_eq!(
+            serde_json::to_value(slot).expect("should serialize registered slot"),
+            value,
+            "should preserve publisher-registered initialization in a round trip"
+        );
+    }
+
+    #[test]
+    fn slot_initialization_toml_configuration_accepts_only_known_modes() {
+        let base = r#"
+            id = "header"
+            page_patterns = ["/example/*"]
+            formats = [{ width = 300, height = 250, media_type = "banner" }]
+        "#;
+        for mode in [None, Some("auto"), Some("publisher_registered")] {
+            let source = match mode {
+                Some(mode) => format!("{base}\ninitialization = \"{mode}\"\n"),
+                None => base.to_string(),
+            };
+            let slot: CreativeOpportunitySlot =
+                toml::from_str(&source).expect("should parse a supported initialization mode");
+            let serialized = serde_json::to_value(&slot).expect("should serialize configured slot");
+            assert_eq!(
+                serialized.get("initialization"),
+                mode.filter(|mode| *mode != "auto")
+                    .map(serde_json::Value::from)
+                    .as_ref(),
+                "should emit only non-default initialization for {mode:?}"
+            );
+        }
+        assert!(
+            toml::from_str::<CreativeOpportunitySlot>(&format!(
+                "{base}\ninitialization = \"publisher_ready\"\n"
+            ))
+            .is_err(),
+            "should reject an unknown TOML initialization mode"
+        );
+    }
+
+    #[test]
+    fn slot_initialization_does_not_change_auction_input_or_path_matching() {
+        let mut slot = make_slot("header", vec!["/example/*"]);
+        slot.compile_patterns();
+        let automatic = serde_json::to_value(slot.to_ad_slot())
+            .expect("should serialize automatic auction slot");
+        slot.initialization = CreativeOpportunityInitialization::PublisherRegistered;
+
+        assert_eq!(
+            serde_json::to_value(slot.to_ad_slot())
+                .expect("should serialize registered auction slot"),
+            automatic,
+            "should change delivery ownership without changing auction inputs"
+        );
+        assert!(
+            slot.matches_path("/example/article"),
+            "should retain matching paths"
+        );
+        assert!(
+            !slot.matches_path("/other"),
+            "should retain non-matching paths"
+        );
+        assert!(
+            slot.validate_runtime().is_ok(),
+            "should retain valid slot semantics"
+        );
+    }
+
+    #[test]
+    fn slot_initialization_rejects_unknown_values() {
+        let mut value = serde_json::to_value(make_slot("header", vec!["/example/*"]))
+            .expect("should serialize slot");
+        value["initialization"] = serde_json::json!("publisher_ready");
+
+        assert!(
+            serde_json::from_value::<CreativeOpportunitySlot>(value).is_err(),
+            "should reject an unknown initialization mode"
+        );
     }
 
     #[test]

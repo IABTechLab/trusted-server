@@ -32,6 +32,8 @@ fn main() {
     for path in [
         "lib/src",
         "lib/build-all.mjs",
+        "lib/build-gpt-bootstrap.mjs",
+        "../trusted-server-core/src/integrations/gpt_bootstrap.js",
         "lib/trace-asset-sources.mjs",
         "lib/build-trace.mjs",
         "lib/trace-build-inputs.json",

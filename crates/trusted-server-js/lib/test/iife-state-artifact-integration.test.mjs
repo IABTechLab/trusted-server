@@ -20,7 +20,7 @@ let dom;
 
 beforeAll(async () => {
   outputDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'trusted-server-iife-state-'));
-  for (const name of ['core', 'creative', 'permutive']) {
+  for (const name of ['core', 'creative', 'permutive', 'gpt']) {
     const entryPath =
       name === 'core'
         ? path.join(libDir, 'src', 'core', 'index.ts')
@@ -43,6 +43,7 @@ function createPage({
   logLevel,
   debug = false,
   storedDebug = false,
+  beforeRuntime,
 } = {}) {
   dom = new JSDOM('<!doctype html><head></head><body><div id="slot1"></div></body>', {
     url: `https://publisher.example.com/${debug ? '?tsdebug=1' : ''}`,
@@ -69,6 +70,7 @@ function createPage({
   if (logLevel) {
     window.tsjs = { que: [() => window.tsjs.setConfig({ logLevel })] };
   }
+  beforeRuntime?.(window);
   // Match bundle.rs: core first and independent IIFEs joined into one script.
   window.eval(modules.map((name) => bundles.get(name)).join(';\n'));
   return { window, info, debugLog };
@@ -101,6 +103,58 @@ function requestContext(window) {
 }
 
 describe('shared state across production IIFEs', () => {
+  it('installs the unified GPT runtime without either inline initializer', () => {
+    const queued = [];
+    const configuration = { logLevel: 'silent' };
+    let slots;
+    const { window } = createPage({
+      modules: ['core', 'creative', 'gpt'],
+      beforeRuntime(browser) {
+        browser.__tsjs_gpt_enabled = true;
+        slots = [];
+        browser.tsjs = {
+          adSlots: slots,
+          que: [
+            function () {
+              queued.push({
+                context: this,
+                core: ['setConfig', 'getConfig', 'requestAds', 'addAdUnits'].map(
+                  (name) => typeof browser.tsjs[name]
+                ),
+              });
+              browser.tsjs.setConfig(configuration);
+            },
+          ],
+        };
+      },
+    });
+    expect(queued).toHaveLength(1);
+    expect(queued[0].context).toBe(window.tsjs);
+    expect(queued[0].core).toEqual(Array(4).fill('function'));
+    expect(window.tsjs.getConfig().logLevel).toBe('silent');
+    expect(window.tsjs.adSlots).toBe(slots);
+    // Core drains its queue before the GPT IIFE. All GPT APIs must exist
+    // when the complete synchronous script returns to publisher code.
+    for (const name of ['adInit', 'scheduleInitialAdInit', 'registerPublisherSlot']) {
+      expect(typeof window.tsjs[name], name).toBe('function');
+    }
+    expect(window.tsjs.publisherSlotRegistrationVersion).toBe(1);
+    expect(window.tsjs.tsRenderBridgeVersion).toBe(1);
+    expect(typeof window.__tsjs_installGptShim).toBe('function');
+    expect(window.googletag.cmd.__tsPushed).toBe(true);
+    const later = vi.fn();
+    window.tsjs.que.push(later);
+    expect(later).toHaveBeenCalledOnce();
+    expect(later.mock.instances[0]).toBe(window.tsjs);
+    expect(queued).toHaveLength(1);
+
+    const script = window.document.createElement('script');
+    script.src = 'https://securepubads.g.doubleclick.net/tag/js/gpt.js';
+    window.document.head.appendChild(script);
+    expect(script.src).toBe('https://publisher.example.com/integrations/gpt/tag/js/gpt.js');
+    expect(window.fetch).not.toHaveBeenCalled();
+  });
+
   it('sends Permutive context from an integration bundle through core requestAds', () => {
     const { window } = createPage();
     expect(requestContext(window)).toEqual({ permutive_segments: ['111', '222'] });

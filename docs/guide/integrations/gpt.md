@@ -93,7 +93,49 @@ Successful proxy responses include the `X-GPT-Proxy: true` header for debugging.
 
 ## Client-Side Shim
 
-The GPT integration includes a TypeScript module bundled into the unified TSJS bundle. It provides two capabilities:
+The supported loading contract uses the existing cacheable unified TSJS bundle. It removes the duplicated inline runtime from the supported GPT profile. This is synchronous loading, not a claim that the main bundle can safely defer. Synchronous loading and its critical-script outage boundary are explicitly accepted; real-GPT validation and full issue closure remain pending.
+
+### Loading order
+
+```mermaid
+flowchart TD
+    A[Reservation CSS and integration configuration] --> B[Versioned synchronous unified TSJS bundle]
+    B --> C[Publisher scripts and document parsing]
+    C --> D[Publisher registration and admitted payload]
+    D --> E[Initial registered delivery]
+    C --> F[Existing deferred integrations and window load]
+    F --> G[Existing automatic initializer readiness checks]
+    G --> H[Initial automatic delivery]
+```
+
+Core, creative and GPT execute in the existing unified module order. Core drains its prequeued callbacks before the GPT IIFE executes. Those callbacks can use core APIs; GPT registration, scheduling and rendering APIs are installed when the complete unified script returns to publisher code. The first publisher script after the runtime can use the installed APIs without waiting for a second GPT asset.
+
+With GPT, creative and optionally the separately deferred Prebid integration, configuration remains inline but neither the raw provisional GPT initializer nor the compiled early bundle is embedded in HTML. The external unified URL includes its content hash so browsers can cache the runtime independently of each document. No operator loading-mode flag or automatic retry is added.
+
+Profiles containing another browser integration retain their previous provisional initializer unless an enforced response CSP requires its omission. Their synchronous runtime order is unchanged. The profile allowlist controls omission of the initializer, not permission to defer the whole bundle. The retained implementations and versioned handover helpers are not removed as part of this loading change.
+
+Enforced `Content-Security-Policy` response headers retain the existing synchronous loading and script permissions. This includes actual origin headers and `Settings.response_headers`, matched case-insensitively, even when empty, permissive or repeated. An origin response without CSP cannot cancel a configured policy. Report-Only remains Report-Only. No policy is weakened and no new compiled-inline hash is required. Shared templates preserve the actual policy on cold and warm paths; settings and core fingerprints invalidate older templates. There is no new meta-policy evaluator or nonce handling.
+
+If the sole critical unified script fails to load in the supported profile, the page has no TS initialization APIs or TS delivery. Core-dependent publisher code can report an error. There is no inline fallback or retry. This is the accepted outage boundary for supported ordinary and enforced-CSP pages. It is not equivalent to the earlier design, where a failed deferred GPT asset left the inline renderer working.
+
+The automatic initializer retains its existing load, visibility and animation-frame checks. Registered delivery still requires actual publisher readiness and payload admission. Compare paint and ad-startup separately; a parser-blocking runtime cannot be described as proven deferral, and lab gains do not establish field Core Web Vitals.
+
+These integrations retain their early initialization dependencies:
+
+| Integration            | Early dependency                                                        |
+| ---------------------- | ----------------------------------------------------------------------- |
+| DataDome               | Dynamic SDK script and preload interception                             |
+| Google Tag Manager     | Script interception plus fetch and beacon rewriting                     |
+| Lockr                  | SDK interception and live API-host rewriting                            |
+| Permutive              | SDK interception, endpoint rewriting and auction context registration   |
+| Didomi                 | `didomiConfig.sdkPath` before the SDK reads it                          |
+| Sourcepoint            | SDK interception, runtime configuration rewriting and consent mirroring |
+| Osano                  | Initial consent mirroring and consent-event listeners                   |
+| Testlight              | Immediate publisher queue behavior                                      |
+| Active GPT diagnostics | GPT observation before publisher scripts                                |
+| Enforced response CSP  | Existing script permissions and synchronous loading                     |
+
+Rust-only integrations do not add browser modules to this list. Pages without GPT keep synchronous unified loading. Prebid's external bundle and shim retain their existing execution order. Trusted GAM attribution and APS rendering-mode attributes remain on the executing unified tag. Active diagnostics still install their listeners after core and before publisher scripts.
 
 ### Script Guard
 
@@ -118,15 +160,17 @@ Takes over `googletag.cmd` so every queued callback is wrapped before GPT execut
 
 ### Server slot handoff
 
-For the initial server-rendered auction, the head bootstrap installs
-`window.tsjs.adInit` before the compiled bundle arrives. It reads the
-server-injected slot and bid state synchronously, defines a fallback GPT slot
+For automatic placements in the initial server-rendered auction, the synchronous
+unified runtime installs `window.tsjs.adInit` before publisher scripts. Profiles
+retaining the provisional head bootstrap can install the same API before the
+compiled bundle arrives. Both implementations read the server-injected slot and
+bid state synchronously and define a fallback GPT slot
 on the actual inner div, and records the slot in `gptSlotHandoffs`. It never
 defines a competing slot on an outer `-container` element. When publisher code
 later calls `googletag.defineSlot` for the same placement, the idempotent wrapper
 hands the existing inner-div binding back to GPT.
 
-The bootstrap observes modern `googletag.setConfig({ disableInitialLoad: ... })`
+Both implementations observe modern `googletag.setConfig({ disableInitialLoad: ... })`
 and the legacy `pubads().disableInitialLoad()` call. If initial load is
 disabled, it refreshes only the newly defined Trusted Server slots. It never
 calls an unbounded `refresh()` that could refresh publisher-owned inventory.
@@ -137,6 +181,265 @@ path. After load, the slim Prebid module owns scroll-triggered and refresh
 auctions. SPA navigation obtains page bids through `GET /_ts/page-bids` (the
 legacy `GET /__ts/page-bids` alias remains available); it does not use
 `POST /auction` for that navigation flow.
+
+### Publisher-registered initial delivery
+
+Framework publishers can opt individual placements into
+`initialization = "publisher_registered"`. The default, `auto`, retains the
+existing automatic initializer and handoff behavior. Registration requires a
+matched server, runtime and publisher adapter, plus a compatible bootstrap on
+profiles that retain one. Do not enable it on older artifacts that ignore the setting.
+
+```toml
+[[creative_opportunities.slot]]
+id = "example-header"
+div_id = "example-header-"
+page_patterns = ["/example/*"]
+formats = [{ width = 300, height = 250 }, { width = 300, height = 600 }]
+initialization = "publisher_registered"
+```
+
+TS does not define a fallback for this placement. The publisher mounts the final
+element, defines its native GPT slot, adds PubAdsService and delegates the first
+delivery to TS. The final element ID need not match the configured prefix. Its
+native slot must have the configured rendered GAM path. It must remain connected
+with that ID through delivery and rendering.
+
+```mermaid
+flowchart TD
+    P[Current admitted server payload] --> J[Join for logical slot and navigation]
+    R[Publisher registers exact live native slot] --> J
+    J --> V[Validate identity, eligibility and disabled initial load]
+    V --> D[Claim first delivery once]
+    D --> G[Display exact ID and refresh only that slot]
+    G --> C[Render in the same live element]
+```
+
+#### Page setup and ownership
+
+The publisher must disable initial loading before enabling services. This is
+required even with SRA, because an enabled-load `display` can fetch unrelated
+unfetched slots. TS does not change the page's load or SRA policy for registered
+slots. Configure them in the publisher's existing GPT setup, not a second
+component-level setup:
+
+```js
+googletag.cmd.push(() => {
+  googletag.setConfig({ disableInitialLoad: true, singleRequest: true })
+  // The publisher owns service setup and enables it once for the page.
+  googletag.enableServices()
+})
+```
+
+Before queuing a slot callback, capture `window.tsjs.navGeneration ?? 0`. Pass
+that captured value, not a fresh generation read inside a callback from an older
+route. Inside the callback, after native definition:
+
+```js
+const registration = window.tsjs.registerPublisherSlot({
+  slotId: 'example-header',
+  gptSlot: nativeSlot,
+  navigationGeneration: capturedGeneration,
+  eligibleFormats: [[300, 250]],
+})
+```
+
+Check `publisherSlotRegistrationVersion === 1` as part of the matched publisher
+integration. The publisher must not call the placement's initial `display`,
+`refresh` or Prebid auction after handing it over. TS displays and explicitly
+refreshes only that offered native slot. Genuinely later publisher refreshes keep
+their ordinary Prebid behavior and refresh options.
+
+The slot waits for an accepted current-navigation payload and foreground
+scheduling. Head configuration, `load`, DOM stability, default bids and a failed
+page-bids fetch do not authorize delivery. An accepted empty payload marks the
+registration inactive. A page that never emits an admitted seam can remain waiting
+until the publisher cancels it.
+
+On profiles retaining a provisional initializer, if the framework changes pathname
+before the full runtime arrives, the bootstrap advances the same navigation generation and retires the old admission. New-route
+registrations wait without a request. The bootstrap does not fetch page bids.
+When the runtime takes over, it obtains the current route's payload through its
+existing SPA endpoint without cancelling the new generation's waiting handles.
+A pathname round trip is a new generation, not permission to reuse an earlier
+payload. Ordinary startup without a prior navigation does not start another auction.
+
+#### Responsive eligibility and React teardown
+
+`eligibleFormats` contains finite positive integer size pairs from the same
+publisher values used for the native definition or size mapping. It does not
+change native GPT sizes or run another TS responsive engine. While pending, the
+publisher synchronously cancels and re-registers when that effective set changes,
+including while hidden and before foreground delivery resumes. Do not update it
+in a later passive React effect. Set-equivalent reordering needs no update.
+
+The following example uses public GPT types and assumes
+`gam_network_id = "123456789"`. Its page-level setup above must already be
+installed. The parent explicitly cancels and destroys before changing mounted
+state. Route adapters must call the same teardown before navigation or removal;
+layout cleanup is a backstop, not a replacement for that orchestration. Teardown
+never waits behind a future GPT callback, and queued setup checks its own
+cancellation flag and captured generation.
+
+```tsx
+import { useLayoutEffect, useRef, useState } from 'react'
+
+type TeardownRef = { current: () => void }
+
+export function ExampleRegisteredHeader({
+  teardown,
+}: {
+  teardown: TeardownRef
+}) {
+  useLayoutEffect(() => {
+    const ts = window.tsjs
+    if (ts?.publisherSlotRegistrationVersion !== 1 || !ts.registerPublisherSlot)
+      return
+    const register = ts.registerPublisherSlot.bind(ts)
+    const generation = ts.navGeneration ?? 0
+    const compact: Array<[number, number]> = [[300, 250]]
+    const expanded: Array<[number, number]> = [
+      [300, 250],
+      [300, 600],
+    ]
+    const wide = window.matchMedia('(min-width: 1024px)')
+    let disposed = false
+    let slot: googletag.Slot | null = null
+    let registration: ReturnType<typeof register> | undefined
+    let eligibility: Array<[number, number]> | undefined
+
+    function updateEligibility() {
+      if (disposed || !slot || (ts.navGeneration ?? 0) !== generation) return
+      const next = wide.matches ? expanded : compact
+      if (next === eligibility) return
+      const status = registration?.getStatus().status
+      if (
+        status &&
+        status !== 'waiting_payload' &&
+        status !== 'waiting_delivery'
+      )
+        return
+      registration?.cancel()
+      eligibility = next
+      registration = register({
+        slotId: 'example-header',
+        gptSlot: slot,
+        navigationGeneration: generation,
+        eligibleFormats: next,
+      })
+    }
+
+    googletag.cmd.push(() => {
+      if (disposed || (ts.navGeneration ?? 0) !== generation) return
+      const mapping = googletag
+        .sizeMapping()
+        .addSize([1024, 0], expanded)
+        .addSize([0, 0], compact)
+        .build()
+      if (!mapping) return
+      // Use the rendered path for this configured placement and route.
+      slot = googletag.defineSlot(
+        '/123456789/example-header',
+        expanded,
+        'example-header-final'
+      )
+      if (!slot) return
+      slot.defineSizeMapping(mapping).addService(googletag.pubads())
+      wide.addEventListener('change', updateEligibility)
+      // Capture updates eligibility before foreground delivery listeners run.
+      document.addEventListener('visibilitychange', updateEligibility, true)
+      updateEligibility()
+    })
+
+    function dispose() {
+      if (disposed) return
+      disposed = true
+      registration?.cancel()
+      wide.removeEventListener('change', updateEligibility)
+      document.removeEventListener('visibilitychange', updateEligibility, true)
+      if (slot) googletag.destroySlots([slot])
+    }
+    teardown.current = dispose
+    return dispose
+  }, [teardown])
+
+  return <div id="example-header-final" />
+}
+
+export function ExamplePlacement() {
+  const [mounted, setMounted] = useState(true)
+  const teardown = useRef(() => {})
+  return (
+    <>
+      {mounted && <ExampleRegisteredHeader teardown={teardown} />}
+      <button
+        onClick={() => {
+          teardown.current()
+          setMounted(false)
+        }}
+      >
+        Remove placement
+      </button>
+    </>
+  )
+}
+```
+
+Use your publisher's existing TSJS and public GPT type declarations. The complete
+framework fixture additionally checks native object identity, element identity,
+request-time targeting, visible creative content and teardown ordering. A request
+count alone does not establish visible delivery.
+
+#### Status, cancellation and demand eligibility
+
+`registration.getStatus()` returns a result discriminated by `status`:
+
+- `waiting_payload` or `waiting_delivery`: pending; cancel before replacing the
+  slot or changing its effective eligibility.
+- `dispatching`, `requested` or `rendered`: the logical initial delivery is
+  consumed for this navigation.
+- `inactive`: the admitted payload omitted the placement or did not select this mode.
+- `publisher_owned`: an earlier observed publisher claim won; TS does not overwrite it.
+- `cancelled`: pending work was cancelled or invalidated.
+- `rejected`: invalid input, stale/conflicting identity or enabled/unknown initial-load policy.
+- `failed_after_dispatch`: a native invocation threw after delivery began. A
+  request may already have occurred, so TS never automatically retries it.
+
+Cancellation affects only that handle's record. An old handle cannot cancel a
+replacement or a newer navigation. Cancelling after dispatch cannot undo a
+request or reopen initial delivery. Destroy the native slot before removing its
+div. Intentional replacement after a request belongs to the publisher's later
+lifecycle; TS does not move the creative or rebind the old native object.
+
+A TS bid participates only when a real TS renderer is installed and the winner's
+finite positive dimensions match both configured and declared eligible formats.
+Missing, unknown-size or incompatible bids still permit one ordinary GAM request.
+An empty finite eligibility list permits GAM delivery without TS demand.
+
+Supported profiles install the renderer through the synchronous unified bundle
+before publisher scripts. A retained raw GPT bootstrap alone has no creative
+renderer. If no renderer was installed, registered delivery omits TS candidate
+targeting and makes the single ordinary GAM request. GAM can fill it with a
+publisher creative or return no-fill. TS fill is deliberately unavailable on that
+path. A later runtime load does not add the excluded candidate, replace the ad or
+request it again. Optional trace diagnostics can still correlate the validated
+server-auction opportunity with this no-candidate request; that correlation does
+not assert that the excluded bid participated or was selected.
+
+#### Activation and verification
+
+Publish the matched code with the mode unused first. Verify protocol version,
+selected module hashes, any retained bootstrap, publisher setup and explicit ownership.
+Then activate only selected placements with the matching publisher adapter after
+a separately approved real-GPT staging canary proves one initial request, correct
+targeting, visible rendering, an unaffected unrelated slot and a legitimate later
+refresh. Local stubs do not prove real-GAM behavior or publisher adoption.
+
+A rejected or inactive handle is not automatically permission to start a competing
+publisher request. Rollback is a separate compatible server/adapter/configuration
+release decision, not an asynchronous fallback callback. Do not change ownership
+or initialization mode inside an already-open document. This opt-in API does not
+repair unmodified publishers or close all performance work in issue #854.
 
 ### Shared script-guard dispatcher
 

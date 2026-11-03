@@ -1,6 +1,8 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as setTimeoutPromise } from "node:timers/promises";
 import { createServer } from "node:net";
+import { createWriteStream, mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { waitForReady } from "./wait-for-ready.js";
 
 const ORIGIN_PORT = process.env.INTEGRATION_ORIGIN_PORT || "8888";
@@ -55,7 +57,7 @@ export async function startContainer(framework: string): Promise<string> {
       `${ORIGIN_PORT}:${config.port}`,
       "-e",
       `ORIGIN_HOST=127.0.0.1:${ORIGIN_PORT}`,
-      config.image,
+      process.env.INTEGRATION_FRAMEWORK_IMAGE || config.image,
     ],
     { encoding: "utf-8" },
   ).trim();
@@ -93,17 +95,36 @@ export async function startViceroy(
 ): Promise<{ process: ChildProcess; baseUrl: string }> {
   const port = await findAvailablePort();
 
+  const logDirectory = process.env.PUBLISHER_REGISTRATION_LOG_DIR;
+  if (logDirectory) mkdirSync(logDirectory, { recursive: true });
   const child = spawn(
     "viceroy",
-    [wasmPath, "-C", configPath, "--addr", `127.0.0.1:${port}`],
+    [
+      wasmPath,
+      "-C",
+      configPath,
+      "--addr",
+      `127.0.0.1:${port}`,
+      ...(logDirectory ? ["--log-stdout", "--log-stderr"] : []),
+    ],
     // stdin: ignore, stdout: pipe (drained), stderr: pipe (logged).
     // IMPORTANT: stdout MUST be drained to prevent pipe buffer deadlock.
     // If the OS pipe buffer (~64KB) fills, Viceroy blocks on write.
     { stdio: ["ignore", "pipe", "pipe"] },
   );
 
-  // Drain stdout to prevent pipe buffer deadlock
-  child.stdout?.resume();
+  // Preserve dedicated-run logs without changing normal framework output.
+  // Both paths drain stdout to prevent pipe buffer deadlock.
+  if (logDirectory) {
+    child.stdout?.pipe(
+      createWriteStream(join(logDirectory, "viceroy.stdout.log")),
+    );
+    child.stderr?.pipe(
+      createWriteStream(join(logDirectory, "viceroy.stderr.log")),
+    );
+  } else {
+    child.stdout?.resume();
+  }
 
   // Surface Viceroy stderr for debugging
   child.stderr?.on("data", (data: Buffer) => {

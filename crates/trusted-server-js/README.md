@@ -22,6 +22,19 @@ npm run format
 npm run build
 ```
 
+The provisional GPT bootstrap embedded by `trusted-server-core` is generated
+from `lib/src/integrations/gpt/bootstrap.template.js` and the shared
+`publisher_registration.ts` protocol. After changing either source, regenerate
+the checked-in artifact from `lib`:
+
+```bash
+npm run build:gpt-bootstrap -- --write
+```
+
+`npm run build:gpt-bootstrap -- --check` checks freshness without writing files.
+The regular JS build also rejects stale output before touching bundle directories.
+Cargo prebuilt mode embeds the checked-in bootstrap without invoking Node.
+
 Rust target checks include this crate through `cargo test-fastly`. See
 [Trusted Server JavaScript](../../docs/guide/tsjs.md) for the 12 integration
 entries, 13 emitted bundles, and immediate, deferred, and standalone loading

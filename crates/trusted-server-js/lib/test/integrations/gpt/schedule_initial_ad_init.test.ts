@@ -101,7 +101,7 @@ describe('scheduleInitialAdInit', () => {
     vi.unstubAllGlobals();
   });
 
-  it('records owned initial evidence after the final generation guard and before adInit', async () => {
+  it('records accepted initial evidence before registration settlement and deferred adInit', async () => {
     readyState = 'complete';
     await importGptModule();
     window.__tsjs_trace_active = true;
@@ -141,14 +141,18 @@ describe('scheduleInitialAdInit', () => {
       expect(ts.bids).toBe(bids);
     });
     ts.scheduleInitialAdInit!(bids, slots, { schema_version: 1, evidence });
-    expect(ts.traceEvidence!.snapshot().value?.serverAuctions).toEqual([]);
+    expect(ts.traceEvidence!.snapshot().value?.serverAuctions).toEqual([evidence]);
+    expect(ts.traceGpt!.identity(slots[0]!)).toEqual({
+      diagnostic_auction_id: AUCTION_TOKEN,
+      slot_ref: SLOT_TOKEN,
+    });
     flushFrame();
     flushFrame();
     expect(ts.adInit).toHaveBeenCalledOnce();
     expect(ts.traceEvidence!.snapshot().value?.serverAuctions).toEqual([evidence]);
   });
 
-  it('does not capture an initial transport abandoned before hydration', async () => {
+  it('retains the accepted transport observation but drops automatic work abandoned before hydration', async () => {
     readyState = 'complete';
     await importGptModule();
     window.__tsjs_trace_active = true;
@@ -159,9 +163,11 @@ describe('scheduleInitialAdInit', () => {
       schema_version: 1,
       unavailable_reason: 'evidence_projection_failed',
     });
+    expect(ts.traceEvidence!.snapshot().value?.issues).toEqual(['evidence_projection_failed']);
     ts.navGeneration = 1;
     flushFrame();
     flushFrame();
+    expect(ts.traceEvidence!.snapshot().value?.issues).toEqual(['evidence_projection_failed']);
     expect(ts.traceEvidence!.snapshot().value?.serverAuctions).toEqual([]);
     expect(ts.adInit).not.toHaveBeenCalled();
   });
