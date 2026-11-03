@@ -10907,6 +10907,8 @@ mod tests {
             let (gate, decision) = gate_and_decision(&settings);
             let registry = IntegrationRegistry::new(&settings).expect("should build registry");
             let mut processor = create_html_stream_processor(HtmlStreamProcessorParams {
+                enforced_csp: false,
+                request_path: "/",
                 origin_host: "origin.example.com",
                 request_host: "publisher.example.com",
                 request_scheme: "https",
@@ -19591,6 +19593,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                                 ad_bids_state: Arc::new(Mutex::new(None)),
                                 suppress_datadome_client_side_tag: false,
                                 gpt_diagnostics: None,
+                                trace_bootstrap: None,
                                 shared_template_authorized,
                                 csp_nonce_observed: None,
                                 deferred_inline_marker: None,
