@@ -800,12 +800,12 @@ finalized. Results go into the navigation's single EC row write. A lookup that
 times out or fails leaves the row unchanged.
 
 Lookups run only for an existing or newly issued EC, only when consent allows
-EID persistence, and, when `tcf_vendor_id` is set, only with TCF vendor consent
-for that vendor.
+EID persistence, and, when `tcf_vendor_id` is set and TCF applies to the
+request, only with TCF vendor consent for that vendor.
 
 A provider owns its `sources`: its results replace whatever the row holds for
-them, and batch sync rejects them. Browser-resolved IDs (`ts-eids`, `sharedId`,
-`/auction` body EIDs) for an owned source are stored only as a fallback, when
+them, and batch sync rejects them and pull sync skips them. Browser-resolved IDs
+(`ts-eids`, `sharedId`) for an owned source are stored only as a fallback, when
 the row has no live provider-written UID for the source and the provider kept
 nothing for it on that navigation. The fallback follows the normal browser
 ingest rules, never overwrites an existing value, and does not stop later
