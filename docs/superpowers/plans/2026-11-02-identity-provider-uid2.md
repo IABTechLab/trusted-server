@@ -2,15 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Store the UID2 advertising token the browser already sends in first-party cookies, as an `[[ec.identity_providers]]` entry with `kind = "uid2"`. No login, no server call and no server-side refresh.
+**Status:** Implemented; checkboxes are not updated.
 
-**Architecture:** `crates/trusted-server-identity-providers/src/uid2.rs` holds `Uid2` (a `ProviderKind`), `Uid2Settings` and `Uid2Provider`. The provider implements only `IdentityProvider::read_request_cookies`, using the cookie helpers in `common.rs`; `build_request` always fails, so no lookup is sent.
+**Goal:** Store the UID2 advertising token from first-party cookies, as an `[[ec.identity_providers]]` entry with `kind = "uid2"`, and, when `endpoint` is set, refresh it server side. No login; tokens are never generated.
+
+**Architecture:** `crates/trusted-server-identity-providers/src/uid2.rs` holds `Uid2` (a `ProviderKind`), `Uid2Settings` and `Uid2Provider`. `read_request_cookies` reads the token, using the cookie helpers in `common.rs`; with an `endpoint`, `build_request` posts the stored refresh token to `POST /v2/token/refresh` and `parse_response` decrypts the AES-256-GCM reply (12-byte IV first) using the response key passed in `ProviderRequest::context`. Without an `endpoint`, `build_request` fails.
 
 **Spec:** `docs/superpowers/specs/2026-10-30-s2s-eid-collection-design.md`, section 7.
 
 ## Cookies
 
-- `identity_cookie_name` (default `__uid_2`): percent-encoded JSON from the UID2 SDK. Only `advertising_token` and `identity_expires` (milliseconds) are deserialized. `refresh_token`, `refresh_from`, `refresh_expires` and `refresh_response_key` are never read, so they are never stored.
+- `identity_cookie_name` (default `__uid_2`): percent-encoded JSON from the UID2 SDK. `advertising_token` and `identity_expires` (milliseconds) are read. With an `endpoint`, `refresh_token`, `refresh_response_key` and `refresh_from` are kept as private refresh state (never served, mirrored or forwarded; the admin view shows it as `[redacted]`); without it they are not stored. `refresh_expires` is not read.
 - `cookie_names` (default `["__uid2_advertising_token"]`): cookies holding a raw token, such as Prebid's, read in order only when the identity cookie yields nothing.
 - A missing token or expiry, a blank or opt-out token, or malformed JSON reads as no ID.
 
@@ -19,7 +21,7 @@
 - One EID for the single configured source, one UID with `atype = 3`.
 - From the identity cookie: `ProviderExpiry::At(identity_expires)`; the coordinator's validation drops an expired token.
 - From the raw token cookie: `bounded_expiry(None)`, the shared default TTL.
-- No refresh: the browser SDK refreshes the identity and the next navigation with a due source picks up the new token.
+- Refresh state `from = refresh_from`; the source becomes due then, and is refreshed only when the cookies no longer yield a usable token. A refresh is due only while the token is still live, so a failing refresh stops at its expiry; `rate_limit_per_hour` also bounds it. An `optout` reply removes the stored token.
 
 ## Lockr
 
@@ -27,11 +29,14 @@
 
 ## Not ported from the reference provider
 
-- The reference generates a first token from a hashed email and refreshes it with the refresh token it kept from that call. Generation needs login, and refreshing with the SDK cookie's refresh token would spend the browser's single-use refresh token without a way to write the new `__uid_2` cookie back, so neither is ported.
+- Token generation (needs a hashed email; out of scope).
+
+Risk: a server refresh spends the SDK cookie's refresh token without rewriting `__uid_2`, so the browser SDK's own refresh of that identity may then fail. That is acceptable because server refresh runs only when the browser sends no usable token.
 
 ## Tasks
 
 - [ ] Add `uid2.rs` and register the kind in `is_registered_kind` and `build`.
 - [ ] Unit tests: token and expiry from `__uid_2` with refresh fields not stored, raw token fallback, configured cookie names, missing, malformed and opt-out cookies ignored.
+- [ ] Refresh: `endpoint`, AES-256-GCM decrypt with the response key from `ProviderRequest::context`, `optout` reply as `LookupOutcome::OptedOut`, and `refresh_state` tests.
 - [ ] Add a commented `kind = "uid2"` example to `trusted-server.example.toml`.
 - [ ] Run `cargo test-fastly` and `cargo clippy-fastly`.

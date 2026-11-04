@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented; checkboxes are not updated.
+
 **Goal:** Resolve `LiveIntent`'s IDs at the edge as a no-login `[[ec.identity_providers]]` entry with `kind = "liveintent"`, storing one EID per resolved attribute.
 
 **Architecture:** `crates/trusted-server-identity-providers/src/liveintent.rs` holds `LiveIntent` (a `ProviderKind`), `LiveIntentSettings` and `LiveIntentProvider` (an `IdentityProvider`), plus one `build` arm in `lib.rs`. The provider is pure: `build_request` builds one `GET` to the identity exchange, and `parse_response` maps returned attributes to sources. The coordinator from PR A applies consent, the source gate, validation, expiry and persistence.

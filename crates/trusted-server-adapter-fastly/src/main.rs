@@ -22,7 +22,7 @@ use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::page_load::NavigationPermit;
-use trusted_server_core::ec::provider::ClientSignals;
+use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
 use trusted_server_core::ec::pull_sync::{
     PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
 };
@@ -794,9 +794,7 @@ fn run_after_response_lookups(
     let transport =
         PlatformLookupTransport::new(&ec_state.services, settings.proxy.certificate_check);
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+    let now = trusted_server_core::ec::current_timestamp();
     let pending = futures::executor::block_on(coordinator.dispatch(
         &transport,
         &LookupContext {
@@ -808,6 +806,7 @@ fn run_after_response_lookups(
                 user_agent: lookups.user_agent.as_deref(),
             },
             publisher_domain: &settings.publisher.domain,
+            cookies: RequestCookies::new(&lookups.cookie_header),
             rate_limiter: &limiter,
             now: UnixSeconds::new(now),
         },

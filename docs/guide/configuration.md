@@ -749,16 +749,17 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
 be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
-| Field                     | Type           | Required | Description                                                             |
-| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
-| `partners`                | Array          | No       | Static partner registry entries                                         |
-| `identity_budget_ms`      | Integer        | No       | Shared time budget for identity provider lookups (default 200)          |
-| `identity_providers`      | Array          | No       | Server-side identity providers (see below)                              |
+| Field                               | Type           | Required | Description                                                                                     |
+| ----------------------------------- | -------------- | -------- | ----------------------------------------------------------------------------------------------- |
+| `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                                           |
+| `ec_store`                          | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                 |
+| `pull_sync_concurrency`             | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                      |
+| `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                                             |
+| `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps                         |
+| `partners`                          | Array          | No       | Static partner registry entries                                                                 |
+| `identity_budget_ms`                | Integer        | No       | Shared time budget for identity provider lookups (default 200)                                  |
+| `identity_after_response_budget_ms` | Integer        | No       | Budget for `collect = "after_response"` providers, from their post-send dispatch (default 2000) |
+| `identity_providers`                | Array          | No       | Server-side identity providers (see below)                                                      |
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
@@ -793,8 +794,8 @@ TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 
 ### Identity providers
 
-`[[ec.identity_providers]]` entries look up a visitor's IDs from a provider's
-server on publisher page navigations. Lookups start before the origin fetch,
+`[[ec.identity_providers]]` entries collect a visitor's IDs from the vendor's
+first-party cookies or a provider's server on publisher page navigations. Lookups start before the origin fetch,
 share the `identity_budget_ms` budget, and are collected before the response is
 finalized. Results go into the navigation's single EC row write. A lookup that
 times out or fails leaves the row unchanged.
@@ -811,17 +812,32 @@ nothing for it on that navigation. The fallback follows the normal browser
 ingest rules, never overwrites an existing value, and does not stop later
 lookups: the next successful lookup replaces it.
 
-| Field             | Type    | Required | Description                                                             |
-| ----------------- | ------- | -------- | ----------------------------------------------------------------------- |
-| `id`              | String  | Yes      | Stable provider ID used in logs, metrics and KV ownership               |
-| `kind`            | String  | Yes      | Provider implementation built into this release                         |
-| `enabled`         | Boolean | No       | Whether the provider runs (default `true`)                              |
-| `endpoint`        | String  | Yes      | HTTPS lookup URL; its host must be in `allowed_domains`                 |
-| `allowed_domains` | Array   | Yes      | Hosts the provider may call                                             |
-| `sources`         | Array   | Yes      | Source domains the provider owns; each needs an `[[ec.partners]]` entry |
-| `tcf_vendor_id`   | Integer | No       | TCF vendor ID that must have vendor consent                             |
-| `secrets.token`   | String  | No       | Key in `trusted_server_secrets` for the provider's API token            |
-| `settings`        | Table   | No       | Provider-specific settings, parsed by the provider kind                 |
+A provider set to `collect = "after_response"` looks up only after the response
+is sent, within `identity_after_response_budget_ms`, and its results go into one
+follow-up compare-and-swap write that never creates or revives a row. They are
+served from the next page load. Only the Fastly adapter runs this phase. The
+instance stays busy after the response, which lowers throughput when sandboxes
+are reused. Keep cookie-only kinds on `page`.
+
+Some kinds keep private refresh state with a UID, such as a vendor refresh
+token, and refresh it server side once it is due, while the UID is still live.
+Refresh state is never served, mirrored, forwarded or shown: the admin view
+shows it as `[redacted]`. Kinds without a vendor server may generate an ID into
+the EC row when the cookies hold none; no cookie is set.
+
+| Field                 | Type    | Required | Description                                                                           |
+| --------------------- | ------- | -------- | ------------------------------------------------------------------------------------- |
+| `id`                  | String  | Yes      | Stable provider ID used in logs, metrics and KV ownership                             |
+| `kind`                | String  | Yes      | Provider implementation built into this release                                       |
+| `enabled`             | Boolean | No       | Whether the provider runs (default `true`)                                            |
+| `endpoint`            | String  | No       | HTTPS lookup URL, for kinds that make a lookup; its host must be in `allowed_domains` |
+| `allowed_domains`     | Array   | Yes      | Hosts the provider may call                                                           |
+| `sources`             | Array   | Yes      | Source domains the provider owns; each needs an `[[ec.partners]]` entry               |
+| `tcf_vendor_id`       | Integer | No       | TCF vendor ID that must have vendor consent                                           |
+| `collect`             | String  | No       | `page` (default) or `after_response`                                                  |
+| `rate_limit_per_hour` | Integer | No       | Most lookups per EC per hour; unset means unlimited                                   |
+| `secrets.token`       | String  | No       | Key in `trusted_server_secrets` for the provider's API token                          |
+| `settings`            | Table   | No       | Provider-specific settings, parsed by the provider kind                               |
 
 **Example**:
 

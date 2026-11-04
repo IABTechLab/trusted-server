@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented; checkboxes are not updated.
+
 **Goal:** Resolve the ID5 ID at the edge as an anonymous `[[ec.identity_providers]]` entry with `kind = "id5"`, storing the complete EIDs ID5 returns.
 
 **Architecture:** `crates/trusted-server-identity-providers/src/id5.rs` holds `Id5` (a `ProviderKind`), `Id5Settings` and `Id5Provider` (an `IdentityProvider`), plus one `build` arm in `lib.rs`. The provider is pure: `build_request` builds one JSON `POST`, and `parse_response` borrows EIDs from the body. The coordinator from PR A (`ec::coordinator`) applies consent, the source gate, validation, expiry and persistence.

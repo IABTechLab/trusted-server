@@ -1,12 +1,21 @@
 //! UID2 identity provider: reads the UID2 advertising token from the
-//! browser's own first-party cookies.
+//! browser's own first-party cookies, and refreshes it server side when an
+//! `endpoint` is configured.
 //!
 //! The UID2 SDK stores its identity in the `__uid_2` cookie as
-//! percent-encoded JSON. Only `advertising_token` and `identity_expires`
+//! percent-encoded JSON. `advertising_token` and `identity_expires`
 //! (milliseconds) are read: the token is stored with agent type 3 until
 //! `identity_expires`, and the coordinator drops it once that time has
-//! passed. The refresh token and response key are never read, so they are
-//! never stored, and no refresh is made server side.
+//! passed.
+//!
+//! With an `endpoint` (UID2's `POST /v2/token/refresh`), the cookie's
+//! `refresh_token` and `refresh_response_key` are also kept with the token as
+//! private refresh state, and the source becomes due at `refresh_from`. The
+//! refresh posts the refresh token, which needs no API key and no email, and
+//! decrypts the reply with the response key (AES-256-GCM, a 12-byte IV
+//! first). A refresh replying `optout` removes the stored token. No token is
+//! ever generated: that needs an email or phone number, which is out of
+//! scope. Without an `endpoint` the refresh state is not stored.
 //!
 //! When `__uid_2` yields nothing, the cookies in `cookie_names` (default
 //! Prebid's `__uid2_advertising_token`) are read. Prebid's UID2 module
@@ -28,14 +37,21 @@
 
 use std::borrow::Cow;
 
+use aes_gcm::aead::{Aead as _, KeyInit as _};
+use aes_gcm::{Aes256Gcm, Nonce};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use bytes::Bytes;
 use error_stack::Report;
-use serde::Deserialize;
+use http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
 use trusted_server_core::ec::eid_types::{SourceDomain, UnixSeconds};
 use trusted_server_core::ec::provider::{
     CookieRead, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities, ProviderCommon,
-    ProviderConfigError, ProviderError, ProviderExpiry, ProviderKind, ProviderRequest,
-    ProviderResponse, RequestCookies,
+    ProviderConfigError, ProviderEid, ProviderError, ProviderExpiry, ProviderKind, ProviderRefresh,
+    ProviderRequest, ProviderResponse, RequestCookies,
 };
+use url::Url;
 
 use crate::common::{
     CookieReader, LockrSettings, ReadsLockr, bounded_expiry, cookie_capabilities, cookie_eid,
@@ -78,6 +94,8 @@ pub struct Uid2Provider {
     source: SourceDomain,
     identity_cookie_name: String,
     cookies: CookieReader,
+    /// UID2's token refresh endpoint; `None` disables server refresh.
+    refresh_endpoint: Option<Url>,
 }
 
 impl ReadsLockr for Uid2 {
@@ -103,26 +121,99 @@ impl ProviderKind for Uid2 {
                 settings.cookie_names,
                 settings.lockr,
             )?,
+            refresh_endpoint: common.endpoint.cloned(),
         })
     }
 }
 
-/// The fields of the `__uid_2` cookie this provider reads.
+/// A UID2 identity: the `__uid_2` cookie and the `body` of a decrypted
+/// refresh reply share these fields.
 #[derive(Deserialize)]
-struct IdentityCookie {
+struct Identity {
     advertising_token: String,
     identity_expires: u64,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    refresh_response_key: Option<String>,
+    #[serde(default)]
+    refresh_from: Option<u64>,
 }
 
-/// Decodes one `__uid_2` value into the token and its expiry.
-fn identity(value: &str) -> Option<(String, ProviderExpiry)> {
+/// The refresh state kept with a stored token.
+#[derive(Serialize, Deserialize)]
+struct RefreshState {
+    /// The refresh token posted to the refresh endpoint.
+    token: String,
+    /// Base64 AES-256 key that decrypts the refresh reply.
+    key: String,
+}
+
+/// A usable token with its expiry and, when present, its refresh state.
+struct Token {
+    token: String,
+    expiry: ProviderExpiry,
+    refresh: Option<(RefreshState, ProviderExpiry)>,
+}
+
+impl Identity {
+    /// The token, with refresh state when the identity carries all of it.
+    fn into_token(self) -> Option<Token> {
+        if !is_usable_id(&self.advertising_token) {
+            return None;
+        }
+        let refresh = match (
+            self.refresh_token,
+            self.refresh_response_key,
+            self.refresh_from,
+        ) {
+            (Some(token), Some(key), Some(from)) if !token.is_empty() && !key.is_empty() => Some((
+                RefreshState { token, key },
+                ProviderExpiry::At(UnixSeconds::new(from / 1000)),
+            )),
+            _ => None,
+        };
+        Some(Token {
+            token: self.advertising_token,
+            expiry: ProviderExpiry::At(UnixSeconds::new(self.identity_expires / 1000)),
+            refresh,
+        })
+    }
+}
+
+/// Decodes one `__uid_2` value.
+fn identity(value: &str) -> Option<Token> {
     let decoded = percent_decoded(value);
-    let cookie: IdentityCookie = serde_json::from_str(&decoded).ok()?;
-    if !is_usable_id(&cookie.advertising_token) {
+    serde_json::from_str::<Identity>(&decoded)
+        .ok()?
+        .into_token()
+}
+
+/// A decrypted refresh reply.
+#[derive(Deserialize)]
+struct RefreshReply {
+    status: String,
+    #[serde(default)]
+    body: Option<Identity>,
+}
+
+/// Status of a refresh reply for a user who opted out.
+const REFRESH_OPT_OUT: &str = "optout";
+
+/// Length of the AES-GCM IV that starts a refresh reply.
+const IV_BYTES: usize = 12;
+
+/// Decrypts a base64 refresh reply with the base64 `key`.
+fn decrypt_reply(body: &[u8], key: &str) -> Option<Vec<u8>> {
+    let key = BASE64.decode(key).ok()?;
+    let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
+    let envelope = BASE64.decode(body.trim_ascii()).ok()?;
+    if envelope.len() <= IV_BYTES {
         return None;
     }
-    let expires = UnixSeconds::new(cookie.identity_expires / 1000);
-    Some((cookie.advertising_token, ProviderExpiry::At(expires)))
+    let (iv, ciphertext) = envelope.split_at(IV_BYTES);
+    let nonce = Nonce::try_from(iv).ok()?;
+    cipher.decrypt(&nonce, ciphertext).ok()
 }
 
 /// `latestToken` value Prebid stores after an opt-out.
@@ -187,16 +278,57 @@ impl IdentityProvider for Uid2Provider {
 
     fn build_request(
         &self,
-        _lookup: &LookupInput<'_>,
+        lookup: &LookupInput<'_>,
     ) -> Result<ProviderRequest, Report<ProviderError>> {
-        Err(Report::new(ProviderError::Request).attach("uid2 makes no lookup"))
+        let Some(endpoint) = &self.refresh_endpoint else {
+            return Err(Report::new(ProviderError::Request)
+                .attach("uid2 refreshes only with an endpoint and never generates tokens"));
+        };
+        let state = lookup
+            .current
+            .iter()
+            .flat_map(|(_, eid)| eid.uids())
+            .find_map(|uid| uid.refresh())
+            .and_then(|refresh| serde_json::from_str::<RefreshState>(&refresh.state).ok())
+            .ok_or_else(|| {
+                Report::new(ProviderError::Request).attach("no stored uid2 refresh token")
+            })?;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        Ok(ProviderRequest {
+            method: http::Method::POST,
+            url: endpoint.clone(),
+            headers,
+            body: Bytes::from(state.token),
+            context: Some(state.key),
+        })
     }
 
     fn parse_response<'body>(
         &self,
-        _response: ProviderResponse<'body>,
+        response: ProviderResponse<'body>,
     ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
-        Err(Report::new(ProviderError::InvalidResponse).attach("uid2 makes no lookup"))
+        let key = response.context.ok_or_else(|| {
+            Report::new(ProviderError::InvalidResponse).attach("no uid2 response key")
+        })?;
+        let plaintext = decrypt_reply(response.body, key).ok_or_else(|| {
+            Report::new(ProviderError::InvalidResponse).attach("uid2 reply not decrypted")
+        })?;
+        let reply: RefreshReply = serde_json::from_slice(&plaintext).map_err(|error| {
+            Report::new(ProviderError::InvalidResponse).attach(format!("uid2 reply: {error}"))
+        })?;
+        if reply.status == REFRESH_OPT_OUT {
+            return Ok(LookupOutcome::OptedOut);
+        }
+        let token = reply
+            .body
+            .filter(|_| reply.status == "success")
+            .and_then(Identity::into_token)
+            .ok_or_else(|| {
+                Report::new(ProviderError::InvalidResponse)
+                    .attach(format!("uid2 refresh status {}", reply.status))
+            })?;
+        Ok(LookupOutcome::Found(vec![self.eid(token)]))
     }
 
     fn read_request_cookies<'cookie>(
@@ -215,14 +347,38 @@ impl IdentityProvider for Uid2Provider {
             .or_else(|| {
                 self.cookies
                     .read(cookies, |value| match token_cookie(value)? {
-                        TokenCookie::Token(token, expiry) => Some((token, expiry)),
+                        TokenCookie::Token(token, expiry) => Some(Token {
+                            token,
+                            expiry,
+                            refresh: None,
+                        }),
                         TokenCookie::OptedOut => None,
                     })
             });
-        let Some((token, expiry)) = token else {
+        let Some(token) = token else {
             return CookieRead::Absent;
         };
-        CookieRead::Found(vec![cookie_eid(&self.source, Cow::Owned(token), expiry)])
+        CookieRead::Found(vec![self.eid(token)])
+    }
+}
+
+impl Uid2Provider {
+    /// Builds the entry for `token`, keeping its refresh state only when
+    /// server refresh is enabled.
+    fn eid<'any>(&self, token: Token) -> ProviderEid<'any> {
+        let mut eid = cookie_eid(&self.source, Cow::Owned(token.token), token.expiry);
+        if self.refresh_endpoint.is_some()
+            && let Some((state, from)) = token.refresh
+            && let Ok(state) = serde_json::to_string(&state)
+        {
+            for uid in &mut eid.uids {
+                uid.refresh = Some(ProviderRefresh {
+                    state: Cow::Owned(state.clone()),
+                    from,
+                });
+            }
+        }
+        eid
     }
 }
 
@@ -231,6 +387,11 @@ mod tests {
     use serde_json::json;
     use trusted_server_core::ec::provider::build_kind;
     use trusted_server_core::settings::{IdentityProviderConfig, ProviderSecrets};
+
+    use trusted_server_core::consent::ConsentContext;
+    use trusted_server_core::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue};
+    use trusted_server_core::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvRefresh, KvUid};
+    use trusted_server_core::ec::provider::{ClientSignals, OwnedEntries};
 
     use super::*;
 
@@ -431,5 +592,257 @@ mod tests {
                 "should ignore {header:?}"
             );
         }
+    }
+
+    const REFRESH_ENDPOINT: &str = "https://uid2.example.com/v2/token/refresh";
+
+    fn refreshing_provider() -> Box<dyn IdentityProvider> {
+        let config: IdentityProviderConfig = serde_json::from_value(json!({
+            "id": "uid2",
+            "kind": "uid2",
+            "sources": ["uid2.example.com"],
+            "endpoint": REFRESH_ENDPOINT,
+            "allowed_domains": ["uid2.example.com"],
+        }))
+        .expect("should parse provider config");
+        build_kind::<Uid2>(&config, &ProviderSecrets::default()).expect("should build provider")
+    }
+
+    fn sdk_identity_header() -> String {
+        identity_cookie(&json!({
+            "advertising_token": "AgAAAAexampletoken",
+            "refresh_token": "example-refresh-token",
+            "identity_expires": 1_700_000_000_000_u64,
+            "refresh_from": 1_699_990_000_000_u64,
+            "refresh_expires": 1_702_000_000_000_u64,
+            "refresh_response_key": BASE64.encode([7_u8; 32]),
+        }))
+    }
+
+    fn refresh_of(
+        provider: &dyn IdentityProvider,
+        header: &str,
+    ) -> Option<(String, ProviderExpiry)> {
+        let eids = provider
+            .read_request_cookies(RequestCookies::new(header))
+            .into_found()
+            .expect("should read the token");
+        let refresh = eids[0].uids[0].refresh.as_ref()?;
+        Some((refresh.state.to_string(), refresh.from))
+    }
+
+    #[test]
+    fn keeps_the_refresh_state_when_refresh_is_enabled() {
+        let (state, from) = refresh_of(&*refreshing_provider(), &sdk_identity_header())
+            .expect("should keep the refresh state");
+
+        let state: RefreshState = serde_json::from_str(&state).expect("should parse the state");
+        assert_eq!(
+            state.token, "example-refresh-token",
+            "should keep the refresh token"
+        );
+        assert!(
+            matches!(from, ProviderExpiry::At(at) if at.get() == 1_699_990_000),
+            "should ask for a refresh at refresh_from"
+        );
+    }
+
+    #[test]
+    fn stores_no_refresh_state_without_an_endpoint() {
+        assert!(
+            refresh_of(&*provider(&json!({})), &sdk_identity_header()).is_none(),
+            "should not keep the refresh token when refresh is disabled"
+        );
+    }
+
+    fn stored_entry() -> KvEntry {
+        let state = serde_json::to_string(&RefreshState {
+            token: "example-refresh-token".to_owned(),
+            key: BASE64.encode([7_u8; 32]),
+        })
+        .expect("should serialize the state");
+        let uid = KvUid::new(
+            UidValue::try_from("AgAAAAexampletoken".to_owned()).expect("should build uid"),
+            AgentType::try_from(3).expect("should build atype"),
+            None,
+            Some(ProviderId::new("uid2")),
+            Expiry::At(UnixSeconds::new(1_700_000_000)),
+        )
+        .with_refresh(KvRefresh {
+            state,
+            from: UnixSeconds::new(1_699_990_000),
+        });
+        let record = KvPartnerId::from_eids(
+            vec![KvEid::new(EidFields::default(), vec![uid])],
+            UnixSeconds::new(1_699_995_000),
+        )
+        .expect("should keep the live uid");
+        let mut entry = KvEntry::tombstone(1);
+        entry.consent.ok = true;
+        entry.ids.insert("uid2.example.com".to_owned(), record);
+        entry
+    }
+
+    #[test]
+    fn refresh_posts_the_stored_refresh_token() {
+        let entry = stored_entry();
+        let sources = [SourceDomain::try_from("uid2.example.com").expect("should build source")];
+        let consent = ConsentContext::default();
+        let lookup = LookupInput {
+            ec_id: "ec-example",
+            consent: &consent,
+            client: ClientSignals {
+                ip: None,
+                user_agent: None,
+            },
+            publisher_domain: "www.example.com",
+            due_sources: &sources,
+            current: OwnedEntries::new(Some(&entry), &sources),
+            cookies: RequestCookies::default(),
+            hashed_email: None,
+        };
+
+        let request = refreshing_provider()
+            .build_request(&lookup)
+            .expect("should build the refresh request");
+
+        assert_eq!(request.method, http::Method::POST, "should post");
+        assert_eq!(
+            request.url.as_str(),
+            REFRESH_ENDPOINT,
+            "should call the endpoint"
+        );
+        assert_eq!(
+            request.body.as_ref(),
+            b"example-refresh-token",
+            "should post the refresh token only"
+        );
+        assert_eq!(
+            request.context,
+            Some(BASE64.encode([7_u8; 32])),
+            "should keep the response key for decryption"
+        );
+    }
+
+    #[test]
+    fn makes_no_request_without_an_endpoint() {
+        let entry = stored_entry();
+        let sources = [SourceDomain::try_from("uid2.example.com").expect("should build source")];
+        let consent = ConsentContext::default();
+        let lookup = LookupInput {
+            ec_id: "ec-example",
+            consent: &consent,
+            client: ClientSignals {
+                ip: None,
+                user_agent: None,
+            },
+            publisher_domain: "www.example.com",
+            due_sources: &sources,
+            current: OwnedEntries::new(Some(&entry), &sources),
+            cookies: RequestCookies::default(),
+            hashed_email: None,
+        };
+
+        assert!(
+            provider(&json!({})).build_request(&lookup).is_err(),
+            "should never generate a token"
+        );
+    }
+
+    fn encrypted_reply(reply: &serde_json::Value) -> String {
+        let cipher = Aes256Gcm::new_from_slice(&[7_u8; 32]).expect("should build cipher");
+        let iv = [1_u8; IV_BYTES];
+        let ciphertext = cipher
+            .encrypt(
+                &Nonce::try_from(&iv[..]).expect("should build nonce"),
+                reply.to_string().as_bytes(),
+            )
+            .expect("should encrypt");
+        BASE64.encode([&iv[..], &ciphertext].concat())
+    }
+
+    fn reply<'a>(body: &'a str, key: &'a str, headers: &'a HeaderMap) -> ProviderResponse<'a> {
+        ProviderResponse {
+            status: http::StatusCode::OK,
+            headers,
+            body: body.as_bytes(),
+            context: Some(key),
+        }
+    }
+
+    #[test]
+    fn decrypts_a_refreshed_identity() {
+        let body = encrypted_reply(&json!({
+            "status": "success",
+            "body": {
+                "advertising_token": "AgAAAArefreshedtoken",
+                "refresh_token": "next-refresh-token",
+                "identity_expires": 1_700_100_000_000_u64,
+                "refresh_from": 1_700_090_000_000_u64,
+                "refresh_expires": 1_700_200_000_000_u64,
+                "refresh_response_key": BASE64.encode([9_u8; 32]),
+            },
+        }));
+
+        let (key, headers) = (BASE64.encode([7_u8; 32]), HeaderMap::new());
+
+        let outcome = refreshing_provider()
+            .parse_response(reply(&body, &key, &headers))
+            .expect("should parse the reply");
+
+        let LookupOutcome::Found(eids) = outcome else {
+            panic!("should find the refreshed token");
+        };
+        let uid = &eids[0].uids[0];
+        assert_eq!(uid.id, "AgAAAArefreshedtoken", "should store the new token");
+        assert!(
+            matches!(uid.expiry, ProviderExpiry::At(at) if at.get() == 1_700_100_000),
+            "should expire at the new identity_expires"
+        );
+        let refresh = uid
+            .refresh
+            .as_ref()
+            .expect("should keep the next refresh state");
+        let state: RefreshState =
+            serde_json::from_str(&refresh.state).expect("should parse the state");
+        assert_eq!(
+            state.token, "next-refresh-token",
+            "should keep the next refresh token"
+        );
+        assert_eq!(
+            state.key,
+            BASE64.encode([9_u8; 32]),
+            "should keep the next key"
+        );
+    }
+
+    #[test]
+    fn reports_an_opt_out_from_the_refresh() {
+        let body = encrypted_reply(&json!({ "status": "optout" }));
+
+        let (key, headers) = (BASE64.encode([7_u8; 32]), HeaderMap::new());
+
+        let outcome = refreshing_provider()
+            .parse_response(reply(&body, &key, &headers))
+            .expect("should parse the reply");
+
+        assert!(
+            matches!(outcome, LookupOutcome::OptedOut),
+            "should remove the stored token on opt-out"
+        );
+    }
+
+    #[test]
+    fn rejects_a_reply_under_another_key() {
+        let body = encrypted_reply(&json!({ "status": "optout" }));
+
+        let (key, headers) = (BASE64.encode([8_u8; 32]), HeaderMap::new());
+
+        assert!(
+            refreshing_provider()
+                .parse_response(reply(&body, &key, &headers))
+                .is_err(),
+            "should reject a reply that does not decrypt"
+        );
     }
 }

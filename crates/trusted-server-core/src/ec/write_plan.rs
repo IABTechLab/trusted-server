@@ -176,14 +176,6 @@ fn apply_lookups(
                 written.push(source.clone());
             }
         }
-        for source in &lookup.cleared {
-            if entry.ids.remove(source.as_str()).is_some() {
-                log::info!(
-                    "EC write planner: removing '{source}' after provider '{}' opt-out",
-                    lookup.provider
-                );
-            }
-        }
     }
     written
 }
@@ -560,36 +552,6 @@ mod tests {
                 cleared: Vec::new(),
             }],
         )
-    }
-
-    #[test]
-    fn opt_out_removes_the_provider_sources_and_blocks_browser_fallback() {
-        // Arrange
-        let registry = registry(&["ids.example.com"]);
-        let snapshot = present(&provider_entry(&["p-1"]));
-        let ingest = ingest_owned();
-        let lookups = LookupResults::new(
-            EC_ID,
-            vec![ProviderLookup {
-                provider: ProviderId::new("example-provider"),
-                status: LookupStatus::Skipped(SkipReason::OptedOut),
-                entries: Vec::new(),
-                cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
-            }],
-        );
-
-        // Act
-        let change = plan_write(&input(&snapshot, None, &ingest, &lookups, &registry))
-            .expect("should plan update");
-
-        // Assert
-        let RowChange::Update { entry, .. } = change else {
-            panic!("should update existing row")
-        };
-        assert!(
-            !entry.ids.contains_key("ids.example.com"),
-            "should remove the opted-out source without a browser fallback"
-        );
     }
 
     fn provider_entry(ids: &[&str]) -> KvEntry {
