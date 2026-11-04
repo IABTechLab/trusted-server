@@ -176,6 +176,14 @@ fn apply_lookups(
                 written.push(source.clone());
             }
         }
+        for source in &lookup.cleared {
+            if entry.ids.remove(source.as_str()).is_some() {
+                log::info!(
+                    "EC write planner: removing '{source}' after provider '{}' opt-out",
+                    lookup.provider
+                );
+            }
+        }
     }
     written
 }
@@ -184,37 +192,73 @@ fn serialized_len(entry: &KvEntry) -> usize {
     serde_json::to_vec(entry).map_or(usize::MAX, |bytes| bytes.len())
 }
 
+/// Serialized bytes one `ids` member adds to the row: its record, its
+/// escaped key, the colon and a separating comma.
+fn member_len(source: &str, record: &KvPartnerId) -> usize {
+    let key = serde_json::to_vec(source).map_or(usize::MAX, |bytes| bytes.len());
+    let value = serde_json::to_vec(record).map_or(usize::MAX, |bytes| bytes.len());
+    key.saturating_add(value).saturating_add(2)
+}
+
+/// Shrinks `entry` until it serializes within [`MAX_ENTRY_BYTES`].
+///
+/// # Performance
+///
+/// Tracks the row size by the bytes each drop removes and serializes the
+/// whole row again only when that estimate reaches the cap, so the cost is
+/// linear in the number of dropped UIDs and records.
 fn enforce_size_cap(entry: &mut KvEntry, written: &[SourceDomain]) {
-    while serialized_len(entry) > MAX_ENTRY_BYTES {
-        if let Some(source) = written.iter().rev().find(|source| {
+    let mut size = serialized_len(entry);
+    // Drop this navigation's provider UIDs first, newest source last-in first.
+    while size > MAX_ENTRY_BYTES {
+        let Some(source) = written.iter().rev().find(|source| {
             entry
                 .ids
                 .get(source.as_str())
                 .is_some_and(KvPartnerId::is_provider_written)
-        }) {
-            let record = entry
-                .ids
-                .get_mut(source.as_str())
-                .expect("should hold a written source");
-            record.drop_last_uid();
-            if record.uid.is_empty() {
-                entry.ids.remove(source.as_str());
-            }
-            continue;
-        }
-        // No provider UIDs from this navigation are left: drop whole records,
-        // largest first, so every later write still fits the cap.
-        let Some(largest) = entry
+        }) else {
+            break;
+        };
+        let record = entry
             .ids
-            .iter()
-            .max_by_key(|(_, record)| serde_json::to_vec(record).map_or(usize::MAX, |b| b.len()))
-            .map(|(source, _)| source.clone())
-        else {
+            .get_mut(source.as_str())
+            .expect("should hold a written source");
+        let before = member_len(source.as_str(), record);
+        record.drop_last_uid();
+        let after = if record.uid.is_empty() {
+            entry.ids.remove(source.as_str());
+            0
+        } else {
+            member_len(source.as_str(), record)
+        };
+        size = size.saturating_sub(before.saturating_sub(after));
+        if size <= MAX_ENTRY_BYTES {
+            size = serialized_len(entry);
+        }
+    }
+    if size <= MAX_ENTRY_BYTES {
+        return;
+    }
+    // No provider UIDs from this navigation are left: drop whole records,
+    // largest first, so every later write still fits the cap.
+    let mut by_size: Vec<(usize, String)> = entry
+        .ids
+        .iter()
+        .map(|(source, record)| (member_len(source, record), source.clone()))
+        .collect();
+    // A stable ascending sort pops the last of equally large records first.
+    by_size.sort_by_key(|(len, _)| *len);
+    while size > MAX_ENTRY_BYTES {
+        let Some((len, largest)) = by_size.pop() else {
             log::warn!("EC write planner: row exceeds size cap with no partner IDs left to drop");
             return;
         };
         log::warn!("EC write planner: dropping '{largest}' to fit the row size cap");
         entry.ids.remove(&largest);
+        size = size.saturating_sub(len);
+        if size <= MAX_ENTRY_BYTES {
+            size = serialized_len(entry);
+        }
     }
 }
 
@@ -516,6 +560,36 @@ mod tests {
                 cleared: Vec::new(),
             }],
         )
+    }
+
+    #[test]
+    fn opt_out_removes_the_provider_sources_and_blocks_browser_fallback() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let snapshot = present(&provider_entry(&["p-1"]));
+        let ingest = ingest_owned();
+        let lookups = LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::Skipped(SkipReason::OptedOut),
+                entries: Vec::new(),
+                cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
+            }],
+        );
+
+        // Act
+        let change = plan_write(&input(&snapshot, None, &ingest, &lookups, &registry))
+            .expect("should plan update");
+
+        // Assert
+        let RowChange::Update { entry, .. } = change else {
+            panic!("should update existing row")
+        };
+        assert!(
+            !entry.ids.contains_key("ids.example.com"),
+            "should remove the opted-out source without a browser fallback"
+        );
     }
 
     fn provider_entry(ids: &[&str]) -> KvEntry {

@@ -38,6 +38,7 @@
 mod auth;
 
 pub mod admin;
+pub mod after_response;
 pub mod batch_sync;
 pub mod consent;
 pub mod cookies;
@@ -97,7 +98,7 @@ use device::DeviceSignals;
 use self::coordinator::results::LookupResults;
 use self::kv::KvIdentityGraph;
 use self::kv_types::KvEntry;
-use self::page_load::NavigationPermit;
+use self::page_load::{AfterResponseWrite, NavigationPermit};
 use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
 
 /// Bounded request classifications that may persist browser EID cookies.
@@ -264,6 +265,17 @@ impl Clone for PermitSlot {
     }
 }
 
+/// Holds the navigation's after-response permit. Like [`PermitSlot`],
+/// cloning an [`EcContext`] never copies it.
+#[derive(Debug, Default)]
+struct AfterResponsePermitSlot(Option<AfterResponseWrite>);
+
+impl Clone for AfterResponsePermitSlot {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
 /// Captures the EC state for a single request lifecycle.
 ///
 /// Created via [`read_from_request`](Self::read_from_request) during
@@ -308,6 +320,9 @@ pub struct EcContext {
     eid_sync_source: Option<EidSyncSource>,
     /// Navigation permit issued by the router for page-load navigations.
     navigation_permit: PermitSlot,
+    /// Permit for the navigation's follow-up write after its response, set
+    /// by finalize when it confirms the navigation permit.
+    after_response_permit: AfterResponsePermitSlot,
     /// Validated provider lookup results collected for this navigation.
     lookup_results: LookupResults,
     /// New row built by [`Self::generate_if_needed`], written by finalize.
@@ -395,6 +410,7 @@ impl EcContext {
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
+            after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
             pending_entry: None,
         })
@@ -623,6 +639,17 @@ impl EcContext {
         self.navigation_permit.0.take()
     }
 
+    /// Stores the after-response permit confirmed with the navigation permit.
+    pub(crate) fn set_after_response_permit(&mut self, permit: AfterResponseWrite) {
+        self.after_response_permit = AfterResponsePermitSlot(Some(permit));
+    }
+
+    /// Takes the after-response permit; returns `None` when finalize did not
+    /// confirm a navigation, or after the first call.
+    pub fn take_after_response_permit(&mut self) -> Option<AfterResponseWrite> {
+        self.after_response_permit.0.take()
+    }
+
     /// Takes the navigation permit, for adapter tests.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn take_navigation_permit_for_test(&mut self) -> Option<NavigationPermit> {
@@ -709,6 +736,7 @@ impl EcContext {
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
+            after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
             pending_entry: None,
         }
@@ -737,6 +765,7 @@ impl EcContext {
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
+            after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
             pending_entry: None,
         }
@@ -768,6 +797,7 @@ impl EcContext {
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
+            after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
             pending_entry: None,
         }
@@ -780,7 +810,8 @@ impl EcContext {
 /// native and `wasm32-wasip1` targets and to a JS-backed clock on
 /// `wasm32-unknown-unknown` (Cloudflare Workers), where `std::time` is not
 /// available.
-pub(crate) fn current_timestamp() -> u64 {
+#[must_use]
+pub fn current_timestamp() -> u64 {
     checked_current_timestamp().unwrap_or(0)
 }
 

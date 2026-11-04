@@ -224,15 +224,12 @@ async fn dispatch_fallback(
     }
 
     if state.registry.has_route(&method, &path) {
-        let mut ec_context = EcContext::default();
         return state
             .registry
             .handle_proxy(ProxyDispatchInput {
                 method: &method,
                 path: &path,
                 settings: &state.settings,
-                kv: None,
-                ec_context: &mut ec_context,
                 services,
                 req,
             })

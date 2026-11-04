@@ -88,7 +88,7 @@
 
 use std::cell::RefCell;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
@@ -123,6 +123,7 @@ use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
@@ -147,11 +148,11 @@ use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
-use trusted_server_core::settings::{ProxyAssetRoute, Settings};
+use trusted_server_core::settings::{CollectTiming, ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
-use trusted_server_identity_providers::{build_coordinator, partner_registry};
+use trusted_server_identity_providers::{build_coordinator_with, partner_registry};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -200,6 +201,27 @@ pub(crate) struct AppState {
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
+    /// Partner registry built on first use and reused for the state's lifetime.
+    pub(crate) partner_registry: OnceLock<Arc<PartnerRegistry>>,
+}
+
+impl AppState {
+    /// Returns the partner registry, building it on first use.
+    ///
+    /// A failed build is not cached, so every caller sees its error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`partner_registry`].
+    pub(crate) fn partner_registry(
+        &self,
+    ) -> Result<Arc<PartnerRegistry>, Report<TrustedServerError>> {
+        if let Some(registry) = self.partner_registry.get() {
+            return Ok(Arc::clone(registry));
+        }
+        let registry = Arc::new(partner_registry(&self.settings.ec)?);
+        Ok(Arc::clone(self.partner_registry.get_or_init(|| registry)))
+    }
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -245,6 +267,7 @@ pub(crate) fn build_state_from_settings(
         registry: Arc::new(registry),
         default_kv_store,
         auction_telemetry_sink,
+        partner_registry: OnceLock::new(),
     }))
 }
 
@@ -345,31 +368,107 @@ pub(crate) struct EcFinalizeState {
 }
 
 /// Identity lookups dispatched for this navigation, collected before finalize.
-///
-/// In-flight platform requests are not `Send`, so they cannot ride in
-/// response extensions with [`EcFinalizeState`]. They travel through a
-/// request-local slot instead: the entry point clears it before routing and
-/// takes it after the router returns.
 pub(crate) struct IdentityLookups {
     pub(crate) coordinator: ProviderCoordinator,
     pub(crate) pending: PendingLookups<PlatformPendingRequest>,
 }
 
+/// What a navigation's after-response identity lookups need once the response
+/// has been sent.
+///
+/// The router owns the request, so the request signals the providers read are
+/// copied here. The coordinator is built and the lookups dispatched only after
+/// the response, so neither delays the page.
+pub(crate) struct AfterResponseLookups {
+    pub(crate) ec_id: String,
+    pub(crate) client_ip: Option<IpAddr>,
+    pub(crate) user_agent: Option<String>,
+    pub(crate) cookie_header: String,
+}
+
+/// Identity work a navigation hands to the entry point.
+///
+/// In-flight platform requests are not `Send`, so they cannot ride in
+/// response extensions with [`EcFinalizeState`]. They travel through one
+/// request-local slot instead: the entry point clears it before routing and
+/// takes it after the router returns.
+#[derive(Default)]
+pub(crate) struct NavigationLookups {
+    /// Page-phase lookups, collected before EC finalization.
+    pub(crate) page: Option<IdentityLookups>,
+    /// After-response lookups, dispatched once the response has been sent.
+    pub(crate) after_response: Option<AfterResponseLookups>,
+}
+
 thread_local! {
-    static PENDING_IDENTITY_LOOKUPS: RefCell<Option<IdentityLookups>> = const { RefCell::new(None) };
+    static NAVIGATION_LOOKUPS: RefCell<NavigationLookups> = RefCell::new(NavigationLookups::default());
 }
 
-/// Stores this request's dispatched identity lookups for the entry point.
-fn stash_identity_lookups(lookups: IdentityLookups) {
-    PENDING_IDENTITY_LOOKUPS.with(|slot| *slot.borrow_mut() = Some(lookups));
-}
-
-/// Takes the identity lookups dispatched for the current request, if any.
+/// Takes the identity work stored for the current request.
 ///
 /// The entry point calls this before routing (discarding anything a prior
 /// request left behind) and after the router returns.
-pub(crate) fn take_identity_lookups() -> Option<IdentityLookups> {
-    PENDING_IDENTITY_LOOKUPS.with(|slot| slot.borrow_mut().take())
+pub(crate) fn take_navigation_lookups() -> NavigationLookups {
+    NAVIGATION_LOOKUPS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+/// Request signals lent to identity providers.
+struct ProviderRequestSignals<'a> {
+    client_ip: Option<IpAddr>,
+    user_agent: Option<&'a str>,
+    cookie_header: String,
+}
+
+impl<'a> ProviderRequestSignals<'a> {
+    fn read(req: &'a Request, ec: &EcRequestState) -> Self {
+        Self {
+            client_ip: ec
+                .ec_context
+                .client_ip()
+                .and_then(|ip| ip.parse::<IpAddr>().ok()),
+            user_agent: req
+                .headers()
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            cookie_header: req
+                .headers()
+                .get_all(header::COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect::<Vec<_>>()
+                .join("; "),
+        }
+    }
+}
+
+/// Captures the request signals for after-response identity lookups on a
+/// permitted publisher navigation.
+///
+/// Returns `None` when no after-response provider is enabled, the request has
+/// no EC, or the identity graph is unavailable.
+fn prepare_after_response_lookups(
+    state: &AppState,
+    req: &Request,
+    ec: &EcRequestState,
+) -> Option<AfterResponseLookups> {
+    let has_after_response_provider = state
+        .settings
+        .ec
+        .identity_providers
+        .iter()
+        .any(|config| config.enabled && config.collect == CollectTiming::AfterResponse);
+    if !has_after_response_provider {
+        return None;
+    }
+    ec.kv_graph.as_ref()?;
+    let ec_id = ec.ec_context.ec_value()?.to_owned();
+    let signals = ProviderRequestSignals::read(req, ec);
+    Some(AfterResponseLookups {
+        ec_id,
+        client_ip: signals.client_ip,
+        user_agent: signals.user_agent.map(str::to_owned),
+        cookie_header: signals.cookie_header,
+    })
 }
 
 /// Starts identity-provider lookups for a permitted publisher navigation.
@@ -383,7 +482,23 @@ async fn dispatch_identity_lookups(
     req: &Request,
     ec: &mut EcRequestState,
 ) -> Option<IdentityLookups> {
-    let coordinator = match build_coordinator(&state.settings) {
+    if !state
+        .settings
+        .ec
+        .identity_providers
+        .iter()
+        .any(|config| config.enabled)
+    {
+        return None;
+    }
+    let partners = match state.partner_registry() {
+        Ok(partners) => partners,
+        Err(report) => {
+            log::error!("Identity providers disabled for this request: {report:?}");
+            return None;
+        }
+    };
+    let coordinator = match build_coordinator_with(&state.settings, partners) {
         Ok(Some(coordinator)) => coordinator,
         Ok(None) => return None,
         Err(report) => {
@@ -399,24 +514,8 @@ async fn dispatch_identity_lookups(
     }
     let transport = PlatformLookupTransport::new(services, state.settings.proxy.certificate_check);
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    let client_ip = ec
-        .ec_context
-        .client_ip()
-        .and_then(|ip| ip.parse::<IpAddr>().ok());
-    let user_agent = req
-        .headers()
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok());
-    let cookie_header = req
-        .headers()
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .collect::<Vec<_>>()
-        .join("; ");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+    let signals = ProviderRequestSignals::read(req, ec);
+    let now = trusted_server_core::ec::current_timestamp();
     let pending = coordinator
         .dispatch(
             &transport,
@@ -425,11 +524,11 @@ async fn dispatch_identity_lookups(
                 snapshot: ec.ec_context.kv_snapshot(),
                 consent: ec.ec_context.consent(),
                 client: ClientSignals {
-                    ip: client_ip,
-                    user_agent,
+                    ip: signals.client_ip,
+                    user_agent: signals.user_agent,
                 },
                 publisher_domain: &state.settings.publisher.domain,
-                cookies: RequestCookies::new(&cookie_header),
+                cookies: RequestCookies::new(&signals.cookie_header),
                 rate_limiter: &limiter,
                 now: UnixSeconds::new(now),
             },
@@ -686,7 +785,8 @@ async fn execute_named(
         handler,
         NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
     ) {
-        let response = partner_registry(&state.settings.ec)
+        let response = state
+            .partner_registry()
             .and_then(|registry| match handler {
                 NamedRouteHandler::AdminEcLookup => {
                     // Deliberately do not use an EC request-state graph: that
@@ -767,7 +867,7 @@ async fn run_named_route(
                 cors_preflight_identify(&state.settings, &req)
             } else {
                 let kv = crate::require_identity_graph(&state.settings)?;
-                let partner_registry = partner_registry(&state.settings.ec)?;
+                let partner_registry = state.partner_registry()?;
                 handle_identify(
                     &state.settings,
                     &kv,
@@ -781,11 +881,11 @@ async fn run_named_route(
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Auction => {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Auction);
-            let partner_registry = partner_registry(&state.settings.ec)?;
+            let partner_registry = state.partner_registry()?;
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
-                Some(&partner_registry)
+                Some(&*partner_registry)
             };
             handle_auction(
                 &state.settings,
@@ -805,11 +905,11 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 return Ok(page_bids_preflight_denied());
             }
-            let partner_registry = partner_registry(&state.settings.ec)?;
+            let partner_registry = state.partner_registry()?;
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
-                Some(&partner_registry)
+                Some(&*partner_registry)
             };
             let auction = AuctionDispatch {
                 integration_registry: &state.registry,
@@ -852,7 +952,7 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
-        let partner_registry = partner_registry(&state.settings.ec)?;
+        let partner_registry = state.partner_registry()?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
         handle_batch_sync(&kv, &partner_registry, &limiter, req)
     });
@@ -927,8 +1027,6 @@ async fn dispatch_fallback(
                 method: &method,
                 path: &path,
                 settings: &state.settings,
-                kv: ec.kv_graph.as_ref(),
-                ec_context: &mut ec.ec_context,
                 services,
                 req,
             })
@@ -966,7 +1064,10 @@ async fn dispatch_fallback(
             }
         }
         let is_publisher_navigation = ec.is_real_browser && is_navigation;
+        // A new EC is minted only when this request may also write its row,
+        // so a client without Fetch Metadata never receives a throwaway EC.
         if is_publisher_navigation
+            && has_permit
             && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
@@ -980,7 +1081,15 @@ async fn dispatch_fallback(
             && has_permit
             && let Some(lookups) = dispatch_identity_lookups(state, services, &req, &mut ec).await
         {
-            stash_identity_lookups(lookups);
+            NAVIGATION_LOOKUPS.with(|slot| slot.borrow_mut().page = Some(lookups));
+        }
+        // After-response providers only capture request signals here; they
+        // are built and dispatched once the response has been sent.
+        if is_publisher_navigation
+            && has_permit
+            && let Some(lookups) = prepare_after_response_lookups(state, &req, &ec)
+        {
+            NAVIGATION_LOOKUPS.with(|slot| slot.borrow_mut().after_response = Some(lookups));
         }
 
         // Run the server-side auction with the configured creative-
@@ -990,13 +1099,13 @@ async fn dispatch_fallback(
         // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
         // server-side EIDs, same as the legacy auction.
         let slots = state.settings.creative_opportunity_slots();
-        match partner_registry(&state.settings.ec) {
+        match state.partner_registry() {
             Ok(partner_registry) => {
                 let auction = AuctionDispatch {
                     integration_registry: &state.registry,
                     orchestrator: &state.orchestrator,
                     slots,
-                    registry: Some(&partner_registry),
+                    registry: Some(&*partner_registry),
                 };
                 match handle_publisher_request(
                     &state.settings,
@@ -1754,6 +1863,7 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
+            partner_registry: std::sync::OnceLock::new(),
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -2745,6 +2855,71 @@ mod tests {
         );
     }
 
+    fn consented_navigation(mut request: Request) -> Request {
+        // Viceroy geolocates loopback to a US privacy state; a US Privacy
+        // string without a sale opt-out lets the navigation mint an EC.
+        request.extensions_mut().insert(ClientInfo {
+            client_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ..ClientInfo::default()
+        });
+        request
+            .headers_mut()
+            .insert(header::COOKIE, HeaderValue::from_static("us_privacy=1YNN"));
+        request
+    }
+
+    #[test]
+    fn partner_registry_is_built_once_per_state() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+
+        let first = state.partner_registry().expect("should build the registry");
+        let second = state.partner_registry().expect("should reuse the registry");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "should return the cached registry"
+        );
+    }
+
+    #[test]
+    fn navigation_without_fetch_metadata_mints_no_ec() {
+        let router = test_router();
+        let mut request = consented_navigation(empty_request(Method::GET, "/article"));
+        request
+            .headers_mut()
+            .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+
+        let mut response = route(&router, request);
+
+        let state = take_finalize_state(&mut response);
+        assert!(
+            state.ec_context.ec_value().is_none(),
+            "should not mint an EC that no row can back"
+        );
+    }
+
+    #[test]
+    fn navigation_with_fetch_metadata_mints_an_ec() {
+        let router = test_router();
+
+        let mut response = route(
+            &router,
+            consented_navigation(navigation_request("/article")),
+        );
+
+        let state = take_finalize_state(&mut response);
+        assert!(
+            state.ec_context.ec_value().is_some(),
+            "should mint an EC on a page-load navigation"
+        );
+    }
+
     #[test]
     fn publisher_navigation_without_providers_dispatches_nothing() {
         let router = test_router();
@@ -2753,7 +2928,7 @@ mod tests {
 
         let _state = take_finalize_state(&mut response);
         assert!(
-            super::take_identity_lookups().is_none(),
+            super::take_navigation_lookups().page.is_none(),
             "should dispatch no identity lookups without enabled providers"
         );
     }
@@ -2825,6 +3000,7 @@ mod tests {
                 url: url::Url::parse("https://ids.example.com/lookup").expect("should parse"),
                 headers: edgezero_core::http::HeaderMap::new(),
                 body: Bytes::new(),
+                context: None,
             })
         }
 
@@ -2845,6 +3021,7 @@ mod tests {
                     atype: None,
                     ext: None,
                     expiry: ProviderExpiry::Unspecified,
+                    refresh: None,
                 }],
             }]))
         }
@@ -2947,6 +3124,7 @@ mod tests {
 
         let result = crate::apply_edgezero_ec_finalize(
             &settings,
+            None,
             &mut state,
             Some(super::IdentityLookups {
                 coordinator,

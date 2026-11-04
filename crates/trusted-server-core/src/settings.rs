@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -609,6 +609,12 @@ pub struct IdentityProviderConfig {
     /// TCF vendor ID that must have vendor consent, when set.
     #[serde(default)]
     pub tcf_vendor_id: Option<NonZeroU16>,
+    /// When the provider's lookup runs on a navigation.
+    #[serde(default)]
+    pub collect: CollectTiming,
+    /// Most lookups per EC per hour, when set; unset means unlimited.
+    #[serde(default)]
+    pub rate_limit_per_hour: Option<NonZeroU32>,
     /// Secret Store key references, resolved at startup.
     #[serde(default)]
     pub secrets: ProviderSecrets,
@@ -630,6 +636,20 @@ impl IdentityProviderConfig {
     pub fn kind(&self) -> &str {
         &self.kind
     }
+}
+
+/// When an identity provider's lookup runs on a navigation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectTiming {
+    /// Before the response, within `identity_budget_ms`; results reach the
+    /// navigation's own write and response.
+    #[default]
+    Page,
+    /// After the response has been sent, within
+    /// `identity_after_response_budget_ms`; results reach the row in one
+    /// follow-up write and are served from the next page load.
+    AfterResponse,
 }
 
 /// Secret values for one identity provider.
@@ -690,6 +710,15 @@ pub struct Ec {
     )]
     pub identity_budget_ms: u64,
 
+    /// Time budget, in milliseconds, for lookups of providers with
+    /// `collect = "after_response"`, measured from their dispatch after the
+    /// response has been sent.
+    #[serde(
+        default = "Ec::default_identity_after_response_budget_ms",
+        deserialize_with = "from_value_or_str"
+    )]
+    pub identity_after_response_budget_ms: u64,
+
     /// Server-side identity providers.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub identity_providers: Vec<IdentityProviderConfig>,
@@ -727,6 +756,12 @@ impl Ec {
     #[must_use]
     pub const fn default_identity_budget_ms() -> u64 {
         200
+    }
+
+    /// Default after-response identity lookup budget (2 s).
+    #[must_use]
+    pub const fn default_identity_after_response_budget_ms() -> u64 {
+        2000
     }
 
     /// Returns `true` if `passphrase` matches a known placeholder value

@@ -3458,8 +3458,9 @@ struct EcSnapshotPreloadInput {
 }
 
 fn should_preload_ec_snapshot(input: &EcSnapshotPreloadInput) -> bool {
-    // An earlier step of this request (identity-provider dispatch) already
-    // read the row for an existing EC, so a second read adds nothing.
+    // An earlier step of this request already settled the row snapshot
+    // (identity-provider dispatch, or EC generation's authoritative miss), so
+    // a read adds nothing.
     if input.snapshot_already_read {
         return false;
     }
@@ -5313,10 +5314,12 @@ pub async fn handle_publisher_request(
                 .is_some_and(|registry| !registry.is_empty()),
         eid_cookie_may_need_persistence,
         privacy_needs_row: crate::ec::consent::ec_consent_withdrawn(&consent_context),
-        // A freshly generated EC keeps its refresh read: the Add-confirmed
-        // snapshot may still upgrade to the stored row.
-        snapshot_already_read: !ec_context.ec_generated()
-            && !matches!(ec_context.kv_snapshot(), crate::ec::EcKvSnapshot::NotRead),
+        // A freshly generated EC already holds an authoritative `Missing`
+        // snapshot: its row is only created by this navigation's write.
+        snapshot_already_read: !matches!(
+            ec_context.kv_snapshot(),
+            crate::ec::EcKvSnapshot::NotRead
+        ),
     });
     let mut pending_origin = None;
     // A shared-template hit skips the origin entirely, and an in-flight request

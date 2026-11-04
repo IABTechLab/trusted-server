@@ -305,12 +305,16 @@ impl PartnerRegistry {
             .is_some_and(|partner| partner.provider_owned)
     }
 
-    /// Returns all partners with `pull_sync_enabled = true`.
+    /// Returns all partners with `pull_sync_enabled = true` whose source no
+    /// identity provider owns.
+    ///
+    /// A provider writes full-fidelity records for the sources it owns, so a
+    /// pull-sync write there would overwrite them with a single UID.
     #[must_use]
     pub fn pull_enabled_partners(&self) -> Vec<&PartnerConfig> {
         self.by_source_domain
             .values()
-            .filter(|p| p.pull_sync_enabled)
+            .filter(|p| p.pull_sync_enabled && !p.provider_owned)
             .collect()
     }
 
@@ -698,6 +702,25 @@ mod tests {
         )];
         let result = PartnerRegistry::from_config(&partners);
         assert!(result.is_err(), "should reject invalid source domain");
+    }
+
+    #[test]
+    fn pull_enabled_partners_excludes_provider_owned_sources() {
+        let mut pull_partner = make_partner("pull.example.com", &valid_api_token("token-p"));
+        pull_partner.api_token = None;
+        pull_partner.pull_sync_enabled = true;
+        pull_partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
+        pull_partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];
+        pull_partner.ts_pull_token = Some(Redacted::new("outbound-token".to_owned()));
+        let mut registry =
+            PartnerRegistry::from_config(&[pull_partner]).expect("should build registry");
+
+        registry.mark_provider_owned("pull.example.com");
+
+        assert!(
+            registry.pull_enabled_partners().is_empty(),
+            "should not pull sources an identity provider owns"
+        );
     }
 
     #[test]

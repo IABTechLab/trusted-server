@@ -10,8 +10,6 @@ use matchit::Router;
 
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
-use crate::ec::EcContext;
-use crate::ec::kv::KvIdentityGraph;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::platform::RuntimeServices;
@@ -785,15 +783,11 @@ impl IntegrationMetadata {
 
 /// Inputs to [`IntegrationRegistry::handle_proxy`].
 ///
-/// Bundled into a struct so the dispatch surface stays within the project's
-/// 7-argument cap; `ec_context` and `req` participate in the borrow so the
-/// whole thing shares one lifetime.
+/// Bundled into a struct so the dispatch surface shares one lifetime.
 pub struct ProxyDispatchInput<'a> {
     pub method: &'a Method,
     pub path: &'a str,
     pub settings: &'a Settings,
-    pub kv: Option<&'a KvIdentityGraph>,
-    pub ec_context: &'a mut EcContext,
     pub services: &'a RuntimeServices,
     pub req: Request<EdgeBody>,
 }
@@ -1028,8 +1022,6 @@ impl IntegrationRegistry {
             method,
             path,
             settings,
-            kv: _,
-            ec_context: _,
             services,
             mut req,
         } = input;
@@ -1825,14 +1817,10 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
         let response = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &http::Method::GET,
             path: "/integrations/test/echo",
             settings: &settings,
-            kv: None,
-            ec_context: &mut ec_context,
             services: &noop_services(),
             req,
         }))
@@ -2179,8 +2167,6 @@ mod tests {
             HEADER_X_TS_EC.clone(),
             HeaderValue::from_static("some-ec-value"),
         );
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
         let services = noop_services();
 
         // Call handle_proxy (uses futures executor in test environment)
@@ -2188,8 +2174,6 @@ mod tests {
             method: &Method::GET,
             path: "/integrations/test/ec",
             settings: &settings,
-            kv: None,
-            ec_context: &mut ec_context,
             services: &services,
             req,
         }));
@@ -2229,8 +2213,6 @@ mod tests {
             HEADER_X_TS_EC.clone(),
             HeaderValue::from_static("evil;injected"),
         );
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
         let services = crate::platform::test_support::noop_services();
 
@@ -2238,8 +2220,6 @@ mod tests {
             method: &Method::GET,
             path: "/integrations/test/ec",
             settings: &settings,
-            kv: None,
-            ec_context: &mut ec_context,
             services: &services,
             req,
         }))
@@ -2278,8 +2258,6 @@ mod tests {
             ))
             .expect("should build Cookie header"),
         );
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
         let services = crate::platform::test_support::noop_services();
 
@@ -2287,8 +2265,6 @@ mod tests {
             method: &Method::GET,
             path: "/integrations/test/ec",
             settings: &settings,
-            kv: None,
-            ec_context: &mut ec_context,
             services: &services,
             req,
         }))
@@ -2324,8 +2300,6 @@ mod tests {
             HEADER_X_TS_EC.clone(),
             HeaderValue::from_static("some-ec-value"),
         );
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
         let services = crate::platform::test_support::noop_services();
 
@@ -2333,8 +2307,6 @@ mod tests {
             method: &Method::POST,
             path: "/integrations/test/ec",
             settings: &settings,
-            kv: None,
-            ec_context: &mut ec_context,
             services: &services,
             req,
         }));

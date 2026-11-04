@@ -7,13 +7,16 @@ use crate::ec::eid_types::{
     AgentType, EidFields, EidValidationError, Expiry, MAX_EID_FIELD_BYTES, MatchMethod, ProviderId,
     RawJson, SourceDomain, UidValue, UnixSeconds,
 };
-use crate::ec::kv_types::{KvEid, KvUid};
+use crate::ec::kv_types::{KvEid, KvRefresh, KvUid};
 use crate::ec::provider::{EidLevelFields, EidShape, ProviderEid, ProviderExpiry, ProviderUid};
 use crate::ec::registry::PartnerRegistry;
 
 /// Longest a provider-stated absolute expiry may lie after the request:
 /// 30 days. Cookie- and vendor-supplied timestamps are clamped to it.
 const MAX_ABSOLUTE_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Largest private refresh state a provider may keep with one UID.
+const MAX_REFRESH_STATE_BYTES: usize = 2048;
 
 /// Policy one response is validated against.
 pub(crate) struct ValidationPolicy<'a> {
@@ -130,23 +133,43 @@ fn stored_uid(
     let id = UidValue::try_from(uid.id.into_owned())?;
     let atype = AgentType::try_from(uid.atype.unwrap_or(default_atype))?;
     let ext = uid.ext.as_deref().map(RawJson::try_from).transpose()?;
-    let expiry = match uid.expiry {
-        ProviderExpiry::Unspecified => Expiry::Never,
-        ProviderExpiry::At(at) => {
-            Expiry::At(at.min(policy.now.saturating_add_secs(MAX_ABSOLUTE_EXPIRY_SECS)))
-        }
-        ProviderExpiry::After(after) => Expiry::At(policy.now.saturating_add_secs(after.as_secs())),
+    let expiry = match resolve_expiry(uid.expiry, policy.now) {
+        Some(at) => Expiry::At(at),
+        None => Expiry::Never,
     };
     if !expiry.is_live(policy.now) {
         return Err(EidValidationError::Expired);
     }
-    Ok(KvUid::new(
-        id,
-        atype,
-        ext,
-        Some(policy.provider.clone()),
-        expiry,
-    ))
+    let stored = KvUid::new(id, atype, ext, Some(policy.provider.clone()), expiry);
+    let Some(refresh) = uid.refresh else {
+        return Ok(stored);
+    };
+    // Unusable refresh state is dropped, never the UID: a refresh with no
+    // stated time, or with empty or oversized state, is simply not stored.
+    let usable = !refresh.state.is_empty() && refresh.state.len() <= MAX_REFRESH_STATE_BYTES;
+    match resolve_expiry(refresh.from, policy.now) {
+        Some(from) if usable => Ok(stored.with_refresh(KvRefresh {
+            state: refresh.state.into_owned(),
+            from,
+        })),
+        _ => {
+            log::debug!(
+                "Identity lookup: provider={} drops unusable refresh state",
+                policy.provider
+            );
+            Ok(stored)
+        }
+    }
+}
+
+/// Resolves a provider-stated time against `now`, capping absolute times at
+/// [`MAX_ABSOLUTE_EXPIRY_SECS`]. `None` when no time was stated.
+fn resolve_expiry(expiry: ProviderExpiry, now: UnixSeconds) -> Option<UnixSeconds> {
+    match expiry {
+        ProviderExpiry::Unspecified => None,
+        ProviderExpiry::At(at) => Some(at.min(now.saturating_add_secs(MAX_ABSOLUTE_EXPIRY_SECS))),
+        ProviderExpiry::After(after) => Some(now.saturating_add_secs(after.as_secs())),
+    }
 }
 
 fn is_duplicate(earlier: &[KvEid], current: &[KvUid], uid: &KvUid) -> bool {
@@ -160,6 +183,7 @@ fn is_duplicate(earlier: &[KvEid], current: &[KvUid], uid: &KvUid) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ec::provider::ProviderRefresh;
     use crate::settings::EcPartner;
     use serde_json::value::RawValue;
     use std::num::NonZeroUsize;
@@ -179,6 +203,7 @@ mod tests {
             atype: None,
             ext: None,
             expiry: ProviderExpiry::Unspecified,
+            refresh: None,
         }
     }
 
@@ -237,6 +262,46 @@ mod tests {
             Expiry::At(UnixSeconds::new(1060)),
             "should resolve relative expiry"
         );
+    }
+
+    #[test]
+    fn keeps_the_uid_when_its_refresh_state_is_unusable() {
+        let partners = registry();
+        let provider = ProviderId::new("example-provider");
+        let claimed = claimed();
+        let in_a_minute = ProviderExpiry::After(Duration::from_secs(60));
+        let cases = [
+            (
+                "state".to_owned(),
+                in_a_minute,
+                Some(UnixSeconds::new(1060)),
+            ),
+            (String::new(), in_a_minute, None),
+            ("x".repeat(MAX_REFRESH_STATE_BYTES + 1), in_a_minute, None),
+            ("state".to_owned(), ProviderExpiry::Unspecified, None),
+        ];
+
+        for (state, from, expected) in cases {
+            let mut refreshed = uid("u-1");
+            refreshed.refresh = Some(ProviderRefresh {
+                state: Cow::Owned(state),
+                from,
+            });
+
+            let (entries, dropped) = validate(
+                vec![eid("ids.example.com", vec![refreshed])],
+                &policy(&provider, &claimed, &partners),
+            );
+
+            assert_eq!(dropped, DropCounts::default(), "should drop no UID");
+            assert_eq!(
+                entries[0].1[0].uids()[0]
+                    .refresh()
+                    .map(|refresh| refresh.from),
+                expected,
+                "should keep only usable refresh state"
+            );
+        }
     }
 
     #[test]

@@ -341,6 +341,10 @@ async fn send(
     request: Request<Full<Bytes>>,
 ) -> (StatusCode, HeaderMap, Bytes) {
     tokio::time::timeout(Duration::from_secs(5), async {
+        browser
+            .ready()
+            .await
+            .expect("should wait for the browser connection to accept another request");
         let response = browser
             .send_request(request)
             .await
@@ -355,6 +359,55 @@ async fn send(
     })
     .await
     .expect("should complete the proxied response promptly")
+}
+
+#[tokio::test]
+async fn browser_send_waits_for_connection_readiness() {
+    let (client, server) = tokio::io::duplex(4096);
+    let server = tokio::spawn(async move {
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(server),
+                service_fn(|_: Request<hyper::body::Incoming>| async {
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                }),
+            )
+            .await
+            .expect("should serve both browser requests");
+    });
+    let (mut browser, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client))
+        .await
+        .expect("should create the browser connection");
+    let request = || {
+        Request::builder()
+            .uri("/")
+            .header(header::HOST, PUBLIC_AUTHORITY)
+            .body(Full::new(Bytes::new()))
+            .expect("should build a browser request")
+    };
+    // Fill Hyper's initial dispatch slot without polling the connection driver.
+    let first = browser.send_request(request());
+    let (status, _, body) = {
+        let mut second = std::pin::pin!(send(&mut browser, request()));
+        assert!(
+            futures::poll!(second.as_mut()).is_pending(),
+            "should wait for readiness instead of rejecting a reusable connection"
+        );
+        let driver = tokio::spawn(connection);
+        first
+            .await
+            .expect("should receive the first response")
+            .into_body()
+            .collect()
+            .await
+            .expect("should consume the first response");
+        let response = second.await;
+        driver.abort();
+        response
+    };
+    assert_eq!(status, StatusCode::OK, "should send after becoming ready");
+    assert_eq!(body, "ok", "should receive the second response body");
+    server.abort();
 }
 
 fn action(path: &str, origin: &str) -> Request<Full<Bytes>> {

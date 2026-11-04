@@ -2,8 +2,9 @@
 //!
 //! Each provider kind is a module implementing
 //! [`trusted_server_core::ec::provider::ProviderKind`]. [`build`] maps a
-//! configured `kind` to its implementation; [`build_coordinator`] builds the
-//! coordinator for every enabled provider.
+//! configured `kind` to its implementation; [`build_coordinator`] and
+//! [`build_after_response_coordinator`] build the coordinators for enabled
+//! providers collected before and after the response.
 //!
 //! Dependencies point one way: this crate depends on core, and core never
 //! depends on it.
@@ -30,7 +31,9 @@ use trusted_server_core::ec::provider::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
-use trusted_server_core::settings::{Ec, IdentityProviderConfig, ProviderSecrets, Settings};
+use trusted_server_core::settings::{
+    CollectTiming, Ec, IdentityProviderConfig, ProviderSecrets, Settings,
+};
 
 /// Whether `kind` has a registered implementation.
 ///
@@ -96,48 +99,98 @@ pub fn build(
     }
 }
 
-/// Builds the coordinator for every enabled provider in `settings`.
+/// Builds the coordinator for enabled providers collected before the
+/// response (`collect = "page"`, the default).
 ///
-/// Returns `None` when no provider is enabled.
+/// Returns `None` when no such provider is enabled.
+///
+/// # Errors
+///
+/// Returns [`ProviderConfigError`] when a provider cannot be built or the
+/// enabled providers, taken together, fail the coordinator's configuration
+/// checks.
+pub fn build_coordinator(
+    settings: &Settings,
+) -> Result<Option<ProviderCoordinator>, Report<ProviderConfigError>> {
+    let partners = partner_registry(&settings.ec)
+        .map_err(|report| report.change_context(ProviderConfigError::Invalid))?;
+    build_coordinator_with(settings, Arc::new(partners))
+}
+
+/// Builds the page-phase coordinator against an already built partner
+/// registry.
+///
+/// Enabled providers with an unregistered kind are skipped; building the
+/// registry with [`partner_registry`] already warned about them.
 ///
 /// # Errors
 ///
 /// Returns [`ProviderConfigError`] when a provider cannot be built or fails
 /// the coordinator's configuration checks.
-pub fn build_coordinator(
+pub fn build_coordinator_with(
+    settings: &Settings,
+    partners: Arc<PartnerRegistry>,
+) -> Result<Option<ProviderCoordinator>, Report<ProviderConfigError>> {
+    build_phase_coordinator(
+        settings,
+        partners,
+        CollectTiming::Page,
+        Duration::from_millis(settings.ec.identity_budget_ms),
+    )
+}
+
+/// Builds the coordinator for enabled providers collected after the response
+/// has been sent (`collect = "after_response"`).
+///
+/// Its budget is `identity_after_response_budget_ms`. Returns `None` when no
+/// such provider is enabled.
+///
+/// # Errors
+///
+/// Returns the same errors as [`build_coordinator`].
+pub fn build_after_response_coordinator(
     settings: &Settings,
 ) -> Result<Option<ProviderCoordinator>, Report<ProviderConfigError>> {
-    let enabled: Vec<&IdentityProviderConfig> = settings
+    let partners = partner_registry(&settings.ec)
+        .map_err(|report| report.change_context(ProviderConfigError::Invalid))?;
+    build_phase_coordinator(
+        settings,
+        Arc::new(partners),
+        CollectTiming::AfterResponse,
+        Duration::from_millis(settings.ec.identity_after_response_budget_ms),
+    )
+}
+
+fn build_phase_coordinator(
+    settings: &Settings,
+    partners: Arc<PartnerRegistry>,
+    timing: CollectTiming,
+    budget: Duration,
+) -> Result<Option<ProviderCoordinator>, Report<ProviderConfigError>> {
+    // Source ownership across both phases is checked when settings load
+    // (`config::validate_identity_providers`), so only this phase's providers
+    // are built and checked here.
+    let registered = settings
         .ec
         .identity_providers
         .iter()
-        .filter(|config| config.enabled)
         .filter(|config| {
-            let registered = is_registered_kind(config.kind());
-            if !registered {
-                log::warn!(
-                    "Identity provider '{}' skipped: kind '{}' is not registered",
-                    config.id,
-                    config.kind()
-                );
-            }
-            registered
+            config.enabled && config.collect == timing && is_registered_kind(config.kind())
         })
-        .collect();
-    if enabled.is_empty() {
-        return Ok(None);
-    }
-    let registered = enabled
-        .into_iter()
         .map(|config| {
-            build(config, &config.secrets)
-                .map(|provider| RegisteredProvider::new(config.clone(), provider))
+            build(config, &config.secrets).map(|provider| {
+                let registered = RegisteredProvider::new(config.clone(), provider);
+                match config.rate_limit_per_hour {
+                    Some(per_hour) => registered.with_rate_limit(per_hour),
+                    None => registered,
+                }
+            })
         })
         .collect::<Result<Vec<_>, Report<ProviderConfigError>>>()?;
-    let partners = partner_registry(&settings.ec)
-        .map_err(|report| report.change_context(ProviderConfigError::Invalid))?;
-    let budget = Duration::from_millis(settings.ec.identity_budget_ms);
-    ProviderCoordinator::new(registered, Arc::new(partners), budget).map(Some)
+    if registered.is_empty() {
+        return Ok(None);
+    }
+    ProviderCoordinator::new(registered, partners, budget).map(Some)
 }
 
 #[cfg(test)]
@@ -292,5 +345,38 @@ mod tests {
             !registry.is_provider_owned("ids.example.com"),
             "should leave unregistered provider sources to browser ingest"
         );
+    }
+
+    #[test]
+    fn rejects_an_unknown_collect_timing() {
+        toml::from_str::<IdentityProviderConfig>(
+            "id = \"example-provider\"\nkind = \"example-kind\"\ncollect = \"later\"",
+        )
+        .expect_err("should reject an unknown `collect` value");
+    }
+
+    #[test]
+    fn parses_an_optional_hourly_rate_limit() {
+        let limited: IdentityProviderConfig = toml::from_str(
+            "id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/v1\"\nrate_limit_per_hour = 2",
+        )
+        .expect("should parse a rate limit");
+        let unset: IdentityProviderConfig =
+            toml::from_str("id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/v1\"")
+                .expect("should parse without a rate limit");
+
+        assert_eq!(
+            limited.rate_limit_per_hour.map(std::num::NonZeroU32::get),
+            Some(2),
+            "should keep the hourly limit"
+        );
+        assert!(
+            unset.rate_limit_per_hour.is_none(),
+            "should leave the limit unset by default"
+        );
+        toml::from_str::<IdentityProviderConfig>(
+            "id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/v1\"\nrate_limit_per_hour = 0",
+        )
+        .expect_err("should reject a zero limit");
     }
 }

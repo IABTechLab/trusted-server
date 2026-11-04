@@ -3,7 +3,12 @@
 //! A request classified as a top-level document navigation receives a
 //! [`NavigationPermit`]. Once the final response status is known it becomes a
 //! [`PageLoadWrite`], which [`KvIdentityGraph::commit_page_load`] consumes.
-//! Neither type is `Clone`, so one navigation makes at most one write.
+//! Neither type is `Clone`, so one navigation makes at most one write before
+//! its response.
+//!
+//! The one exception is [`AfterResponseWrite`], confirmed alongside the page
+//! load's permit. It allows one follow-up update after the response has been
+//! sent, carrying only the results of after-response identity lookups.
 //!
 //! [`KvIdentityGraph::commit_page_load`]: super::kv::KvIdentityGraph::commit_page_load
 
@@ -57,6 +62,19 @@ impl NavigationPermit {
         (!Self::is_redirect(status)).then_some(PageLoadWrite(()))
     }
 
+    /// Confirms the permit like [`Self::confirm`] and also issues the
+    /// navigation's [`AfterResponseWrite`].
+    ///
+    /// Returns `None` for a redirect, which makes neither write.
+    #[must_use]
+    pub fn confirm_with_after_response(
+        self,
+        status: StatusCode,
+    ) -> Option<(PageLoadWrite, AfterResponseWrite)> {
+        self.confirm(status)
+            .map(|permit| (permit, AfterResponseWrite(())))
+    }
+
     /// Whether `status` is a redirect (301, 302, 303, 307, 308) on which the
     /// page load's write is skipped.
     ///
@@ -89,6 +107,29 @@ pub struct PageLoadWrite(());
 impl PageLoadWrite {
     /// Consumes the permit. Called only by the write itself.
     pub(crate) fn spend(self) {}
+}
+
+/// Proof that the current navigation may make one follow-up update after its
+/// response has been sent.
+///
+/// Issued only by [`NavigationPermit::confirm_with_after_response`] and
+/// consumed by [`KvIdentityGraph::commit_after_response`]. It is not `Clone`,
+/// so a navigation makes at most one follow-up write.
+///
+/// [`KvIdentityGraph::commit_after_response`]: super::kv::KvIdentityGraph::commit_after_response
+#[derive(Debug)]
+pub struct AfterResponseWrite(());
+
+impl AfterResponseWrite {
+    /// Consumes the permit. Called only by the write itself.
+    pub(crate) fn spend(self) {}
+
+    /// Builds a permit without a navigation, for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_test() -> Self {
+        Self(())
+    }
 }
 
 /// KV generation a conditional write expects.

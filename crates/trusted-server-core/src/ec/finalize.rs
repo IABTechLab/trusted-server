@@ -60,9 +60,10 @@ pub fn ec_finalize_response(
     response: &mut Response<EdgeBody>,
 ) {
     ec_context.validate_pull_sync_marker(settings, registry);
-    let permit = ec_context
+    let (permit, after_response) = ec_context
         .take_navigation_permit()
-        .and_then(|permit| permit.confirm(response.status()));
+        .and_then(|permit| permit.confirm_with_after_response(response.status()))
+        .unzip();
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
@@ -106,10 +107,17 @@ pub fn ec_finalize_response(
             updates: &updates,
             had_eid_updates,
         };
-        if ec_context.ec_generated() {
-            commit_generated(&commit, ec_context, permit, response);
+        let page_write_ok = if ec_context.ec_generated() {
+            commit_generated(&commit, ec_context, permit, response)
         } else if ec_context.ec_was_present() {
-            commit_returning(&commit, ec_context, permit, response);
+            commit_returning(&commit, ec_context, permit, response)
+        } else {
+            false
+        };
+        // The follow-up write is allowed only once consent allows the EC and
+        // the page-load write succeeded or had nothing to change.
+        if page_write_ok && let Some(after_response) = after_response {
+            ec_context.set_after_response_permit(after_response);
         }
     } else if ec_context.ec_generated() {
         // Do not emit a generated EC when there is no KV graph: that would
@@ -162,19 +170,21 @@ fn present_snapshot(ec_id: &str, entry: KvEntry) -> EcKvSnapshot {
 }
 
 /// Creates the row of a newly generated EC and issues its cookie on success.
+///
+/// Returns whether the row was created.
 fn commit_generated(
     commit: &PageLoadCommit<'_>,
     ec_context: &mut EcContext,
     permit: Option<PageLoadWrite>,
     response: &mut Response<EdgeBody>,
-) {
+) -> bool {
     let Some(new_entry) = ec_context.take_pending_entry() else {
         log::warn!("Skipping generated EC cookie because no pending row was built");
-        return;
+        return false;
     };
     let Some(permit) = permit else {
         log::info!("Skipping generated EC: not a page-load navigation");
-        return;
+        return false;
     };
     let Some(change) = commit.plan(
         ec_context,
@@ -183,12 +193,13 @@ fn commit_generated(
         Some(&new_entry),
     ) else {
         log::warn!("Skipping generated EC: no row change was planned");
-        return;
+        return false;
     };
     match commit.graph.commit_page_load(permit, commit.ec_id, change) {
         Ok(committed) => {
             ec_context.set_kv_snapshot(present_snapshot(commit.ec_id, committed));
             set_ec_cookie_on_response(commit.settings, ec_context, response);
+            true
         }
         Err(report) => {
             log::warn!(
@@ -196,19 +207,23 @@ fn commit_generated(
                 log_id(commit.ec_id),
                 report.current_context()
             );
+            false
         }
     }
 }
 
 /// Applies a returning EC's page-load write, or recovers an orphaned EC.
+///
+/// Returns whether the row is live afterwards: written, recovered, or left
+/// unchanged because there was nothing to write.
 fn commit_returning(
     commit: &PageLoadCommit<'_>,
     ec_context: &mut EcContext,
     permit: Option<PageLoadWrite>,
     response: &mut Response<EdgeBody>,
-) {
+) -> bool {
     let Some(permit) = permit else {
-        return;
+        return false;
     };
     // An unread snapshot is read only when this navigation has something to
     // write, or when consent gating emptied real EID data on a request that
@@ -225,27 +240,38 @@ fn commit_returning(
         if ec_context.recovery_eligible() {
             confirm_then_recover_orphaned_ec(commit, ec_context, permit, response);
         }
-        return;
+        return matches!(ec_context.kv_snapshot(), EcKvSnapshot::Present { .. });
     }
-    update_returning(commit, ec_context, permit);
+    if matches!(ec_context.kv_snapshot(), EcKvSnapshot::Failed { .. }) {
+        return false;
+    }
+    update_returning(commit, ec_context, permit)
 }
 
 /// Writes the planned update for a returning EC whose row snapshot is held.
+///
+/// Returns `false` only when a planned write failed.
 fn update_returning(
     commit: &PageLoadCommit<'_>,
     ec_context: &mut EcContext,
     permit: PageLoadWrite,
-) {
+) -> bool {
     let Some(change) = commit.plan(ec_context, commit.ec_id, ec_context.kv_snapshot(), None) else {
-        return;
+        return true;
     };
     match commit.graph.commit_page_load(permit, commit.ec_id, change) {
-        Ok(committed) => ec_context.set_kv_snapshot(present_snapshot(commit.ec_id, committed)),
-        Err(report) => log::info!(
-            "Page-load write skipped for '{}': {}",
-            log_id(commit.ec_id),
-            report.current_context()
-        ),
+        Ok(committed) => {
+            ec_context.set_kv_snapshot(present_snapshot(commit.ec_id, committed));
+            true
+        }
+        Err(report) => {
+            log::info!(
+                "Page-load write skipped for '{}': {}",
+                log_id(commit.ec_id),
+                report.current_context()
+            );
+            false
+        }
     }
 }
 
@@ -815,6 +841,10 @@ mod tests {
             .expect("should replace the stale miss with a tombstone snapshot");
         assert!(!snapshot_entry.consent.ok && snapshot_entry.ids.is_empty());
         assert_eq!(ec_context.kv_snapshot().generation_for(&ec_id), None);
+        assert!(
+            ec_context.take_after_response_permit().is_none(),
+            "should not allow after-response lookups after a withdrawal"
+        );
     }
 
     #[test]
@@ -1291,7 +1321,7 @@ mod tests {
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read store")
-            .expect("row should remain");
+            .expect("should keep the row");
         assert!(
             !stored.ids.contains_key("sharedid.org"),
             "a subresource response must not persist request EID cookies"
@@ -1349,7 +1379,7 @@ mod tests {
             let (stored, _) = graph
                 .get(&ec_id)
                 .expect("should read store")
-                .expect("row should remain");
+                .expect("should keep the row");
             assert_eq!(
                 stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
                 permit.then_some(cookie_id),
@@ -1439,7 +1469,7 @@ mod tests {
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read store")
-            .expect("row should remain");
+            .expect("should keep the row");
         assert!(
             stored.ids.is_empty(),
             "an auction request must leave the row unchanged"
@@ -1514,7 +1544,7 @@ mod tests {
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read store")
-            .expect("row should remain");
+            .expect("should keep the row");
         assert!(
             stored.ids.is_empty(),
             "should persist neither the auction body nor the cookie EIDs"
@@ -1576,7 +1606,7 @@ mod tests {
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read store")
-            .expect("row should remain");
+            .expect("should keep the row");
         assert!(
             !stored.ids.contains_key("id5-sync.com"),
             "denying TCF Purpose 4 must keep the EID out of KV even though Purpose 1 \
@@ -1641,7 +1671,7 @@ mod tests {
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read store")
-            .expect("row should remain");
+            .expect("should keep the row");
         assert!(
             !stored.ids.contains_key("id5-sync.com"),
             "should keep the provider-owned fallback out of KV without Purpose 4"
@@ -2770,5 +2800,65 @@ mod tests {
         let mut entry = KvEntry::tombstone(1000);
         entry.consent.ok = true;
         entry
+    }
+
+    #[test]
+    fn finalize_allows_after_response_lookups_on_a_live_row() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("after1");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        graph
+            .create(
+                &ec_id,
+                &crate::ec::kv_types::KvEntry::minimal("p.example", "uid", 1),
+            )
+            .expect("should seed the identity");
+        let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), true);
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            ec_context.take_after_response_permit().is_some(),
+            "should allow after-response lookups when the page write had nothing to change"
+        );
+    }
+
+    #[test]
+    fn finalize_withholds_after_response_lookups_when_the_row_read_failed() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("after2");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut ec_context = returning_user_context(
+            &ec_id,
+            EcKvSnapshot::Failed {
+                ec_id: ec_id.clone(),
+            },
+            true,
+        );
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            ec_context.take_after_response_permit().is_none(),
+            "should not allow after-response lookups when the page phase failed"
+        );
     }
 }

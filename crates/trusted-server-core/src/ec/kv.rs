@@ -22,7 +22,7 @@ use crate::error::TrustedServerError;
 use super::generation::ec_hash;
 use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use super::kv_types::{KvEntry, KvMetadata, KvNetwork, MAX_ENTRY_BYTES};
-use super::page_load::{KvWriteError, PageLoadWrite, RowChange};
+use super::page_load::{AfterResponseWrite, Generation, KvWriteError, PageLoadWrite, RowChange};
 use super::{EcKvSnapshot, current_timestamp, log_id};
 
 /// Maximum number of CAS retry attempts before giving up.
@@ -60,15 +60,6 @@ pub enum UpsertResult {
     ConsentWithdrawn,
     /// The partner ID already had the requested UID, so no write was needed.
     Unchanged,
-}
-
-/// Outcome of atomically creating an identity-graph root when absent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CreateIfAbsentOutcome {
-    /// The candidate entry was persisted.
-    Written,
-    /// A row already exists for the candidate key.
-    AlreadyExists,
 }
 
 /// Partner UID update to apply to a KV identity graph entry.
@@ -341,23 +332,6 @@ impl KvIdentityGraph {
         }
     }
 
-    /// Atomically creates an entry while preserving collision as normal control flow.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::KvStore`] when serialization or store I/O fails.
-    pub fn create_if_absent(
-        &self,
-        ec_id: &str,
-        entry: &KvEntry,
-    ) -> Result<CreateIfAbsentOutcome, Report<TrustedServerError>> {
-        let (body, meta_str) = Self::serialize_entry(entry, self.store_name())?;
-        match self.write_entry(ec_id, &body, &meta_str, ENTRY_TTL, EcKvWriteMode::Add)? {
-            EcKvWriteOutcome::Written => Ok(CreateIfAbsentOutcome::Written),
-            EcKvWriteOutcome::PreconditionFailed => Ok(CreateIfAbsentOutcome::AlreadyExists),
-        }
-    }
-
     /// Low-level write with shared error context.
     fn write_entry(
         &self,
@@ -415,23 +389,61 @@ impl KvIdentityGraph {
                 EcKvWriteMode::IfGenerationMatch(expected.get()),
             ),
         };
+        self.write_row(ec_id, &entry, ttl, mode)?;
+        if is_tombstone {
+            // Deliberate exception to the one-write-per-page-load rule:
+            // the withdrawal-completion marker is a separate key that
+            // predates the rule. Later withdrawals use it to avoid a
+            // strongly consistent existence check on a row already
+            // withdrawn, and it never touches the identity row.
+            self.record_withdrawal_completion(ec_id, entry.consent.updated);
+        }
+        Ok(entry)
+    }
+
+    /// Applies a navigation's follow-up update after its response was sent.
+    ///
+    /// The row is replaced only while it is still at `expected`, so a
+    /// concurrent write is never overwritten. The `permit` is consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvWriteError::Conflict`] when the row changed since it was
+    /// read, or [`KvWriteError::Store`] on a serialization or store failure,
+    /// including a row over [`MAX_ENTRY_BYTES`]. Callers must not retry.
+    pub fn commit_after_response(
+        &self,
+        permit: AfterResponseWrite,
+        ec_id: &str,
+        entry: &KvEntry,
+        expected: Generation,
+    ) -> Result<(), Report<KvWriteError>> {
+        permit.spend();
+        self.write_row(
+            ec_id,
+            entry,
+            ENTRY_TTL,
+            EcKvWriteMode::IfGenerationMatch(expected.get()),
+        )
+    }
+
+    /// Serializes `entry` and writes it with `mode`, mapping a failed
+    /// precondition to [`KvWriteError::AlreadyExists`] for a create and
+    /// [`KvWriteError::Conflict`] otherwise.
+    fn write_row(
+        &self,
+        ec_id: &str,
+        entry: &KvEntry,
+        ttl: Duration,
+        mode: EcKvWriteMode,
+    ) -> Result<(), Report<KvWriteError>> {
         let (body, metadata) =
-            Self::serialize_entry(&entry, self.store_name()).change_context(KvWriteError::Store)?;
+            Self::serialize_entry(entry, self.store_name()).change_context(KvWriteError::Store)?;
         let outcome = self
             .write_entry(ec_id, &body, &metadata, ttl, mode)
             .change_context(KvWriteError::Store)?;
         match outcome {
-            EcKvWriteOutcome::Written => {
-                if is_tombstone {
-                    // Deliberate exception to the one-write-per-page-load rule:
-                    // the withdrawal-completion marker is a separate key that
-                    // predates the rule. Later withdrawals use it to avoid a
-                    // strongly consistent existence check on a row already
-                    // withdrawn, and it never touches the identity row.
-                    self.record_withdrawal_completion(ec_id, entry.consent.updated);
-                }
-                Ok(entry)
-            }
+            EcKvWriteOutcome::Written => Ok(()),
             EcKvWriteOutcome::PreconditionFailed => Err(Report::new(match mode {
                 EcKvWriteMode::Add => KvWriteError::AlreadyExists,
                 _ => KvWriteError::Conflict,
@@ -1747,34 +1759,6 @@ mod tests {
     }
 
     #[test]
-    fn create_if_absent_reports_written_and_collision() {
-        let kv = KvIdentityGraph::in_memory("test_store");
-        let ec_id = format!("{}.ABC123", "a".repeat(64));
-
-        assert_eq!(
-            kv.create_if_absent(&ec_id, &live_entry())
-                .expect("should create absent entry"),
-            CreateIfAbsentOutcome::Written
-        );
-        assert_eq!(
-            kv.create_if_absent(&ec_id, &live_entry())
-                .expect("should report collision"),
-            CreateIfAbsentOutcome::AlreadyExists
-        );
-    }
-
-    #[test]
-    fn create_if_absent_propagates_store_error() {
-        let kv = KvIdentityGraph::failing("test_store");
-        let ec_id = format!("{}.ABC123", "a".repeat(64));
-
-        assert!(
-            kv.create_if_absent(&ec_id, &live_entry()).is_err(),
-            "should preserve store failures instead of reporting a collision"
-        );
-    }
-
-    #[test]
     fn create_or_revive_revives_tombstone() {
         let kv = KvIdentityGraph::in_memory("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
@@ -1985,7 +1969,7 @@ mod tests {
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read root after rejected hard delete")
-            .expect("rejected hard delete should retain root");
+            .expect("should retain the root after a rejected hard delete");
         assert!(
             !stored.consent.ok,
             "rejected hard delete should leave the tombstoned root in place"
@@ -2574,7 +2558,7 @@ mod tests {
         let (stored, _) = kv
             .get(&ec_id)
             .expect("should read store")
-            .expect("row should remain");
+            .expect("should keep the row");
         assert_eq!(
             stored.ids.get("ssp_x").map(|id| id.uid.as_str()),
             Some("uid-1"),
@@ -2651,7 +2635,7 @@ mod tests {
         let (stored, _) = kv
             .get(&ec_id)
             .expect("should read store")
-            .expect("tombstone should remain");
+            .expect("should keep the tombstone");
         assert!(stored.ids.is_empty(), "no update should reach the store");
     }
 

@@ -33,6 +33,7 @@ const REASON_INVALID_EC_ID: &str = "invalid_ec_id";
 const REASON_INVALID_PARTNER_UID: &str = "invalid_partner_uid";
 const REASON_INELIGIBLE: &str = "ineligible";
 const REASON_KV_UNAVAILABLE: &str = "kv_unavailable";
+const REASON_PROVIDER_OWNED: &str = "provider_owned";
 
 /// Maximum number of mappings allowed in a single batch request.
 const MAX_BATCH_SIZE: usize = 1000;
@@ -167,7 +168,12 @@ fn handle_batch_sync_with_writer(
     }
 
     // 4. Process mappings with per-item validation and rejection reasons.
-    let (accepted, errors) = process_mappings(writer, &partner.source_domain, &body.mappings);
+    let (accepted, errors) = process_mappings_for_partner(
+        writer,
+        &partner.source_domain,
+        registry.is_provider_owned(&partner.source_domain),
+        &body.mappings,
+    );
 
     let rejected = errors.len();
     let status = if rejected > 0 {
@@ -191,6 +197,30 @@ fn content_length_exceeds_limit(req: &Request<EdgeBody>, max_body_size: usize) -
         .and_then(|v| v.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok())
         .is_some_and(|content_length| content_length > max_body_size)
+}
+
+/// Processes mappings for one partner, rejecting all of them when an enabled
+/// identity provider owns the partner's source (spec §8.5).
+fn process_mappings_for_partner(
+    writer: &dyn BatchSyncWriter,
+    partner_id: &str,
+    provider_owned: bool,
+    mappings: &[SyncMapping],
+) -> (usize, Vec<MappingError>) {
+    if !provider_owned {
+        return process_mappings(writer, partner_id, mappings);
+    }
+    log::info!(
+        "Batch sync: rejecting {} mappings for provider-owned source '{partner_id}'",
+        mappings.len()
+    );
+    let errors = (0..mappings.len())
+        .map(|index| MappingError {
+            index,
+            reason: REASON_PROVIDER_OWNED,
+        })
+        .collect();
+    (0, errors)
 }
 
 /// Validates all mappings, then processes each normalized EC ID once.
@@ -542,6 +572,27 @@ mod tests {
         assert_eq!(errors[0].reason, REASON_INVALID_EC_ID);
         assert_eq!(errors[1].index, 1);
         assert_eq!(errors[1].reason, REASON_INVALID_PARTNER_UID);
+    }
+
+    #[test]
+    fn provider_owned_source_rejects_every_mapping() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written), Ok(UpsertResult::Written)]);
+        let mappings = vec![
+            mapping(&format!("{}.ABC123", "a".repeat(64)), "u1", 1),
+            mapping(&format!("{}.ABC123", "b".repeat(64)), "u2", 1),
+        ];
+
+        let (accepted, errors) =
+            process_mappings_for_partner(&writer, "ids.example.com", true, &mappings);
+
+        assert_eq!(accepted, 0, "should accept nothing");
+        assert_eq!(errors.len(), 2, "should reject each mapping");
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.reason == REASON_PROVIDER_OWNED),
+            "should report provider_owned"
+        );
     }
 
     #[test]
