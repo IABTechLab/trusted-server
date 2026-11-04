@@ -1,4 +1,5 @@
 use std::any::{Any, TypeId};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -6,7 +7,7 @@ use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
 use http::{Method, Request, Response};
-use matchit::Router;
+use matchit::{InsertError, Router};
 
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
@@ -799,11 +800,39 @@ pub struct ProxyDispatchInput<'a> {
     pub req: Request<EdgeBody>,
 }
 
-/// In-memory registry of integrations discovered from settings.
+/// Shared executable integration capabilities assembled from registrations.
 #[derive(Clone, Default)]
 pub struct IntegrationRegistry {
     inner: Arc<IntegrationRegistryInner>,
     plan: Option<Arc<AuctionPlan>>,
+}
+
+fn router_path(path: &str) -> Cow<'_, str> {
+    match path.strip_suffix("/*") {
+        Some(prefix) => Cow::Owned(format!("{prefix}/{{*rest}}")),
+        None => Cow::Borrowed(path),
+    }
+}
+
+fn conflicting_route_owner(
+    registered: &[(IntegrationEndpoint, &'static str)],
+    incoming: &IntegrationEndpoint,
+) -> Option<&'static str> {
+    registered.iter().find_map(|(route, owner)| {
+        if route.method != incoming.method {
+            return None;
+        }
+        // Ask the same router about each pair only after a conflict. Its error
+        // text can unescape literal braces, so text lookup cannot identify owners.
+        let mut pair = Router::new();
+        pair.insert(router_path(&route.path), ())
+            .expect("should reinsert a previously validated route");
+        matches!(
+            pair.insert(router_path(&incoming.path), ()),
+            Err(InsertError::Conflict { .. })
+        )
+        .then_some(*owner)
+    })
 }
 
 impl IntegrationRegistry {
@@ -820,38 +849,42 @@ impl IntegrationRegistry {
         Self::with_plan(settings, plan)
     }
 
-    /// Build a registry from the provided settings.
+    /// Assemble explicit registrations around one authoritative auction plan.
+    ///
+    /// Preserves input order independently for each capability. This method
+    /// neither discovers integrations nor constructs them from settings. Global
+    /// settings retain the existing asynchronous HTML completion permission check.
     ///
     /// # Errors
     ///
-    /// Returns an error if route registration fails due to duplicate routes or invalid paths.
+    /// Returns an error for conflicting or invalid routes, or invalid asynchronous
+    /// completion metadata. Diagnostics identify owners without configured paths.
     ///
     /// # Panics
     ///
-    /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
-    pub fn with_plan(
+    /// Panics if a previously validated route cannot be reinserted while identifying
+    /// conflicting owners, which violates the router's validation invariant.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use error_stack::Report;
+    /// # use trusted_server_core::auction::AuctionPlan;
+    /// # use trusted_server_core::error::TrustedServerError;
+    /// # use trusted_server_core::integrations::{IntegrationRegistration, IntegrationRegistry};
+    /// # use trusted_server_core::settings::Settings;
+    /// # fn assemble(settings: &Settings, plan: Arc<AuctionPlan>, registrations: Vec<IntegrationRegistration>)
+    /// #     -> Result<IntegrationRegistry, Report<TrustedServerError>> {
+    /// IntegrationRegistry::from_registrations(settings, plan, registrations)
+    /// # }
+    /// ```
+    pub fn from_registrations(
         settings: &Settings,
         plan: Arc<AuctionPlan>,
+        registrations: impl IntoIterator<Item = IntegrationRegistration>,
     ) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
-        let mut registrations = Vec::new();
-        if let Some(registration) = crate::integrations::prebid::register_for_plan(settings, &plan)?
-        {
-            registrations.push(registration);
-        }
-        if let Some(registration) = crate::integrations::aps::register_for_plan(settings, &plan)? {
-            registrations.push(registration);
-        }
-        for builder in crate::integrations::builders() {
-            if let Some(registration) = (builder.build)(settings)? {
-                debug_assert_eq!(
-                    registration.integration_id, builder.id,
-                    "integration builder ID should match registration ID"
-                );
-                registrations.push(registration);
-            }
-        }
-
         for registration in registrations {
             inner
                 .enabled_integration_ids
@@ -861,18 +894,7 @@ impl IntegrationRegistry {
                 for route in proxy.routes() {
                     let value = (proxy.clone(), registration.integration_id);
 
-                    // Convert /* wildcard to matchit's {*rest} syntax
-                    let matchit_path = if route.path.ends_with("/*") {
-                        format!(
-                            "{}/{{*rest}}",
-                            route
-                                .path
-                                .strip_suffix("/*")
-                                .expect("path should end with '/*'")
-                        )
-                    } else {
-                        route.path.clone()
-                    };
+                    let matchit_path = router_path(&route.path);
 
                     // Select appropriate router and insert
                     let router = match route.method {
@@ -885,21 +907,32 @@ impl IntegrationRegistry {
                         Method::OPTIONS => &mut inner.options_router,
                         _ => {
                             log::warn!(
-                                "Unsupported HTTP method {} for route {}",
-                                route.method,
-                                route.path
+                                "Unsupported HTTP method in route declaration for integration {}",
+                                registration.integration_id
                             );
                             continue;
                         }
                     };
 
-                    if let Err(e) = router.insert(&matchit_path, value) {
-                        return Err(Report::new(TrustedServerError::Configuration {
-                            message: format!(
-                                "Integration route registration failed for {} {}: {:?}",
-                                route.method, route.path, e
-                            ),
-                        }));
+                    if let Err(error) = router.insert(matchit_path, value) {
+                        let message = if matches!(error, InsertError::Conflict { .. }) {
+                            match conflicting_route_owner(&inner.routes, &route) {
+                                Some(owner) => format!(
+                                    "Integration route conflict between {owner} and {} for {}",
+                                    registration.integration_id, route.method,
+                                ),
+                                None => format!(
+                                    "Integration route conflict while registering {}",
+                                    registration.integration_id,
+                                ),
+                            }
+                        } else {
+                            format!(
+                                "Invalid integration route declaration for {}",
+                                registration.integration_id,
+                            )
+                        };
+                        return Err(Report::new(TrustedServerError::Configuration { message }));
                     }
 
                     inner.routes.push((route, registration.integration_id));
@@ -1467,6 +1500,237 @@ mod tests {
     use crate::constants::COOKIE_TS_EC;
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
+
+    fn compile_registry_test_plan(settings: &Settings) -> Arc<AuctionPlan> {
+        Arc::new(
+            crate::auction::compile_auction_plan(settings)
+                .expect("should compile registry test plan"),
+        )
+    }
+
+    struct OrderedRegistrationHook {
+        id: &'static str,
+    }
+
+    impl IntegrationHeadInjector for OrderedRegistrationHook {
+        fn integration_id(&self) -> &'static str {
+            self.id
+        }
+
+        fn head_inserts(&self, _: &IntegrationHtmlContext<'_>) -> Vec<String> {
+            vec![self.id.to_owned()]
+        }
+    }
+
+    impl IntegrationAttributeRewriter for OrderedRegistrationHook {
+        fn integration_id(&self) -> &'static str {
+            self.id
+        }
+
+        fn handles_attribute(&self, attribute: &str) -> bool {
+            attribute == "src"
+        }
+
+        fn rewrite(
+            &self,
+            _: &str,
+            value: &str,
+            _: &IntegrationAttributeContext<'_>,
+        ) -> AttributeRewriteAction {
+            AttributeRewriteAction::replace(format!("{value}/{}", self.id))
+        }
+    }
+
+    struct DeclaredRouteProxy {
+        id: &'static str,
+        path: &'static str,
+    }
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for DeclaredRouteProxy {
+        fn integration_name(&self) -> &'static str {
+            self.id
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![IntegrationEndpoint::get(self.path)]
+        }
+
+        async fn handle(
+            &self,
+            _: &Settings,
+            _: &RuntimeServices,
+            _: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            Ok(Response::new(EdgeBody::empty()))
+        }
+    }
+
+    #[test]
+    fn explicit_registrations_do_not_construct_the_builtin_catalog() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let plan = compile_registry_test_plan(&settings);
+        let legacy = IntegrationRegistry::with_plan(&settings, Arc::clone(&plan))
+            .expect("should construct the existing catalog fixture");
+        assert!(
+            !legacy.registered_integrations().is_empty(),
+            "should use settings that would otherwise construct builtin registrations"
+        );
+        let registry =
+            IntegrationRegistry::from_registrations(&settings, Arc::clone(&plan), Vec::new())
+                .expect("should assemble only the explicit registrations");
+        assert!(
+            registry.registered_integrations().is_empty(),
+            "should not discover or construct registrations from settings"
+        );
+        assert!(
+            registry.shares_plan(&plan),
+            "should retain the authoritative plan allocation"
+        );
+    }
+
+    #[test]
+    fn explicit_registrations_preserve_each_capability_order() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let mut registrations = Vec::new();
+        for (id, attribute) in [
+            ("z-owner", true),
+            ("middle-owner", false),
+            ("a-owner", true),
+        ] {
+            let hook = Arc::new(OrderedRegistrationHook { id });
+            let registration =
+                IntegrationRegistration::builder(id).with_head_injector(hook.clone());
+            registrations.push(if attribute {
+                registration.with_attribute_rewriter(hook).build()
+            } else {
+                registration.build()
+            });
+        }
+        let registry = IntegrationRegistry::from_registrations(
+            &settings,
+            compile_registry_test_plan(&settings),
+            registrations,
+        )
+        .expect("should assemble interleaved capabilities");
+        let state = IntegrationDocumentState::default();
+        let html_context = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            document_state: &state,
+        };
+        assert_eq!(
+            registry.head_inserts(&html_context),
+            ["z-owner", "middle-owner", "a-owner"],
+            "should preserve head capability order rather than sorting owner IDs"
+        );
+        let attribute_context = IntegrationAttributeContext {
+            attribute_name: "src",
+            element_name: "script",
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+        };
+        assert_eq!(
+            registry.rewrite_attribute("src", "initial", &attribute_context),
+            AttributeRewriteOutcome::Replaced("initial/z-owner/a-owner".to_owned()),
+            "should preserve attribute-local order across interleaved head-only registrations"
+        );
+    }
+
+    #[test]
+    fn explicit_route_conflicts_identify_owners_without_disclosing_paths() {
+        for (first, second) in [
+            ("/credential-sentinel", "/credential-sentinel"),
+            (
+                "/credential-sentinel/{first}",
+                "/credential-sentinel/{second}",
+            ),
+            (
+                "/credential-sentinel/{{literal}}",
+                "/credential-sentinel/{{literal}}",
+            ),
+        ] {
+            let settings = crate::test_support::tests::create_test_settings();
+            let registrations = [("first-owner", first), ("second-owner", second)]
+                .into_iter()
+                .map(|(id, path)| {
+                    IntegrationRegistration::builder(id)
+                        .with_proxy(Arc::new(DeclaredRouteProxy { id, path }))
+                        .build()
+                });
+            let error = IntegrationRegistry::from_registrations(
+                &settings,
+                compile_registry_test_plan(&settings),
+                registrations,
+            )
+            .err()
+            .expect("should reject conflicting explicit route claims");
+            let diagnostic = format!("{error:?}");
+            for owner in ["first-owner", "second-owner"] {
+                assert!(
+                    diagnostic.contains(owner),
+                    "should identify both conflicting owners"
+                );
+            }
+            assert!(
+                diagnostic.contains("route"),
+                "should name the conflicting resource kind"
+            );
+            assert!(
+                !diagnostic.contains("credential-sentinel"),
+                "should not disclose configured paths in route conflict diagnostics"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_invalid_routes_do_not_disclose_configured_paths() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let registration = IntegrationRegistration::builder("invalid-owner")
+            .with_proxy(Arc::new(DeclaredRouteProxy {
+                id: "invalid-owner",
+                path: "/credential-sentinel/{invalid",
+            }))
+            .build();
+        let error = IntegrationRegistry::from_registrations(
+            &settings,
+            compile_registry_test_plan(&settings),
+            [registration],
+        )
+        .err()
+        .expect("should reject an invalid explicit route declaration");
+        let diagnostic = format!("{error:?}");
+        assert!(
+            diagnostic.contains("invalid-owner"),
+            "should identify the invalid route owner"
+        );
+        assert!(
+            !diagnostic.contains("credential-sentinel"),
+            "should redact the invalid route path"
+        );
+    }
+
+    #[test]
+    fn explicit_registrations_retain_async_completion_validation() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.publisher.allow_async_html_finish = true;
+        let registration = IntegrationRegistration::builder("example_inconsistent_retention")
+            .with_html_stream_processor(Arc::new(RetentionWithoutAsyncFactory))
+            .build();
+        let error = IntegrationRegistry::from_registrations(
+            &settings,
+            compile_registry_test_plan(&settings),
+            [registration],
+        )
+        .err()
+        .expect("should validate explicit asynchronous completion metadata");
+        assert!(
+            format!("{error:?}").contains("buffering without async completion"),
+            "should preserve the existing finalization metadata contract"
+        );
+    }
 
     #[cfg(feature = "test-utils")]
     #[test]

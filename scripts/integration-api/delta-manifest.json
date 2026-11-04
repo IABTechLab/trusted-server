@@ -1,5 +1,72 @@
 {
   "schema": 1,
   "baselineCommit": "ca95a2dacb7fac1a47d7504ec0cc8d0dad8539bf",
-  "changes": []
+  "changes": [
+    {
+      "profile": "native/default",
+      "key": "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::from_registrations",
+      "change": "add-or-widen",
+      "before": null,
+      "after": "ae4eb7d1a790549612e5d45d848e8296f641c1213e8cd0c99863a7cd8e2452ec",
+      "owner": "trusted_server_core::integrations::registry::IntegrationRegistry",
+      "class": "core-neutral",
+      "consumers": ["trusted-server-core"],
+      "removal": null
+    },
+    {
+      "profile": "native/test-utils",
+      "key": "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::from_registrations",
+      "change": "add-or-widen",
+      "before": null,
+      "after": "ae4eb7d1a790549612e5d45d848e8296f641c1213e8cd0c99863a7cd8e2452ec",
+      "owner": "trusted_server_core::integrations::registry::IntegrationRegistry",
+      "class": "core-neutral",
+      "consumers": ["trusted-server-core"],
+      "removal": null
+    },
+    {
+      "profile": "wasi/default",
+      "key": "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::from_registrations",
+      "change": "add-or-widen",
+      "before": null,
+      "after": "ae4eb7d1a790549612e5d45d848e8296f641c1213e8cd0c99863a7cd8e2452ec",
+      "owner": "trusted_server_core::integrations::registry::IntegrationRegistry",
+      "class": "core-neutral",
+      "consumers": ["trusted-server-core"],
+      "removal": null
+    },
+    {
+      "profile": "wasi/test-utils",
+      "key": "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::from_registrations",
+      "change": "add-or-widen",
+      "before": null,
+      "after": "ae4eb7d1a790549612e5d45d848e8296f641c1213e8cd0c99863a7cd8e2452ec",
+      "owner": "trusted_server_core::integrations::registry::IntegrationRegistry",
+      "class": "core-neutral",
+      "consumers": ["trusted-server-core"],
+      "removal": null
+    },
+    {
+      "profile": "worker/default",
+      "key": "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::from_registrations",
+      "change": "add-or-widen",
+      "before": null,
+      "after": "ae4eb7d1a790549612e5d45d848e8296f641c1213e8cd0c99863a7cd8e2452ec",
+      "owner": "trusted_server_core::integrations::registry::IntegrationRegistry",
+      "class": "core-neutral",
+      "consumers": ["trusted-server-core"],
+      "removal": null
+    },
+    {
+      "profile": "worker/test-utils",
+      "key": "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::from_registrations",
+      "change": "add-or-widen",
+      "before": null,
+      "after": "ae4eb7d1a790549612e5d45d848e8296f641c1213e8cd0c99863a7cd8e2452ec",
+      "owner": "trusted_server_core::integrations::registry::IntegrationRegistry",
+      "class": "core-neutral",
+      "consumers": ["trusted-server-core"],
+      "removal": null
+    }
+  ]
 }

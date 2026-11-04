@@ -72,6 +72,16 @@ tasks.
 - [ ] Introduce neutral profile and prepared exchange-or-skip contracts, a consuming bound response parser, renderer descriptors, transport-header view, and mediator registration. Remove vendor enum/downcast/constructor knowledge from core without changing OpenRTB wire bytes or the #1159 skip/admission matrix.
 - [ ] Run `cargo test-fastly`, `cargo test-axum`, and the baseline differential harness. Expected: schema-one provider order and externally visible local labels match the golden. Run the API-delta guard and commit the neutral seam separately from any source moves.
 
+Task 2 is in progress. The first unit adds explicit registration assembly with
+capability-local order and one shared plan. Legacy catalog construction remains
+the sole source in `integrations/mod.rs`; the registry no longer constructs
+concrete integrations. Route-conflict diagnostics retain owner IDs without
+configured paths. The five new focused regressions, 3,360 native core tests,
+32 Viceroy registry tests, the eleven-output baseline and six API profiles pass.
+The API ledger contains only the new constructor in each profile. Neutral
+declarations, reserved/script claims, profile/prepared-exchange contracts and
+ordinal-bearing provider inputs remain open; this is not Task 2 completion.
+
 ### Task 3: Move lifecycle decisions behind neutral processing requirements
 
 **Files:** Create `crates/trusted-server-core/src/integration/processing.rs`; modify `crates/trusted-server-core/src/{html_processor,publisher,cookies,cache_policy,response_privacy}.rs` and `crates/trusted-server-adapter-{fastly,axum,cloudflare,spin}/src/app.rs` plus Fastly `src/main.rs`.

@@ -1,5 +1,6 @@
 //! Integration module registry and sample implementations.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use edgezero_core::body::Body as EdgeBody;
@@ -7,6 +8,7 @@ use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
 use url::Url;
 
+use crate::auction::AuctionPlan;
 use crate::error::TrustedServerError;
 use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
 use crate::settings::Settings;
@@ -39,6 +41,44 @@ pub use registry::{
     ProxyDispatchInput, RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
     RequestFilterRegistryInput, RequestFilterRegistryOutcome, ScriptRewriteAction,
 };
+
+impl IntegrationRegistry {
+    /// Build registrations from the existing catalog around a shared plan.
+    ///
+    /// Runtime adapters compile one plan and reuse its allocation. Catalog
+    /// construction stays here while the registry only assembles its inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when catalog construction, route registration or
+    /// asynchronous HTML completion validation fails.
+    ///
+    /// # Panics
+    ///
+    /// See [`Self::from_registrations`] for its route-validation invariant.
+    pub fn with_plan(
+        settings: &Settings,
+        plan: Arc<AuctionPlan>,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let mut registrations = Vec::new();
+        if let Some(registration) = prebid::register_for_plan(settings, &plan)? {
+            registrations.push(registration);
+        }
+        if let Some(registration) = aps::register_for_plan(settings, &plan)? {
+            registrations.push(registration);
+        }
+        for builder in builders() {
+            if let Some(registration) = (builder.build)(settings)? {
+                debug_assert_eq!(
+                    registration.integration_id, builder.id,
+                    "integration builder ID should match registration ID"
+                );
+                registrations.push(registration);
+            }
+        }
+        Self::from_registrations(settings, plan, registrations)
+    }
+}
 
 /// Registers or retrieves a platform backend for the given URL.
 ///
