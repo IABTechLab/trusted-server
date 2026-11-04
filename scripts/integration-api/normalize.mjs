@@ -153,9 +153,15 @@ export function normalize(doc, profile) {
       attrs: sorted(
         (node.attrs ?? []).filter((attr) => {
           const source = typeof attr === "string" ? attr : (attr.other ?? "");
-          return !["doc(", "doc =", "#[doc(", "#[doc ="].some((prefix) =>
-            source.startsWith(prefix),
-          );
+          // Rustdoc's cfg trace records source spans, not an exported contract.
+          // Separate target/feature profiles already capture cfg visibility.
+          return ![
+            "doc(",
+            "doc =",
+            "#[doc(",
+            "#[doc =",
+            "#[attr = CfgTrace(",
+          ].some((prefix) => source.startsWith(prefix));
         }),
       ),
       deprecation: semantic(node.deprecation),
@@ -339,7 +345,7 @@ export function normalize(doc, profile) {
       ]),
   );
   return stable({
-    schema: 1,
+    schema: 2,
     rustdocFormat: 60,
     privateInventory: doc.includes_private,
     profile,

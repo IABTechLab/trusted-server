@@ -40,7 +40,7 @@
       ],
       "bootstrap": "trusted_server_core",
       "rawSha256": "d4be73df977a3b1e09dc0a5a61baefbf2ceb822eb6260ac8fc5bde441f8af2ba",
-      "snapshotSha256": "add64591f4fdd888ff67221a8f6cdfc298ed40e976d5804ff06e02cd60b3b0fd"
+      "snapshotSha256": "ef774134d3cdfa228ece3ed6666d2c5032aba63328df44a95b57b65d220fb07c"
     },
     "native/test-utils": {
       "target": "x86_64-unknown-linux-gnu",
@@ -67,7 +67,7 @@
       ],
       "bootstrap": "trusted_server_core",
       "rawSha256": "d8e915081b11b282a02e588e78511191ac289a97da6edf52b17abe7235c023e0",
-      "snapshotSha256": "00bc0ad26c404f8a3b6d0072a5686ccb2aede3e448c4ad486a97f021d55ef117"
+      "snapshotSha256": "79d621bdd57dee2cad307b3cde8591b1a158689bcf1bac1cd82c2c54415120be"
     },
     "wasi/default": {
       "target": "wasm32-wasip1",
@@ -90,7 +90,7 @@
       ],
       "bootstrap": "trusted_server_core",
       "rawSha256": "7b79c02f0cc77c5d80ff12f99101b8d5b6f0c164e1080c39e19d4b682d98a097",
-      "snapshotSha256": "1da0c6d7e3374d3bc3dcdcd5e88873004dbfebc7ed82fdf3f8fb2593d212a812"
+      "snapshotSha256": "a56ad4c90f52cac7739689f29d8faa8123cfe43c44d84d8ed8b129f93d5abe23"
     },
     "wasi/test-utils": {
       "target": "wasm32-wasip1",
@@ -117,7 +117,7 @@
       ],
       "bootstrap": "trusted_server_core",
       "rawSha256": "0629613844530633f3314f80cbd78608d8d9be7bcf7ee86ff7bf3b7bf304ef59",
-      "snapshotSha256": "15e8df0a0ba1b95d6d9f109f77941798483e3fb969aceed3b616ddabac762639"
+      "snapshotSha256": "5d31a7d3b51bfb95011e4a06d1bc9ec451209810fddbc7285c62f2d0ab887570"
     },
     "worker/default": {
       "target": "wasm32-unknown-unknown",
@@ -140,7 +140,7 @@
       ],
       "bootstrap": "trusted_server_core",
       "rawSha256": "c6f82bd5a789cca2104f337ceb536350a4e12562f7e4d8880dc425c3e71260d9",
-      "snapshotSha256": "05339dc31874b2960ffbf5acde6bad1114956140d90bed359ad693e9c57f9cf5"
+      "snapshotSha256": "99e6a754ba5fd44a7986d4e8df779c5904aef27961992853815e8c04f404b090"
     },
     "worker/test-utils": {
       "target": "wasm32-unknown-unknown",
@@ -167,7 +167,7 @@
       ],
       "bootstrap": "trusted_server_core",
       "rawSha256": "2ff7ebe49c1f7fb3014388c0f78be401fa3d0c96992505982770d2e25c94c830",
-      "snapshotSha256": "7f3664e9b648e10ed74e841eaf3c38a84853b789c6e573aeb5f7ece9df4b989b"
+      "snapshotSha256": "28fbcea2105db3e867405752d2678f17fb11d84d304a3f97d3ee78d94aef1e99"
     }
   }
 }

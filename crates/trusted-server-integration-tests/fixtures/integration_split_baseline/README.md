@@ -36,7 +36,9 @@ WASI and Worker targets. `api/provenance.json` pins the historical compiler
 inputs and six snapshots. The empty initial delta ledger permits no new,
 removed or changed exports. Future changes need exact reviewed entries in
 `scripts/integration-api/delta-manifest.json`; the three classes and tool limits
-are documented beside that checker.
+are documented beside that checker. Normalizer schema 2 reproduces the same
+historical raw captures while excluding compiler `CfgTrace` source locations;
+it does not rebaseline candidate exports.
 
 To capture outputs for investigation, use a scratch directory and a freshly
 built CLI. Review the diff before copying any bytes into this directory:
@@ -94,7 +96,7 @@ supplies distinct names instead of changing code under the frozen baseline.
 ## Recorded proof and limits
 
 At this checkpoint, the behavior runner passes four tests, the API script suite
-passes 26 tests, and all six fresh compiler views match their snapshots. Actual
+passes 27 tests, and all six fresh compiler views match their snapshots. Actual
 core source canaries for an added export and a removed export both fail the
 checker. Restoring the source passes again. Eleven output goldens reject deliberate
 mutations. The config fixture has two context allowlist values; existing core

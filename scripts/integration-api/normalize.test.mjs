@@ -48,6 +48,29 @@ test("source order, line positions, ordinary bodies and documentation do not cha
   assert.deepEqual(check(compact(baseline), moved, []), []);
 });
 
+test("compiler cfg traces do not turn shifted source lines into API changes", () => {
+  const conditional =
+    source +
+    '\n#[cfg(any(test, feature = "test-utils"))]\npub fn conditional_canary() {}\n';
+  const options = { cfg: 'feature="test-utils"' };
+  const original = compile(conditional, options);
+  const node = Object.values(original.index).find(
+    (item) => item.name === "conditional_canary",
+  );
+  assert(
+    node.attrs.some((attr) =>
+      (attr.other ?? "").startsWith("#[attr = CfgTrace("),
+    ),
+    "should reproduce compiler cfg trace metadata with embedded source positions",
+  );
+  const before = normalize(original, "native/test-utils");
+  const after = normalize(
+    compile("// shifted source\n\n" + conditional, options),
+    "native/test-utils",
+  );
+  assert.deepEqual(check(compact(before), after, []), []);
+});
+
 test("renumbering every rustdoc item ID does not change records", () => {
   const ids = new Set([
     ...Object.keys(baselineDoc.index),

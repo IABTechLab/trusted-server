@@ -9201,7 +9201,7 @@
     "variant trusted_server_core::trace::TraceSlotCandidate::Unknown": "6dc8ce62334286e4a193953239d84bcd482090215ab32c7825aa5665e57a9e0d"
   },
   "rustdocFormat": 60,
-  "schema": 1,
+  "schema": 2,
   "scope": "owned exports, explicit dependency bindings, signature reachability and auto traits; no instantiated blanket copies",
   "target": "x86_64-unknown-linux-gnu"
 }

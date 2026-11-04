@@ -1355,8 +1355,8 @@
     "function trusted_server_core::integrations::IntegrationRegistry::impl[41eefdf4e6edf9e7]::clone": "62611b5961af6c35bca50b01781410d13f666268bd68eba7983da5a6c7a6906a",
     "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::ensure_async_html_finish_allowed": "b75d1b186f685271bf22ef041731d983360dd6cacb033944a11c17c5201d59ef",
     "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::filter_request": "bc221f9165add293d059b79d3a122703c1beb1e236fb17669b9f7e9eb0e1befb",
-    "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::from_html_stream_processors": "cfd75d134bba2b48041090113128879d5c6011c40f0b393bfcbf76569d60887c",
-    "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::from_request_filters": "cc12789843090e4fc399c1c737e667126cd050853b99cefef185f0778fadd163",
+    "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::from_html_stream_processors": "73a48894f9909fecba39dac3843a17d851b89c614bc7c8e0fa214c8c118b55a9",
+    "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::from_request_filters": "635ce2797babee54ec04ca8fef58e70cce59081d06a8e18e6baa46b88a3116be",
     "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::handle_proxy": "7be013580b15859f3f81c6a1071b33214556af5b96d8065c97b3a7827d01f698",
     "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::has_async_html_finish": "1f750beb3a90afaed834be1393c93db81e080035e9f7c44f7be24c3ffa9199c5",
     "function trusted_server_core::integrations::IntegrationRegistry::impl[508314588d304209]::has_route": "3d7ae1c6f600d48f5c0c75b8d76487cb3ddaf4cf0b86978d6ea92ca91af5d634",
@@ -7234,7 +7234,7 @@
     "module trusted_server_core::streaming_processor::finish": "95a270a6809b1db7399d39a4901c9e1d3e10c689e6ec28fb838644c58d39b02e",
     "module trusted_server_core::streaming_replacer": "d6163140be84b2c203ad476d2b63a61f258670e904e965ab954086a013240c56",
     "module trusted_server_core::test_support": "3a26192179a8efac57d66e41fef0ab019367e46ea1f75734ae327466f97e8df9",
-    "module trusted_server_core::test_support::nextjs_auction": "ac5f288fd73d76368d8d8939868746e20e256cf736c7bb235af59aefbb159384",
+    "module trusted_server_core::test_support::nextjs_auction": "49505088e95b98e42acf709430e7cfc5b2f2d99b0a153cf49d809964d63dcc50",
     "module trusted_server_core::tester_cookie": "730f360e4f24f0c107e8dc00294e8b65a3cc5186bb07d2f04a828ea4fed21178",
     "module trusted_server_core::trace": "662c7a0a6855bd2a941ba3de5cad13ca0ebbb77ca2c0f788ef95a8ed0cb2b4e5",
     "module trusted_server_core::tsjs": "d7969cc654b96896b22a42c591a7df6500813e1fb267cd1f96a64b51cf44ef3a",
@@ -9244,7 +9244,7 @@
     "variant trusted_server_core::trace::TraceSlotCandidate::Unknown": "6dc8ce62334286e4a193953239d84bcd482090215ab32c7825aa5665e57a9e0d"
   },
   "rustdocFormat": 60,
-  "schema": 1,
+  "schema": 2,
   "scope": "owned exports, explicit dependency bindings, signature reachability and auto traits; no instantiated blanket copies",
   "target": "wasm32-wasip1"
 }

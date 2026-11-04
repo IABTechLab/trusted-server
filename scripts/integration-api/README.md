@@ -88,8 +88,15 @@ still requires human review.
 The normalizer tracks exported paths, explicit reexports, public members,
 locally owned impls, auto-trait headers and signature-reachable local types.
 Filesystem paths, spans, docs, numeric compiler IDs and definition-owner metadata
-are not signature identity. Canonical referenced type and reexport binding paths
-remain semantic. Public-only captures classify newly exposed symbols as
+are not signature identity. Snapshot normalizer schema 2 also excludes rustdoc's
+internal `CfgTrace` attribute, which embeds source locations rather than an API
+contract. Profile-specific compiler views still prove configuration visibility;
+other API-bearing attributes remain observed. Canonical referenced type and
+reexport binding paths remain semantic.
+
+A normalization-policy correction must reproduce the same historical raw
+captures, first checking their recorded SHA-256 values. It must not freeze a
+candidate's new exports into the baseline. Public-only captures classify newly exposed symbols as
 `add-or-widen`; private compiler fixtures prove both cases are blocked.
 
 This is not a transitive dependency semver, ABI-layout or runtime-behavior check.
