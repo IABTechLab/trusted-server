@@ -377,7 +377,8 @@ impl AdServerMockProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error when the mediation response body is not valid JSON.
+    /// Returns an error when the mediation response has a non-success HTTP status,
+    /// its body cannot be read within the response limit, or it is not valid JSON.
     async fn parse_response_inner(
         &self,
         response: PlatformResponse,
@@ -388,8 +389,9 @@ impl AdServerMockProvider {
         let response = response.response;
 
         if !response.status().is_success() {
-            log::warn!("AdServer Mock returned non-success: {}", response.status());
-            return Ok(AuctionResponse::error("adserver_mock", response_time_ms));
+            return Err(Report::new(TrustedServerError::Auction {
+                message: format!("AdServer Mock returned HTTP {}", response.status()),
+            }));
         }
 
         // collect_response_bounded caps memory from misbehaving providers.
