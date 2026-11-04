@@ -1,5 +1,5 @@
 {
-  "$comment": "JSON Schema draft-07. Local references only. Structural validation is necessary but never verifies cryptography, trust, authorization, provider qualification or current acceptance. Reject duplicate members/trailing bytes and enforce depth <=16, UTF-8 byte limits (ordinary strings <=256), HTTP limits and canonical encodings before validation. External checks include JWK thumbprints, JCS hashes, equality of projected/bound/enrolled identities, host IDNA profile, time ordering/lifetimes/key validity, nonce consumption, policy-required checks, release eligibility/digest equality, status sequence/withdrawal and independent trust settings. Evidence/status lifetime <=60 seconds; assessment expiry <=observed_from+900, issued_at<=observed_until+60; key validity <=90 days; challenge expiry <=creation+600. No schema alone establishes these relationships. Assessment expiry must not exceed independently authorized operator-record, enrollment, publisher-key or verifier-key expiry. Current status expiry must not exceed those bounds, assessment expiry or issued_at+60. Recheck authority at publication/commit and status reuse even when authorization generation is unchanged; expired operator authority stops positive assessment/current status.",
+  "$comment": "JSON Schema draft-07. Local references only. Structural validation is necessary but never verifies cryptography, trust, authorization, provider qualification or current acceptance under independently configured policy. Reject duplicate members/trailing bytes and enforce depth <=16, UTF-8 byte limits (ordinary strings <=256), HTTP limits and canonical encodings before validation. External checks include JWK thumbprints, JCS hashes, equality of projected/bound/enrolled identities, ASCII-only host canonicalization, time ordering/lifetimes/key validity, nonce consumption, policy-required checks, release eligibility/digest equality, status sequence/withdrawal and independent trust settings. Evidence/status lifetime <=60 seconds; assessment expiry <=observed_from+900, issued_at<=observed_until+60; key validity <=90 days; challenge expiry <=creation+600. No schema alone establishes these relationships. Assessment expiry must not exceed independently authorized operator-record, enrollment, publisher-key or verifier-key expiry. Current status expiry must not exceed those bounds, assessment expiry or issued_at+60. Recheck authority at publication/commit and status reuse even when authorization generation is unchanged; expired operator authority stops positive assessment/current status. Configuration checks concern signed publisher-declared identity/enrollment consistency only, never a registry read of full configuration. Default acceptance is expiry-only (require_status=false); live status is an optional stricter policy. Non-null operator identity requires independent exact operator DNS/account proof; null denotes self-operated with no distinct operator claim.",
   "title": "Publisher attestation version 1 structural contract",
   "oneOf": [
     {
@@ -37,6 +37,9 @@
     },
     {
       "$ref": "#/definitions/keyMetadata"
+    },
+    {
+      "$ref": "#/definitions/keyHistory"
     }
   ],
   "definitions": {
@@ -78,7 +81,7 @@
       "type": "string",
       "maxLength": 253,
       "pattern": "^(?=.{1,253}$)(?![0-9]+(?:\\.[0-9]+)*$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$",
-      "$comment": "Canonical lowercase ASCII DNS A-labels only. Input normalization uses Unicode 18.0.0 / UTS #46 revision 36 nontransitional processing with STD3, Bidi, Joiners, hyphen and DNS length checks and valid A-label round trips; enforce these outside JSON Schema. No trailing dot, IP literal or authority syntax."
+      "$comment": "Protocol boundary accepts ASCII DNS only; canonicalize ASCII letters to lowercase, remove one terminal dot, reject invalid DNS syntax and IP literals. Already-encoded xn-- labels are opaque ASCII DNS labels; Unicode input is rejected, with no Unicode/UTS dependency."
     },
     "httpsIdentifier": {
       "type": "string",
@@ -249,6 +252,28 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "provider": {
+                "const": "axum"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "service_id": {
+                "type": "null"
+              },
+              "service_version": {
+                "type": "null"
+              },
+              "staging": {
+                "type": "null"
+              }
+            }
+          }
         }
       ]
     },
@@ -274,7 +299,14 @@
           "$ref": "#/definitions/uuid"
         },
         "operator_id": {
-          "$ref": "#/definitions/httpsIdentifier"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/httpsIdentifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "deployment_id": {
           "$ref": "#/definitions/uuid"
@@ -326,7 +358,14 @@
           "$ref": "#/definitions/uuid"
         },
         "operator_id": {
-          "$ref": "#/definitions/httpsIdentifier"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/httpsIdentifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "deployment_id": {
           "$ref": "#/definitions/uuid"
@@ -346,29 +385,7 @@
         "extensions": {
           "$ref": "#/definitions/extensions"
         }
-      },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "platform": {
-                "properties": {
-                  "provider": {
-                    "const": "axum"
-                  }
-                }
-              }
-            }
-          },
-          "then": {
-            "properties": {
-              "environment": {
-                "const": "development"
-              }
-            }
-          }
-        }
-      ]
+      }
     },
     "buildReport": {
       "type": "object",
@@ -978,7 +995,7 @@
     },
     "keyDiscovery": {
       "type": "object",
-      "required": ["schema", "host", "keys"],
+      "required": ["schema", "host", "keys", "verifiers"],
       "additionalProperties": false,
       "properties": {
         "schema": {
@@ -994,6 +1011,16 @@
             "$ref": "#/definitions/keyValidity"
           },
           "minItems": 1
+        },
+        "verifiers": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/definitions/httpsIdentifier"
+          },
+          "$comment": "Untrusted HTTPS issuer discovery hints only. Never imports trust roots or enables a policy."
         }
       }
     },
@@ -1058,7 +1085,14 @@
           "$ref": "#/definitions/uuid"
         },
         "operator_id": {
-          "$ref": "#/definitions/httpsIdentifier"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/httpsIdentifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "deployment_id": {
           "$ref": "#/definitions/uuid"
@@ -1116,8 +1150,8 @@
           },
           "then": {
             "properties": {
-              "environment": {
-                "const": "development"
+              "service_id": {
+                "type": "null"
               }
             }
           }
@@ -1157,6 +1191,67 @@
         }
       },
       "$comment": "Read metadata at ts-publisher-key-<localname> in existing trusted_server_config; secret_name must equal ts-publisher-<same-localname> in existing trusted_server_secrets. Cross-entry equality is external."
+    },
+    "compactStatusJws": {
+      "type": "string",
+      "maxLength": 8192,
+      "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{85}[AQgw]$",
+      "$comment": "Explicit exception to the 256-byte string limit. Header/payload parsing, base64url canonicality and signature verification are external."
+    },
+    "keyHistory": {
+      "type": "object",
+      "required": ["schema", "host", "environment", "entries", "next_cursor"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-key-history-v1"
+        },
+        "host": {
+          "$ref": "#/definitions/host"
+        },
+        "environment": {
+          "$ref": "#/definitions/environment"
+        },
+        "entries": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "required": ["assessment", "status"],
+            "additionalProperties": false,
+            "properties": {
+              "assessment": {
+                "$ref": "#/definitions/compactJws"
+              },
+              "status": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/compactStatusJws"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[\\x20-\\x7e]+$"
+            }
+          ]
+        }
+      },
+      "$comment": "Untrusted transport of historical signed objects. Aggregate decoded HTTP body limit 524288 bytes is enforced externally before schema validation. Assessment JWS <=32768 ASCII bytes; status JWS <=8192 ASCII bytes. Pagination cursor is opaque printable ASCII; it confers no authority."
     }
   }
 }

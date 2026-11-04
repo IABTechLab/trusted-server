@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-04. **Status:** Proposed read-only investigation contract and conditional experiment design; no production provider qualification or live mutation authorized.
 
-**Parent contract:** [Publisher attestation](2026-11-04-publisher-attestation-design.md). **Scope:** authenticate the join from an enrolled publisher host and service/version to an installed selected executable, then to independently verified Layer 1 bytes. This is a feasibility/assurance gate, not auction/bid attestation or a new release producer.
+**Parent contract:** [Publisher attestation](2026-11-04-publisher-attestation-design.md). **Registry protocol:** [assessments and operations](2026-11-04-publisher-attestation-registry-design.md). **Scope:** authenticate the join from an enrolled publisher host and service/version to an installed selected executable, then to independently verified Layer 1 bytes. This is a feasibility/assurance gate, not auction/bid attestation or a new release producer.
 
 ## 1. Question and non-assumptions
 
@@ -62,9 +62,9 @@ explicitly enrolled publisher host
   → authenticated eligible official release bytes
 ```
 
-Investigate both versioned and versionless domain mechanisms supported by the actual account, staging, attached resources, configuration selectors, and edge propagation. Resolve the production environment explicitly through supported active/environment associations, not latest version or a legacy staging boolean. The [version API](https://www.fastly.com/documentation/reference/api/services/version/) documents some historical booleans as unused; distinguish those management fields from runtime staging identity. Provider API reads may describe desired/control-plane state rather than execution at every POP. An HTTPS challenge observes one serving path; a browser-visible page or response header cannot authenticate the management-plane mapping alone.
+Investigate both versioned and versionless domain mechanisms supported by the actual account, staging, attached resources, resource linkage where needed by the qualified method, and edge propagation. V1 does not require app-config payload reads for identity consistency; the signed public projection remains a publisher declaration. Resolve the production environment explicitly through supported active/environment associations, not latest version or a legacy staging boolean. The [version API](https://www.fastly.com/documentation/reference/api/services/version/) documents some historical booleans as unused; distinguish those management fields from runtime staging identity. Provider API reads may describe desired/control-plane state rather than execution at every POP. An HTTPS challenge observes one serving path; a browser-visible page or response header cannot authenticate the management-plane mapping alone.
 
-Read active version and covered configuration identity before and after the challenge. Reject inconsistent intervals. Record that matching observations do not exclude a change-and-restore or prove simultaneous global convergence. State whether a supported profile describes control-plane configured deployment, sampled response, or both.
+Read active provider version/host mapping before and after the challenge, and compare fresh signed public identity bindings when needed. Do not treat those declared values as independently observed configuration. Reject inconsistent intervals. Record that matching observations do not exclude a change-and-restore or prove simultaneous global convergence. State whether a supported profile describes control-plane configured deployment, sampled response, or both.
 
 ## 5. Strict local package inspection
 
@@ -100,9 +100,9 @@ Before any upload, activation, token creation, or domain/resource change, obtain
 - Compare local/client/provider hashes; vary only one property per trial. Distinguish successful upload, selected module, activation, and observed response.
 - Exercise provider-accepted naming/root/member rules, duplicate/alias handling, extra entries, and safe selected-module distinguishers. A provider rejection is evidence about that fixture only.
 - Check staging versus production, new-version activation, same-hash upload skipping, domain mappings, and before/after read races.
-- Change a covered config identity without a new service version and observe propagation/snapshot behavior separately.
+- Change a declared public identity value without a new service version and verify the endpoint's loaded snapshot/renewal mismatch behavior separately; no claim of independent full-config appraisal is made.
 - Exercise credential restrictions/revocation and audit-event coverage for relevant changes. Missing events or inaccessible resources must remain explicit gaps.
-- Corroborate the public identity projection through the existing app-config store while treating `ts-publisher-key-` metadata entries and `ts-publisher-` secret entries as separate namespaced records. Do not publish their private linkage or infer code-exclusive access from a shared store.
+- Check structural/enrollment consistency of the signed public identity projection without reading the full app-config blob for that purpose, while treating `ts-publisher-key-` metadata entries and `ts-publisher-` secret entries as separate namespaced records. Do not publish their private linkage or infer code-exclusive access from a shared store.
 - Retain sanitized observations and raw private evidence under restricted access. Clean up only resources the experiment owns; report uncertain outcomes without guessing or retrying mutations blindly.
 
 ### Q4: method security review and disposition
@@ -126,7 +126,7 @@ The parent contract defines policy failure and expiry. This investigation must n
 
 ## 8. Acceptance
 
-- **Q-AC1:** A reviewed evidence graph distinguishes official raw WASM, publisher archive, provider fingerprint, selected executable, active service/version, host, and actual configuration snapshot.
+- **Q-AC1:** A reviewed evidence graph distinguishes official raw WASM, publisher archive, provider fingerprint, selected executable, active service/version, host, and the publisher-declared actual request-used identity snapshot.
 - **Q-AC2:** The observed client hash algorithm and its ambiguity are documented with exact source and harmless fixtures.
 - **Q-AC3:** Provider contract and observations justify the selected method, or an explicit lower-assurance disposition prevents official claims.
 - **Q-AC4:** Hostile packages, parser/resource limits, permissions, staging, version/config changes, and failures have retained evidence at the applicable scope.
@@ -143,3 +143,5 @@ Document approval does not qualify a provider method.
 - **Round 2 (Codex, both independent reviewers):** No blocking companion finding. Strong assurance remained gated on provider-authenticated selected bytes/digest or a documented, reviewed equivalent binding; lower-assurance observations cannot become official claims. Parent discovery inventory finding was corrected there.
 - **Round 3 (Codex, both independent reviewers):** Both approved the linked documents without remaining blocking findings. No live experiment, provider write, runtime test, or strong-method qualification was performed while writing these specs.
 - **Follow-up correction and second detailed pass (Codex, independent security and feasibility reviewers):** Added existing-store capability/provisioning qualification and Q-AC6 following the five-finding review. The parent now avoids additional logical stores and empty linkage, and the companion preserves the same layout. Both reviewers approved the revised linked contracts; selected-executable binding and controlled provider experiments remain explicitly unexecuted.
+
+- **External-review scope clarification:** Linked the separate registry contract and aligned collection with declared identity consistency: v1 does not require a full app-config read to compare five public identity values. The selected-executable evidence gate, adversarial package checks, and no-unapproved-provider-write boundary remain intact. Fresh security/contract review found no additional companion blocker.
