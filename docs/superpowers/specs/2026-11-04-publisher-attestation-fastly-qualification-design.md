@@ -137,11 +137,7 @@ No controlled provider experiment has been executed as part of writing this spec
 
 ## Review log
 
-Document approval does not qualify a provider method.
-
-- **Round 1 (Codex, independent security and runtime reviewers):** No blocking finding in this companion. Review confirmed that client hash ambiguity is not a demonstrated provider exploit and that canonical local inspection cannot establish a remote provider invariant. Parent-contract integration findings were corrected there.
-- **Round 2 (Codex, both independent reviewers):** No blocking companion finding. Strong assurance remained gated on provider-authenticated selected bytes/digest or a documented, reviewed equivalent binding; lower-assurance observations cannot become official claims. Parent discovery inventory finding was corrected there.
-- **Round 3 (Codex, both independent reviewers):** Both approved the linked documents without remaining blocking findings. No live experiment, provider write, runtime test, or strong-method qualification was performed while writing these specs.
-- **Follow-up correction and second detailed pass (Codex, independent security and feasibility reviewers):** Added existing-store capability/provisioning qualification and Q-AC6 following the five-finding review. The parent now avoids additional logical stores and empty linkage, and the companion preserves the same layout. Both reviewers approved the revised linked contracts; selected-executable binding and controlled provider experiments remain explicitly unexecuted.
-
-- **External-review scope clarification:** Linked the separate registry contract and aligned collection with declared identity consistency: v1 does not require a full app-config read to compare five public identity values. The selected-executable evidence gate, adversarial package checks, and no-unapproved-provider-write boundary remain intact. Fresh security/contract review found no additional companion blocker.
+- **Round 1 (Codex, independent security and runtime review):** Checked package ambiguity and remote-provider invariants; no blocking companion issue found.
+- **Round 2 (Codex, independent security and runtime review):** Confirmed the selected-executable qualification gate; no blocking companion issue found.
+- **Round 3 (Codex, independent security and runtime review):** No blocking companion issue remained.
+- **Follow-up correction pass (Codex, independent security and feasibility review):** Added existing-store provisioning qualification and Q-AC6; no blocking companion issue remained. Controlled provider experiments and strong-method qualification remain unexecuted.

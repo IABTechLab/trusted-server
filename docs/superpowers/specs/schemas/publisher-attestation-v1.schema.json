@@ -927,7 +927,55 @@
         "extensions": {
           "$ref": "#/definitions/extensions"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "build": {
+                "properties": {
+                  "provider_files_hash": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "binding": {
+                "properties": {
+                  "platform": {
+                    "properties": {
+                      "provider": {
+                        "const": "fastly"
+                      }
+                    }
+                  }
+                }
+              },
+              "checks": {
+                "properties": {
+                  "host_service_binding": {
+                    "properties": {
+                      "outcome": {
+                        "const": "pass"
+                      }
+                    }
+                  },
+                  "active_version": {
+                    "properties": {
+                      "outcome": {
+                        "const": "pass"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "status": {
       "type": "object",
