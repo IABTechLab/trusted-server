@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use error_stack::Report;
+use trusted_server_core::config::with_placeholder_partner_tokens;
 use trusted_server_core::ec::coordinator::{ProviderCoordinator, RegisteredProvider};
 use trusted_server_core::ec::provider::{
     IdentityProvider, ProviderConfigError, ProviderKind as _, build_kind,
@@ -156,6 +157,40 @@ pub fn build_after_response_coordinator(
         CollectTiming::AfterResponse,
         Duration::from_millis(settings.ec.identity_after_response_budget_ms),
     )
+}
+
+/// Builds every enabled provider of both collection phases, as the adapters
+/// do on each navigation, so a provider-specific setting error is reported
+/// before deploy.
+///
+/// At runtime such an error disables every provider for the request, so
+/// deploy-time config validation (`ts config push`, `validate` and `diff`)
+/// calls this. Partner tokens may still be secret key names at that point;
+/// they are replaced with placeholders for the check.
+///
+/// # Errors
+///
+/// Returns [`ProviderConfigError`] for the first provider that cannot be
+/// built or fails the coordinator's configuration checks.
+pub fn validate_providers(settings: &Settings) -> Result<(), Report<ProviderConfigError>> {
+    let ec = with_placeholder_partner_tokens(&settings.ec);
+    let partners = Arc::new(
+        partner_registry(&ec)
+            .map_err(|report| report.change_context(ProviderConfigError::Invalid))?,
+    );
+    build_phase_coordinator(
+        settings,
+        Arc::clone(&partners),
+        CollectTiming::Page,
+        Duration::from_millis(settings.ec.identity_budget_ms),
+    )?;
+    build_phase_coordinator(
+        settings,
+        partners,
+        CollectTiming::AfterResponse,
+        Duration::from_millis(settings.ec.identity_after_response_budget_ms),
+    )?;
+    Ok(())
 }
 
 fn build_phase_coordinator(
@@ -363,6 +398,69 @@ mod tests {
             .expect("should parse criteo"),
         ];
         settings
+    }
+
+    fn liveramp_provider(collect: &str, settings: &str) -> IdentityProviderConfig {
+        toml::from_str(&format!(
+            "id = \"liveramp\"\nkind = \"liveramp\"\nsources = [\"liveramp.example.com\"]\n\
+             endpoint = \"https://envelope.example.com/api/identity/v2/envelope\"\n\
+             allowed_domains = [\"envelope.example.com\"]\ncollect = \"{collect}\"\n\
+             [settings]\n{settings}"
+        ))
+        .expect("should parse liveramp")
+    }
+
+    fn settings_with_liveramp(collect: &str, settings: &str) -> Settings {
+        let mut configured = settings_with_cookie_providers("page", "page");
+        configured.ec.partners.push(
+            toml::from_str(
+                "name = \"liveramp\"\nsource_domain = \"liveramp.example.com\"\nbidstream_enabled = true",
+            )
+            .expect("should parse partner"),
+        );
+        configured
+            .ec
+            .identity_providers
+            .push(liveramp_provider(collect, settings));
+        configured
+    }
+
+    #[test]
+    fn validate_providers_accepts_buildable_providers_in_both_phases() {
+        let page = settings_with_liveramp(
+            "page",
+            "placement_id = 14\ncustom_id_namespace = \"ana-example\"",
+        );
+        let after = settings_with_liveramp(
+            "after_response",
+            "placement_id = 14\ncustom_id_namespace = \"ana-example\"",
+        );
+
+        validate_providers(&page).expect("should accept a buildable page provider");
+        validate_providers(&after).expect("should accept a buildable after-response provider");
+    }
+
+    #[test]
+    fn validate_providers_rejects_a_provider_that_cannot_be_built() {
+        for collect in ["page", "after_response"] {
+            let settings = settings_with_liveramp(collect, "placement_id = 14");
+
+            assert!(
+                validate_providers(&settings).is_err(),
+                "should reject a {collect} liveramp endpoint without a namespace"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_providers_accepts_partner_tokens_that_are_still_key_names() {
+        let mut settings = settings_with_cookie_providers("page", "page");
+        settings.ec.partners[0] = toml::from_str(
+            "name = \"pubcid.org\"\nsource_domain = \"pubcid.org\"\nbidstream_enabled = true\napi_token = \"partner_token_key\"",
+        )
+        .expect("should parse partner with a token key name");
+
+        validate_providers(&settings).expect("should not resolve partner token key names");
     }
 
     #[test]

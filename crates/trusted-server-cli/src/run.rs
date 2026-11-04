@@ -6,9 +6,9 @@ use edgezero_cli::args::{
     ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs,
     ConfigValidateArgs, DeployArgs, HealthcheckArgs, ProvisionArgs, RollbackArgs, ServeArgs,
 };
-use trusted_server_core::config::TrustedServerAppConfig;
 use trusted_server_core::constants::TS_GIT_VERSION;
 
+use crate::checked_app_config::CheckedAppConfig;
 use crate::commands::audit::{AuditArgs, run_audit};
 use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
 use crate::commands::config::init::{ConfigInitArgs, run_config_init};
@@ -144,7 +144,7 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
             run_config_init(&args).map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Diff(args)) => {
-            match edgezero_cli::run_config_diff_typed::<TrustedServerAppConfig>(&args) {
+            match edgezero_cli::run_config_diff_typed::<CheckedAppConfig>(&args) {
                 Ok(edgezero_cli::DiffExit { code: 0 }) => Ok(RunOutcome::Success),
                 Ok(edgezero_cli::DiffExit { code: 1 }) => Ok(RunOutcome::AssertionFailed),
                 Ok(edgezero_cli::DiffExit { code }) => process::exit(code),
@@ -155,11 +155,11 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
             edgezero_cli::run_config_gc(&args).map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Push(args)) => {
-            edgezero_cli::run_config_push_typed::<TrustedServerAppConfig>(&args)
+            edgezero_cli::run_config_push_typed::<CheckedAppConfig>(&args)
                 .map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Validate(args)) => {
-            edgezero_cli::run_config_validate_typed::<TrustedServerAppConfig>(&args)
+            edgezero_cli::run_config_validate_typed::<CheckedAppConfig>(&args)
                 .map(|()| RunOutcome::Success)
         }
         Command::Deploy(args) => edgezero_cli::run_deploy(&args).map(|()| RunOutcome::Success),
