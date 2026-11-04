@@ -1,0 +1,310 @@
+[
+  {
+    "active": false,
+    "bootstrap": null,
+    "enabled": false,
+    "id": "inactive",
+    "module_script": null,
+    "private": false,
+    "request_headers": {
+      "accept": [
+        "text/html"
+      ],
+      "cookie": [
+        "keep=one"
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "public, max-age=3600"
+      ]
+    },
+    "uri": "https://edge.example.com/article?section=example"
+  },
+  {
+    "active": false,
+    "bootstrap": null,
+    "enabled": false,
+    "id": "activate",
+    "module_script": null,
+    "private": false,
+    "request_headers": {
+      "accept": [
+        "text/html"
+      ],
+      "cookie": [
+        "keep=one"
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "public, max-age=3600"
+      ]
+    },
+    "uri": "https://edge.example.com/article?section=example"
+  },
+  {
+    "active": false,
+    "bootstrap": null,
+    "enabled": false,
+    "id": "deactivate",
+    "module_script": null,
+    "private": false,
+    "request_headers": {
+      "accept": [
+        "text/html"
+      ],
+      "cookie": [
+        "keep=one"
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "public, max-age=3600"
+      ]
+    },
+    "uri": "https://edge.example.com/article"
+  },
+  {
+    "active": false,
+    "bootstrap": null,
+    "enabled": false,
+    "id": "ambiguous-query",
+    "module_script": null,
+    "private": false,
+    "request_headers": {
+      "accept": [
+        "text/html"
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "public, max-age=3600"
+      ]
+    },
+    "uri": "https://edge.example.com/article"
+  },
+  {
+    "active": false,
+    "bootstrap": null,
+    "enabled": false,
+    "id": "duplicate-cookie",
+    "module_script": null,
+    "private": false,
+    "request_headers": {
+      "accept": [
+        "text/html"
+      ],
+      "cookie": [
+        "keep=one"
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "public, max-age=3600"
+      ]
+    },
+    "uri": "https://edge.example.com/article"
+  },
+  {
+    "active": false,
+    "bootstrap": null,
+    "enabled": false,
+    "id": "malformed-neighbor",
+    "module_script": null,
+    "private": false,
+    "request_headers": {
+      "accept": [
+        "text/html"
+      ],
+      "cookie": [
+        "keep=one; token=abc=="
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "public, max-age=3600"
+      ]
+    },
+    "uri": "https://edge.example.com/article"
+  },
+  {
+    "active": false,
+    "bootstrap": null,
+    "enabled": false,
+    "id": "non-navigation",
+    "module_script": null,
+    "private": false,
+    "request_headers": {
+      "accept": [
+        "application/json"
+      ],
+      "cookie": [
+        "keep=one"
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "public, max-age=3600"
+      ]
+    },
+    "uri": "https://edge.example.com/article"
+  },
+  {
+    "active": false,
+    "bootstrap": null,
+    "enabled": true,
+    "id": "inactive",
+    "module_script": null,
+    "private": false,
+    "request_headers": {
+      "accept": [
+        "text/html"
+      ],
+      "cookie": [
+        "keep=one"
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "public, max-age=3600"
+      ]
+    },
+    "uri": "https://edge.example.com/article?section=example"
+  },
+  {
+    "active": true,
+    "bootstrap": "<script>window.__tsjs_gpt_diagnostics_active=true;history.replaceState(history.state,'',\"/article?section=example\"+location.hash);</script>",
+    "enabled": true,
+    "id": "activate",
+    "module_script": "<script src=\"/static/tsjs=tsjs-gpt_diagnostics.min.js?v=@artifact:gpt_diagnostics@\"></script>",
+    "private": true,
+    "request_headers": {
+      "accept": [
+        "text/html"
+      ],
+      "cookie": [
+        "keep=one"
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "no-store, private"
+      ],
+      "set-cookie": [
+        "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=1800"
+      ]
+    },
+    "uri": "https://edge.example.com/article?section=example"
+  },
+  {
+    "active": false,
+    "bootstrap": "<script>history.replaceState(history.state,'',\"/article\"+location.hash);</script>",
+    "enabled": true,
+    "id": "deactivate",
+    "module_script": null,
+    "private": true,
+    "request_headers": {
+      "accept": [
+        "text/html"
+      ],
+      "cookie": [
+        "keep=one"
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "no-store, private"
+      ],
+      "set-cookie": [
+        "__Host-ts-console=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0"
+      ]
+    },
+    "uri": "https://edge.example.com/article"
+  },
+  {
+    "active": false,
+    "bootstrap": "<script>history.replaceState(history.state,'',\"/article\"+location.hash);</script>",
+    "enabled": true,
+    "id": "ambiguous-query",
+    "module_script": null,
+    "private": true,
+    "request_headers": {
+      "accept": [
+        "text/html"
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "no-store, private"
+      ]
+    },
+    "uri": "https://edge.example.com/article"
+  },
+  {
+    "active": false,
+    "bootstrap": null,
+    "enabled": true,
+    "id": "duplicate-cookie",
+    "module_script": null,
+    "private": false,
+    "request_headers": {
+      "accept": [
+        "text/html"
+      ],
+      "cookie": [
+        "keep=one"
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "public, max-age=3600"
+      ]
+    },
+    "uri": "https://edge.example.com/article"
+  },
+  {
+    "active": true,
+    "bootstrap": "<script>window.__tsjs_gpt_diagnostics_active=true;</script>",
+    "enabled": true,
+    "id": "malformed-neighbor",
+    "module_script": "<script src=\"/static/tsjs=tsjs-gpt_diagnostics.min.js?v=@artifact:gpt_diagnostics@\"></script>",
+    "private": true,
+    "request_headers": {
+      "accept": [
+        "text/html"
+      ],
+      "cookie": [
+        "keep=one; token=abc=="
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "no-store, private"
+      ]
+    },
+    "uri": "https://edge.example.com/article"
+  },
+  {
+    "active": false,
+    "bootstrap": null,
+    "enabled": true,
+    "id": "non-navigation",
+    "module_script": null,
+    "private": false,
+    "request_headers": {
+      "accept": [
+        "application/json"
+      ],
+      "cookie": [
+        "keep=one"
+      ]
+    },
+    "response_headers": {
+      "cache-control": [
+        "public, max-age=3600"
+      ]
+    },
+    "uri": "https://edge.example.com/article"
+  }
+]

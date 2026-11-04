@@ -1,0 +1,173 @@
+{
+  "schema": 1,
+  "baselineCommit": "ca95a2dacb7fac1a47d7504ec0cc8d0dad8539bf",
+  "crate": "trusted_server_core",
+  "rustdocFormat": 60,
+  "environment": {
+    "node": "v24.20.0",
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+    "rustdoc": "rustdoc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustdoc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+    "files": {
+      "Cargo.lock": "550a4adb3d7199a73585886ce9fe01f1f66e3c1670e92deb7e78aa8a8420c00c",
+      "rust-toolchain.toml": "95961a65cd44ee0b7d97243bdc87d3b35d2b8d710d86e850bc8da64bcbd51491",
+      ".tool-versions": "273b277448d6ea76639e75ed0af0260f24c80b34b711970747e7e9b9524383c4"
+    },
+    "flags": {
+      "RUSTFLAGS": "",
+      "CARGO_ENCODED_RUSTFLAGS": "",
+      "RUSTDOCFLAGS": ""
+    }
+  },
+  "profiles": {
+    "native/default": {
+      "target": "x86_64-unknown-linux-gnu",
+      "features": [],
+      "snapshot": "native-default.json",
+      "rustdocArgs": [
+        "rustdoc",
+        "--locked",
+        "-p",
+        "trusted-server-core",
+        "--lib",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "--",
+        "-Z",
+        "unstable-options",
+        "--output-format",
+        "json",
+        "--document-hidden-items"
+      ],
+      "bootstrap": "trusted_server_core",
+      "rawSha256": "d4be73df977a3b1e09dc0a5a61baefbf2ceb822eb6260ac8fc5bde441f8af2ba",
+      "snapshotSha256": "add64591f4fdd888ff67221a8f6cdfc298ed40e976d5804ff06e02cd60b3b0fd"
+    },
+    "native/test-utils": {
+      "target": "x86_64-unknown-linux-gnu",
+      "features": [
+        "test-utils"
+      ],
+      "snapshot": "native-test-utils.json",
+      "rustdocArgs": [
+        "rustdoc",
+        "--locked",
+        "-p",
+        "trusted-server-core",
+        "--lib",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "--features",
+        "test-utils",
+        "--",
+        "-Z",
+        "unstable-options",
+        "--output-format",
+        "json",
+        "--document-hidden-items"
+      ],
+      "bootstrap": "trusted_server_core",
+      "rawSha256": "d8e915081b11b282a02e588e78511191ac289a97da6edf52b17abe7235c023e0",
+      "snapshotSha256": "00bc0ad26c404f8a3b6d0072a5686ccb2aede3e448c4ad486a97f021d55ef117"
+    },
+    "wasi/default": {
+      "target": "wasm32-wasip1",
+      "features": [],
+      "snapshot": "wasi-default.json",
+      "rustdocArgs": [
+        "rustdoc",
+        "--locked",
+        "-p",
+        "trusted-server-core",
+        "--lib",
+        "--target",
+        "wasm32-wasip1",
+        "--",
+        "-Z",
+        "unstable-options",
+        "--output-format",
+        "json",
+        "--document-hidden-items"
+      ],
+      "bootstrap": "trusted_server_core",
+      "rawSha256": "7b79c02f0cc77c5d80ff12f99101b8d5b6f0c164e1080c39e19d4b682d98a097",
+      "snapshotSha256": "1da0c6d7e3374d3bc3dcdcd5e88873004dbfebc7ed82fdf3f8fb2593d212a812"
+    },
+    "wasi/test-utils": {
+      "target": "wasm32-wasip1",
+      "features": [
+        "test-utils"
+      ],
+      "snapshot": "wasi-test-utils.json",
+      "rustdocArgs": [
+        "rustdoc",
+        "--locked",
+        "-p",
+        "trusted-server-core",
+        "--lib",
+        "--target",
+        "wasm32-wasip1",
+        "--features",
+        "test-utils",
+        "--",
+        "-Z",
+        "unstable-options",
+        "--output-format",
+        "json",
+        "--document-hidden-items"
+      ],
+      "bootstrap": "trusted_server_core",
+      "rawSha256": "0629613844530633f3314f80cbd78608d8d9be7bcf7ee86ff7bf3b7bf304ef59",
+      "snapshotSha256": "15e8df0a0ba1b95d6d9f109f77941798483e3fb969aceed3b616ddabac762639"
+    },
+    "worker/default": {
+      "target": "wasm32-unknown-unknown",
+      "features": [],
+      "snapshot": "worker-default.json",
+      "rustdocArgs": [
+        "rustdoc",
+        "--locked",
+        "-p",
+        "trusted-server-core",
+        "--lib",
+        "--target",
+        "wasm32-unknown-unknown",
+        "--",
+        "-Z",
+        "unstable-options",
+        "--output-format",
+        "json",
+        "--document-hidden-items"
+      ],
+      "bootstrap": "trusted_server_core",
+      "rawSha256": "c6f82bd5a789cca2104f337ceb536350a4e12562f7e4d8880dc425c3e71260d9",
+      "snapshotSha256": "05339dc31874b2960ffbf5acde6bad1114956140d90bed359ad693e9c57f9cf5"
+    },
+    "worker/test-utils": {
+      "target": "wasm32-unknown-unknown",
+      "features": [
+        "test-utils"
+      ],
+      "snapshot": "worker-test-utils.json",
+      "rustdocArgs": [
+        "rustdoc",
+        "--locked",
+        "-p",
+        "trusted-server-core",
+        "--lib",
+        "--target",
+        "wasm32-unknown-unknown",
+        "--features",
+        "test-utils",
+        "--",
+        "-Z",
+        "unstable-options",
+        "--output-format",
+        "json",
+        "--document-hidden-items"
+      ],
+      "bootstrap": "trusted_server_core",
+      "rawSha256": "2ff7ebe49c1f7fb3014388c0f78be401fa3d0c96992505982770d2e25c94c830",
+      "snapshotSha256": "7f3664e9b648e10ed74e841eaf3c38a84853b789c6e573aeb5f7ece9df4b989b"
+    }
+  }
+}

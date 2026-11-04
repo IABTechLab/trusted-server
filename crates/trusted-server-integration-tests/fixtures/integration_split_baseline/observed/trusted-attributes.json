@@ -1,0 +1,39 @@
+[
+  {
+    "aps_native": false,
+    "attributes": [
+      [
+        "data-ts-gam-attribution",
+        "true"
+      ]
+    ],
+    "gam_attribution": true,
+    "publisher_tag": "<script src=\"/static/tsjs=tsjs-unified.min.js?v=@immediate-artifact@\" id=\"trustedserver-js\" data-ts-gam-attribution=\"true\"></script>"
+  },
+  {
+    "aps_native": true,
+    "attributes": [
+      [
+        "data-ts-aps-rendering-mode",
+        "publisher_native"
+      ]
+    ],
+    "gam_attribution": false,
+    "publisher_tag": "<script src=\"/static/tsjs=tsjs-unified.min.js?v=@immediate-artifact@\" id=\"trustedserver-js\" data-ts-aps-rendering-mode=\"publisher_native\"></script>"
+  },
+  {
+    "aps_native": true,
+    "attributes": [
+      [
+        "data-ts-aps-rendering-mode",
+        "publisher_native"
+      ],
+      [
+        "data-ts-gam-attribution",
+        "true"
+      ]
+    ],
+    "gam_attribution": true,
+    "publisher_tag": "<script src=\"/static/tsjs=tsjs-unified.min.js?v=@immediate-artifact@\" id=\"trustedserver-js\" data-ts-aps-rendering-mode=\"publisher_native\" data-ts-gam-attribution=\"true\"></script>"
+  }
+]

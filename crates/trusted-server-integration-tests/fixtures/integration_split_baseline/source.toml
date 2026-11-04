@@ -1,0 +1,138 @@
+# Fixed, fictional inputs for the schema-one extraction baseline.
+[[handlers]]
+path = "^/_ts/admin"
+username = "baseline-admin"
+password = "baseline-password"
+
+[publisher]
+domain = "edge.example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "baseline-only-proxy-secret"
+
+[ec]
+passphrase = "baseline-only-ec-key-at-least-32-bytes"
+
+[proxy]
+allowed_domains = ["assets.example.com", "origin.example.com"]
+
+[auction]
+enabled = true
+mediator = "adserver_mock"
+allowed_context_keys = ["section", "page"]
+
+# Deliberately interleave families and declare providers out of lexical order.
+[auction.providers.f-prebid]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://bids.example.com/f"
+
+[auction.providers.a-standard]
+protocol = "openrtb-2.6"
+endpoint = "https://bids.example.com/a"
+routing = "all_eligible"
+
+[auction.providers.e-aps]
+protocol = "openrtb-2.6"
+profile = "aps"
+endpoint = "https://bids.example.com/e"
+routing = "all_eligible"
+[auction.providers.e-aps.profile_config]
+account_id = "example-account-e"
+
+[auction.providers.c-prebid]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://bids.example.com/c"
+
+[auction.providers.d-standard]
+protocol = "openrtb-2.6"
+endpoint = "https://bids.example.com/d"
+routing = "all_eligible"
+[auction.providers.d-standard.notifications]
+suppress_seats = ["example-seat-b", "example-seat-a"]
+
+[auction.providers.b-aps]
+protocol = "openrtb-2.6"
+profile = "aps"
+endpoint = "https://bids.example.com/b"
+routing = "all_eligible"
+[auction.providers.b-aps.profile_config]
+account_id = "example-account-b"
+
+[auction.bidders.example-c]
+provider = "c-prebid"
+[auction.bidders.example-f]
+provider = "f-prebid"
+
+[creative_opportunities]
+gam_network_id = "12345"
+[[creative_opportunities.slot]]
+id = "baseline-banner"
+page_patterns = ["/article", "/news/*"]
+formats = [{ width = 300, height = 250 }, { width = 728, height = 90 }]
+[[creative_opportunities.slot]]
+id = "baseline-footer"
+page_patterns = ["/article"]
+formats = [{ width = 300, height = 250 }]
+
+[integrations.adserver_mock]
+enabled = true
+endpoint = "https://mediator.example.com/mediate"
+
+[integrations.aps]
+enabled = true
+
+[integrations.prebid]
+enabled = true
+external_bundle_url = "https://assets.example.com/prebid.js"
+
+[integrations.js_asset_proxy]
+enabled = true
+[[integrations.js_asset_proxy.assets]]
+path = "/managed/library.js"
+origin_url = "https://assets.example.com/prebid.js"
+[[integrations.js_asset_proxy.assets]]
+path = "/managed/blocked.js"
+origin_url = "https://assets.example.com/blocked.js"
+proxy = "blocked"
+
+[integrations.testlight]
+enabled = true
+endpoint = "https://testlight.example.com/openrtb"
+
+[integrations.nextjs]
+enabled = true
+rewrite_attributes = ["href", "link", "url"]
+
+[integrations.permutive]
+enabled = true
+organization_id = "example-organization"
+workspace_id = "example-workspace"
+
+[integrations.lockr]
+enabled = true
+app_id = "example-app"
+
+[integrations.didomi]
+enabled = true
+
+[integrations.sourcepoint]
+enabled = true
+
+[integrations.osano]
+enabled = true
+
+[integrations.google_tag_manager]
+enabled = true
+container_id = "GTM-EXAMPLE"
+
+[integrations.datadome]
+enabled = true
+client_side_key = "example-client-side-key"
+
+[integrations.gpt]
+enabled = true
+
+[integrations.gpt_diagnostics]
+enabled = true

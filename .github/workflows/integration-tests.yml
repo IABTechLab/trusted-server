@@ -105,6 +105,7 @@ jobs:
           -- --include-ignored
           --skip test_wordpress_fastly --skip test_nextjs_fastly
           --skip trace_browser_workflow --skip trace_runtime_boundary
+          --skip capture_corrected_baseline --skip preserves_cli_read_models
           --test-threads=1
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}

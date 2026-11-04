@@ -43,11 +43,25 @@ The names in the new crates are responsibility boundaries, not a requirement to 
 
 **Files:** Create `crates/trusted-server-integration-tests/tests/integration_split_baseline.rs` and a reviewed output-golden directory under `crates/trusted-server-integration-tests/fixtures/integration_split_baseline/`; create `scripts/check-integration-api-delta.sh` and its checked-in manifest; modify only baseline-test selectors in `.github/workflows/integration-tests.yml`.
 
-- [ ] Add differential cases for every current Rust definition and browser module, globally interleaved APS/Prebid/standard provider IDs, deferred Prebid, GPT diagnostics, Next.js/GTM/RSC, #1135, routes, trusted script attributes, CLI views, and relevant failure classifications. Store actual corrected-baseline output bytes and separate artifact hashes; do not hand-author expected runtime output.
-- [ ] Run the harness against the recorded corrected stack-tip baseline twice. Expected: byte-identical behavior goldens; artifact hashes may be recorded separately. Prove each golden fails after a deliberate test-only mutation to its observed output, then restore the mutation.
-- [ ] Capture the current public core symbol snapshot and write an explicit delta manifest for the spec's three classes. Test that an undeclared added/removed public item fails the guard, then restore the canary.
-- [ ] Verify deterministic serialization by repeatedly parsing a fixture with at least two values in every set-valued field and comparing envelope SHA and template identity. If it fails, stop for the standalone prerequisite fix.
-- [ ] Commit the baseline evidence and its exact commit/toolchain/EdgeZero pins. Do not proceed if a prerequisite output defect is still present.
+- [x] Add differential cases for every current Rust definition and browser module, globally interleaved APS/Prebid/standard provider IDs, deferred Prebid, GPT diagnostics, Next.js/GTM/RSC, #1135, routes, trusted script attributes, CLI views, and relevant failure classifications. Store actual corrected-baseline output bytes and separate artifact hashes; do not hand-author expected runtime output.
+- [x] Run the harness against the recorded corrected stack-tip baseline twice. Expected: byte-identical behavior goldens; artifact hashes may be recorded separately. Prove each golden fails after a deliberate test-only mutation to its observed output, then restore the mutation.
+- [x] Capture the current public core symbol snapshot and write an explicit delta manifest for the spec's three classes. Test that an undeclared added/removed public item fails the guard, then restore the canary.
+- [x] Verify deterministic serialization by repeatedly parsing a fixture with at least two values in every set-valued field and comparing envelope SHA and template identity. If it fails, stop for the standalone prerequisite fix.
+- [x] Commit the baseline evidence and its exact commit/toolchain/EdgeZero pins. Do not proceed if a prerequisite output defect is still present.
+
+Task 1 execution checkpoint, 2026-11-04: source main is `51730bdaf`; separate
+prerequisite commits are `a6b0a8b2b` for #1098, `ebd074d5f` for #1203 and
+`ca95a2dac` for #1199. The corrected baseline is `ca95a2dac`. Exact pins and eleven
+observed-output hashes are in
+`crates/trusted-server-integration-tests/fixtures/integration_split_baseline/capture-provenance.json`.
+Two complete captures match byte for byte. The fresh-CLI behavior runner passes
+four tests, and the six-profile public-API gate passes. Actual added/removed core
+source canaries fail before restoration; the restored gate passes. Existing
+collection-rich envelope and template fingerprint regressions remain passing.
+The baseline README names the normalization and unverified runtime coverage.
+EdgeZero v0.0.11 has the environment-selector support but still needs the narrow
+source/command hook extension before Task 8. This is not a merge gate for earlier
+tasks.
 
 ### Task 2: Introduce neutral registration, claims, and plan inputs
 

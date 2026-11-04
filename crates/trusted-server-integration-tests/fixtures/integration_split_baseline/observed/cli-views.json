@@ -1,0 +1,50 @@
+[
+  {
+    "id": "lint",
+    "status": 0,
+    "stderr": "",
+    "stdout": "app config: @baseline-source@\nserver-side ad templates: configured (2 slots)\ngam_network_id: 12345\nauction_timeout_ms: 2000\ncreative_opportunities.enabled: true\nauction.enabled: true\nauction.providers: a-standard, b-aps, c-prebid, d-standard, e-aps, f-prebid\nstatus: eligible for legacy-path server-side auctions\n"
+  },
+  {
+    "id": "match-details",
+    "status": 0,
+    "stderr": "",
+    "stdout": "/article: matched baseline-banner, baseline-footer\n- baseline-banner div=baseline-banner gam=/12345/baseline-banner patterns=[/article, /news/*] formats=[300x250 banner, 728x90 banner] providers=[none]\n- baseline-footer div=baseline-footer gam=/12345/baseline-footer patterns=[/article] formats=[300x250 banner] providers=[none]\n"
+  },
+  {
+    "id": "match-none",
+    "status": 0,
+    "stderr": "",
+    "stdout": "/unmatched: no slots matched\n"
+  },
+  {
+    "id": "explain",
+    "status": 0,
+    "stderr": "",
+    "stdout": "path: /article\n/article: matched baseline-banner, baseline-footer\n- baseline-banner div=baseline-banner gam=/12345/baseline-banner patterns=[/article, /news/*] formats=[300x250 banner, 728x90 banner] providers=[none]\n- baseline-footer div=baseline-footer gam=/12345/baseline-footer patterns=[/article] formats=[300x250 banner] providers=[none]\ngate method GET: pass\ngate navigation: pass\ngate not prefetch: pass\ngate not bot: pass\ngate consent allows auction: pass\ngate auction.enabled: pass\ngate creative_opportunities.enabled: pass\ngate matched slots: pass\nadvisory auction providers configured: yes\nserver-side ad stack: yes\n"
+  },
+  {
+    "id": "explain-prefetch",
+    "status": 0,
+    "stderr": "",
+    "stdout": "path: /article\n/article: matched baseline-banner, baseline-footer\n- baseline-banner div=baseline-banner gam=/12345/baseline-banner patterns=[/article, /news/*] formats=[300x250 banner, 728x90 banner] providers=[none]\n- baseline-footer div=baseline-footer gam=/12345/baseline-footer patterns=[/article] formats=[300x250 banner] providers=[none]\ngate method GET: pass\ngate navigation: pass\ngate not prefetch: block\ngate not bot: pass\ngate consent allows auction: pass\ngate auction.enabled: pass\ngate creative_opportunities.enabled: pass\ngate matched slots: pass\nadvisory auction providers configured: yes\nserver-side ad stack: no\n"
+  },
+  {
+    "id": "explain-consent",
+    "status": 0,
+    "stderr": "",
+    "stdout": "path: /article\n/article: matched baseline-banner, baseline-footer\n- baseline-banner div=baseline-banner gam=/12345/baseline-banner patterns=[/article, /news/*] formats=[300x250 banner, 728x90 banner] providers=[none]\n- baseline-footer div=baseline-footer gam=/12345/baseline-footer patterns=[/article] formats=[300x250 banner] providers=[none]\ngate method GET: pass\ngate navigation: pass\ngate not prefetch: pass\ngate not bot: pass\ngate consent allows auction: block\ngate auction.enabled: pass\ngate creative_opportunities.enabled: pass\ngate matched slots: pass\nadvisory auction providers configured: yes\nserver-side ad stack: no\n"
+  },
+  {
+    "id": "check",
+    "status": 0,
+    "stderr": "",
+    "stdout": "/article: OK, matched baseline-banner, baseline-footer\n"
+  },
+  {
+    "id": "check-fails",
+    "status": 1,
+    "stderr": "/article: missing missing-slot; unexpected baseline-banner, baseline-footer\n",
+    "stdout": ""
+  }
+]

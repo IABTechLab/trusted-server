@@ -1,0 +1,54 @@
+{
+  "core": {
+    "bytes": 33359,
+    "sha256": "116c4626cb6ff5af932117c99d2926da9bf38d7e36b3258c3dc56c70870e870e"
+  },
+  "creative": {
+    "bytes": 14830,
+    "sha256": "d4fb6562058ca59d14fde1ccf263ab5c85fabe963501aa09c8330b84fbfe5cac"
+  },
+  "datadome": {
+    "bytes": 6582,
+    "sha256": "085a86d94a1612690d6f08b2c83163ca3021cd8f525c172cae2cecf6efcb991e"
+  },
+  "didomi": {
+    "bytes": 1682,
+    "sha256": "ca11403af8b24d0ea29c236fdc86f422c6b421fe58e260370f368b48fb6914ad"
+  },
+  "google_tag_manager": {
+    "bytes": 8094,
+    "sha256": "6241d9a0d8a27b2f59786da358a9a9247a998f60ba17dd0df5bc3f1de78a0543"
+  },
+  "gpt": {
+    "bytes": 48926,
+    "sha256": "6f3b340d67749f7089bc420f292b317b2c4de01ee1d97f725391ed6690fe0c05"
+  },
+  "gpt_diagnostics": {
+    "bytes": 88039,
+    "sha256": "b1401ad2f4a1ace1818965be094b08ac2d8abd482f2197525f0050d20e30a6c4"
+  },
+  "lockr": {
+    "bytes": 6865,
+    "sha256": "01f2f210a02315c0382fab061d2f8772a57782e96d0305624117d1e2e0b66537"
+  },
+  "osano": {
+    "bytes": 5725,
+    "sha256": "43f1a0ee70762bf5cda4123e1006d936482400ac9f4f298102e61a7a6bd37780"
+  },
+  "permutive": {
+    "bytes": 8547,
+    "sha256": "41f355ef91aca36f963d41b9be0fe8f6150d4a44d7d35f712ad4da1f77f0304e"
+  },
+  "prebid": {
+    "bytes": 52464,
+    "sha256": "d2ba4827dbb78e584797974bde33ae49ef7ed52e9380f81f4f1fa7fe8b907e60"
+  },
+  "sourcepoint": {
+    "bytes": 9386,
+    "sha256": "ec0858b268802b359f169850f305a7402db50e509da75ed32730c75e41abd42e"
+  },
+  "testlight": {
+    "bytes": 2164,
+    "sha256": "2517e7e6c43d4cd486fe09ee528f63411727125178e47f1040c69bbcd1201a32"
+  }
+}

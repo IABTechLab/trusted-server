@@ -1,0 +1,360 @@
+{
+  "auction": {
+    "allowed_context_keys": [
+      "page",
+      "section"
+    ],
+    "bidders": {
+      "example-c": {
+        "provider": "c-prebid"
+      },
+      "example-f": {
+        "provider": "f-prebid"
+      }
+    },
+    "creative_store": "creative_store",
+    "enabled": true,
+    "mediator": "adserver_mock",
+    "providers": {
+      "a-standard": {
+        "endpoint": "https://bids.example.com/a",
+        "notifications": {
+          "suppress_all": false,
+          "suppress_seats": []
+        },
+        "profile": "standard",
+        "profile_config": {},
+        "protocol": "openrtb-2.6",
+        "routing": "all_eligible",
+        "timeout_ms": null
+      },
+      "b-aps": {
+        "endpoint": "https://bids.example.com/b",
+        "notifications": {
+          "suppress_all": false,
+          "suppress_seats": []
+        },
+        "profile": "aps",
+        "profile_config": {
+          "account_id": "example-account-b"
+        },
+        "protocol": "openrtb-2.6",
+        "routing": "all_eligible",
+        "timeout_ms": null
+      },
+      "c-prebid": {
+        "endpoint": "https://bids.example.com/c",
+        "notifications": {
+          "suppress_all": false,
+          "suppress_seats": []
+        },
+        "profile": "prebid-server",
+        "profile_config": {},
+        "protocol": "openrtb-2.6",
+        "routing": "explicit",
+        "timeout_ms": null
+      },
+      "d-standard": {
+        "endpoint": "https://bids.example.com/d",
+        "notifications": {
+          "suppress_all": false,
+          "suppress_seats": [
+            "example-seat-b",
+            "example-seat-a"
+          ]
+        },
+        "profile": "standard",
+        "profile_config": {},
+        "protocol": "openrtb-2.6",
+        "routing": "all_eligible",
+        "timeout_ms": null
+      },
+      "e-aps": {
+        "endpoint": "https://bids.example.com/e",
+        "notifications": {
+          "suppress_all": false,
+          "suppress_seats": []
+        },
+        "profile": "aps",
+        "profile_config": {
+          "account_id": "example-account-e"
+        },
+        "protocol": "openrtb-2.6",
+        "routing": "all_eligible",
+        "timeout_ms": null
+      },
+      "f-prebid": {
+        "endpoint": "https://bids.example.com/f",
+        "notifications": {
+          "suppress_all": false,
+          "suppress_seats": []
+        },
+        "profile": "prebid-server",
+        "profile_config": {},
+        "protocol": "openrtb-2.6",
+        "routing": "explicit",
+        "timeout_ms": null
+      }
+    },
+    "timeout_ms": 2000
+  },
+  "cache": {
+    "asset_rules": []
+  },
+  "consent": {
+    "check_expiration": true,
+    "conflict_resolution": {
+      "freshness_threshold_days": 30,
+      "mode": "restrictive"
+    },
+    "gdpr": {
+      "applies_in": [
+        "AT",
+        "BE",
+        "BG",
+        "HR",
+        "CY",
+        "CZ",
+        "DK",
+        "EE",
+        "FI",
+        "FR",
+        "DE",
+        "GR",
+        "HU",
+        "IE",
+        "IT",
+        "LV",
+        "LT",
+        "LU",
+        "MT",
+        "NL",
+        "PL",
+        "PT",
+        "RO",
+        "SK",
+        "SI",
+        "ES",
+        "SE",
+        "IS",
+        "LI",
+        "NO",
+        "GB"
+      ]
+    },
+    "max_consent_age_days": 395,
+    "mode": "interpreter",
+    "us_privacy_defaults": {
+      "gpc_implies_optout": true,
+      "lspa_covered": false,
+      "notice_given": true
+    },
+    "us_states": {
+      "privacy_states": [
+        "CA",
+        "VA",
+        "CO",
+        "CT",
+        "UT",
+        "MT",
+        "OR",
+        "TX",
+        "FL",
+        "DE",
+        "IA",
+        "NE",
+        "NH",
+        "NJ",
+        "TN",
+        "MN",
+        "MD",
+        "IN",
+        "KY",
+        "RI"
+      ]
+    }
+  },
+  "creative_opportunities": {
+    "auction_timeout_ms": null,
+    "gam_network_id": "12345",
+    "price_granularity": "dense",
+    "slot": [
+      {
+        "div_id": null,
+        "floor_price": null,
+        "formats": [
+          {
+            "height": 250,
+            "media_type": "banner",
+            "width": 300
+          },
+          {
+            "height": 90,
+            "media_type": "banner",
+            "width": 728
+          }
+        ],
+        "gam_unit_path": null,
+        "id": "baseline-banner",
+        "page_patterns": [
+          "/article",
+          "/news/*"
+        ],
+        "providers": {
+          "aps": null,
+          "prebid": null
+        },
+        "targeting": {}
+      },
+      {
+        "div_id": null,
+        "floor_price": null,
+        "formats": [
+          {
+            "height": 250,
+            "media_type": "banner",
+            "width": 300
+          }
+        ],
+        "gam_unit_path": null,
+        "id": "baseline-footer",
+        "page_patterns": [
+          "/article"
+        ],
+        "providers": {
+          "aps": null,
+          "prebid": null
+        },
+        "targeting": {}
+      }
+    ]
+  },
+  "debug": {
+    "auction_html_comment": false,
+    "inject_adm_for_testing": false,
+    "ja4_endpoint_enabled": false
+  },
+  "ec": {
+    "cluster_recheck_secs": 3600,
+    "cluster_trust_threshold": 10,
+    "ec_store": null,
+    "partners": [],
+    "passphrase": "baseline-only-ec-key-at-least-32-bytes",
+    "pull_sync_concurrency": 3
+  },
+  "handlers": [
+    {
+      "password": "baseline-password",
+      "path": "^/_ts/admin",
+      "username": "baseline-admin"
+    }
+  ],
+  "image_optimizer": {
+    "profile_sets": {}
+  },
+  "integrations": {
+    "adserver_mock": {
+      "enabled": true,
+      "endpoint": "https://mediator.example.com/mediate"
+    },
+    "aps": {
+      "enabled": true
+    },
+    "datadome": {
+      "client_side_key": "example-client-side-key",
+      "enabled": true
+    },
+    "didomi": {
+      "enabled": true
+    },
+    "google_tag_manager": {
+      "container_id": "GTM-EXAMPLE",
+      "enabled": true
+    },
+    "gpt": {
+      "enabled": true
+    },
+    "gpt_diagnostics": {
+      "enabled": true
+    },
+    "js_asset_proxy": {
+      "assets": [
+        {
+          "origin_url": "https://assets.example.com/prebid.js",
+          "path": "/managed/library.js"
+        },
+        {
+          "origin_url": "https://assets.example.com/blocked.js",
+          "path": "/managed/blocked.js",
+          "proxy": "blocked"
+        }
+      ],
+      "enabled": true
+    },
+    "lockr": {
+      "app_id": "example-app",
+      "enabled": true
+    },
+    "nextjs": {
+      "enabled": true,
+      "rewrite_attributes": [
+        "href",
+        "link",
+        "url"
+      ]
+    },
+    "osano": {
+      "enabled": true
+    },
+    "permutive": {
+      "enabled": true,
+      "organization_id": "example-organization",
+      "workspace_id": "example-workspace"
+    },
+    "prebid": {
+      "enabled": true,
+      "external_bundle_url": "https://assets.example.com/prebid.js"
+    },
+    "sourcepoint": {
+      "enabled": true
+    },
+    "testlight": {
+      "enabled": true,
+      "endpoint": "https://testlight.example.com/openrtb"
+    }
+  },
+  "proxy": {
+    "allowed_domains": [
+      "assets.example.com",
+      "origin.example.com"
+    ],
+    "asset_routes": [],
+    "certificate_check": true
+  },
+  "publisher": {
+    "cookie_domain": ".example.com",
+    "domain": "edge.example.com",
+    "max_buffered_body_bytes": 16777216,
+    "origin_host_header_override": null,
+    "origin_url": "https://origin.example.com",
+    "proxy_secret": "baseline-only-proxy-secret"
+  },
+  "request_signing": null,
+  "response_headers": {},
+  "rewrite": {
+    "exclude_domains": []
+  },
+  "tester_cookie": {
+    "enabled": false,
+    "max_age_seconds": 2592000
+  },
+  "tinybird": {
+    "access_dataset": "access_logs_raw",
+    "access_enabled": false,
+    "access_sample_rate": 0.0,
+    "api_host": "",
+    "auction_dataset": "auction_events_raw",
+    "enabled": false,
+    "max_body_bytes": 1048576
+  }
+}

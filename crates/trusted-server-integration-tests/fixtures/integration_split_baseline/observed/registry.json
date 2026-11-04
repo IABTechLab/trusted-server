@@ -1,0 +1,371 @@
+{
+  "browser_modules": [
+    "core",
+    "creative",
+    "datadome",
+    "didomi",
+    "google_tag_manager",
+    "gpt",
+    "gpt_diagnostics",
+    "lockr",
+    "osano",
+    "permutive",
+    "prebid",
+    "sourcepoint",
+    "testlight"
+  ],
+  "deferred_modules": [
+    "prebid"
+  ],
+  "envelope_data_sha256": "a43f62d4a5defefcc2abf0ec3be3dcfb9ccbb249f590061a0ccbc6e5603dc521",
+  "immediate_modules": [
+    "creative",
+    "testlight",
+    "permutive",
+    "lockr",
+    "didomi",
+    "sourcepoint",
+    "osano",
+    "google_tag_manager",
+    "datadome",
+    "gpt"
+  ],
+  "integrations": [
+    {
+      "attribute_rewriters": 0,
+      "head_injectors": 1,
+      "id": "aps",
+      "request_filters": 0,
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/integrations/aps/renderer"
+        }
+      ],
+      "script_selectors": []
+    },
+    {
+      "attribute_rewriters": 1,
+      "head_injectors": 1,
+      "id": "datadome",
+      "request_filters": 0,
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/integrations/datadome/tags.js"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/datadome/js/"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/datadome/js/*"
+        },
+        {
+          "method": "POST",
+          "path": "/integrations/datadome/js/"
+        },
+        {
+          "method": "POST",
+          "path": "/integrations/datadome/js/*"
+        }
+      ],
+      "script_selectors": []
+    },
+    {
+      "attribute_rewriters": 0,
+      "head_injectors": 1,
+      "id": "didomi",
+      "request_filters": 0,
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/integrations/didomi/consent/*"
+        },
+        {
+          "method": "POST",
+          "path": "/integrations/didomi/consent/*"
+        }
+      ],
+      "script_selectors": []
+    },
+    {
+      "attribute_rewriters": 1,
+      "head_injectors": 0,
+      "id": "google_tag_manager",
+      "request_filters": 0,
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/integrations/google_tag_manager/gtm.js"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/google_tag_manager/gtag/js"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/google_tag_manager/gtag.js"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/google_tag_manager/collect"
+        },
+        {
+          "method": "POST",
+          "path": "/integrations/google_tag_manager/collect"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/google_tag_manager/g/collect"
+        },
+        {
+          "method": "POST",
+          "path": "/integrations/google_tag_manager/g/collect"
+        }
+      ],
+      "script_selectors": [
+        "script"
+      ]
+    },
+    {
+      "attribute_rewriters": 1,
+      "head_injectors": 1,
+      "id": "gpt",
+      "request_filters": 0,
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/integrations/gpt/script"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/gpt/pagead/*"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/gpt/tag/*"
+        }
+      ],
+      "script_selectors": []
+    },
+    {
+      "attribute_rewriters": 0,
+      "head_injectors": 0,
+      "id": "gpt_diagnostics",
+      "request_filters": 0,
+      "routes": [],
+      "script_selectors": []
+    },
+    {
+      "attribute_rewriters": 1,
+      "head_injectors": 0,
+      "id": "js_asset_proxy",
+      "request_filters": 0,
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/managed/library.js"
+        }
+      ],
+      "script_selectors": []
+    },
+    {
+      "attribute_rewriters": 1,
+      "head_injectors": 0,
+      "id": "lockr",
+      "request_filters": 0,
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/integrations/lockr/sdk"
+        },
+        {
+          "method": "POST",
+          "path": "/integrations/lockr/api/*"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/lockr/api/*"
+        }
+      ],
+      "script_selectors": []
+    },
+    {
+      "attribute_rewriters": 0,
+      "head_injectors": 0,
+      "id": "nextjs",
+      "request_filters": 0,
+      "routes": [],
+      "script_selectors": [
+        "script#__NEXT_DATA__",
+        "script"
+      ]
+    },
+    {
+      "attribute_rewriters": 0,
+      "head_injectors": 0,
+      "id": "osano",
+      "request_filters": 0,
+      "routes": [],
+      "script_selectors": []
+    },
+    {
+      "attribute_rewriters": 1,
+      "head_injectors": 0,
+      "id": "permutive",
+      "request_filters": 0,
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/integrations/permutive/api/*"
+        },
+        {
+          "method": "POST",
+          "path": "/integrations/permutive/api/*"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/permutive/secure-signal/*"
+        },
+        {
+          "method": "POST",
+          "path": "/integrations/permutive/secure-signal/*"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/permutive/events/*"
+        },
+        {
+          "method": "POST",
+          "path": "/integrations/permutive/events/*"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/permutive/sync/*"
+        },
+        {
+          "method": "POST",
+          "path": "/integrations/permutive/sync/*"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/permutive/cdn/*"
+        },
+        {
+          "method": "GET",
+          "path": "/integrations/permutive/sdk"
+        }
+      ],
+      "script_selectors": []
+    },
+    {
+      "attribute_rewriters": 1,
+      "head_injectors": 1,
+      "id": "prebid",
+      "request_filters": 0,
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/integrations/prebid/bundle.js"
+        },
+        {
+          "method": "GET",
+          "path": "/prebid.js"
+        },
+        {
+          "method": "GET",
+          "path": "/prebid.min.js"
+        },
+        {
+          "method": "GET",
+          "path": "/prebidjs.js"
+        },
+        {
+          "method": "GET",
+          "path": "/prebidjs.min.js"
+        }
+      ],
+      "script_selectors": []
+    },
+    {
+      "attribute_rewriters": 1,
+      "head_injectors": 1,
+      "id": "sourcepoint",
+      "request_filters": 0,
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/integrations/sourcepoint/cdn/*"
+        },
+        {
+          "method": "POST",
+          "path": "/integrations/sourcepoint/cdn/*"
+        },
+        {
+          "method": "HEAD",
+          "path": "/integrations/sourcepoint/cdn/*"
+        },
+        {
+          "method": "OPTIONS",
+          "path": "/integrations/sourcepoint/cdn/*"
+        }
+      ],
+      "script_selectors": []
+    },
+    {
+      "attribute_rewriters": 1,
+      "head_injectors": 0,
+      "id": "testlight",
+      "request_filters": 0,
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/integrations/testlight/auction"
+        }
+      ],
+      "script_selectors": []
+    }
+  ],
+  "mediator": "adserver_mock",
+  "providers": [
+    {
+      "endpoint": "https://bids.example.com/a",
+      "id": "a-standard",
+      "profile": "standard",
+      "timeout_ms": 2000
+    },
+    {
+      "endpoint": "https://bids.example.com/b",
+      "id": "b-aps",
+      "profile": "aps",
+      "timeout_ms": 800
+    },
+    {
+      "endpoint": "https://bids.example.com/c",
+      "id": "c-prebid",
+      "profile": "prebid-server",
+      "timeout_ms": 1000
+    },
+    {
+      "endpoint": "https://bids.example.com/d",
+      "id": "d-standard",
+      "profile": "standard",
+      "timeout_ms": 2000
+    },
+    {
+      "endpoint": "https://bids.example.com/e",
+      "id": "e-aps",
+      "profile": "aps",
+      "timeout_ms": 800
+    },
+    {
+      "endpoint": "https://bids.example.com/f",
+      "id": "f-prebid",
+      "profile": "prebid-server",
+      "timeout_ms": 1000
+    }
+  ],
+  "trusted_script_attributes": []
+}

@@ -1,0 +1,1117 @@
+[
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "https://edge.example.com/integrations/lockr/sdk"
+      },
+      {
+        "action": "replace",
+        "value": "https://edge.example.com/integrations/lockr/sdk"
+      }
+    ],
+    "id": "lockr-sdk"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "https://edge.example.com/integrations/lockr/sdk"
+      },
+      {
+        "action": "replace",
+        "value": "https://edge.example.com/integrations/lockr/sdk"
+      }
+    ],
+    "id": "lockr-query-fragment"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "https://edge.example.com/integrations/lockr/sdk"
+      },
+      {
+        "action": "replace",
+        "value": "https://edge.example.com/integrations/lockr/sdk"
+      }
+    ],
+    "id": "lockr-filename-contained"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "https://edge.example.com/integrations/lockr/sdk"
+      },
+      {
+        "action": "replace",
+        "value": "https://edge.example.com/integrations/lockr/sdk"
+      }
+    ],
+    "id": "lockr-mixed-case"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "https://edge.example.com/integrations/lockr/sdk"
+      },
+      {
+        "action": "replace",
+        "value": "https://edge.example.com/integrations/lockr/sdk"
+      }
+    ],
+    "id": "lockr-userinfo-owned"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "https://edge.example.com/integrations/lockr/sdk"
+      },
+      {
+        "action": "replace",
+        "value": "https://edge.example.com/integrations/lockr/sdk"
+      }
+    ],
+    "id": "lockr-port"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "lockr-suffix-host"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "lockr-prefix-host"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "lockr-userinfo-spoof"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "lockr-path-spoof"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "lockr-query-spoof"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "lockr-directory-spoof"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "lockr-query-filename"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "lockr-pixel"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "lockr-bare-relative"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "lockr-relative"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "lockr-ftp"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/permutive/sdk"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/permutive/sdk"
+      }
+    ],
+    "id": "permutive-edge"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/permutive/sdk"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/permutive/sdk"
+      }
+    ],
+    "id": "permutive-cdn"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/permutive/sdk"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/permutive/sdk"
+      }
+    ],
+    "id": "permutive-port-case"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/permutive/sdk"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/permutive/sdk"
+      }
+    ],
+    "id": "permutive-dot-segments"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "permutive-suffix"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "permutive-prefix"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "permutive-apex"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "permutive-path"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "permutive-query"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "permutive-userinfo"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "permutive-bare-relative"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "permutive-non-sdk"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "permutive-escaped-separator"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js?cache=1#sdk"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js?cache=1#sdk"
+      }
+    ],
+    "id": "datadome-tag"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/js/check?x=1"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/js/check?x=1"
+      }
+    ],
+    "id": "datadome-check"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/other.js"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/other.js"
+      }
+    ],
+    "id": "datadome-path-breadth"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js"
+      }
+    ],
+    "id": "datadome-root"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js"
+      }
+    ],
+    "id": "datadome-port"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js"
+      }
+    ],
+    "id": "datadome-owned-userinfo"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/js/check?x=1#api"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/js/check?x=1#api"
+      }
+    ],
+    "id": "datadome-api"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "datadome-apex"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "datadome-suffix"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "datadome-prefix"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "datadome-path"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "datadome-query"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "datadome-userinfo"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "datadome-bare-relative"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "datadome-ftp"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "datadome-blob"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "testlight-absolute"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "testlight-root-relative"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "testlight-path-relative"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "testlight-dot-segments"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "testlight-query"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "testlight-directory"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "testlight-longer-filename"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "testlight-javascript"
+  },
+  {
+    "actions": [
+      {
+        "action": "remove"
+      },
+      {
+        "action": "remove"
+      }
+    ],
+    "id": "prebid-absolute"
+  },
+  {
+    "actions": [
+      {
+        "action": "remove"
+      },
+      {
+        "action": "remove"
+      }
+    ],
+    "id": "prebid-root-relative"
+  },
+  {
+    "actions": [
+      {
+        "action": "remove"
+      },
+      {
+        "action": "remove"
+      }
+    ],
+    "id": "prebid-path-relative"
+  },
+  {
+    "actions": [
+      {
+        "action": "remove"
+      },
+      {
+        "action": "remove"
+      }
+    ],
+    "id": "prebid-dot-segments"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "prebid-query"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "prebid-data"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "prebid-javascript"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "prebid-ftp"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/gpt/script"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/gpt/script"
+      }
+    ],
+    "id": "gpt-bootstrap"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "gpt-cascade"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "gpt-ftp"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "gpt-suffix"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/google_tag_manager/gtm.js?id=GTM-TEST#sdk"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/google_tag_manager/gtm.js?id=GTM-TEST#sdk"
+      }
+    ],
+    "id": "gtm-sdk"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/google_tag_manager/gtm.js?id=GTM-TEST"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/google_tag_manager/gtm.js?id=GTM-TEST"
+      }
+    ],
+    "id": "gtm-case-port-userinfo"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/google_tag_manager/gtag/js?id=G-TEST"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/google_tag_manager/gtag/js?id=G-TEST"
+      }
+    ],
+    "id": "gtm-normalized-path"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/google_tag_manager/g/collect?v=2#collect"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/google_tag_manager/g/collect?v=2#collect"
+      }
+    ],
+    "id": "ga-collect"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/google_tag_manager/collect?v=2"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/google_tag_manager/collect?v=2"
+      }
+    ],
+    "id": "analytics-collect"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "gtm-unsupported"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "gtm-suffix"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "gtm-bare-relative"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "gtm-ftp"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/sourcepoint/cdn/wrapper.js?x=1#sdk"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/sourcepoint/cdn/wrapper.js?x=1#sdk"
+      }
+    ],
+    "id": "sourcepoint-sdk"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/sourcepoint/cdn/wrapper.js"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/sourcepoint/cdn/wrapper.js"
+      }
+    ],
+    "id": "sourcepoint-protocol-relative"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "sourcepoint-suffix"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "sourcepoint-bare-relative"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "sourcepoint-ftp"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js?u=aim.loc.kr/identity-lockr.js"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js?u=aim.loc.kr/identity-lockr.js"
+      }
+    ],
+    "id": "cross-owner-datadome"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/gpt/script"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/gpt/script"
+      }
+    ],
+    "id": "cross-owner-gpt"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/sourcepoint/cdn/wrapper.js?u=js.datadome.co/tags.js"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/sourcepoint/cdn/wrapper.js?u=js.datadome.co/tags.js"
+      }
+    ],
+    "id": "cross-owner-sourcepoint"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "document-base-owned"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "empty"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "malformed"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js?cache=1#sdk"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js?cache=1#sdk"
+      }
+    ],
+    "id": "datadome-no-path-query-fragment"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/"
+      }
+    ],
+    "id": "datadome-explicit-root"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/?cache=1#sdk"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/?cache=1#sdk"
+      }
+    ],
+    "id": "datadome-explicit-root-query-fragment"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/"
+      }
+    ],
+    "id": "datadome-dot-segment-root"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "lockr-same-scheme-relative"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "http://aim.loc.kr/integrations/lockr/sdk"
+      },
+      {
+        "action": "replace",
+        "value": "http://aim.loc.kr/integrations/lockr/sdk"
+      }
+    ],
+    "id": "request-origin-relative-owned"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/?x=1#api"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/?x=1#api"
+      }
+    ],
+    "id": "datadome-api-explicit-root"
+  },
+  {
+    "actions": [
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js?x=1#api"
+      },
+      {
+        "action": "replace",
+        "value": "/integrations/datadome/tags.js?x=1#api"
+      }
+    ],
+    "id": "datadome-api-no-path"
+  },
+  {
+    "actions": [
+      {
+        "action": "keep"
+      },
+      {
+        "action": "keep"
+      }
+    ],
+    "id": "permutive-empty-subdomain"
+  }
+]

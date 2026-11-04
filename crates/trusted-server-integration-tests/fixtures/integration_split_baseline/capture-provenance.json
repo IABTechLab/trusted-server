@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "sourceMain": "51730bdaf841e4d7bb96c2258e5e98169bdff9a7",
+  "correctedBaseline": "ca95a2dacb7fac1a47d7504ec0cc8d0dad8539bf",
+  "prerequisites": [
+    {
+      "issue": 1098,
+      "commit": "a6b0a8b2b0b2ff55be38af0c2c98c8fbf1e13bc2"
+    },
+    {
+      "issue": 1203,
+      "commit": "ebd074d5fb801b03c3b5ef689f5f611400c30b9e"
+    },
+    {
+      "issue": 1199,
+      "commit": "ca95a2dacb7fac1a47d7504ec0cc8d0dad8539bf"
+    }
+  ],
+  "reviewedPlan": "a405c204f01855d268dcef6919a29f75a5b25377",
+  "edgezero": {
+    "tag": "v0.0.11",
+    "packageVersion": "0.1.0",
+    "revision": "87456c708ffe9edf86b3a0f8b06dfd15d60b07b5"
+  },
+  "toolchain": {
+    "node": "v24.20.0",
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+    "rustdoc": "rustdoc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustdoc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8"
+  },
+  "inputs": {
+    "source.toml": "2c555b298ef015feed6fdddf87117b2bd70cec2cd3b68c405bd116bd3be6261c",
+    "document.html": "fd61f87c4240973c2df150b00373229e2175af07604d91403c74dce13fc2f6a2"
+  },
+  "sharedUrlCorpusSha256": "c62a73f574fda51fcbc4b60ccf088223c7dce8afc6bae3eda77c721dd1a03185",
+  "observed": {
+    "adapter-runtime.json": "0bbbce1fc89552a6e6329f5ca8c021c91443e025a1c610f40f0d9db5334c800d",
+    "attributes.json": "85ea4e22622132192f112d107d4a4fbbdecb55112aa8335ab4cda335d76286db",
+    "auction-runtime.json": "bec9c181dcc9b7cc9a7360f4979d799049d15e443c34cad49c9585415331ad62",
+    "cli-views.json": "207ed89a6d4963e5a367ec30f4b5f7a785342c385c4a206f8f1d69d1683f44cb",
+    "diagnostics.html": "7fe8a1e86d36c6dcf054ab67958f7bb17120e3406154337f241ea1578a240a26",
+    "document.html": "d08354b5c5c34afcdbb699892044aa797acc4ed82db16e4fd7be12ccc59c5664",
+    "registry.json": "29661534fb8f0dbaaafcca1720192dc5ad173b13752464e5d8630f56bc2e1039",
+    "request-decisions.json": "87fd2179442916a9712d69ce934d81994ee4a2d1f4029a44b2a60f19a2e4f6e4",
+    "settings.json": "153ad671459697d64349f424116bcaae32c8b5a8de1aa3afff591753409dc6a5",
+    "suppressed-datadome.html": "e2f089a04a8b6c06c161f021674b40d4990082b157ab6e80460a86790e6b5884",
+    "trusted-attributes.json": "712bdfaabb6afb1186acd5ac1b490a883bda3d3c0f5d0e733fd1369236b69296"
+  },
+  "artifactInventorySha256": "4cb2bb5cb4425c9b9dff0a2d6046f17763c9260817a2b348f3dca48deae3e303",
+  "apiProvenanceSha256": "8a1f4a2ddaca1b8202a0518b5da1e8379e099cfd63da31fb8b4f2795ee7f2c72",
+  "capture": {
+    "runs": 2,
+    "byteIdentical": true,
+    "command": "INTEGRATION_SPLIT_BASELINE_TS=<fresh-candidate-ts> INTEGRATION_SPLIT_CAPTURE_DIR=<scratch> cargo test -p trusted-server-integration-tests --test integration_split_baseline capture_corrected_baseline -- --ignored --exact"
+  }
+}
