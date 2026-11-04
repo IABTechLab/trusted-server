@@ -14,7 +14,7 @@
 
 ## Closes
 
-<!-- Link to the issue this PR resolves. Every PR should have a ticket. -->
+<!-- Link the issue this PR resolves. Features and other substantial changes need one; smaller PRs link one if it exists. -->
 <!-- Use "Closes #123" syntax to auto-close the issue when merged. -->
 
 Closes #
@@ -46,6 +46,6 @@ Spec:
 - [ ] Feature PRs: spec linked above, ending in a review log of two or more agent review rounds
 - [ ] Changes follow [AGENTS.md](/AGENTS.md) conventions
 - [ ] No `unwrap()` in production code — use `expect("should ...")`
-- [ ] Uses `tracing` macros (not `println!`)
+- [ ] Uses `log` macros (not `println!`)
 - [ ] New code has tests
 - [ ] No secrets or credentials committed
