@@ -861,6 +861,13 @@ token = "example_provider_token"
 has no `[[ec.partners]]` entry, or when two enabled providers claim the same
 source. Deploy validation also rejects an empty `secrets.token` key name.
 
+`ts config validate`, `ts config push` and `ts config diff` also build every
+enabled provider of a registered kind, so a provider-specific setting error
+(for example a `liveramp` `endpoint` without `placement_id` and
+`custom_id_namespace`) fails the command before deploy. At runtime the same
+error would disable every identity provider for each request, with an error
+log.
+
 ### Field Details
 
 #### `passphrase`
