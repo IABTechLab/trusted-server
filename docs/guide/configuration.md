@@ -911,6 +911,13 @@ build, and an older writer drops a row's `eids` and provider opt-outs when it
 rewrites the row.
 :::
 
+`ts config validate`, `ts config push` and `ts config diff` also build every
+enabled provider of a registered kind, so a provider-specific setting error
+(for example a `liveramp` `endpoint` without `placement_id` and
+`custom_id_namespace`) fails the command before deploy. At runtime the same
+error would disable every identity provider for each request, with an error
+log.
+
 ### Field Details
 
 #### `passphrase`

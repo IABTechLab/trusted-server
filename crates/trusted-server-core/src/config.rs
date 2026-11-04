@@ -351,7 +351,8 @@ fn validate_gpt_diagnostics_config(settings: &Settings) -> Result<(), Report<Tru
 /// Deploy validation runs before secret references are resolved, so partner
 /// tokens still hold secret key names that would fail the runtime length
 /// check when the partner registry is built.
-fn with_placeholder_partner_tokens(ec: &Ec) -> Ec {
+#[must_use]
+pub fn with_placeholder_partner_tokens(ec: &Ec) -> Ec {
     let mut ec = ec.clone();
     for (index, partner) in ec.partners.iter_mut().enumerate() {
         if partner.api_token.is_some() {
