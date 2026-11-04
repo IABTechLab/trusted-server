@@ -1,8 +1,46 @@
 # EdgeZero RC431 validation record
 
+## Relay consent and EdgeZero pin update, 2026-11-04
+
+PR #1498 was backported as `0a7c30176`. All six workspace EdgeZero declarations
+and ten resolved EdgeZero packages now use
+`fda87556f5aab160711eb5244c1d1065a6bb48d6`. Existing Off/CloudFront selection is
+unchanged; the optional MaxMind provider is not enabled or qualified here.
+
+Checks ran with Rust 1.98.1 and Node 24.12.0 on the working tree over
+`0a7c30176`, including the pin update and the pre-existing uncommitted Prebid
+10.28.0 builder, publisher-processing tests and documentation changes.
+
+- Full Vitest suite: 53 files, 1,284 tests passed, including real Prebid relay
+  dispatch with Purpose 2 granted, denial without Purpose 2, and mapped-vendor
+  denial. JS build, ESLint and Prettier passed.
+- `cargo test --locked -p trusted-server-adapter-axum --all-features -- --test-threads=1`:
+  101 passed; two runtime cases and one doctest remain ignored.
+- `cargo clippy --locked -p trusted-server-adapter-axum --all-targets --all-features -- -D warnings`:
+  passed.
+- `cargo check --locked -p trusted-server-cli --all-targets`: passed with an
+  unused `clap::Parser` test import warning in `src/run.rs`.
+- `cargo check-fastly --locked`, `cargo check-cloudflare --locked` and
+  `cargo check-spin --locked`: passed for their WASM targets.
+- `cargo test --locked -p trusted-server-adapter-cloudflare -p trusted-server-adapter-spin`:
+  156 passed; two doctests remain ignored. These are native tests, not deployed
+  Worker/Spin runtime checks.
+- `cargo metadata --locked --format-version 1` confirmed ten EdgeZero packages
+  from the single new Git source. Rust formatting and changed-guide formatting
+  passed.
+
+The first parallel native run failed the missing-config test's no-listener
+assertion. The isolated startup suite and full serial native suite then passed
+without source changes. The fixture releases its reserved port before spawning;
+port reuse is a possible cause, not a confirmed diagnosis.
+
+No image was rebuilt or deployed. Live CMP/browser acceptance, cloud-provider
+qualification and WASM runtime suites were not rerun for this update. Earlier
+validation sections retain their original source and image identities.
+
 ## Geo follow-up, 2026-10-23
 
-The operator guide now targets EdgeZero RC
+This follow-up targeted EdgeZero RC
 `9896233cb4274ec14a3ed33babac1846ab3d3715`, including the explicit production
 options runner and admitted-error finalizer. Partial TS geography preserves
 populated field names and omits unavailable detail. Native Geo remains

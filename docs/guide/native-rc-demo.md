@@ -3,8 +3,11 @@
 This is a compatibility/demo candidate, not production certification or an AWS
 deployment. It starts from Trusted Server main
 `6ef07ae52bec3e695ec57fe090243b1a281c314f` and pins EdgeZero to
-`9896233cb4274ec14a3ed33babac1846ab3d3715`. PRs #1410, #1411 and #1412,
+`fda87556f5aab160711eb5244c1d1065a6bb48d6`. PRs #1410, #1411 and #1412,
 including their #777 module/configuration/permission stack, are excluded.
+The newer EdgeZero revision includes optional local GeoIP support, but this
+candidate retains its existing Off/CloudFront selections. MaxMind is not enabled
+or configured by the dependency update.
 
 The [validation record](./native-rc-validation.md) lists executed checks,
 resolved failures and remaining limits.
