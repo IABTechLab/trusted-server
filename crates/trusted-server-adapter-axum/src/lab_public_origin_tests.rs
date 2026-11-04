@@ -47,8 +47,22 @@ impl PlatformKvStore for EmptyKv {
     }
 }
 
+const FLY_HOST: &str = "ts-lab-golf-1ba0b7f5.fly.dev";
+const FLY_ORIGIN: &str = "https://ts-lab-golf-1ba0b7f5.fly.dev";
+
 fn router(fixed_origin: Option<&str>) -> RouterService {
+    router_with_ingress(fixed_origin, None, nextjs_auction::PUBLISHER_HOST)
+}
+
+fn router_with_ingress(
+    public: Option<&str>,
+    ingress: Option<&str>,
+    publisher_domain: &str,
+) -> RouterService {
     let mut settings = nextjs_auction::settings();
+    settings.publisher.domain = publisher_domain.to_owned();
+    settings.publisher.cookie_domain = format!(".{publisher_domain}");
+    settings.proxy.allowed_domains = vec![nextjs_auction::ORIGIN_HOST.to_owned()];
     settings.auction.enabled = false;
     settings.creative_opportunities = None;
     let services =
@@ -58,7 +72,7 @@ fn router(fixed_origin: Option<&str>) -> RouterService {
         .expect("should build application state");
     let state_mut = Arc::get_mut(&mut state).expect("should uniquely own test state");
     state_mut.public_origin =
-        LabPublicOrigin::from_value(fixed_origin, &state_mut.settings.publisher.domain)
+        LabPublicOrigin::from_values(public, ingress, &state_mut.settings.publisher.domain)
             .expect("should validate startup origin");
     state_mut.config_sha256 = Some("fixture-adopted-checksum".to_owned());
     build_router(Some(state))
@@ -125,6 +139,141 @@ async fn fixed_origin_reaches_real_publisher_rewriting_and_same_diagnostic_facts
     assert_eq!(diagnostic["scheme"], "https");
     assert_eq!(diagnostic["host"], nextjs_auction::PUBLISHER_HOST);
     assert_eq!(diagnostic["config_sha256"], "fixture-adopted-checksum");
+}
+
+#[tokio::test]
+async fn fly_ingress_uses_golf_public_urls_in_real_handlers() {
+    let router = router_with_ingress(Some("https://golf.com"), Some(FLY_ORIGIN), "golf.com");
+    for target in ["/article".to_owned(), format!("{FLY_ORIGIN}/article")] {
+        let request = request_builder()
+            .uri(target)
+            .header("host", FLY_HOST)
+            .header("forwarded", "host=evil.example.com;proto=http")
+            .header("x-forwarded-host", "evil.example.com")
+            .header("x-forwarded-proto", "http")
+            .body(Body::empty())
+            .expect("should build Fly-ingress publisher request");
+        let body = text(
+            router
+                .oneshot(request)
+                .await
+                .expect("should rewrite publisher"),
+        )
+        .await;
+        assert!(body.contains("https://golf.com"), "{body}");
+        let flight_content = r#"{"url":"https://golf.com/app","text":"</body>"}"#;
+        assert!(
+            body.contains(&format!("1:T{:x},", flight_content.len())),
+            "{body}"
+        );
+        assert!(!body.contains("http://golf.com"), "{body}");
+        assert!(!body.contains(FLY_HOST), "{body}");
+        assert!(!body.contains("evil.example.com"), "{body}");
+    }
+
+    // Protocol-relative targets must use the installed public HTTPS scheme.
+    // The generated proxy href is first-party/root-relative, not a Fly URL.
+    let request = request_builder()
+        .method("POST")
+        .uri("/first-party/sign")
+        .header("host", FLY_HOST)
+        .header("content-type", "application/json")
+        .header("x-forwarded-proto", "http")
+        .body(Body::from(format!(
+            r#"{{"url":"//{}/asset.js?cache=1"}}"#,
+            nextjs_auction::ORIGIN_HOST
+        )))
+        .expect("should build signing request");
+    let body = text(
+        router
+            .oneshot(request)
+            .await
+            .expect("should sign proxy URL"),
+    )
+    .await;
+    let signed: serde_json::Value = serde_json::from_str(&body).expect("should parse signed URL");
+    assert_eq!(
+        signed["base"],
+        format!("https://{}/asset.js", nextjs_auction::ORIGIN_HOST)
+    );
+    let href = signed["href"].as_str().expect("should return proxy href");
+    assert!(href.starts_with("/first-party/proxy?tsurl="), "{body}");
+    assert!(
+        href.contains("tstoken=") && href.contains("tsexp="),
+        "{body}"
+    );
+    assert!(!body.contains(FLY_HOST), "{body}");
+
+    let request = request_builder()
+        .uri(crate::lab_store_check::PATH)
+        .header("host", FLY_HOST)
+        .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+        .header("forwarded", "host=evil.example.com;proto=http")
+        .body(Body::empty())
+        .expect("should build Fly-ingress diagnostic request");
+    let body = text(
+        router
+            .oneshot(request)
+            .await
+            .expect("should handle diagnostic"),
+    )
+    .await;
+    let diagnostic: serde_json::Value =
+        serde_json::from_str(&body).expect("should parse diagnostic");
+    assert_eq!(diagnostic["scheme"], "https");
+    assert_eq!(diagnostic["host"], "golf.com");
+    assert_eq!(diagnostic["config_sha256"], "fixture-adopted-checksum");
+}
+
+#[tokio::test]
+async fn fly_ingress_rejects_public_host_and_disagreeing_targets_before_handlers() {
+    let router = router_with_ingress(Some("https://golf.com"), Some(FLY_ORIGIN), "golf.com");
+    for (host, target) in [
+        (Some("golf.com"), "/article"),
+        (None, "/article"),
+        (Some("evil.example.com"), "/article"),
+        (Some("ts-lab-golf-1ba0b7f5.fly.dev:443"), "/article"),
+        (Some(FLY_HOST), "https://golf.com/article"),
+        (Some(FLY_HOST), "https://evil.example.com/article"),
+        (
+            Some(FLY_HOST),
+            "http://ts-lab-golf-1ba0b7f5.fly.dev/article",
+        ),
+    ] {
+        let mut builder = request_builder().uri(target);
+        if let Some(host) = host {
+            builder = builder.header("host", host);
+        }
+        let request = builder
+            .header("forwarded", format!("host={FLY_HOST};proto=https"))
+            .header("x-forwarded-host", FLY_HOST)
+            .header("x-forwarded-proto", "https")
+            .body(Body::empty())
+            .expect("should build hostile Fly request");
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("should reject locally");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{host:?} {target}"
+        );
+    }
+    let request = request_builder()
+        .uri("/article")
+        .header("host", FLY_HOST)
+        .header("host", FLY_HOST)
+        .body(Body::empty())
+        .expect("should build duplicate Host request");
+    assert_eq!(
+        router
+            .oneshot(request)
+            .await
+            .expect("should reject duplicate Host")
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
 }
 
 #[tokio::test]

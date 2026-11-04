@@ -65,18 +65,25 @@ by UID 10001. The native CA loader uses only the environment-selected paths
 when either variable is set, so a private-only file without the system CA
 directory can break public HTTPS upstreams. Keep TLS verification enabled.
 
-For a single-host lab behind HTTPS termination, the optional
-`TS_LAB_PUBLIC_ORIGIN=https://lab.example.com` supplies fixed public URL facts
+For a lab behind HTTPS termination, the optional
+`TS_LAB_PUBLIC_ORIGIN=https://golf.com` supplies fixed public URL facts
 without enabling forwarding-header trust. It is available only with
-`lab-store-check` and absent by default. Startup requires an HTTPS origin whose
-authority exactly equals the adopted `publisher.domain`. Userinfo, paths including
-a trailing slash, queries and fragments fail startup before listening.
-The origin is captured once; changing it or publisher configuration requires a
-restart.
+`lab-store-check` and absent by default. Its authority must exactly equal the
+adopted `publisher.domain`.
 
-Application handlers reject a missing, duplicate or mismatched Host. An absolute
-request target must also agree with the configured HTTPS origin. They never
-repair a hostile authority or derive public facts from forwarding headers.
+When ingress uses another host, set
+`TS_LAB_INGRESS_ORIGIN=https://ts-lab-golf-1ba0b7f5.fly.dev`. This permits the
+Fly Host while installing `https://golf.com` for browser-facing rewrites and
+URL consumers. Without this option, ingress defaults to the public origin.
+The ingress option requires the public option. Both must be clean HTTPS origins;
+userinfo, paths including a trailing slash, queries, fragments and invalid ports
+fail startup before listening. Origins are captured once; changing them or
+publisher configuration requires a restart.
+
+Application handlers reject a missing, duplicate or mismatched ingress Host. An
+absolute request target must also agree with the configured ingress authority
+and HTTPS scheme before normalization. They never repair a hostile authority or
+derive public facts from forwarding headers.
 Approved requests retain their path/query/body and receive the same HTTPS facts
 in URI, Host and RequestInfo. Native ingress client address and geography remain
 unchanged. The local `/health` route does not consume public URL facts. This does
