@@ -11,6 +11,8 @@ use crate::commands::audit::generate::{
 };
 use crate::error::{CliResult, report_error};
 
+const LOCKR_APP_ID_SELECTOR: &str = "meta[name=\"lockr-signin-app_id\"]";
+
 static GTM_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bGTM-[A-Z0-9]{4,20}\b").expect("should compile GTM regex"));
 static GPT_INLINE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -65,6 +67,18 @@ pub(crate) fn analyze_collected_page(collected: &CollectedPage) -> CliResult<Aud
         ));
     }
 
+    let lockr_selector =
+        Selector::parse(LOCKR_APP_ID_SELECTOR).expect("should parse lockr app ID selector");
+    let mut lockr_metadata = document.select(&lockr_selector).peekable();
+    if lockr_metadata.peek().is_some() {
+        integrations.insert("lockr".to_string(), LOCKR_APP_ID_SELECTOR.to_string());
+    }
+    let lockr_app_id = lockr_metadata
+        .filter_map(|element| element.value().attr("content"))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
     for tag in &collected.script_tags {
         if let Some(src) = &tag.src {
             if let Ok(asset_url) = final_url.join(src) {
@@ -113,6 +127,7 @@ pub(crate) fn analyze_collected_page(collected: &CollectedPage) -> CliResult<Aud
         .or(derived_title);
 
     Ok(AuditArtifact {
+        lockr_app_id,
         audited_url: final_url.to_string(),
         page_title,
         js_asset_count: assets.len(),
@@ -559,6 +574,7 @@ mod tests {
             "https://tags.example.com/gtm.js?id=GTM-ABC123&l=dataLayer",
         ] {
             let artifact = AuditArtifact {
+                lockr_app_id: None,
                 audited_url: "https://example.com".to_string(),
                 page_title: None,
                 js_asset_count: 0,
@@ -600,6 +616,7 @@ mod tests {
 
             let evidence = format!("https://tags.example.com/gtm.js?id={container_id}&l=dataLayer");
             let mut artifact = AuditArtifact {
+                lockr_app_id: None,
                 audited_url: "https://publisher.example.com".to_string(),
                 page_title: None,
                 js_asset_count: 0,
@@ -648,6 +665,7 @@ mod tests {
             ("https://tags.example.com/gtm.js?id=GTM-ABC", "GTM-BBB222"),
         ] {
             let artifact = AuditArtifact {
+                lockr_app_id: None,
                 audited_url: "https://publisher.example.com".to_string(),
                 page_title: None,
                 js_asset_count: 1,
@@ -677,6 +695,7 @@ mod tests {
     #[test]
     fn extract_gtm_container_id_reads_query_parameter_urls() {
         let artifact = AuditArtifact {
+            lockr_app_id: None,
             audited_url: "https://publisher.example".to_string(),
             page_title: None,
             js_asset_count: 1,
@@ -703,6 +722,7 @@ mod tests {
     #[test]
     fn artifact_serialization_uses_expected_shape() {
         let artifact = AuditArtifact {
+            lockr_app_id: None,
             audited_url: "https://publisher.example".to_string(),
             page_title: None,
             js_asset_count: 1,
