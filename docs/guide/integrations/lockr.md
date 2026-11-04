@@ -14,6 +14,11 @@ app_id = "example-lockr-app-id"
 
 The integration is off when the section is absent. When the section exists, `enabled` defaults to `true` and `app_id` must be nonempty. Use the application ID from your existing `lockr-signin-app_id` metadata. Keep the publisher's SDK loading, metadata, and initialization in place. The integration does not inject them.
 
+To discover the ID automatically, run
+[`ts audit generate <url>`](/guide/cli#audit-a-public-page). It fills `app_id` from
+nonempty page metadata but explicitly leaves the generated integration disabled.
+Verify SDK/API behavior on the intended serving domain before enabling it.
+
 | Field               | Default                                             | Behavior                                                                        |
 | ------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `enabled`           | `true`                                              | Enable the integration when its section exists                                  |

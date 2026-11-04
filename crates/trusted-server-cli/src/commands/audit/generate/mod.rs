@@ -100,6 +100,9 @@ pub(crate) struct AuditArtifact {
     pub(crate) page_title: Option<String>,
     pub(crate) js_asset_count: usize,
     pub(crate) third_party_asset_count: usize,
+    /// Public application ID discovered in lockr page metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) lockr_app_id: Option<String>,
     pub(crate) detected_integrations: Vec<DetectedIntegration>,
     pub(crate) assets: Vec<AuditedAsset>,
     pub(crate) warnings: Vec<String>,
@@ -451,6 +454,13 @@ fn build_draft_config_with_generator(
         } else {
             manual_review.push("google_tag_manager");
         }
+    }
+
+    if let Some(app_id) = &artifact.lockr_app_id {
+        draft
+            .push_str("\n# Verify lockr SDK/API behavior on the serving domain before enabling.\n");
+        draft.push_str("[integrations.lockr]\nenabled = false\n");
+        draft.push_str(&format!("app_id = {}\n", toml_string(app_id)));
     }
 
     for integration in detected {
@@ -2061,6 +2071,21 @@ mod tests {
         }
     }
 
+    fn collected_lockr_page(metadata: &str, with_script: bool) -> CollectedPage {
+        let mut page = collected_page();
+        page.html = format!("<html><head>{metadata}</head></html>");
+        page.script_tags = if with_script {
+            vec![CollectedScriptTag {
+                src: None,
+                inline_text: Some("window.lockr = {};".to_string()),
+            }]
+        } else {
+            Vec::new()
+        };
+        page.network_requests.clear();
+        page
+    }
+
     /// A collected page carrying one discoverable GPT slot, for `run_update_slots`.
     fn collected_page_with_header_slot() -> CollectedPage {
         let mut collected = collected_page();
@@ -2353,6 +2378,134 @@ mod tests {
     }
 
     #[test]
+    fn run_generate_extracts_lockr_app_id_from_page_metadata() {
+        for (metadata, expected_id) in [
+            (
+                r#"<meta name="lockr-signin-app_id" content="  example-app-id  ">"#,
+                "example-app-id",
+            ),
+            (
+                r#"<meta name="lockr-signin-app_id" content=""><meta name="lockr-signin-app_id" content="example-app-id">"#,
+                "example-app-id",
+            ),
+            (
+                r#"<meta content="example-&quot;app\id&#10;line" name="lockr-signin-app_id">"#,
+                "example-\"app\\id\nline",
+            ),
+        ] {
+            for with_script in [false, true] {
+                let temp = TempDir::new().expect("should create temp dir");
+                let mut args = audit_args("https://publisher.example/page");
+                args.js_assets = Some(temp.path().join("js-assets.toml"));
+                args.config = Some(temp.path().join("trusted-server.toml"));
+                let page = collected_lockr_page(metadata, with_script);
+
+                run_generate(&args, &FakeCollector::new(page), &mut Vec::new())
+                    .expect("should generate outputs from offline lockr page");
+
+                let artifact_text =
+                    fs::read_to_string(args.js_assets.as_ref().expect("should set audit path"))
+                        .expect("should read audit artifact");
+                let artifact: toml::Value =
+                    toml::from_str(&artifact_text).expect("should parse audit artifact");
+                assert_eq!(
+                    artifact["lockr_app_id"].as_str(),
+                    Some(expected_id),
+                    "should persist the normalized public app ID"
+                );
+                let integrations = artifact["detected_integrations"]
+                    .as_array()
+                    .expect("should record detected integrations");
+                assert_eq!(integrations.len(), 1, "should detect lockr exactly once");
+                assert_eq!(integrations[0]["id"].as_str(), Some("lockr"));
+                assert_eq!(
+                    integrations[0]["evidence"].as_str(),
+                    Some("meta[name=\"lockr-signin-app_id\"]"),
+                    "should retain metadata evidence even when a script also detects lockr"
+                );
+                assert_eq!(artifact["js_asset_count"].as_integer(), Some(0));
+
+                let draft =
+                    fs::read_to_string(args.config.as_ref().expect("should set config path"))
+                        .expect("should read generated config");
+                let config: toml::Value =
+                    toml::from_str(&draft).expect("should parse generated config");
+                let lockr = &config["integrations"]["lockr"];
+                assert_eq!(lockr["app_id"].as_str(), Some(expected_id));
+                assert_eq!(
+                    lockr["enabled"].as_bool(),
+                    Some(false),
+                    "discovering an ID should not enable lockr"
+                );
+                assert!(
+                    draft.contains("# - Detected lockr;"),
+                    "should retain manual review"
+                );
+                let warnings = validate::check_candidate(&draft, &draft)
+                    .expect("should validate generated config");
+                assert!(
+                    warnings.is_empty(),
+                    "should pass deploy validation: {warnings:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_generate_keeps_lockr_without_app_id_on_manual_review_path() {
+        for (metadata, with_script) in [
+            ("", true),
+            (r#"<meta name="lockr-signin-app_id">"#, true),
+            (r#"<meta name="lockr-signin-app_id" content="">"#, true),
+            (
+                r#"<meta name="lockr-signin-app_id" content=" &#10; ">"#,
+                true,
+            ),
+            (
+                r#"<meta name="other-app_id" content="not-a-lockr-id">"#,
+                true,
+            ),
+            (r#"<meta name="lockr-signin-app_id">"#, false),
+            (r#"<meta name="lockr-signin-app_id" content="">"#, false),
+            (
+                r#"<meta name="lockr-signin-app_id" content=" &#10; ">"#,
+                false,
+            ),
+        ] {
+            let temp = TempDir::new().expect("should create temp dir");
+            let mut args = audit_args("https://publisher.example/page");
+            args.js_assets = Some(temp.path().join("js-assets.toml"));
+            args.config = Some(temp.path().join("trusted-server.toml"));
+            let page = collected_lockr_page(metadata, with_script);
+
+            run_generate(&args, &FakeCollector::new(page), &mut Vec::new())
+                .expect("should generate outputs without a lockr app ID");
+
+            let artifact_text =
+                fs::read_to_string(args.js_assets.as_ref().expect("should set audit path"))
+                    .expect("should read audit artifact");
+            let artifact: toml::Value =
+                toml::from_str(&artifact_text).expect("should parse audit artifact");
+            assert!(
+                artifact.get("lockr_app_id").is_none(),
+                "should not invent an ID"
+            );
+            let draft = fs::read_to_string(args.config.as_ref().expect("should set config path"))
+                .expect("should read generated config");
+            let config: toml::Value =
+                toml::from_str(&draft).expect("should parse generated config");
+            assert!(
+                config["integrations"].get("lockr").is_none(),
+                "should not activate a lockr section without an ID"
+            );
+            assert!(
+                draft.contains("# - Detected lockr;"),
+                "should retain manual review"
+            );
+        }
+    }
+
+    #[test]
     fn run_generate_respects_no_config() {
         let temp = TempDir::new().expect("should create temp dir");
         let js_assets = temp.path().join("js-assets.toml");
@@ -2471,6 +2624,7 @@ mod tests {
     fn build_draft_config_writes_disabled_js_asset_proxy_candidates() {
         let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
         let artifact = AuditArtifact {
+            lockr_app_id: None,
             audited_url: url.to_string(),
             page_title: Some("Example".to_string()),
             js_asset_count: 2,
@@ -2553,6 +2707,7 @@ mod tests {
     fn generated_asset_proxy_paths_are_opaque() {
         let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
         let artifact = AuditArtifact {
+            lockr_app_id: None,
             audited_url: url.to_string(),
             page_title: None,
             js_asset_count: 1,
@@ -2593,6 +2748,7 @@ mod tests {
     fn asset_proxy_generation_deduplicates_and_summarizes_skips() {
         let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
         let artifact = AuditArtifact {
+            lockr_app_id: None,
             audited_url: url.to_string(),
             page_title: None,
             js_asset_count: 4,
@@ -2650,6 +2806,7 @@ mod tests {
     fn asset_proxy_generation_warns_about_query_string_candidates() {
         let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
         let artifact = AuditArtifact {
+            lockr_app_id: None,
             audited_url: url.to_string(),
             page_title: None,
             js_asset_count: 2,
@@ -2697,6 +2854,7 @@ mod tests {
     fn asset_proxy_generation_with_no_candidates_removes_placeholder_asset() {
         let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
         let artifact = AuditArtifact {
+            lockr_app_id: None,
             audited_url: url.to_string(),
             page_title: None,
             js_asset_count: 1,
@@ -2759,6 +2917,7 @@ mod tests {
     fn build_draft_config_uses_final_url_and_detected_integrations() {
         let url = Url::parse("https://www.publisher.example:8443/path").expect("should parse URL");
         let artifact = AuditArtifact {
+            lockr_app_id: None,
             audited_url: url.to_string(),
             page_title: Some("Example".to_string()),
             js_asset_count: 2,
@@ -2798,6 +2957,7 @@ mod tests {
     fn build_draft_config_requires_manual_review_for_didomi() {
         let url = Url::parse("https://publisher.example.com").expect("should parse URL");
         let artifact = AuditArtifact {
+            lockr_app_id: None,
             audited_url: url.to_string(),
             page_title: None,
             js_asset_count: 0,
@@ -2839,6 +2999,7 @@ mod tests {
     fn build_draft_config_extracts_gtm_container_id_from_url_evidence() {
         let url = Url::parse("https://publisher.example.com").expect("should parse URL");
         let artifact = AuditArtifact {
+            lockr_app_id: None,
             audited_url: url.to_string(),
             page_title: None,
             js_asset_count: 0,
@@ -2882,6 +3043,7 @@ mod tests {
             "https://tags.example.com/gtm.js?id=GTM-ABCDEFGHIJKLMNOPQRSTU",
         ] {
             let artifact = AuditArtifact {
+                lockr_app_id: None,
                 audited_url: url.to_string(),
                 page_title: None,
                 js_asset_count: 1,
@@ -2926,6 +3088,7 @@ mod tests {
     fn build_draft_config_does_not_enable_gtm_without_container_id() {
         let url = Url::parse("https://publisher.example/path").expect("should parse URL");
         let artifact = AuditArtifact {
+            lockr_app_id: None,
             audited_url: url.to_string(),
             page_title: None,
             js_asset_count: 1,
