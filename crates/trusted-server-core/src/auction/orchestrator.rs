@@ -793,24 +793,9 @@ impl AuctionOrchestratorHarness {
                     }
                 };
                 if let Some(mediated) = mediated {
-                    let winners = mediated
-                        .bids
-                        .iter()
-                        .filter_map(|bid| {
-                            if bid.price.is_none() {
-                                log::warn!(
-                                    "Planned mediator returned a bid without a decoded price"
-                                );
-                                None
-                            } else {
-                                Some((bid.slot_id.clone(), bid.clone()))
-                            }
-                        })
-                        .collect();
-                    (
-                        Some(mediated),
-                        helper.apply_floor_prices(winners, &floor_prices),
-                    )
+                    let winners =
+                        helper.select_mediator_winning_bids(&mediated, &responses, &floor_prices);
+                    (Some(mediated), winners)
                 } else {
                     (None, local_winners())
                 }
@@ -1151,28 +1136,12 @@ impl AuctionOrchestrator {
                 }
             };
 
-            // Extract only mediator bids with comparable numeric prices.
-            let winning = mediator_resp
-                .bids
-                .iter()
-                .filter_map(|bid| {
-                    if bid.price.is_none() {
-                        log::warn!(
-                            "Mediator '{}' returned bid for slot '{}' without a price - skipping",
-                            mediator.provider_name(),
-                            bid.slot_id
-                        );
-                        None
-                    } else {
-                        Some((bid.slot_id.clone(), bid.clone()))
-                    }
-                })
-                .collect();
-
-            (
-                Some(mediator_resp),
-                self.apply_floor_prices(winning, &floor_prices),
-            )
+            let winning = self.select_mediator_winning_bids(
+                &mediator_resp,
+                &provider_responses,
+                &floor_prices,
+            );
+            (Some(mediator_resp), winning)
         } else {
             // No mediator - select best bid per slot from bidder responses
             let winning = self.select_winning_bids(&provider_responses, &floor_prices);
@@ -1609,6 +1578,39 @@ impl AuctionOrchestrator {
         }
 
         self.apply_floor_prices(winning_bids, floor_prices)
+    }
+
+    fn select_mediator_winning_bids(
+        &self,
+        mediator_response: &AuctionResponse,
+        provider_responses: &[AuctionResponse],
+        floor_prices: &HashMap<String, f64>,
+    ) -> HashMap<String, Bid> {
+        if mediator_response.status == BidStatus::Error {
+            log::warn!(
+                "Mediator '{}' returned an error response; using local ranking",
+                mediator_response.provider
+            );
+            return self.select_winning_bids(provider_responses, floor_prices);
+        }
+
+        let winning = mediator_response
+            .bids
+            .iter()
+            .filter_map(|bid| {
+                if bid.price.is_none() {
+                    log::warn!(
+                        "Mediator '{}' returned bid for slot '{}' without a price - skipping",
+                        mediator_response.provider,
+                        bid.slot_id
+                    );
+                    None
+                } else {
+                    Some((bid.slot_id.clone(), bid.clone()))
+                }
+            })
+            .collect();
+        self.apply_floor_prices(winning, floor_prices)
     }
 
     fn apply_floor_prices(
@@ -2687,23 +2689,11 @@ impl AuctionOrchestrator {
                 }
 
                 if let Some(mediator_response) = mediator_response {
-                    let winning = mediator_response
-                            .bids
-                            .iter()
-                            .filter_map(|bid| {
-                                if bid.price.is_none() {
-                                    log::warn!(
-                                        "Mediator '{}' returned bid for slot '{}' without decoded price - skipping",
-                                        mediator.provider_name(),
-                                        bid.slot_id
-                                    );
-                                    None
-                                } else {
-                                    Some((bid.slot_id.clone(), bid.clone()))
-                                }
-                            })
-                            .collect();
-                    let winning = self.apply_floor_prices(winning, &floor_prices);
+                    let winning = self.select_mediator_winning_bids(
+                        &mediator_response,
+                        &responses,
+                        &floor_prices,
+                    );
                     (Some(mediator_response), winning)
                 } else {
                     (None, self.select_winning_bids(&responses, &floor_prices))
@@ -2798,6 +2788,9 @@ mod tests {
         AuctionProvider, GenericOpenRtbProvider, ProviderRequestOutcome,
     };
     use crate::auction::routing::{RoutingDiagnostics, route_auction};
+    use crate::auction::telemetry::{
+        AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
+    };
     use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
         AdFormat, AdSlot, ApsRendererV1, ApsTagType, AuctionContext, AuctionRequest,
@@ -7142,6 +7135,208 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn mediator_http_failure_preserves_local_winner_and_error_telemetry() {
+        for status in [302, 400, 429, 500] {
+            for (harness, split) in [(false, false), (false, true), (true, false)] {
+                for floor in [1.0, 2.5] {
+                    let http = Arc::new(StubHttpClient::new());
+                    http.push_response(
+                        200,
+                        serde_json::to_vec(&serde_json::json!({
+                            "seatbid": [{"seat": "provider-seat", "bid": [{
+                                "id": "provider-bid", "impid": "fictional-slot", "price": 2.0,
+                                "adm": "<div>provider</div>", "w": 300, "h": 250
+                            }]}]
+                        }))
+                        .expect("should serialize provider response"),
+                    );
+                    http.push_response(status, b"not JSON and never a mediator winner".to_vec());
+                    let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
+                    let plan = Arc::new(
+                        AuctionPlan::compile(planned_config(
+                            &[("provider-a", RoutingMode::AllEligible)],
+                            false,
+                        ))
+                        .expect("should compile planned auction"),
+                    );
+                    let mediator = Arc::new(AdServerMockProvider::new(AdServerMockConfig {
+                        enabled: true,
+                        endpoint: "https://mediator.example.com/mediate".to_string(),
+                        timeout_ms: 500,
+                        ..AdServerMockConfig::default()
+                    }));
+                    let mut request = planned_request();
+                    request.slots[0].floor_price = Some(floor);
+                    let settings = create_test_settings();
+                    let inbound = http::Request::new(edgezero_core::body::Body::empty());
+                    let context = AuctionContext {
+                        settings: &settings,
+                        request: &inbound,
+                        timeout_ms: 777,
+                        transport_timeout_ms: 777,
+                        provider_responses: None,
+                        services: &services,
+                    };
+                    let result = if harness {
+                        AuctionOrchestratorHarness::new(plan, Some(mediator))
+                            .run_auction(&request, &context)
+                            .await
+                            .expect("should fall back from parsed mediator HTTP failure")
+                    } else {
+                        let orchestrator = AuctionOrchestrator::from_plan(plan, Some(mediator));
+                        if split {
+                            let DispatchAuctionOutcome::Dispatched(dispatched) =
+                                orchestrator.dispatch_auction(&request, &context).await
+                            else {
+                                panic!("should dispatch the provider auction");
+                            };
+                            orchestrator
+                                .collect_dispatched_auction(dispatched, &services, &context)
+                                .await
+                        } else {
+                            orchestrator
+                                .run_auction(&request, &context)
+                                .await
+                                .expect("should fall back without failing the auction")
+                        }
+                    };
+
+                    assert_eq!(
+                        result.provider_responses.len(),
+                        1,
+                        "should retain provider outcomes"
+                    );
+                    assert_eq!(result.provider_responses[0].provider, "provider-a");
+                    assert_eq!(result.provider_responses[0].status, BidStatus::Success);
+                    let won = floor <= 2.0;
+                    assert_eq!(
+                        result.winning_bids.len(),
+                        usize::from(won),
+                        "should apply the existing floor to local fallback"
+                    );
+                    if won {
+                        let winner = &result.winning_bids["fictional-slot"];
+                        assert_eq!(winner.bid_id.as_deref(), Some("provider-bid"));
+                        assert_eq!(winner.price, Some(2.0));
+                    }
+                    let failure = result
+                        .mediator_response
+                        .as_ref()
+                        .expect("should retain the failed mediator call for diagnostics");
+                    assert_eq!(failure.status, BidStatus::Error);
+                    assert!(
+                        failure.bids.is_empty(),
+                        "HTTP failure must not create mediator bids"
+                    );
+                    assert_eq!(
+                        failure.metadata.get("error_type"),
+                        Some(&serde_json::json!("http_status"))
+                    );
+                    assert_eq!(
+                        failure.metadata.get("http_status"),
+                        Some(&serde_json::json!(status))
+                    );
+
+                    let batch = build_auction_events(
+                        AuctionObservationContext::from_auction_request(
+                            AuctionSource::AuctionApi,
+                            &request,
+                            &crate::ec::EcContext::default(),
+                        ),
+                        AuctionTerminalOutcome::Completed {
+                            request: &request,
+                            result: &result,
+                            delivered_winner_slots: None,
+                        },
+                    );
+                    let mediator_row = batch
+                        .rows()
+                        .iter()
+                        .find(|row| row.provider_role.as_deref() == Some("mediator"))
+                        .expect("should emit the mediator call row");
+                    assert_eq!(mediator_row.provider.as_deref(), Some("adserver_mock"));
+                    assert_eq!(mediator_row.status.as_deref(), Some("http_status_error"));
+                    assert!(
+                        !batch.rows().iter().any(|row| row.event_kind == "bid"
+                            && row.provider.as_deref() == Some("adserver_mock")),
+                        "should not attribute a synthetic bid to the failed mediator"
+                    );
+                    let bid_row = batch
+                        .rows()
+                        .iter()
+                        .find(|row| row.event_kind == "bid")
+                        .expect("should retain provider bid telemetry");
+                    assert_eq!(bid_row.provider.as_deref(), Some("provider-a"));
+                    assert_eq!(bid_row.is_win, Some(u8::from(won)));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mediator_successful_no_bid_remains_authoritative() {
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(
+            200,
+            serde_json::to_vec(&serde_json::json!({
+                "seatbid": [{"seat": "provider-seat", "bid": [{
+                    "id": "provider-bid", "impid": "fictional-slot", "price": 2.0,
+                    "adm": "<div>provider</div>", "w": 300, "h": 250
+                }]}]
+            }))
+            .expect("should serialize provider response"),
+        );
+        http.push_response(
+            200,
+            serde_json::to_vec(&serde_json::json!({"seatbid": []}))
+                .expect("should serialize successful mediator no-bid"),
+        );
+        let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
+        let plan = Arc::new(
+            AuctionPlan::compile(planned_config(
+                &[("provider-a", RoutingMode::AllEligible)],
+                false,
+            ))
+            .expect("should compile planned auction"),
+        );
+        let mediator = Arc::new(AdServerMockProvider::new(AdServerMockConfig {
+            enabled: true,
+            endpoint: "https://mediator.example.com/mediate".to_string(),
+            timeout_ms: 500,
+            ..AdServerMockConfig::default()
+        }));
+        let orchestrator = AuctionOrchestrator::from_plan(plan, Some(mediator));
+        let request = planned_request();
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let result = orchestrator
+            .run_auction(&request, &context)
+            .await
+            .expect("should complete a successful no-bid mediation");
+
+        assert_eq!(
+            result
+                .mediator_response
+                .as_ref()
+                .map(|response| &response.status),
+            Some(&BidStatus::NoBid)
+        );
+        assert!(
+            result.winning_bids.is_empty(),
+            "a valid mediator no-bid must not trigger local fallback"
+        );
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ use crate::auction::openrtb::{
     BidDimensionIndex, BidRejectionReason, build_bid_dimension_index_from_slots,
     parse_optional_bid_dimension, resolve_bid_dimensions,
 };
+use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
@@ -389,7 +390,9 @@ impl AdServerMockProvider {
 
         if !response.status().is_success() {
             log::warn!("AdServer Mock returned non-success: {}", response.status());
-            return Ok(AuctionResponse::error("adserver_mock", response_time_ms));
+            return Ok(AuctionResponse::error("adserver_mock", response_time_ms)
+                .with_metadata("error_type", json!(ERROR_TYPE_HTTP_STATUS))
+                .with_metadata("http_status", json!(response.status().as_u16())));
         }
 
         // collect_response_bounded caps memory from misbehaving providers.
