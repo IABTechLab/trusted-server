@@ -1,0 +1,45 @@
+name: Set up pinned Rust
+description: Install the .tool-versions Rust toolchain with a per-job cache that only main saves.
+
+inputs:
+  cache-key:
+    description: Per-job rust-cache key prefix; the runner OS is appended.
+    required: true
+  target:
+    description: Comma-separated extra targets.
+    required: false
+    default: ""
+  components:
+    description: Comma-separated extra components.
+    required: false
+    default: ""
+  save-cache:
+    description: Set to "false" for restore-only callers.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Retrieve Rust version
+      id: rust-version
+      shell: bash
+      run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+    - name: Remove runner-image Rust toolchain
+      # rust-cache hashes every installed toolchain into its key, so the image's
+      # preinstalled stable would rotate the key on each runner-image rollout.
+      # Unsetting the default stops rustup from silently reinstalling stable
+      # when cargo runs outside the checkout.
+      shell: bash
+      run: if command -v rustup >/dev/null; then rustup toolchain uninstall stable && rustup default none; fi
+
+    - name: Set up Rust toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: ${{ steps.rust-version.outputs.rust-version }}
+        target: ${{ inputs.target }}
+        components: ${{ inputs.components }}
+        cache-shared-key: ${{ inputs.cache-key }}-${{ runner.os }}
+        # PR caches are scoped to their ref and only evict main's shared caches.
+        cache-save-if: ${{ inputs.save-cache == 'true' && github.ref == 'refs/heads/main' }}

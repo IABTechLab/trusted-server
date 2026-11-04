@@ -9,6 +9,7 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 
 use super::connect::UpstreamSender;
 use super::manager::{Lease, Manager};
+use crate::commands::dev::proxy::config::FORWARDER_AUTH_HEADER;
 use crate::commands::dev::proxy::metrics::ProxyMetrics;
 
 const STREAMING: u8 = 0;
@@ -89,7 +90,12 @@ impl Body for RequestUploadBody {
                 self.state.store(FAILED, Ordering::Release);
                 Poll::Ready(Some(Err(error)))
             }
-            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Ok(mut frame))) => {
+                if let Some(trailers) = frame.trailers_mut() {
+                    trailers.remove(FORWARDER_AUTH_HEADER);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -267,6 +273,77 @@ mod tests {
         fn is_end_stream(&self) -> bool {
             self.frames.is_empty()
         }
+    }
+
+    #[tokio::test]
+    async fn upload_removes_forwarder_authentication_from_streamed_trailers() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut trailers = HeaderMap::new();
+        trailers.append(
+            "x-ts-forwarder-auth",
+            hyper::header::HeaderValue::from_static("hostile"),
+        );
+        trailers.append(
+            "x-ts-forwarder-auth",
+            hyper::header::HeaderValue::from_static("second"),
+        );
+        trailers.insert(
+            "x-checksum",
+            hyper::header::HeaderValue::from_static("verified"),
+        );
+        let scripted = ScriptedBody {
+            frames: VecDeque::from([
+                Frame::data(Bytes::from_static(b"data")),
+                Frame::trailers(trailers),
+            ]),
+            polls: Arc::clone(&polls),
+        };
+        let (mut body, state) = RequestUploadBody::from_boxed(scripted.boxed(), false);
+        assert_eq!(
+            polls.load(AtomicOrdering::Relaxed),
+            0,
+            "should not pre-poll frames"
+        );
+        let data = body
+            .frame()
+            .await
+            .expect("should have data frame")
+            .expect("should read data frame");
+        assert_eq!(
+            data.data_ref().expect("should retain data frame"),
+            &Bytes::from_static(b"data"),
+            "should preserve streaming body data"
+        );
+        assert_eq!(
+            polls.load(AtomicOrdering::Relaxed),
+            1,
+            "should poll one frame at a time"
+        );
+        let frame = body
+            .frame()
+            .await
+            .expect("should have trailer frame")
+            .expect("should read trailer frame");
+        let trailers = frame.trailers_ref().expect("should retain benign trailers");
+        assert!(
+            !trailers.contains_key("x-ts-forwarder-auth"),
+            "should remove every inbound credential trailer"
+        );
+        assert_eq!(
+            trailers["x-checksum"], "verified",
+            "should retain benign trailer"
+        );
+        assert_eq!(
+            state.load(Ordering::Acquire),
+            STREAMING,
+            "should wait for terminal EOS"
+        );
+        assert!(body.frame().await.is_none(), "should reach terminal EOS");
+        assert_eq!(
+            state.load(Ordering::Acquire),
+            COMPLETE,
+            "should mark complete after EOS"
+        );
     }
 
     #[tokio::test]

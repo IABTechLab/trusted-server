@@ -39,10 +39,12 @@ mod error;
 mod http;
 mod image_optimizer;
 mod kv;
+mod pending_response;
 mod template_assembly;
 mod template_cache;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod timer;
 mod traits;
 mod types;
 
@@ -61,6 +63,7 @@ pub use image_optimizer::{
     PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
 };
 pub use kv::UnavailableKvStore;
+pub use pending_response::PlatformPendingResponse;
 pub use template_assembly::{
     PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
     contains_publisher_esi_directive,
@@ -72,6 +75,7 @@ pub use template_cache::{
     TemplateCookieValue, TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError,
     UnavailableTemplateCache, VaryHeaderValues, VarySpec, reader_url_surrogate_key,
 };
+pub use timer::PlatformTimer;
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
 pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,
@@ -93,6 +97,15 @@ mod tests {
 
     use super::test_support::{noop_services, noop_services_with_client_ip};
     use super::*;
+
+    #[test]
+    fn runtime_timer_is_optional() {
+        let services = noop_services();
+        assert!(
+            services.timer().is_none(),
+            "should allow platforms without cooperative timers"
+        );
+    }
 
     struct MarkerKvStore(&'static str);
 
@@ -160,6 +173,43 @@ mod tests {
         assert!(
             cloned.client_info().tls_protocol.is_none(),
             "should preserve tls_protocol through clone"
+        );
+    }
+
+    struct MarkerTimer;
+    impl PlatformTimer for MarkerTimer {
+        fn delay(&self, _: Duration) -> futures::future::LocalBoxFuture<'static, ()> {
+            Box::pin(futures::future::ready(()))
+        }
+    }
+
+    #[test]
+    fn runtime_timer_survives_cloning_and_service_replacement() {
+        let mut services = noop_services();
+        services.timer = Some(Arc::new(MarkerTimer));
+        let replaced = services
+            .clone()
+            .with_kv_store(Arc::new(MarkerKvStore("example")))
+            .with_template_cache(Arc::new(UnavailableTemplateCache))
+            .with_template_assembler(Arc::new(UnavailableTemplateAssembler));
+        assert!(
+            Arc::ptr_eq(
+                services
+                    .timer
+                    .as_ref()
+                    .expect("should retain the original timer"),
+                replaced
+                    .timer
+                    .as_ref()
+                    .expect("should preserve the timer through service replacement")
+            ),
+            "should preserve the same timer capability"
+        );
+        futures::executor::block_on(
+            replaced
+                .timer()
+                .expect("should expose the installed timer")
+                .delay(Duration::ZERO),
         );
     }
 

@@ -22,13 +22,22 @@ use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
+use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
+use crate::integrations::datadome::HEADER_DATADOME_TEST_BYPASS;
 use crate::platform::PlatformImageOptimizerRegion;
+use crate::proxy::{is_host_allowed, is_host_permitted};
 use crate::redacted::Redacted;
 
 #[cfg(test)]
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 #[cfg(test)]
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
+/// Build inputs that share the settings prefix but are not settings.
+///
+/// The core build script exports these with `cargo:rustc-env`, and Cargo sets
+/// them on every `cargo test` run of this crate.
+#[cfg(test)]
+const BUILD_ENVIRONMENT_VARIABLES: [&str; 1] = ["TRUSTED_SERVER__GIT_VERSION"];
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -65,7 +74,8 @@ pub struct Publisher {
     /// trips, so the response is truncated mid-body (with the error logged)
     /// rather than replaced with a 5xx.
     ///
-    /// Buffered adapters keep using it as the post-rewrite output buffer cap.
+    /// The async HTML EOF driver also caps cumulative raw and decoded input on
+    /// every adapter. Other buffered responses use the post-rewrite output cap.
     /// There it additionally bounds how much decoded gzip output may sit in the
     /// heap at once, so a bomb is rejected mid-decode instead of after its full
     /// expansion; that bound is per-step, never cumulative, so a gzip-encoded
@@ -78,6 +88,38 @@ pub struct Publisher {
     #[serde(default = "default_max_buffered_body_bytes")]
     #[validate(range(min = 1, message = "must be at least 1 byte"))]
     pub max_buffered_body_bytes: usize,
+    /// Explicit operator permission for asynchronous HTML EOF work.
+    ///
+    /// Defaults to false. Enabled work can delay response delivery, especially
+    /// on buffered adapters and processors retaining output until EOF.
+    ///
+    /// Skipped from serialization while false: [`Publisher`] denies unknown
+    /// fields, so a default blob must stay readable by a binary built before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_async_html_finish: bool,
+    /// Whole-chain HTML EOF budget in milliseconds; inert without an async processor.
+    ///
+    /// Skipped from serialization at its default for the same rollback reason
+    /// as [`Self::allow_async_html_finish`].
+    #[serde(
+        default = "default_html_finalization_timeout_ms",
+        skip_serializing_if = "is_default_html_finalization_timeout_ms"
+    )]
+    #[validate(range(
+        min = 1,
+        max = 60000,
+        message = "must be between 1 and 60000 milliseconds"
+    ))]
+    pub html_finalization_timeout_ms: u32,
+}
+
+fn default_html_finalization_timeout_ms() -> u32 {
+    5000
+}
+
+fn is_default_html_finalization_timeout_ms(value: &u32) -> bool {
+    *value == default_html_finalization_timeout_ms()
 }
 
 fn default_max_buffered_body_bytes() -> usize {
@@ -98,6 +140,8 @@ impl Default for Publisher {
             origin_host_header_override: None,
             proxy_secret: Redacted::default(),
             max_buffered_body_bytes: default_max_buffered_body_bytes(),
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         }
     }
 }
@@ -189,6 +233,8 @@ impl Publisher {
     ///     origin_host_header_override: None,
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
     ///     max_buffered_body_bytes: 16 * 1024 * 1024,
+    ///     html_finalization_timeout_ms: 5000,
+    ///     allow_async_html_finish: false,
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
@@ -636,37 +682,140 @@ impl Ec {
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Rewrite {
-    /// List of domains to exclude from rewriting. Supports wildcards (e.g., "*.example.com").
-    /// URLs from these domains will not be proxied through first-party endpoints.
+    /// Hosts never rewritten, for assets and click-through links.
+    ///
+    /// Each entry is an exact host or `*.example.com`, which matches the apex
+    /// and any subdomain. Matching is case-insensitive. Wins over
+    /// [`Self::include_domains`].
     #[serde(default)]
     pub exclude_domains: Vec<String>,
+    /// When non-empty, the only hosts whose asset URLs are rewritten to
+    /// `/first-party/proxy`.
+    ///
+    /// Same pattern syntax as [`Self::exclude_domains`]. Empty (the default)
+    /// proxies every eligible asset URL. Never applies to click-through links.
+    /// The default is omitted from serialized config so older binaries, which
+    /// reject unknown fields, can still read it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[validate(custom(function = validate_include_domains))]
+    pub include_domains: Vec<String>,
 }
 
 impl Rewrite {
-    /// Checks if a URL should be excluded from rewriting based on domain matching
-    #[allow(dead_code)]
+    /// Returns `true` when an asset URL on `host` should be rewritten to
+    /// `/first-party/proxy`.
+    ///
+    /// The host must not match [`Self::exclude_domains`], and must match
+    /// [`Self::include_domains`] when that list is non-empty. Matching is
+    /// case-insensitive; see `crate::proxy::is_host_allowed` for the pattern rules.
     #[must_use]
-    pub fn is_excluded(&self, url: &str) -> bool {
-        // Parse URL to extract host
-        let Ok(parsed) = url::Url::parse(url) else {
-            return false;
-        };
+    pub fn should_proxy_asset(&self, host: &str) -> bool {
+        !self.is_excluded_host(host) && is_host_permitted(&self.include_domains, host)
+    }
 
-        let host = parsed.host_str().unwrap_or("");
+    /// Returns `true` when a click-through URL on `host` should be wrapped in
+    /// `/first-party/click`.
+    ///
+    /// Only [`Self::exclude_domains`] applies to click-through links.
+    #[must_use]
+    pub fn should_wrap_click(&self, host: &str) -> bool {
+        !self.is_excluded_host(host)
+    }
 
-        // Check exact domain matches (with wildcard support)
-        for domain in &self.exclude_domains {
-            if let Some(suffix) = domain.strip_prefix("*.") {
-                // Wildcard: *.example.com matches both example.com and sub.example.com
-                if host == suffix || host.ends_with(&format!(".{}", suffix)) {
-                    return true;
-                }
-            } else if host == domain {
-                return true;
-            }
+    fn is_excluded_host(&self, host: &str) -> bool {
+        self.exclude_domains
+            .iter()
+            .any(|pattern| is_host_allowed(host, pattern))
+    }
+
+    /// Trims and lowercases host patterns in place.
+    ///
+    /// Empty and bare `*` entries in `exclude_domains` are dropped with a
+    /// warning: neither can match a host, so dropping them changes no behavior.
+    /// Other entries that no URL host can match are kept and reported by
+    /// position, counted before that drop; see
+    /// [`Self::inert_exclude_domain_warnings`]. `ts config push` stores the
+    /// normalized list, so positions logged at the edge can sit lower than the
+    /// ones `ts config validate` prints when empty or `*` entries came first.
+    fn normalize(&mut self) {
+        let (exclude_domains, warnings) = Self::normalized_exclude_domains(&self.exclude_domains);
+        self.exclude_domains = exclude_domains;
+        self.include_domains = self
+            .include_domains
+            .iter()
+            .map(|pattern| pattern.trim().to_ascii_lowercase())
+            .collect();
+        for warning in &warnings {
+            log::warn!("{warning}");
         }
+    }
 
-        false
+    /// Returns the trimmed, lowercased `exclude_domains` entries without empty
+    /// and bare `*` entries, plus the warnings [`Self::normalize`] logs.
+    ///
+    /// Inert-entry warnings are built from `patterns` before the drop, so
+    /// their positions match the configured list.
+    fn normalized_exclude_domains(patterns: &[String]) -> (Vec<String>, Vec<String>) {
+        // An `exclude_domains` entry that can never equal a URL host keeps its
+        // host proxied and receiving `ts-ec`. Rejecting it would stop existing
+        // blobs from loading, so warn once per entry and keep it.
+        let mut warnings = Self::inert_exclude_domain_warnings(patterns);
+        let normalized: Vec<String> = patterns
+            .iter()
+            .map(|pattern| pattern.trim().to_ascii_lowercase())
+            .filter(|pattern| !pattern.is_empty() && pattern != "*")
+            .collect();
+        if normalized.len() < patterns.len() {
+            warnings.insert(
+                0,
+                "rewrite.exclude_domains: removed empty or bare \"*\" entries, which never match a host"
+                    .to_owned(),
+            );
+        }
+        (normalized, warnings)
+    }
+
+    /// Returns one warning per `exclude_domains` entry that never matches a URL
+    /// host.
+    ///
+    /// Each warning names the entry by its index in `patterns` and gives a
+    /// static reason. It never includes the raw value, which may be a pasted URL
+    /// carrying credentials or control characters. Empty and bare `*` entries
+    /// are skipped because [`Self::normalize`] drops them with its own warning.
+    fn inert_exclude_domain_warnings(patterns: &[String]) -> Vec<String> {
+        patterns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pattern)| {
+                let pattern = pattern.trim().to_ascii_lowercase();
+                if pattern.is_empty() || pattern == "*" {
+                    return None;
+                }
+                Self::check_exclude_domain(&pattern).err().map(|reason| {
+                    format!(
+                        "rewrite.exclude_domains[{index}] never matches a URL host ({reason}); the entry is kept"
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Checks one normalized `exclude_domains` entry, returning why no fetched
+    /// URL can match it.
+    ///
+    /// Looser than the `include_domains` grammar on purpose: a trailing `.`, a
+    /// `_` and a wildcard IP address all still match a URL host, and a
+    /// trailing-dot entry is the only way to exclude `blocked.example.com.`.
+    fn check_exclude_domain(pattern: &str) -> Result<(), &'static str> {
+        let host = pattern.strip_prefix("*.").unwrap_or(pattern);
+        let labels = host.strip_suffix('.').unwrap_or(host);
+        if host.contains('*') {
+            Err("`*` other than a leading `*.`")
+        } else if labels.split('.').any(str::is_empty) {
+            Err("leading `.` or empty label")
+        } else {
+            check_host_round_trip(host)
+        }
     }
 }
 
@@ -2954,8 +3103,123 @@ fn validate_trusted_client_ip_shared_secret(
     Ok(())
 }
 
+/// Authenticated forwarding configuration for the public request host and scheme.
+///
+/// The upstream proxy must replace client-supplied authentication and forwarding
+/// headers before forwarding a request to Trusted Server.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = validate_trusted_forwarder, skip_on_field_errors = false))]
+pub struct TrustedForwarderConfig {
+    /// Explicit authentication header name, normally `x-ts-forwarder-auth`.
+    pub auth_header: String,
+    /// Shared secret required before accepting forwarded host and scheme values.
+    #[validate(custom(function = validate_trusted_forwarder_shared_secret))]
+    pub shared_secret: Redacted<String>,
+}
+
+impl TrustedForwarderConfig {
+    /// Placeholder shared secrets shipped in example configuration and docs.
+    pub const SHARED_SECRET_PLACEHOLDERS: &[&str] = &["replace-with-a-random-shared-secret"];
+
+    /// Returns whether the shared secret is a known placeholder, ignoring case.
+    #[must_use]
+    pub fn is_placeholder_shared_secret(shared_secret: &str) -> bool {
+        Self::SHARED_SECRET_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| placeholder.eq_ignore_ascii_case(shared_secret))
+    }
+
+    /// Returns whether `candidate` exactly matches the configured shared secret.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::redacted::Redacted;
+    /// use trusted_server_core::settings::TrustedForwarderConfig;
+    ///
+    /// let config = TrustedForwarderConfig {
+    ///     auth_header: "x-ts-forwarder-auth".to_owned(),
+    ///     shared_secret: Redacted::new("fictional-forwarder-secret-0123456789".to_owned()),
+    /// };
+    /// assert!(config.authenticates("fictional-forwarder-secret-0123456789"));
+    /// assert!(!config.authenticates("fictional-wrong-secret"));
+    /// ```
+    #[must_use]
+    pub fn authenticates(&self, candidate: &str) -> bool {
+        let configured_digest = Sha256::digest(self.shared_secret.expose().as_bytes());
+        let candidate_digest = Sha256::digest(candidate.as_bytes());
+        configured_digest.ct_eq(&candidate_digest).into()
+    }
+}
+
+fn validate_trusted_forwarder(config: &TrustedForwarderConfig) -> Result<(), ValidationError> {
+    let auth_header = http::HeaderName::from_bytes(config.auth_header.as_bytes())
+        .map_err(|_| ValidationError::new("invalid_trusted_forwarder_auth_header"))?;
+    let name = auth_header.as_str();
+    if !name.starts_with("x-") {
+        return Err(ValidationError::new("unsafe_trusted_forwarder_auth_header"));
+    }
+    if SPOOFABLE_FORWARDED_HEADERS.contains(&name)
+        || INTERNAL_HEADERS.contains(&name)
+        || name == HEADER_DATADOME_TEST_BYPASS
+        || matches!(name, "x-ts-trace-action" | "x-ts-original-scheme")
+        || name.starts_with("x-ts-tls-")
+    {
+        return Err(ValidationError::new(
+            "reserved_trusted_forwarder_auth_header",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_trusted_forwarder_shared_secret(
+    shared_secret: &Redacted<String>,
+) -> Result<(), ValidationError> {
+    let shared_secret = shared_secret.expose();
+    if shared_secret.len() < Ec::MIN_PASSPHRASE_LENGTH {
+        return Err(ValidationError::new(
+            "short_trusted_forwarder_shared_secret",
+        ));
+    }
+    if !shared_secret
+        .bytes()
+        .all(|byte| matches!(byte, b'!'..=b'~'))
+    {
+        return Err(ValidationError::new(
+            "invalid_trusted_forwarder_shared_secret",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_trust_header_collisions(settings: &Settings) -> Result<(), ValidationError> {
+    let (Some(forwarder), Some(client_ip)) =
+        (&settings.trusted_forwarder, &settings.trusted_client_ip)
+    else {
+        return Ok(());
+    };
+    for header in [&client_ip.ip_header, &client_ip.auth_header] {
+        if forwarder.auth_header.eq_ignore_ascii_case(header) {
+            return Err(ValidationError::new(
+                "colliding_trusted_forwarder_client_ip_header",
+            ));
+        }
+        if ["forwarded", "x-forwarded-host", "x-forwarded-proto"]
+            .iter()
+            .any(|forwarded| forwarded.eq_ignore_ascii_case(header))
+        {
+            return Err(ValidationError::new(
+                "colliding_trusted_client_ip_forwarded_header",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
+#[validate(schema(function = validate_trust_header_collisions, skip_on_field_errors = false))]
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
@@ -2973,6 +3237,12 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(nested)]
     pub trusted_client_ip: Option<TrustedClientIpConfig>,
+    /// Optional authenticated forwarding of the public request host and scheme.
+    ///
+    /// Omitted when unset to preserve config compatibility with older binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub trusted_forwarder: Option<TrustedForwarderConfig>,
     #[serde(default)]
     #[validate(nested)]
     pub ec: Ec,
@@ -3044,16 +3314,26 @@ impl Settings {
     /// Runtime loading does not use this legacy helper; `EdgeZero` CLI app-config
     /// overlays are applied before deserializing [`crate::config::TrustedServerAppConfig`].
     /// This helper remains available to existing tests that exercise legacy
-    /// parsing behavior.
+    /// parsing behavior. Build inputs such as `TRUSTED_SERVER__GIT_VERSION`
+    /// are not treated as overrides.
     ///
     /// # Errors
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     #[cfg(test)]
     pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
+        let overrides = std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .filter(|(key, _)| {
+                !BUILD_ENVIRONMENT_VARIABLES
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(key))
+            })
+            .collect();
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
-            .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
+            .separator(ENVIRONMENT_VARIABLE_SEPARATOR)
+            .source(Some(overrides));
 
         let toml = File::from_str(toml_str, FileFormat::Toml);
         let config = Config::builder()
@@ -3081,6 +3361,7 @@ impl Settings {
     pub(crate) fn normalize_deserialized(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.cache.normalize();
         self.proxy.normalize();
+        self.rewrite.normalize();
         self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
@@ -3202,6 +3483,13 @@ impl Settings {
             )
         {
             insecure_fields.push("trusted_client_ip.shared_secret".to_owned());
+        }
+        if let Some(trusted_forwarder) = &self.trusted_forwarder
+            && TrustedForwarderConfig::is_placeholder_shared_secret(
+                trusted_forwarder.shared_secret.expose(),
+            )
+        {
+            insecure_fields.push("trusted_forwarder.shared_secret".to_owned());
         }
         for partner in &self.ec.partners {
             if partner
@@ -3473,6 +3761,105 @@ impl Settings {
     {
         self.integrations.get_typed(integration_id)
     }
+}
+
+/// Rejects `rewrite.include_domains` entries that can never equal a URL host.
+///
+/// Runs after [`Rewrite::normalize`], so entries are already trimmed and
+/// lowercased. Entries are matched against [`Url::host_str`], so each one must
+/// be:
+///
+/// - a DNS name, optionally prefixed with `*.`: one or more `.`-separated,
+///   non-empty labels of ASCII `a-z`, `0-9`, `-` and `_`;
+/// - an IPv4 address in dotted-quad form, such as `192.0.2.1`; or
+/// - an IPv6 address in brackets and compressed form, such as `[2001:db8::1]`.
+///
+/// A scheme, port, path, space, leading or trailing `.`, empty label, wildcard
+/// IP address or unbracketed IPv6 address is rejected with
+/// `invalid_rewrite_include_domain`. A non-ASCII (IDN) name is rejected with
+/// `non_ascii_rewrite_include_domain`; write it in punycode (`xn--`) form.
+///
+/// Errors name the entry by its index, never its raw value, which may be a
+/// pasted URL carrying credentials. [`Rewrite::normalize`] drops no
+/// `include_domains` entries, so the index matches the operator's TOML.
+fn validate_include_domains(patterns: &[String]) -> Result<(), ValidationError> {
+    for (index, pattern) in patterns.iter().enumerate() {
+        if !pattern.is_ascii() {
+            let mut err = ValidationError::new("non_ascii_rewrite_include_domain");
+            err.add_param("index".into(), &index);
+            err.message = Some(
+                format!(
+                    "rewrite.include_domains[{index}] is not ASCII; write internationalized domain names in punycode (xn--) form"
+                )
+                .into(),
+            );
+            return Err(err);
+        }
+        if let Err(reason) = check_include_domain(pattern) {
+            let mut err = ValidationError::new("invalid_rewrite_include_domain");
+            err.add_param("index".into(), &index);
+            err.add_param("reason".into(), &reason);
+            err.message = Some(
+                format!(
+                    "rewrite.include_domains[{index}] must be a host name with an optional leading `*.`, a dotted-quad IPv4 address or a bracketed IPv6 address ({reason})"
+                )
+                .into(),
+            );
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Checks one normalized ASCII `include_domains` entry, returning why it can
+/// never equal a URL host.
+fn check_include_domain(pattern: &str) -> Result<(), &'static str> {
+    if let Some(bracketed) = pattern.strip_prefix('[') {
+        bracketed
+            .strip_suffix(']')
+            .and_then(|inner| inner.parse::<std::net::Ipv6Addr>().ok())
+            .ok_or("not a bracketed IPv6 address")?;
+        return check_host_round_trip(pattern);
+    }
+    if pattern.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Err("IPv6 address without brackets");
+    }
+
+    let name = pattern.strip_prefix("*.").unwrap_or(pattern);
+    if name.is_empty() {
+        return Err("no host");
+    }
+    if !name.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.' | b'_')
+    }) {
+        return Err("character outside a-z, 0-9, `-`, `_` and `.`");
+    }
+    if name.split('.').any(str::is_empty) {
+        return Err("leading or trailing `.` or empty label");
+    }
+
+    // A URL host whose last label is numeric is parsed as an IPv4 address, so
+    // such an entry only matches as an exact dotted-quad address.
+    let last_label = name.rsplit('.').next().unwrap_or(name);
+    let numeric_last_label = last_label.bytes().all(|byte| byte.is_ascii_digit());
+    if numeric_last_label
+        && (name.len() != pattern.len() || name.parse::<std::net::Ipv4Addr>().is_err())
+    {
+        return Err("numeric host that is not a dotted-quad IPv4 address");
+    }
+    check_host_round_trip(name)
+}
+
+/// Parses `host` with the parser behind [`Url::host_str`] and requires the
+/// rendered form to equal the input, so an entry that `url` rewrites (an
+/// IPv4-mapped IPv6 address in dotted form, an invalid `xn--` label) or rejects
+/// can never load and then silently fail to match.
+fn check_host_round_trip(host: &str) -> Result<(), &'static str> {
+    let parsed = url::Host::parse(host).map_err(|_| "not a valid URL host")?;
+    if parsed.to_string() != host {
+        return Err("not in the form Url::host_str() renders");
+    }
+    Ok(())
 }
 
 fn validate_publisher_domain(value: &str) -> Result<(), ValidationError> {
@@ -3813,10 +4200,97 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auction::build_orchestrator;
+    use crate::integrations::{
+        IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
+        prebid::PrebidIntegrationConfig,
+    };
+    use crate::redacted::Redacted;
+    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use regex::Regex;
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+
+    #[test]
+    fn html_finalization_timeout_defaults_and_boundaries() {
+        let parsed = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse an omitted terminal timeout");
+        assert_eq!(
+            parsed.publisher.html_finalization_timeout_ms,
+            Publisher::default().html_finalization_timeout_ms,
+            "should match TOML omission and the hand-written default"
+        );
+        assert_eq!(
+            Publisher::default().html_finalization_timeout_ms,
+            5000,
+            "should default the chain budget to five seconds"
+        );
+        for (milliseconds, invalid) in [
+            (0, true),
+            (1, false),
+            (5000, false),
+            (60000, false),
+            (60001, true),
+        ] {
+            let publisher = Publisher {
+                html_finalization_timeout_ms: milliseconds,
+                ..Publisher::default()
+            };
+            let errors = publisher
+                .validate()
+                .expect_err("should reject the other empty publisher fields");
+            assert_eq!(
+                errors
+                    .field_errors()
+                    .contains_key("html_finalization_timeout_ms"),
+                invalid,
+                "should enforce finish timeout boundaries"
+            );
+        }
+    }
+    #[test]
+    fn default_publisher_omits_async_finish_settings_for_rollback() {
+        let serialized = serde_json::to_value(Publisher::default())
+            .expect("should serialize default publisher settings");
+        for field in ["allow_async_html_finish", "html_finalization_timeout_ms"] {
+            assert!(
+                serialized.get(field).is_none(),
+                "should omit default {field} for older binaries"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_publisher_async_finish_settings_round_trip() {
+        let publisher = Publisher {
+            allow_async_html_finish: true,
+            html_finalization_timeout_ms: 1500,
+            ..Publisher::default()
+        };
+        let serialized =
+            serde_json::to_value(&publisher).expect("should serialize enabled EOF settings");
+        assert_eq!(
+            serialized["allow_async_html_finish"],
+            json!(true),
+            "should serialize permission"
+        );
+        assert_eq!(
+            serialized["html_finalization_timeout_ms"],
+            json!(1500),
+            "should serialize custom timeout"
+        );
+        let restored: Publisher =
+            serde_json::from_value(serialized).expect("should restore EOF settings");
+        assert!(
+            restored.allow_async_html_finish,
+            "should preserve permission"
+        );
+        assert_eq!(
+            restored.html_finalization_timeout_ms, 1500,
+            "should preserve timeout"
+        );
+    }
 
     /// `DebugConfig` denies unknown fields, so a binary built before
     /// `sandbox_metrics_enabled` existed must still accept a default blob.
@@ -3869,14 +4343,225 @@ mod tests {
         );
     }
 
-    use crate::auction::build_orchestrator;
-    use crate::integrations::{
-        IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
-        prebid::PrebidIntegrationConfig,
-    };
-    use crate::redacted::Redacted;
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    fn trusted_forwarder_json(auth_header: &str, shared_secret: &str) -> JsonValue {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        let mut value = serde_json::to_value(settings).expect("should serialize test settings");
+        value["trusted_forwarder"] = json!({
+            "auth_header": auth_header,
+            "shared_secret": shared_secret,
+        });
+        value
+    }
 
+    #[test]
+    fn trusted_forwarder_accepts_valid_configuration_and_redacts_debug_output() {
+        let secret = "fictional-shared-secret-01234567";
+        let settings =
+            Settings::from_json_value(trusted_forwarder_json("x-ts-forwarder-auth", secret))
+                .expect("should accept trusted forwarder configuration");
+        let config = settings
+            .trusted_forwarder
+            .as_ref()
+            .expect("should retain the forwarder configuration");
+        assert!(
+            config.authenticates(secret),
+            "should authenticate the exact shared secret"
+        );
+        for candidate in [
+            secret.to_uppercase(),
+            format!(" {secret}"),
+            format!("{secret} "),
+            secret[..secret.len() - 1].to_owned(),
+            format!("{secret}extra"),
+            String::new(),
+        ] {
+            assert!(
+                !config.authenticates(&candidate),
+                "should reject altered authentication values"
+            );
+        }
+        let debug = format!("{settings:?}");
+        assert!(
+            !debug.contains(secret),
+            "should redact the forwarder shared secret"
+        );
+        let value = serde_json::to_value(settings).expect("should serialize configured settings");
+        assert_eq!(
+            value["trusted_forwarder"]["auth_header"], "x-ts-forwarder-auth",
+            "should retain the configured authentication header"
+        );
+    }
+
+    #[test]
+    fn trusted_forwarder_rejects_invalid_shared_secrets_without_exposing_them() {
+        for secret in [
+            "fictional-shared-secret-0123456",
+            "fictional-secret-with space-012345",
+            "fictional-secret-withé-0123456789",
+            "fictional-secret-with\t-0123456789",
+            "fictional-secret-with\u{007f}-0123456789",
+        ] {
+            let error =
+                Settings::from_json_value(trusted_forwarder_json("x-ts-forwarder-auth", secret))
+                    .expect_err("should reject an invalid forwarder shared secret");
+            let message = format!("{error:?}");
+            assert!(
+                message.contains("trusted_forwarder_shared_secret"),
+                "should identify shared-secret validation: {message}"
+            );
+            assert!(
+                !message.contains(secret),
+                "should not expose the shared secret: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_rejects_placeholder_shared_secret() {
+        let settings = Settings::from_json_value(trusted_forwarder_json(
+            "x-ts-forwarder-auth",
+            "REPLACE-WITH-A-RANDOM-SHARED-SECRET",
+        ))
+        .expect("should parse the placeholder before rejecting insecure defaults");
+        let error = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject a forwarder placeholder");
+        assert!(
+            format!("{error:?}").contains("trusted_forwarder.shared_secret"),
+            "should identify the placeholder field"
+        );
+    }
+
+    #[test]
+    fn trusted_forwarder_requires_explicit_fields_and_rejects_unknown_fields() {
+        for section in [
+            json!({"shared_secret": "fictional-forwarder-secret-0123456789"}),
+            json!({"auth_header": "x-ts-forwarder-auth"}),
+            json!({"auth_header": "x-ts-forwarder-auth", "shared_secret": "fictional-forwarder-secret-0123456789", "enabled": true}),
+        ] {
+            let mut value = trusted_forwarder_json(
+                "x-ts-forwarder-auth",
+                "fictional-forwarder-secret-0123456789",
+            );
+            value["trusted_forwarder"] = section;
+            let _ = Settings::from_json_value(value)
+                .expect_err("should reject incomplete or unknown forwarder fields");
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_rejects_unsafe_authentication_header() {
+        for header in [
+            "authorization",
+            "host",
+            "Forwarded",
+            "Fastly-SSL",
+            "Fastly-Client-IP",
+            "",
+            "x-invalid header",
+            "x-invalid\r\nheader",
+        ] {
+            let error = Settings::from_json_value(trusted_forwarder_json(
+                header,
+                "fictional-forwarder-secret-0123456789",
+            ))
+            .expect_err("should reject unsafe authentication headers");
+            assert!(
+                format!("{error:?}").contains("trusted_forwarder_auth_header"),
+                "should identify authentication-header validation"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_rejects_reserved_header_collisions_case_insensitively() {
+        for header in [
+            "X-Forwarded-Host",
+            "X-Forwarded-Proto",
+            "X-Forwarded-For",
+            "X-TS-Trace-Action",
+            "X-TS-DataDome-Bypass",
+            "X-TS-Original-Scheme",
+            "X-TS-TLS-Protocol",
+            "X-TS-TLS-Cipher",
+            "X-TS-TLS-Future",
+            "X-TS-EC",
+            "X-Request-ID",
+        ] {
+            let error = Settings::from_json_value(trusted_forwarder_json(
+                header,
+                "fictional-forwarder-secret-0123456789",
+            ))
+            .expect_err("should reject reserved forwarder authentication headers");
+            assert!(
+                format!("{error:?}").contains("reserved_trusted_forwarder_auth_header"),
+                "should identify the reserved header collision"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_rejects_client_ip_header_collisions_case_insensitively() {
+        for header in ["X-TS-Client-IP", "X-TS-Client-IP-Auth"] {
+            let mut value = trusted_forwarder_json(header, "fictional-forwarder-secret-0123456789");
+            value["trusted_client_ip"] = json!({"ip_header": "x-ts-client-ip", "auth_header": "x-ts-client-ip-auth", "shared_secret": "fictional-client-ip-secret-0123456789"});
+            let error = Settings::from_json_value(value)
+                .expect_err("should reject overlapping trust headers");
+            assert!(
+                format!("{error:?}").contains("colliding_trusted_forwarder_client_ip_header"),
+                "should identify colliding trust headers"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_rejects_client_ip_overlap_with_forwarded_metadata() {
+        for (ip_header, auth_header) in [
+            ("Forwarded", "x-ts-client-ip-auth"),
+            ("x-ts-client-ip", "FORWARDED"),
+            ("X-Forwarded-Host", "x-ts-client-ip-auth"),
+            ("X-Forwarded-Proto", "x-ts-client-ip-auth"),
+            ("x-ts-client-ip", "X-Forwarded-Host"),
+            ("x-ts-client-ip", "X-Forwarded-Proto"),
+        ] {
+            let mut value = trusted_forwarder_json(
+                "x-ts-forwarder-auth",
+                "fictional-forwarder-secret-0123456789",
+            );
+            value["trusted_client_ip"] = json!({"ip_header": ip_header, "auth_header": auth_header, "shared_secret": "fictional-client-ip-secret-0123456789"});
+            let error = Settings::from_json_value(value)
+                .expect_err("should reject client IP headers that overlap forwarded metadata");
+            assert!(
+                format!("{error:?}").contains("colliding_trusted_client_ip_forwarded_header"),
+                "should identify forwarded metadata collisions"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_allows_distinct_client_ip_configuration() {
+        let mut value = trusted_forwarder_json(
+            "x-ts-forwarder-auth",
+            "fictional-forwarder-secret-0123456789",
+        );
+        value["trusted_client_ip"] = json!({"ip_header": "fastly-client-ip", "auth_header": "x-ts-client-ip-auth", "shared_secret": "fictional-client-ip-secret-0123456789"});
+        Settings::from_json_value(value)
+            .expect("should accept distinct forwarder and client IP trust headers");
+    }
+
+    #[test]
+    fn trusted_forwarder_is_omitted_when_unconfigured() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse settings");
+        let value = serde_json::to_value(settings).expect("should serialize settings");
+        assert!(
+            value.get("trusted_forwarder").is_none(),
+            "should omit an unconfigured forwarder"
+        );
+        serde_json::from_value::<BaseRevisionSettings>(value)
+            .expect("should preserve backward compatibility without forwarder configuration");
+    }
     fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
         format!(
             "{}\n[trusted_client_ip]\nip_header = \"{ip_header}\"\nauth_header = \"{auth_header}\"\nshared_secret = \"{shared_secret}\"\n",
@@ -4015,6 +4700,8 @@ mod tests {
         const CANARY_EC_PARTNER_TS_PULL_TOKEN: &str = "CANARY-EC-PARTNER-TS-PULL-TOKEN-0123456789";
         const CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET: &str =
             "CANARY-TRUSTED-CLIENT-IP-SHARED-SECRET-0123456789";
+        const CANARY_TRUSTED_FORWARDER_SHARED_SECRET: &str =
+            "CANARY-TRUSTED-FORWARDER-SHARED-SECRET-0123456789";
         const CANARY_S3_ACCESS_KEY_ID: &str = "CANARY-S3-ACCESS-KEY-ID-0123456789";
         const CANARY_S3_SECRET_ACCESS_KEY: &str = "CANARY-S3-SECRET-ACCESS-KEY-0123456789";
         const CANARY_S3_SESSION_TOKEN: &str = "CANARY-S3-SESSION-TOKEN-0123456789";
@@ -4053,6 +4740,10 @@ mod tests {
             ip_header: "fastly-client-ip".to_string(),
             auth_header: "x-trusted-client-auth".to_string(),
             shared_secret: Redacted::new(CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET.to_string()),
+        });
+        settings.trusted_forwarder = Some(TrustedForwarderConfig {
+            auth_header: "x-ts-forwarder-auth".to_owned(),
+            shared_secret: Redacted::new(CANARY_TRUSTED_FORWARDER_SHARED_SECRET.to_string()),
         });
 
         let mut asset_route = ProxyAssetRoute::new("/s3-assets/", "https://s3.canary.example");
@@ -4118,6 +4809,10 @@ mod tests {
             (
                 "trusted_client_ip.shared_secret",
                 CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET,
+            ),
+            (
+                "trusted_forwarder.shared_secret",
+                CANARY_TRUSTED_FORWARDER_SHARED_SECRET,
             ),
             (
                 "proxy.asset_routes[].auth.access_key_id",
@@ -6305,6 +7000,25 @@ source_domain = "partner.example.com"
     }
 
     #[test]
+    fn legacy_env_loader_ignores_build_time_git_version() {
+        let toml_str = crate_test_settings_str();
+
+        for key in [
+            "TRUSTED_SERVER__GIT_VERSION",
+            "trusted_server__git_version",
+            "Trusted_Server__Git_Version",
+        ] {
+            for value in ["v0.0.0-example", ""] {
+                temp_env::with_var(key, Some(value), || {
+                    Settings::from_toml_and_env(&toml_str).expect(
+                        "should ignore the build-time git version input regardless of case",
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
     fn test_origin_host_header_override_env() {
         let env_key = format!(
             "{}{}PUBLISHER{}ORIGIN_HOST_HEADER_OVERRIDE",
@@ -6354,6 +7068,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
 
@@ -6365,6 +7081,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
 
@@ -6376,6 +7094,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -6387,6 +7107,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -6398,6 +7120,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
 
@@ -6409,6 +7133,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
     }
@@ -6422,6 +7148,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
 
         assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
@@ -6436,6 +7164,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: Some("www.example.com".to_string()),
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
 
         assert_eq!(publisher.origin_host_header(), "www.example.com");
@@ -6673,29 +7403,366 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn test_rewrite_is_excluded() {
-        let rewrite = Rewrite {
-            exclude_domains: vec!["cdn.example.com".to_string(), "*.example2.com".to_string()],
-        };
+    fn rewrite_policy_matches_exclude_patterns_case_insensitively() {
+        let mut rewrite = Rewrite::default();
+        rewrite
+            .exclude_domains
+            .extend(["cdn.example.com", "*.example.org"].map(str::to_owned));
 
-        // Exact domain match
-        assert!(rewrite.is_excluded("http://cdn.example.com/image.png"));
+        for (host, expected) in [
+            ("cdn.example.com", false),
+            ("CDN.EXAMPLE.COM", false),
+            ("example.org", false),
+            ("a.b.example.org", false),
+            ("evil-example.org", true),
+            ("example.org.evil.example.net", true),
+            ("sub.cdn.example.com", true),
+            ("other.example.com", true),
+        ] {
+            assert_eq!(
+                rewrite.should_proxy_asset(host),
+                expected,
+                "should_proxy_asset(`{host}`) should be {expected}"
+            );
+            assert_eq!(
+                rewrite.should_wrap_click(host),
+                expected,
+                "should_wrap_click(`{host}`) should be {expected}"
+            );
+        }
+    }
 
-        // Wildcard match - base domain
-        assert!(rewrite.is_excluded("https://example2.com/cdn.js"));
-        // Wildcard match - subdomains
-        assert!(rewrite.is_excluded("https://cdnjs.example2.com/lib.js"));
-        assert!(rewrite.is_excluded("https://sub.domain.example2.com/asset.js"));
+    #[test]
+    fn rewrite_normalize_trims_lowercases_and_drops_inert_exclude_entries() {
+        let mut rewrite = Rewrite::default();
+        rewrite
+            .exclude_domains
+            .extend(["  CDN.Example.com ", "", "*", "*.Example.ORG"].map(str::to_owned));
 
-        // Should NOT match
-        assert!(!rewrite.is_excluded("https://other.example.com/asset.js"));
-        assert!(!rewrite.is_excluded("https://sub.cdn.example.com/asset.js"));
-        assert!(!rewrite.is_excluded("https://example2.com.fake.com/asset.js"));
-        assert!(!rewrite.is_excluded("https://notexample.com/asset.js"));
+        rewrite.normalize();
 
-        // Invalid URLs should not crash and should return false
-        assert!(!rewrite.is_excluded("not a url"));
-        assert!(!rewrite.is_excluded(""));
+        assert_eq!(
+            rewrite.exclude_domains,
+            vec!["cdn.example.com".to_owned(), "*.example.org".to_owned()],
+            "should trim, lowercase, and drop empty and bare `*` entries"
+        );
+    }
+
+    #[test]
+    fn rewrite_exclude_domains_match_mixed_case_entries_from_toml() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            exclude_domains = ["CDN.Example.com"]
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert!(
+            !settings.rewrite.should_proxy_asset("cdn.example.com"),
+            "should exclude a host whose config entry was written in mixed case"
+        );
+    }
+
+    #[test]
+    fn settings_load_normalizes_rewrite_exclude_domains() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            exclude_domains = ["  CDN.Example.com ", "*", ""]
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert_eq!(
+            settings.rewrite.exclude_domains,
+            vec!["cdn.example.com".to_owned()],
+            "should trim, lowercase, and drop inert entries when settings load"
+        );
+    }
+
+    #[test]
+    fn rewrite_should_proxy_asset_honors_include_list() {
+        let mut rewrite = Rewrite::default();
+        rewrite
+            .include_domains
+            .extend(["*.example.com", "img.example.net", "*.UPPER.Example.org"].map(str::to_owned));
+        rewrite
+            .exclude_domains
+            .push("blocked.example.com".to_owned());
+
+        for (host, expected) in [
+            ("example.com", true),
+            ("a.b.example.com", true),
+            ("img.example.net", true),
+            ("IMG.EXAMPLE.NET", true),
+            ("cdn.upper.example.org", true),
+            ("evil-example.com", false),
+            ("cdn.example.org", false),
+            ("blocked.example.com", false),
+        ] {
+            assert_eq!(
+                rewrite.should_proxy_asset(host),
+                expected,
+                "should_proxy_asset(`{host}`) should be {expected}"
+            );
+        }
+        for host in ["cdn.example.org", "evil-example.com", "example.com"] {
+            assert!(
+                rewrite.should_wrap_click(host),
+                "should wrap click for `{host}` regardless of include_domains"
+            );
+        }
+        assert!(
+            !rewrite.should_wrap_click("blocked.example.com"),
+            "should not wrap a click to an excluded host"
+        );
+    }
+
+    #[test]
+    fn rewrite_exclude_domains_keep_entries_that_never_match() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            exclude_domains = ["https://cdn.example.com", "cdn.example.com:443", "[2001:0db8::1]"]
+            "#;
+
+        let settings = Settings::from_toml(&toml_str)
+            .expect("should load inert exclude_domains entries with a warning");
+
+        assert_eq!(
+            settings.rewrite.exclude_domains,
+            vec![
+                "https://cdn.example.com".to_owned(),
+                "cdn.example.com:443".to_owned(),
+                "[2001:0db8::1]".to_owned(),
+            ],
+            "should keep inert exclude_domains entries unchanged"
+        );
+    }
+
+    #[test]
+    fn rewrite_exclude_domains_warnings_omit_raw_values() {
+        let sentinel = "example-secret-sentinel";
+        let malformed = format!("https://example-user:{sentinel}@ads.example.com/path\u{7}");
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            exclude_domains = ["", "cdn.example.com", "https://example-user:example-secret-sentinel@ads.example.com/path\u0007"]
+            "#;
+        let configured: Vec<String> = vec![
+            String::new(),
+            "cdn.example.com".to_owned(),
+            malformed.clone(),
+        ];
+
+        let (normalized, warnings) = Rewrite::normalized_exclude_domains(&configured);
+        let settings = Settings::from_toml(&toml_str)
+            .expect("should load a malformed exclude_domains entry with a warning");
+
+        assert_eq!(
+            warnings,
+            vec![
+                "rewrite.exclude_domains: removed empty or bare \"*\" entries, which never match a host"
+                    .to_owned(),
+                "rewrite.exclude_domains[2] never matches a URL host (not a valid URL host); the entry is kept"
+                    .to_owned(),
+            ],
+            "should name the malformed entry by its index counted before the empty entry is dropped"
+        );
+        assert_eq!(
+            normalized,
+            vec!["cdn.example.com".to_owned(), malformed.to_ascii_lowercase()],
+            "should drop the empty entry and keep the malformed one"
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains(sentinel) && !warning.contains("ads.example.com")),
+            "should omit the credential sentinel and raw value from warnings"
+        );
+        assert_eq!(
+            settings.rewrite.exclude_domains,
+            vec!["cdn.example.com".to_owned(), malformed.to_ascii_lowercase()],
+            "should keep the malformed entry as an inert pattern"
+        );
+    }
+
+    #[test]
+    fn rewrite_exclude_domains_flag_only_entries_that_never_match() {
+        for entry in [
+            "https://cdn.example.com",
+            "cdn.example.com:443",
+            "[2001:0db8::1]",
+            "cdn.*.example.com",
+            ".example.com",
+            "bücher.example",
+        ] {
+            assert!(
+                Rewrite::check_exclude_domain(entry).is_err(),
+                "should flag `{entry}`, which never matches a URL host"
+            );
+        }
+        for entry in [
+            "blocked.example.com.",
+            "ads_cdn.example.com",
+            "*.192.0.2.1",
+            "*.example.com",
+            "[::1]",
+        ] {
+            assert!(
+                Rewrite::check_exclude_domain(entry).is_ok(),
+                "should not flag `{entry}`, which matches a URL host"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_report_the_bad_entry_and_reason() {
+        let err = validate_include_domains(&[
+            "assets.example.com".to_owned(),
+            "https://example-user:example-secret@cdn.example.com/path".to_owned(),
+        ])
+        .expect_err("should reject an entry with a scheme and credentials");
+
+        let params = format!("{:?}", err.params);
+        let message = err.message.expect("should set a message").into_owned();
+        assert!(
+            message.contains("rewrite.include_domains[1]") && message.contains("character outside"),
+            "should name the bad entry by index and give the reason: {message}"
+        );
+        assert!(
+            !message.contains("example-secret") && !params.contains("example-secret"),
+            "should keep the raw value out of the message and params: {message} {params}"
+        );
+    }
+
+    #[test]
+    fn rewrite_include_domains_report_non_ascii_entries_by_index() {
+        let err = validate_include_domains(&[
+            "assets.example.com".to_owned(),
+            "bücher.example".to_owned(),
+        ])
+        .expect_err("should reject a non-ASCII entry");
+
+        let params = format!("{:?}", err.params);
+        let message = err.message.expect("should set a message").into_owned();
+        assert!(
+            message.contains("rewrite.include_domains[1] is not ASCII"),
+            "should name the non-ASCII entry by index: {message}"
+        );
+        assert!(
+            !message.contains("bücher") && !params.contains("bücher"),
+            "should keep the raw value out of the message and params: {message} {params}"
+        );
+    }
+
+    #[test]
+    fn rewrite_include_domains_are_normalized_from_toml() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            include_domains = ["*.CDN.Example.com", "  img.example.net "]
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert_eq!(
+            settings.rewrite.include_domains,
+            vec!["*.cdn.example.com".to_owned(), "img.example.net".to_owned()],
+            "should trim and lowercase include_domains entries"
+        );
+    }
+
+    fn include_domains_toml(entry: &str) -> String {
+        crate_test_settings_str() + &format!("\n[rewrite]\ninclude_domains = [\"{entry}\"]\n")
+    }
+
+    #[test]
+    fn rewrite_include_domains_reject_malformed_entries() {
+        for entry in [
+            "",
+            "   ",
+            "*",
+            "*.",
+            "cdn.*.example.com",
+            "**.example.com",
+            "https://cdn.example.com",
+            "cdn.example.com:443",
+            "cdn.example.com/x",
+            ".example.com",
+            "example.com.",
+            "cdn..example.com",
+            "cdn example.com",
+            "0xc0000201",
+            "::1",
+            "[::1",
+            "[2001:0db8::1]",
+            "[::ffff:192.0.2.1]",
+            "xn--zz.example",
+            "*.192.0.2.1",
+            "192.0.2",
+            "256.0.2.1",
+        ] {
+            let result = Settings::from_toml(&include_domains_toml(entry));
+
+            let err = result.expect_err(&format!("should reject include_domains entry `{entry}`"));
+            assert!(
+                format!("{err:?}").contains("invalid_rewrite_include_domain"),
+                "should report `{entry}` as an invalid include_domains entry: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_reject_non_ascii_entries_with_a_punycode_hint() {
+        for entry in ["bücher.example", "*.bücher.example"] {
+            let result = Settings::from_toml(&include_domains_toml(entry));
+
+            let err = result.expect_err(&format!("should reject non-ASCII entry `{entry}`"));
+            assert!(
+                format!("{err:?}").contains("non_ascii_rewrite_include_domain"),
+                "should report `{entry}` as non-ASCII: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_accept_hosts_and_ip_literals() {
+        for entry in [
+            "cdn.example.com",
+            "*.example.com",
+            "xn--bcher-kva.example",
+            "cdn_assets.example.com",
+            "0xproxy",
+            "*.0xproxy",
+            "a.0xcdn",
+            "192.0.2.1",
+            "[2001:db8::1]",
+            "[::1]",
+            "[::ffff:c000:201]",
+        ] {
+            let settings =
+                Settings::from_toml(&include_domains_toml(entry)).unwrap_or_else(|err| {
+                    panic!("should accept include_domains entry `{entry}`: {err:?}")
+                });
+
+            assert_eq!(
+                settings.rewrite.include_domains,
+                vec![entry.to_owned()],
+                "should keep accepted entry `{entry}` as written"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_default_to_empty() {
+        let settings = create_test_settings();
+
+        assert!(
+            settings.rewrite.include_domains.is_empty(),
+            "should default include_domains to an empty list"
+        );
     }
 
     #[test]
@@ -6716,6 +7783,32 @@ source_domain = "partner.example.com"
             !settings.auction.sanitize_creatives,
             "creative sanitization is opt-in when the setting is omitted"
         );
+        assert_eq!(
+            settings.auction.rewrite_clicks, None,
+            "click rewriting stays unset when the setting is omitted"
+        );
+    }
+
+    #[test]
+    fn test_auction_rewrite_clicks_accepts_explicit_values() {
+        for value in [true, false] {
+            let toml_str = crate_test_settings_str()
+                + &format!(
+                    r#"
+            [auction]
+            enabled = true
+            rewrite_clicks = {value}
+            "#
+                );
+
+            let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+            assert_eq!(
+                settings.auction.rewrite_clicks,
+                Some(value),
+                "should parse explicit rewrite_clicks = {value}"
+            );
+        }
     }
 
     #[test]

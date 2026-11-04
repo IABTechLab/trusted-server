@@ -1,5 +1,8 @@
 import { log } from '../../core/log';
 import type { GptDiagnosticsApi, TsjsApi } from '../../core/types';
+import { createTraceHandoff } from '../../trace/handoff';
+import type { TraceHandoff } from '../../trace/handoff';
+import { getActiveTraceCollector } from '../../trace/runtime';
 
 import { GptDiagnosticsApiController } from './api';
 import { GptDiagnosticsBadgeManager } from './badges';
@@ -47,11 +50,19 @@ export function installGptDiagnosticsRuntime(
   let overlay: GptDiagnosticsOverlay | undefined;
   let slotSizeObserver: GptDiagnosticsSlotSizeObserver | undefined;
   let apiController: GptDiagnosticsApiController | undefined;
+  let traceHandoff: TraceHandoff | undefined;
 
   try {
     if (!target.tsjs) throw new Error('TSJS core API unavailable');
 
-    const store = new GptDiagnosticsStore();
+    const store = new GptDiagnosticsStore(
+      target.__tsjs_trace_active === true
+        ? {
+            onTraceCorrelation: (value) =>
+              getActiveTraceCollector(target)?.recordCorrelation(value),
+          }
+        : {}
+    );
     const observer = new GptDiagnosticsObserver(store, { window: target });
     bindings = new GptDiagnosticsBindingManager(store, {
       window: target,
@@ -66,6 +77,12 @@ export function installGptDiagnosticsRuntime(
       window: target,
       document: target.document,
       onExport: () => apiController?.api.export(),
+      ...(target.__tsjs_trace_active === true
+        ? {
+            onViewTrace: () => traceHandoff?.view(),
+            onDownloadTrace: () => traceHandoff?.download(),
+          }
+        : {}),
       onBadgeLayerChange: (layer) => badges?.setLayer(layer),
     });
     apiController = new GptDiagnosticsApiController(store, bindings, overlay, {
@@ -79,6 +96,8 @@ export function installGptDiagnosticsRuntime(
     const runtime: GptDiagnosticsRuntime = {
       api,
       destroy: () => {
+        traceHandoff?.destroy();
+        traceHandoff = undefined;
         if (target.tsjs?.gptDiagnostics === api) delete target.tsjs.gptDiagnostics;
         if (target.tsjs?.gptDiagnosticsRecorder === recorder) {
           delete target.tsjs.gptDiagnosticsRecorder;
@@ -93,9 +112,17 @@ export function installGptDiagnosticsRuntime(
     };
     target.tsjs.gptDiagnostics = api;
     target.tsjs.gptDiagnosticsRecorder = recorder;
+    if (target.__tsjs_trace_active === true) {
+      traceHandoff = createTraceHandoff({
+        target,
+        onChange: (state) => overlay?.setTraceState(state),
+      });
+    }
     target.__tsjs_gpt_diagnostics_runtime = runtime;
     return api;
   } catch (error) {
+    traceHandoff?.destroy();
+    traceHandoff = undefined;
     apiController?.destroy();
     overlay?.destroy();
     badges?.destroy();

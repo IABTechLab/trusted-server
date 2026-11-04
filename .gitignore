@@ -23,6 +23,8 @@
 # env
 .env*
 trusted-server.toml
+# partial copies left if the ts CLI config writer is killed mid-write
+.ts-write-*
 js-assets.toml
 
 # backup
@@ -63,3 +65,6 @@ src/*.html
 # leftover local build artifacts (node_modules, target, dist) that remain on disk.
 /crates/js/
 /crates/integration-tests/
+
+# Documentation proposal workflow scratch space
+/.docs-proposal/
