@@ -342,6 +342,20 @@ register routes or rewrite HTML until you set
 runtime-injected scripts; JS Asset Proxy only rewrites matching script `src` URLs
 present in HTML processed by Trusted Server.
 
+The audit also extracts the public lockr app ID from rendered page metadata:
+
+```html
+<meta name="lockr-signin-app_id" content="example-app-id" />
+```
+
+It trims the `content` value and records a nonempty ID as `lockr_app_id` in
+`js-assets.toml`, alongside the metadata source evidence. The draft config fills
+`[integrations.lockr].app_id` but explicitly sets `enabled = false`. Missing or
+empty IDs are not populated; detected lockr remains on the manual-review path.
+Finding an ID does not verify SDK/API behavior on another serving domain.
+Complete the [Lockr verification checks](/guide/integrations/lockr#verification)
+before enabling it.
+
 If a config already exists, avoid overwriting it:
 
 ```bash
