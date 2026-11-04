@@ -174,6 +174,7 @@ impl LookupTransport for PlatformLookupTransport<'_> {
             url,
             headers,
             body,
+            context: _,
         } = request;
         let host = url
             .host_str()
@@ -317,6 +318,7 @@ mod tests {
             url: url::Url::parse(&format!("https://ids.example.com/{path}")).expect("should parse"),
             headers: http::HeaderMap::new(),
             body: bytes::Bytes::new(),
+            context: None,
         }
     }
 

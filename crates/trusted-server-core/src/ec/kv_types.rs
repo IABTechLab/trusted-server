@@ -157,6 +157,15 @@ impl KvPartnerId {
         !self.eids.is_empty()
     }
 
+    /// Whether a UID in the record asks its provider for a refresh by `now`.
+    #[must_use]
+    pub fn refresh_due(&self, now: UnixSeconds) -> bool {
+        self.eids
+            .iter()
+            .flat_map(KvEid::uids)
+            .any(|uid| uid.refresh_due(now))
+    }
+
     /// Whether the record holds a UID that may be served at `now`.
     #[must_use]
     pub fn has_live_uid(&self, now: UnixSeconds) -> bool {
@@ -338,6 +347,29 @@ pub struct KvUid {
         skip_serializing_if = "Expiry::is_never"
     )]
     expiry: Expiry,
+    /// Private refresh state; never served, mirrored or forwarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh: Option<KvRefresh>,
+}
+
+/// Refresh state a provider keeps with one of its UIDs.
+///
+/// It stays in the row only: outbound EIDs are built from the UID's `id`,
+/// `atype` and `ext`, so this state never reaches bidders or cookies.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct KvRefresh {
+    /// Provider-defined state, opaque to the framework.
+    pub state: String,
+    /// When the owning provider should be asked to refresh the UID.
+    pub from: UnixSeconds,
+}
+
+impl core::fmt::Debug for KvRefresh {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("KvRefresh")
+            .field("from", &self.from)
+            .finish_non_exhaustive()
+    }
 }
 
 impl KvUid {
@@ -356,7 +388,34 @@ impl KvUid {
             ext,
             owner,
             expiry,
+            refresh: None,
         }
+    }
+
+    /// Attaches the owning provider's private refresh state.
+    #[must_use]
+    pub fn with_refresh(mut self, refresh: KvRefresh) -> Self {
+        self.refresh = Some(refresh);
+        self
+    }
+
+    /// The owning provider's private refresh state.
+    #[must_use]
+    pub fn refresh(&self) -> Option<&KvRefresh> {
+        self.refresh.as_ref()
+    }
+
+    /// Whether the owning provider asked to refresh this live UID by `now`.
+    ///
+    /// An expired UID is never refresh-due: its source is due anyway, and a
+    /// refresh that keeps failing must not outlive the UID.
+    #[must_use]
+    pub fn refresh_due(&self, now: UnixSeconds) -> bool {
+        self.is_live(now)
+            && self
+                .refresh
+                .as_ref()
+                .is_some_and(|refresh| refresh.from <= now)
     }
 
     /// The UID value.
@@ -1731,5 +1790,33 @@ mod tests {
 
             assert!(entry.validate().is_err(), "should reject oversized {field}");
         }
+    }
+
+    #[test]
+    fn refresh_is_due_only_while_the_uid_is_live() {
+        let uid = KvUid::new(
+            UidValue::try_from("p-1").expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            None,
+            Expiry::At(UnixSeconds::new(5000)),
+        )
+        .with_refresh(KvRefresh {
+            state: "refresh-state".to_owned(),
+            from: UnixSeconds::new(1000),
+        });
+
+        assert!(
+            !uid.refresh_due(UnixSeconds::new(999)),
+            "should wait for `from`"
+        );
+        assert!(
+            uid.refresh_due(UnixSeconds::new(1000)),
+            "should be due at `from`"
+        );
+        assert!(
+            !uid.refresh_due(UnixSeconds::new(5000)),
+            "should stop refreshing once the UID expires"
+        );
     }
 }

@@ -63,6 +63,9 @@ pub enum SkipReason {
     Destination,
     /// The provider's hourly rate limit is reached.
     RateLimited,
+    /// The vendor reports an opt-out; the provider's stored UIDs are
+    /// removed.
+    OptedOut,
 }
 
 /// One outcome per provider per navigation.
@@ -106,6 +109,7 @@ impl LookupStatus {
             Self::Skipped(SkipReason::Input) => "skipped_input",
             Self::Skipped(SkipReason::RateLimited) => "skipped_rate_limited",
             Self::Skipped(SkipReason::Destination) => "destination_rejected",
+            Self::Skipped(SkipReason::OptedOut) => "skipped_opted_out",
         }
     }
 }
@@ -119,6 +123,9 @@ pub struct ProviderLookup {
     pub status: LookupStatus,
     /// Validated entries per returned source; empty unless `Found`.
     pub entries: Vec<(SourceDomain, Vec<KvEid>)>,
+    /// Sources whose stored records are removed, because the user opted
+    /// out of the provider; empty unless `Skipped(OptedOut)`.
+    pub cleared: Vec<SourceDomain>,
 }
 
 /// Validated results of one navigation's lookups.

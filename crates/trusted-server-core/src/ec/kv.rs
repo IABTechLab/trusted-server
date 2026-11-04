@@ -22,7 +22,7 @@ use crate::error::TrustedServerError;
 use super::generation::ec_hash;
 use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use super::kv_types::{KvEntry, KvMetadata, KvNetwork, MAX_ENTRY_BYTES};
-use super::page_load::{KvWriteError, PageLoadWrite, RowChange};
+use super::page_load::{AfterResponseWrite, Generation, KvWriteError, PageLoadWrite, RowChange};
 use super::{EcKvSnapshot, current_timestamp, log_id};
 
 /// Maximum number of CAS retry attempts before giving up.
@@ -389,23 +389,61 @@ impl KvIdentityGraph {
                 EcKvWriteMode::IfGenerationMatch(expected.get()),
             ),
         };
+        self.write_row(ec_id, &entry, ttl, mode)?;
+        if is_tombstone {
+            // Deliberate exception to the one-write-per-page-load rule:
+            // the withdrawal-completion marker is a separate key that
+            // predates the rule. Later withdrawals use it to avoid a
+            // strongly consistent existence check on a row already
+            // withdrawn, and it never touches the identity row.
+            self.record_withdrawal_completion(ec_id, entry.consent.updated);
+        }
+        Ok(entry)
+    }
+
+    /// Applies a navigation's follow-up update after its response was sent.
+    ///
+    /// The row is replaced only while it is still at `expected`, so a
+    /// concurrent write is never overwritten. The `permit` is consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvWriteError::Conflict`] when the row changed since it was
+    /// read, or [`KvWriteError::Store`] on a serialization or store failure,
+    /// including a row over [`MAX_ENTRY_BYTES`]. Callers must not retry.
+    pub fn commit_after_response(
+        &self,
+        permit: AfterResponseWrite,
+        ec_id: &str,
+        entry: &KvEntry,
+        expected: Generation,
+    ) -> Result<(), Report<KvWriteError>> {
+        permit.spend();
+        self.write_row(
+            ec_id,
+            entry,
+            ENTRY_TTL,
+            EcKvWriteMode::IfGenerationMatch(expected.get()),
+        )
+    }
+
+    /// Serializes `entry` and writes it with `mode`, mapping a failed
+    /// precondition to [`KvWriteError::AlreadyExists`] for a create and
+    /// [`KvWriteError::Conflict`] otherwise.
+    fn write_row(
+        &self,
+        ec_id: &str,
+        entry: &KvEntry,
+        ttl: Duration,
+        mode: EcKvWriteMode,
+    ) -> Result<(), Report<KvWriteError>> {
         let (body, metadata) =
-            Self::serialize_entry(&entry, self.store_name()).change_context(KvWriteError::Store)?;
+            Self::serialize_entry(entry, self.store_name()).change_context(KvWriteError::Store)?;
         let outcome = self
             .write_entry(ec_id, &body, &metadata, ttl, mode)
             .change_context(KvWriteError::Store)?;
         match outcome {
-            EcKvWriteOutcome::Written => {
-                if is_tombstone {
-                    // Deliberate exception to the one-write-per-page-load rule:
-                    // the withdrawal-completion marker is a separate key that
-                    // predates the rule. Later withdrawals use it to avoid a
-                    // strongly consistent existence check on a row already
-                    // withdrawn, and it never touches the identity row.
-                    self.record_withdrawal_completion(ec_id, entry.consent.updated);
-                }
-                Ok(entry)
-            }
+            EcKvWriteOutcome::Written => Ok(()),
             EcKvWriteOutcome::PreconditionFailed => Err(Report::new(match mode {
                 EcKvWriteMode::Add => KvWriteError::AlreadyExists,
                 _ => KvWriteError::Conflict,

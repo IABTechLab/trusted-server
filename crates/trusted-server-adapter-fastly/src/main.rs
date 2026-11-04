@@ -13,12 +13,16 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
+use trusted_server_core::ec::after_response::commit_after_response_lookups;
 use trusted_server_core::ec::coordinator::IdentityCoordinator as _;
+use trusted_server_core::ec::coordinator::LookupContext;
 use trusted_server_core::ec::coordinator::transport::PlatformLookupTransport;
 use trusted_server_core::ec::device::DeviceSignals;
+use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::page_load::NavigationPermit;
+use trusted_server_core::ec::provider::ClientSignals;
 use trusted_server_core::ec::pull_sync::{
     PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
 };
@@ -31,7 +35,7 @@ use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::trace::{TraceTerminalResponse, is_trace_path};
 use trusted_server_core::version_header::{apply_git_version_header, git_version_header_value};
-use trusted_server_identity_providers::partner_registry;
+use trusted_server_identity_providers::{build_after_response_coordinator, partner_registry};
 
 mod app;
 mod backend;
@@ -48,8 +52,8 @@ mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    AppState, EcFinalizeState, IdentityLookups, RuntimeStoreConfig, TrustedServerApp,
-    load_settings_from_config_store, take_identity_lookups,
+    AfterResponseLookups, AppState, EcFinalizeState, IdentityLookups, NavigationLookups,
+    RuntimeStoreConfig, TrustedServerApp, load_settings_from_config_store, take_navigation_lookups,
 };
 use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
@@ -496,7 +500,7 @@ fn edgezero_main(
             }
             core_req.extensions_mut().insert(client_info);
             // Drop lookups a previous request on this sandbox left behind.
-            drop(take_identity_lookups());
+            drop(take_navigation_lookups());
             match futures::executor::block_on(app.router().oneshot(core_req)) {
                 Ok(response) => response,
                 Err(error) => edge_error_response(error),
@@ -525,7 +529,10 @@ fn edgezero_main(
     let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
     // Identity lookups dispatched on a publisher navigation are collected in
     // EC finalization, after the router's executor has returned.
-    let identity = take_identity_lookups();
+    let NavigationLookups {
+        page: identity,
+        after_response,
+    } = take_navigation_lookups();
     let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
     let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
 
@@ -567,6 +574,12 @@ fn edgezero_main(
                         counters.as_ref(),
                     );
                     run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
+                    run_after_response_lookups(
+                        settings,
+                        &partner_registry,
+                        &mut ec_state,
+                        after_response,
+                    );
                     return;
                 }
                 Err(e) => {
@@ -595,6 +608,12 @@ fn edgezero_main(
                                 &settings,
                                 &partner_registry,
                                 &ec_state,
+                            );
+                            run_after_response_lookups(
+                                &settings,
+                                &partner_registry,
+                                &mut ec_state,
+                                after_response,
                             );
                             return;
                         }
@@ -733,6 +752,79 @@ fn run_edgezero_pull_sync_after_send(
         &context,
         &ec_state.services,
     );
+}
+
+/// Runs after-response identity lookups and applies their follow-up write.
+///
+/// Called once the response has been sent, so provider latency never delays
+/// the page. Skipped unless finalize confirmed the navigation (it issues the
+/// follow-up permit) and the EC is still the one the lookups were prepared
+/// for.
+fn run_after_response_lookups(
+    settings: &Settings,
+    partner_registry: &PartnerRegistry,
+    ec_state: &mut EcFinalizeState,
+    lookups: Option<AfterResponseLookups>,
+) {
+    let Some(lookups) = lookups else {
+        return;
+    };
+    let Some(permit) = ec_state.ec_context.take_after_response_permit() else {
+        log::debug!(
+            "After-response lookups skipped: no permit (consent, redirect or failed page-load write)"
+        );
+        return;
+    };
+    if ec_state.ec_context.ec_value() != Some(lookups.ec_id.as_str()) {
+        log::debug!("After-response lookups skipped: EC changed during the request");
+        return;
+    }
+    let coordinator = match build_after_response_coordinator(settings) {
+        Ok(Some(coordinator)) => coordinator,
+        Ok(None) => return,
+        Err(report) => {
+            log::error!("After-response identity providers disabled for this request: {report:?}");
+            return;
+        }
+    };
+    let Some(graph) = maybe_identity_graph(settings) else {
+        return;
+    };
+    let snapshot = graph.load_snapshot(&lookups.ec_id);
+    let transport =
+        PlatformLookupTransport::new(&ec_state.services, settings.proxy.certificate_check);
+    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let pending = futures::executor::block_on(coordinator.dispatch(
+        &transport,
+        &LookupContext {
+            ec_id: &lookups.ec_id,
+            snapshot: &snapshot,
+            consent: ec_state.ec_context.consent(),
+            client: ClientSignals {
+                ip: lookups.client_ip,
+                user_agent: lookups.user_agent.as_deref(),
+            },
+            publisher_domain: &settings.publisher.domain,
+            rate_limiter: &limiter,
+            now: UnixSeconds::new(now),
+        },
+    ));
+    if pending.is_empty() {
+        return;
+    }
+    let results = futures::executor::block_on(coordinator.collect(&transport, pending));
+    let outcome = commit_after_response_lookups(
+        &graph,
+        permit,
+        partner_registry,
+        &lookups.ec_id,
+        &snapshot,
+        &results,
+    );
+    log::info!("After-response lookups: write outcome={outcome}");
 }
 
 fn prepare_pull_sync_after_send<F>(

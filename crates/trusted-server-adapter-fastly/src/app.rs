@@ -148,7 +148,7 @@ use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
-use trusted_server_core::settings::{ProxyAssetRoute, Settings};
+use trusted_server_core::settings::{CollectTiming, ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
@@ -368,31 +368,97 @@ pub(crate) struct EcFinalizeState {
 }
 
 /// Identity lookups dispatched for this navigation, collected before finalize.
-///
-/// In-flight platform requests are not `Send`, so they cannot ride in
-/// response extensions with [`EcFinalizeState`]. They travel through a
-/// request-local slot instead: the entry point clears it before routing and
-/// takes it after the router returns.
 pub(crate) struct IdentityLookups {
     pub(crate) coordinator: ProviderCoordinator,
     pub(crate) pending: PendingLookups<PlatformPendingRequest>,
 }
 
+/// What a navigation's after-response identity lookups need once the response
+/// has been sent.
+///
+/// The router owns the request, so the request signals the providers read are
+/// copied here. The coordinator is built and the lookups dispatched only after
+/// the response, so neither delays the page.
+pub(crate) struct AfterResponseLookups {
+    pub(crate) ec_id: String,
+    pub(crate) client_ip: Option<IpAddr>,
+    pub(crate) user_agent: Option<String>,
+}
+
+/// Identity work a navigation hands to the entry point.
+///
+/// In-flight platform requests are not `Send`, so they cannot ride in
+/// response extensions with [`EcFinalizeState`]. They travel through one
+/// request-local slot instead: the entry point clears it before routing and
+/// takes it after the router returns.
+#[derive(Default)]
+pub(crate) struct NavigationLookups {
+    /// Page-phase lookups, collected before EC finalization.
+    pub(crate) page: Option<IdentityLookups>,
+    /// After-response lookups, dispatched once the response has been sent.
+    pub(crate) after_response: Option<AfterResponseLookups>,
+}
+
 thread_local! {
-    static PENDING_IDENTITY_LOOKUPS: RefCell<Option<IdentityLookups>> = const { RefCell::new(None) };
+    static NAVIGATION_LOOKUPS: RefCell<NavigationLookups> = RefCell::new(NavigationLookups::default());
 }
 
-/// Stores this request's dispatched identity lookups for the entry point.
-fn stash_identity_lookups(lookups: IdentityLookups) {
-    PENDING_IDENTITY_LOOKUPS.with(|slot| *slot.borrow_mut() = Some(lookups));
-}
-
-/// Takes the identity lookups dispatched for the current request, if any.
+/// Takes the identity work stored for the current request.
 ///
 /// The entry point calls this before routing (discarding anything a prior
 /// request left behind) and after the router returns.
-pub(crate) fn take_identity_lookups() -> Option<IdentityLookups> {
-    PENDING_IDENTITY_LOOKUPS.with(|slot| slot.borrow_mut().take())
+pub(crate) fn take_navigation_lookups() -> NavigationLookups {
+    NAVIGATION_LOOKUPS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+/// Request signals lent to identity providers.
+struct ProviderRequestSignals<'a> {
+    client_ip: Option<IpAddr>,
+    user_agent: Option<&'a str>,
+}
+
+impl<'a> ProviderRequestSignals<'a> {
+    fn read(req: &'a Request, ec: &EcRequestState) -> Self {
+        Self {
+            client_ip: ec
+                .ec_context
+                .client_ip()
+                .and_then(|ip| ip.parse::<IpAddr>().ok()),
+            user_agent: req
+                .headers()
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+        }
+    }
+}
+
+/// Captures the request signals for after-response identity lookups on a
+/// permitted publisher navigation.
+///
+/// Returns `None` when no after-response provider is enabled, the request has
+/// no EC, or the identity graph is unavailable.
+fn prepare_after_response_lookups(
+    state: &AppState,
+    req: &Request,
+    ec: &EcRequestState,
+) -> Option<AfterResponseLookups> {
+    let has_after_response_provider = state
+        .settings
+        .ec
+        .identity_providers
+        .iter()
+        .any(|config| config.enabled && config.collect == CollectTiming::AfterResponse);
+    if !has_after_response_provider {
+        return None;
+    }
+    ec.kv_graph.as_ref()?;
+    let ec_id = ec.ec_context.ec_value()?.to_owned();
+    let signals = ProviderRequestSignals::read(req, ec);
+    Some(AfterResponseLookups {
+        ec_id,
+        client_ip: signals.client_ip,
+        user_agent: signals.user_agent.map(str::to_owned),
+    })
 }
 
 /// Starts identity-provider lookups for a permitted publisher navigation.
@@ -438,14 +504,7 @@ async fn dispatch_identity_lookups(
     }
     let transport = PlatformLookupTransport::new(services, state.settings.proxy.certificate_check);
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    let client_ip = ec
-        .ec_context
-        .client_ip()
-        .and_then(|ip| ip.parse::<IpAddr>().ok());
-    let user_agent = req
-        .headers()
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok());
+    let signals = ProviderRequestSignals::read(req, ec);
     let now = trusted_server_core::ec::current_timestamp();
     let pending = coordinator
         .dispatch(
@@ -455,8 +514,8 @@ async fn dispatch_identity_lookups(
                 snapshot: ec.ec_context.kv_snapshot(),
                 consent: ec.ec_context.consent(),
                 client: ClientSignals {
-                    ip: client_ip,
-                    user_agent,
+                    ip: signals.client_ip,
+                    user_agent: signals.user_agent,
                 },
                 publisher_domain: &state.settings.publisher.domain,
                 rate_limiter: &limiter,
@@ -1011,7 +1070,15 @@ async fn dispatch_fallback(
             && has_permit
             && let Some(lookups) = dispatch_identity_lookups(state, services, &req, &mut ec).await
         {
-            stash_identity_lookups(lookups);
+            NAVIGATION_LOOKUPS.with(|slot| slot.borrow_mut().page = Some(lookups));
+        }
+        // After-response providers only capture request signals here; they
+        // are built and dispatched once the response has been sent.
+        if is_publisher_navigation
+            && has_permit
+            && let Some(lookups) = prepare_after_response_lookups(state, &req, &ec)
+        {
+            NAVIGATION_LOOKUPS.with(|slot| slot.borrow_mut().after_response = Some(lookups));
         }
 
         // Run the server-side auction with the configured creative-
@@ -2850,7 +2917,7 @@ mod tests {
 
         let _state = take_finalize_state(&mut response);
         assert!(
-            super::take_identity_lookups().is_none(),
+            super::take_navigation_lookups().page.is_none(),
             "should dispatch no identity lookups without enabled providers"
         );
     }
@@ -2922,6 +2989,7 @@ mod tests {
                 url: url::Url::parse("https://ids.example.com/lookup").expect("should parse"),
                 headers: edgezero_core::http::HeaderMap::new(),
                 body: Bytes::new(),
+                context: None,
             })
         }
 
@@ -2942,6 +3010,7 @@ mod tests {
                     atype: None,
                     ext: None,
                     expiry: ProviderExpiry::Unspecified,
+                    refresh: None,
                 }],
             }]))
         }

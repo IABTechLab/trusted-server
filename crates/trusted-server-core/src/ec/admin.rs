@@ -395,6 +395,7 @@ fn build_lookup_response(
     match serde_json::from_slice::<JsonValue>(&lookup.body) {
         Ok(mut entry_json) => {
             add_iso_timestamp_companions(&mut entry_json);
+            redact_refresh_state(&mut entry_json);
             payload.entry = Some(entry_json);
 
             match serde_json::from_slice::<KvEntry>(&lookup.body) {
@@ -468,6 +469,30 @@ fn add_iso_timestamp_companions(entry_json: &mut JsonValue) {
                 .entry("updated_iso".to_owned())
                 .or_insert(JsonValue::String(iso));
         }
+    }
+}
+
+/// Placeholder served in place of a provider's private refresh state.
+const REDACTED: &str = "[redacted]";
+
+/// Replaces every provider refresh `state` in the entry with [`REDACTED`].
+///
+/// Refresh state can hold a provider credential (for example a refresh
+/// token), so the admin view shows only that it exists and when it is due.
+fn redact_refresh_state(value: &mut JsonValue) {
+    match value {
+        JsonValue::Object(object) => {
+            if let Some(state) = object
+                .get_mut("refresh")
+                .and_then(JsonValue::as_object_mut)
+                .and_then(|refresh| refresh.get_mut("state"))
+            {
+                *state = JsonValue::String(REDACTED.to_owned());
+            }
+            object.values_mut().for_each(redact_refresh_state);
+        }
+        JsonValue::Array(items) => items.iter_mut().for_each(redact_refresh_state),
+        _ => {}
     }
 }
 
@@ -1584,5 +1609,27 @@ mod tests {
         assert_eq!(view.skipped.len(), 1, "should report the expired record");
         assert_eq!(view.skipped[0].source_domain, "expired.example");
         assert_eq!(view.skipped[0].reason, "expired", "should report expiry");
+    }
+
+    #[test]
+    fn redacts_provider_refresh_state() {
+        let mut entry = serde_json::json!({
+            "ids": {"token.example": {"eids": [{"source": "token.example", "uids": [
+                {"id": "token", "refresh": {"state": "secret-refresh", "from": 1_000}}
+            ]}]}}
+        });
+
+        redact_refresh_state(&mut entry);
+
+        let refresh = &entry["ids"]["token.example"]["eids"][0]["uids"][0]["refresh"];
+        assert_eq!(refresh["state"], REDACTED, "should hide the refresh state");
+        assert_eq!(
+            refresh["from"], 1_000,
+            "should keep when the refresh is due"
+        );
+        assert_eq!(
+            entry["ids"]["token.example"]["eids"][0]["uids"][0]["id"], "token",
+            "should keep the UID"
+        );
     }
 }

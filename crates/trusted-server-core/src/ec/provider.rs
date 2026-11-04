@@ -57,6 +57,17 @@ pub trait IdentityProvider {
         &self,
         response: ProviderResponse<'body>,
     ) -> Result<LookupOutcome<'body>, Report<ProviderError>>;
+
+    /// Creates IDs for due sources without a lookup, for a provider whose
+    /// IDs the operator owns rather than a vendor server.
+    ///
+    /// Runs when a source is due. A returned entry goes through the same
+    /// validation and write plan as a lookup result, and no request is built.
+    /// The default creates nothing.
+    fn generate(&self, lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
+        let _ = lookup;
+        None
+    }
 }
 
 impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
@@ -76,6 +87,10 @@ impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
         response: ProviderResponse<'body>,
     ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
         (**self).parse_response(response)
+    }
+
+    fn generate(&self, lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
+        (**self).generate(lookup)
     }
 }
 
@@ -206,6 +221,9 @@ pub struct ProviderRequest {
     pub headers: http::HeaderMap,
     /// Request body.
     pub body: bytes::Bytes,
+    /// Provider state returned with the response in
+    /// [`ProviderResponse::context`]; never sent.
+    pub context: Option<String>,
 }
 
 impl fmt::Debug for ProviderRequest {
@@ -226,6 +244,8 @@ pub struct ProviderResponse<'body> {
     pub headers: &'body http::HeaderMap,
     /// Response body.
     pub body: &'body [u8],
+    /// The [`ProviderRequest::context`] of the request this answers.
+    pub context: Option<&'body str>,
 }
 
 /// A parsed provider response.
@@ -235,6 +255,8 @@ pub enum LookupOutcome<'body> {
     Found(Vec<ProviderEid<'body>>),
     /// The provider knows no ID for this visitor.
     NoMatch,
+    /// The visitor opted out with the provider; its stored UIDs are removed.
+    OptedOut,
 }
 
 /// One entry as returned by a provider, before validation.
@@ -265,6 +287,28 @@ pub struct ProviderUid<'body> {
     pub ext: Option<&'body RawValue>,
     /// Expiry as the provider states it.
     pub expiry: ProviderExpiry,
+    /// Private refresh state kept with the UID in the row and never served.
+    pub refresh: Option<ProviderRefresh<'body>>,
+}
+
+/// Refresh state a provider asks the framework to keep with a UID.
+///
+/// The stored UID's source becomes due again at `from`, and the state is
+/// handed back through [`LookupInput::current`]. `Debug` hides the state,
+/// which may hold a credential.
+pub struct ProviderRefresh<'body> {
+    /// Provider-defined state, such as a refresh token.
+    pub state: Cow<'body, str>,
+    /// When the provider should be asked to refresh the UID.
+    pub from: ProviderExpiry,
+}
+
+impl fmt::Debug for ProviderRefresh<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderRefresh")
+            .field("from", &self.from)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Expiry as a provider states it. The coordinator turns it into
@@ -587,6 +631,7 @@ mod tests {
                 .expect("should parse"),
             headers,
             body: bytes::Bytes::new(),
+            context: None,
         };
 
         let printed = format!("{request:?}");
