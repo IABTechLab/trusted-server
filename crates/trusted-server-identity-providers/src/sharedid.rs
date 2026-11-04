@@ -6,6 +6,12 @@
 //! (agent type 1) EID. The opt-out cookie `_pubcid_optout` reports an
 //! opt-out, which removes a stored `SharedID`.
 //! No server call is made.
+//!
+//! `SharedID` is a publisher first-party ID with no vendor server, so when
+//! the cookies hold none and no live `SharedID` is stored, Trusted Server
+//! generates one itself: a random UUID v4, stored in the row only. No cookie
+//! is set, so Prebid's own cookie is never touched; when Prebid later writes
+//! one, the cookie's ID replaces the generated one.
 
 use std::borrow::Cow;
 
@@ -14,11 +20,14 @@ use serde::Deserialize;
 use trusted_server_core::ec::eid_types::SourceDomain;
 use trusted_server_core::ec::provider::{
     CookieRead, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities, ProviderCommon,
-    ProviderConfigError, ProviderError, ProviderKind, ProviderRequest, ProviderResponse,
-    RequestCookies,
+    ProviderConfigError, ProviderEid, ProviderError, ProviderKind, ProviderRequest,
+    ProviderResponse, RequestCookies,
 };
+use uuid::Uuid;
 
-use crate::common::{CookieReader, bounded_expiry, cookie_capabilities, device_eid, is_usable_id};
+use crate::common::{
+    CookieReader, MAX_TTL, bounded_expiry, cookie_capabilities, device_eid, is_usable_id,
+};
 
 /// Cookie Prebid sets when the user opts out of `SharedID`.
 const OPT_OUT_COOKIE: &str = "_pubcid_optout";
@@ -109,12 +118,22 @@ impl IdentityProvider for SharedIdProvider {
             bounded_expiry(None),
         )])
     }
+
+    fn generate(&self, _lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
+        Some(vec![device_eid(
+            &self.source,
+            Cow::Owned(Uuid::new_v4().to_string()),
+            // A generated ID has no cookie to renew it, so it keeps the
+            // longest lifetime rather than changing every day.
+            bounded_expiry(Some(MAX_TTL)),
+        )])
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use trusted_server_core::ec::provider::build_kind;
+    use trusted_server_core::ec::provider::{ProviderExpiry, build_kind};
     use trusted_server_core::settings::{IdentityProviderConfig, ProviderSecrets};
 
     use super::*;
@@ -170,5 +189,43 @@ mod tests {
         for header in ["_sharedid=", "_sharedid=0", "other=1"] {
             assert!(read(header).is_none(), "should ignore {header}");
         }
+    }
+
+    #[test]
+    fn generates_a_random_uuid_when_none_is_held() {
+        let consent = trusted_server_core::consent::ConsentContext::default();
+        let lookup = LookupInput {
+            ec_id: "ec-example",
+            consent: &consent,
+            client: trusted_server_core::ec::provider::ClientSignals {
+                ip: None,
+                user_agent: None,
+            },
+            publisher_domain: "www.example.com",
+            due_sources: &[],
+            current: trusted_server_core::ec::provider::OwnedEntries::new(None, &[]),
+            cookies: RequestCookies::default(),
+            hashed_email: None,
+        };
+        let provider = provider();
+
+        let first = provider.generate(&lookup).expect("should generate an ID");
+        let second = provider.generate(&lookup).expect("should generate an ID");
+
+        let uid = &first[0].uids[0];
+        assert_eq!(
+            first[0].source, "sharedid.example.com",
+            "should use the source"
+        );
+        assert_eq!(uid.atype, Some(1), "should be device-based");
+        assert!(
+            Uuid::parse_str(&uid.id).is_ok_and(|id| id.get_version_num() == 4),
+            "should be a UUID v4"
+        );
+        assert_ne!(uid.id, second[0].uids[0].id, "should be random");
+        assert!(
+            matches!(uid.expiry, ProviderExpiry::After(ttl) if ttl == MAX_TTL),
+            "should keep a generated ID for the longest TTL"
+        );
     }
 }

@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented; checkboxes are not updated.
+
 **Goal:** Store Yahoo ConnectID from Yahoo's own first-party cookie, as an `[[ec.identity_providers]]` entry with `kind = "connectid"`. No login and no server call.
 
 **Architecture:** `crates/trusted-server-identity-providers/src/connectid.rs` holds `ConnectId` (a `ProviderKind`), `ConnectIdSettings` and `ConnectIdProvider`. The provider implements only `IdentityProvider::read_request_cookies`, using the cookie helpers in `common.rs`; `build_request` always fails, so no lookup is sent.

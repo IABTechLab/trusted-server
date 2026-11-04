@@ -107,9 +107,8 @@ pub fn build(
 ///
 /// # Errors
 ///
-/// Returns [`ProviderConfigError`] when a provider cannot be built or the
-/// enabled providers, taken together, fail the coordinator's configuration
-/// checks.
+/// Returns [`ProviderConfigError`] when a provider cannot be built or fails
+/// the coordinator's configuration checks.
 pub fn build_coordinator(
     settings: &Settings,
 ) -> Result<Option<ProviderCoordinator>, Report<ProviderConfigError>> {
@@ -189,6 +188,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use std::num::NonZeroU32;
+
+    use trusted_server_core::ec::provider::validate_enabled_configs;
+    use trusted_server_core::settings::IdentityProviderConfig;
 
     fn create_test_settings() -> Settings {
         Settings::from_toml(
@@ -338,36 +341,130 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_an_unknown_collect_timing() {
-        toml::from_str::<IdentityProviderConfig>(
-            "id = \"example-provider\"\nkind = \"example-kind\"\ncollect = \"later\"",
-        )
-        .expect_err("should reject an unknown `collect` value");
+    fn settings_with_cookie_providers(sharedid_collect: &str, criteo_collect: &str) -> Settings {
+        let mut settings = create_test_settings();
+        settings.ec.partners = ["pubcid.org", "criteo.com"]
+            .iter()
+            .map(|source| {
+                toml::from_str(&format!(
+                    "name = \"{source}\"\nsource_domain = \"{source}\"\nbidstream_enabled = true"
+                ))
+                .expect("should parse partner")
+            })
+            .collect();
+        settings.ec.identity_providers = vec![
+            toml::from_str(&format!(
+                "id = \"sharedid\"\nkind = \"sharedid\"\nsources = [\"pubcid.org\"]\ncollect = \"{sharedid_collect}\""
+            ))
+            .expect("should parse sharedid"),
+            toml::from_str(&format!(
+                "id = \"criteo\"\nkind = \"criteo\"\nsources = [\"criteo.com\"]\ncollect = \"{criteo_collect}\""
+            ))
+            .expect("should parse criteo"),
+        ];
+        settings
     }
 
     #[test]
     fn parses_an_optional_hourly_rate_limit() {
         let limited: IdentityProviderConfig = toml::from_str(
-            "id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/v1\"\nrate_limit_per_hour = 2",
+            "id = \"sharedid\"\nkind = \"sharedid\"\nsources = [\"pubcid.org\"]\nrate_limit_per_hour = 2",
         )
         .expect("should parse a rate limit");
-        let unset: IdentityProviderConfig =
-            toml::from_str("id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/v1\"")
-                .expect("should parse without a rate limit");
+        let zero = toml::from_str::<IdentityProviderConfig>(
+            "id = \"sharedid\"\nkind = \"sharedid\"\nsources = [\"pubcid.org\"]\nrate_limit_per_hour = 0",
+        );
 
         assert_eq!(
-            limited.rate_limit_per_hour.map(std::num::NonZeroU32::get),
+            limited.rate_limit_per_hour.map(NonZeroU32::get),
             Some(2),
             "should keep the hourly limit"
         );
+        assert!(zero.is_err(), "should reject a zero limit");
+        let settings = settings_with_cookie_providers("page", "page");
         assert!(
-            unset.rate_limit_per_hour.is_none(),
+            settings.ec.identity_providers[0]
+                .rate_limit_per_hour
+                .is_none(),
             "should leave the limit unset by default"
         );
-        toml::from_str::<IdentityProviderConfig>(
-            "id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/v1\"\nrate_limit_per_hour = 0",
+    }
+
+    #[test]
+    fn providers_default_to_page_collection() {
+        let mut settings = settings_with_cookie_providers("page", "page");
+        settings.ec.identity_providers = vec![
+            toml::from_str("id = \"sharedid\"\nkind = \"sharedid\"\nsources = [\"pubcid.org\"]")
+                .expect("should parse sharedid"),
+        ];
+
+        let page = build_coordinator(&settings).expect("should build page coordinator");
+        let after = build_after_response_coordinator(&settings)
+            .expect("should build after-response coordinator");
+
+        assert!(
+            page.is_some(),
+            "should collect a provider without `collect` on the page"
+        );
+        assert!(
+            after.is_none(),
+            "should build no after-response coordinator"
+        );
+    }
+
+    #[test]
+    fn splits_providers_by_collect_timing() {
+        let settings = settings_with_cookie_providers("page", "after_response");
+
+        let page = build_coordinator(&settings)
+            .expect("should build page coordinator")
+            .expect("should have a page provider");
+        let after = build_after_response_coordinator(&settings)
+            .expect("should build after-response coordinator")
+            .expect("should have an after-response provider");
+
+        assert!(!page.is_empty(), "should hold the page provider");
+        assert!(!after.is_empty(), "should hold the after-response provider");
+    }
+
+    #[test]
+    fn all_after_response_builds_no_page_coordinator() {
+        let settings = settings_with_cookie_providers("after_response", "after_response");
+
+        let page = build_coordinator(&settings).expect("should build page coordinator");
+        let after = build_after_response_coordinator(&settings)
+            .expect("should build after-response coordinator");
+
+        assert!(page.is_none(), "should build no page coordinator");
+        assert!(
+            after.is_some(),
+            "should build the after-response coordinator"
+        );
+    }
+
+    #[test]
+    fn rejects_a_source_claimed_in_both_phases() {
+        let mut settings = settings_with_cookie_providers("page", "after_response");
+        settings.ec.identity_providers[1] = toml::from_str(
+            "id = \"sharedid-late\"\nkind = \"sharedid\"\nsources = [\"pubcid.org\"]\ncollect = \"after_response\"",
         )
-        .expect_err("should reject a zero limit");
+        .expect("should parse second sharedid");
+
+        let partners = partner_registry(&settings.ec).expect("should build partner registry");
+
+        let result = validate_enabled_configs(&settings.ec.identity_providers, &partners);
+
+        assert!(
+            result.is_err(),
+            "should reject a source claimed by providers in different phases"
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_collect_timing() {
+        toml::from_str::<IdentityProviderConfig>(
+            "id = \"sharedid\"\nkind = \"sharedid\"\ncollect = \"later\"",
+        )
+        .expect_err("should reject an unknown `collect` value");
     }
 }

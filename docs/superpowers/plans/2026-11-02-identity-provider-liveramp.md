@@ -2,9 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented; checkboxes are not updated.
+
 **Goal:** Store the LiveRamp RampID envelope the browser already sends in LiveRamp's own first-party cookie, as an `[[ec.identity_providers]]` entry with `kind = "liveramp"`. No login and no server call.
 
-**Architecture:** `crates/trusted-server-identity-providers/src/liveramp.rs` holds `LiveRamp` (a `ProviderKind`), `LiveRampSettings` and `LiveRampProvider`. The provider implements only `IdentityProvider::read_request_cookies`; `build_request` always fails, so the coordinator never sends a lookup. The coordinator reads cookies only for due sources and applies consent, validation, expiry and persistence exactly as for lookup results.
+**Architecture:** `crates/trusted-server-identity-providers/src/liveramp.rs` holds `LiveRamp` (a `ProviderKind`), `LiveRampSettings` and `LiveRampProvider`. The provider implements only `IdentityProvider::read_request_cookies`; `build_request` always fails, so the coordinator never sends a lookup. The coordinator reads cookies on every navigation (a cookie repeating the held UID is not rewritten) and applies consent, validation, expiry and persistence exactly as for lookup results.
 
 **Spec:** `docs/superpowers/specs/2026-10-30-s2s-eid-collection-design.md`, section 7.
 
@@ -19,7 +21,7 @@
 
 - One EID for the single configured source, one UID with `atype = 3`.
 - Expiry `ProviderExpiry::After(15 days)` through `bounded_expiry`.
-- No refresh call: LiveRamp's server-side refresh contract is not confirmed, so the browser keeps refreshing the cookie. Revisit when it is.
+- Optional server lookup (with `endpoint`): `GET /api/identity/v2/envelope` with `pid` (`placement_id`), `it=15`, `iv=<custom_id_namespace>:<stable EC ID>`, `atype=2`, consent as `ct`/`cv` (TCF `4`, else US Privacy `3`), `gpp` and `gpp_sid`; headers `Origin` (publisher) and `X-Forwarded-For` (routable visitor IP, else no lookup). `200 {"envelope"}` is stored like the cookie; `204` is an opt-out; a blank envelope is no match; other statuses fail. Without `endpoint`, no server call. LiveRamp must enable Custom ID for the placement and approve the origin.
 
 ## Lockr
 
@@ -27,9 +29,11 @@
 
 ## Not ported from the reference provider
 
-- The reference refreshes a stored envelope server side (placement ID, approved countries, 15 or 30 days by region). It needs the visitor's region, which `LookupInput` does not carry, and its request and response shape are unconfirmed with LiveRamp, so this provider keeps reading the `_lr_env` cookie only.
+- Hashed-email and hashed-phone lookups (`it=4`, `it=11`): out of scope (no logged-in experience).
 
 ## Tasks
+
+- [x] Custom ID envelope lookup with `endpoint`, `placement_id` and `custom_id_namespace`, with tests.
 
 - [ ] Add `cookie_capabilities`, `cookie_eid`, `is_usable_id` and `percent_decoded` to `common.rs`.
 - [ ] Add `liveramp.rs` and register the kind in `is_registered_kind` and `build`.

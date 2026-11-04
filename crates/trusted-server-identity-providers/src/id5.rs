@@ -277,6 +277,7 @@ impl Id5Provider {
                     atype: Some(1),
                     ext: link_type.map(Cow::Owned),
                     expiry,
+                    refresh: None,
                 }],
             });
         }
@@ -311,6 +312,7 @@ impl Id5Provider {
                         atype: Some(1),
                         ext: None,
                         expiry: bounded_expiry(None),
+                        refresh: None,
                     }],
                 }]
             }
@@ -360,6 +362,7 @@ impl IdentityProvider for Id5Provider {
             url: self.url.clone(),
             headers,
             body: Bytes::from(body),
+            context: None,
         })
     }
 
@@ -430,6 +433,7 @@ fn owned<'any>(eid: ProviderEid<'_>) -> ProviderEid<'any> {
                 atype: uid.atype,
                 ext: uid.ext.map(|ext| Cow::Owned(ext.into_owned())),
                 expiry: uid.expiry,
+                refresh: None,
             })
             .collect(),
     }
@@ -475,6 +479,7 @@ mod tests {
                 status: StatusCode::OK,
                 headers,
                 body,
+                context: None,
             })
             .expect("should parse response")
     }
@@ -678,6 +683,7 @@ mod tests {
                     status,
                     headers: &headers,
                     body,
+                    context: None,
                 })
                 .expect_err("should reject the response");
             assert!(

@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented; checkboxes are not updated.
+
 **Goal:** Read vendor IDs that Lockr AIM writes into first-party cookies on the publisher domain, as an explicit, reusable capability of the provider kinds Lockr delivers (ID5, LiveRamp, UID2), instead of ad-hoc cookie names per provider.
 
 **Architecture:** Everything lives in `crates/trusted-server-identity-providers/src/common.rs`; core only passes the configured provider ID to builds (`ProviderCommon::id`) for logging.

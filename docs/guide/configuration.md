@@ -904,8 +904,8 @@ TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 
 ### Identity providers
 
-`[[ec.identity_providers]]` entries look up a visitor's IDs from a provider's
-server on publisher page navigations. Lookups start before the origin fetch,
+`[[ec.identity_providers]]` entries collect a visitor's IDs from the vendor's
+first-party cookies or a provider's server on publisher page navigations. Lookups start before the origin fetch,
 share the `identity_budget_ms` budget, and are collected before the response is
 finalized. Results go into the navigation's single EC row write. A lookup that
 times out or fails leaves the row unchanged.
@@ -940,19 +940,25 @@ When a provider reports an opt-out, its sources are cleared and the row
 remembers the opt-out for 30 days. The provider is not called for that EC
 again until the 30 days pass.
 
-| Field                 | Type    | Required | Description                                                             |
-| --------------------- | ------- | -------- | ----------------------------------------------------------------------- |
-| `id`                  | String  | Yes      | Stable provider ID used in logs, metrics and KV ownership               |
-| `kind`                | String  | Yes      | Provider implementation; must be one this build includes                |
-| `enabled`             | Boolean | No       | Whether the provider runs (default `true`)                              |
-| `endpoint`            | String  | Yes      | HTTPS lookup URL; its host must be in `allowed_domains`                 |
-| `allowed_domains`     | Array   | Yes      | Hosts the provider may call                                             |
-| `sources`             | Array   | Yes      | Source domains the provider owns; each needs an `[[ec.partners]]` entry |
-| `tcf_vendor_id`       | Integer | No       | TCF vendor ID that must have vendor consent                             |
-| `collect`             | String  | No       | `"page"` (default) or `"after_response"`; see below                     |
-| `rate_limit_per_hour` | Integer | No       | Most lookups per EC hash per hour; unset means unlimited. See below     |
-| `secrets.token`       | String  | No       | Key in `trusted_server_secrets` for the provider's API token            |
-| `settings`            | Table   | No       | Provider-specific settings, parsed by the provider kind                 |
+Some kinds keep private refresh state with a UID, such as a vendor refresh
+token, and refresh it server side once it is due, while the UID is still live.
+Refresh state is never served, mirrored, forwarded or shown: the admin view
+shows it as `[redacted]`. Kinds without a vendor server may generate an ID into
+the EC row when the cookies hold none; no cookie is set.
+
+| Field                 | Type    | Required | Description                                                                           |
+| --------------------- | ------- | -------- | ------------------------------------------------------------------------------------- |
+| `id`                  | String  | Yes      | Stable provider ID used in logs, metrics and KV ownership                             |
+| `kind`                | String  | Yes      | Provider implementation; must be one this build includes                              |
+| `enabled`             | Boolean | No       | Whether the provider runs (default `true`)                                            |
+| `endpoint`            | String  | No       | HTTPS lookup URL, for kinds that make a lookup; its host must be in `allowed_domains` |
+| `allowed_domains`     | Array   | No       | Hosts the provider may call; needed with `endpoint`                                   |
+| `sources`             | Array   | Yes      | Source domains the provider owns; each needs an `[[ec.partners]]` entry               |
+| `tcf_vendor_id`       | Integer | No       | TCF vendor ID that must have vendor consent                                           |
+| `collect`             | String  | No       | `"page"` (default) or `"after_response"`; see below                                   |
+| `rate_limit_per_hour` | Integer | No       | Most lookups per EC hash per hour; unset means unlimited. See below                   |
+| `secrets.token`       | String  | No       | Key in `trusted_server_secrets` for the provider's API token                          |
+| `settings`            | Table   | No       | Provider-specific settings, parsed by the provider kind                               |
 
 **Example**:
 

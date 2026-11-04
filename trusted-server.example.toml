@@ -122,9 +122,7 @@ pull_sync_concurrency = 3
 # pull_sync_enabled = false  # default false
 
 # Optional server-side identity providers (Fastly only), looked up on publisher
-# navigations before the origin fetch. Their budgets are set in [ec] above. This
-# release registers no provider kind, so `ts config push` rejects an enabled
-# provider and every runtime refuses to start with one.
+# navigations before the origin fetch. Their budgets are set in [ec] above.
 #
 # [[ec.identity_providers]]
 # id = "example-provider"
@@ -140,10 +138,13 @@ pull_sync_concurrency = 3
 # these sources to bidders, including browser IDs, even while disabled.
 # tcf_vendor_id = 9999
 # "page" (default) collects before the response; "after_response" collects
-# after it is sent, only for an EC issued on an earlier request.
+# after it is sent, only for an EC issued on an earlier request. Keep
+# cookie-only kinds on "page".
 # collect = "page"
 # Optional: most lookups per EC hash (client IP) per hour. On Fastly this is
 # enforced per minute with a minimum of one, so values below 60 behave like 60.
+# Useful for kinds whose unresolved sources stay due, such as LiveIntent
+# partner IDs.
 # rate_limit_per_hour = 60
 # Secret Store key name, resolved like other secret references.
 # [ec.identity_providers.secrets]
@@ -209,19 +210,28 @@ pull_sync_concurrency = 3
 # resolve = ["nonId", "magnite"]
 # cookie_names = ["_lc2_fpi"]
 #
-# LiveRamp (kind "liveramp"): no lookup and no endpoint. Reads the RampID
-# envelope from LiveRamp's own first-party `_lr_env` cookie (ATS) or the bare
-# envelope Prebid's identityLink module stores in `idl_env`, and keeps it for
-# 15 days. Takes exactly one source; use the one LiveRamp gives you. Supports
-# the Lockr capability.
+# LiveRamp (kind "liveramp"): reads the RampID envelope from LiveRamp's own
+# first-party `_lr_env` cookie (ATS) or the bare envelope Prebid's
+# identityLink module stores in `idl_env`, and keeps it for 15 days. Takes
+# exactly one source; use the one LiveRamp gives you. Supports the Lockr
+# capability. Optional server lookup: with an `endpoint` (LiveRamp's ATS
+# envelope API, `/api/identity/v2/envelope`), a visitor without an envelope
+# cookie is looked up by Custom ID: the stable part of the EC ID, sent as
+# `<custom_id_namespace>:<id>` with the visitor IP and consent. LiveRamp must
+# enable Custom ID for `placement_id` and approve the publisher origin; both
+# settings are required with an endpoint. No login or hashed email is used.
 # [[ec.identity_providers]]
 # id = "liveramp"
 # kind = "liveramp"
 # enabled = false
+# endpoint = "https://liveramp.example.com/api/identity/v2/envelope"
+# allowed_domains = ["liveramp.example.com"]
 # sources = ["liveramp.example.com"]
 # tcf_vendor_id = 9999
 # [ec.identity_providers.settings]
 # cookie_names = ["_lr_env", "idl_env"]
+# placement_id = 14
+# custom_id_namespace = "ana-example"
 # [ec.identity_providers.settings.lockr]
 # enabled = true
 # cookie_names = ["_lr_env"]
@@ -238,16 +248,24 @@ pull_sync_concurrency = 3
 # [ec.identity_providers.settings]
 # cookie_names = ["connectId"]
 #
-# UID2 (kind "uid2"): no lookup and no endpoint. Reads the advertising token
-# from the UID2 SDK's `__uid_2` cookie until its `identity_expires`, falling
-# back to Prebid's raw `__uid2_advertising_token` cookie. Never stores or uses
-# the refresh token. Takes exactly one source. `cookie_names` lists the raw
-# token cookies, read in order after `identity_cookie_name`. Supports the
-# Lockr capability; Lockr cookies are read last, as raw tokens.
+# UID2 (kind "uid2"): reads the advertising token from the UID2 SDK's
+# `__uid_2` cookie until its `identity_expires`, falling back to Prebid's raw
+# `__uid2_advertising_token` cookie. Takes exactly one source. `cookie_names`
+# lists the raw token cookies, read in order after `identity_cookie_name`.
+# Supports the Lockr capability; Lockr cookies are read last, as raw tokens.
+# Optional server refresh: set `endpoint` to the UID2 operator's
+# `/v2/token/refresh` URL. The `__uid_2` cookie's refresh token and response
+# key are then kept privately in the row (never served), and the token is
+# refreshed server side from `refresh_from`, with no API key and no email.
+# Tokens are never generated: that needs an email or phone number. Without
+# `endpoint`, the refresh token is never stored. The authenticated
+# `/_ts/admin/ec/{id}` view shows refresh state as "[redacted]".
 # [[ec.identity_providers]]
 # id = "uid2"
 # kind = "uid2"
 # enabled = false
+# endpoint = "https://uid2.example.com/v2/token/refresh"
+# allowed_domains = ["uid2.example.com"]
 # sources = ["uid2.example.com"]
 # [ec.identity_providers.settings]
 # identity_cookie_name = "__uid_2"
@@ -259,7 +277,10 @@ pull_sync_concurrency = 3
 # Prebid SharedID (kind "sharedid"): no lookup and no endpoint. Reads the
 # publisher common ID from Prebid's first-party `_sharedid` cookie, falling
 # back to the legacy `_pubcid`, as a device-based (atype 1) ID. The
-# `_pubcid_optout` cookie suppresses it. Takes exactly one source.
+# `_pubcid_optout` cookie suppresses it. Takes exactly one source. When no
+# cookie holds an ID and none is stored, Trusted Server generates a random
+# UUID and stores it in the row only (no cookie is set); a later Prebid cookie
+# replaces it.
 # [[ec.identity_providers]]
 # id = "sharedid"
 # kind = "sharedid"
