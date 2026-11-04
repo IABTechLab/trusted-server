@@ -80,6 +80,7 @@ Retain the exact inspected file inventory, content digests/sizes, selected-membe
 
 - Pin the examined CLI version and source commit; inspect `getFilesHash`, archive parser, package validation, upload, skip-same-hash, and activation behavior.
 - Identify actual provider metadata and active-version APIs, host mapping APIs, resource links, selector observation, and read permissions.
+- Verify the parent contract's existing-store namespaces against the pinned EdgeZero capability model. Do not add a second portable logical secret store or require empty metadata-store association; disabled attestation must preserve strict validation/config-push/provision behavior and existing store quotas. Check exact entry ownership/collision and physical link resolution before enabling keys.
 - Ask whether authenticated selected-module digest/readback exists and under what access/retention conditions. Record documentation or provider confirmation; do not invent an API.
 - Document what each field measures and whether it is reported, derived, mutable, versionless, or sampled.
 - Separate supported facts from hypotheses in a method report. Runtime reports and client source do not establish server semantics.
@@ -101,6 +102,7 @@ Before any upload, activation, token creation, or domain/resource change, obtain
 - Check staging versus production, new-version activation, same-hash upload skipping, domain mappings, and before/after read races.
 - Change a covered config identity without a new service version and observe propagation/snapshot behavior separately.
 - Exercise credential restrictions/revocation and audit-event coverage for relevant changes. Missing events or inaccessible resources must remain explicit gaps.
+- Corroborate the public identity projection through the existing app-config store while treating `ts-publisher-key-` metadata entries and `ts-publisher-` secret entries as separate namespaced records. Do not publish their private linkage or infer code-exclusive access from a shared store.
 - Retain sanitized observations and raw private evidence under restricted access. Clean up only resources the experiment owns; report uncertain outcomes without guessing or retrying mutations blindly.
 
 ### Q4: method security review and disposition
@@ -129,6 +131,7 @@ The parent contract defines policy failure and expiry. This investigation must n
 - **Q-AC3:** Provider contract and observations justify the selected method, or an explicit lower-assurance disposition prevents official claims.
 - **Q-AC4:** Hostile packages, parser/resource limits, permissions, staging, version/config changes, and failures have retained evidence at the applicable scope.
 - **Q-AC5:** No unapproved live provider changes, invented readback capability, or inference from canonical success to universal safety is accepted.
+- **Q-AC6:** The qualified path uses the compatible existing-store layout, with provider-valid initialization, collision checks, and no disabled-deployment resource/inventory regression.
 
 No controlled provider experiment has been executed as part of writing this specification.
 
@@ -139,3 +142,4 @@ Document approval does not qualify a provider method.
 - **Round 1 (Codex, independent security and runtime reviewers):** No blocking finding in this companion. Review confirmed that client hash ambiguity is not a demonstrated provider exploit and that canonical local inspection cannot establish a remote provider invariant. Parent-contract integration findings were corrected there.
 - **Round 2 (Codex, both independent reviewers):** No blocking companion finding. Strong assurance remained gated on provider-authenticated selected bytes/digest or a documented, reviewed equivalent binding; lower-assurance observations cannot become official claims. Parent discovery inventory finding was corrected there.
 - **Round 3 (Codex, both independent reviewers):** Both approved the linked documents without remaining blocking findings. No live experiment, provider write, runtime test, or strong-method qualification was performed while writing these specs.
+- **Follow-up correction and second detailed pass (Codex, independent security and feasibility reviewers):** Added existing-store capability/provisioning qualification and Q-AC6 following the five-finding review. The parent now avoids additional logical stores and empty linkage, and the companion preserves the same layout. Both reviewers approved the revised linked contracts; selected-executable binding and controlled provider experiments remain explicitly unexecuted.
