@@ -175,6 +175,7 @@ pub(crate) fn cookie_eid<'cookie>(
             atype: Some(COOKIE_ATYPE),
             ext: None,
             expiry,
+            refresh: None,
         }],
     }
 }
@@ -376,6 +377,7 @@ impl<'body> VendorEid<'body> {
                     atype: uid.atype,
                     ext: uid.ext.map(Cow::Borrowed),
                     expiry,
+                    refresh: None,
                 })
                 .collect(),
         }

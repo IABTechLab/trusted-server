@@ -307,6 +307,7 @@ impl IdentityProvider for LiveIntentProvider {
             url,
             headers,
             body: Bytes::new(),
+            context: None,
         })
     }
 
@@ -355,6 +356,7 @@ impl IdentityProvider for LiveIntentProvider {
                         atype: Some(LIVEINTENT_ATYPE),
                         ext: uid_ext.map(Cow::Borrowed),
                         expiry,
+                        refresh: None,
                     }],
                 })
             })
@@ -552,6 +554,7 @@ mod tests {
                 status: StatusCode::OK,
                 headers: &headers,
                 body: &body,
+                context: None,
             })
             .expect("should parse response");
         let LookupOutcome::Found(eids) = outcome else {
@@ -698,6 +701,7 @@ mod tests {
                     status,
                     headers: &headers,
                     body,
+                    context: None,
                 })
                 .expect("should parse response");
             assert!(
@@ -721,6 +725,7 @@ mod tests {
                     status,
                     headers: &headers,
                     body,
+                    context: None,
                 })
                 .expect_err("should reject the response");
             assert!(
