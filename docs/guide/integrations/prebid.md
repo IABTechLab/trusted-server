@@ -284,6 +284,18 @@ rule, and Purpose 4 controls user-provided-data activity rather than
 IdentityLink resolution. Validate a regenerated bundle against a live CMP before
 rolling it out broadly.
 
+The `trustedServer` bidder is a first-party auction relay without its own GVL
+vendor ID. With `consentManagement.gdpr` configured, before each relay auction
+the shim adds it to the `basicAds` rule's `softVendorExceptions`. Purpose 2
+enforcement remains active; unrelated bidders,
+storage, and User ID modules keep their existing rules. Publisher rules and
+existing exceptions are preserved. If the publisher supplies a
+`gvlMapping.trustedServer` identity, that identity's vendor consent is enforced
+instead. The relay forwards the original consent signals; downstream auction
+endpoints remain responsible for enforcing consent for their individual vendors.
+Legacy top-level TCF settings are left unchanged; use the namespaced
+`consentManagement.gdpr` configuration for relay consent handling.
+
 When managed User IDs are configured and the page exposes a callable
 `window.__tcfapi`, the Trusted Server shim activates Prebid's standard IAB GDPR
 collector by adding only `consentManagement.gdpr.cmpApi = "iab"`. It does not
