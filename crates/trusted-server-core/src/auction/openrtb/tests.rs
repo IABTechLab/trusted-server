@@ -743,6 +743,41 @@ fn pbs_filtering_keeps_slot_pairs_and_drops_demandless_trusted_routes() {
 }
 
 #[test]
+fn pbs_explicit_empty_direct_and_configured_slot_params_remain_inline_demand() {
+    let configured: crate::creative_opportunities::CreativeOpportunitySlot = toml::from_str(
+        r#"
+        id = "configured-slot"
+        page_patterns = ["/"]
+        [[formats]]
+        width = 970
+        height = 250
+        [providers.prebid.bidders.exampleBidder]
+        "#,
+    )
+    .expect("should parse explicitly configured empty bidder params");
+    let mut direct = canonical_parity_auction_request().slots.remove(0);
+    direct.bidders = HashMap::from([("exampleBidder".to_string(), json!({}))]);
+
+    for slot in [direct, configured.to_ad_slot()] {
+        let mut request = canonical_parity_auction_request();
+        request.slots = vec![slot.clone()];
+        let built = build_with_request("prebid-server", json!({}), request, None);
+        let wire = serde_json::to_value(built).expect("should serialize explicit empty demand");
+        assert_eq!(wire["imp"][0]["id"], slot.id);
+        assert_eq!(
+            wire["imp"][0]["ext"]["prebid"]["bidder"]["exampleBidder"],
+            json!({}),
+            "should retain explicitly supplied parameter-free adapter demand"
+        );
+        assert!(
+            wire["imp"][0]["ext"]["prebid"]
+                .get("storedrequest")
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn pbs_disabled_empty_candidate_does_not_become_stored_demand() {
     let mut raw = config("prebid-server", json!({}));
     raw.providers

@@ -522,7 +522,9 @@ fn apply_prebid(
                     );
                     params
                         .as_object()
-                        .is_some_and(|params| !params.is_empty())
+                        .is_some_and(|params| {
+                            !params.is_empty() || slot.has_explicit_empty_params(bidder)
+                        })
                         .then(|| (bidder.as_str().to_string(), params))
                 })
                 .collect::<Map<_, _>>();

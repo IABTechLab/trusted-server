@@ -168,6 +168,7 @@ impl ProviderAuctionInput {
 pub(crate) struct ProviderSlotInput {
     slot: AdSlot,
     bidder_params: BTreeMap<BidderId, Value>,
+    explicit_empty_bidders: BTreeSet<BidderId>,
     prebid_zone: Option<String>,
     stored_request: StoredRequestIntent,
 }
@@ -180,6 +181,11 @@ impl ProviderSlotInput {
 
     pub(crate) fn bidder_params(&self) -> &BTreeMap<BidderId, Value> {
         &self.bidder_params
+    }
+
+    /// Whether an empty object was supplied as direct demand, not a legacy placeholder.
+    pub(crate) fn has_explicit_empty_params(&self, bidder: &BidderId) -> bool {
+        self.explicit_empty_bidders.contains(bidder)
     }
 
     pub(crate) fn prebid_zone(&self) -> Option<&str> {
@@ -285,6 +291,7 @@ impl StoredRequestIntent {
 #[derive(Debug, Default)]
 struct NormalizedSlotDemand {
     bidder_params: BTreeMap<BidderId, Value>,
+    explicit_empty_bidders: BTreeSet<BidderId>,
     stored_request: StoredRequestIntent,
     prebid_zone: Option<String>,
 }
@@ -395,6 +402,11 @@ pub(crate) fn route_auction_with_trusted_routes(
             }
             builder.slots.push(ProviderSlotInput {
                 slot: common_slot.clone(),
+                explicit_empty_bidders: bidder_params
+                    .keys()
+                    .filter(|bidder| demand.explicit_empty_bidders.contains(*bidder))
+                    .cloned()
+                    .collect(),
                 bidder_params,
                 prebid_zone: builder
                     .is_prebid
@@ -494,9 +506,22 @@ fn normalize_slot_demand(
             diagnostics.record_malformed_direct_demand();
             continue;
         };
-        if bidder.as_str() == TRUSTED_SERVER_ENVELOPE || !is_usable_params(params) {
+        if bidder.as_str() == TRUSTED_SERVER_ENVELOPE || !params.is_object() {
             diagnostics.record_malformed_direct_demand();
             continue;
+        }
+        if params.as_object().is_some_and(serde_json::Map::is_empty) {
+            // Preserve real envelope params on collision, but allow explicit
+            // parameter-free adapters when there is no nonempty value to lose.
+            if demand
+                .bidder_params
+                .get(&bidder)
+                .is_some_and(is_usable_params)
+            {
+                diagnostics.record_malformed_direct_demand();
+                continue;
+            }
+            demand.explicit_empty_bidders.insert(bidder.clone());
         }
         demand.bidder_params.insert(bidder, params.clone());
     }
@@ -553,6 +578,7 @@ fn normalize_envelope(envelope: &Value) -> Option<NormalizedSlotDemand> {
         bidder_params,
         stored_request,
         prebid_zone,
+        ..Default::default()
     })
 }
 
@@ -1033,6 +1059,50 @@ mod tests {
             "aps-primary",
             "unknown demand should not cause PBS fallback"
         );
+    }
+
+    #[test]
+    fn explicit_empty_direct_params_are_demand_not_stored_placeholders() {
+        let routed = route_auction(
+            request(vec![slot(HashMap::from([(
+                "alpha".to_string(),
+                json!({}),
+            )]))]),
+            &inbound(),
+            &plan(),
+            None,
+        );
+        let bidder = BidderId::from_str("alpha").expect("should parse bidder");
+        let slot = &input(&routed, "pbs-a").slots()[0];
+        assert_eq!(slot.bidder_params()[&bidder], json!({}));
+        assert!(slot.has_explicit_empty_params(&bidder));
+        assert!(!slot.allows_stored_fallback_without_candidates());
+        assert_eq!(routed.diagnostics().malformed_direct_demand_count(), 0);
+        assert!(
+            routed
+                .skipped_no_eligible_provider_ids()
+                .iter()
+                .any(|id| id.as_str() == "pbs-b")
+        );
+    }
+
+    #[test]
+    fn nonobject_direct_params_are_not_parameter_free_demand() {
+        for params in [Value::Null, json!(false), json!(1), json!(""), json!([])] {
+            let routed = route_auction(
+                request(vec![slot(HashMap::from([("alpha".to_string(), params)]))]),
+                &inbound(),
+                &plan(),
+                None,
+            );
+            assert!(
+                routed
+                    .inputs()
+                    .iter()
+                    .all(|input| input.provider_id().as_str() != "pbs-a")
+            );
+            assert_eq!(routed.diagnostics().malformed_direct_demand_count(), 1);
+        }
     }
 
     #[test]
