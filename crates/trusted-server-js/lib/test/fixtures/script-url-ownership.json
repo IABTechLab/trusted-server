@@ -1,0 +1,757 @@
+[
+  {
+    "id": "lockr-sdk",
+    "url": "https://aim.loc.kr/identity-lockr-trust-server.js",
+    "native": {
+      "lockr": "https://edge.example.com/integrations/lockr/sdk"
+    },
+    "dom": "lockr",
+    "domPath": "/integrations/lockr/sdk"
+  },
+  {
+    "id": "lockr-query-fragment",
+    "url": "//identity.loc.kr/identity-lockr-v2.js?cache=1#sdk",
+    "native": {
+      "lockr": "https://edge.example.com/integrations/lockr/sdk"
+    },
+    "dom": "lockr",
+    "domPath": "/integrations/lockr/sdk"
+  },
+  {
+    "id": "lockr-filename-contained",
+    "url": "https://aim.loc.kr/custom-identity-lockr-v1.js",
+    "native": {
+      "lockr": "https://edge.example.com/integrations/lockr/sdk"
+    },
+    "dom": "lockr",
+    "domPath": "/integrations/lockr/sdk"
+  },
+  {
+    "id": "lockr-mixed-case",
+    "url": "HTTPS://AIM.LOC.KR/IDENTITY-LOCKR.JS?x=1",
+    "native": {
+      "lockr": "https://edge.example.com/integrations/lockr/sdk"
+    },
+    "dom": "lockr",
+    "domPath": "/integrations/lockr/sdk"
+  },
+  {
+    "id": "lockr-userinfo-owned",
+    "url": "https://user:pass@aim.loc.kr/identity-lockr.js",
+    "native": {
+      "lockr": "https://edge.example.com/integrations/lockr/sdk"
+    },
+    "dom": "lockr",
+    "domPath": "/integrations/lockr/sdk"
+  },
+  {
+    "id": "lockr-port",
+    "url": "https://aim.loc.kr:8443/identity-lockr.js",
+    "native": {
+      "lockr": "https://edge.example.com/integrations/lockr/sdk"
+    },
+    "dom": "lockr",
+    "domPath": "/integrations/lockr/sdk"
+  },
+  {
+    "id": "lockr-suffix-host",
+    "url": "https://aim.loc.kr.evil.example/identity-lockr.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "lockr-prefix-host",
+    "url": "https://notaim.loc.kr.evil.example/identity-lockr.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "lockr-userinfo-spoof",
+    "url": "https://aim.loc.kr@evil.example/identity-lockr.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "lockr-path-spoof",
+    "url": "https://evil.example/aim.loc.kr/identity-lockr.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "lockr-query-spoof",
+    "url": "https://evil.example/app.js?u=aim.loc.kr/identity-lockr.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "lockr-directory-spoof",
+    "url": "https://aim.loc.kr/identity-lockr/other.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "lockr-query-filename",
+    "url": "https://aim.loc.kr/other.js?name=identity-lockr.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "lockr-pixel",
+    "url": "https://aim.loc.kr/pixel.gif",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "lockr-bare-relative",
+    "url": "aim.loc.kr/identity-lockr.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "lockr-relative",
+    "url": "../identity-lockr.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "lockr-ftp",
+    "url": "ftp://aim.loc.kr/identity-lockr.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "permutive-edge",
+    "url": "https://org.edge.permutive.app/workspace-web.js",
+    "native": {
+      "permutive": "/integrations/permutive/sdk"
+    },
+    "dom": "permutive",
+    "domPath": "/integrations/permutive/sdk"
+  },
+  {
+    "id": "permutive-cdn",
+    "url": "https://cdn.permutive.com/workspace-web.js?cache=1#sdk",
+    "native": {
+      "permutive": "/integrations/permutive/sdk"
+    },
+    "dom": "permutive",
+    "domPath": "/integrations/permutive/sdk"
+  },
+  {
+    "id": "permutive-port-case",
+    "url": "HTTPS://CDN.PERMUTIVE.COM:443/WORKSPACE-WEB.JS",
+    "native": {
+      "permutive": "/integrations/permutive/sdk"
+    },
+    "dom": "permutive",
+    "domPath": "/integrations/permutive/sdk"
+  },
+  {
+    "id": "permutive-dot-segments",
+    "url": "https://cdn.permutive.com/a/../workspace-web.js",
+    "native": {
+      "permutive": "/integrations/permutive/sdk"
+    },
+    "dom": "permutive",
+    "domPath": "/integrations/permutive/sdk"
+  },
+  {
+    "id": "permutive-suffix",
+    "url": "https://org.edge.permutive.app.evil.example/workspace-web.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "permutive-prefix",
+    "url": "https://notcdn.permutive.com.evil.example/workspace-web.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "permutive-apex",
+    "url": "https://edge.permutive.app/workspace-web.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "permutive-path",
+    "url": "https://evil.example/cdn.permutive.com/workspace-web.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "permutive-query",
+    "url": "https://evil.example/app.js?u=cdn.permutive.com/workspace-web.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "permutive-userinfo",
+    "url": "https://cdn.permutive.com@evil.example/workspace-web.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "permutive-bare-relative",
+    "url": "cdn.permutive.com/workspace-web.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "permutive-non-sdk",
+    "url": "https://cdn.permutive.com/other.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "permutive-escaped-separator",
+    "url": "https://cdn.permutive.com/workspace-web.js%2fother.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "datadome-tag",
+    "url": "https://js.datadome.co/tags.js?cache=1#sdk",
+    "native": {
+      "datadome": "/integrations/datadome/tags.js?cache=1#sdk"
+    },
+    "dom": "datadome",
+    "domPath": "/integrations/datadome/tags.js?cache=1#sdk"
+  },
+  {
+    "id": "datadome-check",
+    "url": "//js.datadome.co/js/check?x=1",
+    "native": {
+      "datadome": "/integrations/datadome/js/check?x=1"
+    },
+    "dom": "datadome",
+    "domPath": "/integrations/datadome/js/check?x=1"
+  },
+  {
+    "id": "datadome-path-breadth",
+    "url": "https://js.datadome.co/other.js",
+    "native": {
+      "datadome": "/integrations/datadome/other.js"
+    },
+    "dom": "datadome",
+    "domPath": "/integrations/datadome/other.js"
+  },
+  {
+    "id": "datadome-root",
+    "url": "https://js.datadome.co",
+    "native": {
+      "datadome": "/integrations/datadome/tags.js"
+    },
+    "dom": "datadome",
+    "domPath": "/integrations/datadome/"
+  },
+  {
+    "id": "datadome-port",
+    "url": "HTTPS://JS.DATADOME.CO:8443/tags.js",
+    "native": {
+      "datadome": "/integrations/datadome/tags.js"
+    },
+    "dom": "datadome",
+    "domPath": "/integrations/datadome/tags.js"
+  },
+  {
+    "id": "datadome-owned-userinfo",
+    "url": "https://user:pass@js.datadome.co/tags.js",
+    "native": {
+      "datadome": "/integrations/datadome/tags.js"
+    },
+    "dom": "datadome",
+    "domPath": "/integrations/datadome/tags.js"
+  },
+  {
+    "id": "datadome-api",
+    "url": "https://api-js.datadome.co/js/check?x=1#api",
+    "native": {
+      "datadome": "/integrations/datadome/js/check?x=1#api"
+    },
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "datadome-apex",
+    "url": "https://datadome.co.evil.example/tags.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "datadome-suffix",
+    "url": "https://js.datadome.co.evil.example/tags.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "datadome-prefix",
+    "url": "https://notjs.datadome.co.evil.example/tags.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "datadome-path",
+    "url": "https://evil.example/js.datadome.co/tags.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "datadome-query",
+    "url": "https://evil.example/a.js?u=https://js.datadome.co/tags.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "datadome-userinfo",
+    "url": "https://js.datadome.co@evil.example/tags.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "datadome-bare-relative",
+    "url": "js.datadome.co/tags.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "datadome-ftp",
+    "url": "ftp://js.datadome.co/tags.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "datadome-blob",
+    "url": "blob:https://js.datadome.co/id",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "testlight-absolute",
+    "url": "https://example.com/assets/testlight.js?cache=1#shim",
+    "native": {
+      "testlight": "/static/testlight-shim.js"
+    },
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "testlight-root-relative",
+    "url": "/assets/testlight.js",
+    "native": {
+      "testlight": "/static/testlight-shim.js"
+    },
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "testlight-path-relative",
+    "url": "assets/TESTLIGHT.JS",
+    "native": {
+      "testlight": "/static/testlight-shim.js"
+    },
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "testlight-dot-segments",
+    "url": "/assets/other/../testlight.js",
+    "native": {
+      "testlight": "/static/testlight-shim.js"
+    },
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "testlight-query",
+    "url": "https://example.com/a.js?u=testlight.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "testlight-directory",
+    "url": "/testlight.js/other.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "testlight-longer-filename",
+    "url": "/testlight.js.backup",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "testlight-javascript",
+    "url": "javascript:/assets/testlight.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "prebid-absolute",
+    "url": "https://cdn.example.com/prebid.js?cache=1",
+    "native": {
+      "prebid": "REMOVE"
+    },
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "prebid-root-relative",
+    "url": "/assets/prebid.min.js",
+    "native": {
+      "prebid": "REMOVE"
+    },
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "prebid-path-relative",
+    "url": "assets/prebid.js",
+    "native": {
+      "prebid": "REMOVE"
+    },
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "prebid-dot-segments",
+    "url": "/assets/x/../prebidjs.min.js",
+    "native": {
+      "prebid": "REMOVE"
+    },
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "prebid-query",
+    "url": "https://example.com/a.js?u=/prebid.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "prebid-data",
+    "url": "data:text/javascript,/prebid.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "prebid-javascript",
+    "url": "javascript:/assets/prebid.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "prebid-ftp",
+    "url": "ftp://cdn.example.com/prebid.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "gpt-bootstrap",
+    "url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js?x=1#sdk",
+    "native": {
+      "gpt": "/integrations/gpt/script"
+    },
+    "dom": "gpt",
+    "domPath": "/integrations/gpt/tag/js/gpt.js?x=1#sdk"
+  },
+  {
+    "id": "gpt-cascade",
+    "url": "https://securepubads.g.doubleclick.net/pagead/managed/pubads_impl.js",
+    "native": {},
+    "dom": "gpt",
+    "domPath": "/integrations/gpt/pagead/managed/pubads_impl.js"
+  },
+  {
+    "id": "gpt-ftp",
+    "url": "ftp://securepubads.g.doubleclick.net/tag/js/gpt.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "gpt-suffix",
+    "url": "https://securepubads.g.doubleclick.net.evil.example/tag/js/gpt.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "gtm-sdk",
+    "url": "https://www.googletagmanager.com/gtm.js?id=GTM-TEST#sdk",
+    "native": {
+      "google_tag_manager": "/integrations/google_tag_manager/gtm.js?id=GTM-TEST#sdk"
+    },
+    "dom": "google_tag_manager",
+    "domPath": "/integrations/google_tag_manager/gtm.js?id=GTM-TEST#sdk"
+  },
+  {
+    "id": "gtm-case-port-userinfo",
+    "url": "HTTPS://user:pass@WWW.GOOGLETAGMANAGER.COM:8443/gtm.js?id=GTM-TEST",
+    "native": {
+      "google_tag_manager": "/integrations/google_tag_manager/gtm.js?id=GTM-TEST"
+    },
+    "dom": "google_tag_manager",
+    "domPath": "/integrations/google_tag_manager/gtm.js?id=GTM-TEST"
+  },
+  {
+    "id": "gtm-normalized-path",
+    "url": "https://www.googletagmanager.com/a/../gtag/js?id=G-TEST",
+    "native": {
+      "google_tag_manager": "/integrations/google_tag_manager/gtag/js?id=G-TEST"
+    },
+    "dom": "google_tag_manager",
+    "domPath": "/integrations/google_tag_manager/gtag/js?id=G-TEST"
+  },
+  {
+    "id": "ga-collect",
+    "url": "https://www.google-analytics.com/g/collect?v=2#collect",
+    "native": {
+      "google_tag_manager": "/integrations/google_tag_manager/g/collect?v=2#collect"
+    },
+    "dom": "google_tag_manager",
+    "domPath": "/integrations/google_tag_manager/g/collect?v=2#collect"
+  },
+  {
+    "id": "analytics-collect",
+    "url": "//analytics.google.com/collect?v=2",
+    "native": {
+      "google_tag_manager": "/integrations/google_tag_manager/collect?v=2"
+    },
+    "dom": "google_tag_manager",
+    "domPath": "/integrations/google_tag_manager/collect?v=2"
+  },
+  {
+    "id": "gtm-unsupported",
+    "url": "https://www.googletagmanager.com/ns.html",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "gtm-suffix",
+    "url": "https://www.googletagmanager.com.evil.example/gtm.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "gtm-bare-relative",
+    "url": "www.googletagmanager.com/gtm.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "gtm-ftp",
+    "url": "ftp://www.googletagmanager.com/gtm.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "sourcepoint-sdk",
+    "url": "https://cdn.privacy-mgmt.com/wrapper.js?x=1#sdk",
+    "native": {
+      "sourcepoint": "/integrations/sourcepoint/cdn/wrapper.js?x=1#sdk"
+    },
+    "dom": "sourcepoint",
+    "domPath": "/integrations/sourcepoint/cdn/wrapper.js?x=1#sdk"
+  },
+  {
+    "id": "sourcepoint-protocol-relative",
+    "url": "//cdn.privacy-mgmt.com:8443/wrapper.js",
+    "native": {
+      "sourcepoint": "/integrations/sourcepoint/cdn/wrapper.js"
+    },
+    "dom": "sourcepoint",
+    "domPath": "/integrations/sourcepoint/cdn/wrapper.js"
+  },
+  {
+    "id": "sourcepoint-suffix",
+    "url": "https://cdn.privacy-mgmt.com.evil.example/wrapper.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "sourcepoint-bare-relative",
+    "url": "cdn.privacy-mgmt.com/wrapper.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "sourcepoint-ftp",
+    "url": "ftp://cdn.privacy-mgmt.com/wrapper.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "cross-owner-datadome",
+    "url": "https://js.datadome.co/tags.js?u=aim.loc.kr/identity-lockr.js",
+    "native": {
+      "datadome": "/integrations/datadome/tags.js?u=aim.loc.kr/identity-lockr.js"
+    },
+    "dom": "datadome",
+    "domPath": "/integrations/datadome/tags.js?u=aim.loc.kr/identity-lockr.js"
+  },
+  {
+    "id": "cross-owner-gpt",
+    "url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js?u=cdn.permutive.com/workspace-web.js",
+    "native": {
+      "gpt": "/integrations/gpt/script"
+    },
+    "dom": "gpt",
+    "domPath": "/integrations/gpt/tag/js/gpt.js?u=cdn.permutive.com/workspace-web.js"
+  },
+  {
+    "id": "cross-owner-sourcepoint",
+    "url": "https://cdn.privacy-mgmt.com/wrapper.js?u=js.datadome.co/tags.js",
+    "native": {
+      "sourcepoint": "/integrations/sourcepoint/cdn/wrapper.js?u=js.datadome.co/tags.js"
+    },
+    "dom": "sourcepoint",
+    "domPath": "/integrations/sourcepoint/cdn/wrapper.js?u=js.datadome.co/tags.js"
+  },
+  {
+    "id": "document-base-owned",
+    "url": "../identity-lockr.js",
+    "native": {},
+    "dom": "lockr",
+    "domPath": "/integrations/lockr/sdk",
+    "base": "https://aim.loc.kr/assets/"
+  },
+  {
+    "id": "empty",
+    "url": "",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "malformed",
+    "url": "https://[invalid.example/tags.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "datadome-no-path-query-fragment",
+    "url": "https://js.datadome.co?cache=1#sdk",
+    "native": {
+      "datadome": "/integrations/datadome/tags.js?cache=1#sdk"
+    },
+    "dom": "datadome",
+    "domPath": "/integrations/datadome/?cache=1#sdk"
+  },
+  {
+    "id": "datadome-explicit-root",
+    "url": "https://js.datadome.co/",
+    "native": {
+      "datadome": "/integrations/datadome/"
+    },
+    "dom": "datadome",
+    "domPath": "/integrations/datadome/"
+  },
+  {
+    "id": "datadome-explicit-root-query-fragment",
+    "url": "//js.datadome.co/?cache=1#sdk",
+    "native": {
+      "datadome": "/integrations/datadome/?cache=1#sdk"
+    },
+    "dom": "datadome",
+    "domPath": "/integrations/datadome/?cache=1#sdk"
+  },
+  {
+    "id": "datadome-dot-segment-root",
+    "url": "https://js.datadome.co/assets/..",
+    "native": {
+      "datadome": "/integrations/datadome/"
+    },
+    "dom": "datadome",
+    "domPath": "/integrations/datadome/"
+  },
+  {
+    "id": "lockr-same-scheme-relative",
+    "url": "https:aim.loc.kr/identity-lockr.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "request-origin-relative-owned",
+    "url": "sdk/identity-lockr.js",
+    "requestHost": "aim.loc.kr",
+    "requestScheme": "http",
+    "base": "http://aim.loc.kr/articles/",
+    "native": {
+      "lockr": "http://aim.loc.kr/integrations/lockr/sdk"
+    },
+    "dom": "lockr",
+    "domPath": "/integrations/lockr/sdk"
+  },
+  {
+    "id": "datadome-api-explicit-root",
+    "url": "https://api-js.datadome.co/?x=1#api",
+    "native": {
+      "datadome": "/integrations/datadome/?x=1#api"
+    },
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "datadome-api-no-path",
+    "url": "//api-js.datadome.co?x=1#api",
+    "native": {
+      "datadome": "/integrations/datadome/tags.js?x=1#api"
+    },
+    "dom": null,
+    "domPath": null
+  },
+  {
+    "id": "permutive-empty-subdomain",
+    "url": "https://.edge.permutive.app/workspace-web.js",
+    "native": {},
+    "dom": null,
+    "domPath": null
+  }
+]

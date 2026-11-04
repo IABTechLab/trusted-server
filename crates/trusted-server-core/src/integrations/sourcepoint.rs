@@ -343,24 +343,24 @@ impl SourcepointIntegration {
         Ok(target.to_string())
     }
 
-    fn build_first_party_url(&self, source_url: &str) -> Option<String> {
-        let parsed = parse_sourcepoint_url(source_url)?;
+    fn build_first_party_url(
+        &self,
+        source_url: &str,
+        ctx: &IntegrationAttributeContext<'_>,
+    ) -> Option<String> {
+        let parsed = super::script_url::parse_script_url(source_url, ctx)?;
         if parsed.host_str()? != SOURCEPOINT_CDN_HOST {
             return None;
         }
 
-        let path = parsed.path();
-        let query = parsed
-            .query()
-            .map(|value| format!("?{value}"))
-            .unwrap_or_default();
+        let path = super::script_url::path_and_suffix(&parsed);
 
         // Root-relative so the browser resolves it against the page host.
         // Note: a page-level `<base href>` participates in this resolution, so
         // on pages that set an external base URL these resolve against that base
         // rather than the address-bar origin — an accepted tradeoff, matching
         // GTM/Didomi/Testlight which are also relative.
-        Some(format!("{SOURCEPOINT_CDN_PREFIX}{path}{query}"))
+        Some(format!("{SOURCEPOINT_CDN_PREFIX}{path}"))
     }
 
     fn copy_headers(
@@ -725,39 +725,6 @@ impl SourcepointIntegration {
     }
 }
 
-fn parse_sourcepoint_url(url: &str) -> Option<Url> {
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    // Keep in sync with JS normalization in:
-    // crates/trusted-server-js/lib/src/integrations/sourcepoint/script_guard.ts
-    // (protocol-relative + bare-domain handling + host-validation behavior).
-    let normalized = if trimmed.starts_with("//") {
-        format!("https:{trimmed}")
-    } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else if is_sourcepoint_bare_host_reference(trimmed) {
-        format!("https://{trimmed}")
-    } else {
-        return None;
-    };
-
-    Url::parse(&normalized).ok()
-}
-
-fn is_sourcepoint_bare_host_reference(value: &str) -> bool {
-    let Some(remainder) = value.strip_prefix(SOURCEPOINT_CDN_HOST) else {
-        return false;
-    };
-
-    remainder
-        .as_bytes()
-        .first()
-        .is_none_or(|byte| matches!(byte, b':' | b'/'))
-}
-
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<SourcepointIntegration>>, Report<TrustedServerError>> {
@@ -1060,11 +1027,11 @@ impl IntegrationAttributeRewriter for SourcepointIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
+        ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         // `handles_attribute()` already gates on `rewrite_sdk`, so this
         // method is only called when rewriting is enabled.
-        if let Some(rewritten) = self.build_first_party_url(attr_value) {
+        if let Some(rewritten) = self.build_first_party_url(attr_value, ctx) {
             return AttributeRewriteAction::replace(rewritten);
         }
 
@@ -1992,6 +1959,12 @@ mod tests {
     }
 
     #[test]
+    fn script_url_ownership_corpus() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        crate::integrations::script_url::tests::assert_ownership("sourcepoint", &*integration);
+    }
+
+    #[test]
     fn rewrites_cdn_urls_to_first_party_paths() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
         let ctx = IntegrationAttributeContext {
@@ -2583,24 +2556,6 @@ mod tests {
                 "should reject invalid auth_cookie_name: {auth_cookie_name:?}"
             );
         }
-    }
-
-    #[test]
-    fn parses_bare_sourcepoint_host_references() {
-        let parsed = parse_sourcepoint_url("cdn.privacy-mgmt.com/wrapper.js")
-            .expect("should parse bare Sourcepoint host reference");
-
-        assert_eq!(parsed.host_str(), Some(SOURCEPOINT_CDN_HOST));
-        assert_eq!(parsed.path(), "/wrapper.js");
-    }
-
-    #[test]
-    fn rejects_bare_host_prefix_spoofing() {
-        assert_eq!(
-            parse_sourcepoint_url("cdn.privacy-mgmt.com.evil.com/wrapper.js"),
-            None,
-            "should reject bare host strings that only prefix-match Sourcepoint"
-        );
     }
 
     fn make_req(method: Method, url: &str) -> Request<EdgeBody> {

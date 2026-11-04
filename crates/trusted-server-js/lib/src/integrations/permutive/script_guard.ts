@@ -1,16 +1,18 @@
 import { createScriptGuard } from '../../shared/script_guard';
+import { parseScriptUrl } from '../../shared/script_url';
 
 /**
  * Check if a URL is a Permutive SDK URL.
- * Matches the logic from permutive.rs:97-101
+ * Match the parsed host and SDK pathname, as in the native rewriter.
  */
 function isPermutiveSdkUrl(url: string): boolean {
-  if (!url) return false;
-
-  const lower = url.toLowerCase();
+  const parsed = parseScriptUrl(url);
   return (
-    (lower.includes('.edge.permutive.app') || lower.includes('cdn.permutive.com')) &&
-    lower.endsWith('-web.js')
+    !!parsed &&
+    (parsed.hostname === 'cdn.permutive.com' ||
+      (parsed.hostname.endsWith('.edge.permutive.app') &&
+        parsed.hostname.length > '.edge.permutive.app'.length)) &&
+    parsed.pathname.toLowerCase().endsWith('-web.js')
   );
 }
 

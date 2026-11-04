@@ -25,6 +25,7 @@ pub mod osano;
 pub mod permutive;
 pub mod prebid;
 mod registry;
+mod script_url;
 pub mod sourcepoint;
 pub mod testlight;
 

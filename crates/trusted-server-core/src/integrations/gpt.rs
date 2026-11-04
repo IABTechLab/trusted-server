@@ -39,7 +39,6 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{Request, Response, header};
 use serde::{Deserialize, Serialize};
-use url::Url;
 use validator::Validate;
 
 use crate::constants::{HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE};
@@ -295,24 +294,11 @@ impl GptIntegration {
     /// This matcher is intentionally strict and only controls HTML attribute
     /// rewriting for the initial bootstrap tag. The `script_url` config option
     /// still controls which upstream URL `/integrations/gpt/script` fetches.
-    fn is_gpt_script_url(url: &str) -> bool {
-        let parsed = Url::parse(url).or_else(|_| {
-            let stripped = url
-                .strip_prefix("//")
-                .ok_or(url::ParseError::RelativeUrlWithoutBase)?;
-            Url::parse(&format!("https://{stripped}"))
-        });
-
-        let Ok(parsed) = parsed else {
-            return false;
-        };
-
-        let Some(host) = parsed.host_str() else {
-            return false;
-        };
-
-        host.eq_ignore_ascii_case(SECUREPUBADS_HOST)
-            && parsed.path().eq_ignore_ascii_case("/tag/js/gpt.js")
+    fn is_gpt_script_url(value: &str, ctx: &IntegrationAttributeContext<'_>) -> bool {
+        super::script_url::parse_script_url(value, ctx).is_some_and(|url| {
+            url.host_str() == Some(SECUREPUBADS_HOST)
+                && url.path().eq_ignore_ascii_case("/tag/js/gpt.js")
+        })
     }
 
     /// Fetch and serve the GPT bootstrap script (`gpt.js`).
@@ -449,13 +435,13 @@ impl IntegrationAttributeRewriter for GptIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
+        ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         if !self.config.rewrite_script {
             return AttributeRewriteAction::keep();
         }
 
-        if Self::is_gpt_script_url(attr_value) {
+        if Self::is_gpt_script_url(attr_value, ctx) {
             // Root-relative so the browser resolves it against the page host.
             // Note: a page-level `<base href>` participates in this resolution,
             // so on pages that set an external base URL these resolve against
@@ -576,6 +562,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn script_url_ownership_corpus() {
+        let integration = GptIntegration::new(test_config());
+        crate::integrations::script_url::tests::assert_ownership("gpt", &*integration);
+    }
+
     fn test_context() -> IntegrationAttributeContext<'static> {
         IntegrationAttributeContext {
             attribute_name: "src",
@@ -623,45 +615,56 @@ mod tests {
     fn gpt_script_url_detection() {
         assert!(
             GptIntegration::is_gpt_script_url(
-                "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
+                "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+                &crate::integrations::script_url::tests::context()
             ),
             "should match the standard GPT CDN URL"
         );
 
         assert!(
-            GptIntegration::is_gpt_script_url("//securepubads.g.doubleclick.net/tag/js/gpt.js"),
+            GptIntegration::is_gpt_script_url(
+                "//securepubads.g.doubleclick.net/tag/js/gpt.js",
+                &crate::integrations::script_url::tests::context()
+            ),
             "should match protocol-relative GPT CDN URLs"
         );
 
         assert!(
             GptIntegration::is_gpt_script_url(
-                "https://SECUREPUBADS.G.DOUBLECLICK.NET/tag/js/gpt.js"
+                "https://SECUREPUBADS.G.DOUBLECLICK.NET/tag/js/gpt.js",
+                &crate::integrations::script_url::tests::context()
             ),
             "should match case-insensitively"
         );
 
         assert!(
-            !GptIntegration::is_gpt_script_url("https://example.com/script.js"),
+            !GptIntegration::is_gpt_script_url(
+                "https://example.com/script.js",
+                &crate::integrations::script_url::tests::context()
+            ),
             "should not match unrelated URLs"
         );
 
         assert!(
             !GptIntegration::is_gpt_script_url(
-                "https://securepubads.g.doubleclick.net/other/script.js"
+                "https://securepubads.g.doubleclick.net/other/script.js",
+                &crate::integrations::script_url::tests::context()
             ),
             "should not match other doubleclick paths"
         );
 
         assert!(
             !GptIntegration::is_gpt_script_url(
-                "https://cdn.example.com/loader.js?ref=securepubads.g.doubleclick.net/tag/js/gpt.js"
+                "https://cdn.example.com/loader.js?ref=securepubads.g.doubleclick.net/tag/js/gpt.js",
+                &crate::integrations::script_url::tests::context()
             ),
             "should not match when GPT host appears only in query text"
         );
 
         assert!(
             !GptIntegration::is_gpt_script_url(
-                "https://cdn.example.com/assets/securepubads.g.doubleclick.net/tag/js/gpt.js"
+                "https://cdn.example.com/assets/securepubads.g.doubleclick.net/tag/js/gpt.js",
+                &crate::integrations::script_url::tests::context()
             ),
             "should not match when GPT host appears only in path text"
         );

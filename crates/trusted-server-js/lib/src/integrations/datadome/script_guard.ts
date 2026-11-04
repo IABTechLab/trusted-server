@@ -1,4 +1,5 @@
 import { createScriptGuard } from '../../shared/script_guard';
+import { parseScriptUrl, scriptUrlPath } from '../../shared/script_url';
 
 /**
  * DataDome SDK Script Interception Guard
@@ -14,52 +15,20 @@ import { createScriptGuard } from '../../shared/script_guard';
  * (e.g., /tags.js, /js/check).
  */
 
-/** Regex to match js.datadome.co as a domain in URLs */
-const DATADOME_URL_PATTERN = /^(?:https?:)?\/\/js\.datadome\.co(?:\/|$)|^js\.datadome\.co(?:\/|$)/i;
-
-/**
- * Check if a URL is a DataDome SDK URL.
- * Matches URLs where js.datadome.co is the host (not just a substring).
- *
- * Valid patterns:
- * - https://js.datadome.co/...
- * - //js.datadome.co/...
- * - js.datadome.co/... (bare domain)
- *
- * Invalid:
- * - https://cdn.example.com/js.datadome.co.js (domain is not js.datadome.co)
- */
+/** Check parsed SDK host ownership, without promoting relative paths to hosts. */
 function isDataDomeSdkUrl(url: string): boolean {
-  return !!url && DATADOME_URL_PATTERN.test(url);
+  return parseScriptUrl(url)?.hostname === 'js.datadome.co';
 }
 
-/**
- * Extract the path from a DataDome URL to preserve it in the rewrite.
- * e.g., "https://js.datadome.co/tags.js" -> "/tags.js"
- *       "https://js.datadome.co/js/check" -> "/js/check"
- */
+/** Extract the parsed path, query and fragment of an HTTP source reference. */
 function extractDataDomePath(url: string): string {
-  try {
-    // Normalize to absolute URL for parsing
-    const normalizedUrl = url.startsWith('//')
-      ? `https:${url}`
-      : url.startsWith('http')
-        ? url
-        : `https://${url}`;
-
-    const parsed = new URL(normalizedUrl);
-    return parsed.pathname + parsed.search;
-  } catch {
-    // Fallback: extract path after js.datadome.co
-    const match = url.match(/js\.datadome\.co(\/[^'"]*)?/i);
-    return match?.[1] || '/tags.js';
-  }
+  const parsed = parseScriptUrl(url);
+  return parsed ? scriptUrlPath(parsed) : '';
 }
 
-/**
- * Build a first-party URL from the current page origin and the DataDome path.
- */
+/** Keep the SDK path on the first-party proxy. */
 function rewriteDataDomeUrl(originalUrl: string): string {
+  if (!isDataDomeSdkUrl(originalUrl)) return originalUrl;
   return `${window.location.origin}/integrations/datadome${extractDataDomePath(originalUrl)}`;
 }
 

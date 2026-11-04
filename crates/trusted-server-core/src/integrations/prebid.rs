@@ -1023,32 +1023,8 @@ impl PrebidIntegration {
         }
     }
 
-    fn matches_script_url(&self, attr_value: &str) -> bool {
-        let trimmed = attr_value.trim();
-        let without_query = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
-
-        if self.matches_script_pattern(without_query) {
-            return true;
-        }
-
-        if !without_query.starts_with('/')
-            && !without_query.starts_with("//")
-            && !without_query.contains("://")
-        {
-            let with_slash = format!("/{without_query}");
-            if self.matches_script_pattern(&with_slash) {
-                return true;
-            }
-        }
-
-        let parsed = if without_query.starts_with("//") {
-            ParsedUrl::parse(&format!("https:{without_query}"))
-        } else {
-            ParsedUrl::parse(without_query)
-        };
-
-        parsed
-            .ok()
+    fn matches_script_url(&self, value: &str, ctx: &IntegrationAttributeContext<'_>) -> bool {
+        super::script_url::parse_script_url(value, ctx)
             .is_some_and(|url| self.matches_script_pattern(url.path()))
     }
 
@@ -1462,9 +1438,9 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
+        ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
-        if self.matches_script_url(attr_value) {
+        if self.matches_script_url(attr_value, ctx) {
             AttributeRewriteAction::remove_element()
         } else {
             AttributeRewriteAction::keep()
@@ -4724,11 +4700,26 @@ excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
     }
 
     #[test]
+    fn script_url_ownership_corpus() {
+        let integration = PrebidIntegration::new(base_config());
+        crate::integrations::script_url::tests::assert_ownership("prebid", &*integration);
+    }
+
+    #[test]
     fn matches_script_url_matches_common_variants() {
         let integration = PrebidIntegration::new(base_config());
-        assert!(integration.matches_script_url("https://cdn.com/prebid.js"));
-        assert!(integration.matches_script_url("https://cdn.com/prebid.min.js?version=1"));
-        assert!(!integration.matches_script_url("https://cdn.com/app.js"));
+        assert!(integration.matches_script_url(
+            "https://cdn.example.com/prebid.js",
+            &crate::integrations::script_url::tests::context()
+        ));
+        assert!(integration.matches_script_url(
+            "https://cdn.example.com/prebid.min.js?version=1",
+            &crate::integrations::script_url::tests::context()
+        ));
+        assert!(!integration.matches_script_url(
+            "https://cdn.example.com/app.js",
+            &crate::integrations::script_url::tests::context()
+        ));
     }
 
     #[test]

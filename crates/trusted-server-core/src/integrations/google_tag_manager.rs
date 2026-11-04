@@ -555,58 +555,16 @@ impl GoogleTagManagerIntegration {
         rewritten
     }
 
-    /// Whether an attribute value URL should be rewritten to first-party.
-    /// Only matches URLs for which we have corresponding proxy routes
-    /// (gtm.js, gtag/js, collect, g/collect). Excludes ns.html and other
-    /// GTM endpoints we don't proxy.
-    ///
-    /// Uses proper URL parsing to prevent false positives from substring matching.
-    /// For example, rejects URLs like `https://evil.com/?u=https://www.google-analytics.com/collect`
-    fn is_rewritable_url(url: &str) -> bool {
-        // List of supported paths we proxy (must match route handlers)
+    /// Parse an owned source using the same host/path rule as execution.
+    fn rewritable_url(value: &str, ctx: &IntegrationAttributeContext<'_>) -> Option<url::Url> {
         const SUPPORTED_PATHS: &[&str] =
             &["/gtm.js", "/gtag/js", "/gtag.js", "/collect", "/g/collect"];
-
-        // Parse URL to extract host and path
-        // Support both absolute URLs (https://...) and protocol-relative URLs (//...)
-        let url_to_parse = if url.starts_with("//") {
-            format!("https:{}", url)
-        } else if url.starts_with("http://") || url.starts_with("https://") {
-            url.to_string()
-        } else {
-            // Relative URLs or other formats - not rewritable via this integration
-            return false;
-        };
-
-        // Extract host and path from URL
-        // Format: https://host/path?query
-        let without_protocol = url_to_parse
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-
-        let (host, path_with_query) = match without_protocol.split_once('/') {
-            Some((h, p)) => (h, format!("/{}", p)),
-            None => return false, // No path component
-        };
-
-        // Extract path without query string or fragment
-        let path = path_with_query
-            .split('?')
-            .next()
-            .and_then(|p| p.split('#').next())
-            .unwrap_or("");
-
-        // Validate host is exactly one of our supported GTM/GA domains.
-        // Shares the constants used to build proxy targets and the allowlist so
-        // the two cannot name different hosts.
-        let valid_host = matches!(host, GTM_SCRIPT_HOST | GA_COLLECT_HOST | ANALYTICS_HOST);
-
-        if !valid_host {
-            return false;
-        }
-
-        // Validate path is in our allowlist
-        SUPPORTED_PATHS.contains(&path)
+        let url = super::script_url::parse_script_url(value, ctx)?;
+        (matches!(
+            url.host_str(),
+            Some(GTM_SCRIPT_HOST | GA_COLLECT_HOST | ANALYTICS_HOST)
+        ) && SUPPORTED_PATHS.contains(&url.path()))
+        .then_some(url)
     }
 
     /// Both `/gtag/js` (canonical) and `/gtag.js` (alternate) are accepted;
@@ -1114,10 +1072,13 @@ impl IntegrationAttributeRewriter for GoogleTagManagerIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
+        ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
-        if Self::is_rewritable_url(attr_value) {
-            AttributeRewriteAction::replace(Self::rewrite_gtm_urls(attr_value))
+        if let Some(url) = Self::rewritable_url(attr_value, ctx) {
+            AttributeRewriteAction::replace(format!(
+                "/integrations/{GTM_INTEGRATION_ID}{}",
+                super::script_url::path_and_suffix(&url)
+            ))
         } else {
             AttributeRewriteAction::keep()
         }
@@ -1216,6 +1177,17 @@ mod tests {
     use crate::settings::Settings;
     use crate::streaming_processor::StreamProcessor as _;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+
+    #[test]
+    fn script_url_ownership_corpus() {
+        let config = serde_json::from_value(serde_json::json!({"container_id": "GTM-TEST"}))
+            .expect("should deserialize GTM config");
+        let integration = GoogleTagManagerIntegration::new(config);
+        crate::integrations::script_url::tests::assert_ownership(
+            "google_tag_manager",
+            &*integration,
+        );
+    }
 
     #[test]
     fn container_id_validation_matches_gtm_pattern() {

@@ -18,9 +18,11 @@ unchanged without claiming a JSON content type.
 
 ## Script rewrite
 
-When `rewrite_scripts = true`, `src` and `href` values containing
-`testlight.js` are replaced with `shim_src`. Other attributes and values
-are unchanged. The default shim source is the registry-free unified `tsjs`
+When `rewrite_scripts = true`, HTTP(S) source references whose final parsed
+path segment is `testlight.js`, matched case-insensitively, are replaced with
+`shim_src`. Relative references use the request origin available to the native
+rewriter. A filename appearing only in a query, fragment, or parent directory
+does not match. Other attributes and values are unchanged. The default shim source is the registry-free unified `tsjs`
 path because Testlight is an immediate bundled module.
 
 This integration is for controlled development validation, not a production

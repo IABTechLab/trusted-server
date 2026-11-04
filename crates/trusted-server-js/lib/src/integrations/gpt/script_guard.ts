@@ -1,4 +1,5 @@
 import { log } from '../../core/log';
+import { parseScriptUrl } from '../../shared/script_url';
 import {
   DEFAULT_DOM_INSERTION_HANDLER_PRIORITY,
   type DomInsertionCandidate,
@@ -55,34 +56,10 @@ const PROXY_PREFIX = '/integrations/gpt';
 // ---------------------------------------------------------------------------
 
 /**
- * Parse a URL string into a URL object, supporting protocol-relative URLs.
- */
-function parseUrl(url: string): URL | undefined {
-  if (!url) return undefined;
-
-  try {
-    if (typeof window !== 'undefined') {
-      return new URL(url, window.location.href);
-    }
-    return new URL(url);
-  } catch {
-    if (!url.startsWith('//')) {
-      return undefined;
-    }
-
-    try {
-      return new URL(`https:${url}`);
-    } catch {
-      return undefined;
-    }
-  }
-}
-
-/**
  * Check if a URL belongs to the GPT domain we proxy.
  */
 function isGptDomainUrl(url: string): boolean {
-  const parsed = parseUrl(url);
+  const parsed = parseScriptUrl(url);
   return !!parsed && parsed.hostname.toLowerCase() === GPT_DOMAIN;
 }
 
@@ -95,7 +72,7 @@ function isGptDomainUrl(url: string): boolean {
  * ```
  */
 function rewriteUrl(originalUrl: string): string {
-  const parsed = parseUrl(originalUrl);
+  const parsed = parseScriptUrl(originalUrl);
   if (!parsed || typeof window === 'undefined') {
     return originalUrl;
   }

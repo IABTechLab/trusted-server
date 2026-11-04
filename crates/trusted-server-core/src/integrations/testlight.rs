@@ -244,14 +244,17 @@ impl IntegrationAttributeRewriter for TestlightIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
+        ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         if !self.config.rewrite_scripts {
             return AttributeRewriteAction::keep();
         }
 
-        let lowered = attr_value.to_ascii_lowercase();
-        if lowered.contains("testlight.js") {
+        let Some(url) = super::script_url::parse_script_url(attr_value, ctx) else {
+            return AttributeRewriteAction::keep();
+        };
+        let filename = url.path().rsplit('/').next().unwrap_or("");
+        if filename.eq_ignore_ascii_case("testlight.js") {
             AttributeRewriteAction::replace(self.config.shim_src.clone())
         } else {
             AttributeRewriteAction::keep()
@@ -293,6 +296,18 @@ mod tests {
                 .is_none(),
             "Should not build without integration config"
         );
+    }
+
+    #[test]
+    fn script_url_ownership_corpus() {
+        let integration = TestlightIntegration::new(TestlightConfig {
+            enabled: true,
+            endpoint: "https://example.com/openrtb".to_string(),
+            timeout_ms: 1000,
+            shim_src: "/static/testlight-shim.js".to_string(),
+            rewrite_scripts: true,
+        });
+        crate::integrations::script_url::tests::assert_ownership("testlight", &*integration);
     }
 
     #[test]

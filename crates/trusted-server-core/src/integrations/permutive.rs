@@ -98,10 +98,16 @@ impl PermutiveIntegration {
     }
 
     /// Check if a URL is a Permutive SDK URL.
-    fn is_permutive_sdk_url(&self, url: &str) -> bool {
-        let lower = url.to_ascii_lowercase();
-        (lower.contains(".edge.permutive.app") || lower.contains("cdn.permutive.com"))
-            && lower.ends_with("-web.js")
+    fn is_permutive_sdk_url(&self, value: &str, ctx: &IntegrationAttributeContext<'_>) -> bool {
+        let Some(url) = super::script_url::parse_script_url(value, ctx) else {
+            return false;
+        };
+        let host = url.host_str().unwrap_or("");
+        (host == "cdn.permutive.com"
+            || host
+                .strip_suffix(".edge.permutive.app")
+                .is_some_and(|subdomain| !subdomain.is_empty()))
+            && url.path().to_ascii_lowercase().ends_with("-web.js")
     }
 
     /// Handle SDK serving - fetch from Permutive CDN and serve through first-party domain.
@@ -428,13 +434,13 @@ impl IntegrationAttributeRewriter for PermutiveIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
+        ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         if !self.config.rewrite_sdk {
             return AttributeRewriteAction::keep();
         }
 
-        if self.is_permutive_sdk_url(attr_value) {
+        if self.is_permutive_sdk_url(attr_value, ctx) {
             // Rewrite to first-party SDK endpoint.
             // Root-relative so the browser resolves it against the page host.
             // Note: a page-level `<base href>` participates in this resolution,
@@ -498,6 +504,16 @@ mod tests {
     }
 
     #[test]
+    fn script_url_ownership_corpus() {
+        let config = serde_json::from_value(serde_json::json!({
+            "organization_id": "example", "workspace_id": "workspace"
+        }))
+        .expect("should deserialize Permutive config");
+        let integration = PermutiveIntegration::new(config);
+        crate::integrations::script_url::tests::assert_ownership("permutive", &*integration);
+    }
+
+    #[test]
     fn test_permutive_sdk_url_detection() {
         let config = PermutiveConfig {
             enabled: true,
@@ -512,17 +528,26 @@ mod tests {
         let integration = PermutiveIntegration::new(config);
 
         // Should match edge.permutive.app URLs
-        assert!(
-            integration
-                .is_permutive_sdk_url("https://myorg.edge.permutive.app/workspace-123-web.js")
-        );
+        assert!(integration.is_permutive_sdk_url(
+            "https://myorg.edge.permutive.app/workspace-123-web.js",
+            &crate::integrations::script_url::tests::context()
+        ));
 
         // Should match cdn.permutive.com URLs
-        assert!(integration.is_permutive_sdk_url("https://cdn.permutive.com/myworkspace-web.js"));
+        assert!(integration.is_permutive_sdk_url(
+            "https://cdn.permutive.com/myworkspace-web.js",
+            &crate::integrations::script_url::tests::context()
+        ));
 
         // Should not match other URLs
-        assert!(!integration.is_permutive_sdk_url("https://example.com/script.js"));
-        assert!(!integration.is_permutive_sdk_url("https://myorg.edge.permutive.app/other.js"));
+        assert!(!integration.is_permutive_sdk_url(
+            "https://example.com/script.js",
+            &crate::integrations::script_url::tests::context()
+        ));
+        assert!(!integration.is_permutive_sdk_url(
+            "https://myorg.edge.permutive.app/other.js",
+            &crate::integrations::script_url::tests::context()
+        ));
     }
 
     #[test]

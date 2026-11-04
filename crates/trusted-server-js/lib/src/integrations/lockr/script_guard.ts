@@ -1,4 +1,5 @@
 import { createScriptGuard } from '../../shared/script_guard';
+import { parseScriptUrl } from '../../shared/script_url';
 
 /**
  * Lockr SDK Script Interception Guard
@@ -17,28 +18,13 @@ import { createScriptGuard } from '../../shared/script_guard';
 
 /**
  * Check if a URL is a Lockr SDK URL.
- * Matches the logic from lockr.rs:79-86
+ * Match the parsed host and final SDK filename, as in the native rewriter.
  */
 function isLockrSdkUrl(url: string): boolean {
-  if (!url) return false;
-
-  const lower = url.toLowerCase();
-
-  // Check for aim.loc.kr domain
-  if (lower.includes('aim.loc.kr')) {
-    return true;
-  }
-
-  // Check for identity.loc.kr with identity-lockr and .js extension
-  if (
-    lower.includes('identity.loc.kr') &&
-    lower.includes('identity-lockr') &&
-    lower.endsWith('.js')
-  ) {
-    return true;
-  }
-
-  return false;
+  const parsed = parseScriptUrl(url);
+  if (!parsed || !['aim.loc.kr', 'identity.loc.kr'].includes(parsed.hostname)) return false;
+  const filename = parsed.pathname.split('/').pop()?.toLowerCase() ?? '';
+  return filename.includes('identity-lockr') && filename.endsWith('.js');
 }
 
 const guard = createScriptGuard({

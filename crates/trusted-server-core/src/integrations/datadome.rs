@@ -789,21 +789,6 @@ impl DataDomeIntegration {
         Ok(backend_resp.response)
     }
 
-    /// Extract the path portion after the `DataDome` domain from a URL.
-    ///
-    /// Returns the path (including leading slash) or `/tags.js` as default.
-    fn extract_datadome_path(url: &str) -> &str {
-        url.split_once("js.datadome.co")
-            .and_then(|(_, after)| {
-                if after.starts_with('/') {
-                    Some(after)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or("/tags.js")
-    }
-
     fn backend_name_for_url(
         services: &RuntimeServices,
         target_url: &str,
@@ -917,17 +902,36 @@ impl IntegrationAttributeRewriter for DataDomeIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
+        ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
-        // Check if this is a DataDome script URL
-        let is_datadome =
-            attr_value.contains("js.datadome.co") || attr_value.contains("datadome.co/tags.js");
-
-        if !is_datadome {
+        if !self.config.rewrite_sdk {
             return AttributeRewriteAction::Keep;
         }
-
-        let path = Self::extract_datadome_path(attr_value);
+        let Some(url) = super::script_url::parse_script_url(attr_value, ctx) else {
+            return AttributeRewriteAction::Keep;
+        };
+        if !matches!(
+            url.host_str(),
+            Some("js.datadome.co" | "api-js.datadome.co")
+        ) {
+            return AttributeRewriteAction::Keep;
+        }
+        let path = super::script_url::path_and_suffix(&url);
+        // Parsed URLs normalize a missing path to "/". Preserve the legacy
+        // default only for an authority reference with no explicit path.
+        // This spelling check runs after parsed host ownership, never as a matcher.
+        let source = attr_value.trim().split(['?', '#']).next().unwrap_or("");
+        let authority_reference = source
+            .split_once("://")
+            .map(|(_, authority)| authority)
+            .or_else(|| source.strip_prefix("//"));
+        let missing_path =
+            authority_reference.is_some_and(|authority| !authority.contains(['/', '\\']));
+        let path = if url.path() == "/" && missing_path {
+            format!("/tags.js{}", &path[1..])
+        } else {
+            path.to_owned()
+        };
         // Root-relative so the browser resolves it against the page host.
         // Note: a page-level `<base href>` participates in this resolution, so
         // on pages that set an external base URL these resolve against that base
@@ -1528,29 +1532,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_datadome_path() {
-        assert_eq!(
-            DataDomeIntegration::extract_datadome_path("https://js.datadome.co/tags.js"),
-            "/tags.js"
-        );
-        assert_eq!(
-            DataDomeIntegration::extract_datadome_path("//js.datadome.co/js/check"),
-            "/js/check"
-        );
-        assert_eq!(
-            DataDomeIntegration::extract_datadome_path("js.datadome.co/js/signal"),
-            "/js/signal"
-        );
-        // Bare domain without path should default to /tags.js
-        assert_eq!(
-            DataDomeIntegration::extract_datadome_path("https://js.datadome.co"),
-            "/tags.js"
-        );
-        // api-js subdomain
-        assert_eq!(
-            DataDomeIntegration::extract_datadome_path("https://api-js.datadome.co/js/"),
-            "/js/"
-        );
+    fn script_url_ownership_corpus() {
+        let integration = DataDomeIntegration::new(test_config());
+        crate::integrations::script_url::tests::assert_ownership("datadome", &*integration);
     }
 
     #[test]

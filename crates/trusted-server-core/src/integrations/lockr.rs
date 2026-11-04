@@ -97,11 +97,19 @@ impl LockrIntegration {
     }
 
     /// Check if a URL is a Lockr SDK URL.
-    fn is_lockr_sdk_url(&self, url: &str) -> bool {
-        let lower = url.to_ascii_lowercase();
-        (lower.contains("aim.loc.kr") || lower.contains("identity.loc.kr"))
-            && lower.contains("identity-lockr")
-            && lower.ends_with(".js")
+    fn is_lockr_sdk_url(&self, value: &str, ctx: &IntegrationAttributeContext<'_>) -> bool {
+        let Some(url) = super::script_url::parse_script_url(value, ctx) else {
+            return false;
+        };
+        let filename = url
+            .path()
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        matches!(url.host_str(), Some("aim.loc.kr" | "identity.loc.kr"))
+            && filename.contains("identity-lockr")
+            && filename.ends_with(".js")
     }
 
     /// Handle SDK serving — fetch from Lockr CDN and serve through first-party domain.
@@ -394,7 +402,7 @@ impl IntegrationAttributeRewriter for LockrIntegration {
             return AttributeRewriteAction::Keep;
         }
 
-        if self.is_lockr_sdk_url(attr_value) {
+        if self.is_lockr_sdk_url(attr_value, ctx) {
             // Anchor SDK scripts and preloads to the page origin, not an external base URL.
             let replacement = format!(
                 "{}://{}/integrations/lockr/sdk",
@@ -463,31 +471,58 @@ mod tests {
     }
 
     #[test]
+    fn script_url_ownership_corpus() {
+        let integration = LockrIntegration::new(test_config());
+        crate::integrations::script_url::tests::assert_ownership("lockr", &*integration);
+    }
+
+    #[test]
     fn test_lockr_sdk_url_detection() {
         let integration = LockrIntegration::new(test_config());
 
         // Should match Lockr SDK URLs
-        assert!(integration.is_lockr_sdk_url("https://aim.loc.kr/identity-lockr-v1.0.js"));
-        assert!(integration.is_lockr_sdk_url("https://aim.loc.kr/identity-lockr-trust-server.js"));
-        assert!(integration.is_lockr_sdk_url("https://identity.loc.kr/identity-lockr-v2.0.js"));
+        assert!(integration.is_lockr_sdk_url(
+            "https://aim.loc.kr/identity-lockr-v1.0.js",
+            &crate::integrations::script_url::tests::context()
+        ));
+        assert!(integration.is_lockr_sdk_url(
+            "https://aim.loc.kr/identity-lockr-trust-server.js",
+            &crate::integrations::script_url::tests::context()
+        ));
+        assert!(integration.is_lockr_sdk_url(
+            "https://identity.loc.kr/identity-lockr-v2.0.js",
+            &crate::integrations::script_url::tests::context()
+        ));
 
         // Should not match non-SDK resources on Lockr domains
         assert!(
-            !integration.is_lockr_sdk_url("https://aim.loc.kr/pixel.gif"),
+            !integration.is_lockr_sdk_url(
+                "https://aim.loc.kr/pixel.gif",
+                &crate::integrations::script_url::tests::context()
+            ),
             "should not match non-JS assets on aim.loc.kr"
         );
         assert!(
-            !integration.is_lockr_sdk_url("https://aim.loc.kr/styles.css"),
+            !integration.is_lockr_sdk_url(
+                "https://aim.loc.kr/styles.css",
+                &crate::integrations::script_url::tests::context()
+            ),
             "should not match CSS files on aim.loc.kr"
         );
         assert!(
-            !integration.is_lockr_sdk_url("https://identity.loc.kr/some-other-script.js"),
+            !integration.is_lockr_sdk_url(
+                "https://identity.loc.kr/some-other-script.js",
+                &crate::integrations::script_url::tests::context()
+            ),
             "should not match non-SDK JS files on identity.loc.kr"
         );
 
         // Should not match other URLs
         assert!(
-            !integration.is_lockr_sdk_url("https://example.com/script.js"),
+            !integration.is_lockr_sdk_url(
+                "https://example.com/script.js",
+                &crate::integrations::script_url::tests::context()
+            ),
             "should not match unrelated domains"
         );
     }
