@@ -30,16 +30,21 @@ cd docs && npm run format
 
 If any gate fails, report the failure and stop — do not create a broken PR.
 
-### 3. Ensure a linked issue exists
+### 3. Link an issue when one is required
 
-Every PR should close a ticket.
+Features and other substantial changes need an issue; smaller PRs link one if
+it exists (see `CONTRIBUTING.md`).
 
-1. **Ask the user** if there is an existing issue number for this work.
-2. If the user provides an issue number, use it in the `Closes #<number>` line.
-3. If no issue exists, create one using the appropriate issue type (see Issue
-   Types below), then reference it in the PR body with `Closes #<number>`.
+1. Check the user's context and search the issue tracker for an existing issue
+   for this work.
+2. If an issue exists, use it in the `Closes #<number>` line.
+3. If no issue exists and the change is a feature or otherwise substantial,
+   create one using the appropriate issue type (see Issue Types below), then
+   reference it in the PR body with `Closes #<number>`.
+4. For a smaller PR with no existing issue, state that there is no linked issue
+   in the PR body; do not create an issue just for the PR.
 
-Do **not** skip this step or assume an issue exists without asking.
+Do not assume an issue exists without verifying it.
 
 ### 4. Draft PR content
 
@@ -47,7 +52,8 @@ Using the `.github/pull_request_template.md` structure, draft:
 
 - **Summary**: 1-3 bullet points describing what the PR does and why.
 - **Changes table**: list each file modified and what changed.
-- **Closes**: `Closes #<issue-number>` to auto-close the linked issue.
+- **Closes**: `Closes #<issue-number>` to auto-close the linked issue, or state
+  that there is no linked issue for a smaller PR without one.
 - **Test plan**: check off which verification steps were run.
 - **Hardening note**: when config-derived regex or pattern compilation is touched, state how invalid enabled config fails startup and which regression tests cover that path.
 - **Checklist**: verify each item applies.
@@ -74,8 +80,9 @@ EOF
 
 ### 6. Move linked issue to "In progress"
 
-After creating the PR, move the linked issue on the project board — but only
-if it is **not** already in "In review" or "Done".
+If there is no linked issue, skip this step. Otherwise, after creating the PR,
+move the linked issue on the project board — but only if it is **not** already
+in "In review" or "Done".
 
 1. Get the issue's project item ID and current status:
 
