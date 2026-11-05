@@ -158,17 +158,20 @@ impl<'a> RequestCookies<'a> {
         Self(header)
     }
 
-    /// Returns the first value of cookie `name`, undecoded and unquoted.
+    /// Returns the first non-empty value of cookie `name`, undecoded and
+    /// unquoted.
     ///
-    /// An empty value reads as absent.
+    /// Empty values are skipped, so an empty duplicate (another path or
+    /// domain) does not hide a later value; a name with only empty values
+    /// reads as absent.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&'a str> {
         self.0
             .split(';')
             .filter_map(|pair| pair.split_once('='))
-            .find(|(key, _)| key.trim() == name)
+            .filter(|(key, _)| key.trim() == name)
             .map(|(_, value)| value.trim().trim_matches('"'))
-            .filter(|value| !value.is_empty())
+            .find(|value| !value.is_empty())
     }
 }
 
@@ -813,6 +816,11 @@ mod tests {
         );
         assert_eq!(cookies.get("a"), Some("1"), "should find leading cookie");
         assert_eq!(cookies.get("empty"), None, "should ignore empty values");
+        assert_eq!(
+            RequestCookies::new("vendor_id=; vendor_id=v-2").get("vendor_id"),
+            Some("v-2"),
+            "should skip an empty duplicate before a later value"
+        );
         assert_eq!(cookies.get("missing"), None, "should miss absent cookies");
     }
 
