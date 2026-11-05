@@ -1,5 +1,64 @@
 # EdgeZero RC431 validation record
 
+## Native MaxMind follow-up, 2026-11-04
+
+Checked on Linux amd64 with Rust 1.98.1 and Node 24.12.0, in branch
+`feat/native-maxmind-geo` over `45da2460e53a8c396fcfb2eb14020b81e047e966`.
+The original worktree's unrelated uncommitted work was not copied or changed.
+EdgeZero remains pinned to `fda87556f5aab160711eb5244c1d1065a6bb48d6`.
+
+The TS boot profile now selects Off, MaxMind or protected CloudFront assertions.
+MaxMind stays default-off and uses the existing checked reader/proxy policy.
+No Fly-specific parser, ALB requirement, downloader or remote lookup was added.
+
+| Check                                                                                                                       | Result                                                                                                                     | Local log                                                        |
+| --------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `cargo test --locked -p trusted-server-adapter-axum`                                                                        | 96 passed, 2 ignored                                                                                                       | `/tmp/ts-maxmind-matrix.log`                                     |
+| Same command with `--features geo-maxmind`                                                                                  | 101 passed, 3 ignored                                                                                                      | Same matrix log                                                  |
+| Same command with `--features geo-maxmind,geo-cloudfront`                                                                   | 103 passed, 3 ignored                                                                                                      | Same matrix log                                                  |
+| `cargo clippy --locked -p trusted-server-adapter-axum --all-targets --features geo-maxmind,geo-cloudfront -- -D warnings`   | Passed                                                                                                                     | Same matrix log                                                  |
+| `cargo doc --locked -p trusted-server-adapter-axum --no-deps --features geo-maxmind,geo-cloudfront`                         | Passed                                                                                                                     | Same matrix log                                                  |
+| Ignored `operator_geolite_snapshot_resolves_checked_reader` test, explicitly selected with operator dataset/location inputs | Three passes, covering country-only IPv4, GB/ENG and country-only IPv6                                                     | `/tmp/ts-maxmind-real-test.log`, `/tmp/ts-maxmind-real-more.log` |
+| `docker build --build-arg NATIVE_FEATURES=geo-maxmind -t ts-native-maxmind:local .`                                         | Passed with locked release build                                                                                           | `/tmp/ts-maxmind-docker-build.log`                               |
+| `node scripts/test-native-container.mjs ts-native-maxmind:local`                                                            | Default-Off routes, startup rejection and in-flight SIGTERM drain passed                                                   | `/tmp/ts-maxmind-container-default.log`                          |
+| `node /tmp/ts-maxmind-real/container-smoke.mjs`                                                                             | Read-only mounted operator dataset, checked IPv4/IPv6 proxy chains, spoof rejection, auth-error headers and SIGTERM passed | `/tmp/ts-maxmind-container-geo.log`                              |
+
+The operator snapshot was an extracted 48 MB GeoLite2-City MMDB. It stayed outside
+the repository and build context. The loaded snapshot checksum matched the source.
+The release container became ready in 2.6 seconds including container startup and
+used about 59 MiB idle; peak startup RSS was not measured. The first debug probe
+hit the existing fixture's 10-second timeout. Only the opt-in operator test now
+has a 120-second allowance. It passed in 21.55 seconds without concurrent image
+compilation; additional debug runs under build load took 35.68 and 53.64 seconds.
+The initial one-off container probe omitted the image's existing `/data` mount
+and failed hosting validation. Adding its normal ephemeral mount fixed the probe;
+no runtime source change was needed.
+
+The local image ID is
+`sha256:7a91157d5af1dd70e47fb660649ac1a524348687877c8de7c5c2e50ba73131fd`,
+configured as UID/GID `10001:10001`. No git-version build argument was supplied
+for this uncommitted source. The image's embedded input hashes matched the current
+workspace Cargo files, native Geo implementation, startup tests and all synthetic
+fixtures. The SHA-256 of `/tmp/ts-maxmind-checked-inputs.sha256`, covering the changed
+Rust/build inputs and fixtures, is
+`6c627b6929002146c04dd57a88d5379963e61d954cd7e6f532427fcceb9265ec`.
+
+Dependency trees confirmed no MaxMind or AWS SDK in the default native graph, and
+MaxMind without an AWS SDK when selected. Rust formatting, changed Markdown
+formatting and `git diff --check` passed. Actionlint passed with the existing
+SC2086 findings excluded; running it against the untouched workflow reproduced
+those same three unquoted `GITHUB_OUTPUT` findings. A read-only source review
+found no remaining issues. Temporary containers/networks were removed.
+
+No live Fly deployment, ingress peer discovery, image publication, arm64 build,
+WASM suite or full cross-adapter CI rerun is claimed. The existing ignored Next.js
+fixture and doctest remain unexecuted. The operator snapshot test is ignored in
+ordinary CI and was explicitly run locally. Upstream's unused-metadata validation
+limitation in EdgeZero issue #438 remains. These checks do not certify geographic
+accuracy, dataset authenticity, consent, or suitability for a particular Fly
+network boundary. See [the operator guide](./native-rc-demo.md#optional-native-geo)
+for generic reverse-proxy configuration and Fly caveats.
+
 ## Relay consent and EdgeZero pin update, 2026-11-04
 
 PR #1498 was backported as `0a7c30176`. All six workspace EdgeZero declarations

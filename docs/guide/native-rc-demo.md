@@ -5,9 +5,9 @@ deployment. It starts from Trusted Server main
 `6ef07ae52bec3e695ec57fe090243b1a281c314f` and pins EdgeZero to
 `fda87556f5aab160711eb5244c1d1065a6bb48d6`. PRs #1410, #1411 and #1412,
 including their #777 module/configuration/permission stack, are excluded.
-The newer EdgeZero revision includes optional local GeoIP support, but this
-candidate retains its existing Off/CloudFront selections. MaxMind is not enabled
-or configured by the dependency update.
+Native Geo supports Off, a local GeoLite database, or protected CloudFront
+assertions. Both built-in implementations are default-off and require an explicit
+TS boot profile as well as their build feature.
 
 The [validation record](./native-rc-validation.md) lists executed checks,
 resolved failures and remaining limits.
@@ -114,12 +114,128 @@ The file must contain only trusted shell assignments and be readable by UID 1000
 secrets remain visible to Docker administrators. Remote Secrets Manager bindings
 avoid this local file-to-environment bridge.
 
-## Optional protected native Geo
+## Optional native Geo
 
-The `geo-cloudfront` feature is default-off. Compile it explicitly, then select
-it through a separately delivered TS boot profile. EdgeZero does not read a
-Geo setting from store bindings, publisher AppConfig or an `EDGEZERO__GEO__*`
-environment variable.
+Compile `geo-maxmind` for local IP lookup, `geo-cloudfront` for protected
+assertions, or both to make either available. Select exactly one through a
+separately delivered TS boot profile. EdgeZero does not read a Geo setting from
+store bindings, publisher AppConfig or an `EDGEZERO__GEO__*` environment variable.
+Set `TS_NATIVE_GEO_PROFILE_FILE` to the profile path. No profile means Off.
+An unreadable/invalid selected profile or compiled-out provider fails startup.
+
+### Local GeoLite lookup
+
+Local lookup requires no AWS, ALB, CloudFront, origin credential or geographic
+request headers. This is native Unix hosting support, not a WASM provider.
+
+```toml
+version = 1
+
+[geo]
+provider = "maxmind"
+database_path = "/geo/GeoLite2-City.mmdb"
+reader_ip_expectation = "forwarded_required"
+```
+
+The path must identify an extracted, regular MMDB file, not a gzip or tar archive.
+Prefer an absolute path; relative paths resolve from the server's working directory.
+Download and verify it outside the application, then mount it read-only and readable
+by the runtime user, UID 10001 in the supplied image. The server has no downloader
+and needs no MaxMind credentials. Do not commit or copy a production dataset into
+this repository or its Docker build context.
+
+Supported metadata types are `GeoLite2-City` and `GeoLite2-Country`.
+City supplies country and optional first-level subdivision through this API.
+Country supplies country only. Neither supplies city or coordinates to TS.
+
+`reader_ip_expectation` is required:
+
+- `forwarded_required` uses only a client resolved by EdgeZero's checked
+  `Forwarded` or `X-Forwarded-For` handling. Use this behind reverse proxies.
+  Missing/untrusted/unresolved forwarding leaves Geo unavailable. It does not
+  fall back to geolocating the proxy.
+- `peer_allowed` also permits the actual socket peer as the reader. Use it only
+  when direct reader connections are intended.
+
+For either forwarding header family, separately configure the actual trusted
+proxy peers and trusted chain hops. For example, these are synthetic addresses,
+not deployable provider ranges:
+
+```sh
+export EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS=192.0.2.10/32,198.51.100.8/32
+export EDGEZERO__ADAPTER__FORWARDING_HEADER_FAMILY=x-forwarded
+export TS_NATIVE_GEO_PROFILE_FILE=/config/native-geo.toml
+```
+
+Use `forwarded` instead of `x-forwarded` for an ingress that owns the standard
+`Forwarded` header. EdgeZero requires the actual TCP peer to be trusted, walks
+the selected chain right-to-left across trusted hops, and stops at the first
+untrusted address. Do not trust all private networks or a platform-wide range
+merely to get a result. Network access controls must prevent unrelated callers
+from impersonating the configured proxy peers. Raw geographic headers and
+`Fly-Client-IP` do not override the selected local lookup.
+
+```mermaid
+flowchart TD
+    Request[Incoming request] --> Ingress[EdgeZero checks socket peer and proxy chain]
+    Ingress --> Reader{Usable checked reader?}
+    Reader -->|Yes| Database[Look up immutable local MMDB snapshot]
+    Reader -->|No| Unavailable[Geo unavailable]
+    Database --> Outcome[RequestContext geo outcome]
+    Unavailable --> Outcome
+    Outcome --> TS[TS response headers and existing consent policy]
+```
+
+EdgeZero reads and validates the selected database before application initialization,
+listening and readiness. Missing, corrupt or unsupported databases fail startup
+without falling back to Off. Replacing/deleting the source file does not change a
+running snapshot. Publish a complete replacement and restart each process to adopt
+updates. Measure startup time and peak memory with your chosen snapshot before
+deployment. The upstream pinned reader has a known unused-metadata validation
+limitation, tracked in EdgeZero issue #438; it does not authenticate the dataset.
+
+Operators own GeoLite download/update, license and attribution requirements.
+This product includes GeoLite Data created by MaxMind, available from
+https://www.maxmind.com. <!-- allow-domain: www.maxmind.com -->
+
+#### Fly.io and other reverse proxies
+
+Fly's [request-header documentation](https://fly.io/docs/networking/request-headers/) <!-- allow-domain: fly.io -->
+says its `X-Forwarded-For` ends with an app-assigned shared or dedicated IP.
+For the generic chain walker to reach the reader, configure both the actual
+socket-peer ranges and any deployment-controlled rightmost proxy hops, including
+that app address where present. Use exact `/32` or `/128` addresses where possible.
+Confirm the peer and chain on your deployment and retest when routing or assigned
+addresses change. The docs do not establish a stable socket-peer allowlist, so
+there is no built-in Fly CIDR default.
+
+Start with `forwarded_required` and `x-forwarded`. Test a normal request, a forged
+leftmost XFF entry, missing forwarding, and access that bypasses the intended
+ingress. Do not enable Geo by trusting every peer. If your network cannot provide
+a narrow authenticated ingress boundary, put a controlled proxy in front of TS
+that normalizes forwarding and restrict access to it. This branch does not add a
+Fly header parser or claim a verified live Fly deployment.
+
+#### Test an operator snapshot locally
+
+The normal adapter tests use tiny synthetic databases and require no account or
+download. An ignored test also exercises a real operator snapshot through the
+production binary. Supply a known IP/location pair from your dataset:
+
+```sh
+TS_TEST_GEOLITE_DATABASE=/absolute/path/to/GeoLite2-City.mmdb \
+TS_TEST_GEO_IP="<known reader IP>" \
+TS_TEST_GEO_COUNTRY="<expected two-letter country>" \
+TS_TEST_GEO_REGION="<expected subdivision>" \
+cargo test --locked -p trusted-server-adapter-axum --features geo-maxmind \
+  --test startup operator_geolite_snapshot_resolves_checked_reader -- --ignored
+```
+
+Unset `TS_TEST_GEO_REGION` when the selected record has no subdivision.
+The test uses a loopback trusted proxy and a synthetic app-address hop, requires
+a forwarded reader and checks that a direct request stays unavailable.
+
+### Protected CloudFront assertions
 
 ```toml
 version = 1
@@ -174,11 +290,22 @@ docker build --build-arg TRUSTED_SERVER__GIT_VERSION="$(git rev-parse HEAD)" \
   -t ts-edgezero431-local:providers .
 ```
 
-Only `aws-appconfig-agent`, `aws-secrets-manager` and `geo-cloudfront` are accepted
-by this recipe. Add `geo-cloudfront` to the build argument for the protected
-profile; compiling it alone does not select Geo. CLI features do not compile
-server providers. There is no DynamoDB feature or EC
-graph claim here. Build outputs include `/usr/local/share/ts-build-inputs.sha256`
+The recipe accepts `aws-appconfig-agent`, `aws-secrets-manager`,
+`aws-dynamodb-ec`, `geo-cloudfront` and `geo-maxmind`. Add `geo-maxmind` to
+`NATIVE_FEATURES` for local lookup or `geo-cloudfront` for protected assertions.
+Compiling a provider alone does not select Geo. CLI features do not compile
+server providers. Mount the profile and extracted MMDB separately from the
+image, for example:
+
+```sh
+docker build --build-arg NATIVE_FEATURES=geo-maxmind -t ts-native-geo:local .
+# Add these to the existing prepared-config/secret docker run command:
+# --mount type=bind,src=/srv/ts/native-geo.toml,dst=/config/native-geo.toml,readonly
+# --mount type=bind,src=/srv/ts/geo,dst=/geo,readonly
+# -e TS_NATIVE_GEO_PROFILE_FILE=/config/native-geo.toml
+```
+
+The image's existing prepared configuration and secrets remain required. Build outputs include `/usr/local/share/ts-build-inputs.sha256`
 for comparing the exact copied build inputs with later working-tree changes.
 Digest-pinned bases do not make subsequent Debian security updates bit-reproducible.
 Build from a clean committed checkout when supplying the existing git-version

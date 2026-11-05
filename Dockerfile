@@ -5,7 +5,7 @@ FROM rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288
 COPY --from=node /usr/local/ /usr/local/
 WORKDIR /src
 COPY . .
-# Native providers and lab diagnostics are default-off. Forward them explicitly.
+# Native providers, Geo implementations and lab diagnostics are default-off. Forward them explicitly.
 ARG NATIVE_FEATURES=""
 # Optional existing build metadata input; .git never enters the build context.
 ARG TRUSTED_SERVER__GIT_VERSION=""
@@ -19,7 +19,7 @@ feature_ifs=$IFS
 IFS=,
 for feature in $NATIVE_FEATURES; do
   case "$feature" in
-    aws-appconfig-agent|aws-secrets-manager|aws-dynamodb-ec|geo-cloudfront|celld-config|celld-kv|lab-store-check) ;;
+    aws-appconfig-agent|aws-secrets-manager|aws-dynamodb-ec|geo-cloudfront|geo-maxmind|celld-config|celld-kv|lab-store-check) ;;
     *) echo 'Only the declared native store, Geo and lab diagnostic features are supported' >&2; exit 1 ;;
   esac
 done
