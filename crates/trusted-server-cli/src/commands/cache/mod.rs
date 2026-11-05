@@ -44,11 +44,7 @@ pub struct PurgeArgs {
     pub username: String,
 }
 
-/// Environment variable carrying the admin password.
-///
-/// Read from the environment and never accepted as a flag: an argument is visible to every
-/// other process on the host through `ps`, and lands in shell history.
-pub const ADMIN_PASSWORD_ENVIRONMENT_VARIABLE: &str = "TRUSTED_SERVER_ADMIN_PASSWORD";
+pub use crate::admin_client::ADMIN_PASSWORD_ENVIRONMENT_VARIABLE;
 
 /// Run a `ts cache` subcommand.
 ///
