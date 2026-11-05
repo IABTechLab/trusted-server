@@ -96,6 +96,10 @@ spin up --from crates/trusted-server-adapter-spin
 
 ### Testing & Quality
 
+Browser npm scripts acquire the shared build lease. For dependency installs,
+run `node scripts/browser-build-runner.mjs -- npm ci` from the repository root.
+Use that runner for direct browser tools too.
+
 ```bash
 # Run all Rust tests — use workspace aliases (bare `cargo test` fails at the
 # workspace root: it compiles the Fastly adapter for the host target).
@@ -144,7 +148,7 @@ cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings
 cargo check-fastly && cargo check-axum && cargo check-cloudflare
 
 # JS tests
-cd crates/trusted-server-js/lib && npx vitest run
+cd crates/trusted-server-js/lib && npm test
 
 # JS format
 cd crates/trusted-server-js/lib && npm run format
@@ -153,7 +157,7 @@ cd crates/trusted-server-js/lib && npm run format
 cd docs && npm run format
 
 # JS build
-cd crates/trusted-server-js/lib && node build-all.mjs
+cd crates/trusted-server-js/lib && npm run build
 ```
 
 ### Install prerequisites
@@ -366,7 +370,7 @@ Every PR must pass:
 2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm && cargo clippy-cli && cargo clippy-codegen`
 3. `cargo test-fastly && cargo test-fastly-reuse && cargo test-axum && cargo test-cloudflare && cargo test-spin`
 4. `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
-5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
+5. JS build and test (`cd crates/trusted-server-js/lib && npm test`)
 6. JS format (`cd crates/trusted-server-js/lib && npm run format`)
 7. Docs format (`cd docs && npm run format`)
 8. Markdown format outside `docs/` (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"`; fix with `--write` in place of `--check`
