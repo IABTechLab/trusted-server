@@ -196,10 +196,10 @@ Verify your setup is correct:
 fastly compute serve
 
 # Check that stores are accessible
-curl http://localhost:7676/.well-known/trusted-server.json
+ts keys list --service http://localhost:7676
 ```
 
-You should see a JWKS response with your public keys.
+You should see one line per active public key.
 
 ## Key Rotation Process
 
@@ -299,6 +299,33 @@ curl -X POST https://your-domain/_ts/admin/keys/rotate \
   "jwk": { ... }
 }
 ```
+
+### Confirm the New Key Is Published
+
+Before deactivating the previous key, confirm the new key appears in the service's
+discovery document (`/.well-known/trusted-server.json`). `ts keys list` fetches it and
+prints each active kid with its key type and curve; it needs no admin password:
+
+```bash
+ts keys list --service https://edge.example.com
+```
+
+```
+ts-2024-01-15	OKP	Ed25519
+ts-2024-02-15	OKP	Ed25519
+```
+
+Pass `--json` to print the discovery document exactly as the service returned it. To
+check a signature end to end against the new key, use `ts keys verify`, which exits
+non-zero when the signature does not verify:
+
+```bash
+ts keys verify --service https://edge.example.com \
+  --kid ts-2024-02-15 --payload '<payload>' --signature '<signature>'
+```
+
+Both commands require HTTPS, with plain HTTP allowed only for loopback development
+services.
 
 ### Using the Rust API
 
