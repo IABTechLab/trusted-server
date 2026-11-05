@@ -198,6 +198,8 @@ jobs:
           retention-days: 7
 
   fastly-reproduction:
+    # Deliberately after canonical: the comparison rejects a pair whose
+    # whole-second start times match, and parallel jobs can start together.
     needs: [checks, fastly-canonical]
     name: Reproduce trusted-server-fastly.wasm
     runs-on: ubuntu-24.04
@@ -426,7 +428,7 @@ jobs:
           fi
           echo 'SUCCESS: actual canonical and reproduction Fastly bytes match; ordinary unqualified companion sealed'
       - name: Upload the real Fastly rebuild check
-        if: ${{ success() && steps.comparison.outcome == 'success' }}
+        if: steps.comparison.outcome == 'success'
         uses: actions/upload-artifact@v6
         with:
           name: fastly-rebuild-check

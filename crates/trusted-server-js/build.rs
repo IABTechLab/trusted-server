@@ -79,7 +79,9 @@ pub(crate) fn run_with_hook(hook: impl FnMut(&Path, &Path)) {
 
     assert!(
         env::var_os(SKIP_BUILD_VAR).is_none(),
-        "tsjs: {SKIP_BUILD_VAR} is no longer supported whenever present"
+        "tsjs: {SKIP_BUILD_VAR} is no longer supported whenever present; run `npm run build` \
+         in crates/trusted-server-js/lib and set {PREBUILT_DIR_VAR} to embed prebuilt bundles \
+         instead"
     );
     let source = env::var_os(SOURCE_VAR);
     let release =

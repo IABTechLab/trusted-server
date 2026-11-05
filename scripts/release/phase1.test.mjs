@@ -2316,9 +2316,11 @@ test('ordinary Fastly gate binds dedicated A and B uploads before isolated signi
   assert.match(comparison, /ordinary-fetch/)
   assert.match(comparison, /ordinary-compare/)
   assert.match(comparison, /id: comparison/)
+  // Without a status function GitHub adds success(), so the companion uploads
+  // only after every earlier step and the comparison itself succeed.
   assert.match(
     comparison,
-    /if:.*success\(\).*steps\.comparison\.outcome == 'success'/
+    /- name: Upload the real Fastly rebuild check\n {8}if: steps\.comparison\.outcome == 'success'\n/
   )
   assert.match(comparison, /if ! env -i/)
   assert.doesNotMatch(
@@ -2458,13 +2460,11 @@ test('Fastly route diagnostics preserve literal directory headers and reject mal
   )
 })
 
-test('negative comparator proof keeps canaries read-only and audits both skipped stages', () => {
+test('failed comparison is proven by the Rust fixture and blocks the real sign and publish jobs', () => {
   const workflow = readFileSync('.github/workflows/test.yml', 'utf8')
-  const job = (name) =>
-    workflow.split(`\n  ${name}:`)[1]?.split(/\n  [a-z][\w-]*:\n/)[0]
+  const job = (name, source = workflow) =>
+    source.split(`\n  ${name}:`)[1]?.split(/\n  [a-z][\w-]*:\n/)[0]
   const native = job('test-axum')
-  assert.match(native, /id: producer-tests/)
-  assert.match(native, /comparison-succeeded=false/)
   assert.match(
     native,
     /ordinary_comparison_failure_prevents_signing_and_publication_sentinels -- --exact/
@@ -2482,19 +2482,27 @@ test('negative comparator proof keeps canaries read-only and audits both skipped
     fixture,
     /stderr\(&result\)\.contains\("ordinary final-byte mismatch"\)/
   )
-  for (const name of ['ordinary-negative-sign', 'ordinary-negative-publish']) {
-    const canary = job(name)
-    assert.match(canary, /needs: test-axum/)
-    assert.match(canary, /if:.*outputs\.comparison-succeeded == 'true'/)
-    assert.match(canary, /contents: read/)
-    assert.match(canary, /exit 1/)
-    assert.doesNotMatch(canary, /uses:|write|gh |cargo |npm |secrets/)
-  }
-  const audit = job('ordinary-negative-audit')
-  assert.match(audit, /if: always\(\)/)
-  assert.match(audit, /test "\$NATIVE_RESULT" = success/)
-  assert.match(audit, /test "\$SIGN_RESULT" = skipped/)
-  assert.match(audit, /test "\$PUBLISH_RESULT" = skipped/)
+  // A job `if:` without a status function gets GitHub's implicit success(),
+  // so a failed comparison skips signing and, through the reusable workflow,
+  // publication. A status function would let either job run after a failure.
+  const statusFunction = /\b(?:always|failure|cancelled)\(\)/
+  const jobCondition = (body) => body.match(/^ {4}if: (.+)$/m)?.[1] ?? ''
+  const build = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const sign = job('sign', build)
+  assert.match(sign, /needs: \[checks, build, fastly-comparison\]/)
+  assert.doesNotMatch(
+    jobCondition(sign),
+    statusFunction,
+    'should skip signing whenever the comparison fails'
+  )
+  const caller = readFileSync('.github/workflows/release.yml', 'utf8')
+  const release = job('release', caller)
+  assert.match(release, /needs: build\n/)
+  assert.doesNotMatch(
+    jobCondition(release),
+    statusFunction,
+    'should skip publication whenever the reusable build fails'
+  )
 })
 
 test('release build keeps locked builds, pinned generators and final integrity checks', () => {

@@ -1,4 +1,4 @@
-name: 'Run Format'
+name: "Run Format"
 
 on:
   push:
@@ -85,7 +85,7 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           target: wasm32-wasip1,wasm32-unknown-unknown
-          components: 'clippy, rustfmt'
+          components: "clippy, rustfmt"
           cache-key: cargo-clippy
 
       # trusted-server-core's dependency on trusted-server-js runs the TSJS
@@ -152,14 +152,14 @@ jobs:
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
       - name: Use Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: 'npm'
+          cache: "npm"
           cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies
@@ -183,14 +183,14 @@ jobs:
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
       - name: Use Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: 'npm'
+          cache: "npm"
           cache-dependency-path: docs/package.json
 
       - name: Install dependencies
@@ -219,7 +219,7 @@ jobs:
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
       - name: Use Node.js
