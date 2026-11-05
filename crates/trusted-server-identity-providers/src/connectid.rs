@@ -8,6 +8,10 @@
 //! drops it once that time has passed. A missing `ttl` uses the shared
 //! default TTL. No server call is made.
 //!
+//! Yahoo's opt-out (`connectIdOptOut` = `1`) is kept in local storage, which
+//! a server never sees, so it is not honoured here: a `ConnectID` cookie left
+//! behind after an opt-out is still read until it expires.
+//!
 //! This kind has no Lockr capability: Lockr AIM is not documented to
 //! deliver `ConnectID`, so a `lockr` settings table is rejected.
 //!
