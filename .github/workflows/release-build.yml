@@ -377,6 +377,10 @@ jobs:
         env:
           SOURCE_COMMIT: ${{ github.sha }}
           REPOSITORY_ID: ${{ github.repository_id }}
+          # Expected value, not a self-check: the comparator matches it against
+          # each artifact's API-reported workflow_run.head_repository_id. This
+          # workflow only runs on push and tag events, whose head repository is
+          # always this repository, so a fork-headed run's uploads are rejected.
           HEAD_REPOSITORY_ID: ${{ github.repository_id }}
           A_ARTIFACT_ID: ${{ needs.fastly-canonical.outputs.artifact-id }}
           A_ARTIFACT_DIGEST: ${{ needs.fastly-canonical.outputs.artifact-digest }}

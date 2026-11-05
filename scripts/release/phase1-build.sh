@@ -122,6 +122,8 @@ DOCKERFILE
     ' phase1 "$build_package" "$build_target"
 else
   if [[ "$build_target" == wasm32-wasip1 ]]; then
+    # `set -o pipefail` above is required here: without it, `tee` succeeding
+    # would hide a cargo failure and the build would continue.
     cargo --config "$ordinary_rustflags" build --package "$build_package" --release --target "$build_target" --locked \
       --message-format=json-render-diagnostics | tee "$ordinary_messages"
   else
