@@ -761,6 +761,7 @@ fn named_route_handler(
                             &services,
                             state.config_sha256.as_deref(),
                             req,
+                            state.identity_graph(),
                         )
                         .await
                     }

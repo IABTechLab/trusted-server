@@ -16,6 +16,7 @@ use error_stack::Report;
 use serde::Deserialize;
 use serde_json::json;
 use trusted_server_core::config_payload::DEFAULT_CONFIG_STORE_ID;
+use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::http_util::RequestInfo;
 use trusted_server_core::platform::RuntimeServices;
@@ -205,6 +206,7 @@ pub async fn handle(
     services: &RuntimeServices,
     config_sha256: Option<&str>,
     request: Request,
+    ec_graph: Option<KvIdentityGraph>,
 ) -> Result<Response, Report<TrustedServerError>> {
     let Some(checksum) = config_sha256 else {
         return Ok(failure(
@@ -252,6 +254,20 @@ pub async fn handle(
             .headers_mut()
             .insert(header::ALLOW, HeaderValue::from_static("GET, PUT, DELETE"));
         return Ok(result);
+    }
+    // A fixed non-identity key proves the selected EC provider is reachable.
+    // No caller-supplied identity, consent snapshot or write enters this probe.
+    let ec_configured = ec_graph.is_some();
+    if let Some(graph) = &ec_graph
+        && graph
+            .key_exists_confirmed("ts-lab/ec-store-check")
+            .await
+            .is_err()
+    {
+        return Ok(failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "selected EC store probe failed",
+        ));
     }
     let kv = services.kv_handle();
     let written = if method == Method::PUT {
@@ -322,6 +338,10 @@ pub async fn handle(
             "key": PROOF_KEY,
             "value": value,
             "ingress": ingress,
+            "ec": {
+                "configured": ec_configured,
+                "available": ec_configured,
+            },
             "geo": {
                 "available": geo.is_some(),
                 "country": geo.as_ref().map(|location| location.country.as_str()),
