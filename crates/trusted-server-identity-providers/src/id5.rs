@@ -53,7 +53,7 @@ use serde_json::value::RawValue;
 
 use crate::common::{
     CookieReader, LockrSettings, ReadsLockr, VendorEid, bounded_expiry, is_routable_ip,
-    is_usable_id, join_section_ids, percent_decoded,
+    is_usable_id, percent_decoded,
 };
 
 /// The UID ID5 returns for a visitor who opted out.
@@ -169,7 +169,7 @@ struct FetchBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     gpp_string: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    gpp_sid: Option<String>,
+    gpp_sid: Option<&'a [u16]>,
     tml: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     ua: Option<&'a str>,
@@ -341,7 +341,7 @@ impl IdentityProvider for Id5Provider {
             gdpr_consent: consent.raw_tc_string.as_deref(),
             us_privacy: consent.raw_us_privacy.as_deref(),
             gpp_string: consent.raw_gpp_string.as_deref(),
-            gpp_sid: consent.gpp_section_ids.as_deref().map(join_section_ids),
+            gpp_sid: consent.gpp_section_ids.as_deref(),
             tml: &origin,
             ua: lookup.client.user_agent,
             ip: lookup
@@ -460,7 +460,7 @@ mod tests {
         let config: IdentityProviderConfig = serde_json::from_value(json!({
             "id": "id5",
             "kind": "id5",
-            "endpoint": "https://id5.example.com/g/v2",
+            "endpoint": "https://id5.example.com/gs/v2",
             "allowed_domains": ["id5.example.com"],
             "sources": ["id5.example.com", "id5-link.example.com"],
             "settings": { "partner_id": 1234 },
@@ -515,7 +515,7 @@ mod tests {
         assert_eq!(request.method, Method::POST, "should post");
         assert_eq!(
             request.url.as_str(),
-            "https://id5.example.com/g/v2/1234.json",
+            "https://id5.example.com/gs/v2/1234.json",
             "should call the partner's fetch URL"
         );
         assert_eq!(
@@ -526,7 +526,11 @@ mod tests {
         assert_eq!(body["partner"], 1234, "should send the partner");
         assert_eq!(body["gdpr"], 0, "should send that GDPR does not apply");
         assert_eq!(body["us_privacy"], "1YNN", "should send US privacy");
-        assert_eq!(body["gpp_sid"], "7,8", "should join GPP section IDs");
+        assert_eq!(
+            body["gpp_sid"],
+            json!([7, 8]),
+            "should send GPP section IDs as an array"
+        );
         assert_eq!(body["ip"], "11.22.33.44", "should send the client IP");
         assert_eq!(
             body["ua"], "ExampleBrowser/1.0",
@@ -777,7 +781,7 @@ mod tests {
         let config: IdentityProviderConfig = serde_json::from_value(json!({
             "id": "id5",
             "kind": "id5",
-            "endpoint": "https://id5.example.com/g/v2",
+            "endpoint": "https://id5.example.com/gs/v2",
             "allowed_domains": ["id5.example.com"],
             "sources": ["id5.example.com"],
             "settings": { "partner_id": 1234, "cookie_names": ["example_lockr_id5", "id5id"] },
@@ -807,7 +811,7 @@ mod tests {
         let config: IdentityProviderConfig = serde_json::from_value(json!({
             "id": "id5",
             "kind": "id5",
-            "endpoint": "https://id5.example.com/g/v2",
+            "endpoint": "https://id5.example.com/gs/v2",
             "allowed_domains": ["id5.example.com"],
             "sources": ["id5.example.com"],
             "settings": {

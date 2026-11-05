@@ -254,7 +254,7 @@ mod tests {
         for (kind, endpoint, sources, settings) in [
             (
                 "id5",
-                Some("https://id5.example.com/g/v2"),
+                Some("https://id5.example.com/gs/v2"),
                 json!(["id5.example.com"]),
                 json!({ "partner_id": 1234 }),
             ),
