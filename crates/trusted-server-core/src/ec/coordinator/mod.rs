@@ -501,7 +501,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 pending.early.push(skip(SkipReason::Consent));
                 continue;
             }
-            let (due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
+            let (mut due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
             // The vendor's own first-party cookies are read on every
             // navigation, so an opt-out or a changed ID is noticed while the
             // sources still hold live UIDs. Their IDs stand in for a lookup.
@@ -517,18 +517,26 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 CookieRead::Found(eids) => {
                     let found = self.validated(provider, eids, lookup.now);
                     if matches!(found.status, LookupStatus::Found { .. }) {
+                        // Only the sources the cookies filled are spared a
+                        // lookup; the provider's other due sources are
+                        // still looked up.
+                        due.retain(|source| {
+                            found.entries.iter().all(|(filled, _)| filled != source)
+                        });
                         // A cookie repeating the held UIDs is not rewritten,
                         // so its relative expiry does not cause a write on
                         // every navigation.
                         if due.is_empty() && holds_same_uids(entry, &found, lookup.now) {
                             pending.early.push(skip(SkipReason::NotDue));
-                        } else {
-                            pending.from_cookies.push(Tagged {
-                                provider,
-                                value: found,
-                            });
+                            continue;
                         }
-                        continue;
+                        pending.from_cookies.push(Tagged {
+                            provider,
+                            value: found,
+                        });
+                        if due.is_empty() {
+                            continue;
+                        }
                     }
                 }
                 CookieRead::Absent => {}
@@ -627,15 +635,33 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         for Tagged { provider, value } in early {
             slots[provider.get()] = Some(self.lookup(provider, value, Vec::new()));
         }
+        // A provider's cookie result replaces its early skip, and its later
+        // lookup or generated result is merged into the cookie result.
+        let mut filled: Vec<Option<ProviderLookup>> =
+            (0..self.providers.len()).map(|_| None).collect();
         for Tagged { provider, value } in from_cookies {
-            slots[provider.get()] = Some(value);
+            let slot = &mut filled[provider.get()];
+            *slot = Some(match slot.take() {
+                Some(earlier) => merge_lookups(earlier, value),
+                None => value,
+            });
         }
         for Tagged { provider, value } in responses {
             let context = contexts
                 .iter()
                 .find(|tagged| tagged.provider == provider)
                 .map(|tagged| tagged.value.as_str());
-            slots[provider.get()] = Some(self.interpret(provider, value, context, now));
+            let later = self.interpret(provider, value, context, now);
+            let slot = &mut filled[provider.get()];
+            *slot = Some(match slot.take() {
+                Some(earlier) => merge_lookups(earlier, later),
+                None => later,
+            });
+        }
+        for (slot, value) in slots.iter_mut().zip(filled) {
+            if value.is_some() {
+                *slot = value;
+            }
         }
         let lookups: Vec<ProviderLookup> = slots.into_iter().flatten().collect();
         for lookup in &lookups {
@@ -646,6 +672,45 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
 
     fn plan_write(&self, input: &WritePlanInput<'_>) -> Option<RowChange> {
         plan_write(input)
+    }
+}
+
+/// Merges a provider's cookie result with its later lookup or generated
+/// result for the sources the cookies did not fill.
+///
+/// An opt-out wins; otherwise the found entries of both are kept, and a
+/// later result that found nothing leaves the cookie result.
+fn merge_lookups(earlier: ProviderLookup, later: ProviderLookup) -> ProviderLookup {
+    let LookupStatus::Found { dropped, .. } = later.status else {
+        return if later.status == LookupStatus::Skipped(SkipReason::OptedOut)
+            || !matches!(earlier.status, LookupStatus::Found { .. })
+        {
+            later
+        } else {
+            earlier
+        };
+    };
+    if !matches!(earlier.status, LookupStatus::Found { .. }) {
+        return later;
+    }
+    let mut entries = later.entries;
+    for (source, eids) in earlier.entries {
+        if entries.iter().all(|(held, _)| *held != source) {
+            entries.push((source, eids));
+        }
+    }
+    let merged = entries
+        .iter()
+        .flat_map(|(_, eids)| eids)
+        .map(|eid| eid.uids().len())
+        .sum::<usize>();
+    ProviderLookup {
+        status: LookupStatus::Found {
+            kept: u16::try_from(merged).unwrap_or(u16::MAX),
+            dropped,
+        },
+        entries,
+        ..later
     }
 }
 
@@ -1797,5 +1862,103 @@ mod tests {
             "should skip a provider that builds no request"
         );
         assert_eq!(limiter.0.get(), 0, "should not check the rate limit");
+    }
+
+    const SECOND_SOURCE: &str = "ids-b.example.com";
+
+    /// A two-source provider: its cookie fills the first source and its
+    /// lookup the second.
+    struct TwoSourceProvider(EchoProvider);
+
+    impl IdentityProvider for TwoSourceProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            self.0.build_request(lookup)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            let mut outcome = self.0.parse_response(response)?;
+            if let LookupOutcome::Found(eids) = &mut outcome {
+                for eid in eids {
+                    eid.source = Cow::Borrowed(SECOND_SOURCE);
+                }
+            }
+            Ok(outcome)
+        }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            self.0.read_request_cookies(cookies)
+        }
+    }
+
+    #[test]
+    fn a_cookie_spares_only_the_sources_it_fills() {
+        let mut provider = cookie_provider(SourceInput::Anonymous, Some("vendor_id"));
+        provider.0.sources = Box::new([
+            SourceCapability {
+                source: SourceDomain::try_from("ids.example.com").expect("should parse"),
+                input: SourceInput::Anonymous,
+            },
+            SourceCapability {
+                source: SourceDomain::try_from(SECOND_SOURCE).expect("should parse"),
+                input: SourceInput::Anonymous,
+            },
+        ]);
+        let config: IdentityProviderConfig = toml::from_str(&format!(
+            "id = \"example-provider\"\nkind = \"echo\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\", \"{SECOND_SOURCE}\"]\n"
+        ))
+        .expect("should parse config");
+        let partners: Vec<EcPartner> = ["ids.example.com", SECOND_SOURCE]
+            .into_iter()
+            .map(|source| {
+                serde_json::from_value(serde_json::json!({
+                    "name": source, "source_domain": source, "bidstream_enabled": true
+                }))
+                .expect("should build partner")
+            })
+            .collect();
+        let coordinator = ProviderCoordinator::new(
+            vec![RegisteredProvider::new(config, TwoSourceProvider(provider))],
+            Arc::new(PartnerRegistry::from_config(&partners).expect("should build registry")),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &missing(), &granting());
+
+        assert_eq!(
+            *transport.sent.borrow(),
+            ["https://ids.example.com/lookup?due=1"],
+            "should look up only the source the cookie did not fill"
+        );
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            matches!(lookup.status, LookupStatus::Found { kept: 2, .. }),
+            "should keep the cookie and lookup UIDs"
+        );
+        let mut sources: Vec<&str> = lookup
+            .entries
+            .iter()
+            .map(|(source, _)| source.as_str())
+            .collect();
+        sources.sort_unstable();
+        assert_eq!(
+            sources,
+            ["ids-b.example.com", "ids.example.com"],
+            "should store both sources"
+        );
     }
 }
