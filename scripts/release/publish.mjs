@@ -270,7 +270,9 @@ export async function publish({
             '--format',
             'json',
           ],
-          { timeout: 60000, stdio: 'pipe' }
+          // The SBOM result embeds the whole SPDX document, which exceeds
+          // Node's 1 MiB default output buffer.
+          { timeout: 60000, stdio: 'pipe', maxBuffer: 256 * 1024 * 1024 }
         )
       )
       // The signed SBOM predicate must be the SPDX document shipped beside it.

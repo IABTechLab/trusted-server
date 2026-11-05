@@ -277,6 +277,20 @@ export function mergeSboms(cargo, npm, binary, name) {
   }
 }
 
+/**
+ * Checks `ts --version` output against the workspace package version, the
+ * release source commit and the build target.
+ */
+export function checkCliVersion(output, cargoManifest, source, target) {
+  const expected =
+    'ts package=' +
+    cargoManifest.match(
+      /\[workspace\.package\][\s\S]*?^version = "([^"]+)"/m
+    )[1] +
+    ` source=${source} target=${target} variant=default`
+  if (output.trim() !== expected) throw Error('Unexpected CLI version')
+}
+
 async function smokeRelease(file, target) {
   const linux = target === 'x86_64-unknown-linux-gnu'
   const elf = linux
@@ -293,14 +307,13 @@ async function smokeRelease(file, target) {
     [...new Set(elf.match(/GLIBC_[\w.]+/g) ?? [])].join(' ')
   )
   if (target === 'wasm32-wasip1') return
-  const expected =
-    'ts package=' +
-    readFileSync('Cargo.toml', 'utf8').match(
-      /\[workspace\.package\][\s\S]*?^version = "([^"]+)"/m
-    )[1] +
-    ` source=${process.env.SOURCE_COMMIT} target=${target} variant=default`
   const version = (output) => {
-    if (output.trim() !== expected) throw Error('Unexpected CLI version')
+    checkCliVersion(
+      output,
+      readFileSync('Cargo.toml', 'utf8'),
+      process.env.SOURCE_COMMIT,
+      target
+    )
     console.log('SUCCESS:', output.trim())
   }
   version(

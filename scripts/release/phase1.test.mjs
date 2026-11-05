@@ -14,7 +14,12 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import * as fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { checkBinary, mergeSboms, sentinels } from './phase1.mjs'
+import {
+  checkBinary,
+  checkCliVersion,
+  mergeSboms,
+  sentinels,
+} from './phase1.mjs'
 import {
   publish,
   readRetrier,
@@ -271,6 +276,8 @@ test('signing job shell refuses symlinked, extra, empty and changed inputs', () 
   }
 })
 const assets = releaseAssets
+// The publisher fixture shadows `execFileSync`; this runs a real child process.
+const realExecFileSync = execFileSync
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex')
 const canonicalBlock = (markdown) => {
   const block = markdown.match(
@@ -319,6 +326,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'bundle-verification-failure',
     'bundle-sbom-mismatch',
     'identity-late',
+    'large-sbom-output',
     'publication-disabled',
     'prerelease-mismatch',
     'draft',
@@ -393,6 +401,11 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
               ? 'v1.0.0'
               : 'v0.0.0-example'
     const opaque = mode.startsWith('attestation-null-bundle')
+    // Real SBOM results embed the whole SPDX document and exceed 1 MiB.
+    const spdxDocument = (asset) =>
+      mode === 'large-sbom-output'
+        ? { fixture: asset, padding: 'x'.repeat(2 * 1024 * 1024) }
+        : { fixture: asset }
     const waits = [],
       ignored = []
     let verifies = 0,
@@ -416,7 +429,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         ]) {
           const bytes = Buffer.from(
             suffix === '.spdx.json'
-              ? JSON.stringify({ fixture: asset })
+              ? JSON.stringify(spdxDocument(asset))
               : `fixture ${asset}${suffix}`
           )
           writeFileSync(
@@ -760,7 +773,11 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
                 '--format',
                 'json',
               ],
-              { timeout: 60000, stdio: 'pipe' },
+              {
+                timeout: 60000,
+                stdio: 'pipe',
+                maxBuffer: 256 * 1024 * 1024,
+              },
             ],
             'should verify each signing bundle for its asset and predicate'
           )
@@ -770,19 +787,31 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           )
           if (mode === 'bundle-verification-failure' && index === 3)
             throw Error('Signature verification failed')
-          return Buffer.from(
-            JSON.stringify([
-              {
-                verificationResult: {
-                  statement: {
-                    predicate:
-                      mode === 'bundle-sbom-mismatch'
-                        ? { fixture: 'other' }
-                        : { fixture: name },
-                  },
+          const output = JSON.stringify([
+            {
+              verificationResult: {
+                statement: {
+                  predicate:
+                    mode === 'bundle-sbom-mismatch'
+                      ? { fixture: 'other' }
+                      : spdxDocument(name),
                 },
               },
-            ])
+            },
+          ])
+          if (mode !== 'large-sbom-output') return Buffer.from(output)
+          // Pass the large result through a real child process with the
+          // publisher's own options, so Node's output buffer limit applies.
+          const file = join(root, 'gh-output.json')
+          writeFileSync(file, output)
+          return realExecFileSync(
+            process.execPath,
+            [
+              '-e',
+              "process.stdout.write(require('node:fs').readFileSync(process.argv[1]))",
+              file,
+            ],
+            args[2]
           )
         }
         verifies++
@@ -872,6 +901,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'idle-socket',
         'stable',
         'identity-late',
+        'large-sbom-output',
         'attestation-404-then-present',
         'attestation-after-two-waits',
         'attestation-other-tag',
@@ -1905,5 +1935,108 @@ test('release build cleans owned config and inventory on success and failure', (
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
+  }
+})
+test('smoke accepts only the release build facts in ts --version', () => {
+  const manifest = '[workspace.package]\nversion = "1.2.3"\n'
+  const source = 'a'.repeat(40)
+  const target = 'x86_64-unknown-linux-gnu'
+  const facts = `ts package=1.2.3 source=${source} target=${target} variant=default`
+  checkCliVersion(`${facts}\n`, manifest, source, target)
+  for (const output of [
+    `ts package=1.2.3 source=unknown target=${target} variant=default`,
+    `ts package=1.2.4 source=${source} target=${target} variant=default`,
+    `ts package=1.2.3 source=${source} target=aarch64-apple-darwin variant=default`,
+    `${facts} extra`,
+    'ts 1.2.3',
+  ])
+    assert.throws(
+      () => checkCliVersion(output, manifest, source, target),
+      /Unexpected CLI version/,
+      output
+    )
+})
+// Runs a workflow step's shell with stub tools, as GitHub's `bash -eo pipefail`.
+const runStep = (workflow, step, stubs, env) => {
+  const bin = mkdtempSync(join(tmpdir(), 'phase1-step-'))
+  try {
+    for (const [name, body] of Object.entries(stubs))
+      writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 })
+    return spawnSync(
+      'bash',
+      [
+        '--noprofile',
+        '--norc',
+        '-eo',
+        'pipefail',
+        '-c',
+        runBlock(workflow, step),
+      ],
+      {
+        cwd: bin,
+        encoding: 'utf8',
+        env: { PATH: `${bin}:${process.env.PATH}`, ...env },
+      }
+    )
+  } finally {
+    rmSync(bin, { recursive: true, force: true })
+  }
+}
+test('build checks refuse a tag reference that is not a lightweight tag at the commit', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const commit = 'a'.repeat(40)
+  for (const [reference, status] of [
+    [`commit ${commit}`, 0],
+    [`tag ${commit}`, 1],
+    [`commit ${'b'.repeat(40)}`, 1],
+    [null, 1],
+  ]) {
+    const result = runStep(
+      workflow,
+      'Refuse annotated release tags',
+      {
+        gh:
+          reference === null
+            ? 'echo "HTTP 404: Not Found" >&2; exit 1'
+            : `printf '%s\\n' '${reference}'`,
+      },
+      {
+        GITHUB_REPOSITORY: 'example/project',
+        GITHUB_SHA: commit,
+        RELEASE_TAG: 'v1.2.3',
+      }
+    )
+    assert.equal(result.status, status, `${reference}: ${result.stderr}`)
+    if (reference?.startsWith('tag'))
+      assert.match(result.stdout, /::error::Release tags must be lightweight/)
+  }
+})
+test('publisher step refuses a Node other than the pinned version before publishing', () => {
+  const release = readFileSync('.github/workflows/release.yml', 'utf8')
+  const step = 'Verify handoff, create once, publish by release ID and verify'
+  assert.match(
+    release.split(`- name: ${step}`)[1],
+    /\n {10}NODE_VERSION: \$\{\{ steps\.tools\.outputs\.node \}\}\n/,
+    'should compare against the Node version the job installed'
+  )
+  for (const [installed, status] of [
+    ['v24.20.0', 0],
+    ['v20.20.2', 1],
+  ]) {
+    const result = runStep(
+      release,
+      step,
+      {
+        gh: 'echo "gh version 2.102.0 (2026-01-01)"',
+        node: `if [ "$1" = --version ]; then echo ${installed}; else echo published; fi`,
+      },
+      { NODE_VERSION: '24.20.0' }
+    )
+    assert.equal(result.status, status, `${installed}: ${result.stderr}`)
+    assert.equal(
+      result.stdout.includes('published'),
+      status === 0,
+      `${installed}: should run the publisher only on the pinned Node`
+    )
   }
 })
