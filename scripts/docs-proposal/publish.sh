@@ -105,7 +105,7 @@ docs_proposal_pr_body "$sha" "$base" "$subject" "$origin_pr" "$work_dir/rational
 if [ -n "$existing" ]; then
   gh pr edit "$pr_number" --title "$title" --body-file "$work_dir/pr-body.md"
 else
-  pr_url="$(gh pr create --base main --head "$branch" --title "$title" --body-file "$work_dir/pr-body.md")"
+  pr_url="$(gh pr create --base "$DOCS_PROPOSAL_BRANCH" --head "$branch" --title "$title" --body-file "$work_dir/pr-body.md")"
   pr_number="${pr_url##*/}"
 fi
 

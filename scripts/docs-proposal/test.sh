@@ -372,13 +372,12 @@ rm -rf 'proposal&out'
 assert_eq "$(run_propose "")" 0 "should propose without a base"
 assert_eq "$(cat .docs-proposal/base)" "$first_sha" "should default the base to the first parent"
 
-assert_eq "$(run_propose 0000000000000000000000000000000000000000)" 0 "should propose for a push that created main"
-assert_eq "$(cat .docs-proposal/base)" "$first_sha" "should replace an all-zero base with the first parent"
-assert_eq "$(grep -c '::warning::' "$tmp/out.log" || true)" 0 "should not warn about an all-zero base"
+assert_eq "$(run_propose 0000000000000000000000000000000000000000)" 1 "should reject an all-zero base"
+assert_eq "$(run_propose "$second_sha")" 1 "should reject the commit itself as the base"
 
-assert_eq "$(run_propose "$published_head")" 0 "should propose with an unrelated base"
-assert_eq "$(cat .docs-proposal/base)" "$first_sha" "should replace an unrelated base with the first parent"
-assert_contains "$(cat "$tmp/out.log")" "is not an ancestor" "should warn about an unrelated base"
+assert_eq "$(run_propose "$published_head")" 1 "should reject an unrelated base"
+assert_contains "$(cat "$tmp/out.log")" "is not an earlier commit" "should explain an unrelated base"
+assert_eq "$(grep -c 'copilot -p' "$STUB_LOG" || true)" 0 "should not run Copilot for an unrelated base"
 
 assert_eq "$(run_propose "$second_sha~2")" 0 "should propose with a revision expression as the base"
 assert_eq "$(cat .docs-proposal/base)" "$merge_sha" "should record the base as a full SHA"
@@ -393,6 +392,45 @@ assert_eq "$(STUB_COPILOT_EDIT=docs/guide/cli.md STUB_COPILOT_FAIL_EVIDENCE=1 ru
 assert_contains "$(cat .docs-proposal/proposal.patch)" "+proposed" "should keep the patch when the evidence run fails"
 assert_eq "$(cat .docs-proposal/evidence.json)" "{}" "should fall back to no evidence"
 assert_contains "$(cat "$tmp/out.log")" "evidence run failed" "should warn that the evidence run failed"
+
+# A proposal for another branch is checked against that branch and opens its
+# pull request against it.
+git reset -q --hard "$merge_sha" && git clean -qfd
+printf 'release\n' > notes.txt
+git add notes.txt && git commit -q -m "Touch release notes"
+release_sha="$(git rev-parse HEAD)"
+git push -q origin HEAD:refs/heads/release
+git fetch -q origin
+
+if (DOCS_PROPOSAL_BRANCH=release docs_proposal_require_sha "$release_sha") 2>/dev/null; then
+  status=0
+else
+  status=1
+fi
+assert_eq "$status" 0 "should accept a commit on the chosen branch"
+
+if (DOCS_PROPOSAL_BRANCH=release docs_proposal_require_sha "$second_sha") 2>/dev/null; then
+  status=0
+else
+  status=1
+fi
+assert_eq "$status" 1 "should reject a commit that is only on main"
+
+rm -rf "$tmp/proposal" && mkdir -p "$tmp/proposal"
+printf 'proposed\n' >> docs/guide/cli.md
+git add -A && git diff --cached --binary "$release_sha" > "$tmp/proposal/proposal.patch"
+git reset -q --hard "$release_sha"
+printf -- '- docs/guide/cli.md: example rationale.\n' > "$tmp/proposal/rationale.md"
+printf '{}\n' > "$tmp/proposal/evidence.json"
+printf '%s\n' "$merge_sha" > "$tmp/proposal/base"
+: > "$STUB_LOG"
+if DOCS_PROPOSAL_BRANCH=release STUB_PR="" "$here/publish.sh" "$release_sha" "$tmp/proposal" > "$tmp/out.log" 2>&1; then
+  status=0
+else
+  status=1
+fi
+assert_eq "$status" 0 "should publish a proposal for the chosen branch"
+assert_contains "$(cat "$STUB_LOG")" "pr create --base release --head $(docs_proposal_branch "$release_sha")" "should open the PR against the chosen branch"
 
 cd "$here"
 
