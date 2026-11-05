@@ -678,6 +678,14 @@ fn log_outcome(lookup: &ProviderLookup) {
         LookupStatus::Found { kept, dropped } => (kept, dropped.total()),
         _ => (0, 0),
     };
+    if let LookupStatus::HttpError(status) = lookup.status {
+        log::info!(
+            "Identity lookup: provider={} outcome={} status={status}",
+            lookup.provider,
+            lookup.status.metric_name()
+        );
+        return;
+    }
     log::info!(
         "Identity lookup: provider={} outcome={} kept={kept} dropped={dropped}",
         lookup.provider,
