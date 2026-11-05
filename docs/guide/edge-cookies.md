@@ -265,7 +265,7 @@ Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source
 
 ### Pull Sync on Navigations
 
-Pull sync runs as an identity provider during top-level page navigations, within the shared identity lookup budget, and its result lands in the navigation's single KV write. A pull-sync partner's source is provider-owned: browser EID ingestion stores a fallback UID for it only when the row holds no live UID for that source, and batch sync rejects its mappings with `provider_owned`. Trusted Server logs a warning at config load when a pull-sync partner also has a batch `api_token`, since that token's mappings are all rejected. A source that already holds any live UID, including an ownerless fallback, is not pulled again; a source with no UID is pulled at most `pull_sync_rate_limit` times per hour per EC.
+Pull sync runs as an identity provider on top-level page navigations, after the response has been sent, as it did before it became a provider. It uses the after-response budget (`identity_after_response_budget_ms`), so a slow partner never delays the page, and its result reaches the row in the follow-up write and is served from the next page load. Like other after-response lookups, it never creates a row. A pull-sync partner's source is provider-owned, so browser EID ingestion skips it. Batch sync still accepts the partner's mappings, as before. A source that already holds any live UID, including a batch-synced one, is not pulled again; a source with no UID is pulled at most `pull_sync_rate_limit` times per hour per EC.
 
 The former `ts-ec-pull-complete` completeness marker is retired. A response to a request that still carries it expires the leftover cookie.
 

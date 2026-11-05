@@ -54,7 +54,7 @@ pub struct PartnerConfig {
     /// Outbound bearer token for pull sync requests.
     pub ts_pull_token: Option<Redacted<String>>,
     /// Whether an enabled identity provider claims this source. Browser
-    /// ingest skips it and batch sync rejects it.
+    /// ingest skips it.
     pub provider_owned: bool,
     /// TCF vendor IDs of the configured providers, enabled or disabled, that
     /// claim this source. Its UIDs leave the server only while every one of
@@ -64,6 +64,11 @@ pub struct PartnerConfig {
     /// source where GDPR applies. Its UIDs then never leave the server for a
     /// visitor whose jurisdiction is GDPR.
     pub excluded_where_gdpr_applies: bool,
+    /// Whether batch sync rejects this source's mappings: an enabled
+    /// configured provider owns it. A source owned only by its partner's pull
+    /// sync keeps accepting batch mappings, as it did before pull sync became
+    /// a provider.
+    pub batch_sync_rejected: bool,
 }
 
 impl PartnerConfig {
@@ -286,6 +291,7 @@ impl PartnerRegistry {
             }
             for source in &provider.sources {
                 registry.mark_provider_owned(source, provider.tcf_vendor_id);
+                registry.reject_batch_sync(source);
             }
         }
         // A disabled provider's stored UIDs stay behind its vendor consent,
@@ -301,13 +307,6 @@ impl PartnerRegistry {
             .iter()
             .filter(|partner| pull_sync_registered && runs_pull_sync(partner))
         {
-            if batch_sync_rejected(partner) {
-                log::warn!(
-                    "Partner '{}' runs pull sync and has a batch sync api_token; its source is \
-                     provider-owned, so batch sync rejects every mapping for it",
-                    partner.source_domain
-                );
-            }
             registry.mark_provider_owned(&partner.source_domain, None);
         }
         Ok(registry)
@@ -397,6 +396,30 @@ impl PartnerRegistry {
             .is_some_and(|partner| partner.provider_owned)
     }
 
+    /// Marks `source` as owned by an enabled configured provider, so batch
+    /// sync rejects its mappings. Returns whether `source` is registered.
+    pub fn reject_batch_sync(&mut self, source: &str) -> bool {
+        let Ok(normalized) = normalize_partner_source_domain(source) else {
+            return false;
+        };
+        match self.by_source_domain.get_mut(&normalized) {
+            Some(partner) => {
+                partner.batch_sync_rejected = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether batch sync rejects mappings for `source` (spec §8.5): an
+    /// enabled configured provider owns it. Pull-sync ownership alone does
+    /// not reject batch mappings.
+    #[must_use]
+    pub fn rejects_batch_sync(&self, source: &str) -> bool {
+        self.find_by_source_domain(source)
+            .is_some_and(|partner| partner.batch_sync_rejected)
+    }
+
     /// Returns all partners with `pull_sync_enabled = true`.
     #[must_use]
     pub fn pull_enabled_partners(&self) -> Vec<&PartnerConfig> {
@@ -438,12 +461,6 @@ impl PartnerRegistry {
 /// provider-owned.
 fn runs_pull_sync(partner: &EcPartner) -> bool {
     partner.pull_sync_enabled && partner.pull_sync_url.is_some()
-}
-
-/// Whether a pull-sync partner also has a batch `api_token`, whose mappings
-/// batch sync then rejects because the source is provider-owned.
-fn batch_sync_rejected(partner: &EcPartner) -> bool {
-    runs_pull_sync(partner) && partner.api_token.is_some()
 }
 
 fn validate_api_token(
@@ -490,6 +507,7 @@ fn build_partner_config(
         provider_owned: false,
         owner_tcf_vendor_ids: Vec::new(),
         excluded_where_gdpr_applies: false,
+        batch_sync_rejected: false,
     }
 }
 
@@ -667,6 +685,14 @@ mod tests {
             registry.is_provider_owned("pull.example.com"),
             "should mark pull-sync partner source"
         );
+        assert!(
+            registry.rejects_batch_sync("ids.example.com"),
+            "should reject batch sync for a configured provider's source"
+        );
+        assert!(
+            !registry.rejects_batch_sync("pull.example.com"),
+            "should keep batch sync for a source owned only by pull sync"
+        );
     }
 
     #[test]
@@ -724,27 +750,6 @@ mod tests {
         assert!(
             partner.owner_vendor_consent_denied(&consent),
             "should withhold the source while the disabled provider's vendor lacks consent"
-        );
-    }
-
-    #[test]
-    fn batch_token_on_pull_sync_partner_is_flagged() {
-        let mut pull = make_partner("pull.example.com", &valid_api_token("pull-partner"));
-
-        assert!(
-            !batch_sync_rejected(&pull),
-            "should not flag a batch-only partner"
-        );
-        pull.pull_sync_enabled = true;
-        pull.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
-        assert!(
-            batch_sync_rejected(&pull),
-            "should flag a pull-sync partner with a batch token"
-        );
-        pull.api_token = None;
-        assert!(
-            !batch_sync_rejected(&pull),
-            "should not flag a pull-sync partner without a batch token"
         );
     }
 
