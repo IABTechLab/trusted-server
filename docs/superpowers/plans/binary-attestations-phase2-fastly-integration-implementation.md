@@ -2,7 +2,7 @@
 
 **Phase 2 spec:** [ordinary Fastly release equality](../specs/2026-10-28-1235-binary-attestations-phase2-design.md), with its own source-checked review rounds. Tracking issue: #1235.
 
-**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). The Phase 1 narrowing merge (four binaries, 18 files) needs a fresh rehearsal; see the [compatibility and rehearsal record](binary-attestations-phase2-fastly-integration.md#phase-1-narrowing-merge).
+**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). Rehearsal `.27` at `9eeccbb88` covers the Phase 1 narrowing merge (four binaries, 18 files); see the [compatibility and rehearsal record](binary-attestations-phase2-fastly-integration.md#phase-1-narrowing-merge).
 
 **Goal:** Compare the actual canonical Fastly release bytes to a second fresh ordinary build, write and attest the approved version-1 informational rebuild-check, and block release on any mismatch.
 
@@ -192,7 +192,7 @@ The implementation CI separately passed 952 producer unit tests with nine existi
 
 ## Current-source rehearsal .20 (2026-10-29)
 
-**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). The Phase 1 narrowing merge (four binaries, 18 files) needs a fresh rehearsal; see the [compatibility and rehearsal record](binary-attestations-phase2-fastly-integration.md#phase-1-narrowing-merge).
+**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). Rehearsal `.27` at `9eeccbb88` covers the Phase 1 narrowing merge (four binaries, 18 files); see the [compatibility and rehearsal record](binary-attestations-phase2-fastly-integration.md#phase-1-narrowing-merge).
 
 Canonical and reproduction Wasm SHA-256 was `4fe7204f17df07a392f4e4b64f31eebf3b02179e57abee689ab0094990d0a572` (80,207,071 bytes). Reproduction took 282 seconds and comparison 122 seconds, overlapping native builds. Checkout/target roots, job count (4 versus 2), umask (0022 versus 0027) and start time varied; UID, locale and timezone stayed equal. The profile remains `ordinary-release-fastly-byte-equality-v1` with `release_qualification:false`. Native reproduction and controlled qualification remain outside this ordinary gate.
 

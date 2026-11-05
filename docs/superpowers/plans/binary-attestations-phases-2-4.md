@@ -2,7 +2,7 @@
 
 **Phase 2 spec:** [ordinary Fastly release equality](../specs/2026-10-28-1235-binary-attestations-phase2-design.md), with its own source-checked review rounds. Tracking issue: #1235.
 
-**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). The Phase 1 narrowing merge (four binaries, 18 files) needs a fresh rehearsal; see the [compatibility and rehearsal record](binary-attestations-phase2-fastly-integration.md#phase-1-narrowing-merge). Historical `.16` remains at `5fa384336`, and `.13` at `770a425df`. Qualification and Phase 3/4 production gates remain closed; Phase 3 is draft #1463.
+**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). Rehearsal `.27` at `9eeccbb88` covers the Phase 1 narrowing merge (four binaries, 18 files); see the [compatibility and rehearsal record](binary-attestations-phase2-fastly-integration.md#phase-1-narrowing-merge). Historical `.16` remains at `5fa384336`, and `.13` at `770a425df`. Qualification and Phase 3/4 production gates remain closed; Phase 3 is draft #1463.
 
 **Tracking issue:** #1235. The earlier separate tracking-issue draft is retained as planning history, not an additional issue prerequisite.
 

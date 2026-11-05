@@ -97,7 +97,7 @@ Preserve single-shot listing/refusal, draft creation, uploads and publication by
 - [x] User approves implementation after a concrete plan is written and independently reviewed within this design; qualification types/selectors and new triggers remain closed.
 - [x] Rehearse the exact reviewed head and report time/cost and unchanged Phase 1 verification before merge. Merging Phase 2 activates the gate on the next real tag; no separate switch.
 
-**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). The Phase 1 narrowing merge (four binaries, 18 files) needs a fresh rehearsal; see the [compatibility and rehearsal record](#phase-1-narrowing-merge).
+**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). Rehearsal `.27` at `9eeccbb88` covers the Phase 1 narrowing merge (four binaries, 18 files); see the [compatibility and rehearsal record](#phase-1-narrowing-merge).
 
 ## Approved forward-compatibility and mismatch conditions
 
@@ -118,8 +118,20 @@ audit and the publisher's post-publish re-download. The release is now four
 binaries plus the rebuild check and `SHA256SUMS`: 18 files, with `SHA256SUMS`
 covering the other 17. The publisher verifies every signing bundle before it
 creates a draft, including the rebuild check against the Fastly provenance
-bundle. No earlier rehearsal covers this merge; a fresh rehearsal of the merged
-head is required.
+bundle.
+
+Rehearsal `.26` of the merge commit `3ddcd1996` failed the canonical Fastly
+build before anything was signed: Phase 1 had stopped writing
+`cargo-metadata.json`, which the ordinary capture reads. `9eeccbb88` writes it
+again and tests that the capture reads the file the acquisition step writes.
+Rehearsal [`.27`](https://github.com/prk-Jr/trusted-server/actions/runs/41987840964)
+at `9eeccbb88` then passed all 13 jobs: both Fastly builds matched
+(`8fc36bb49a06f2182512d57976b26ee763f0ef06e9a40635f24540ef7c7980eb`; canonical
+399s, reproduction 443s, comparison 129s), the publisher verified every bundle
+and the rebuild check before creating the release, and it published 18
+immutable prerelease assets. The guide's verification block passed against
+the published release. Offline verification and the local Viceroy runtime
+check were not repeated.
 
 ### Approved Phase 2 rebuild-check compatibility
 

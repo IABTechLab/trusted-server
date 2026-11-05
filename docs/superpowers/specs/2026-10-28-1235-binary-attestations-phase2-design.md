@@ -4,7 +4,7 @@
 
 **Status:** Implementation and follow-up correction reviewed; rehearsal `.20` and exact published-byte verification passed for the earlier seven-binary release. Historical successful `.16` remains exclusively at `5fa3843364f247fdc261c438ab9257323637a42c`, with its [exact published-byte runtime supplement](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6471330921). This phase-specific spec retains the approved Gate 1 design and opens no later gates.
 
-**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). The Phase 1 narrowing merge (four binaries, 18 files) needs a fresh rehearsal; see the [compatibility and rehearsal record](../plans/binary-attestations-phase2-fastly-integration.md#phase-1-narrowing-merge).
+**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). Rehearsal `.27` at `9eeccbb88` covers the Phase 1 narrowing merge (four binaries, 18 files); see the [compatibility and rehearsal record](../plans/binary-attestations-phase2-fastly-integration.md#phase-1-narrowing-merge).
 
 ## Goal and scope
 
