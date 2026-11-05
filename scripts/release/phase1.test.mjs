@@ -1791,6 +1791,13 @@ test('acquires the locked workspace graph before offline SBOM resolution', () =>
     acquisition < script.indexOf('CARGO_NET_OFFLINE=true'),
     'should acquire before offline generation'
   )
+  // The Fastly ordinary capture reads the locked graph this step writes.
+  const metadata = script.match(/^ {4}ORDINARY_METADATA="([^"]+)" \\$/m)?.[1]
+  assert.ok(metadata, 'should pass the metadata file to the ordinary capture')
+  assert.ok(
+    script.slice(acquisition).split('\n')[0].endsWith(` > "${metadata}"`),
+    'should write the metadata the ordinary capture reads'
+  )
 })
 // SPDX conversion retains the binary root and conservative package inventory.
 const binary = Buffer.from('fictional binary')

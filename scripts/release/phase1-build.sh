@@ -145,7 +145,7 @@ CARGO_TARGET_DIR="$tool_root/target" cargo install \
   --path "$tool_root/cargo-cyclonedx-0.5.9" --locked --root "$tool_root/install"
 # The generator resolves the whole workspace, including unbuilt members. Acquire
 # their selected sources under the lock before denying network resolution.
-cargo metadata --locked --format-version 1 --filter-platform "$build_target" > /dev/null
+cargo metadata --locked --format-version 1 --filter-platform "$build_target" > "$tool_root/cargo-metadata.json"
 # Pinned generator has no --locked flag. Resolve offline after the locked build
 # with identical target/default features, then require the lock to be unchanged.
 CARGO_NET_OFFLINE=true "$tool_root/install/bin/cargo-cyclonedx" cyclonedx \
