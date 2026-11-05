@@ -496,7 +496,9 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 pending.early.push(skip(SkipReason::NoRow));
                 continue;
             }
-            if !consented || vendor_denied {
+            let region_excluded =
+                lookup.consent.gdpr_applies && !registered.provider.runs_where_gdpr_applies();
+            if !consented || vendor_denied || region_excluded {
                 pending.early.push(skip(SkipReason::Consent));
                 continue;
             }
@@ -1386,6 +1388,67 @@ mod tests {
         assert!(
             matches!(only_status(&results), LookupStatus::Found { .. }),
             "should look up with vendor consent"
+        );
+    }
+
+    /// An echo provider whose IDs are not offered where GDPR applies.
+    struct OutsideGdprProvider(EchoProvider);
+
+    impl IdentityProvider for OutsideGdprProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            self.0.build_request(lookup)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            self.0.read_request_cookies(cookies)
+        }
+
+        fn runs_where_gdpr_applies(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_provider_outside_gdpr_regions_is_skipped_where_gdpr_applies() {
+        let coordinator = ProviderCoordinator::new(
+            vec![RegisteredProvider::new(
+                provider_config(""),
+                OutsideGdprProvider(cookie_provider(SourceInput::Anonymous, Some("vendor_id"))),
+            )],
+            partners(),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator");
+        let transport = CannedTransport::new(ok_reply);
+
+        let gdpr = run(&coordinator, &transport, &missing(), &tcf_consent(vec![]));
+        let outside = run(&coordinator, &transport, &missing(), &granting());
+
+        assert_eq!(
+            only_status(&gdpr),
+            LookupStatus::Skipped(SkipReason::Consent),
+            "should neither read cookies nor look up where GDPR applies"
+        );
+        assert!(
+            matches!(only_status(&outside), LookupStatus::Found { .. }),
+            "should read the cookie where GDPR does not apply"
         );
     }
 

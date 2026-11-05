@@ -87,6 +87,15 @@ pub trait IdentityProvider: Send + Sync {
         let _ = cookies;
         CookieRead::Absent
     }
+
+    /// Whether this provider runs for visitors where GDPR applies.
+    ///
+    /// A provider whose IDs are not offered in GDPR regions returns `false`,
+    /// and the coordinator then skips it there for consent: its cookies are
+    /// not read and no lookup is made. The default runs everywhere.
+    fn runs_where_gdpr_applies(&self) -> bool {
+        true
+    }
 }
 
 impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
@@ -117,6 +126,10 @@ impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
         cookies: RequestCookies<'cookie>,
     ) -> CookieRead<'cookie> {
         (**self).read_request_cookies(cookies)
+    }
+
+    fn runs_where_gdpr_applies(&self) -> bool {
+        (**self).runs_where_gdpr_applies()
     }
 }
 
