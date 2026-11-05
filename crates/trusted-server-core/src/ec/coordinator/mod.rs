@@ -21,6 +21,7 @@ use self::transport::{
 };
 use self::validate::{ValidatedEntries, ValidationPolicy, validate};
 use crate::consent::ConsentContext;
+use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{allows_eid_persistence, tcf_vendor_consent_denied};
 use crate::ec::EcKvSnapshot;
 use crate::ec::consent::ec_consent_granted;
@@ -102,6 +103,8 @@ pub struct PendingLookups<Pending> {
     early: Vec<Tagged<LookupStatus>>,
     /// Providers whose IDs were generated at dispatch, validated.
     generated: Vec<Tagged<ProviderLookup>>,
+    /// Sources each provider may not collect or keep where GDPR applies.
+    excluded: Vec<Tagged<Vec<SourceDomain>>>,
     /// Provider state to hand back with each in-flight request's response.
     contexts: Vec<Tagged<String>>,
     /// Providers whose IDs were read from first-party cookies, validated.
@@ -117,6 +120,7 @@ impl<Pending> Default for PendingLookups<Pending> {
             now: UnixSeconds::new(0),
             early: Vec::new(),
             generated: Vec::new(),
+            excluded: Vec::new(),
             contexts: Vec::new(),
             from_cookies: Vec::new(),
         }
@@ -313,6 +317,23 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         (due, input_blocked)
     }
 
+    /// The provider's sources it may not collect or keep for this request:
+    /// those it excludes where GDPR applies, when the visitor's jurisdiction
+    /// is GDPR. A TCF string alone does not decide this, because some CMPs
+    /// set one for every visitor.
+    fn excluded_sources(registered: &Registered<P>, consent: &ConsentContext) -> Vec<SourceDomain> {
+        if !matches!(consent.jurisdiction, Jurisdiction::Gdpr) {
+            return Vec::new();
+        }
+        registered
+            .policy
+            .sources
+            .iter()
+            .filter(|source| registered.provider.excluded_where_gdpr_applies(source))
+            .cloned()
+            .collect()
+    }
+
     /// Whether the provider's hourly limit is reached. Limiter errors fail
     /// open, matching pull sync.
     ///
@@ -343,7 +364,10 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         entries: ValidatedEntries,
     ) -> ProviderLookup {
         let registered = &self.providers[provider.get()];
-        let cleared = if status == LookupStatus::Skipped(SkipReason::OptedOut) {
+        let cleared = if matches!(
+            status,
+            LookupStatus::Skipped(SkipReason::OptedOut | SkipReason::Region)
+        ) {
             registered.policy.sources.to_vec()
         } else {
             Vec::new()
@@ -496,11 +520,20 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 pending.early.push(skip(SkipReason::NoRow));
                 continue;
             }
-            let region_excluded =
-                lookup.consent.gdpr_applies && !registered.provider.runs_where_gdpr_applies();
-            if !consented || vendor_denied || region_excluded {
+            if !consented || vendor_denied {
                 pending.early.push(skip(SkipReason::Consent));
                 continue;
+            }
+            let excluded = Self::excluded_sources(registered, lookup.consent);
+            if !excluded.is_empty() {
+                if excluded.len() == registered.policy.sources.len() {
+                    pending.early.push(skip(SkipReason::Region));
+                    continue;
+                }
+                pending.excluded.push(Tagged {
+                    provider,
+                    value: excluded.clone(),
+                });
             }
             // A remembered opt-out keeps the provider from being called until
             // it lapses. It clears only sources the row still stores, so once
@@ -524,6 +557,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 continue;
             }
             let (mut due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
+            due.retain(|source| !excluded.contains(source));
             // The vendor's own first-party cookies are read on every
             // navigation, so an opt-out or a changed ID is noticed while the
             // sources still hold live UIDs. Their IDs stand in for a lookup.
@@ -659,6 +693,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             now,
             early,
             generated,
+            excluded,
             contexts,
             from_cookies,
         } = pending;
@@ -699,11 +734,31 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 *slot = value;
             }
         }
+        for Tagged { provider, value } in excluded {
+            if let Some(lookup) = slots[provider.get()].as_mut() {
+                exclude_sources(lookup, value);
+            }
+        }
         let lookups: Vec<ProviderLookup> = slots.into_iter().flatten().collect();
         for lookup in &lookups {
             log_outcome(lookup);
         }
         LookupResults::new(&ec_id, lookups)
+    }
+}
+
+/// Drops `sources` from a provider's result and removes them from the row.
+fn exclude_sources(lookup: &mut ProviderLookup, sources: Vec<SourceDomain>) {
+    lookup
+        .entries
+        .retain(|(source, _)| !sources.contains(source));
+    if matches!(lookup.status, LookupStatus::Found { .. }) && lookup.entries.is_empty() {
+        lookup.status = LookupStatus::NoMatch;
+    }
+    for source in sources {
+        if !lookup.cleared.contains(&source) {
+            lookup.cleared.push(source);
+        }
     }
 }
 
@@ -795,7 +850,6 @@ fn log_outcome(lookup: &ProviderLookup) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::TcfConsent;
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, UidValue};
     use crate::ec::kv::KvIdentityGraph;
@@ -1420,8 +1474,8 @@ mod tests {
             self.0.read_request_cookies(cookies)
         }
 
-        fn runs_where_gdpr_applies(&self) -> bool {
-            false
+        fn excluded_where_gdpr_applies(&self, _source: &SourceDomain) -> bool {
+            true
         }
     }
 
@@ -1441,14 +1495,48 @@ mod tests {
         let gdpr = run(&coordinator, &transport, &missing(), &tcf_consent(vec![]));
         let outside = run(&coordinator, &transport, &missing(), &granting());
 
+        let lookup = gdpr.iter().next().expect("should report the provider");
         assert_eq!(
-            only_status(&gdpr),
-            LookupStatus::Skipped(SkipReason::Consent),
+            lookup.status,
+            LookupStatus::Skipped(SkipReason::Region),
             "should neither read cookies nor look up where GDPR applies"
+        );
+        assert_eq!(
+            lookup.cleared,
+            [SourceDomain::try_from("ids.example.com").expect("should parse")],
+            "should remove the stored UIDs where GDPR applies"
         );
         assert!(
             matches!(only_status(&outside), LookupStatus::Found { .. }),
             "should read the cookie where GDPR does not apply"
+        );
+    }
+
+    #[test]
+    fn a_tcf_string_alone_does_not_exclude_a_provider_outside_gdpr() {
+        // Arrange: a CMP that sets a TCF string for a US visitor.
+        let coordinator = ProviderCoordinator::new(
+            vec![RegisteredProvider::new(
+                provider_config(""),
+                OutsideGdprProvider(cookie_provider(SourceInput::Anonymous, Some("vendor_id"))),
+            )],
+            partners(),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator");
+        let transport = CannedTransport::new(ok_reply);
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            ..tcf_consent(vec![])
+        };
+
+        // Act
+        let results = run(&coordinator, &transport, &missing(), &consent);
+
+        // Assert
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should collect where only a TCF string is present"
         );
     }
 
@@ -2226,8 +2314,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_cookie_spares_only_the_sources_it_fills() {
+    fn two_source_coordinator<P: IdentityProvider>(
+        wrap: impl FnOnce(TwoSourceProvider) -> P,
+    ) -> ProviderCoordinator<P> {
         let mut provider = cookie_provider(SourceInput::Anonymous, Some("vendor_id"));
         provider.0.sources = Box::new([
             SourceCapability {
@@ -2252,12 +2341,20 @@ mod tests {
                 .expect("should build partner")
             })
             .collect();
-        let coordinator = ProviderCoordinator::new(
-            vec![RegisteredProvider::new(config, TwoSourceProvider(provider))],
+        ProviderCoordinator::new(
+            vec![RegisteredProvider::new(
+                config,
+                wrap(TwoSourceProvider(provider)),
+            )],
             Arc::new(PartnerRegistry::from_config(&partners).expect("should build registry")),
             Duration::from_millis(200),
         )
-        .expect("should build coordinator");
+        .expect("should build coordinator")
+    }
+
+    #[test]
+    fn a_cookie_spares_only_the_sources_it_fills() {
+        let coordinator = two_source_coordinator(|provider| provider);
         let transport = CannedTransport::new(ok_reply);
 
         let results = run(&coordinator, &transport, &missing(), &granting());
@@ -2282,6 +2379,69 @@ mod tests {
             sources,
             ["ids-b.example.com", "ids.example.com"],
             "should store both sources"
+        );
+    }
+
+    /// A two-source provider whose cookie source is excluded where GDPR
+    /// applies.
+    struct CookieSourceExcluded(TwoSourceProvider);
+
+    impl IdentityProvider for CookieSourceExcluded {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            self.0.build_request(lookup)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            self.0.read_request_cookies(cookies)
+        }
+
+        fn excluded_where_gdpr_applies(&self, source: &SourceDomain) -> bool {
+            source.as_str() == "ids.example.com"
+        }
+    }
+
+    #[test]
+    fn an_excluded_source_is_neither_collected_nor_kept_where_gdpr_applies() {
+        // Arrange
+        let coordinator = two_source_coordinator(CookieSourceExcluded);
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run(&coordinator, &transport, &missing(), &tcf_consent(vec![]));
+
+        // Assert
+        let lookup = results.iter().next().expect("should report the provider");
+        let sources: Vec<&str> = lookup
+            .entries
+            .iter()
+            .map(|(source, _)| source.as_str())
+            .collect();
+        assert_eq!(
+            sources,
+            [SECOND_SOURCE],
+            "should keep only the source that is not excluded"
+        );
+        assert_eq!(
+            lookup.cleared,
+            [SourceDomain::try_from("ids.example.com").expect("should parse")],
+            "should remove the excluded source from the row"
         );
     }
 }
