@@ -53,7 +53,8 @@ proxy_secret = "phase1-secret-canary-32-characters"
 policy = "phase1-permission-policy-canary"
 CONFIG
 export CARGO_TARGET_DIR="$RUNNER_TEMP/phase1-target"
-# macOS runners ship bash 3.2, where a failing standalone [[ ]] does not stop set -e.
+# Exit explicitly: under bash 3.2 (macOS /bin/bash) a failing standalone [[ ]]
+# does not stop set -e.
 [[ ! -e "$CARGO_TARGET_DIR" ]] || { echo "Refusing existing target directory: $CARGO_TARGET_DIR" >&2; exit 1; }
 mkdir -p release-assets
 [[ -z "$(ls -A release-assets)" ]] || { echo "Refusing non-empty release-assets" >&2; exit 1; }

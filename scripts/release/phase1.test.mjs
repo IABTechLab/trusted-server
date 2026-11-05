@@ -348,6 +348,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'wrong-id',
     'published-asset-digest',
     'published-asset-extra',
+    'published-asset-renamed',
     'attestation-404-then-present',
     'attestation-after-two-waits',
     'attestation-404-never',
@@ -408,6 +409,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         : { fixture: asset }
     const waits = [],
       ignored = []
+    // Whether a gh command ran since the last API call.
+    let ghSinceFetch = false
     let verifies = 0,
       now = 0,
       // The availability window starts when the identity reads finish.
@@ -538,16 +541,15 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           method === 'GET',
           `should time-bound every read and only reads: ${method} ${u.pathname}`
         )
-        // A synchronous gh check after earlier API reads can leave pooled
-        // sockets idle.
+        // A synchronous gh check between API calls leaves pooled sockets
+        // idle, and the server may close them meanwhile.
         if (
           mode === 'idle-socket' &&
-          calls.some(
-            ([kind, args]) => kind === 'gh' && args[1][0] === 'release'
-          ) &&
+          ghSinceFetch &&
           options.headers.Connection !== 'close'
         )
           throw new TypeError('other side closed')
+        ghSinceFetch = false
         calls.push([method, u.pathname + u.search])
         const response = (body, status = 200, headers = {}) =>
           new Response(
@@ -732,12 +734,16 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           const current = release(method !== 'PATCH' && uploaded.length === 0)
           if (mode === 'published-asset-extra')
             current.assets.push({ name: 'unexpected', size: 1 })
+          // Same count and unique names, but one name is not in the set.
+          if (mode === 'published-asset-renamed' && current.assets.length)
+            current.assets[0] = { ...current.assets[0], name: 'unexpected' }
           return response(current)
         }
         throw Error(`Unexpected ${method} ${url}`)
       }
       const execFileSync = (...args) => {
         calls.push(['gh', args])
+        ghSinceFetch = true
         if (args[1][0] === 'attestation') {
           const index =
             calls.filter(
@@ -822,6 +828,10 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           Math.min(10000, availabilityEnd - now),
           'should bound proof verification by the availability deadline'
         )
+        // The first proof fails, so the next availability check reads the
+        // API again after a gh command.
+        if (mode === 'idle-socket' && verifies === 1)
+          throw Error('Signature verification failed')
         if (mode === 'attestation-verify-transient' && verifies === 1)
           throw Object.assign(Error('gh failed'), {
             stderr: Buffer.from('HTTP 503: Service Unavailable'),
@@ -931,6 +941,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'upload-digest': /Upload mismatch/,
         'published-asset-digest': /Published asset digest mismatch/,
         'published-asset-extra': /Published asset set mismatch/,
+        'published-asset-renamed': /Unexpected published asset/,
         'attestation-404-never': /unavailable after five checks/,
         // The deadline names its window and keeps the failure that caused the
         // retry.
@@ -1031,6 +1042,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         assert.equal(
           verifies,
           [
+            'idle-socket',
             'attestation-verify-transient',
             'attestation-null-bundle-late',
           ].includes(mode)
@@ -1241,6 +1253,17 @@ test('SPDX rejects root/hash ambiguity and lost package identities', () => {
     mutate(document)
     assert.throws(() => validateSpdx(document, binary, original))
   }
+  // A converter package named like the root, listed before it, must not stand
+  // in for the described root.
+  const { document, original } = spdxFixture()
+  document.packages.unshift({
+    SPDXID: 'SPDXRef-Impostor',
+    name: document.packages[0].name,
+  })
+  assert.throws(
+    () => validateSpdx(document, binary, original),
+    /SPDX describes a different inventory root/
+  )
 })
 test('SPDX validation rescans the final binary for planted operator values', () => {
   const planted = Buffer.concat([binary, Buffer.from(sentinels[0])])
