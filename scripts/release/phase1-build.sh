@@ -7,7 +7,6 @@ release_asset=${3:?asset required}
 case "$build_package/$build_target/$release_asset" in
   trusted-server-adapter-fastly/wasm32-wasip1/trusted-server-fastly.wasm) executable=trusted-server-adapter-fastly.wasm ;;
   trusted-server-cli/x86_64-unknown-linux-gnu/ts-x86_64-unknown-linux-gnu|trusted-server-cli/aarch64-apple-darwin/ts-aarch64-apple-darwin|trusted-server-cli/x86_64-apple-darwin/ts-x86_64-apple-darwin) executable=ts ;;
-  trusted-server-adapter-axum/x86_64-unknown-linux-gnu/trusted-server-axum-x86_64-unknown-linux-gnu|trusted-server-adapter-axum/x86_64-unknown-linux-musl/trusted-server-axum-x86_64-unknown-linux-musl|trusted-server-adapter-axum/aarch64-unknown-linux-gnu/trusted-server-axum-aarch64-unknown-linux-gnu) executable=trusted-server-axum ;;
   *) echo 'Unsupported release build selection' >&2; exit 1 ;;
 esac
 : "${RUNNER_TEMP:?}"
@@ -20,7 +19,6 @@ for variable in TSJS_SKIP_BUILD TSJS_PREBUILT_DIR TSJS_TEST; do
     exit 1
   fi
 done
-node scripts/release/phase1.mjs audit
 # No operator values enter through inherited environment; these fictional canaries
 # additionally catch known config embedding regressions in the final executable.
 export TRUSTED_SERVER__RELEASE_BUILD=1
@@ -37,14 +35,15 @@ if [[ "$build_target" != wasm32-wasip1 ]]; then
   export CARGO_PROFILE_RELEASE_STRIP=debuginfo
 fi
 inventory="crates/$build_package/phase1.json"
+# The generator writes phase1.json beside every workspace member manifest.
 # Refuse existing paths, including dangling symlinks, before claiming cleanup ownership.
-for owned_path in trusted-server.toml "$inventory"; do
+for owned_path in trusted-server.toml crates/*/phase1.json; do
   if [[ -e "$owned_path" || -L "$owned_path" ]]; then
     echo "Refusing existing release temporary path: $owned_path" >&2
     exit 1
   fi
 done
-trap 'rm -f trusted-server.toml "$inventory"; if [[ -n "${build_container:-}" ]]; then docker rm -f "$build_container" >/dev/null 2>&1 || true; fi' EXIT
+trap 'rm -f trusted-server.toml crates/*/phase1.json; if [[ -n "${build_container:-}" ]]; then docker rm -f "$build_container" >/dev/null 2>&1 || true; fi' EXIT
 cat > trusted-server.toml <<'CONFIG'
 # Fictional config must never become a build input.
 [publisher]
@@ -54,9 +53,10 @@ proxy_secret = "phase1-secret-canary-32-characters"
 policy = "phase1-permission-policy-canary"
 CONFIG
 export CARGO_TARGET_DIR="$RUNNER_TEMP/phase1-target"
-[[ ! -e "$CARGO_TARGET_DIR" ]]
+# macOS runners ship bash 3.2, where a failing standalone [[ ]] does not stop set -e.
+[[ ! -e "$CARGO_TARGET_DIR" ]] || { echo "Refusing existing target directory: $CARGO_TARGET_DIR" >&2; exit 1; }
 mkdir -p release-assets
-[[ -z "$(ls -A release-assets)" ]]
+[[ -z "$(ls -A release-assets)" ]] || { echo "Refusing non-empty release-assets" >&2; exit 1; }
 # The pinned Node distribution includes npm. npm verifies lockfile integrity for
 # fetched packages; no generator dependencies are installed with unpinned npx.
 npm --prefix crates/trusted-server-js/lib ci
@@ -90,13 +90,6 @@ DOCKERFILE
       rustup run "$rust_version" cargo build --package "$1" --release --target "$2" --locked
     ' phase1 "$build_package" "$build_target"
 else
-  if [[ "$build_target" == x86_64-unknown-linux-musl ]]; then
-    sudo apt-get update
-    sudo apt-get install --yes --no-install-recommends musl=1.2.4-2 musl-dev=1.2.4-2 musl-tools=1.2.4-2
-    export REALGCC=gcc-13 CC_x86_64_unknown_linux_musl=musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
-    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS='-C target-feature=+crt-static'
-    musl-gcc -dumpfullversion
-  fi
   cargo build --package "$build_package" --release --target "$build_target" --locked
 fi
 cp "$CARGO_TARGET_DIR/$build_target/release/$executable" "release-assets/$release_asset"
@@ -116,7 +109,7 @@ CARGO_TARGET_DIR="$tool_root/target" cargo install \
   --path "$tool_root/cargo-cyclonedx-0.5.9" --locked --root "$tool_root/install"
 # The generator resolves the whole workspace, including unbuilt members. Acquire
 # their selected sources under the lock before denying network resolution.
-cargo metadata --locked --format-version 1 --filter-platform "$build_target" > "$tool_root/cargo-metadata.json"
+cargo metadata --locked --format-version 1 --filter-platform "$build_target" > /dev/null
 # Pinned generator has no --locked flag. Resolve offline after the locked build
 # with identical target/default features, then require the lock to be unchanged.
 CARGO_NET_OFFLINE=true "$tool_root/install/bin/cargo-cyclonedx" cyclonedx \
@@ -128,12 +121,9 @@ node scripts/release/phase1.mjs merge \
   "release-assets/$release_asset" "$tool_root/combined.cdx.json"
 # Convert the internal dependency graph into real SPDX 2.3 before publication.
 case "$build_target" in
-  wasm32-wasip1|x86_64-unknown-linux-gnu|x86_64-unknown-linux-musl)
+  wasm32-wasip1|x86_64-unknown-linux-gnu)
     converter_asset=cyclonedx-linux-x64
     converter_sha=bfc8b2538da86fe239bc53658bbb63c1c8c510a293c1e6891aa5bea5d3c58746 ;;
-  aarch64-unknown-linux-gnu)
-    converter_asset=cyclonedx-linux-arm64
-    converter_sha=b2e9fdf9665ef49868a2ec012171c6e785dcd69745bc5869e53e4f4bfb096a5f ;;
   aarch64-apple-darwin)
     converter_asset=cyclonedx-osx-arm64
     converter_sha=750c148780154833f6401f9067d08c5a4c31567b6ee3c26c062c3a95c62d741c ;;

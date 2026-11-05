@@ -1165,7 +1165,7 @@ This section provides detailed code examples and implementation patterns for the
 ### GitHub Artifact Attestations (CI/CD)
 
 This binary workflow example is historical and superseded by the [October
-release contract](2026-10-09-1235-release-attestation-design.md#r-sign). Its
+release contract](2026-10-09-1235-release-attestation-design.md#r-sign--signer). Its
 current certificate SAN names `release-build.yml`; the caller `release.yml`
 does not satisfy that signer identity. Runtime/configuration and publisher
 proposals below remain historical #161 material.

@@ -161,6 +161,7 @@ fn release_source_requires_an_exact_full_lowercase_commit() {
         Some(" abcdef0123456789abcdef0123456789abcdef01"),
         Some("abcdef0123456789abcdef0123456789abcdef01\n"),
         Some("abcdef0123456789abcdef0123456789abcdef0g"),
+        Some("abcdef0123456789abcdef0123456789abcdef012"),
     ] {
         assert!(
             git_version::release_source(Some(OsStr::new("1")), source.map(OsStr::new)).is_err(),

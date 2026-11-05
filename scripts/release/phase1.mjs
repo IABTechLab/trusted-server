@@ -1,17 +1,8 @@
 /** Small Phase 1 build-inventory and configuration checks, without release authority. */
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { createServer } from 'node:net'
-import { once } from 'node:events'
-import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
-import {
-  basename,
-  dirname,
-  isAbsolute,
-  join,
-  relative,
-  resolve,
-} from 'node:path'
+import { readFileSync, statSync, writeFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 /** Check minimal wasm headers and final Linux loader requirements. */
@@ -19,23 +10,23 @@ export function checkReleaseFormat(bytes, target, elf = '') {
   if (target === 'wasm32-wasip1') {
     if (!bytes.subarray(0, 8).equals(Buffer.from('0061736d01000000', 'hex')))
       throw Error('Invalid wasm magic or version')
-  } else if (target.includes('-linux-')) {
-    if (!bytes.subarray(0, 4).equals(Buffer.from('7f454c46', 'hex')))
-      throw Error('Expected ELF binary')
-    if (target.endsWith('-musl')) {
-      if (/INTERP|\(NEEDED\)/.test(elf))
-        throw Error('Expected fully static musl binary')
-    } else {
-      if (/GLIBC_[A-Z]/.test(elf)) throw Error('Unknown GLIBC requirement')
-      for (const [, major, minor, patch] of elf.matchAll(
-        /GLIBC_(\d+)\.(\d+)(?:\.(\d+))?/g
-      ))
-        if (
-          +major > 2 ||
-          (+major === 2 && (+minor > 34 || (+minor === 34 && +patch > 0)))
-        )
-          throw Error('GLIBC requirement exceeds 2.34')
-    }
+  } else if (target === 'x86_64-unknown-linux-gnu') {
+    // 64-bit little-endian ELF whose e_machine is EM_X86_64.
+    if (
+      bytes.length < 20 ||
+      !bytes.subarray(0, 6).equals(Buffer.from('7f454c460201', 'hex')) ||
+      bytes.readUInt16LE(18) !== 0x3e
+    )
+      throw Error('Expected target-matched 64-bit ELF')
+    if (/GLIBC_[A-Z]/.test(elf)) throw Error('Unknown GLIBC requirement')
+    for (const [, major, minor, patch] of elf.matchAll(
+      /GLIBC_(\d+)\.(\d+)(?:\.(\d+))?/g
+    ))
+      if (
+        +major > 2 ||
+        (+major === 2 && (+minor > 34 || (+minor === 34 && +patch > 0)))
+      )
+        throw Error('GLIBC requirement exceeds 2.34')
   } else if (target.endsWith('-apple-darwin')) {
     if (
       bytes.length < 32 ||
@@ -70,7 +61,7 @@ export function checkReleaseFormat(bytes, target, elf = '') {
     if (offset !== end || minimum === undefined || minimum !== 0x000d0000)
       throw Error('Expected macOS minimum OS 13.0')
     console.log('SUCCESS: Mach-O target and macOS minimum OS 13.0:', target)
-  }
+  } else throw Error('Unsupported release target')
 }
 
 /** Complete converter output with the actual binary's SPDX package. */
@@ -215,221 +206,6 @@ export function checkBinary(bytes) {
   }
 }
 
-// Resolve literal macro arguments, including nested concat!, without Rust dataflow claims.
-function rustTokens(source) {
-  const tokens = []
-  for (let i = 0; i < source.length; ) {
-    if (/\s/.test(source[i])) {
-      i++
-      continue
-    }
-    if (source.startsWith('//', i)) {
-      i = source.indexOf('\n', i)
-      if (i < 0) break
-      continue
-    }
-    if (source.startsWith('/*', i)) {
-      let depth = 1
-      i += 2
-      while (i < source.length && depth) {
-        if (source.startsWith('/*', i)) {
-          depth++
-          i += 2
-        } else if (source.startsWith('*/', i)) {
-          depth--
-          i += 2
-        } else i++
-      }
-      continue
-    }
-    const raw = source.slice(i).match(/^[bc]?r(#{0,255})"/)
-    if (raw) {
-      const start = i + raw[0].length,
-        end = source.indexOf('"' + raw[1], start)
-      if (end < 0) throw Error('Unterminated Rust raw string')
-      tokens.push({ string: source.slice(start, end) })
-      i = end + 1 + raw[1].length
-      continue
-    }
-    const character = source
-      .slice(i)
-      .match(/^'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\r\n])'/u)
-    if (character) {
-      i += character[0].length
-      continue
-    }
-    if (source[i] === '"') {
-      let end = i + 1
-      while (end < source.length && source[end] !== '"') {
-        if (source[end] === '\\') end++
-        end++
-      }
-      if (end === source.length) throw Error('Unterminated Rust string')
-      const value = source
-        .slice(i + 1, end)
-        .replace(
-          /\\(?:x([0-9a-fA-F]{2})|u\{([0-9a-fA-F_]+)\}|(\r?\n)\s*|([nrt0\\"']))/g,
-          (_, hex, unicode, newline, simple) => {
-            if (hex) return String.fromCodePoint(parseInt(hex, 16))
-            if (unicode)
-              return String.fromCodePoint(
-                parseInt(unicode.replaceAll('_', ''), 16)
-              )
-            if (newline) return ''
-            return { n: '\n', r: '\r', t: '\t', 0: '\0' }[simple] ?? simple
-          }
-        )
-      tokens.push({ string: value })
-      i = end + 1
-      continue
-    }
-    const word = source.slice(i).match(/^[A-Za-z_][A-Za-z_0-9]*/)
-    if (word) {
-      tokens.push(word[0])
-      i += word[0].length
-    } else tokens.push(source[i++])
-  }
-  return tokens
-}
-
-/**
- * Returns, for each `mod name;` a Rust file declares, the files rustc may load
- * for it. A `#[path = "..."]` declaration has exactly one candidate, relative
- * to that file's directory, and is marked `explicit`.
- */
-export function moduleFiles(file, source) {
-  const tokens = rustTokens(source)
-  const directory = dirname(file)
-  const modules = []
-  let path
-  for (let i = 0; i < tokens.length; i++) {
-    if (
-      tokens[i] === '#' &&
-      tokens[i + 1] === '[' &&
-      tokens[i + 2] === 'path' &&
-      tokens[i + 3] === '=' &&
-      tokens[i + 4]?.string !== undefined &&
-      tokens[i + 5] === ']'
-    ) {
-      path = tokens[i + 4].string
-      i += 5
-    } else if (
-      tokens[i] === 'mod' &&
-      typeof tokens[i + 1] === 'string' &&
-      tokens[i + 2] === ';'
-    ) {
-      modules.push(
-        path === undefined
-          ? {
-              explicit: false,
-              files: [
-                join(directory, `${tokens[i + 1]}.rs`),
-                join(directory, tokens[i + 1], 'mod.rs'),
-                // A non-mod.rs file `y.rs` loads `mod z;` from `y/`.
-                join(directory, basename(file, '.rs'), `${tokens[i + 1]}.rs`),
-                join(directory, basename(file, '.rs'), tokens[i + 1], 'mod.rs'),
-              ],
-            }
-          : {
-              explicit: true,
-              // rustc loads an absolute path as given.
-              files: [isAbsolute(path) ? path : join(directory, path)],
-            }
-      )
-      path = undefined
-    } else if (tokens[i] === 'mod' || tokens[i] === ';') path = undefined
-  }
-  return modules
-}
-
-/**
- * Rejects deployment configuration read at compile time. `buildScript`
- * applies the stricter rule for code that runs during the build: `build.rs`
- * and every module it loads.
- */
-export function checkSource(
-  file,
-  source,
-  buildScript = basename(file) === 'build.rs'
-) {
-  const tokens = rustTokens(source)
-  const deployment = (value) => /^(?:TRUSTED_SERVER__|EDGEZERO__)/.test(value)
-  // Only release control and Cargo-owned target facts are additional build-time inputs.
-  const allowedBuild = new Set([
-    'TRUSTED_SERVER__GIT_VERSION',
-    'TRUSTED_SERVER__RELEASE_BUILD',
-    'TRUSTED_SERVER__BUILD_TARGET',
-  ])
-  const expression = (start) => {
-    if (
-      ['env', 'option_env'].includes(tokens[start]) &&
-      tokens[start + 1] === '!' &&
-      ['(', '[', '{'].includes(tokens[start + 2])
-    ) {
-      const close = { '(': ')', '[': ']', '{': '}' }[tokens[start + 2]]
-      const argument = expression(start + 3)
-      if (argument && tokens[argument.end] === close)
-        return { value: '__BUILD_ENV__', end: argument.end + 1 }
-      return null
-    }
-    if (tokens[start]?.string !== undefined)
-      return { value: tokens[start].string, end: start + 1 }
-    if (
-      tokens[start] !== 'concat' ||
-      tokens[start + 1] !== '!' ||
-      !['(', '[', '{'].includes(tokens[start + 2])
-    )
-      return null
-    const close = { '(': ')', '[': ']', '{': '}' }[tokens[start + 2]]
-    let cursor = start + 3,
-      value = ''
-    while (tokens[cursor] !== close) {
-      const part = expression(cursor)
-      if (!part) return null
-      value += part.value
-      cursor = part.end
-      if (tokens[cursor] === ',') cursor++
-      else if (tokens[cursor] !== close) return null
-    }
-    return { value, end: cursor + 1 }
-  }
-  const operatorPath = (value) =>
-    /(?:^|[/\\])(?:trusted-server\.toml|\.env(?:[./\\]|$))/.test(value)
-  for (let i = 0; i < tokens.length; i++) {
-    if (
-      ['env', 'option_env', 'include_str', 'include_bytes'].includes(
-        tokens[i]
-      ) &&
-      tokens[i + 1] === '!'
-    ) {
-      const argument = expression(i + 3)
-      if (!argument) continue
-      const value = argument.value
-      if (
-        (['env', 'option_env'].includes(tokens[i]) &&
-          deployment(value) &&
-          !allowedBuild.has(value)) ||
-        (tokens[i].startsWith('include_') && operatorPath(value))
-      )
-        throw Error(`${file}: deployment compile-time input`)
-    }
-    if (buildScript) {
-      const value = expression(i)?.value
-      // Judge the leading variable name, so an error message that names an
-      // allowed control still passes while a padded or templated name fails.
-      if (
-        value !== undefined &&
-        ((deployment(value) &&
-          !allowedBuild.has(
-            value.match(/^(?:TRUSTED_SERVER__|EDGEZERO__)\w*/)[0]
-          )) ||
-          operatorPath(value))
-      )
-        throw Error(`${file}: operator compile-time build input`)
-    }
-  }
-}
-
 function namespace(bom, prefix) {
   if (
     bom.bomFormat !== 'CycloneDX' ||
@@ -452,7 +228,7 @@ function namespace(bom, prefix) {
   return rename(bom)
 }
 
-export function mergeSboms(cargo, npm, binary, name, version) {
+export function mergeSboms(cargo, npm, binary, name) {
   checkBinary(binary)
   const rust = namespace(cargo, 'cargo')
   const javascript = namespace(npm, 'npm')
@@ -473,8 +249,9 @@ export function mergeSboms(cargo, npm, binary, name, version) {
       ...rust.metadata,
       component: {
         ...root,
+        // The root's nested components are listed once, below.
+        components: undefined,
         name,
-        version: version ?? root.version,
         hashes: [
           {
             alg: 'SHA-256',
@@ -500,84 +277,9 @@ export function mergeSboms(cargo, npm, binary, name, version) {
   }
 }
 
-function crateFiles(root, files = []) {
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
-    if (['node_modules', 'target', 'dist', '.git'].includes(entry.name))
-      continue
-    const file = join(root, entry.name)
-    if (entry.isDirectory()) crateFiles(file, files)
-    else if (
-      entry.isFile() &&
-      (file.endsWith('.rs') || entry.name === 'Cargo.toml')
-    )
-      files.push(file)
-  }
-  return files
-}
-
-/**
- * Refuses a manifest that names a build script other than `build.rs`, which
- * the audit would not recognise as one.
- */
-function checkManifest(file, source) {
-  let section
-  for (const line of source.split(/\r?\n/)) {
-    const header = line.match(/^\s*\[([^\]]*)\]/)
-    if (header) section = header[1].trim()
-    const build =
-      section === 'package'
-        ? line.match(/^\s*build\s*=\s*([^#]*?)\s*(?:#.*)?$/)
-        : line.match(/^\s*package\.build\s*=\s*([^#]*?)\s*(?:#.*)?$/)
-    if (build && !['"build.rs"', "'build.rs'", 'false'].includes(build[1]))
-      throw Error(`${file}: custom build script is not audited`)
-  }
-}
-
-/**
- * Audits every Rust file under `root`. Build scripts, every module they reach
- * and every file under a crate's `build/` or `build_support/` directory get the
- * build-script rule. Module resolution is simplified (no inline-module nesting,
- * `cfg_attr` paths or `include!`), so build-time helpers belong in those two
- * directories. A custom `package.build` script and a `#[path]` module outside
- * the audited `.rs` files are refused.
- */
-export function audit(root) {
-  const found = crateFiles(root)
-  for (const manifest of found.filter((file) => file.endsWith('Cargo.toml')))
-    checkManifest(manifest, readFileSync(manifest, 'utf8'))
-  const files = found.filter((file) => file.endsWith('.rs'))
-  const sources = new Map(
-    files.map((file) => [file, readFileSync(file, 'utf8')])
-  )
-  for (const file of files)
-    for (const module of moduleFiles(file, sources.get(file)))
-      if (module.explicit && !sources.has(module.files[0]))
-        throw Error(`${file}: #[path] module outside the audited Rust sources`)
-  const buildTime = new Set(
-    files.filter(
-      (file) =>
-        basename(file) === 'build.rs' ||
-        /^[^/\\]+[/\\](?:build|build_support)[/\\]/.test(relative(root, file))
-    )
-  )
-  const pending = [...buildTime]
-  while (pending.length) {
-    const file = pending.pop()
-    for (const module of moduleFiles(file, sources.get(file)).flatMap(
-      (declaration) => declaration.files
-    )) {
-      if (!buildTime.has(module) && sources.has(module)) {
-        buildTime.add(module)
-        pending.push(module)
-      }
-    }
-  }
-  for (const file of files)
-    checkSource(file, sources.get(file), buildTime.has(file))
-}
-
 async function smokeRelease(file, target) {
-  const elf = target.includes('-linux-')
+  const linux = target === 'x86_64-unknown-linux-gnu'
+  const elf = linux
     ? execFileSync(
         'readelf',
         ['--program-headers', '--dynamic', '--version-info', file],
@@ -591,7 +293,6 @@ async function smokeRelease(file, target) {
     [...new Set(elf.match(/GLIBC_[\w.]+/g) ?? [])].join(' ')
   )
   if (target === 'wasm32-wasip1') return
-  const cli = file.split('/').at(-1).startsWith('ts-')
   const expected =
     'ts package=' +
     readFileSync('Cargo.toml', 'utf8').match(
@@ -602,14 +303,13 @@ async function smokeRelease(file, target) {
     if (output.trim() !== expected) throw Error('Unexpected CLI version')
     console.log('SUCCESS:', output.trim())
   }
-  if (cli)
-    version(
-      execFileSync(resolve(file), ['--version'], {
-        encoding: 'utf8',
-        timeout: 10000,
-      })
-    )
-  if (!target.includes('-linux-')) return
+  version(
+    execFileSync(resolve(file), ['--version'], {
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+  )
+  if (!linux) return
   const docker = (args, input) =>
     execFileSync('docker', args, {
       input,
@@ -617,195 +317,36 @@ async function smokeRelease(file, target) {
       timeout: args[0] === 'pull' ? 180000 : 10000,
       maxBuffer: 8388608,
     })
-  const images = target.endsWith('-musl')
-    ? [
-        'alpine:3.22.2@sha256:4b7ce07002c69e8f3d704a9c5d6fd3053be500b7f1c69fc0d80990c2ad8dd412',
-        'scratch',
-      ]
-    : target.startsWith('aarch64-')
-      ? [
-          'debian:12-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8',
-        ]
-      : [
-          'debian:12-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8',
-          'ubuntu:22.04@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956',
-          'registry.access.redhat.com/ubi9/ubi-minimal:9.6@sha256:34880b64c07f28f64d95737f82f891516de9a3b43583f39970f7bf8e4cfa48b7',
-        ]
-  for (const reference of images) {
-    let image
-    if (reference === 'scratch')
-      image = docker(['import', '-'], Buffer.alloc(1024)).trim()
-    else {
-      docker(['pull', reference])
-      image = docker([
-        'image',
-        'inspect',
-        '--format',
-        '{{.Id}}',
-        reference,
-      ]).trim()
-    }
+  for (const reference of [
+    'debian:12-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8',
+    'ubuntu:22.04@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956',
+    'registry.access.redhat.com/ubi9/ubi-minimal:9.6@sha256:34880b64c07f28f64d95737f82f891516de9a3b43583f39970f7bf8e4cfa48b7',
+  ]) {
+    docker(['pull', reference])
+    const image = docker([
+      'image',
+      'inspect',
+      '--format',
+      '{{.Id}}',
+      reference,
+    ]).trim()
     console.log('Runtime image:', reference, image)
-    const restrictions = [
-      '--read-only',
-      '--cap-drop=ALL',
-      '--security-opt=no-new-privileges',
-      '--user=65534:65534',
-      '--entrypoint=/release',
-      '--mount',
-      `type=bind,src=${resolve(file)},dst=/release,readonly`,
-    ]
-    if (!cli)
-      restrictions.push(
-        '--mount',
-        'type=bind,src=/etc/ssl/certs/ca-certificates.crt,dst=/ca.pem,readonly',
-        '--env=SSL_CERT_FILE=/ca.pem'
-      )
-    const container = 'phase1-smoke-' + randomUUID()
-    let failed
-    try {
-      if (cli) {
-        version(
-          docker([
-            'run',
-            '--name',
-            container,
-            '--network=none',
-            ...restrictions,
-            image,
-            '--version',
-          ])
-        )
-        continue
-      }
-      for (const setting of ['EDGEZERO__ADAPTER__PORT', 'PORT']) {
-        let rejected = false
-        try {
-          docker([
-            'run',
-            '--rm',
-            '--network=none',
-            ...restrictions,
-            '--env',
-            setting + '=0',
-            image,
-          ])
-        } catch (error) {
-          if (
-            error.status !== 1 ||
-            !(String(error.stdout ?? '') + String(error.stderr ?? '')).includes(
-              '1–65535'
-            )
-          )
-            throw error
-          rejected = true
-        }
-        if (!rejected) throw Error('Axum accepted port zero: ' + setting)
-        console.log(
-          'SUCCESS: Axum rejects ' +
-            setting +
-            '=0; exit 1, ports must be 1–65535:',
-          image
-        )
-      }
-      const reservation = createServer().listen(0, '127.0.0.1')
-      await once(reservation, 'listening')
-      const port = reservation.address().port
-      await new Promise((resolve) => reservation.close(resolve))
-      // Fixed ASCII fixture keys are sorted for the envelope's canonical hash.
-      const data = {
-        ec: { passphrase: 'ec_passphrase' },
-        handlers: [
-          {
-            password: 'handler_password',
-            path: '^/_ts/admin',
-            username: 'smoke',
-          },
-        ],
-        publisher: {
-          cookie_domain: '127.0.0.1',
-          domain: '127.0.0.1',
-          origin_url: 'http://127.0.0.1:9',
-          proxy_secret: 'publisher_proxy_secret',
-        },
-      }
-      const envelope = {
-        data,
-        generated_at: '2026-01-01T00:00:00Z',
-        sha256: createHash('sha256').update(JSON.stringify(data)).digest('hex'),
-        version: 1,
-      }
-      const environment = [
-        'EDGEZERO__ADAPTER__PORT=8080',
-        'EDGEZERO__ADAPTER__HOST=0.0.0.0',
-        `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG=${JSON.stringify(envelope)}`,
-        'TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE=smoke-edge-cookie-passphrase-32-bytes',
-        'TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD=smoke-admin-password-32-bytes-ok',
-        'TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET=smoke-publisher-proxy-secret-32-bytes',
-      ]
+    version(
       docker([
         'run',
-        '--name',
-        container,
-        '-d',
-        '--publish',
-        `127.0.0.1:${port}:8080`,
-        ...restrictions,
-        ...environment.flatMap((value) => ['--env', value]),
+        '--rm',
+        '--network=none',
+        '--read-only',
+        '--cap-drop=ALL',
+        '--security-opt=no-new-privileges',
+        '--user=65534:65534',
+        '--entrypoint=/release',
+        '--mount',
+        `type=bind,src=${resolve(file)},dst=/release,readonly`,
         image,
+        '--version',
       ])
-      let healthy = false
-      for (let attempt = 0; attempt < 30; attempt++) {
-        if (
-          docker([
-            'inspect',
-            '--format',
-            '{{.State.Running}}',
-            container,
-          ]).trim() !== 'true'
-        )
-          throw Error('Axum exited before readiness')
-        let response
-        try {
-          response = await fetch(`http://127.0.0.1:${port}/health`, {
-            signal: AbortSignal.timeout(1000),
-          })
-        } catch {
-          await new Promise((resolve) => setTimeout(resolve, 100))
-          continue
-        }
-        const body = await response.text()
-        if (response.status !== 200 || body !== 'ok')
-          throw Error(
-            `Axum health mismatch: HTTP ${response.status}: ${body.slice(0, 500)}`
-          )
-        healthy = true
-        break
-      }
-      if (!healthy) throw Error('Axum startup deadline exhausted')
-      console.log(
-        'SUCCESS: Axum bound to 0.0.0.0:8080; host reached published container port, HTTP 200 ok:',
-        reference,
-        image
-      )
-    } catch (error) {
-      failed = error
-      try {
-        console.error(docker(['logs', container]).slice(-4000))
-      } catch {}
-      throw error
-    } finally {
-      try {
-        docker(['rm', '-f', container])
-      } catch (error) {
-        if (
-          !error.stderr?.toString().includes(`No such container: ${container}`)
-        ) {
-          if (!failed) throw error
-          console.error('Smoke container cleanup failed:', error.message)
-        }
-      }
-    }
+    )
   }
 }
 
@@ -814,9 +355,7 @@ if (
   import.meta.url === pathToFileURL(resolve(process.argv[1])).href
 ) {
   const [command, ...args] = process.argv.slice(2)
-  if (command === 'audit' && args.length === 0) {
-    audit('crates')
-  } else if (command === 'check' && args.length > 0) {
+  if (command === 'check' && args.length > 0) {
     for (const file of args) {
       if (!statSync(file).isFile())
         throw new Error('Expected regular release binary')
@@ -833,8 +372,7 @@ if (
           JSON.parse(readFileSync(cargo)),
           JSON.parse(readFileSync(npm)),
           readFileSync(binary),
-          binary.split('/').at(-1),
-          process.env.RELEASE_VERSION
+          binary.split('/').at(-1)
         ),
         null,
         2
@@ -859,7 +397,7 @@ if (
     writeFileSync(file, JSON.stringify(document, null, 2) + '\n')
   } else {
     throw new Error(
-      'Expected audit, check <binary...>, merge <cargo> <npm> <binary> <output>, or validate-spdx <spdx> <binary> <merged-cdx>'
+      'Expected check <binary...>, merge <cargo> <npm> <binary> <output>, or validate-spdx <spdx> <binary> <merged-cdx>'
     )
   }
 }

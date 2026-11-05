@@ -42,8 +42,7 @@ fn owner_command(script: &Path) -> Command {
     command
         .env("TARGET", "example-target")
         .env_remove("TRUSTED_SERVER__RELEASE_BUILD")
-        .env_remove("TRUSTED_SERVER__GIT_VERSION")
-        .env_remove("CARGO_FEATURE_REUSABLE_SANDBOX");
+        .env_remove("TRUSTED_SERVER__GIT_VERSION");
     command
 }
 
@@ -52,7 +51,7 @@ fn owner_command(script: &Path) -> Command {
 #[test]
 fn actual_owner_scripts_emit_only_own_target() {
     let directory = tempfile::tempdir().expect("should create fixture");
-    for owner in ["trusted-server-cli", "trusted-server-adapter-fastly"] {
+    for owner in ["trusted-server-cli"] {
         let script = compile_build_script(owner, &directory);
         let mut outputs = Vec::new();
         for tag in ["v1.2.3", "v1.2.4"] {

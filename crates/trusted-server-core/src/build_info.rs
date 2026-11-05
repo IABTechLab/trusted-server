@@ -12,9 +12,6 @@ pub enum BuildVariant {
     /// The product's default feature set.
     #[display("default")]
     Default,
-    /// Fastly's opt-in reusable sandbox feature.
-    #[display("reusable-sandbox")]
-    ReusableSandbox,
 }
 
 /// Immutable package, source, target and variant facts for an owning product.
@@ -91,11 +88,6 @@ mod tests {
             BuildVariant::Default.to_string(),
             "default",
             "should label the default product variant"
-        );
-        assert_eq!(
-            BuildVariant::ReusableSandbox.to_string(),
-            "reusable-sandbox",
-            "should label the reusable sandbox product variant"
         );
     }
 }

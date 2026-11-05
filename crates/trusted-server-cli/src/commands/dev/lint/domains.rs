@@ -94,9 +94,6 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "docs.github.com",
     "help.github.com",
     "token.actions.githubusercontent.com",
-    // GitHub Actions SLSA buildType URI cited by the release spec and compatibility record:
-    // https://actions.github.io/buildtypes/workflow/v1
-    "actions.github.io",
     // Git commit conventions
     "chris.beams.io",
     // Rust
@@ -121,7 +118,7 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "rslstandard.org",
     // SLSA: canonical provenance predicate and build specification references.
     "slsa.dev",
-    // SPDX: canonical document predicate in the retained reviewed contract.
+    // SPDX: canonical document predicate in the release verification guide.
     "spdx.dev",
     // Specs (other)
     "webassembly.org",
@@ -346,23 +343,6 @@ mod allow_check_tests {
         );
         // But NOT subdomains of REFERENCE_HOSTS (exact-match).
         assert!(!is_allowed("other.github.com", &nothing_suppressed()));
-    }
-
-    #[test]
-    fn actions_build_type_host_is_exact() {
-        assert!(
-            is_allowed("actions.github.io", &nothing_suppressed()),
-            "should allow the GitHub Actions build type reference"
-        );
-        for host in [
-            "unapproved.actions.github.io",
-            "actions.github.io.invalid-host.com",
-        ] {
-            assert!(
-                !is_allowed(host, &nothing_suppressed()),
-                "should reject Actions host subdomains and lookalikes"
-            );
-        }
     }
 
     #[test]

@@ -36,7 +36,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type + " " + .object.sha')" = "commit $GITHUB_SHA"
+        run: |
+          ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type + " " + .object.sha')"
+          if [ "$ref" != "commit $GITHUB_SHA" ]; then
+            echo "::error::Release tags must be lightweight tags at $GITHUB_SHA; found $ref"
+            exit 1
+          fi
   build:
     needs: checks
     name: Build ${{ matrix.asset }}
@@ -64,18 +69,6 @@ jobs:
             package: trusted-server-cli
             target: x86_64-apple-darwin
             asset: ts-x86_64-apple-darwin
-          - os: ubuntu-24.04
-            package: trusted-server-adapter-axum
-            target: x86_64-unknown-linux-gnu
-            asset: trusted-server-axum-x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04
-            package: trusted-server-adapter-axum
-            target: x86_64-unknown-linux-musl
-            asset: trusted-server-axum-x86_64-unknown-linux-musl
-          - os: ubuntu-24.04-arm
-            package: trusted-server-adapter-axum
-            target: aarch64-unknown-linux-gnu
-            asset: trusted-server-axum-aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v5
         with:
@@ -102,14 +95,13 @@ jobs:
           BUILD_TARGET: ${{ matrix.target }}
           RELEASE_ASSET: ${{ matrix.asset }}
           SOURCE_COMMIT: ${{ github.sha }}
-          RELEASE_VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           env -i PATH="$PATH" HOME="$HOME" \
             CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
             RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
             TMPDIR="${TMPDIR:-/tmp}" RUNNER_TEMP="$RUNNER_TEMP" \
-            SOURCE_COMMIT="$SOURCE_COMMIT" RELEASE_VERSION="$RELEASE_VERSION" \
+            SOURCE_COMMIT="$SOURCE_COMMIT" \
             bash scripts/release/phase1-build.sh "$BUILD_PACKAGE" "$BUILD_TARGET" "$RELEASE_ASSET"
       # Only the tag-triggered signing job reads these; a main push is a build
       # and smoke check.
@@ -135,9 +127,6 @@ jobs:
       matrix:
         asset:
           [
-            trusted-server-axum-x86_64-unknown-linux-gnu,
-            trusted-server-axum-x86_64-unknown-linux-musl,
-            trusted-server-axum-aarch64-unknown-linux-gnu,
             trusted-server-fastly.wasm,
             ts-aarch64-apple-darwin,
             ts-x86_64-apple-darwin,

@@ -57,30 +57,6 @@ jobs:
         with:
           name: signed-ts-x86_64-unknown-linux-gnu
           path: signed/ts-x86_64-unknown-linux-gnu
-      - uses: actions/download-artifact@v7
-        with:
-          name: release-trusted-server-axum-x86_64-unknown-linux-gnu
-          path: build/trusted-server-axum-x86_64-unknown-linux-gnu
-      - uses: actions/download-artifact@v7
-        with:
-          name: signed-trusted-server-axum-x86_64-unknown-linux-gnu
-          path: signed/trusted-server-axum-x86_64-unknown-linux-gnu
-      - uses: actions/download-artifact@v7
-        with:
-          name: release-trusted-server-axum-x86_64-unknown-linux-musl
-          path: build/trusted-server-axum-x86_64-unknown-linux-musl
-      - uses: actions/download-artifact@v7
-        with:
-          name: signed-trusted-server-axum-x86_64-unknown-linux-musl
-          path: signed/trusted-server-axum-x86_64-unknown-linux-musl
-      - uses: actions/download-artifact@v7
-        with:
-          name: release-trusted-server-axum-aarch64-unknown-linux-gnu
-          path: build/trusted-server-axum-aarch64-unknown-linux-gnu
-      - uses: actions/download-artifact@v7
-        with:
-          name: signed-trusted-server-axum-aarch64-unknown-linux-gnu
-          path: signed/trusted-server-axum-aarch64-unknown-linux-gnu
       # Run only the publisher and its notes template from the tagged commit;
       # never check out build inputs here.
       - uses: actions/checkout@v5
@@ -118,8 +94,11 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
           SOURCE_COMMIT: ${{ github.sha }}
           RELEASE_PUBLICATION_ENABLED: ${{ vars.RELEASE_PUBLICATION_ENABLED }}
+          NODE_VERSION: ${{ steps.tools.outputs.node }}
         run: |
           set -euo pipefail
           test "$(gh --version | head -1 | cut -d' ' -f3)" = 2.102.0
-          node --version
+          # publish.mjs runs only where import.meta.main exists; an older Node
+          # would exit 0 without publishing.
+          test "$(node --version)" = "v$NODE_VERSION"
           node publisher/scripts/release/publish.mjs
