@@ -2,12 +2,16 @@
 //!
 //! EdgeZero does not load a Geo environment or store binding. This optional TS
 //! boot profile selects its Rust options before store preparation and listening.
-//! It contains a credential removal name, never the expected origin credential.
+//! Local databases use checked reader IPs and the existing trusted proxy policy.
+//! Protected assertions contain a credential removal name, never its value.
 
 use std::fmt;
 use std::fs;
+use std::path::PathBuf;
 
-use edgezero_adapter_axum::geo::{NativeGeoSelection, ProtectedCloudFrontAlb};
+use edgezero_adapter_axum::geo::{
+    MaxMindGeoConfig, NativeGeoSelection, ProtectedCloudFrontAlb, ReaderIpExpectation,
+};
 use serde::Deserialize;
 
 /// Path to the separately delivered TS native Geo boot profile.
@@ -53,6 +57,18 @@ enum GeoSelection {
         alb_peer_cidrs: Vec<String>,
         origin_credential_header_name: String,
     },
+    #[serde(rename = "maxmind")]
+    MaxMind {
+        database_path: PathBuf,
+        reader_ip_expectation: ReaderExpectation,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReaderExpectation {
+    PeerAllowed,
+    ForwardedRequired,
 }
 
 /// Capture the application-owned selection once before starting the runner.
@@ -85,11 +101,25 @@ fn parse_selection(bytes: &str) -> Result<NativeGeoSelection, NativeGeoProfileEr
         } => ProtectedCloudFrontAlb::new(alb_peer_cidrs, &origin_credential_header_name)
             .map(|policy| NativeGeoSelection::CloudFront { policy })
             .map_err(|_| NativeGeoProfileError::InvalidPolicy),
+        GeoSelection::MaxMind {
+            database_path,
+            reader_ip_expectation,
+        } => Ok(NativeGeoSelection::MaxMind {
+            config: MaxMindGeoConfig::new(
+                database_path,
+                match reader_ip_expectation {
+                    ReaderExpectation::PeerAllowed => ReaderIpExpectation::PeerAllowed,
+                    ReaderExpectation::ForwardedRequired => ReaderIpExpectation::ForwardedRequired,
+                },
+            ),
+        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use edgezero_adapter_axum::dev_server::AxumRunOptions;
     use edgezero_adapter_axum::geo::NativeGeoCapability;
 
@@ -101,6 +131,71 @@ provider = "cloudfront"
 alb_peer_cidrs = ["127.0.0.1/32"]
 origin_credential_header_name = "x-origin-fixture-private-name"
 "#;
+
+    const MAXMIND_PROFILE: &str = r#"version = 1
+[geo]
+provider = "maxmind"
+database_path = "/geo/GeoLite2-City.mmdb"
+reader_ip_expectation = "forwarded_required"
+"#;
+
+    #[test]
+    fn maxmind_profile_selects_local_database_and_explicit_reader_expectation() {
+        for (name, expected) in [
+            ("forwarded_required", ReaderIpExpectation::ForwardedRequired),
+            ("peer_allowed", ReaderIpExpectation::PeerAllowed),
+        ] {
+            let selection = parse_selection(&MAXMIND_PROFILE.replace("forwarded_required", name))
+                .expect("should parse local database selection");
+            let NativeGeoSelection::MaxMind { config } = selection else {
+                unreachable!("should select MaxMind");
+            };
+            assert_eq!(config.path, Path::new("/geo/GeoLite2-City.mmdb"));
+            assert_eq!(config.expectation, expected);
+        }
+    }
+
+    #[test]
+    fn maxmind_profile_rejects_missing_or_unknown_expectation_and_foreign_policy_fields() {
+        for bytes in [
+            MAXMIND_PROFILE.replace("reader_ip_expectation = \"forwarded_required\"", ""),
+            MAXMIND_PROFILE.replace("forwarded_required", "automatic"),
+            MAXMIND_PROFILE.replace("database_path = \"/geo/GeoLite2-City.mmdb\"", ""),
+            format!("{MAXMIND_PROFILE}alb_peer_cidrs = ['127.0.0.1/32']\n"),
+            format!("{MAXMIND_PROFILE}origin_credential_header_name = 'x-origin-test'\n"),
+        ] {
+            assert!(matches!(
+                parse_selection(&bytes),
+                Err(NativeGeoProfileError::InvalidProfile)
+            ));
+        }
+    }
+
+    #[test]
+    fn maxmind_capability_validates_compiled_provider_without_opening_database() {
+        let selection = parse_selection(MAXMIND_PROFILE)
+            .expect("should parse selection without opening a database");
+        let options = AxumRunOptions::new("127.0.0.1:8787".parse().expect("should parse address"))
+            .expect("should construct options")
+            .with_geo(selection);
+        #[cfg(all(feature = "geo-maxmind", unix))]
+        assert!(matches!(
+            options
+                .geo_capability()
+                .expect("should validate available provider"),
+            NativeGeoCapability::Selected {
+                input: edgezero_adapter_axum::geo::NativeGeoInputContract::ReaderIp {
+                    expectation: ReaderIpExpectation::ForwardedRequired
+                },
+                ..
+            }
+        ));
+        #[cfg(not(all(feature = "geo-maxmind", unix)))]
+        assert!(
+            options.geo_capability().is_err(),
+            "should reject unavailable MaxMind"
+        );
+    }
 
     #[test]
     fn absent_profile_retains_off() {
