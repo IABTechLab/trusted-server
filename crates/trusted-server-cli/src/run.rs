@@ -51,6 +51,9 @@ enum Command {
     /// Local developer tools (e.g. the macOS/Linux production-hostname proxy).
     #[command(subcommand)]
     Dev(crate::commands::dev::DevCommand),
+    /// Inspect a deployed service's request-signing keys.
+    #[command(subcommand)]
+    Keys(crate::commands::keys::KeysCommand),
     /// Questions about a publisher origin's behaviour.
     #[command(subcommand)]
     Origin(crate::commands::origin::OriginCommand),
@@ -174,6 +177,11 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             crate::commands::cache::run(command, &mut out).map(|()| RunOutcome::Success)
+        }
+        Command::Keys(command) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::commands::keys::run(command, &mut out)
         }
         Command::Origin(command) => {
             let stdout = std::io::stdout();

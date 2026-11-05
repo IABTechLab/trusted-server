@@ -41,6 +41,32 @@ pub(crate) fn require_credential_safe_transport(url: &reqwest::Url, flag: &str) 
     Ok(())
 }
 
+/// Join a service base URL and an endpoint path without doubling or dropping a slash.
+///
+/// The service must be a bare base URL: credentials, a path, a query, or a fragment would
+/// each let the typed value change which endpoint is reached.
+///
+/// # Errors
+///
+/// Returns an error when `service` is not an absolute URL, fails
+/// [`require_credential_safe_transport`], or carries more than a scheme, host, and port.
+pub(crate) fn service_endpoint(service: &str, path: &str) -> CliResult<String> {
+    let mut url =
+        reqwest::Url::parse(service).map_err(|_| "--service must be an absolute HTTPS URL")?;
+    require_credential_safe_transport(&url, "--service")?;
+    if url.host().is_none()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.path().trim_matches('/').is_empty()
+    {
+        return cli_error(
+            "--service must be a base HTTPS URL without credentials, a path, query, or fragment",
+        );
+    }
+    url.set_path(path);
+    Ok(url.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
