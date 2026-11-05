@@ -787,8 +787,17 @@ If omitted, auto-generates date-based ID (e.g., `ts-2025-01-15-A`).
 **Example:**
 
 ```bash
+# TRUSTED_SERVER_ADMIN_PASSWORD holds the admin password
+ts keys rotate --service https://edge.example.com [--kid custom-key-id]
+```
+
+`ts keys rotate` reads the password from `TRUSTED_SERVER_ADMIN_PASSWORD` only,
+so it never reaches shell history or `ps`. Fallback with curl, reading
+credentials from a netrc file:
+
+```bash
 curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
-  -u admin:password \
+  --netrc-file ~/.ts-admin.netrc \
   -H "Content-Type: application/json"
 ```
 
@@ -844,8 +853,16 @@ defines no dedicated cache, CORS, or rate-limit policy.
 **Example:**
 
 ```bash
+# TRUSTED_SERVER_ADMIN_PASSWORD holds the admin password
+ts keys deactivate --service https://edge.example.com --kid ts-2025-01-14-A [--delete [--yes]]
+```
+
+`--delete` asks for confirmation before sending; a non-interactive run must
+add `--yes`. Fallback with curl:
+
+```bash
 curl -X POST https://edge.example.com/_ts/admin/keys/deactivate \
-  -u admin:password \
+  --netrc-file ~/.ts-admin.netrc \
   -H "Content-Type: application/json" \
   -d '{"kid":"ts-2025-01-14-A","delete":true}'
 ```
