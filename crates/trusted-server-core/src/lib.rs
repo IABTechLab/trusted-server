@@ -55,6 +55,7 @@ pub mod host_header;
 pub(crate) mod host_rewrite;
 pub mod html_processor;
 pub mod http_util;
+pub mod integration;
 pub mod integrations;
 pub mod models;
 pub mod openrtb;

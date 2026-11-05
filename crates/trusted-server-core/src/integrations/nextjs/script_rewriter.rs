@@ -4,7 +4,7 @@ use error_stack::Report;
 use regex::{Regex, escape};
 
 use crate::error::TrustedServerError;
-use crate::integrations::{
+use crate::integration::{
     IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };
 
@@ -208,8 +208,8 @@ impl UrlRewriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::IntegrationDocumentState;
-    use crate::integrations::ScriptRewriteAction;
+    use crate::integration::IntegrationDocumentState;
+    use crate::integration::ScriptRewriteAction;
 
     fn test_config() -> Arc<NextJsIntegrationConfig> {
         Arc::new(NextJsIntegrationConfig {

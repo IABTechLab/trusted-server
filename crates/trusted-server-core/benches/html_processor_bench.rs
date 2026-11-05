@@ -2,7 +2,7 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use trusted_server_core::html_processor::{
     BodyCloseInjection, HtmlProcessorConfig, create_html_processor,
 };
-use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::integration::IntegrationRegistry;
 use trusted_server_core::streaming_processor::StreamProcessor as _;
 
 fn make_config() -> HtmlProcessorConfig {

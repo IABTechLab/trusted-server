@@ -4201,9 +4201,9 @@ where
 mod tests {
     use super::*;
     use crate::auction::build_orchestrator;
+    use crate::integration::IntegrationRegistry;
     use crate::integrations::{
-        IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
-        prebid::PrebidIntegrationConfig,
+        gpt::GptConfig, nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig,
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};

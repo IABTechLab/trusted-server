@@ -98,6 +98,27 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         ("html_processor.rs", include_str!("html_processor.rs")),
         ("http_util.rs", include_str!("http_util.rs")),
         (
+            "integration/declaration.rs",
+            include_str!("integration/declaration.rs"),
+        ),
+        (
+            "integration/declaration/routes.rs",
+            include_str!("integration/declaration/routes.rs"),
+        ),
+        (
+            "integration/declaration/scripts.rs",
+            include_str!("integration/declaration/scripts.rs"),
+        ),
+        ("integration/mod.rs", include_str!("integration/mod.rs")),
+        (
+            "integration/processing.rs",
+            include_str!("integration/processing.rs"),
+        ),
+        (
+            "integration/registry.rs",
+            include_str!("integration/registry.rs"),
+        ),
+        (
             "integrations/adserver_mock.rs",
             include_str!("integrations/adserver_mock.rs"),
         ),
@@ -155,10 +176,6 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         (
             "integrations/prebid.rs",
             include_str!("integrations/prebid.rs"),
-        ),
-        (
-            "integrations/registry.rs",
-            include_str!("integrations/registry.rs"),
         ),
         (
             "integrations/sourcepoint.rs",

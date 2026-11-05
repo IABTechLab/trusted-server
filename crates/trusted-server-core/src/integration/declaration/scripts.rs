@@ -44,7 +44,7 @@ impl ScriptSourceContext<'_> {
     /// # Examples
     ///
     /// ```
-    /// use trusted_server_core::integrations::{ScriptSourceContext, ScriptSourceKind};
+    /// use trusted_server_core::integration::{ScriptSourceContext, ScriptSourceKind};
     /// use url::Url;
     /// let base = Url::parse("https://example.com/").expect("should parse base");
     /// let context = ScriptSourceContext { element_name: "link", attribute_name: "href",
@@ -112,7 +112,7 @@ pub trait ScriptSourceTransition: Send + Sync {
     /// # Examples
     ///
     /// ```
-    /// use trusted_server_core::integrations::{ScriptSourceAction, ScriptSourceContext, ScriptSourceTransition};
+    /// use trusted_server_core::integration::{ScriptSourceAction, ScriptSourceContext, ScriptSourceTransition};
     /// use url::Url;
     /// struct Keep;
     /// impl ScriptSourceTransition for Keep {
@@ -146,7 +146,7 @@ impl ScriptSourceClaim {
     ///
     /// ```
     /// use std::sync::Arc;
-    /// use trusted_server_core::integrations::{ScriptSourceAction, ScriptSourceClaim,
+    /// use trusted_server_core::integration::{ScriptSourceAction, ScriptSourceClaim,
     ///     ScriptSourceContext, ScriptSourceTransition};
     /// struct Keep;
     /// impl ScriptSourceTransition for Keep {
@@ -227,7 +227,7 @@ pub struct ScriptSourceOutcome {
 /// # Examples
 ///
 /// ```
-/// use trusted_server_core::integrations::{evaluate_script_sources, ScriptSourceAction, ScriptSourceContext};
+/// use trusted_server_core::integration::{evaluate_script_sources, ScriptSourceAction, ScriptSourceContext};
 /// use url::Url;
 /// let base = Url::parse("https://example.com/").expect("should parse base");
 /// let context = ScriptSourceContext { element_name: "script", attribute_name: "src",
@@ -319,7 +319,7 @@ impl fmt::Debug for ScriptAssetPolicy {
 /// # Examples
 ///
 /// ```
-/// use trusted_server_core::integrations::{validate_script_asset_policy, ScriptAssetPolicy, ScriptSourceContext};
+/// use trusted_server_core::integration::{validate_script_asset_policy, ScriptAssetPolicy, ScriptSourceContext};
 /// use url::Url;
 /// let base = Url::parse("https://example.com/").expect("should parse base");
 /// let context = ScriptSourceContext { element_name: "script", attribute_name: "src",

@@ -78,8 +78,8 @@ use crate::html_processor::{
     BodyCloseInjection, HtmlProcessorConfig, create_html_processor_with_document_state,
 };
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
-use crate::integrations::processing::{RequestProcessingState, ResponsePrivacyScope};
-use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
+use crate::integration::processing::{RequestProcessingState, ResponsePrivacyScope};
+use crate::integration::{IntegrationDocumentState, IntegrationRegistry};
 use crate::platform::{
     ClientInfo, GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices,
     TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, VarySpec, contains_publisher_esi_directive,
@@ -8432,7 +8432,7 @@ mod tests {
     use crate::consent::ConsentContext;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteOutcome};
-    use crate::integrations::IntegrationRegistry;
+    use crate::integration::IntegrationRegistry;
     use crate::platform::test_support::{
         NoopSecretStore, StubHttpClient, build_services_with_http_client,
         build_services_with_secret_http_client_and_client_ip, noop_services,
@@ -10857,7 +10857,7 @@ mod tests {
         use super::*;
         use crate::creative_opportunities::AssemblyMode;
         use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
-        use crate::integrations::IntegrationRegistry;
+        use crate::integration::IntegrationRegistry;
         use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
 
         const DOCUMENT: &[u8] =
@@ -15545,7 +15545,7 @@ mod tests {
             let mut request = cookie_policy_request(fields);
             request
                 .extensions_mut()
-                .insert(crate::integrations::processing::ReservedInputsNormalized);
+                .insert(crate::integration::processing::ReservedInputsNormalized);
             request
         }
 
@@ -17521,7 +17521,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             private: bool,
         }
 
-        impl crate::integrations::processing::IntegrationRequestLifecycle for PrivacyOnlyLifecycle {
+        impl crate::integration::processing::IntegrationRequestLifecycle for PrivacyOnlyLifecycle {
             fn integration_id(&self) -> &'static str {
                 "privacy-only-fixture"
             }
@@ -17531,7 +17531,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 _settings: &Settings,
                 request: &mut Request<EdgeBody>,
             ) -> Result<
-                Arc<dyn crate::integrations::processing::PreparedIntegrationRequest>,
+                Arc<dyn crate::integration::processing::PreparedIntegrationRequest>,
                 Report<TrustedServerError>,
             > {
                 Ok(Arc::new(PrivacyOnlyPrepared {
@@ -17540,12 +17540,12 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             }
         }
 
-        impl crate::integrations::processing::PreparedIntegrationRequest for PrivacyOnlyPrepared {
+        impl crate::integration::processing::PreparedIntegrationRequest for PrivacyOnlyPrepared {
             fn requirements(
                 &self,
-            ) -> crate::integrations::processing::RequestProcessingRequirements {
-                crate::integrations::processing::RequestProcessingRequirements {
-                    origin: crate::integrations::processing::OriginRequirement::Ordinary,
+            ) -> crate::integration::processing::RequestProcessingRequirements {
+                crate::integration::processing::RequestProcessingRequirements {
+                    origin: crate::integration::processing::OriginRequirement::Ordinary,
                     privacy: if self.private {
                         ResponsePrivacyScope::AllResponses
                     } else {
@@ -17565,7 +17565,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                         .expect("should compile neutral privacy test plan"),
                 );
                 let registration =
-                    crate::integrations::IntegrationRegistration::builder("privacy-only-fixture")
+                    crate::integration::IntegrationRegistration::builder("privacy-only-fixture")
                         .without_js()
                         .with_request_lifecycle(Arc::new(PrivacyOnlyLifecycle))
                         .build();
@@ -17587,7 +17587,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                         .expect("should prepare independent privacy-only axes");
                     assert_eq!(
                         state.requirements().origin,
-                        crate::integrations::processing::OriginRequirement::Ordinary,
+                        crate::integration::processing::OriginRequirement::Ordinary,
                         "should never escalate privacy into an origin-sharing veto"
                     );
                     assert_eq!(
@@ -21746,7 +21746,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .expect("should build request");
 
         let filter_outcome = registry
-            .filter_request(crate::integrations::RequestFilterRegistryInput {
+            .filter_request(crate::integration::RequestFilterRegistryInput {
                 settings: &settings,
                 services: &services,
                 req: &mut req,
@@ -21756,7 +21756,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .expect("should run DataDome filter");
         assert!(matches!(
             filter_outcome,
-            crate::integrations::RequestFilterRegistryOutcome::Continue(_)
+            crate::integration::RequestFilterRegistryOutcome::Continue(_)
         ));
         let publisher_response = run_publisher_proxy(&settings, &services, req).await;
         let response = buffer_publisher_response_async(
@@ -21783,7 +21783,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
     struct AllResponsesLifecycle;
     struct AllResponsesPrepared;
 
-    impl crate::integrations::processing::IntegrationRequestLifecycle for AllResponsesLifecycle {
+    impl crate::integration::processing::IntegrationRequestLifecycle for AllResponsesLifecycle {
         fn integration_id(&self) -> &'static str {
             "neutral-privacy-fixture"
         }
@@ -21793,17 +21793,17 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             _settings: &Settings,
             _request: &mut Request<EdgeBody>,
         ) -> Result<
-            Arc<dyn crate::integrations::processing::PreparedIntegrationRequest>,
+            Arc<dyn crate::integration::processing::PreparedIntegrationRequest>,
             Report<TrustedServerError>,
         > {
             Ok(Arc::new(AllResponsesPrepared))
         }
     }
 
-    impl crate::integrations::processing::PreparedIntegrationRequest for AllResponsesPrepared {
-        fn requirements(&self) -> crate::integrations::processing::RequestProcessingRequirements {
-            crate::integrations::processing::RequestProcessingRequirements {
-                origin: crate::integrations::processing::OriginRequirement::BypassShared,
+    impl crate::integration::processing::PreparedIntegrationRequest for AllResponsesPrepared {
+        fn requirements(&self) -> crate::integration::processing::RequestProcessingRequirements {
+            crate::integration::processing::RequestProcessingRequirements {
+                origin: crate::integration::processing::OriginRequirement::BypassShared,
                 privacy: ResponsePrivacyScope::AllResponses,
             }
         }
@@ -21826,7 +21826,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     .expect("should compile neutral test plan"),
             );
             let registration =
-                crate::integrations::IntegrationRegistration::builder("neutral-privacy-fixture")
+                crate::integration::IntegrationRegistration::builder("neutral-privacy-fixture")
                     .without_js()
                     .with_request_lifecycle(Arc::new(AllResponsesLifecycle))
                     .build();
@@ -24836,7 +24836,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
     struct AsyncTailFactory(Arc<AtomicUsize>);
     struct AsyncTailProcessor(Arc<AtomicUsize>);
 
-    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for AsyncTailFactory {
+    impl crate::integration::IntegrationHtmlStreamProcessorFactory for AsyncTailFactory {
         fn integration_id(&self) -> &'static str {
             "example_async_tail"
         }
@@ -24845,7 +24845,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         }
         fn create(
             &self,
-            _: crate::integrations::IntegrationHtmlStreamContext,
+            _: crate::integration::IntegrationHtmlStreamContext,
         ) -> Box<dyn StreamProcessor> {
             Box::new(AsyncTailProcessor(Arc::clone(&self.0)))
         }
@@ -24878,13 +24878,13 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
     }
 
     struct UndeclaredAsyncFactory(Arc<AtomicUsize>);
-    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for UndeclaredAsyncFactory {
+    impl crate::integration::IntegrationHtmlStreamProcessorFactory for UndeclaredAsyncFactory {
         fn integration_id(&self) -> &'static str {
             "example_inconsistent_factory"
         }
         fn create(
             &self,
-            _: crate::integrations::IntegrationHtmlStreamContext,
+            _: crate::integration::IntegrationHtmlStreamContext,
         ) -> Box<dyn StreamProcessor> {
             Box::new(AsyncTailProcessor(Arc::clone(&self.0)))
         }
@@ -25268,7 +25268,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
     struct CountingTerminalFactory(Arc<AtomicUsize>);
     struct CountingTerminalSession(Arc<AtomicUsize>);
 
-    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for CountingTerminalFactory {
+    impl crate::integration::IntegrationHtmlStreamProcessorFactory for CountingTerminalFactory {
         fn integration_id(&self) -> &'static str {
             "example_counter"
         }
@@ -25280,7 +25280,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         }
         fn create(
             &self,
-            _: crate::integrations::IntegrationHtmlStreamContext,
+            _: crate::integration::IntegrationHtmlStreamContext,
         ) -> Box<dyn StreamProcessor> {
             Box::new(CountingTerminalSession(Arc::clone(&self.0)))
         }
@@ -25785,7 +25785,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
     struct StatusTerminalFactory(Arc<Mutex<Vec<StatusCode>>>);
     struct StatusTerminalSession(Arc<Mutex<Vec<StatusCode>>>);
 
-    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for StatusTerminalFactory {
+    impl crate::integration::IntegrationHtmlStreamProcessorFactory for StatusTerminalFactory {
         fn integration_id(&self) -> &'static str {
             "example_status"
         }
@@ -25798,7 +25798,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
         fn create(
             &self,
-            _: crate::integrations::IntegrationHtmlStreamContext,
+            _: crate::integration::IntegrationHtmlStreamContext,
         ) -> Box<dyn StreamProcessor> {
             Box::new(StatusTerminalSession(Arc::clone(&self.0)))
         }
@@ -26156,7 +26156,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
-    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for HungTerminalFactory {
+    impl crate::integration::IntegrationHtmlStreamProcessorFactory for HungTerminalFactory {
         fn integration_id(&self) -> &'static str {
             "example_hung"
         }
@@ -26168,7 +26168,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         }
         fn create(
             &self,
-            _: crate::integrations::IntegrationHtmlStreamContext,
+            _: crate::integration::IntegrationHtmlStreamContext,
         ) -> Box<dyn StreamProcessor> {
             Box::new(HungTerminalSession {
                 started: Arc::clone(&self.started),
@@ -26476,7 +26476,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
     struct TerminalTestSession;
 
-    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for TerminalTestFactory {
+    impl crate::integration::IntegrationHtmlStreamProcessorFactory for TerminalTestFactory {
         fn integration_id(&self) -> &'static str {
             "example_terminal"
         }
@@ -26488,7 +26488,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         }
         fn create(
             &self,
-            _context: crate::integrations::IntegrationHtmlStreamContext,
+            _context: crate::integration::IntegrationHtmlStreamContext,
         ) -> Box<dyn StreamProcessor> {
             Box::new(TerminalTestSession)
         }
@@ -27999,7 +27999,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
         };
         use crate::http_util::RequestInfo;
-        use crate::integrations::IntegrationRegistry;
+        use crate::integration::IntegrationRegistry;
         use crate::integrations::aps::{ApsRendererV1, ApsTagType};
         use crate::price_bucket::PriceGranularity;
         use crate::settings::Settings;

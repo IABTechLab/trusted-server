@@ -956,19 +956,6 @@ impl IntegrationRegistry {
         self.inner.auction_correlation
     }
 
-    /// Build a registry and auction plan from the provided settings for tests.
-    ///
-    /// Runtime adapters should compile one plan and pass it to [`Self::with_plan`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the auction plan or integration registry is invalid.
-    #[cfg(test)]
-    pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
-        let plan = Arc::new(crate::auction::compile_auction_plan(settings)?);
-        Self::with_plan(settings, plan)
-    }
-
     /// Assemble explicit registrations around one authoritative auction plan.
     ///
     /// Preserves input order independently for each capability. This method
@@ -992,7 +979,7 @@ impl IntegrationRegistry {
     /// # use error_stack::Report;
     /// # use trusted_server_core::auction::AuctionPlan;
     /// # use trusted_server_core::error::TrustedServerError;
-    /// # use trusted_server_core::integrations::{IntegrationRegistration, IntegrationRegistry};
+    /// # use trusted_server_core::integration::{IntegrationRegistration, IntegrationRegistry};
     /// # use trusted_server_core::settings::Settings;
     /// # fn assemble(settings: &Settings, plan: Arc<AuctionPlan>, registrations: Vec<IntegrationRegistration>)
     /// #     -> Result<IntegrationRegistry, Report<TrustedServerError>> {

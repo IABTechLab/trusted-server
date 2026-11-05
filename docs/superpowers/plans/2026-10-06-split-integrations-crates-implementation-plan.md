@@ -70,7 +70,7 @@ tasks.
 - [x] Write compile/runtime tests for `IntegrationRegistry::from_registrations`, capability-local order, duplicate/reserved route and script claims, and a flat ordinal-bearing provider sequence independent of lookup-map order. Expected initially: missing contracts or wrong order.
 - [x] Add `IntegrationDeclaration` and only the typed capabilities consumed by current implementations; make the registry accept registrations rather than constructing APS/Prebid or calling `builders()`. Keep the old fixed builder table as the sole schema-one source until the new composition root owns it.
 - [x] Introduce neutral profile and prepared exchange-or-skip contracts, a consuming bound response parser, renderer descriptors, transport-header view, and mediator registration. Remove vendor enum/downcast/constructor knowledge from core without changing OpenRTB wire bytes or the #1159 skip/admission matrix.
-- [ ] Run `cargo test-fastly`, `cargo test-axum`, and the baseline differential harness. Expected: schema-one provider order and externally visible local labels match the golden. Run the API-delta guard and commit the neutral seam separately from any source moves.
+- [x] Run `cargo test-fastly`, `cargo test-axum`, and the baseline differential harness. Expected: schema-one provider order and externally visible local labels match the golden. Run the API-delta guard and commit the neutral seam separately from any source moves.
 
 Tasks 2 through 4 have a verified implementation checkpoint, not a completed crate split.
 Explicit registration/claims and ordinal inputs, profile-owned prepared exchanges
@@ -79,19 +79,24 @@ lifecycle requirements now preserve the corrected schema-one output. The legacy
 catalog remains the sole production source. Pure declarations and the source-chain
 policy do not activate schema-two operator behavior.
 
-The next rename-focused unit moves neutral contracts from the legacy
-`integrations/` directory to `integration/`, migrating callers without permanent
-reexport shims. Concrete owner moves remain Tasks 10 and 11. The standard-only
-response extractor is still private pending its owner move. Neither milestone is
-complete.
+The behavior contracts were committed as `852cbbdaf`, after the separate tooling
+commit `7fbe1de9c`. The rename-focused follow-up moves the five neutral files and
+shared helpers into `integration/` and updates every workspace caller. No old
+neutral reexports or forwarding modules remain. All existing visibilities stay
+unchanged; four SDK transport helpers need a separate public-contract change
+before their first external Task 10 consumers. Concrete owner moves remain
+Tasks 10 and 11. The standard-only response extractor is still private pending
+its owner move. Neither milestone is complete.
 
 Checks at this checkpoint pass: 3,393 native core tests, full Fastly/Axum/Cloudflare/
 Spin suites, all eight target-matched lint aliases, 86 native doctests, four
 frozen differential tests, native HTML EOF plus actual Axum/Fastly EOF/auction
 probes, and all six public API profiles. Existing skips/ignored tests remain.
-The cumulative API ledger records 896 exact changes per profile, with neutral
-contracts or named removal steps for transitional exports. Frozen output goldens
-and compiler-origin snapshots were not regenerated.
+The relocation's cumulative API ledger records 2,132 exact changes per default
+profile and 2,136 per test-utils profile, 12,804 rows in total. Concrete catalog
+methods and concrete implementations rooted under neutral traits retain named
+Task 9 or Task 10 removal conditions. Frozen output goldens and compiler-origin
+snapshots were not regenerated.
 
 ### Task 3: Move lifecycle decisions behind neutral processing requirements
 
@@ -100,15 +105,16 @@ and compiler-origin snapshots were not regenerated.
 - [x] Write failing matrices for DataDome origin/body/privacy requirements, GPT diagnostics preparation/finalization and cache vetoes, reserved Cookie/query normalization even when diagnostics is absent, and request-local mutable document state. Include every adapter's existing fallback and health behavior.
 - [x] Add narrow neutral per-request requirements and document-state factories. Make core apply requirements and fixed parser phases without importing `datadome` or `gpt_diagnostics`; keep current concrete implementations in their original owner until their individual move.
 - [x] Move fixed GPT-diagnostics input cleanup to the neutral ingress boundary. Preserve lenient Cookie handling and all-response privacy before cache/origin selection; integration requirements may only restrict baseline cache decisions.
-- [ ] Run focused core module tests, `cargo test-fastly`, `cargo test-axum`, `cargo test-cloudflare`, `cargo test-spin`, and API/differential guards. Commit the lifecycle seam before moving DataDome or GPT diagnostics.
+- [x] Run focused core module tests, `cargo test-fastly`, `cargo test-axum`, `cargo test-cloudflare`, `cargo test-spin`, and API/differential guards. Commit the lifecycle seam before moving DataDome or GPT diagnostics.
 
 The lifecycle checkpoint includes a 480-case cache/cookie matrix, actual-owner
 unexpected-304 cases, and all-response privacy with no owner finalizer. A separate
 warm-template-hit regression passes for both streaming and buffered finalizers with
 ordinary origin policy and all-response privacy; no production fix was needed. Its
 source-first missing-contract red run was not executed during the exclusive
-browser command window; the record does not claim otherwise. Neutral contracts
-still await the directory relocation noted above and the final independent review.
+browser command window; the record does not claim otherwise. The neutral files
+now live in `integration/`; the physical move has its own verification and review
+before its separate commit.
 
 ### Task 4: Establish the one browser build lease and two-root toolchain
 
@@ -117,7 +123,7 @@ still await the directory relocation noted above and the final independent revie
 - [x] Add failing lease tests for outer and authenticated nested invocations, absent/wrong nonce, holder PID reuse, a live orphan child, stale recovery, and direct tool invocation. A nested `Cargo build → runner → npm → runner → Node` path must complete without deadlock.
 - [x] Implement one atomic-directory lease rooted at the canonical Node project. Keep the lock while the complete child process scope lives. Fail closed when ownership cannot be proven dead; no per-crate locks. Put `npm ci`, Vite, Vitest, TypeScript, ESLint, Prettier, Cargo browser builds, and Prebid bundle behind this runner.
 - [x] Configure the canonical package at `crates/trusted-server-js/lib` to resolve both source roots and `prebid.js` exports. Add production two-root `typecheck`, isolated failing canary, explicit test/lint/format globs, and exact GPT-bootstrap legacy formatter/linter exceptions. Keep one lockfile.
-- [ ] Run runner unit tests and wrapped `npm run typecheck`, `npm run test`, `npm run lint`, `npm run format`. Expected: both roots are selected and the canary fails only in its isolated negative test. Commit tooling before moving browser files.
+- [x] Run runner unit tests and wrapped `npm run typecheck`, `npm run test`, `npm run lint`, `npm run format`. Expected: both roots are selected and the canary fails only in its isolated negative test. Commit tooling before moving browser files.
 
 The runner is `scripts/browser-build-runner.mjs`, backed by the dependency-free
 `browser-build-lease.mjs`. Thirty lease and eight invocation-guard tests pass.
@@ -139,10 +145,22 @@ positive or unknown result. A zombie-only group on a non-reaping host may block
 indefinitely. Interrupted draining retains the lease if absence is unproven.
 Linux identity/boot/PID-namespace proof is required; other hosts fail closed.
 Deliberate process-group, session or PID-namespace escapes are unsupported. This
-is the spec's dedicated-group option, not whole-session containment. Final review
-and the separate tooling commit remain before browser source moves.
+is the spec's dedicated-group option, not whole-session containment. Four review
+lanes accepted the fix, including an independently scheduled syscall handoff.
+Tooling commit `7fbe1de9c` was verified alone against its predecessor before the
+neutral changes were restored byte-for-byte and committed separately.
 
 ### Task 5: Define the versioned browser facade and neutral APS/queue seams
+
+Activation is blocked on a verification-policy decision. The specified APS IIFE
+changes the actual browser inventory from 13 to 14 modules and immediate inventory
+from 10 to 11. The fixed finalizer adds a tag, and the shared service replaces the
+inline GPT bootstrap. The current frozen comparator permits only hash-value
+normalization, so it rejects those startup changes. Keep the original goldens
+unchanged. A narrow reviewed startup-delta contract must be approved before
+activation; do not hide modules, mask complete tags, or substitute a legacy-only
+execution path. The read-only runtime/import design is complete; no facade code
+or startup change has been made.
 
 **Files:** Create focused facade/IDL/ABI snapshot and tests under `crates/trusted-server-js/lib/src/core/` and `lib/test/core/`; modify `lib/src/core/{index,auction,request,queue,registry}.ts`, `lib/src/shared/dom_insertion_dispatcher.ts`, `lib/src/integrations/{aps,gpt,prebid,permutive,testlight}/` only where required by the seam.
 
@@ -171,7 +189,14 @@ and the separate tooling commit remain before browser source moves.
 
 ### Task 8: Add the Rust composition root while retaining schema one
 
-**Files:** Fill `crates/trusted-server-integrations/src/lib.rs`; create `src/{catalog,composition,config,legacy_config,source_config,validation,secret_metadata}.rs`; modify `crates/trusted-server-core/src/{config,config_payload,settings_data,integrations/registry}.rs`, `Cargo.toml`, `.cargo/config.toml`, `Cargo.lock`.
+The hook prerequisite is currently absent. Public EdgeZero main
+`cf2c57b1cf0e139d3b86f128218c798027d7978b` has separate raw and typed source
+loads and no reviewed source/command hook API. A successor must provide one
+captured source, one overlaid table and one typed value, plus safe downstream
+error presentation. Review that extension and repin all EdgeZero packages together
+before this task. No upstream or dependency change has been authorized or made.
+
+**Files:** Fill `crates/trusted-server-integrations/src/lib.rs`; create `src/{catalog,composition,config,legacy_config,source_config,validation,secret_metadata}.rs`; modify `crates/trusted-server-core/src/{config,config_payload,settings_data,integration/registry}.rs`, `Cargo.toml`, `.cargo/config.toml`, `Cargo.lock`.
 
 - [ ] Before edits, verify the reviewed EdgeZero `run_*_typed_with_hooks` revision is available and repin all `edgezero-*` dependencies together. Add tests proving one exact config read/value across pre-pass, overlay, validation, serialization, diff, and push, including source replacement and `--no-env`. If the extension is absent, stop; do not substitute filesystem snapshots.
 - [ ] Write failing catalog completeness and schema-one differential tests. The catalog initially has one entry per current definition, each delegating to the old owner through an explicit transitional export. One legacy converter preserves omitted-default behavior, fixed builder sequence, globally lexical flat provider order, implicit APS, current local external labels, and baseline unknown-ID acceptance.

@@ -10,7 +10,7 @@ use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
-use crate::integrations::{
+use crate::integration::{
     INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationHeadInjector,
     IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
     ensure_integration_backend,
@@ -550,7 +550,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use crate::integration::{IntegrationDocumentState, IntegrationRegistry};
     use crate::platform::PlatformCacheIntent;
     use crate::platform::test_support::{
         NoopConfigStore, NoopSecretStore, StubBackend, StubHttpClient,

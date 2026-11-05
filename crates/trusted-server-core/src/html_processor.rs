@@ -14,8 +14,8 @@ use lol_html::{
     text,
 };
 
-use crate::integrations::processing::RequestProcessingState;
-use crate::integrations::{
+use crate::integration::processing::RequestProcessingState;
+use crate::integration::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
     IntegrationHtmlContext, IntegrationRegistry, IntegrationScriptContext, ScriptRewriteAction,
 };
@@ -774,7 +774,7 @@ pub(crate) fn create_html_processor_with_document_state(
 
     let inner = HtmlRewriterAdapter::new(rewriter_settings);
 
-    let stream_context = crate::integrations::IntegrationHtmlStreamContext {
+    let stream_context = crate::integration::IntegrationHtmlStreamContext {
         request_host: config.request_host.clone(),
         request_scheme: config.request_scheme.clone(),
         origin_host: config.origin_host.clone(),
@@ -798,7 +798,7 @@ pub(crate) fn create_html_processor_with_document_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::{
+    use crate::integration::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
         IntegrationHeadInjector, IntegrationHtmlContext, IntegrationScriptRewriter,
     };

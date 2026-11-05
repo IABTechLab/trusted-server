@@ -44,7 +44,7 @@ use validator::Validate;
 
 use crate::constants::{HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE};
 use crate::error::TrustedServerError;
-use crate::integrations::{
+use crate::integration::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationDeclaration, IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
     IntegrationProxy, IntegrationRegistration, ScriptSourceAction, ScriptSourceClaim,
@@ -606,7 +606,7 @@ fn default_rewrite_script() -> bool {
 mod tests {
     use super::*;
     use crate::constants::HEADER_X_FORWARDED_FOR;
-    use crate::integrations::IntegrationDocumentState;
+    use crate::integration::IntegrationDocumentState;
     use crate::test_support::tests::create_test_settings;
     use http::Method;
 

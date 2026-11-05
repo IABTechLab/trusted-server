@@ -33,9 +33,9 @@ use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::AuctionContext;
 use crate::auction::types::{AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType};
 use crate::error::TrustedServerError;
-use crate::integrations::{UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded};
+use crate::integration::{UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded};
 #[cfg(test)]
-use crate::integrations::{
+use crate::integration::{
     ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
 use crate::platform::PlatformResponse;

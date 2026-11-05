@@ -22,14 +22,14 @@ For project usage, start with the public guides.
 
 ## Codebase pointers
 
-| Path                                                      | Purpose                           |
-| --------------------------------------------------------- | --------------------------------- |
-| `crates/trusted-server-adapter-fastly/src/main.rs`        | Request routing entry point       |
-| `crates/trusted-server-core/src/publisher.rs`             | Publisher origin handling         |
-| `crates/trusted-server-core/src/proxy.rs`                 | First-party proxy implementation  |
-| `crates/trusted-server-core/src/ec/`                      | EC identity subsystem             |
-| `crates/trusted-server-core/src/integrations/registry.rs` | Integration module registry       |
-| `trusted-server.example.toml`                             | Example application configuration |
+| Path                                                     | Purpose                           |
+| -------------------------------------------------------- | --------------------------------- |
+| `crates/trusted-server-adapter-fastly/src/main.rs`       | Request routing entry point       |
+| `crates/trusted-server-core/src/publisher.rs`            | Publisher origin handling         |
+| `crates/trusted-server-core/src/proxy.rs`                | First-party proxy implementation  |
+| `crates/trusted-server-core/src/ec/`                     | EC identity subsystem             |
+| `crates/trusted-server-core/src/integration/registry.rs` | Integration module registry       |
+| `trusted-server.example.toml`                            | Example application configuration |
 
 ## Development workflow
 

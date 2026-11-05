@@ -70,7 +70,7 @@ use validator::Validate;
 
 use crate::constants::ENV_FASTLY_IS_STAGING;
 use crate::error::TrustedServerError;
-use crate::integrations::{
+use crate::integration::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
     IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, IntegrationRequestFilter,
@@ -100,20 +100,20 @@ pub(crate) const HEADER_DATADOME_TEST_BYPASS: &str = "x-ts-datadome-bypass";
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DataDomeClientTagSuppressed;
 
-impl super::processing::PreparedIntegrationRequest for DataDomeClientTagSuppressed {
-    fn requirements(&self) -> super::processing::RequestProcessingRequirements {
-        super::processing::RequestProcessingRequirements {
-            origin: super::processing::OriginRequirement::FullHtmlRepresentation,
-            privacy: super::processing::ResponsePrivacyScope::SynthesizedHtml,
+impl crate::integration::processing::PreparedIntegrationRequest for DataDomeClientTagSuppressed {
+    fn requirements(&self) -> crate::integration::processing::RequestProcessingRequirements {
+        crate::integration::processing::RequestProcessingRequirements {
+            origin: crate::integration::processing::OriginRequirement::FullHtmlRepresentation,
+            privacy: crate::integration::processing::ResponsePrivacyScope::SynthesizedHtml,
         }
     }
 
-    fn initialize_document(&self, state: &super::IntegrationDocumentState) {
+    fn initialize_document(&self, state: &crate::integration::IntegrationDocumentState) {
         state.get_or_insert_with(DATADOME_INTEGRATION_ID, || Self);
     }
 }
 
-impl From<DataDomeClientTagSuppressed> for super::processing::RequestProcessingState {
+impl From<DataDomeClientTagSuppressed> for crate::integration::processing::RequestProcessingState {
     fn from(decision: DataDomeClientTagSuppressed) -> Self {
         let mut state = Self::default();
         state.insert(DATADOME_INTEGRATION_ID, Arc::new(decision));
@@ -133,7 +133,7 @@ impl From<DataDomeClientTagSuppressed> for super::processing::RequestProcessingS
 /// ```
 pub fn suppress_client_tag(request: &mut http::Request<EdgeBody>) {
     request.extensions_mut().insert(DataDomeClientTagSuppressed);
-    super::processing::RequestProcessingState::attach(
+    crate::integration::processing::RequestProcessingState::attach(
         request,
         DATADOME_INTEGRATION_ID,
         Arc::new(DataDomeClientTagSuppressed),
@@ -1244,7 +1244,7 @@ mod tests {
     }
 
     fn html_context_for_tests(
-        document_state: &crate::integrations::IntegrationDocumentState,
+        document_state: &crate::integration::IntegrationDocumentState,
     ) -> IntegrationHtmlContext<'_> {
         IntegrationHtmlContext {
             request_host: "publisher.example.com",
@@ -1480,7 +1480,7 @@ mod tests {
         config.client_side_key = "test-client-key".to_string();
         config.client_side_tag_url = "/integrations/datadome/tags.js?one=1&two=2".to_string();
         let integration = DataDomeIntegration::new(config);
-        let document_state = crate::integrations::IntegrationDocumentState::default();
+        let document_state = crate::integration::IntegrationDocumentState::default();
         let ctx = html_context_for_tests(&document_state);
 
         let inserts = integration.head_inserts(&ctx);
@@ -1499,7 +1499,7 @@ mod tests {
         config.client_side_key = "test-client-key".to_string();
         config.client_side_configuration = serde_json::json!({ "ajaxListenerPath": true });
         let integration = DataDomeIntegration::new(config);
-        let document_state = crate::integrations::IntegrationDocumentState::default();
+        let document_state = crate::integration::IntegrationDocumentState::default();
         let ctx = html_context_for_tests(&document_state);
 
         let inserts = integration.head_inserts(&ctx);
@@ -1524,7 +1524,7 @@ mod tests {
         let mut suppressed = test_config();
         suppressed.client_side_key = "test-client-key".to_string();
         let suppressed_integration = DataDomeIntegration::new(suppressed);
-        let suppressed_state = crate::integrations::IntegrationDocumentState::default();
+        let suppressed_state = crate::integration::IntegrationDocumentState::default();
         suppressed_state
             .get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
         let suppressed_ctx = html_context_for_tests(&suppressed_state);
@@ -1538,7 +1538,7 @@ mod tests {
         let mut blank_key = test_config();
         blank_key.client_side_key = " ".to_string();
         let integration = DataDomeIntegration::new(blank_key);
-        let document_state = crate::integrations::IntegrationDocumentState::default();
+        let document_state = crate::integration::IntegrationDocumentState::default();
         let ctx = html_context_for_tests(&document_state);
         assert!(
             integration.head_inserts(&ctx).is_empty(),

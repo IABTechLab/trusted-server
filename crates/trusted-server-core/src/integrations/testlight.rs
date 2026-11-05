@@ -11,7 +11,7 @@ use validator::Validate;
 
 use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
-use crate::integrations::{
+use crate::integration::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationDeclaration, IntegrationEndpoint, IntegrationProxy,
     IntegrationRegistration, ScriptSourceAction, ScriptSourceClaim, ScriptSourceContext,

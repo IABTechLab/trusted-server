@@ -21,7 +21,7 @@ use crate::constants::{
     HEADER_X_TS_ERROR, HEADER_X_TS_JS_ASSET_PROXY,
 };
 use crate::error::TrustedServerError;
-use crate::integrations::{
+use crate::integration::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationDeclaration, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
     ScriptSourceAction, ScriptSourceClaim, ScriptSourceContext, ScriptSourceTransition,
@@ -631,7 +631,7 @@ mod tests {
 
     use crate::constants::{HEADER_REFERER, HEADER_X_FORWARDED_FOR, HEADER_X_TS_EC};
     use crate::html_processor::{BodyCloseInjection, HtmlProcessorConfig, create_html_processor};
-    use crate::integrations::{
+    use crate::integration::{
         AttributeRewriteAction, IntegrationAttributeRewriter, IntegrationRegistry,
         evaluate_script_sources,
     };

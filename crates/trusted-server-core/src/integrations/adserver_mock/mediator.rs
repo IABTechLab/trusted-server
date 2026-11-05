@@ -56,7 +56,7 @@ impl CompiledMediator for AdServerMockProvider {
 
         let request = self.build_mediation_http_request(input.request, input.provider_responses)?;
 
-        let backend = crate::integrations::integration_backend_spec(
+        let backend = crate::integration::integration_backend_spec(
             &self.config.endpoint,
             "adserver_mock",
             true,

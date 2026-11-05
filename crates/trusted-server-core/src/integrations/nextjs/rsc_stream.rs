@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use crate::integrations::{
+use crate::integration::{
     IntegrationDocumentState, IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory,
 };
 use crate::streaming_processor::StreamProcessor;

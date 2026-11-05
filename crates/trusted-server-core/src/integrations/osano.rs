@@ -12,7 +12,7 @@ use validator::Validate;
 use crate::error::TrustedServerError;
 use crate::settings::{IntegrationConfig, Settings};
 
-use super::IntegrationRegistration;
+use crate::integration::IntegrationRegistration;
 
 const OSANO_INTEGRATION_ID: &str = "osano";
 

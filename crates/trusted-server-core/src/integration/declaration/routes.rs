@@ -26,7 +26,7 @@ impl ReservedRouteClaim {
     ///
     /// ```
     /// use http::Method;
-    /// use trusted_server_core::integrations::ReservedRouteClaim;
+    /// use trusted_server_core::integration::ReservedRouteClaim;
     /// let claim = ReservedRouteClaim::new("application.auction", Method::POST, "/auction");
     /// ```
     #[must_use]

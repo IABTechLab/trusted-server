@@ -33,7 +33,7 @@ use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
-use crate::integrations::{
+use crate::integration::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
     IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
@@ -1112,7 +1112,7 @@ impl IntegrationHeadInjector for SourcepointIntegration {
 mod tests {
     use super::*;
     use crate::error::IntoHttpResponse as _;
-    use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use crate::integration::{IntegrationDocumentState, IntegrationRegistry};
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::platform::{
         PlatformError, PlatformHttpClient, PlatformPendingRequest, PlatformResponse,

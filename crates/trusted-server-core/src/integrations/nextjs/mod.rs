@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use crate::error::TrustedServerError;
-use crate::integrations::IntegrationRegistration;
+use crate::integration::IntegrationRegistration;
 use crate::settings::{IntegrationConfig, Settings};
 
 const NEXTJS_INTEGRATION_ID: &str = "nextjs";
@@ -67,7 +67,7 @@ pub(super) fn configuration_error(message: impl Into<String>) -> Report<TrustedS
 /// Whether the current parser fragment restores or passes through owned Flight.
 /// This snapshot remains visible through downstream stages on empty/final text.
 pub(crate) fn protects_current_flight_fragment(
-    state: &crate::integrations::IntegrationDocumentState,
+    state: &crate::integration::IntegrationDocumentState,
 ) -> bool {
     state
         .get::<std::sync::Mutex<rsc_stream::NextJsDocumentState>>(NEXTJS_INTEGRATION_ID)
@@ -143,7 +143,7 @@ mod tests {
     use super::rsc_placeholders::RSC_PAYLOAD_PLACEHOLDER_PREFIX;
     use super::*;
     use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
-    use crate::integrations::IntegrationRegistry;
+    use crate::integration::IntegrationRegistry;
     use crate::streaming_processor::{
         Compression, PipelineConfig, StreamProcessor as _, StreamingPipeline,
     };

@@ -15,7 +15,7 @@ use url::Url;
 use validator::Validate;
 
 use crate::error::TrustedServerError;
-use crate::integrations::{
+use crate::integration::{
     IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory, IntegrationRegistration,
 };
 use crate::platform::{PlatformBackendSpec, PlatformHttpRequest};
@@ -216,7 +216,7 @@ impl StreamProcessor for FixtureSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::IntegrationRegistry;
+    use crate::integration::IntegrationRegistry;
     use crate::test_support::tests::create_test_settings;
 
     #[test]

@@ -16,7 +16,7 @@ use trusted_server_adapter_axum::app::TrustedServerApp as AxumApp;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp as CloudflareApp;
 use trusted_server_adapter_spin::app::TrustedServerApp as SpinApp;
 use trusted_server_core::auction::compile_auction_plan;
-use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::integration::IntegrationRegistry;
 use trusted_server_core::test_support::nextjs_auction;
 
 use super::{Observation, json_bytes, normalize_asset_versions};

@@ -31,12 +31,12 @@ use crate::auction::routing::ProviderAuctionInput;
 use crate::auction::types::{AdSlot, AuctionContext, AuctionRequest};
 use crate::auction::types::{AuctionResponse, Bid, BidRenderer, MediaType};
 use crate::error::TrustedServerError;
-use crate::integrations::{
+use crate::integration::{
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
 };
 #[cfg(test)]
-use crate::integrations::{
+use crate::integration::{
     ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
 #[cfg(test)]
@@ -1988,7 +1988,7 @@ mod tests {
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, PublisherInfo, UserInfo,
     };
-    use crate::integrations::IntegrationDocumentState;
+    use crate::integration::IntegrationDocumentState;
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_http_client, noop_services,
     };

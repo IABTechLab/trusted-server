@@ -1,6 +1,6 @@
 use url::{Position, Url};
 
-use crate::integrations::{
+use crate::integration::{
     AttributeRewriteAction, IntegrationAttributeContext, ScriptSourceAction, ScriptSourceContext,
     ScriptSourceTransition,
 };
@@ -82,7 +82,7 @@ pub(super) mod tests {
     use serde::Deserialize;
     use url::Url;
 
-    use crate::integrations::{
+    use crate::integration::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
         ScriptSourceAction, ScriptSourceClaim, ScriptSourceContext, evaluate_script_sources,
     };

@@ -14,10 +14,10 @@ use http::{HeaderMap, HeaderValue, Request, Response, header};
 use serde_json::{Value, json};
 use trusted_server_core::auction::compile_auction_plan;
 use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
-use trusted_server_core::integrations::gpt_diagnostics;
-use trusted_server_core::integrations::{
+use trusted_server_core::integration::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationRegistry,
 };
+use trusted_server_core::integrations::gpt_diagnostics;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::streaming_processor::StreamProcessor as _;
 use trusted_server_core::tsjs;
@@ -352,13 +352,13 @@ fn observations() -> (Vec<Observation>, Vec<u8>) {
                 decision.active(),
                 "should activate diagnostics in its baseline case"
             );
-            trusted_server_core::integrations::processing::RequestProcessingState::from(decision)
+            trusted_server_core::integration::processing::RequestProcessingState::from(decision)
         });
         if suppress_datadome {
             let mut request = Request::new(Body::empty());
             trusted_server_core::integrations::datadome::suppress_client_tag(&mut request);
             decision = Some(
-                trusted_server_core::integrations::processing::RequestProcessingState::from_request(
+                trusted_server_core::integration::processing::RequestProcessingState::from_request(
                     &request,
                 ),
             );

@@ -63,7 +63,7 @@ impl IntegrationDeclaration {
     /// # Examples
     ///
     /// ```
-    /// use trusted_server_core::integrations::IntegrationDeclaration;
+    /// use trusted_server_core::integration::IntegrationDeclaration;
     /// let declaration = IntegrationDeclaration::new("example");
     /// assert_eq!(declaration.integration_id, "example");
     /// ```
@@ -119,7 +119,7 @@ impl fmt::Debug for IntegrationDeclaration {
 /// # Examples
 ///
 /// ```
-/// use trusted_server_core::integrations::{IntegrationDeclaration, validate_integration_declarations};
+/// use trusted_server_core::integration::{IntegrationDeclaration, validate_integration_declarations};
 /// validate_integration_declarations(&[IntegrationDeclaration::new("example")], &[])
 ///     .expect("should accept an empty definition");
 /// ```

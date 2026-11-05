@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
-use crate::integrations::{
+use crate::integration::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, IntegrationScriptContext,
     IntegrationScriptRewriter, ScriptRewriteAction, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
@@ -1168,7 +1168,7 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
 mod tests {
     use super::*;
     use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
-    use crate::integrations::{
+    use crate::integration::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
         IntegrationDocumentState, IntegrationRegistry, IntegrationScriptContext,
         IntegrationScriptRewriter, ScriptRewriteAction,

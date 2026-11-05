@@ -3,7 +3,7 @@ use std::sync::{Arc, LazyLock};
 use regex::Regex;
 use serde::de::IgnoredAny;
 
-use crate::integrations::{
+use crate::integration::{
     IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };
 
@@ -777,7 +777,7 @@ fn remember_released(context: &mut String, released: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::IntegrationDocumentState;
+    use crate::integration::IntegrationDocumentState;
     use crate::integrations::nextjs::rsc_stream::NextJsDocumentState;
 
     fn ctx(
@@ -806,7 +806,7 @@ mod tests {
     mod fallback_logging {
         use super::*;
         use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
-        use crate::integrations::IntegrationRegistry;
+        use crate::integration::IntegrationRegistry;
         use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
         use crate::test_support::logging::WarningCapture;
         use crate::test_support::nextjs_auction;
@@ -1265,7 +1265,7 @@ mod tests {
                 &serde_json::json!({"enabled": true, "container_id": "GTM-MIX1"}),
             )
             .expect("should enable GTM");
-        let registry = crate::integrations::IntegrationRegistry::with_plan(
+        let registry = crate::integration::IntegrationRegistry::with_plan(
             &settings,
             Arc::new(crate::auction::compile_auction_plan(&settings).expect("should compile plan")),
         )
@@ -1353,7 +1353,7 @@ mod tests {
                 &serde_json::json!({"enabled": true, "container_id": "GTM-MIX1"}),
             )
             .expect("should configure GTM");
-        let registry = crate::integrations::IntegrationRegistry::with_plan(
+        let registry = crate::integration::IntegrationRegistry::with_plan(
             &settings,
             Arc::new(crate::auction::compile_auction_plan(&settings).expect("should compile plan")),
         )

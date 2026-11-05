@@ -53,7 +53,7 @@ pub fn tsjs_script_tag_with_attributes(
 /// [`tsjs_script_src`] with exact module IDs when [`IntegrationRegistry`] is
 /// available.
 ///
-/// [`IntegrationRegistry`]: crate::integrations::IntegrationRegistry
+/// [`IntegrationRegistry`]: crate::integration::IntegrationRegistry
 #[must_use]
 pub fn tsjs_unified_script_src() -> String {
     "/static/tsjs=tsjs-unified.min.js".to_string()

@@ -114,7 +114,7 @@ pub fn build_orchestrator(
 #[cfg(test)]
 mod plan_sharing_tests {
     use super::*;
-    use crate::integrations::IntegrationRegistry;
+    use crate::integration::IntegrationRegistry;
     use crate::test_support::tests::create_test_settings;
 
     #[test]

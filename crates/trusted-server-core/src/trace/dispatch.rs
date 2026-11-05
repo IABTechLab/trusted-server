@@ -694,7 +694,7 @@ mod tests {
                     .expect("should preserve console preparation");
             let decision = request
                 .extensions()
-                .get::<crate::integrations::processing::RequestProcessingState>()
+                .get::<crate::integration::processing::RequestProcessingState>()
                 .expect("should store existing decision");
             assert_eq!(
                 gate.base_active(),

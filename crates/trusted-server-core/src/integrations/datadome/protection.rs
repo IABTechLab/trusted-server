@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::error::TrustedServerError;
 use crate::http_util::{RequestInfo, is_navigation_request};
-use crate::integrations::{
+use crate::integration::{
     HeaderMutation, RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
 };
 use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};

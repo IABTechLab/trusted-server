@@ -20,8 +20,8 @@ use crate::response_privacy::enforce_synthesized_html_cache_privacy;
 use crate::settings::{IntegrationConfig, Settings};
 use crate::tsjs;
 
-use super::IntegrationRegistration;
-use super::processing::{
+use crate::integration::IntegrationRegistration;
+use crate::integration::processing::{
     IntegrationRequestLifecycle, OriginRequirement, PreparedIntegrationRequest,
     RequestProcessingRequirements, RequestProcessingState, ReservedInputState,
     ResponsePrivacyScope,
@@ -572,7 +572,7 @@ fn replace_path_and_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::IntegrationRegistry;
+    use crate::integration::IntegrationRegistry;
     use crate::test_support::tests::create_test_settings;
     use serde_json::json;
 

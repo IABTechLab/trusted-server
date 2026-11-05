@@ -20,7 +20,7 @@ use super::{
 use crate::error::TrustedServerError;
 use crate::html_processor::HtmlWithStreamingProcessors;
 use crate::html_processor::finish::HtmlFinishContext;
-use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
+use crate::integration::{IntegrationDocumentState, IntegrationRegistry};
 use crate::settings::Settings;
 use crate::streaming_processor::finish::StreamFinishDeadline;
 use crate::streaming_processor::{

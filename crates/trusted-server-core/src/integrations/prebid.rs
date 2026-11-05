@@ -44,13 +44,13 @@ use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
-use crate::integrations::{
+use crate::integration::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
 };
 #[cfg(test)]
-use crate::integrations::{
+use crate::integration::{
     ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
 #[cfg(test)]
@@ -3721,7 +3721,7 @@ mod tests {
     use crate::consent::{ConsentContext, ConsentSource};
     use crate::geo::GeoInfo;
     use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
-    use crate::integrations::{
+    use crate::integration::{
         AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
     };
     use crate::platform::test_support::{

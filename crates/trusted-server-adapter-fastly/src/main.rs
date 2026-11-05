@@ -21,7 +21,7 @@ use trusted_server_core::ec::pull_sync::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
-use trusted_server_core::integrations::RequestFilterEffects;
+use trusted_server_core::integration::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
@@ -910,7 +910,7 @@ mod tests {
         TargetUnavailable,
     };
     use fastly::mime;
-    use trusted_server_core::integrations::HeaderMutation;
+    use trusted_server_core::integration::HeaderMutation;
 
     fn test_settings() -> Settings {
         Settings::from_toml(
