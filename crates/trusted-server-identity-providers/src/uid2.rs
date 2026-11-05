@@ -279,9 +279,10 @@ impl IdentityProvider for Uid2Provider {
         &self.capabilities
     }
 
-    /// UID2 is not offered where GDPR applies, so it is skipped there.
-    fn runs_where_gdpr_applies(&self) -> bool {
-        false
+    /// UID2 is not offered where GDPR applies, so none of its sources is
+    /// collected or kept there.
+    fn excluded_where_gdpr_applies(&self, _source: &SourceDomain) -> bool {
+        true
     }
 
     fn build_request(
@@ -431,9 +432,10 @@ mod tests {
     #[test]
     fn is_not_run_where_gdpr_applies() {
         let provider = provider(&json!({}));
+        let source = SourceDomain::try_from("uid2.example.com").expect("should build source");
 
         assert!(
-            !provider.runs_where_gdpr_applies(),
+            provider.excluded_where_gdpr_applies(&source),
             "should not run UID2 where GDPR applies"
         );
     }

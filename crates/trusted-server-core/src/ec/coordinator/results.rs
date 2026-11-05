@@ -66,6 +66,9 @@ pub enum SkipReason {
     /// The vendor's own cookies record an opt-out; the provider's stored
     /// UIDs are removed.
     OptedOut,
+    /// Every source of the provider is excluded where GDPR applies; the
+    /// provider's stored UIDs are removed.
+    Region,
 }
 
 /// One outcome per provider per navigation.
@@ -109,6 +112,7 @@ impl LookupStatus {
             Self::Skipped(SkipReason::Input) => "skipped_input",
             Self::Skipped(SkipReason::RateLimited) => "skipped_rate_limited",
             Self::Skipped(SkipReason::OptedOut) => "skipped_opted_out",
+            Self::Skipped(SkipReason::Region) => "skipped_region",
             Self::Skipped(SkipReason::Destination) => "destination_rejected",
         }
     }

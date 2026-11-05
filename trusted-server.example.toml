@@ -177,6 +177,7 @@ pull_sync_concurrency = 3
 # liveintent.sonobi.com, triplelift liveintent.triplelift.com, zetassp
 # zeta-ssp.liveintent.com, vidazoo liveintent.vidazoo.com, nexxen
 # liveintent.unrulymedia.com, uid2 uidapi.com, thetradedesk adserver.org.
+# Where GDPR applies, uid2 is neither resolved nor kept, as for kind "uid2".
 # `nonId` is LiveIntent's own ID and carries the reply's `segments` as EID
 # `ext`; the others are partner IDs, sent with UID `ext.provider` naming
 # LiveIntent (the Trade Desk ID also with `rtiPartner` and EID `matcher`).
@@ -248,7 +249,9 @@ pull_sync_concurrency = 3
 # Tokens are never generated: that needs an email or phone number. Without
 # `endpoint`, the refresh token is never stored. The authenticated
 # `/_ts/admin/ec/{id}` view shows refresh state as "[redacted]". UID2 is not
-# offered where GDPR applies, so it is skipped there.
+# offered where GDPR applies: for a visitor whose detected jurisdiction is
+# GDPR it is skipped and the UIDs the row holds for it are removed. A TCF
+# string alone does not count, since some CMPs set one for every visitor.
 # [[ec.identity_providers]]
 # id = "uid2"
 # kind = "uid2"

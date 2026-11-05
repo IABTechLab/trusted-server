@@ -55,9 +55,12 @@ pub const ATTRIBUTE_SOURCES: &[(&str, &str)] = &[
     ("zetassp", "zeta-ssp.liveintent.com"),
     ("vidazoo", "liveintent.vidazoo.com"),
     ("nexxen", "liveintent.unrulymedia.com"),
-    ("uid2", "uidapi.com"),
+    ("uid2", UID2_SOURCE),
     (TDID_ATTRIBUTE, "adserver.org"),
 ];
+
+/// The source of UID2 tokens `LiveIntent` resolves.
+const UID2_SOURCE: &str = "uidapi.com";
 
 /// The attribute holding the Trade Desk ID `LiveIntent` resolved.
 const TDID_ATTRIBUTE: &str = "thetradedesk";
@@ -254,6 +257,12 @@ impl IdentityProvider for LiveIntentProvider {
         &self.capabilities
     }
 
+    /// UID2 tokens `LiveIntent` resolves are not collected or kept where GDPR
+    /// applies, matching the `uid2` provider.
+    fn excluded_where_gdpr_applies(&self, source: &SourceDomain) -> bool {
+        source.as_str() == UID2_SOURCE
+    }
+
     fn build_request(
         &self,
         lookup: &LookupInput<'_>,
@@ -428,6 +437,22 @@ mod tests {
                 "should report invalid config for {resolve}"
             );
         }
+    }
+
+    #[test]
+    fn excludes_only_uid2_where_gdpr_applies() {
+        let provider = provider();
+        let uid2 = SourceDomain::try_from("uidapi.com").expect("should build source");
+        let nonid = SourceDomain::try_from("liveintent.com").expect("should build source");
+
+        assert!(
+            provider.excluded_where_gdpr_applies(&uid2),
+            "should exclude UID2 tokens where GDPR applies"
+        );
+        assert!(
+            !provider.excluded_where_gdpr_applies(&nonid),
+            "should keep LiveIntent's own ID where GDPR applies"
+        );
     }
 
     #[test]
