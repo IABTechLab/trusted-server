@@ -61,6 +61,16 @@ impl ServerFixture {
         short_passphrase: bool,
         profile: Option<&str>,
     ) {
+        self.spawn_configured_with_env(missing_secret, short_passphrase, profile, &[]);
+    }
+
+    fn spawn_configured_with_env(
+        &mut self,
+        missing_secret: bool,
+        short_passphrase: bool,
+        profile: Option<&str>,
+        environment: &[(&str, &str)],
+    ) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"));
         command
             .env_clear()
@@ -87,6 +97,7 @@ impl ServerFixture {
             )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command.envs(environment.iter().copied());
         if let Some(profile) = profile {
             let path = self.root.join("native-geo.toml");
             fs::write(&path, profile).expect("should write synthetic Geo profile");
@@ -150,6 +161,12 @@ impl ServerFixture {
                     !diagnostic.contains("native-fixture-passphrase"),
                     "should not expose resolved secrets"
                 );
+                for sensitive in ["private-database-name", "invalid-private-database-content"] {
+                    assert!(
+                        !diagnostic.contains(sensitive),
+                        "should not expose database inputs"
+                    );
+                }
                 return;
             }
             assert!(
@@ -161,7 +178,11 @@ impl ServerFixture {
     }
 
     fn wait_ready(&mut self) -> String {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        self.wait_ready_with_timeout(Duration::from_secs(10))
+    }
+
+    fn wait_ready_with_timeout(&mut self, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
         loop {
             if let Ok(response) = self.get("/health") {
                 assert!(
@@ -435,6 +456,265 @@ fn nonmatching_real_socket_peer_cannot_supply_geo() {
             .contains("x-geo-info-available: false")
     );
     assert!(!response.to_ascii_lowercase().contains("x-geo-country:"));
+}
+
+#[test]
+#[cfg(not(all(feature = "geo-maxmind", unix)))]
+fn compiled_out_maxmind_fails_before_store_preparation_and_listen() {
+    let mut server = ServerFixture::new(None);
+    server.spawn_configured(false, false, Some(
+        "version = 1\n[geo]\nprovider = 'maxmind'\ndatabase_path = '/missing.mmdb'\nreader_ip_expectation = 'forwarded_required'"
+    ));
+    server.assert_failed_before_listen("maxmind implementation unavailable");
+}
+
+#[cfg(all(feature = "geo-maxmind", unix))]
+mod maxmind {
+    use std::path::Path;
+
+    use super::*;
+
+    const CITY: &[u8] = include_bytes!("fixtures/geoip/city.mmdb");
+    const COUNTRY: &[u8] = include_bytes!("fixtures/geoip/country.mmdb");
+    const IPV6: &[u8] = include_bytes!("fixtures/geoip/ipv6.mmdb");
+    const TRUSTED_XFF: &[(&str, &str)] = &[
+        (
+            "EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS",
+            "127.0.0.1/32,198.51.100.8/32",
+        ),
+        ("EDGEZERO__ADAPTER__FORWARDING_HEADER_FAMILY", "x-forwarded"),
+    ];
+
+    fn profile(database: &Path, expectation: &str) -> String {
+        let mut geo = toml::Table::new();
+        geo.insert("provider".to_owned(), "maxmind".into());
+        geo.insert(
+            "database_path".to_owned(),
+            database
+                .to_str()
+                .expect("should use UTF-8 test path")
+                .into(),
+        );
+        geo.insert("reader_ip_expectation".to_owned(), expectation.into());
+        let mut profile = toml::Table::new();
+        profile.insert("version".to_owned(), 1.into());
+        profile.insert("geo".to_owned(), geo.into());
+        toml::to_string(&profile).expect("should serialize native Geo profile")
+    }
+
+    fn spawn(bytes: &[u8], expectation: &str, environment: &[(&str, &str)]) -> ServerFixture {
+        let mut server = ServerFixture::new(Some(ENVELOPE));
+        let path = server.root.join("test.mmdb");
+        fs::write(&path, bytes).expect("should write synthetic database");
+        let profile = profile(&path, expectation);
+        server.spawn_configured_with_env(false, false, Some(&profile), environment);
+        server.wait_ready();
+        server
+    }
+
+    fn assert_location(response: &str, country: &str, region: Option<&str>) {
+        let lower = response.to_ascii_lowercase();
+        assert!(lower.contains("x-geo-info-available: true"), "{response}");
+        assert!(
+            lower.contains(&format!(
+                "x-geo-country: {}\r\n",
+                country.to_ascii_lowercase()
+            )),
+            "{response}"
+        );
+        if let Some(region) = region {
+            assert!(
+                lower.contains(&format!(
+                    "x-geo-region: {}\r\n",
+                    region.to_ascii_lowercase()
+                )),
+                "{response}"
+            );
+        } else {
+            assert!(!lower.contains("x-geo-region:"), "{response}");
+        }
+        for absent in [
+            "x-geo-city:",
+            "x-geo-coordinates:",
+            "x-geo-continent:",
+            "x-geo-metro-code:",
+        ] {
+            assert!(
+                !lower.contains(absent),
+                "should not invent unavailable detail: {response}"
+            );
+        }
+    }
+
+    fn assert_unavailable(response: &str) {
+        let lower = response.to_ascii_lowercase();
+        assert!(lower.contains("x-geo-info-available: false"), "{response}");
+        assert!(!lower.contains("x-geo-country:"), "{response}");
+        assert!(!lower.contains("x-geo-region:"), "{response}");
+    }
+
+    #[test]
+    fn direct_reader_uses_snapshot_and_ignores_geographic_and_untrusted_forwarding_headers() {
+        let server = spawn(CITY, "peer_allowed", &[]);
+        let headers = "CloudFront-Viewer-Country: GB\r\nCloudFront-Viewer-Country-Region: ENG\r\nX-Forwarded-For: 192.0.2.2\r\nFly-Client-IP: 192.0.2.2\r\n";
+        assert_location(
+            &server
+                .get_with_headers("/health", headers)
+                .expect("should reach health"),
+            "US",
+            Some("CA"),
+        );
+        fs::remove_file(server.root.join("test.mmdb"))
+            .expect("should remove source after readiness");
+        assert_location(
+            &server
+                .get("/health")
+                .expect("should retain prepared snapshot"),
+            "US",
+            Some("CA"),
+        );
+    }
+
+    #[test]
+    fn forwarded_reader_uses_checked_chain_and_finalizes_error_routes() {
+        let server = spawn(CITY, "forwarded_required", TRUSTED_XFF);
+        // A deployment-controlled rightmost hop resembles proxy chains that append an app address.
+        // The forged leftmost country-only reader must not override the first untrusted reader.
+        let headers = "X-Forwarded-For: 192.0.2.2, 192.0.2.1, 198.51.100.8\r\nCloudFront-Viewer-Country: GB\r\n";
+        for (path, status) in [
+            ("/health", "200"),
+            ("/_ts/admin/ec", "401"),
+            ("/static/tsjs=0000000000000000", "404"),
+        ] {
+            let response = server
+                .get_with_headers(path, headers)
+                .expect("should reach managed route");
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response}"
+            );
+            assert_location(&response, "US", Some("CA"));
+        }
+        let country_only = server
+            .get_with_headers("/health", "X-Forwarded-For: 192.0.2.2\r\n")
+            .expect("should resolve a different reader");
+        assert_location(&country_only, "GB", None);
+        for headers in [
+            "",
+            "X-Forwarded-For: malformed\r\n",
+            "X-Forwarded-For: 127.0.0.1\r\n",
+            "CloudFront-Viewer-Country: US\r\nFly-Client-IP: 192.0.2.1\r\n",
+            "X-Forwarded-For: 203.0.113.1\r\n",
+        ] {
+            assert_unavailable(
+                &server
+                    .get_with_headers("/health", headers)
+                    .expect("should preserve health"),
+            );
+        }
+    }
+
+    #[test]
+    fn forwarded_reader_requires_actual_proxy_peer_trust() {
+        let server = spawn(
+            CITY,
+            "forwarded_required",
+            &[
+                ("EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS", "198.51.100.8/32"),
+                ("EDGEZERO__ADAPTER__FORWARDING_HEADER_FAMILY", "x-forwarded"),
+            ],
+        );
+        assert_unavailable(
+            &server
+                .get_with_headers("/health", "X-Forwarded-For: 192.0.2.1, 198.51.100.8\r\n")
+                .expect("should ignore untrusted peer"),
+        );
+    }
+
+    #[test]
+    fn standard_forwarded_supports_ipv6_readers() {
+        let server = spawn(
+            IPV6,
+            "forwarded_required",
+            &[
+                ("EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS", "127.0.0.1/32"),
+                ("EDGEZERO__ADAPTER__FORWARDING_HEADER_FAMILY", "forwarded"),
+            ],
+        );
+        assert_location(
+            &server
+                .get_with_headers(
+                    "/health",
+                    "Forwarded: for=\"[2001:db8::1234]\";proto=https\r\n",
+                )
+                .expect("should resolve IPv6 reader"),
+            "GB",
+            Some("ENG"),
+        );
+    }
+
+    #[test]
+    fn country_database_never_supplies_a_subdivision() {
+        let server = spawn(COUNTRY, "peer_allowed", &[]);
+        assert_location(
+            &server.get("/health").expect("should use country snapshot"),
+            "US",
+            None,
+        );
+    }
+
+    #[test]
+    fn missing_or_corrupt_database_fails_before_listen() {
+        for corrupt in [false, true] {
+            let mut server = ServerFixture::new(Some(ENVELOPE));
+            let path = server.root.join("private-database-name.mmdb");
+            if corrupt {
+                fs::write(&path, b"invalid-private-database-content")
+                    .expect("should write invalid database");
+            }
+            server.spawn_configured(false, false, Some(&profile(&path, "peer_allowed")));
+            server.assert_failed_before_listen(if corrupt {
+                "native_geo: invalid database"
+            } else {
+                "native_geo: database unavailable"
+            });
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an operator GeoLite snapshot and explicit expected location"]
+    fn operator_geolite_snapshot_resolves_checked_reader() {
+        let database = std::env::var("TS_TEST_GEOLITE_DATABASE")
+            .expect("should supply TS_TEST_GEOLITE_DATABASE");
+        let reader = std::env::var("TS_TEST_GEO_IP").expect("should supply TS_TEST_GEO_IP");
+        let country =
+            std::env::var("TS_TEST_GEO_COUNTRY").expect("should supply TS_TEST_GEO_COUNTRY");
+        let region = std::env::var("TS_TEST_GEO_REGION").ok();
+        let mut server = ServerFixture::new(Some(ENVELOPE));
+        server.spawn_configured_with_env(
+            false,
+            false,
+            Some(&profile(Path::new(&database), "forwarded_required")),
+            TRUSTED_XFF,
+        );
+        // Production-size snapshots take longer to validate than synthetic fixtures.
+        server.wait_ready_with_timeout(Duration::from_secs(120));
+        assert_location(
+            &server
+                .get_with_headers(
+                    "/health",
+                    &format!("X-Forwarded-For: {reader}, 198.51.100.8\r\n"),
+                )
+                .expect("should resolve operator snapshot"),
+            &country,
+            region.as_deref(),
+        );
+        assert_unavailable(
+            &server
+                .get("/health")
+                .expect("should not geolocate the proxy"),
+        );
+    }
 }
 
 #[test]

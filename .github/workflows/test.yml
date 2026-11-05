@@ -94,6 +94,12 @@ jobs:
       - name: Run Axum adapter tests
         run: cargo test-axum
 
+      - name: Test native Geo without CloudFront
+        run: cargo test --locked -p trusted-server-adapter-axum --features geo-maxmind
+
+      - name: Test both native Geo implementations
+        run: cargo test --locked -p trusted-server-adapter-axum --features geo-maxmind,geo-cloudfront
+
       - name: Test template build digest inputs (native)
         run: cargo test -p trusted-server-core --test template_build_digest
 
