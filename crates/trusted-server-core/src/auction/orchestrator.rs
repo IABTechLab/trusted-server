@@ -7274,6 +7274,20 @@ mod tests {
                     Some(u16::from(expected_winner.is_some())),
                     "should count locally selected winners in telemetry"
                 );
+                let bid_rows = events
+                    .rows()
+                    .iter()
+                    .filter(|row| row.event_kind == "bid")
+                    .map(|row| (row.price_cpm, row.is_win))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    bid_rows,
+                    vec![
+                        (Some(1.5), Some(0)),
+                        (Some(2.0), Some(u8::from(expected_winner.is_some()))),
+                    ],
+                    "should mark only the selected provider bid as winning after HTTP {status} (harness={harness})"
+                );
             }
         }
     }

@@ -755,6 +755,10 @@ fn push_bid_rows(
                     delivered_winner_slots.is_none_or(|slots| slots.contains(*slot_id))
                         && !matched_wins.contains(*slot_id)
                         && bid_matches_winning_bid(bid, winning)
+                        // Local ranking clones the selected bid without changing its identity or price.
+                        // Mediation can replace both, so keep its original provider association.
+                        && (result.mediator_response.is_some()
+                            || (bid.bid_id == winning.bid_id && bid.price == winning.price))
                 })
                 .map(|(slot_id, winning)| (slot_id.clone(), winning));
             let (is_win, price) = if let Some((slot_id, winning)) = matched_slot {
@@ -1452,11 +1456,119 @@ mod tests {
     }
 
     #[test]
+    fn local_winner_rows_identify_the_selected_bid() {
+        for (lower_id, higher_id) in [
+            (None, None),
+            (Some("lower"), Some("higher")),
+            (Some("shared"), Some("shared")),
+        ] {
+            for ad_id in [None, Some("shared-ad")] {
+                for separate_providers in [false, true] {
+                    let request = test_request("local-auction");
+                    let mut lower = bid("slot-1", "example-bidder", ad_id, Some(1.5));
+                    lower.bid_id = lower_id.map(String::from);
+                    let mut higher = bid("slot-1", "example-bidder", ad_id, Some(2.0));
+                    higher.bid_id = higher_id.map(String::from);
+                    let winner = higher.clone();
+                    let provider_responses = if separate_providers {
+                        vec![
+                            AuctionResponse::success("provider-a", vec![lower], 1),
+                            AuctionResponse::success("provider-b", vec![higher], 2),
+                        ]
+                    } else {
+                        vec![AuctionResponse::success(
+                            "provider-a",
+                            vec![lower, higher],
+                            2,
+                        )]
+                    };
+                    let result = OrchestrationResult {
+                        provider_responses,
+                        mediator_response: None,
+                        winning_bids: HashMap::from([("slot-1".to_owned(), winner)]),
+                        total_time_ms: 2,
+                        metadata: HashMap::new(),
+                    };
+                    let events = build_auction_events(
+                        AuctionObservationContext::for_test(
+                            AuctionSource::AuctionApi,
+                            "/auction",
+                            1,
+                        ),
+                        AuctionTerminalOutcome::Completed {
+                            request: &request,
+                            result: &result,
+                            delivered_winner_slots: None,
+                        },
+                    );
+                    let rows = events
+                        .rows()
+                        .iter()
+                        .filter(|row| row.event_kind == "bid")
+                        .map(|row| (row.provider.as_deref(), row.price_cpm, row.is_win))
+                        .collect::<Vec<_>>();
+                    let winning_provider = if separate_providers {
+                        "provider-b"
+                    } else {
+                        "provider-a"
+                    };
+                    assert_eq!(
+                        rows,
+                        vec![
+                            (Some("provider-a"), Some(1.5), Some(0)),
+                            (Some(winning_provider), Some(2.0), Some(1)),
+                        ],
+                        "should attribute the win and CPM to the selected bid even with absent or reused IDs"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_tied_bids_keep_the_first_provider_as_the_only_winner() {
+        let request = test_request("tied-auction");
+        let first = bid("slot-1", "example-bidder", None, Some(2.0));
+        let second = first.clone();
+        let result = OrchestrationResult {
+            winning_bids: HashMap::from([("slot-1".to_owned(), first.clone())]),
+            provider_responses: vec![
+                AuctionResponse::success("provider-a", vec![first], 1),
+                AuctionResponse::success("provider-b", vec![second], 2),
+            ],
+            mediator_response: None,
+            total_time_ms: 2,
+            metadata: HashMap::new(),
+        };
+        let events = build_auction_events(
+            AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/auction", 1),
+            AuctionTerminalOutcome::Completed {
+                request: &request,
+                result: &result,
+                delivered_winner_slots: None,
+            },
+        );
+        let winning_providers = events
+            .rows()
+            .iter()
+            .filter(|row| row.event_kind == "bid" && row.is_win == Some(1))
+            .map(|row| row.provider.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            winning_providers,
+            vec![Some("provider-a")],
+            "should preserve local ranking's first-provider tie decision without duplicate wins"
+        );
+    }
+
+    #[test]
     fn mediated_win_marks_original_bid_once() {
         let request = test_request("req");
-        let original_bid = bid("slot-1", "kargo", Some("ad-1"), None);
+        let mut original_bid = bid("slot-1", "example-bidder", Some("ad-1"), None);
+        original_bid.bid_id = Some("original-bid".to_owned());
         let provider_success = AuctionResponse::success("prebid", vec![original_bid], 42);
-        let mediator_bid = bid("slot-1", "kargo", Some("ad-1"), Some(2.0));
+        let mut mediator_bid = bid("slot-1", "example-bidder", Some("ad-1"), Some(2.0));
+        mediator_bid.bid_id = Some("mediated-bid".to_owned());
         let mediator_response =
             AuctionResponse::success("adserver_mock", vec![mediator_bid.clone()], 15);
         let result = OrchestrationResult {

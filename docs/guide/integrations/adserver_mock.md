@@ -11,7 +11,7 @@ configured auction providers, then passes successful bids to the mediator's
 HTTP endpoint for final selection.
 
 If the mediator request fails, returns a non-2xx HTTP status, or cannot be parsed,
-the orchestrator warns and falls back to local ranking of the collected provider
+the orchestrator logs and falls back to local ranking of the collected provider
 bids, enforcing floor prices. A valid successful no-bid response remains final.
 Failed mediation produces no mediator response or mediator telemetry row, matching
 other mediation failures.
