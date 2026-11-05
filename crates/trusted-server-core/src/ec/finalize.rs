@@ -1679,7 +1679,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_stores_browser_fallback_for_provider_owned_source() {
+    fn finalize_skips_browser_uid_for_provider_owned_source() {
         // Arrange
         let settings = create_test_settings();
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1717,17 +1717,9 @@ mod tests {
             .get(&ec_id)
             .expect("should read store")
             .expect("should create the row");
-        let record = stored
-            .ids
-            .get("sharedid.org")
-            .expect("should store the browser fallback");
-        assert_eq!(
-            record.uid, "fallback-cookie-id",
-            "should store the browser uid"
-        );
         assert!(
-            !record.is_provider_written(),
-            "should mark the fallback as not provider-written"
+            !stored.ids.contains_key("sharedid.org"),
+            "should not store a browser UID for a provider-owned source"
         );
     }
 
