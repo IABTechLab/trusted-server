@@ -4,8 +4,8 @@
 # Usage: scripts/docs-proposal/propose.sh <merge-sha> <work-dir> [<base-sha>]
 # Run from a checkout of <merge-sha>; this script may live in a separate
 # checkout. Copilot inspects <base-sha>..<merge-sha>, where <base-sha>
-# defaults to the first parent and is the previous main head when one push
-# added several commits. Writes proposal.patch (empty when nothing changes),
+# defaults to the first parent and must otherwise be an earlier commit of
+# <merge-sha>. Writes proposal.patch (empty when nothing changes),
 # rationale.md, evidence.json, and the resolved base to <work-dir>, which must
 # be inside the repository so Copilot can read the prompts and write its
 # outputs there.
@@ -21,11 +21,12 @@ source "$here/lib.sh"
 cd "$root"
 docs_proposal_require_sha "$sha"
 base="${3:-}"
-if [ -z "$base" ] || [ "$base" = "$sha" ] || ! git merge-base --is-ancestor "$base" "$sha" 2>/dev/null; then
-  if [ -n "$base" ] && [ "$base" != "0000000000000000000000000000000000000000" ]; then
-    printf '::warning::Base %s is not an ancestor of %s; using its first parent.\n' "$base" "$sha"
-  fi
+if [ -z "$base" ]; then
   base="$(git rev-parse "$sha^1")"
+elif ! git merge-base --is-ancestor "$base" "$sha" 2>/dev/null \
+  || [ "$(git rev-parse --verify "$base^{commit}")" = "$sha" ]; then
+  printf '::error::Base %s is not an earlier commit of %s\n' "$base" "$sha" >&2
+  exit 1
 fi
 # A manual base such as `main` resolves here, so publish.sh gets a full SHA.
 base="$(git rev-parse --verify "$base^{commit}")"

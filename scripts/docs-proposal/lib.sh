@@ -6,15 +6,18 @@ DOCS_PROPOSAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCS_PROPOSAL_ALLOWED_RE='^docs/(guide/.+|index\.md)$'
 DOCS_PROPOSAL_MAX_RATIONALE_BYTES=20000
 
-# Exits unless the argument is a full commit SHA reachable from origin/main.
+# The branch proposals are made for and opened against; defaults to main.
+DOCS_PROPOSAL_BRANCH="${DOCS_PROPOSAL_BRANCH:-main}"
+
+# Exits unless the argument is a full commit SHA reachable from the branch.
 docs_proposal_require_sha() {
   local sha="$1"
   if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
     printf '::error::Expected a full 40-character commit SHA, got %s\n' "$sha" >&2
     exit 1
   fi
-  if ! git merge-base --is-ancestor "$sha" origin/main 2>/dev/null; then
-    printf '::error::Commit %s is not reachable from origin/main\n' "$sha" >&2
+  if ! git merge-base --is-ancestor "$sha" "origin/$DOCS_PROPOSAL_BRANCH" 2>/dev/null; then
+    printf '::error::Commit %s is not reachable from origin/%s\n' "$sha" "$DOCS_PROPOSAL_BRANCH" >&2
     exit 1
   fi
 }
