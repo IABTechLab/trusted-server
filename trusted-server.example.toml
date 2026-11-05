@@ -127,7 +127,10 @@ pull_sync_concurrency = 3
 # must be claimed by only one enabled provider.
 # sources = ["ids.example.com"]
 # Optional: require TCF vendor consent for lookups and for sending any ID of
-# these sources to bidders, including browser IDs, even while disabled.
+# these sources to bidders, including browser IDs, even while disabled. Set it
+# to the vendor's IAB Global Vendor List ID for every kind whose vendor is
+# registered there; without it, GDPR traffic is gated only by the purpose
+# consents.
 # tcf_vendor_id = 9999
 # "page" (default) collects before the response; "after_response" collects
 # after it is sent, only for an EC issued on an earlier request. Keep
@@ -273,7 +276,7 @@ pull_sync_concurrency = 3
 # `_pubcid_optout` cookie suppresses it. Takes exactly one source. When no
 # cookie holds an ID and none is stored, Trusted Server generates a random
 # UUID and stores it in the row only (no cookie is set); a later Prebid cookie
-# replaces it.
+# replaces it. SharedID is the publisher's own ID, so it has no TCF vendor.
 # [[ec.identity_providers]]
 # id = "sharedid"
 # kind = "sharedid"
@@ -290,6 +293,7 @@ pull_sync_concurrency = 3
 # kind = "criteo"
 # enabled = false
 # sources = ["criteo.example.com"]
+# tcf_vendor_id = 9999
 # [ec.identity_providers.settings]
 # cookie_names = ["cto_bidid"]
 #
@@ -303,6 +307,7 @@ pull_sync_concurrency = 3
 # kind = "unifiedid"
 # enabled = false
 # sources = ["unifiedid.example.com"]
+# tcf_vendor_id = 9999
 # [ec.identity_providers.settings]
 # cookie_names = ["pbjs-unifiedid"]
 
