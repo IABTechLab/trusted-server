@@ -96,6 +96,9 @@ fn build_state_with_services(
             message: "lab store diagnostic requires existing admin handler coverage".to_owned(),
         }));
     }
+    settings
+        .ec
+        .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Native)?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;

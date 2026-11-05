@@ -23,9 +23,171 @@ use trusted_server_core::config_payload::{
 };
 use trusted_server_core::test_support::nextjs_auction;
 
+#[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
+#[path = "support/celld.rs"]
+mod celld_fixture;
+#[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+#[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
+use trusted_server_core::ec::kv_backend::{
+    EcKvStore as _, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
+};
+
 const ADMIN_PASSWORD: &str = "native-admin-password-32-bytes-example";
 const PROXY_SECRET: &str = "native-proxy-secret-32-bytes-example";
 const EC_PASSPHRASE: &str = "native-ec-passphrase-32-bytes-example";
+
+#[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
+fn ec_response_cookie(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            value.strip_prefix("ts-ec=").map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .expect("should contain cookie value")
+                    .to_owned()
+            })
+        })
+}
+
+#[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
+#[test]
+#[ignore = "requires CELLD_EC_TEST_BINARY and celld-ec,geo-cloudfront features; real disposable servers only"]
+fn real_celld_envelope_drives_native_http_issuance_withdrawal_restart_and_outage() {
+    let mut celld = celld_fixture::CelldFixture::new();
+    let origin = origin::Origin::start("celld-ec-http");
+    let mut prepared = Prepared::new(&origin.base_url);
+    let mut storage =
+        serde_json::to_value(celld.settings()).expect("should serialize pure selected binding");
+    storage["provider"] = json!("celld");
+    prepared.data["ec"]["storage"] = storage;
+    prepared.data["ec"]["partners"] = json!([{"name":"Fixture partner","source_domain":"partner.example.com","bidstream_enabled":true,"pull_sync_enabled":false}]);
+    prepared.publish();
+    let profile = prepared.workspace.path().join("native-geo.toml");
+    fs::write(&profile,"version = 1\n[geo]\nprovider = \"cloudfront\"\nalb_peer_cidrs = [\"127.0.0.1/32\"]\norigin_credential_header_name = \"x-origin-synthetic-fixture\"\n").expect("should write synthetic local protected-ingress profile");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("should drive typed record inspection");
+    let store = runtime.block_on(celld.store());
+    let client = client(None);
+    let document = |server: &Running, country: &str, cookie: Option<&str>, withdrawal: bool| {
+        let mut request = client
+            .get(format!("{}/article", server.base_url()))
+            .header("host", "publisher.example.com")
+            .header(
+                "forwarded",
+                "for=198.51.100.24;proto=https;host=publisher.example.com",
+            )
+            .header("accept", "text/html")
+            .header("sec-fetch-dest", "document")
+            .header("sec-fetch-mode", "navigate")
+            .header(
+                "user-agent",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36",
+            )
+            .header("cloudfront-viewer-country", country)
+            .header("cloudfront-viewer-country-region", "TN")
+            .header("x-origin-synthetic-fixture", "synthetic-fixture-only");
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        if withdrawal {
+            request = request.header("sec-gpc", "1");
+        }
+        request
+            .send()
+            .expect("should complete actual native publisher HTTP request")
+    };
+    let mut app = prepared.spawn_with_geo(true, Some(&profile));
+    app.ready();
+    let issued = document(&app, "AU", None, false);
+    assert_eq!(issued.status().as_u16(), 200);
+    assert_eq!(
+        issued
+            .headers()
+            .get("x-geo-country")
+            .expect("should admit checked synthetic geography"),
+        "AU"
+    );
+    let ec = ec_response_cookie(&issued)
+        .expect("should issue only with confirmed real record persistence");
+    let created = runtime
+        .block_on(store.lookup(&ec))
+        .expect("should read actual persisted identity")
+        .expect("should retain issued identity");
+    let eids = STANDARD.encode(
+        json!([{"source":"partner.example.com","uids":[{"id":"fixture-uid","atype":1}]}])
+            .to_string(),
+    );
+    let cookie = format!("ts-ec={ec}; ts-eids={eids}");
+    let updated = document(&app, "AU", Some(&cookie), false);
+    assert_eq!(updated.status().as_u16(), 200);
+    let updated = runtime
+        .block_on(store.lookup(&ec))
+        .expect("should read real native EID update")
+        .expect("should retain updated identity");
+    let row: Value =
+        serde_json::from_slice(&updated.body).expect("should decode persisted graph schema");
+    assert_eq!(row["ids"]["partner.example.com"]["uid"], "fixture-uid");
+    assert!(updated.generation > created.generation);
+    drop(app);
+    app = prepared.spawn_with_geo(true, Some(&profile));
+    app.ready();
+    assert!(
+        ec_response_cookie(&document(&app, "AU", Some(&cookie), false)).is_none(),
+        "should reuse identity across application recreation"
+    );
+    let withdrawn = document(&app, "US", Some(&cookie), true);
+    assert_eq!(ec_response_cookie(&withdrawn).as_deref(), Some(""));
+    let tombstone = runtime
+        .block_on(store.lookup(&ec))
+        .expect("should read acknowledged native withdrawal")
+        .expect("should retain tombstone");
+    let row: Value =
+        serde_json::from_slice(&tombstone.body).expect("should decode actual tombstone");
+    assert_eq!(row["consent"]["ok"], false);
+    celld.stop();
+    assert!(
+        ec_response_cookie(&document(&app, "AU", None, false)).is_none(),
+        "should not issue unsupported cookie during real storage outage"
+    );
+    drop(app);
+    celld.restart();
+    prepared.data["ec"]["storage"]["endpoint"] = json!(celld.endpoint);
+    prepared.publish();
+    app = prepared.spawn_with_geo(true, Some(&profile));
+    app.ready();
+    assert!(
+        ec_response_cookie(&document(&app, "AU", Some(&cookie), false)).is_none(),
+        "should not revive withdrawal after server and application restart"
+    );
+    let store = runtime.block_on(celld.store());
+    let restored = runtime
+        .block_on(store.lookup(&ec))
+        .expect("should read recovered tombstone")
+        .expect("should restore withdrawal");
+    assert_eq!(restored.body, tombstone.body);
+    assert_eq!(
+        runtime
+            .block_on(store.insert(
+                &ec,
+                EcKvWrite {
+                    body: std::str::from_utf8(&updated.body).expect("should decode old entry"),
+                    metadata: "{}",
+                    ttl: Duration::from_secs(60),
+                    mode: EcKvWriteMode::IfGenerationMatch(updated.generation)
+                }
+            ))
+            .expect("should reject stale writer"),
+        EcKvWriteOutcome::PreconditionFailed
+    );
+}
 
 struct Prepared {
     workspace: TempDir,
@@ -102,6 +264,14 @@ impl Prepared {
     }
 
     fn spawn(&self, trusted_proxy: bool) -> Running {
+        self.spawn_with_geo(trusted_proxy, None)
+    }
+
+    fn spawn_with_geo(
+        &self,
+        trusted_proxy: bool,
+        geo_profile: Option<&std::path::Path>,
+    ) -> Running {
         let port = TcpListener::bind("127.0.0.1:0")
             .expect("should reserve isolated port")
             .local_addr()
@@ -162,6 +332,9 @@ impl Prepared {
             command
                 .env("EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS", "127.0.0.1/32")
                 .env("EDGEZERO__ADAPTER__FORWARDING_HEADER_FAMILY", "forwarded");
+        }
+        if let Some(profile) = geo_profile {
+            command.env("TS_NATIVE_GEO_PROFILE_FILE", profile);
         }
         Running {
             child: command
