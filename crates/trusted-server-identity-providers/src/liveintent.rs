@@ -10,8 +10,8 @@
 //! As in Prebid's `LiveIntent` module, every attribute other than `nonId` is
 //! a partner ID and its UID carries `ext.provider` naming `LiveIntent`; the
 //! Trade Desk ID also carries `ext.rtiPartner` and its EID names
-//! `LiveIntent` as `matcher`. `segments` in the reply become the `nonId`
-//! EID's `ext`.
+//! `LiveIntent` as `matcher`. A non-empty `segments` array in the reply
+//! becomes the `nonId` EID's `ext`.
 //!
 //! This kind has no Lockr capability: Lockr AIM is not documented to
 //! deliver `LiveIntent` IDs, so a `lockr` settings table is rejected.
@@ -325,9 +325,16 @@ impl IdentityProvider for LiveIntentProvider {
         let reply: HashMap<String, &'body RawValue> =
             serde_json::from_slice(response.body).change_context(ProviderError::InvalidResponse)?;
         let expiry = expiry(response.headers);
-        let segments = reply.get("segments").and_then(|segments| {
-            RawValue::from_string(format!(r#"{{"segments":{}}}"#, segments.get())).ok()
-        });
+        // Only a non-empty segment array is kept, as Prebid does.
+        let segments = reply
+            .get("segments")
+            .filter(|segments| {
+                serde_json::from_str::<Vec<&RawValue>>(segments.get())
+                    .is_ok_and(|segments| !segments.is_empty())
+            })
+            .and_then(|segments| {
+                RawValue::from_string(format!(r#"{{"segments":{}}}"#, segments.get())).ok()
+            });
         let eids: Vec<ProviderEid<'body>> = self
             .attributes
             .iter()
@@ -522,6 +529,34 @@ mod tests {
             ["nonId"],
             "should ask only for due attributes"
         );
+    }
+
+    #[test]
+    fn omits_empty_or_null_segments() {
+        let provider = provider();
+        let headers = HeaderMap::new();
+
+        for segments in [json!([]), json!(null), json!("s1")] {
+            let body = json!({ "nonId": "li-example", "segments": segments })
+                .to_string()
+                .into_bytes();
+            let outcome = provider
+                .parse_response(ProviderResponse {
+                    status: StatusCode::OK,
+                    headers: &headers,
+                    body: &body,
+                    context: None,
+                })
+                .expect("should parse response");
+            let LookupOutcome::Found(eids) = outcome else {
+                panic!("should find the nonId EID");
+            };
+
+            assert!(
+                eids[0].ext.is_none(),
+                "should omit segments {segments} from the nonId EID ext"
+            );
+        }
     }
 
     #[test]
