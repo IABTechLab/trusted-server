@@ -24,8 +24,8 @@ pub trait FrontendFramework: Send + Sync {
 
     /// Build a Docker container request mapped to the given origin port.
     ///
-    /// The `origin_port` is the fixed host port that the WASM binary
-    /// expects the origin to be running on (baked in at build time).
+    /// The `origin_port` is the fixed host port where the runtime test
+    /// configuration expects the origin to be running.
     ///
     /// # Errors
     ///

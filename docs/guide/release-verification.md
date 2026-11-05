@@ -1,10 +1,11 @@
 # Verify release binaries
 
-Phase 1 publishes four binaries, four SPDX 2.3 SBOMs, eight Sigstore bundles
-and `SHA256SUMS`: **17 immutable release assets**. Each binary has SLSA build
-provenance and an SBOM attestation. Verify the downloaded bytes before execution
-or deployment. Reproducibility, complete composition and the custom Trusted
-Server verifier remain later phases.
+Each release publishes four binaries, four SPDX 2.3 SBOMs, eight Sigstore
+bundles, the Fastly rebuild check and `SHA256SUMS`: **18 immutable release
+assets**. Each binary has SLSA build provenance and an SBOM attestation. Verify
+the downloaded bytes before execution or deployment. Fastly's ordinary A/B
+equality gate is described below; controlled reproducibility qualification,
+complete composition and the custom Trusted Server verifier remain later work.
 
 The tag caller is `.github/workflows/release.yml`. Its local reusable
 `.github/workflows/release-build.yml` owns builds and signing at the same source
@@ -17,12 +18,12 @@ them with the pinned Node and a checksum-verified GitHub CLI 2.102.0.
 
 ## Platforms and coverage
 
-| Asset                         | Phase 1 baseline and qualification limit                                                                           |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `trusted-server-fastly.wasm`  | Fastly Compute, `wasm32-wasip1`, default features; reproducibility and hosted runtime qualification remain pending |
-| `ts-x86_64-unknown-linux-gnu` | GNU x86-64; UBI 9 builder; maximum required glibc 2.34; Debian 12, Ubuntu 22.04 and UBI 9 startup smokes           |
-| `ts-aarch64-apple-darwin`     | macOS 15 Apple Silicon runner, deployment target 13.0; runtime compatibility qualification remains pending         |
-| `ts-x86_64-apple-darwin`      | macOS 15 Intel runner, deployment target 13.0; runtime compatibility qualification remains pending                 |
+| Asset                         | Phase 1 baseline and qualification limit                                                                                                                    |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `trusted-server-fastly.wasm`  | Fastly Compute, `wasm32-wasip1`, default features; ordinary A/B byte equality required, controlled reproducibility and hosted runtime qualification pending |
+| `ts-x86_64-unknown-linux-gnu` | GNU x86-64; UBI 9 builder; maximum required glibc 2.34; Debian 12, Ubuntu 22.04 and UBI 9 startup smokes                                                    |
+| `ts-aarch64-apple-darwin`     | macOS 15 Apple Silicon runner, deployment target 13.0; runtime compatibility qualification remains pending                                                  |
+| `ts-x86_64-apple-darwin`      | macOS 15 Intel runner, deployment target 13.0; runtime compatibility qualification remains pending                                                          |
 
 The build checks 64-bit Mach-O magic, target CPU and minimum macOS 13.0 load
 commands. Actual execution on macOS 13 remains later qualification. The
@@ -47,7 +48,7 @@ linking, tree-shaking or minification. The installed `prebid.js` package is a
 build-tree entry; the external Prebid bundle is not embedded in tsjs. Native
 C/assembly, system libraries, Rust's standard library and compiler runtimes do
 not have complete coverage. Exact retained-code attribution and complete native
-and tool closure remain Phase 2 work. An SBOM or provenance result is not a
+and tool closure remain later controlled-stage work. An SBOM or provenance result is not a
 vulnerability scan.
 
 ## Download and verify
@@ -67,7 +68,7 @@ approval.
 
 Run this in a new private directory, using Bash. Replace the fictional tag and
 commit. For rehearsal, change `REPO` to the approved public sandbox and use the
-individually approved, never-reused rehearsal tag.
+fresh lightweight, never-reused rehearsal tag.
 
 <!-- release-verification:start -->
 
@@ -94,21 +95,108 @@ for asset in "${ASSETS[@]}"; do
     if [[ "$kind" == sbom ]]; then jq -e --slurpfile sbom "$asset.spdx.json" '[.[].verificationResult.statement.predicate] | length == 1 and .[0] == $sbom[0]' "$asset.$kind.verified.json"; fi
   done
 done
+CHECK=trusted-server-fastly.wasm.rebuild-check.json
+gh release verify-asset "$TAG" "$CHECK" --repo "$REPO"
+gh attestation verify "$CHECK" --repo "$REPO" --bundle trusted-server-fastly.wasm.provenance.sigstore.json \
+  --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" --signer-digest "$COMMIT" \
+  --deny-self-hosted-runners --predicate-type https://slsa.dev/provenance/v1 --signer-workflow "$WORKFLOW"
+binary_sha=$(shasum -a 256 trusted-server-fastly.wasm | awk '{print $1}')
+jq -e --arg source "$COMMIT" --arg digest "$binary_sha" '.version == 1 and .profile == "ordinary-release-fastly-byte-equality-v1" and .release_qualification == false and .outcome == "matched" and .source_commit == $source and .asset == "trusted-server-fastly.wasm" and .canonical_sha256 == $digest and .reproduction_sha256 == $digest' "$CHECK"
 gh release verify-asset "$TAG" SHA256SUMS --repo "$REPO"
 shasum -a 256 --check SHA256SUMS
 ```
 
 <!-- release-verification:end -->
 
-Provenance covers the binary and its SPDX document; the SBOM attestation covers
-the binary. The verified SBOM predicate must equal the shipped SPDX document.
+Provenance covers the binary and its SPDX document, plus the rebuild check for
+Fastly; the SBOM attestation covers the binary. The verified SBOM predicate must equal the shipped SPDX document.
 `--signer-workflow` pins the reusable signer; with the source ref and both
 digests pinned to the reviewed tag and commit, it identifies the exact signing
 workflow run's source.
 
-The checksums cover the other 16 assets, never `SHA256SUMS` itself. Immutable
+The checksums cover the other 17 assets, never `SHA256SUMS` itself. Immutable
 release verification establishes membership; provenance establishes the
 reviewed signer and source. Both are required.
+
+## Fastly's ordinary rebuild check
+
+Merging Phase 2 activates the equality gate on the next real tag, using the
+existing publication enablement variable with no additional switch. Each release
+adds a second fresh Fastly build, after the first completes, and a read-only
+comparison. Both full final Wasm files must match byte for byte; a mismatch
+prevents all signing and publication. Debug information and custom sections are
+retained. The CLI binaries have no A/B release gate; native reproduction remains
+later measured coverage.
+
+The builds vary physical source/target directories, job count, umask and start
+time. Both receive the identical four-map target-scoped Cargo argument pair:
+their checkout roots map to `/trusted-server`, and their target roots map to
+`/cargo-target`. Normalized compiler source-path identity is intentionally
+shared. The retained argument bytes are checked against both observations, and
+the complete binaries are scanned for surviving physical paths. This is ordinary
+hosted equality, with `release_qualification:false`; controlled
+material/tool/boundary closure and an alternate user remain unqualified.
+
+`trusted-server-fastly.wasm.rebuild-check.json` is a third subject in the
+existing Fastly provenance bundle. Existing binary/SPDX commands and signer
+identity stay unchanged. Consumers must check the companion's `version` and
+`profile`, not infer controlled qualification from `outcome:"matched"`. Phase 3
+will index this same filename; later controlled evidence uses a different
+profile, with reviewed compatible joins or an explicit version change.
+
+To verify the companion through the online attestation store, omit the bundle
+and keep every identity/source constraint:
+
+```bash
+checks=(--repo "$REPO" --source-ref "refs/tags/$TAG" --source-digest "$COMMIT"
+  --signer-digest "$COMMIT" --deny-self-hosted-runners
+  --predicate-type https://slsa.dev/provenance/v1)
+gh attestation verify "$CHECK" "${checks[@]}" --signer-workflow "$WORKFLOW"
+```
+
+The same omission performs online lookup for each binary's provenance. For
+online SBOM lookup, first authenticate the published SPDX file with the
+release/asset checks above, then compare it only with results that `gh` has
+successfully verified with every existing pin:
+
+```bash
+set -euo pipefail
+checks=(--repo "$REPO" --source-ref "refs/tags/$TAG" --source-digest "$COMMIT"
+  --signer-digest "$COMMIT" --deny-self-hosted-runners
+  --predicate-type https://spdx.dev/Document/v2.3)
+for asset in "${ASSETS[@]}"; do
+  gh attestation verify "$asset" "${checks[@]}" --signer-workflow "$WORKFLOW" \
+    --format json > "$asset.online-sbom-verification.json"
+  jq -e --slurpfile document "$asset.spdx.json" \
+    'any(.[]; .verificationResult.statement.predicate == $document[0])' \
+    "$asset.online-sbom-verification.json"
+done
+```
+
+Reruns or retries of signing can leave more than one valid SBOM attestation for
+the same binary digest, in no guaranteed order. Require a verified predicate
+exactly equal to the authenticated published SPDX; do not choose the first or
+newest record. `any` over an empty array is false, and `jq -e` exits non-zero
+for an empty or nonmatching result. The published-bundle checks above and below
+retain their single-result comparison.
+
+For offline companion verification, first obtain its SHA-256 independently as
+`APPROVED_REBUILD_CHECK_SHA256SUMS`, then transfer the companion, Fastly
+provenance bundle and trusted roots:
+
+```bash
+shasum -a 256 --check APPROVED_REBUILD_CHECK_SHA256SUMS
+gh attestation verify "$CHECK" --repo "$REPO" --source-ref "refs/tags/$TAG" \
+  --source-digest "$COMMIT" --signer-digest "$COMMIT" --deny-self-hosted-runners \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  --bundle trusted-server-fastly.wasm.provenance.sigstore.json \
+  --custom-trusted-root trusted_root.jsonl --signer-workflow "$WORKFLOW"
+```
+
+Acquire the roots as described below before disconnecting. Keep the companion's
+profile/source/binary-digest check and the separate online immutable-membership
+record with the deployment evidence. A partial rerun fails closed on old-attempt
+evidence; an existing immutable release is refused rather than published again.
 
 Stop if any check fails. Keep the outputs, reviewed source identity, bundles
 and checksums with your deployment record. These checks do not approve a
@@ -201,6 +289,14 @@ push configuration, implement staging, or supply recovery guarantees.
 
 From the private directory:
 
+The canonical Fastly CI job also exercises this route on its freshly built wasm,
+using the `.tool-versions` CLI version and a source-pinned archive checksum.
+After downloading the CLI, it clears inherited credentials and runs in a
+network namespace with no active interfaces or retained capabilities. CLI
+configuration and caches live only in the job's fresh temporary directory.
+The job logs pack, validation, strict archive inspection and both byte comparisons;
+the rehearsal transcript links that job. No deployment command is run.
+
 ```bash
 fastly compute pack --wasm-binary ./trusted-server-fastly.wasm
 fastly compute validate --package ./pkg/example-app.tar.gz
@@ -288,9 +384,9 @@ a backport release to Latest. Whether to authorize tags from rc branches is a
 maintainer decision; Phase 1 does not validate branch ancestry or rulesets.
 
 Before creating anything, the publisher runs `gh attestation verify` for every
-binary and predicate against the signing bundles it is about to publish, with
-the same pins as the commands above, and requires each signed SBOM predicate to
-equal the shipped SPDX document. A failure there creates nothing.
+binary and predicate, and for the Fastly rebuild check, against the signing
+bundles it is about to publish, with the same pins as the commands above, and
+requires each signed SBOM predicate to equal the shipped SPDX document. A failure there creates nothing.
 
 Publication then lists releases, including drafts, and refuses every existing
 matching tag. It creates one draft, logs and retains its release ID, and binds
@@ -383,6 +479,7 @@ for asset in "${ASSETS[@]}"; do
     gh release verify-asset "$TAG" "$asset$suffix" --repo "$REPO"
   done
 done
+gh release verify-asset "$TAG" trusted-server-fastly.wasm.rebuild-check.json --repo "$REPO"
 gh release verify-asset "$TAG" SHA256SUMS --repo "$REPO"
 shasum -a 256 --check SHA256SUMS
 ```

@@ -1,0 +1,3 @@
+0example-app v0.1.0 (/build/source/app)
+1example-host-helper v0.1.0 (/build/source/host-helper)
+2example-host-unix v0.1.0 (/build/source/host-unix)

@@ -1,0 +1,140 @@
+{
+  "artifacts": [
+    {
+      "actions": ["readonly-verify"],
+      "assurance_profile": "provenance-sbom-repeatable",
+      "bin": "trusted-server-adapter-fastly",
+      "capabilities": ["fastly-production"],
+      "compatibility": {
+        "architecture": "wasm32",
+        "minimum_version": "wasip1",
+        "runtime": "fastly-compute"
+      },
+      "default_features": true,
+      "features": [],
+      "kind": "wasm-core",
+      "name": "trusted-server-fastly.wasm",
+      "package": "trusted-server-adapter-fastly",
+      "role": "server",
+      "target": "wasm32-wasip1",
+      "variant": "default"
+    },
+    {
+      "actions": ["readonly-verify"],
+      "assurance_profile": "provenance-sbom",
+      "bin": "ts",
+      "capabilities": ["cli-execute"],
+      "compatibility": {
+        "architecture": "aarch64",
+        "minimum_version": "13.0",
+        "runtime": "macos"
+      },
+      "default_features": true,
+      "features": [],
+      "kind": "native-executable",
+      "name": "ts-aarch64-apple-darwin",
+      "package": "trusted-server-cli",
+      "role": "operator-cli",
+      "target": "aarch64-apple-darwin",
+      "variant": "default"
+    },
+    {
+      "actions": ["readonly-verify"],
+      "assurance_profile": "provenance-sbom",
+      "bin": "ts",
+      "capabilities": ["cli-execute"],
+      "compatibility": {
+        "architecture": "x86_64",
+        "minimum_version": "13.0",
+        "runtime": "macos"
+      },
+      "default_features": true,
+      "features": [],
+      "kind": "native-executable",
+      "name": "ts-x86_64-apple-darwin",
+      "package": "trusted-server-cli",
+      "role": "operator-cli",
+      "target": "x86_64-apple-darwin",
+      "variant": "default"
+    },
+    {
+      "actions": ["readonly-verify"],
+      "assurance_profile": "provenance-sbom",
+      "bin": "ts",
+      "capabilities": ["cli-execute"],
+      "compatibility": {
+        "architecture": "x86_64",
+        "minimum_version": "glibc-2.34",
+        "runtime": "linux-gnu"
+      },
+      "default_features": true,
+      "features": [],
+      "kind": "native-executable",
+      "name": "ts-x86_64-unknown-linux-gnu",
+      "package": "trusted-server-cli",
+      "role": "operator-cli",
+      "target": "x86_64-unknown-linux-gnu",
+      "variant": "default"
+    }
+  ],
+  "bounds": {
+    "attempt_seconds": 900,
+    "bundle_bytes": 33554432,
+    "child_seconds": 120,
+    "cohort_executables": 4,
+    "companion_bytes": 33554432,
+    "executable_bytes": 536870912,
+    "index_bytes": 1048576,
+    "inventory_bytes": 1048576,
+    "json_depth": 64,
+    "matching_attestations_per_bundle": 1,
+    "metadata_bytes": 1048576,
+    "policy_bytes": 1048576,
+    "spdx_bytes": 16777216,
+    "stderr_bytes": 1048576,
+    "stdout_bytes": 134217728,
+    "trusted_roots_bytes": 1048576
+  },
+  "cohort": "phase1-fastly-cli",
+  "github_host": "github.com",
+  "historical_producer_policies": [],
+  "identity": {
+    "builder_id": "https://github.com/IABTechLab/trusted-server/.github/workflows/release-build.yml@refs/tags/<tag>",
+    "caller_commit": "same-approved-source-commit",
+    "caller_path": ".github/workflows/release.yml",
+    "caller_repository": "https://github.com/IABTechLab/trusted-server",
+    "certificate_fields": [
+      "buildConfigDigest",
+      "buildConfigURI",
+      "buildTrigger",
+      "runInvocationURI",
+      "sourceRepositoryIdentifier",
+      "sourceRepositoryOwnerIdentifier"
+    ],
+    "certificate_san": "https://github.com/IABTechLab/trusted-server/.github/workflows/release-build.yml@refs/tags/<tag>",
+    "event": "push",
+    "external_parameters": "exact-caller-workflow-only-no-inputs",
+    "invocation": "same-repository-run-and-attempt-across-certificate-and-provenance",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "runner": "github-hosted",
+    "signer_commit": "same-approved-source-commit",
+    "source_commit": "independently-approved-40-lowercase-hex",
+    "source_dependency": "git+https://github.com/IABTechLab/trusted-server@refs/tags/<tag>",
+    "source_ref": "refs/tags/<tag>"
+  },
+  "policy_version": 1,
+  "predicates": {
+    "build_type": "https://actions.github.io/buildtypes/workflow/v1",
+    "provenance": "https://slsa.dev/provenance/v1",
+    "sbom": "https://spdx.dev/Document/v2.3"
+  },
+  "public_actions": ["readonly-verify"],
+  "repository": "IABTechLab/trusted-server",
+  "repository_id": "950860906",
+  "repository_owner_id": "82903538",
+  "tool_versions": {
+    "actions_attest": "4.2.2",
+    "actions_attest_revision": "1e69f48acb82d1966a394da916b4c1698aa569d6",
+    "gh": "2.97.0"
+  }
+}

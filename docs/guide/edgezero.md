@@ -71,10 +71,19 @@ store before deletion, especially when using `--store` or `--no-env`.
 4. Run `ts config push --adapter ADAPTER`.
 5. Start or deploy the adapter and verify a non-health publisher route. A
    healthy endpoint alone may not prove that application configuration loaded.
-   Confirm that its `x-ts-version` response header reports the release you
-   deployed.
+   Confirm that its `x-ts-version` response header reports the source identity
+   you deployed. A canonical attested release uses the approved full source
+   commit; its external release tag is recorded in immutable release metadata.
+   Development source builds retain the override/tag/branch/short-commit
+   display fallback. The header alone does not verify artifact provenance.
 
 See [Configuration](/guide/configuration) for the field contract, the
 [CLI guide](/guide/cli) for exact command help, and
 [deployment guides](/guide/integrations-overview#adapter-support) for target
 behavior.
+
+Canonical Fastly release consumption has a separate
+[manual verified-byte procedure](/guide/release-verification#deploy-the-verified-fastly-wasm).
+Integrated attested deployment with preactivation checks and staging isolation
+remains separate work; the managed source/application-release path is not proof
+those guarantees exist.

@@ -1,0 +1,554 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/release/qualification-results-v1.schema.json",
+  "title": "Disposable release environment observations (not qualification authority)",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "purpose": {
+      "const": "disposable-rehearsal-observation"
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "closure_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "selection_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "raw_tools_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "dependency_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*$"
+        },
+        "owner_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*$"
+        },
+        "run_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*$"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "job": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "runner": {
+          "const": "github-hosted"
+        }
+      },
+      "required": [
+        "repository_id",
+        "owner_id",
+        "run_id",
+        "attempt",
+        "job",
+        "runner"
+      ]
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "environment_id": {
+          "enum": ["gnu-builder-x86_64", "macos15-aarch64", "macos15-x86_64"]
+        },
+        "kind": {
+          "enum": ["oci-builder", "github-hosted-macos"]
+        },
+        "architecture": {
+          "enum": ["aarch64", "x86_64"]
+        },
+        "kernel_architecture": {
+          "enum": ["aarch64", "x86_64"]
+        },
+        "os_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "translated": {
+          "type": "boolean"
+        },
+        "runner_image_version": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "oci_index_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "oci_manifest_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "glibc_version": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "identity_log_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "environment_id",
+        "kind",
+        "architecture",
+        "kernel_architecture",
+        "os_version",
+        "translated",
+        "runner_image_version",
+        "oci_index_sha256",
+        "oci_manifest_sha256",
+        "glibc_version",
+        "identity_log_sha256"
+      ]
+    },
+    "sdk": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": ["apple-sdk", "gnu-sysroot"]
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "build_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "tree_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "vendor_evidence_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "kind",
+        "version",
+        "build_version",
+        "tree_sha256",
+        "vendor_evidence_sha256"
+      ]
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "version": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "file_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "archive_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "tree_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "authentication": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "method": {
+                "enum": [
+                  "vendor-signature",
+                  "github-attestation",
+                  "hosted-platform-sdk"
+                ]
+              },
+              "evidence_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "trust_root_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            },
+            "required": ["method", "evidence_sha256", "trust_root_sha256"]
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "file_sha256",
+          "archive_sha256",
+          "tree_sha256",
+          "authentication"
+        ]
+      },
+      "maxItems": 32
+    },
+    "recipe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "enum": [
+            "ts-aarch64-apple-darwin",
+            "ts-x86_64-apple-darwin",
+            "ts-x86_64-unknown-linux-gnu",
+            "trusted-server-fastly.wasm",
+            "tsjs"
+          ]
+        },
+        "boundary_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "preparation_log_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "compile_log_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "native_log_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "exit_code": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "full_recipe": {
+          "type": "boolean"
+        },
+        "same_boundary": {
+          "type": "boolean"
+        },
+        "executable_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "native_materials_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "deployment_target": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "glibc_symbols": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "maxItems": 8192
+        },
+        "unconfined": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "depth": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 2
+              },
+              "family": {
+                "enum": ["ipv4", "ipv6", "unix"]
+              },
+              "operation": {
+                "enum": ["bind", "connect", "send", "exchange"]
+              },
+              "destination": {
+                "enum": ["loopback", "external", "private"]
+              },
+              "outcome": {
+                "enum": ["allowed", "denied", "unavailable"]
+              },
+              "errno": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "phase": {
+                "enum": ["socket", "bind", "connect", "send", "exchange"]
+              },
+              "protocol": {
+                "enum": ["tcp", "udp", "unix"]
+              }
+            },
+            "required": [
+              "depth",
+              "family",
+              "operation",
+              "destination",
+              "outcome",
+              "errno",
+              "phase",
+              "protocol"
+            ]
+          },
+          "maxItems": 75
+        },
+        "confined": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "depth": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 2
+              },
+              "family": {
+                "enum": ["ipv4", "ipv6", "unix"]
+              },
+              "operation": {
+                "enum": ["bind", "connect", "send", "exchange"]
+              },
+              "destination": {
+                "enum": ["loopback", "external", "private"]
+              },
+              "outcome": {
+                "enum": ["allowed", "denied", "unavailable"]
+              },
+              "errno": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "phase": {
+                "enum": ["socket", "bind", "connect", "send", "exchange"]
+              },
+              "protocol": {
+                "enum": ["tcp", "udp", "unix"]
+              }
+            },
+            "required": [
+              "depth",
+              "family",
+              "operation",
+              "destination",
+              "outcome",
+              "errno",
+              "phase",
+              "protocol"
+            ]
+          },
+          "maxItems": 75
+        },
+        "download_attempts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cargo": {
+              "enum": ["denied", "allowed", "unavailable"]
+            },
+            "npm": {
+              "enum": ["denied", "allowed", "unavailable"]
+            },
+            "missing_tool": {
+              "enum": ["failed", "succeeded", "unavailable"]
+            }
+          },
+          "required": ["cargo", "npm", "missing_tool"]
+        }
+      },
+      "required": [
+        "id",
+        "boundary_sha256",
+        "preparation_log_sha256",
+        "compile_log_sha256",
+        "native_log_sha256",
+        "exit_code",
+        "full_recipe",
+        "same_boundary",
+        "executable_sha256",
+        "native_materials_sha256",
+        "deployment_target",
+        "glibc_symbols",
+        "unconfined",
+        "confined",
+        "download_attempts"
+      ]
+    },
+    "runtime": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "environment_id": {
+            "enum": [
+              "ubi9-x86_64",
+              "ubuntu22.04-x86_64",
+              "debian12-x86_64",
+              "macos15-aarch64",
+              "macos15-x86_64",
+              "fastly-viceroy",
+              "js-pair"
+            ]
+          },
+          "architecture": {
+            "enum": ["aarch64", "x86_64", "wasm32"]
+          },
+          "os_version": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "outside_checkout": {
+            "type": "boolean"
+          },
+          "exit_code": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "kind": {
+            "enum": [
+              "cli-startup",
+              "publisher-request",
+              "js-tests-and-equality"
+            ]
+          },
+          "executable_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "executable_after_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "log_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "response_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "environment_id",
+          "architecture",
+          "os_version",
+          "outside_checkout",
+          "exit_code",
+          "kind",
+          "executable_sha256",
+          "executable_after_sha256",
+          "log_sha256",
+          "response_sha256"
+        ]
+      },
+      "maxItems": 8
+    }
+  },
+  "required": [
+    "schema_version",
+    "purpose",
+    "source_commit",
+    "closure_sha256",
+    "selection_sha256",
+    "raw_tools_sha256",
+    "dependency_sha256",
+    "run",
+    "host",
+    "sdk",
+    "tools",
+    "recipe",
+    "runtime"
+  ]
+}

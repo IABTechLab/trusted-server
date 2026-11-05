@@ -1,0 +1,12 @@
+[package]
+name = "macro-attempt"
+edition.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lib]
+proc-macro = true
+
+[[bin]]
+name = "macro-attempt"
+path = "src/main.rs"

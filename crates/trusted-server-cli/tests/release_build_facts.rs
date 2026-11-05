@@ -74,11 +74,27 @@ fn actual_owner_scripts_emit_only_own_target() {
             )
             .expect("should emit UTF-8 directives"),
         );
-        for directives in &outputs {
+        for (index, directives) in outputs.iter().enumerate() {
+            // Only the CLI selects release-only resource discovery, for the two
+            // release runs.
+            let cli_cfg = match (owner, index) {
+                ("trusted-server-cli", 2) => {
+                    "cargo:rerun-if-env-changed=TRUSTED_SERVER__RELEASE_BUILD\n\
+                     cargo:rustc-check-cfg=cfg(trusted_server_release_build)\n"
+                }
+                ("trusted-server-cli", _) => {
+                    "cargo:rerun-if-env-changed=TRUSTED_SERVER__RELEASE_BUILD\n\
+                     cargo:rustc-check-cfg=cfg(trusted_server_release_build)\n\
+                     cargo:rustc-cfg=trusted_server_release_build\n"
+                }
+                _ => "",
+            };
             assert_eq!(
                 directives,
-                "cargo:rerun-if-changed=build.rs\n\
-                 cargo:rustc-env=TRUSTED_SERVER__BUILD_TARGET=example-target\n",
+                &format!(
+                    "cargo:rerun-if-changed=build.rs\n{cli_cfg}\
+                     cargo:rustc-env=TRUSTED_SERVER__BUILD_TARGET=example-target\n"
+                ),
                 "should emit only the target owned by Cargo TARGET for {owner}"
             );
         }

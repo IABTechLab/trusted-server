@@ -20,16 +20,13 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'vite';
 
 import { buildTraceAssets } from './build-trace.mjs';
 import { moduleBuildOptions } from './build-module-options.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const srcDir = path.resolve(__dirname, 'src');
-const distDir = resolveOutDir(process.argv.slice(2));
-const integrationsDir = path.join(srcDir, 'integrations');
 
 /** Resolve `--out-dir <dir>` (relative to the cwd), defaulting to ../dist. */
 function resolveOutDir(args) {
@@ -44,54 +41,95 @@ function resolveOutDir(args) {
   return path.resolve(value);
 }
 
-// Remove only the bundles this script writes, so a wrong --out-dir cannot
-// delete unrelated files.
-fs.mkdirSync(distDir, { recursive: true });
-for (const name of fs.readdirSync(distDir)) {
-  if (name.startsWith('tsjs-') && name.endsWith('.js')) {
-    fs.rmSync(path.join(distDir, name));
+/** Build the discovered modules; recording is opt-in and cannot change bundle bytes. */
+export async function buildAll({
+  outDir,
+  composition,
+  sourceDir = path.resolve(__dirname, 'src'),
+}) {
+  const srcDir = sourceDir;
+  const distDir = path.resolve(outDir);
+  const integrationsDir = path.join(srcDir, 'integrations');
+  const records = [];
+
+  // Remove only the bundles this script writes, so a wrong --out-dir cannot
+  // delete unrelated files.
+  fs.mkdirSync(distDir, { recursive: true });
+  for (const name of fs.readdirSync(distDir)) {
+    if (name.startsWith('tsjs-') && name.endsWith('.js')) {
+      fs.rmSync(path.join(distDir, name));
+    }
   }
+
+  // Discover integration modules: directories in src/integrations/ with index.ts
+  const integrationModules = fs.existsSync(integrationsDir)
+    ? fs
+        .readdirSync(integrationsDir)
+        .filter((name) => {
+          const fullPath = path.join(integrationsDir, name);
+          return (
+            fs.statSync(fullPath).isDirectory() && fs.existsSync(path.join(fullPath, 'index.ts'))
+          );
+        })
+        .sort()
+    : [];
+
+  console.log('[build-all] Discovered integrations:', integrationModules);
+
+  /** Build a single module as a self-contained IIFE. */
+  async function buildModule(name, entryPath) {
+    const outFile = `tsjs-${name}.js`;
+    console.log(`[build-all] Building ${outFile} from ${path.relative(__dirname, entryPath)}`);
+
+    let contributions;
+    const recording = composition
+      ? {
+          ...composition,
+          onContributions: (rows) => {
+            contributions = rows;
+          },
+        }
+      : undefined;
+    await build(moduleBuildOptions({ name, entryPath, outDir: distDir, composition: recording }));
+    records.push({ id: name, filename: outFile, contributions });
+
+    console.log(`[build-all] Built ${outFile}`);
+  }
+
+  // Build core first (synchronously), then all integrations in parallel
+  await buildModule('core', path.join(srcDir, 'core', 'index.ts'));
+
+  await Promise.all(
+    integrationModules.map((name) =>
+      buildModule(name, path.join(integrationsDir, name, 'index.ts'))
+    )
+  );
+
+  // List all built files
+  const builtFiles = fs
+    .readdirSync(distDir)
+    .filter((f) => f.startsWith('tsjs-') && f.endsWith('.js'))
+    .sort();
+
+  console.log('[build-all] Built files:', builtFiles);
+  console.log(`[build-all] Total: ${builtFiles.length} modules`);
+
+  return records.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-// Discover integration modules: directories in src/integrations/ with index.ts
-const integrationModules = fs.existsSync(integrationsDir)
-  ? fs
-      .readdirSync(integrationsDir)
-      .filter((name) => {
-        const fullPath = path.join(integrationsDir, name);
-        return (
-          fs.statSync(fullPath).isDirectory() && fs.existsSync(path.join(fullPath, 'index.ts'))
-        );
-      })
-      .sort()
-  : [];
-
-console.log('[build-all] Discovered integrations:', integrationModules);
-
-/** Build a single module as a self-contained IIFE. */
-async function buildModule(name, entryPath) {
-  const outFile = `tsjs-${name}.js`;
-  console.log(`[build-all] Building ${outFile} from ${path.relative(__dirname, entryPath)}`);
-
-  await build(moduleBuildOptions({ name, entryPath, outDir: distDir }));
-
-  console.log(`[build-all] Built ${outFile}`);
+// Node before 24.2 leaves `import.meta.main` undefined, which would skip the build silently.
+if (import.meta.main === undefined) {
+  throw new Error('[build-all] requires Node.js 24.2 or later; use the .tool-versions version');
 }
-
-// Build core first (synchronously), then all integrations in parallel
-await buildModule('core', path.join(srcDir, 'core', 'index.ts'));
-
-await Promise.all(
-  integrationModules.map((name) => buildModule(name, path.join(integrationsDir, name, 'index.ts')))
-);
-
-await buildTraceAssets(distDir);
-
-// List all built files
-const builtFiles = fs
-  .readdirSync(distDir)
-  .filter((f) => f.startsWith('tsjs-') && f.endsWith('.js'))
-  .sort();
-
-console.log('[build-all] Built files:', builtFiles);
-console.log(`[build-all] Total: ${builtFiles.length} modules`);
+if (import.meta.main) {
+  if (
+    !process.argv[1] ||
+    import.meta.url !== pathToFileURL(fs.realpathSync(process.argv[1])).href
+  ) {
+    throw new Error('build-all entrypoint identity check failed');
+  }
+  const outDir = resolveOutDir(process.argv.slice(2));
+  await buildAll({ outDir });
+  // The trace viewer is independent of the bundles, so release collection skips it.
+  await buildTraceAssets(outDir);
+}

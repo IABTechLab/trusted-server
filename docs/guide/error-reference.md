@@ -620,7 +620,11 @@ TSJS_PREBUILT_DIR="$PWD/crates/trusted-server-js/dist" cargo build-fastly
 ```
 
 `TSJS_PREBUILT_DIR` is checked the same way as a normal build: every expected
-bundle must be present and non-empty. `TSJS_SKIP_BUILD` is no longer supported.
+bundle must be present and non-empty. Inventory-absent development builds keep
+unrelated non-bundle entries such as an external Prebid directory. Rust Cargo
+builds reject ANY presence of `TSJS_SKIP_BUILD`, including empty, `0` and `1`.
+Node development build/Vitest entry points preserve development behavior when
+`TRUSTED_SERVER__RELEASE_BUILD` is absent.
 
 ---
 
@@ -635,14 +639,45 @@ writes.
 | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `tsjs: npm not found on PATH`                                    | Node.js is not installed or not on `PATH`. Install Node.js, or set `TSJS_PREBUILT_DIR` as shown above.                                                                                                                             |
 | `tsjs: TSJS_PREBUILT_DIR must be an absolute path`               | Cargo runs build scripts from `crates/trusted-server-js`, so a relative path would resolve there. Pass an absolute path, for example `"$PWD/crates/trusted-server-js/dist"`.                                                       |
-| `tsjs: TSJS_SKIP_BUILD is no longer supported`                   | `TSJS_SKIP_BUILD=1` no longer skips the build. Unset it and use `TSJS_PREBUILT_DIR` instead.                                                                                                                                       |
+| `tsjs: TSJS_SKIP_BUILD is no longer supported whenever present`  | Any present value, including empty, `0` or `1`, fails Rust Cargo builds. Unset it and use `TSJS_PREBUILT_DIR` instead.                                                                                                             |
 | `tsjs: node_modules is out of date with package-lock.json`       | Dependencies changed, for example after switching branches. Run `npm ci` in `crates/trusted-server-js/lib`. The check compares file times, so a checkout that rewrites an unchanged lockfile also triggers it; `npm ci` clears it. |
 | `tsjs: npm ci failed`                                            | `node_modules` was missing and the automatic install failed. Run `npm ci` in `crates/trusted-server-js/lib` to see the error.                                                                                                      |
 | `tsjs: invalid bundle set ... missing bundles` / `empty bundles` | The Node build or the `TSJS_PREBUILT_DIR` directory did not produce one `tsjs-<id>.js` per `core` and `lib/src/integrations/<id>/index.ts`.                                                                                        |
 | `tsjs: invalid bundle set ... unexpected bundles`                | `TSJS_PREBUILT_DIR` holds bundles from a different source tree. Rebuild it with `npm run build`.                                                                                                                                   |
 
+When `TRUSTED_SERVER__RELEASE_BUILD=1`, the source must be a full lowercase
+40-character `TRUSTED_SERVER__GIT_VERSION`; missing/malformed source and other
+present release-control values fail without Git fallback. Ordinary release builds run npm and generate fresh private bundles; their release
+script refuses prebuilt overrides. An explicitly selected prebuilt release path
+requires both absolute `TSJS_PREBUILT_DIR` and
+`TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY` paths and does not run npm.
+
+Canonical `x-ts-version` reports that full source commit, while the external
+release tag belongs to immutable release metadata. Development builds retain the
+override/tag/branch/short-commit display fallback. The header alone does not
+authenticate executable bytes; use [release verification](/guide/release-verification).
+
+| Error message contains                                                                       | Cause and fix                                                                                                                                                   |
+| -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tsjs: release builds require TSJS_PREBUILT_DIR` / `TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY` | Supply both absolute paths from the checked producer output.                                                                                                    |
+| `tsjs: TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY requires TSJS_PREBUILT_DIR`                   | An inventory cannot select bundles without a prebuilt directory.                                                                                                |
+| `tsjs: TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY must be an absolute path`                     | Pass the absolute sibling inventory pathname.                                                                                                                   |
+| `tsjs: invalid inventory path`                                                               | Inventory must be outside the exact bundle directory and a regular single-link file.                                                                            |
+| `tsjs: invalid inventory` / `invalid prebuilt inventory inputs`                              | Fix source/module order, byte sizes/digests or unsafe entries. The checked path rejects bundle links, hard links, empty/extra entries and changed copied bytes. |
+
+Inventory-present development builds use the same strict checked path; the
+inventory validates its own source syntax/hash, while the development source
+display label is not compared with its commit. Strict checked-copy support is
+Linux/macOS; inventory-absent development follows the existing portable path.
+The exact raw inventory digest is exposed as
+`TRUSTED_SERVER__TSJS_INVENTORY_SHA256` for composition evidence.
+
 Set `TSJS_TEST=1` to run the TypeScript tests before the build; a failing test
-fails the build.
+fails the build. Controlled JS preparation still pins esbuild 0.27.3 while the
+current lock selects 0.28.2. Its full collector fixture is visibly disabled, and
+`TRUSTED_SERVER__RELEASE_JS_TESTS=1` fails against the unsupported lock. Ordinary
+release builds and the Gate 1 Fastly A/B adapter do not use that observer. See the
+[compatibility gap](https://github.com/IABTechLab/trusted-server/blob/b2cde8be6a061c17edf6b4ad1f2c3884fbd7121d/docs/superpowers/plans/binary-attestations-phase1-compatibility.md#controlled-js-observer-gap).
 
 ---
 
