@@ -298,7 +298,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 .filter(|record| record.is_provider_written());
             // A UID whose provider asked for a refresh makes its source due;
             // the stored refresh state is the lookup's input.
-            if record.is_some_and(|record| record.refresh_due(now)) {
+            if record.is_some_and(|record| record.refresh_due_for(&registered.id, now)) {
                 due.push(source.clone());
                 continue;
             }
@@ -514,7 +514,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 client: lookup.client,
                 publisher_domain: lookup.publisher_domain,
                 due_sources: &due,
-                current: OwnedEntries::new(entry, &registered.policy.sources),
+                current: OwnedEntries::new(entry, &registered.policy.sources, &registered.id),
                 hashed_email: None,
             };
             if let Some(eids) = registered.provider.generate(&input) {
@@ -1282,11 +1282,15 @@ mod tests {
     }
 
     fn refreshable_record(from: u64) -> KvPartnerId {
+        refreshable_record_owned_by("example-provider", from)
+    }
+
+    fn refreshable_record_owned_by(owner: &str, from: u64) -> KvPartnerId {
         let uid = KvUid::new(
             UidValue::try_from("p-1").expect("should build uid"),
             AgentType::try_from(1).expect("should build atype"),
             None,
-            Some(ProviderId::new("example-provider")),
+            Some(ProviderId::new(owner)),
             Expiry::At(UnixSeconds::new(5000)),
         )
         .with_refresh(KvRefresh {
@@ -1344,6 +1348,33 @@ mod tests {
             "should not refresh before the refresh time"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn another_providers_refresh_state_is_never_handed_over() {
+        // Arrange: a live UID with due refresh state written by a provider that
+        // no longer owns the source.
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record_owned_by("former-provider", 900)),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NotDue),
+            "should not refresh a UID another provider wrote"
+        );
+        assert!(
+            transport.sent.borrow().is_empty(),
+            "should not send another provider's refresh state"
+        );
     }
 
     fn optout_reply() -> Result<TransportResponse, Report<TransportError>> {

@@ -157,13 +157,16 @@ impl KvPartnerId {
         !self.eids.is_empty()
     }
 
-    /// Whether a UID in the record asks its provider for a refresh by `now`.
+    /// Whether a UID `owner` wrote asks it for a refresh by `now`.
+    ///
+    /// UIDs another provider wrote never make the record refresh-due for
+    /// `owner`, so their refresh state is never handed to it.
     #[must_use]
-    pub fn refresh_due(&self, now: UnixSeconds) -> bool {
+    pub fn refresh_due_for(&self, owner: &ProviderId, now: UnixSeconds) -> bool {
         self.eids
             .iter()
             .flat_map(KvEid::uids)
-            .any(|uid| uid.refresh_due(now))
+            .any(|uid| uid.owner() == Some(owner) && uid.refresh_due(now))
     }
 
     /// Whether the record holds a UID that may be served at `now`.

@@ -22,7 +22,7 @@ use serde_json::value::RawValue;
 use url::Url;
 
 use crate::consent::ConsentContext;
-use crate::ec::eid_types::{SourceDomain, UnixSeconds};
+use crate::ec::eid_types::{ProviderId, SourceDomain, UnixSeconds};
 use crate::ec::kv_types::{KvEid, KvEntry};
 use crate::ec::registry::PartnerRegistry;
 use crate::settings::{IdentityProviderConfig, ProviderSecrets};
@@ -170,27 +170,46 @@ pub struct ClientSignals<'a> {
 }
 
 /// This provider's stored entries, borrowed from the row.
+///
+/// Only entries whose every UID this provider wrote are visible, so another
+/// provider's refresh state never reaches it.
 #[derive(Debug, Clone, Copy)]
 pub struct OwnedEntries<'a> {
     entry: Option<&'a KvEntry>,
     sources: &'a [SourceDomain],
+    owner: &'a ProviderId,
 }
 
 impl<'a> OwnedEntries<'a> {
-    /// Views the entries of `entry` for `sources`.
+    /// Views the entries of `entry` for `sources` that `owner` wrote.
     #[must_use]
-    pub fn new(entry: Option<&'a KvEntry>, sources: &'a [SourceDomain]) -> Self {
-        Self { entry, sources }
+    pub fn new(
+        entry: Option<&'a KvEntry>,
+        sources: &'a [SourceDomain],
+        owner: &'a ProviderId,
+    ) -> Self {
+        Self {
+            entry,
+            sources,
+            owner,
+        }
     }
 
     /// Iterates `(source, entry)` pairs in source order.
     pub fn iter(&self) -> impl Iterator<Item = (&'a str, &'a KvEid)> + 'a {
         let entry = self.entry;
+        let owner = self.owner;
         self.sources.iter().flat_map(move |source| {
             entry
                 .and_then(|entry| entry.ids.get_key_value(source.as_str()))
                 .into_iter()
-                .flat_map(|(key, record)| record.eids().iter().map(move |eid| (key.as_str(), eid)))
+                .flat_map(move |(key, record)| {
+                    record
+                        .eids()
+                        .iter()
+                        .filter(move |eid| eid.uids().iter().all(|uid| uid.owner() == Some(owner)))
+                        .map(move |eid| (key.as_str(), eid))
+                })
         })
     }
 }
@@ -705,14 +724,15 @@ mod tests {
             "consent": { "ok": true, "updated": 1 },
             "geo": { "country": "US" },
             "ids": {
-                "ids.example.com": { "uid": "u-1", "eids": [{ "uids": [{ "id": "u-1", "atype": 3 }] }] },
-                "other.example.com": { "uid": "u-2", "eids": [{ "uids": [{ "id": "u-2", "atype": 3 }] }] }
+                "ids.example.com": { "uid": "u-1", "eids": [{ "uids": [{ "id": "u-1", "atype": 3, "owner": "example-provider" }] }] },
+                "other.example.com": { "uid": "u-2", "eids": [{ "uids": [{ "id": "u-2", "atype": 3, "owner": "example-provider" }] }] }
             }
         }))
         .expect("should build entry");
         let sources = [SourceDomain::try_from("ids.example.com").expect("should parse")];
+        let owner = ProviderId::new("example-provider");
 
-        let owned: Vec<&str> = OwnedEntries::new(Some(&entry), &sources)
+        let owned: Vec<&str> = OwnedEntries::new(Some(&entry), &sources, &owner)
             .iter()
             .map(|(source, _)| source)
             .collect();
@@ -722,5 +742,30 @@ mod tests {
             ["ids.example.com"],
             "should yield owned sources only"
         );
+    }
+
+    #[test]
+    fn owned_entries_hides_entries_another_provider_wrote() {
+        let entry: KvEntry = serde_json::from_value(json!({
+            "v": 1,
+            "created": 1,
+            "consent": { "ok": true, "updated": 1 },
+            "geo": { "country": "US" },
+            "ids": {
+                "ids.example.com": { "uid": "u-1", "eids": [
+                    { "uids": [{ "id": "u-1", "atype": 3, "owner": "former-provider" }] },
+                    { "uids": [{ "id": "u-2", "atype": 3 }] }
+                ] }
+            }
+        }))
+        .expect("should build entry");
+        let sources = [SourceDomain::try_from("ids.example.com").expect("should parse")];
+        let owner = ProviderId::new("example-provider");
+
+        let count = OwnedEntries::new(Some(&entry), &sources, &owner)
+            .iter()
+            .count();
+
+        assert_eq!(count, 0, "should hide entries this provider did not write");
     }
 }
