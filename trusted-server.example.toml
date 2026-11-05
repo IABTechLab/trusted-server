@@ -125,7 +125,9 @@ pull_sync_concurrency = 3
 # Each source needs an [[ec.partners]] entry and must be claimed by only one
 # enabled provider.
 # sources = ["ids.example.com"]
-# Optional: require TCF vendor consent for this provider.
+# Optional: require TCF vendor consent for this provider. Set it to the
+# vendor's IAB Global Vendor List ID for every kind whose vendor is registered
+# there; without it, GDPR traffic is gated only by the purpose consents.
 # tcf_vendor_id = 9999
 # Optional: "page" (default) or "after_response". Keep cookie-only kinds on "page".
 # collect = "page"
@@ -267,7 +269,7 @@ pull_sync_concurrency = 3
 # `_pubcid_optout` cookie suppresses it. Takes exactly one source. When no
 # cookie holds an ID and none is stored, Trusted Server generates a random
 # UUID and stores it in the row only (no cookie is set); a later Prebid cookie
-# replaces it.
+# replaces it. SharedID is the publisher's own ID, so it has no TCF vendor.
 # [[ec.identity_providers]]
 # id = "sharedid"
 # kind = "sharedid"
@@ -284,6 +286,7 @@ pull_sync_concurrency = 3
 # kind = "criteo"
 # enabled = false
 # sources = ["criteo.example.com"]
+# tcf_vendor_id = 9999
 # [ec.identity_providers.settings]
 # cookie_names = ["cto_bidid"]
 #
@@ -297,6 +300,7 @@ pull_sync_concurrency = 3
 # kind = "unifiedid"
 # enabled = false
 # sources = ["unifiedid.example.com"]
+# tcf_vendor_id = 9999
 # [ec.identity_providers.settings]
 # cookie_names = ["pbjs-unifiedid"]
 
