@@ -24,7 +24,8 @@
 //! usable UID is ignored and the lookup runs as usual. A cookie holding
 //! ID5's opt-out (a bare `0`, or a reply whose `universal_uid` is `0`)
 //! reports an opt-out: the lookup is skipped and stored ID5 UIDs are
-//! removed.
+//! removed. A fetch reply whose `universal_uid` is `0` reports the same
+//! opt-out.
 //!
 //! The request field names for the client IP and user agent follow ID5's
 //! server-to-server integration and should be confirmed with ID5 for each
@@ -386,6 +387,9 @@ impl IdentityProvider for Id5Provider {
             return Err(Report::new(ProviderError::InvalidResponse)
                 .attach(format!("ID5 returned status {}", response.status)));
         }
+        if std::str::from_utf8(response.body).is_ok_and(is_opt_out_cookie) {
+            return Ok(LookupOutcome::OptedOut);
+        }
         let eids = self
             .parse_reply(response.body)
             .change_context(ProviderError::InvalidResponse)?;
@@ -410,8 +414,8 @@ impl IdentityProvider for Id5Provider {
 /// The ID5 opt-out UID.
 const OPT_OUT_UID: &str = "0";
 
-/// Whether one ID5 cookie value records an opt-out: a bare `0`, or a reply
-/// whose `universal_uid` is `0`.
+/// Whether one ID5 cookie value or fetch reply records an opt-out: a bare
+/// `0`, or a reply whose `universal_uid` is `0`.
 fn is_opt_out_cookie(value: &str) -> bool {
     let decoded = percent_decoded(value);
     let decoded = decoded.trim();
@@ -674,17 +678,33 @@ mod tests {
     }
 
     #[test]
-    fn reports_no_match_for_an_opted_out_or_empty_reply() {
+    fn reports_no_match_for_an_empty_reply() {
         let provider = provider();
         let headers = HeaderMap::new();
+        let body = serde_json::to_vec(&json!({})).expect("should encode body");
 
-        for body in [json!({ "universal_uid": "0" }), json!({})] {
-            let body = serde_json::to_vec(&body).expect("should encode body");
-            assert!(
-                matches!(respond(&*provider, &headers, &body), LookupOutcome::NoMatch),
-                "should report no match"
-            );
-        }
+        assert!(
+            matches!(respond(&*provider, &headers, &body), LookupOutcome::NoMatch),
+            "should report no match"
+        );
+    }
+
+    #[test]
+    fn reports_an_opt_out_reply() {
+        let provider = provider();
+        let headers = HeaderMap::new();
+        let body = serde_json::to_vec(&json!({
+            "universal_uid": "0",
+            "cache_control": { "max_age_sec": 7200 },
+        }))
+        .expect("should encode body");
+
+        let outcome = respond(&*provider, &headers, &body);
+
+        assert!(
+            matches!(outcome, LookupOutcome::OptedOut),
+            "should report an opt-out for a universal_uid of 0"
+        );
     }
 
     #[test]
