@@ -27,6 +27,125 @@ use trusted_server_core::platform::{
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::nextjs_auction::{self, NextJsAuctionOrigin};
 
+#[cfg(feature = "celld-ec")]
+#[path = "support/celld.rs"]
+mod celld_fixture;
+
+#[cfg(feature = "celld-ec")]
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires CELLD_EC_TEST_BINARY pointing to the built real conditional-record server"]
+async fn real_celld_persists_routes_withdrawal_restart_and_outage_without_fallback() {
+    let mut celld = celld_fixture::CelldFixture::new();
+    let store = celld.store().await;
+    let app = allowed_router(store.clone());
+    let issued = call(&app, request(Method::GET, "/article", None)).await;
+    let ec =
+        ec_cookie(&issued).expect("should issue cookie only after real record acknowledgement");
+    let original = store
+        .lookup(&ec)
+        .await
+        .expect("should read real record")
+        .expect("should retain issued identity");
+    assert!(
+        store
+            .key_exists(&ec)
+            .await
+            .expect("should strongly confirm exact identity")
+    );
+    let eids = BASE64.encode(
+        json!([{"source":"partner.example.com","uids":[{"id":"celld-fixture-uid","atype":1}]}])
+            .to_string(),
+    );
+    let cookie = format!("ts-ec={ec}; ts-eids={eids}");
+    let returned = call(&app, request(Method::GET, "/article", Some(&cookie))).await;
+    assert_eq!(returned.status(), 200);
+    let updated = store
+        .lookup(&ec)
+        .await
+        .expect("should read updated record")
+        .expect("should retain updated identity");
+    assert!(updated.generation > original.generation);
+    let data: serde_json::Value =
+        serde_json::from_slice(&updated.body).expect("should decode unchanged graph schema");
+    assert_eq!(
+        data["ids"]["partner.example.com"]["uid"],
+        "celld-fixture-uid"
+    );
+    celld.restart();
+    let store = celld.store().await;
+    let restored = store
+        .lookup(&ec)
+        .await
+        .expect("should read after actual celld restart")
+        .expect("should restore identity");
+    assert_eq!(restored.body, updated.body);
+    assert_eq!(restored.metadata, updated.metadata);
+    assert_eq!(restored.generation, updated.generation);
+    let regulated = router(
+        store.clone(),
+        Some(GeoInfo::country_region("US", Some("TN".to_owned()))),
+    );
+    let mut withdrawal = request(Method::GET, "/article", Some(&cookie));
+    withdrawal.headers_mut().insert(
+        "sec-gpc",
+        "1".parse().expect("should set synthetic withdrawal signal"),
+    );
+    let withdrawn = call(&regulated, withdrawal).await;
+    assert_eq!(ec_cookie(&withdrawn).as_deref(), Some(""));
+    let tombstone = store
+        .lookup(&ec)
+        .await
+        .expect("should read actual tombstone")
+        .expect("should retain actual tombstone");
+    let data: serde_json::Value =
+        serde_json::from_slice(&tombstone.body).expect("should decode tombstone");
+    assert_eq!(data["consent"]["ok"], false);
+    assert_eq!(
+        store
+            .insert(
+                &ec,
+                EcKvWrite {
+                    body: std::str::from_utf8(&updated.body).expect("should decode old entry"),
+                    metadata: "{}",
+                    ttl: Duration::from_secs(60),
+                    mode: EcKvWriteMode::IfGenerationMatch(updated.generation)
+                }
+            )
+            .await
+            .expect("should classify stale CAS"),
+        EcKvWriteOutcome::PreconditionFailed
+    );
+    celld.restart();
+    let store = celld.store().await;
+    assert_eq!(
+        store
+            .lookup(&ec)
+            .await
+            .expect("should read recovered withdrawal")
+            .expect("should retain withdrawal")
+            .body,
+        tombstone.body
+    );
+    let app = allowed_router(store.clone());
+    assert!(
+        ec_cookie(&call(&app, request(Method::GET, "/article", Some(&cookie))).await).is_none(),
+        "should not resurrect withdrawal"
+    );
+    celld.stop();
+    let failed = call(&app, request(Method::GET, "/article", None)).await;
+    assert!(
+        ec_cookie(&failed).is_none(),
+        "should not mint unsupported cookie on real storage outage"
+    );
+    assert!(
+        store.key_exists(&ec).await.is_err(),
+        "should not turn outage into false absence"
+    );
+    trusted_server_adapter_axum::celld_ec::CelldEcKv::prepare(&celld.settings(), None)
+        .await
+        .expect_err("should fail selected-provider preparation without fallback");
+}
+
 #[derive(Clone, Default)]
 struct Store {
     rows: Arc<Mutex<BTreeMap<String, EcKvLookup>>>,
@@ -157,7 +276,10 @@ fn settings() -> Settings {
     settings
 }
 
-fn router(store: Store, geo: Option<GeoInfo>) -> RouterService {
+fn router<S: EcKvStore + Clone + Send + Sync + 'static>(
+    store: S,
+    geo: Option<GeoInfo>,
+) -> RouterService {
     let services = RuntimeServices::builder()
         .config_store(Arc::new(UnusedStores))
         .secret_store(Arc::new(UnusedStores))
@@ -173,7 +295,7 @@ fn router(store: Store, geo: Option<GeoInfo>) -> RouterService {
     TrustedServerApp::routes_with_settings_services_and_ec_store(settings(), services, store)
         .expect("should construct native EC fixture router")
 }
-fn allowed_router(store: Store) -> RouterService {
+fn allowed_router<S: EcKvStore + Clone + Send + Sync + 'static>(store: S) -> RouterService {
     router(store, Some(GeoInfo::country_region("AU", None)))
 }
 fn request(method: Method, path: &str, cookie: Option<&str>) -> Request {

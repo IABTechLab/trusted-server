@@ -11,8 +11,10 @@ proxy_secret = "integration_proxy_secret"
 
 [ec]
 passphrase = "integration_ec_passphrase"
-ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
+
+[ec.storage]
+store = "ec_identity_store"
 
 [[ec.partners]]
 name = "Integration Test Partner"

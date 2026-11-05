@@ -9,7 +9,12 @@ const GENERATED_AT: &str = "2026-06-23T00:00:00Z";
 const APP_CONFIG: &str = include_str!("../../fixtures/configs/trusted-server.integration.toml");
 
 pub fn integration_app_config_envelope(origin_port: u16) -> TestResult<String> {
-    app_config_envelope(origin_port, |_| Ok(()))
+    app_config_envelope(origin_port, |table| {
+        // The shared source names a Fastly binding. Native and Cloudflare
+        // fixtures intentionally retain their previous unconfigured graph.
+        table_mut(table, "ec")?.remove("storage");
+        Ok(())
+    })
 }
 
 /// Builds the integration app-config envelope after `customize` edits the
@@ -61,6 +66,7 @@ pub fn cloudflare_config_json(origin_port: u16) -> TestResult<String> {
 /// through the orchestrator and telemetry without any outbound provider call.
 pub fn cloudflare_auction_config_json(origin_port: u16) -> TestResult<String> {
     let envelope = app_config_envelope(origin_port, |table| {
+        table_mut(table, "ec")?.remove("storage");
         let auction = table_mut(table, "auction")?;
         auction.insert("enabled".to_string(), toml::Value::Boolean(true));
         auction.remove("providers");
@@ -91,6 +97,35 @@ fn cloudflare_binding_json(binding: &serde_json::Value) -> TestResult<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_and_cloudflare_fixtures_do_not_select_a_fastly_graph() {
+        let native = super::integration_app_config_envelope(8888)
+            .expect("should generate native fixture envelope");
+        let envelope: edgezero_core::blob_envelope::BlobEnvelope =
+            serde_json::from_str(&native).expect("should parse native envelope");
+        assert!(
+            envelope.data["ec"].get("storage").is_none(),
+            "should retain native unconfigured persistence"
+        );
+        for binding in [
+            super::cloudflare_config_json(8888),
+            super::cloudflare_auction_config_json(8888),
+        ] {
+            let binding: serde_json::Value =
+                serde_json::from_str(&binding.expect("should generate Cloudflare fixture"))
+                    .expect("should parse Cloudflare binding");
+            let encoded = binding[trusted_server_core::config_payload::CONFIG_BLOB_KEY]
+                .as_str()
+                .expect("should contain existing envelope");
+            let envelope: edgezero_core::blob_envelope::BlobEnvelope =
+                serde_json::from_str(encoded).expect("should parse Cloudflare envelope");
+            assert!(
+                envelope.data["ec"].get("storage").is_none(),
+                "should retain Cloudflare unconfigured persistence"
+            );
+        }
+    }
+
     const FASTLY_CONFIG: &str = include_str!("../../../../fastly.toml");
     const VICEROY_TEMPLATE: &str = include_str!("../../fixtures/configs/viceroy-template.toml");
     const LOGICAL_SECRET_STORE_ID: &str = "trusted_server_secrets";

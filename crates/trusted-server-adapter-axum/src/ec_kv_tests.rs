@@ -70,6 +70,58 @@ fn table_description() -> Value {
     }})
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn typed_local_preparation_uses_envelope_binding_and_dummy_credentials() {
+    let captured = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+    let headers = Arc::clone(&captured);
+    let router = axum::Router::new().fallback(move |request: Request<axum::body::Body>| {
+        headers
+            .lock()
+            .expect("should capture typed preparation request")
+            .push(request.headers().clone());
+        async { axum::Json(table_description()) }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("should bind typed preparation fixture");
+    let endpoint = format!(
+        "http://{}",
+        listener
+            .local_addr()
+            .expect("should read local fixture address")
+    );
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("should serve typed preparation fixture");
+    });
+    let config = trusted_server_core::ec::storage::DynamoDbEcStorage {
+        region: "us-east-1".to_owned(),
+        table: TABLE.to_owned(),
+        namespace: " exact ".to_owned(),
+        local_endpoint: Some(endpoint),
+    };
+    let provider = super::prepare(&config)
+        .await
+        .expect("should prepare from typed envelope fields");
+    assert_eq!(
+        provider.partition, "ec: exact ",
+        "should preserve exact namespace bytes"
+    );
+    let headers = captured.lock().expect("should inspect preparation headers");
+    assert_eq!(headers.len(), 1, "should not retry preparation");
+    let authorization = headers[0]
+        .get("authorization")
+        .expect("should sign local request")
+        .to_str()
+        .expect("should decode local authorization");
+    assert!(
+        authorization.contains("Credential=local/"),
+        "should bypass ambient credentials with explicit local dummy credentials"
+    );
+    task.abort();
+}
+
 async fn fixture() -> Fixture {
     let requests: Requests = Arc::new(Mutex::new(Vec::new()));
     let responses: Responses = Arc::new(Mutex::new(VecDeque::from([(
@@ -401,14 +453,20 @@ async fn malformed_cursor_expiry_or_allocator_fails_closed() {
 }
 
 /// Run explicitly against disposable `DynamoDB` Local, never AWS:
-/// `TS_EC_DYNAMODB_LOCAL_ENDPOINT=http://127.0.0.1:PORT cargo test ... -- --ignored`
+/// `TS_TEST_EC_DYNAMODB_ENDPOINT=http://127.0.0.1:PORT cargo test ... -- --ignored`
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires explicitly selected disposable DynamoDB Local loopback endpoint"]
 async fn dynamodb_local_contract() {
-    let endpoint = std::env::var("TS_EC_DYNAMODB_LOCAL_ENDPOINT")
-        .expect("should explicitly select a Local endpoint");
-    super::enabled::validate_local_endpoint(&endpoint)
-        .expect("should restrict DynamoDB Local tests to a loopback root URL");
+    let endpoint = std::env::var("TS_TEST_EC_DYNAMODB_ENDPOINT")
+        .expect("should explicitly select a test-only Local endpoint");
+    trusted_server_core::ec::storage::DynamoDbEcStorage {
+        region: "us-east-1".to_owned(),
+        table: "example-identity".to_owned(),
+        namespace: "fixture".to_owned(),
+        local_endpoint: Some(endpoint.clone()),
+    }
+    .validate()
+    .expect("should restrict DynamoDB Local tests to a loopback root URL");
     let client = client(&endpoint);
     let table = format!(
         "ec-contract-{}-{}",
