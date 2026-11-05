@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
+chrono = { workspace = true }
 bytes = { workspace = true }
 error-stack = { workspace = true }
 http = { workspace = true }
