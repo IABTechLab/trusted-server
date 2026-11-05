@@ -103,10 +103,6 @@ export interface AuctionBidData {
   burl?: string;
   /** Typed winning-bid renderer capability. */
   renderer?: AuctionBidRenderer;
-  /** Winning creative width used by the inline render bridge. */
-  w?: number;
-  /** Winning creative height used by the inline render bridge. */
-  h?: number;
   /**
    * Sanitized winning creative markup for the inline render bridge. Present
    * when the server retained a non-empty creative; not gated by debug mode.

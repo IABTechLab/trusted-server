@@ -1,11 +1,13 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { build } from 'vite';
+import { assertBrowserBuildLease } from '../../../scripts/browser-build-lease.mjs';
 
 const library = path.dirname(fileURLToPath(import.meta.url));
 
 /** Build only the independent versioned trace viewer into the supplied directory. */
 export async function buildTraceAssets(outDir) {
+  await assertBrowserBuildLease();
+  const { build } = await import('vite');
   // The full-document trace viewer is independent of publisher integration bundles.
   await build({
     configFile: false,

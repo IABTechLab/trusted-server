@@ -11,7 +11,7 @@ mod trace_sources;
 
 use std::env;
 use std::fmt::Write as _;
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
@@ -26,12 +26,48 @@ const SKIP_BUILD_VAR: &str = "TSJS_SKIP_BUILD";
 const TEST_VAR: &str = "TSJS_TEST";
 
 fn main() {
+    let crate_dir = PathBuf::from(
+        env::var("CARGO_MANIFEST_DIR").expect("should set CARGO_MANIFEST_DIR for build script"),
+    );
+    let under_lease = env::args().nth(1).as_deref() == Some("--browser-lease-inner");
+    let mut command = Command::new("node");
+    if under_lease {
+        // An inherited token alone is insufficient. The Node guard proves this
+        // process is descended from the live holder in its recorded session.
+        command.arg(crate_dir.join("lib/assert-browser-build-lease.mjs"));
+    } else {
+        // Keep installation, build, validation, copying, and code generation in
+        // one child scope. Cargo receives the inner script's cargo: directives
+        // through inherited stdout, exactly as for the original build script.
+        command
+            .arg(crate_dir.join("../../scripts/browser-build-runner.mjs"))
+            .arg("--")
+            .arg(env::current_exe().expect("should locate the current build script"))
+            .arg("--browser-lease-inner");
+    }
+    let status = command.status();
+    assert!(
+        status.as_ref().is_ok_and(ExitStatus::success),
+        "tsjs: browser build lease command failed: {status:?}"
+    );
+    if !under_lease {
+        return;
+    }
+    build_under_lease();
+}
+
+fn build_under_lease() {
     // Cargo scans directories recursively, so these cover every TS source.
     // Every path must exist: a missing entry makes Cargo rerun this script on
     // every build, the opposite of the intent.
     for path in [
         "lib/src",
         "lib/build-all.mjs",
+        "lib/build-module-options.mjs",
+        "lib/browser-resolution.mjs",
+        "lib/assert-browser-build-lease.mjs",
+        "../../scripts/browser-build-runner.mjs",
+        "../../scripts/browser-build-lease.mjs",
         "lib/trace-asset-sources.mjs",
         "lib/build-trace.mjs",
         "lib/trace-build-inputs.json",
@@ -155,23 +191,11 @@ fn build_bundles(ts_dir: &Path, bundle_dir: &Path) {
     );
 }
 
-/// Run `npm ci` when `node_modules` is absent, serialized across build scripts.
+/// Run `npm ci` when dependencies are absent, inside the complete browser lease.
 ///
-/// Removes a partial `node_modules` left by a failed install so the next build
-/// retries it.
+/// Reports partial install failures without deleting under a possible orphan.
 fn install_dependencies_if_missing(npm: &Path, ts_dir: &Path) {
     let node_modules = ts_dir.join("node_modules");
-
-    // Two build scripts must not run `npm ci` in the same directory at once.
-    // Check only while holding the lock: `npm ci` creates node_modules seconds
-    // before it finishes, so an unlocked check can see a partial install. The
-    // lock is released when `lock_file` drops.
-    let lock_path = ts_dir.join(".tsjs-npm-ci.lock");
-    let lock_file = File::create(&lock_path)
-        .unwrap_or_else(|err| panic!("tsjs: failed to create {}: {err}", lock_path.display()));
-    lock_file
-        .lock()
-        .unwrap_or_else(|err| panic!("tsjs: failed to lock {}: {err}", lock_path.display()));
 
     if node_modules.exists() {
         return;
@@ -183,18 +207,9 @@ fn install_dependencies_if_missing(npm: &Path, ts_dir: &Path) {
         return;
     }
 
-    // A failed `npm ci` can leave a partial node_modules behind. Remove it
-    // while still holding the lock so the next build retries the install
-    // instead of skipping it and failing the freshness check.
-    if node_modules.exists()
-        && let Err(err) = fs::remove_dir_all(&node_modules)
-    {
-        panic!(
-            "tsjs: npm ci failed in {} and removing the partial {} also failed: {err}",
-            ts_dir.display(),
-            node_modules.display()
-        );
-    }
+    // Do not delete a partial installation here: npm may have left a live
+    // child. The outer holder retains ownership until its complete scope is
+    // gone. Report the failure without replacing dependencies under an orphan.
     panic!("tsjs: npm ci failed in {}", ts_dir.display());
 }
 

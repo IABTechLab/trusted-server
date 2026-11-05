@@ -1,6 +1,8 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { browserPackageResolution } from './browser-resolution.mjs';
+
 const libDir = path.dirname(fileURLToPath(import.meta.url));
 
 /** Production Vite options for one independently bundled tsjs IIFE. */
@@ -8,6 +10,7 @@ export function moduleBuildOptions({ name, entryPath, outDir }) {
   return {
     configFile: false,
     root: libDir,
+    plugins: [browserPackageResolution()],
     build: {
       emptyOutDir: false,
       outDir,

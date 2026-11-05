@@ -352,6 +352,18 @@ function dedupeManagedUserIdsBySubmodule(
   return kept;
 }
 
+type SeededPbjsConfig = PbjsConfig & {
+  userSync: NonNullable<PbjsConfig['userSync']> & { autoRefresh?: unknown };
+};
+
+function withManagedUserIds(
+  config: SeededPbjsConfig,
+  managedUserIds: InjectedManagedUserId[]
+): SeededPbjsConfig;
+function withManagedUserIds(
+  config: PbjsConfig,
+  managedUserIds: InjectedManagedUserId[]
+): PbjsConfig;
 function withManagedUserIds(
   config: PbjsConfig,
   managedUserIds: InjectedManagedUserId[]
@@ -2249,7 +2261,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
               ...(isRecord(effectiveUserSync) ? effectiveUserSync : {}),
               userIds: effectiveUserIds,
             },
-          } as PbjsConfig,
+          } as SeededPbjsConfig,
           managedUserIds
         );
         if (awaitingLateConsent && seed.userSync.autoRefresh !== true) {

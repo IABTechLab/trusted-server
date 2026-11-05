@@ -13,7 +13,7 @@ use crate::fs_util::write_file_atomically;
 
 pub(crate) type CliResult<T> = Result<T, String>;
 
-const NODE_MODULES_MISSING_HELP: &str = "Prebid bundling dependencies are missing. Run `cd crates/trusted-server-js/lib && npm ci`, then retry `ts prebid client`.";
+const NODE_MODULES_MISSING_HELP: &str = "Prebid bundling dependencies are missing. From the repository root, run `node scripts/browser-build-runner.mjs -- npm ci`, then retry `ts prebid client`.";
 const USER_ID_REGISTRY_RELATIVE_PATH: &str = "src/integrations/prebid/user_id_modules.json";
 
 #[derive(Debug, clap::Args)]
@@ -130,14 +130,19 @@ impl PrebidBundleGenerator for NpmPrebidBundleGenerator {
 
         let args = npm_prebid_bundle_args(request)?;
 
-        let output = Command::new("npm")
+        let runner = request
+            .js_lib_dir
+            .join("../../../scripts/browser-build-runner.mjs");
+        let output = Command::new("node")
+            .arg(runner)
+            .args(["--", "npm"])
             .args(&args)
             .current_dir(&request.js_lib_dir)
             .stdin(Stdio::null())
             .output()
             .map_err(|error| {
                 report_error(format!(
-                    "failed to run Prebid bundle generator with npm: {error}"
+                    "failed to run leased Prebid bundle generator: {error}"
                 ))
             })?;
 
@@ -228,6 +233,50 @@ struct PrebidBundleRunContext<'a> {
     js_lib_dir: PathBuf,
     registry_path: &'a Path,
     registry: &'a PrebidUserIdModuleRegistry,
+}
+
+/// Keep the concrete CLI command, including manifest checks and config update,
+/// inside one browser lease. Mock-generator tests continue to call `run_bundle`.
+pub(crate) fn run_production_bundle(args: &PrebidBundleArgs) -> CliResult<()> {
+    let current_dir = env::current_dir()
+        .map_err(|error| report_error(format!("failed to read current directory: {error}")))?;
+    let js_lib_dir = find_js_lib_dir(&current_dir)?;
+    if env::var_os("TS_BROWSER_BUILD_LEASE").is_some_and(|value| !value.is_empty()) {
+        let status = Command::new("node")
+            .arg(js_lib_dir.join("assert-browser-build-lease.mjs"))
+            .status()
+            .map_err(|error| report_error(format!("failed to verify browser lease: {error}")))?;
+        if !status.success() {
+            return cli_error("Prebid browser lease nonce/ancestry verification failed");
+        }
+        let mut generator = NpmPrebidBundleGenerator;
+        return run_bundle(
+            args,
+            &mut generator,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        );
+    }
+
+    let executable = env::current_exe()
+        .map_err(|error| report_error(format!("failed to locate the CLI executable: {error}")))?;
+    // The runner uses the canonical project cwd. Resolve user paths first so
+    // relative config and output arguments retain their original CLI meaning.
+    let status = Command::new("node")
+        .arg(js_lib_dir.join("../../../scripts/browser-build-runner.mjs"))
+        .arg("--")
+        .arg(executable)
+        .args(["prebid", "client", "--config"])
+        .arg(resolve_output_dir(&current_dir, &args.config))
+        .arg("--out")
+        .arg(resolve_output_dir(&current_dir, &args.out))
+        .status()
+        .map_err(|error| report_error(format!("failed to enter browser lease: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        cli_error(format!("leased Prebid command exited with status {status}"))
+    }
 }
 
 pub(crate) fn run_bundle(

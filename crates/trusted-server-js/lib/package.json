@@ -5,16 +5,18 @@
   "type": "module",
   "description": "Trusted Server tsjs TypeScript library with queue and simple banner rendering.",
   "scripts": {
-    "build": "node build-all.mjs",
-    "build:trace-assets": "node build-trace-assets.mjs",
-    "build:prebid-external": "node build-prebid-external.mjs",
-    "dev": "vite build --watch",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "lint": "eslint . --max-warnings=0",
-    "lint:fix": "eslint --fix . --max-warnings=0",
-    "format": "prettier --check \"**/*.{ts,tsx,js,json,css,md}\"",
-    "format:write": "prettier --write \"**/*.{ts,tsx,js,json,css,md}\""
+    "build": "node ../../../scripts/browser-build-runner.mjs -- node build-all.mjs",
+    "build:trace-assets": "node ../../../scripts/browser-build-runner.mjs -- node build-trace-assets.mjs",
+    "build:prebid-external": "node ../../../scripts/browser-build-runner.mjs -- node build-prebid-external.mjs",
+    "dev": "node ../../../scripts/browser-build-runner.mjs -- node browser-tools.mjs dev",
+    "test": "node ../../../scripts/browser-build-runner.mjs -- node browser-tools.mjs test",
+    "test:watch": "node ../../../scripts/browser-build-runner.mjs -- node browser-tools.mjs test:watch",
+    "typecheck": "node ../../../scripts/browser-build-runner.mjs -- node browser-tools.mjs typecheck",
+    "typecheck:canary": "node ../../../scripts/browser-build-runner.mjs -- node check-two-root-typecheck.mjs",
+    "lint": "node ../../../scripts/browser-build-runner.mjs -- node browser-tools.mjs lint",
+    "lint:fix": "node ../../../scripts/browser-build-runner.mjs -- node browser-tools.mjs lint:fix",
+    "format": "node ../../../scripts/browser-build-runner.mjs -- node browser-tools.mjs format",
+    "format:write": "node ../../../scripts/browser-build-runner.mjs -- node browser-tools.mjs format:write"
   },
   "dependencies": {
     "prebid.js": "^10.26.0"

@@ -2,7 +2,14 @@ import path from 'node:path';
 
 import { defineConfig } from 'vitest/config';
 
+import { assertBrowserBuildLease } from '../../../scripts/browser-build-lease.mjs';
+
+import { browserPackageResolution } from './browser-resolution.mjs';
+
+await assertBrowserBuildLease();
+
 export default defineConfig({
+  plugins: [browserPackageResolution()],
   resolve: {
     alias: {
       // prebid.js doesn't expose src/adapterManager.js via its package
@@ -20,6 +27,10 @@ export default defineConfig({
   },
   test: {
     environment: 'jsdom',
+    include: [
+      'test/**/*.{test,spec}.{ts,tsx,js,mjs}',
+      '../../trusted-server-integrations-js/lib/test/**/*.{test,spec}.{ts,tsx,js,mjs}',
+    ],
     globals: true,
     // Run tests in the main thread to avoid spawning
     // child processes/workers, which are blocked in this sandbox.
@@ -34,7 +45,10 @@ export default defineConfig({
     // pre-existing errors elsewhere.
     typecheck: {
       enabled: true,
-      include: ['test/**/types.test.ts'],
+      include: [
+        'test/**/types.test.ts',
+        '../../trusted-server-integrations-js/lib/test/**/types.test.ts',
+      ],
       // Errors reported from files outside `include` are pre-existing and
       // unrelated; only the type assertions in the included files gate here.
       ignoreSourceErrors: true,

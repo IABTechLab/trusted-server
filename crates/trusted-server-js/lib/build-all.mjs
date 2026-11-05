@@ -21,10 +21,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { build } from 'vite';
+import { assertBrowserBuildLease } from '../../../scripts/browser-build-lease.mjs';
 
-import { buildTraceAssets } from './build-trace.mjs';
-import { moduleBuildOptions } from './build-module-options.mjs';
+await assertBrowserBuildLease();
+const { build } = await import('vite');
+const { buildTraceAssets } = await import('./build-trace.mjs');
+const { moduleBuildOptions } = await import('./build-module-options.mjs');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const srcDir = path.resolve(__dirname, 'src');

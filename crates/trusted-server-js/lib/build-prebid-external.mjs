@@ -14,6 +14,8 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { assertBrowserBuildLease } from '../../../scripts/browser-build-lease.mjs';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const srcDir = path.resolve(__dirname, 'src');
@@ -580,6 +582,7 @@ async function buildExternalBundle(outDir, generatedModules) {
   let renamedTemporaryFile = false;
 
   try {
+    await assertBrowserBuildLease();
     const { build } = await import('vite');
 
     await build({
@@ -663,6 +666,7 @@ export async function main(
     buildBundle = buildExternalBundle,
   } = {}
 ) {
+  await assertBrowserBuildLease();
   const args = parseArgs(argv);
   const prebidVersion = verifyPrebidPackageVersion({ lockFile, packageJsonFile });
   const registry = readUserIdRegistry(registryFile);

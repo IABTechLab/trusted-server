@@ -6,10 +6,21 @@ import importPlugin from 'eslint-plugin-import';
 import jsdoc from 'eslint-plugin-jsdoc';
 import unicorn from 'eslint-plugin-unicorn';
 
+import { assertBrowserBuildLease } from '../../../scripts/browser-build-lease.mjs';
+
+await assertBrowserBuildLease();
+
 export default [
   // Files/folders to ignore
   {
-    ignores: ['node_modules', 'dist', 'coverage', 'trace-assets/**'],
+    ignores: [
+      '**/node_modules/**',
+      '**/dist/**',
+      '**/coverage/**',
+      '**/trace-assets/**',
+      '**/.browser-build-lease/**',
+      '**/.browser-build-lease.retired-*/**',
+    ],
   },
   // Base JS recommended
   js.configs.recommended,
@@ -52,9 +63,23 @@ export default [
   // so CommonJS-only names (__dirname, require, module) still fail no-undef
   // in these ES modules
   {
-    files: ['*.mjs', 'test/**/*.mjs'],
+    files: [
+      'trusted-server-js/lib/*.mjs',
+      'trusted-server-js/lib/test/**/*.mjs',
+      'trusted-server-integrations-js/lib/test/**/*.mjs',
+    ],
     languageOptions: {
       globals: globals.nodeBuiltin,
+    },
+  },
+  // Preserve the moved legacy bootstrap byte-for-byte. Only this exact file
+  // uses historical unused parameters, short-circuit logging and GPT globals.
+  {
+    files: ['trusted-server-integrations-js/lib/src/integrations/gpt/gpt_bootstrap.js'],
+    languageOptions: { globals: { ...globals.browser, googletag: 'readonly' } },
+    rules: {
+      '@typescript-eslint/no-unused-vars': 'off',
+      '@typescript-eslint/no-unused-expressions': 'off',
     },
   },
 ];

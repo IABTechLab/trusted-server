@@ -11,7 +11,7 @@ use crate::commands::audit::{AuditArgs, run_audit};
 use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
 use crate::commands::config::init::{ConfigInitArgs, run_config_init};
 use crate::commands::pbs::{self, PbsArgs};
-use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
+use crate::prebid_bundle::{PrebidBundleArgs, run_production_bundle};
 
 #[derive(Debug, Parser)]
 #[command(name = "ts", version, about = "Trusted Server CLI")]
@@ -154,11 +154,7 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         }
         Command::Prebid(prebid) => match prebid.command {
             PrebidCommand::Client(args) => {
-                let mut generator = NpmPrebidBundleGenerator;
-                let mut stdout = std::io::stdout();
-                let mut stderr = std::io::stderr();
-                run_bundle(&args, &mut generator, &mut stdout, &mut stderr)
-                    .map(|()| RunOutcome::Success)
+                run_production_bundle(&args).map(|()| RunOutcome::Success)
             }
             PrebidCommand::Server(args) => pbs::run(&args)
                 .map(|()| RunOutcome::Success)

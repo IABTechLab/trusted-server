@@ -2,3 +2,7 @@ node_modules
 dist
 coverage
 trace-assets/**
+.browser-build-lease/
+.browser-build-lease.retired-*/
+# Exact future legacy GPT path, also excluded explicitly by browser-tools.mjs.
+../../trusted-server-integrations-js/lib/src/integrations/gpt/gpt_bootstrap.js

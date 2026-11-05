@@ -2,5 +2,6 @@
 src/generated-modules.ts
 src/integrations/prebid/.external-generated-*
 
-# Serializes `npm ci` across concurrent cargo build scripts
-.tsjs-npm-ci.lock
+# The one production-browser lease, including safely retired metadata.
+.browser-build-lease/
+.browser-build-lease.retired-*/

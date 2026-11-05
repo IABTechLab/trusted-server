@@ -38,7 +38,7 @@ jobs:
           cache-key: worker-deadline-${{ matrix.adapter }}
       - name: Install JS dependencies
         working-directory: crates/trusted-server-js/lib
-        run: npm ci
+        run: node ../../../scripts/browser-build-runner.mjs -- npm ci
       - name: Build actual adapter HTTP fixture
         shell: bash
         run: |

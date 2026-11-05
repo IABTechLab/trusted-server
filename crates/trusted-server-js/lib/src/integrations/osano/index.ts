@@ -273,7 +273,7 @@ function readGppSignal(win: OsanoWindow): Promise<SignalResult> {
           return;
         }
 
-        const applicableSections = data.applicableSections;
+        const applicableSections = data.applicableSections as number[] | undefined;
         if (typeof data.gppString === 'string' && data.gppString.length > 0) {
           const writes = [{ name: GPP_COOKIE_NAME, value: data.gppString }];
           const clears: string[] = [];

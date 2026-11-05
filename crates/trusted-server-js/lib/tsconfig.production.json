@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "types": ["vite/client"],
+    "paths": {
+      "prebid.js": ["./node_modules/prebid.js/dist/src/src/prebid.public.d.ts"],
+      "tsjs-prebid/prebidGlobal": ["./node_modules/prebid.js/dist/src/src/prebidGlobal.d.ts"]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "browser-env.d.ts",
+    "../../trusted-server-integrations-js/lib/src/**/*.ts"
+  ],
+  "exclude": ["node_modules", "test", "../../trusted-server-integrations-js/lib/test"]
+}

@@ -197,7 +197,7 @@ jobs:
 
       - name: Install browser dependencies
         run: |
-          npm ci --prefix crates/trusted-server-js/lib
+          node scripts/browser-build-runner.mjs -- npm ci
           npm ci --prefix crates/trusted-server-integration-tests/browser
           cd crates/trusted-server-integration-tests/browser
           npx playwright install --with-deps chromium
@@ -288,9 +288,9 @@ jobs:
       - name: Build TSJS browser fixtures
         working-directory: crates/trusted-server-js/lib
         run: |
-          npm ci
-          npm run build
-          npm run build:prebid-external -- --modules-json '{"bidder":["rubiconBidAdapter"]}'
+          node ../../../scripts/browser-build-runner.mjs -- npm ci
+          node ../../../scripts/browser-build-runner.mjs -- npm run build
+          node ../../../scripts/browser-build-runner.mjs -- npm run build:prebid-external -- --modules-json '{"bidder":["rubiconBidAdapter"]}'
 
       - name: Install Playwright
         working-directory: crates/trusted-server-integration-tests/browser

@@ -157,13 +157,20 @@ jobs:
           cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies
-        run: npm ci
+        run: node ../../../scripts/browser-build-runner.mjs -- npm ci
+
+      - name: Check browser invocation boundaries and lease behavior
+        working-directory: .
+        run: node --test scripts/browser-build-runner.test.mjs scripts/check-browser-build-invocations.test.mjs && node scripts/check-browser-build-invocations.mjs
+
+      - name: Typecheck both production roots and the isolated canary
+        run: node ../../../scripts/browser-build-runner.mjs -- npm run typecheck && node ../../../scripts/browser-build-runner.mjs -- npm run typecheck:canary
 
       - name: Run ESLint
-        run: npm run lint
+        run: node ../../../scripts/browser-build-runner.mjs -- npm run lint
 
       - name: Run Prettier (check)
-        run: npm run format
+        run: node ../../../scripts/browser-build-runner.mjs -- npm run format
 
   format-docs:
     runs-on: ubuntu-latest

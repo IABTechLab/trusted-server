@@ -71,9 +71,9 @@ npx playwright install chromium
 # --- Build browser-side Trusted Server and external Prebid fixtures ---
 echo "==> Building TSJS browser fixtures..."
 cd "$REPO_ROOT/$TSJS_LIB_DIR"
-npm ci
-npm run build
-npm run build:prebid-external -- --modules-json '{"bidder":["rubiconBidAdapter"]}'
+node "$REPO_ROOT/scripts/browser-build-runner.mjs" -- npm ci
+node "$REPO_ROOT/scripts/browser-build-runner.mjs" -- npm run build
+node "$REPO_ROOT/scripts/browser-build-runner.mjs" -- npm run build:prebid-external -- --modules-json '{"bidder":["rubiconBidAdapter"]}'
 cd "$REPO_ROOT/$BROWSER_DIR"
 
 # --- Export env vars for global-setup.ts ---

@@ -20,6 +20,13 @@ function fixture() {
   temporary.push(root);
   const directory = path.join(root, 'crates/trusted-server-js/lib');
   fs.mkdirSync(directory, { recursive: true });
+  fs.mkdirSync(path.join(root, 'scripts'));
+  for (const name of ['browser-build-lease.mjs', 'browser-build-runner.mjs']) {
+    fs.copyFileSync(
+      path.resolve(library, '../../../scripts', name),
+      path.join(root, 'scripts', name)
+    );
+  }
   fs.copyFileSync(
     path.resolve(library, '../../../.tool-versions'),
     path.join(root, '.tool-versions')
@@ -83,10 +90,20 @@ describe('trace build provenance', () => {
     const directory = fixture();
     fs.symlinkSync(path.join(library, 'node_modules'), path.join(directory, 'node_modules'), 'dir');
     const build = () =>
-      execFileSync(process.execPath, [path.join(directory, 'build-trace-assets.mjs')], {
-        cwd: directory,
-        stdio: 'pipe',
-      });
+      execFileSync(
+        process.execPath,
+        [
+          path.resolve(directory, '../../../scripts/browser-build-runner.mjs'),
+          '--',
+          process.execPath,
+          path.join(directory, 'build-trace-assets.mjs'),
+        ],
+        {
+          cwd: directory,
+          stdio: 'pipe',
+          env: { ...process.env, TS_BROWSER_BUILD_LEASE: '' },
+        }
+      );
     const snapshot = () =>
       ['trace-assets-manifest.json', 'trace-assets/v1.js', 'trace-assets/v1.css'].map((file) =>
         fs.readFileSync(path.join(directory, file))

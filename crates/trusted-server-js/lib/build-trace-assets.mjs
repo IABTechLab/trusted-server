@@ -4,8 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { buildTraceAssets } from './build-trace.mjs';
+import { assertBrowserBuildLease } from '../../../scripts/browser-build-lease.mjs';
 import { traceSourceDigest } from './trace-asset-sources.mjs';
+
+await assertBrowserBuildLease();
+const { buildTraceAssets } = await import('./build-trace.mjs');
 
 const library = path.dirname(fileURLToPath(import.meta.url));
 // v1 is still unpublished. Once released, add a version rather than replacing its bytes.
