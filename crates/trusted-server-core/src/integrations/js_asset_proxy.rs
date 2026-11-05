@@ -656,6 +656,60 @@ mod tests {
         String::from_utf8(output).expect("should produce UTF-8 HTML")
     }
 
+    fn process_prebid_script_with_asset_mode(mode: &str) -> String {
+        // `create_test_settings` enables `[integrations.prebid]` with the default
+        // `script_patterns`, so its attribute rewriter matches `/prebid.min.js`.
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                JS_ASSET_PROXY_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "assets": [{
+                        "path": "/assets/vendor-pb.js",
+                        "origin_url": "https://cdn.example.com/prebid.min.js",
+                        "proxy": mode
+                    }]
+                }),
+            )
+            .expect("should insert JS asset proxy config");
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let html = r#"<html><body><script src="https://cdn.example.com/prebid.min.js"></script></body></html>"#;
+
+        process_html_with_registry(html, registry)
+    }
+
+    #[test]
+    fn js_asset_proxy_rewriter_takes_precedence_over_prebid_script_removal() {
+        let processed = process_prebid_script_with_asset_mode("enabled");
+
+        assert!(
+            processed.contains(r#"<script src="/assets/vendor-pb.js"></script>"#),
+            "JS asset proxy should rewrite before Prebid removes the script: {processed}"
+        );
+    }
+
+    #[test]
+    fn blocked_js_asset_proxy_entry_removes_prebid_script() {
+        let processed = process_prebid_script_with_asset_mode("blocked");
+
+        assert!(
+            !processed.contains("prebid.min.js") && !processed.contains("<script"),
+            "blocked JS asset should remove the script element: {processed}"
+        );
+    }
+
+    #[test]
+    fn disabled_js_asset_proxy_entry_lets_prebid_remove_script() {
+        let processed = process_prebid_script_with_asset_mode("disabled");
+
+        assert!(
+            !processed.contains("prebid.min.js") && !processed.contains("<script"),
+            "disabled JS asset should defer to Prebid script interception: {processed}"
+        );
+    }
+
     #[test]
     fn disabled_config_does_not_register_routes() {
         let mut settings = create_test_settings();

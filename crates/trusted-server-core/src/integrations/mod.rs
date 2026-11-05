@@ -290,7 +290,10 @@ pub(crate) struct IntegrationBuilder {
 
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     &[
-        // This must remain first: attribute rewriters chain replacements and short-circuit removals.
+        // Attribute rewriters chain replacements and short-circuit removals, so
+        // `js_asset_proxy` must run first. `IntegrationRegistry::with_plan` enforces
+        // this by sorting its attribute rewriter ahead of every other one; list
+        // position here does not decide precedence.
         IntegrationBuilder {
             id: js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
             build: js_asset_proxy::register,

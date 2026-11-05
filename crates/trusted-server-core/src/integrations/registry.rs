@@ -921,6 +921,15 @@ impl IntegrationRegistry {
             }
         }
 
+        // `js_asset_proxy` is the operator's per-URL override, so it runs before
+        // every native attribute rewriter regardless of registration order:
+        // `rewrite_attribute` chains replacements and short-circuits removals.
+        // The sort is stable, so the other rewriters keep registration order.
+        inner.html_rewriters.sort_by_key(|rewriter| {
+            rewriter.integration_id()
+                != crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID
+        });
+
         let registry = Self {
             inner: Arc::new(inner),
             plan: Some(plan),
@@ -1244,6 +1253,16 @@ impl IntegrationRegistry {
         }
 
         map.into_values().collect()
+    }
+
+    /// Return attribute rewriter integration IDs in execution order.
+    #[cfg(test)]
+    pub(crate) fn attribute_rewriter_ids(&self) -> Vec<&'static str> {
+        self.inner
+            .html_rewriters
+            .iter()
+            .map(|rewriter| rewriter.integration_id())
+            .collect()
     }
 
     /// Return whether an integration is enabled in this registry.
