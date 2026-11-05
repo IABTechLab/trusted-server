@@ -10,6 +10,12 @@ when both conditions hold. The orchestrator first gathers responses from the
 configured auction providers, then passes successful bids to the mediator's
 HTTP endpoint for final selection.
 
+If the mediator request fails, returns a non-2xx HTTP status, or cannot be parsed,
+the orchestrator logs and falls back to local ranking of the collected provider
+bids, enforcing floor prices. A valid successful no-bid response remains final.
+Failed mediation produces no mediator response or mediator telemetry row, matching
+other mediation failures.
+
 The mediator supports banner bids. It omits bids without a decoded numeric
 price, applies the optional CPM floor, and restores render and accounting
 fields from the original provider bids after the mediation response. Duplicate

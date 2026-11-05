@@ -756,7 +756,7 @@ impl AuctionOrchestratorHarness {
                                     .await
                                     .map_err(|error| {
                                         log::warn!(
-                                            "Planned mediator '{}' parse failed: {:?}",
+                                            "Planned mediator '{}' response processing failed; using local ranking: {:?}",
                                             mediator.provider_name(),
                                             error
                                         );
@@ -1570,6 +1570,11 @@ impl AuctionOrchestrator {
     }
 
     /// Select the best decoded-price bid for each slot from all responses.
+    ///
+    /// Winning bids are verbatim clones of provider bids, and floor enforcement
+    /// only removes entries. Auction telemetry attributes local wins by matching
+    /// `bid_id` and `price`, so any future change that rewrites a winner (for
+    /// example currency conversion or bid shading) must update that matching too.
     fn select_winning_bids(
         &self,
         responses: &[AuctionResponse],
@@ -2648,7 +2653,7 @@ impl AuctionOrchestrator {
                                     }
                                     Err(error) => {
                                         log::warn!(
-                                            "Mediator '{}' parse failed: {:?}",
+                                            "Mediator '{}' response processing failed; using local ranking: {:?}",
                                             mediator.provider_name(),
                                             error
                                         );
@@ -2798,11 +2803,16 @@ mod tests {
         AuctionProvider, GenericOpenRtbProvider, ProviderRequestOutcome,
     };
     use crate::auction::routing::{RoutingDiagnostics, route_auction};
+    use crate::auction::telemetry::{
+        AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
+    };
     use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
         AdFormat, AdSlot, ApsRendererV1, ApsTagType, AuctionContext, AuctionRequest,
         AuctionResponse, Bid, BidRenderer, BidStatus, MediaType, PublisherInfo, UserInfo,
     };
+    use crate::consent::types::ConsentContext;
+    use crate::ec::EcContext;
     use crate::error::TrustedServerError;
     use crate::integrations::adserver_mock::{AdServerMockConfig, AdServerMockProvider};
     use crate::platform::test_support::{
@@ -7140,6 +7150,188 @@ mod tests {
                         "should preserve the local winner"
                     );
                 }
+            }
+        }
+    }
+
+    async fn run_mock_mediator_response(
+        harness: bool,
+        status: u16,
+        body: &serde_json::Value,
+        floor: f64,
+    ) -> (AuctionRequest, OrchestrationResult) {
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(
+            200,
+            serde_json::to_vec(&serde_json::json!({
+                "seatbid": [{"seat": "provider-seat", "bid": [
+                    {"id": "lower", "impid": "fictional-slot", "price": 1.5,
+                     "adm": "<div>lower</div>", "w": 300, "h": 250},
+                    {"id": "higher", "impid": "fictional-slot", "price": 2.0,
+                     "adm": "<div>higher</div>", "w": 300, "h": 250}
+                ]}]
+            }))
+            .expect("should serialize provider bids"),
+        );
+        http.push_response(
+            status,
+            serde_json::to_vec(body).expect("should serialize mediator response"),
+        );
+        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let services = build_services_with_backend_and_http_client(
+            Arc::clone(&backend) as Arc<_>,
+            Arc::clone(&http) as Arc<_>,
+        );
+        let plan = AuctionPlan::compile(planned_config(
+            &[("provider-a", RoutingMode::AllEligible)],
+            false,
+        ))
+        .expect("should compile planned auction");
+        let mediator = Arc::new(AdServerMockProvider::new(AdServerMockConfig {
+            enabled: true,
+            endpoint: "https://mediator.example/mediate".to_string(),
+            timeout_ms: 500,
+            ..AdServerMockConfig::default()
+        }));
+        let mut request = planned_request();
+        request.slots[0].floor_price = Some(floor);
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let result = if harness {
+            AuctionOrchestratorHarness::new(plan, Some(mediator))
+                .run_auction(&request, &context)
+                .await
+        } else {
+            AuctionOrchestrator::from_plan(Arc::new(plan), Some(mediator))
+                .run_auction(&request, &context)
+                .await
+        }
+        .expect("should complete auction with mock mediation");
+
+        (request, result)
+    }
+
+    async fn assert_mediator_non_success_falls_back(harness: bool) {
+        for status in [302, 400, 503] {
+            for floor in [1.0, 3.0] {
+                let (request, result) = run_mock_mediator_response(
+                    harness,
+                    status,
+                    &serde_json::json!({"seatbid": []}),
+                    floor,
+                )
+                .await;
+                let expected_winner = if floor < 2.0 { Some("higher") } else { None };
+                assert_eq!(
+                    result
+                        .winning_bids
+                        .get("fictional-slot")
+                        .and_then(|bid| bid.bid_id.as_deref()),
+                    expected_winner,
+                    "should rank provider bids locally with floors after HTTP {status} (harness={harness})"
+                );
+                assert_eq!(
+                    result.provider_responses[0].bids.len(),
+                    2,
+                    "should retain both collected provider bids"
+                );
+                assert!(
+                    result.mediator_response.is_none(),
+                    "should treat HTTP {status} as failed mediation"
+                );
+
+                let ec_context = EcContext::new_for_test(None, ConsentContext::default());
+                let observation = AuctionObservationContext::from_auction_request(
+                    AuctionSource::AuctionApi,
+                    &request,
+                    &ec_context,
+                );
+                let events = build_auction_events(
+                    observation,
+                    AuctionTerminalOutcome::Completed {
+                        request: &request,
+                        result: &result,
+                        delivered_winner_slots: None,
+                    },
+                );
+                assert!(
+                    !events
+                        .rows()
+                        .iter()
+                        .any(|row| row.provider_role.as_deref() == Some("mediator")),
+                    "should omit failed mediator rows consistently with other mediation failures"
+                );
+                assert_eq!(
+                    events
+                        .rows()
+                        .iter()
+                        .find(|row| row.event_kind == "summary")
+                        .and_then(|row| row.winning_bid_count),
+                    Some(u16::from(expected_winner.is_some())),
+                    "should count locally selected winners in telemetry"
+                );
+                let bid_rows = events
+                    .rows()
+                    .iter()
+                    .filter(|row| row.event_kind == "bid")
+                    .map(|row| (row.price_cpm, row.is_win))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    bid_rows,
+                    vec![
+                        (Some(1.5), Some(0)),
+                        (Some(2.0), Some(u8::from(expected_winner.is_some()))),
+                    ],
+                    "should mark only the selected provider bid as winning after HTTP {status} (harness={harness})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mediator_non_success_status_falls_back_to_local_ranking() {
+        assert_mediator_non_success_falls_back(false).await;
+    }
+
+    #[tokio::test]
+    async fn planned_executor_mediator_non_success_status_falls_back_locally() {
+        assert_mediator_non_success_falls_back(true).await;
+    }
+
+    #[tokio::test]
+    async fn mock_mediator_success_and_no_bid_remain_authoritative() {
+        for harness in [false, true] {
+            for has_winner in [false, true] {
+                let body = if has_winner {
+                    serde_json::json!({"seatbid": [{"seat": "provider-a", "bid": [{
+                        "id": "mediated", "impid": "fictional-slot", "price": 1.75,
+                        "adm": "<div>mediated</div>", "w": 300, "h": 250
+                    }]}]})
+                } else {
+                    serde_json::json!({"seatbid": []})
+                };
+                let (_, result) = run_mock_mediator_response(harness, 200, &body, 1.0).await;
+                assert!(
+                    result.mediator_response.is_some(),
+                    "should preserve a valid mediation result, including no-bid"
+                );
+                assert_eq!(
+                    result
+                        .winning_bids
+                        .get("fictional-slot")
+                        .and_then(|bid| bid.bid_id.as_deref()),
+                    if has_winner { Some("mediated") } else { None },
+                    "should honor the mediator decision instead of the higher local bid"
+                );
             }
         }
     }
