@@ -46,7 +46,7 @@ Branch: `feature/binary-attestations-phase4`; base: Phase 3 branch.
 
 ## Fixed contract and qualification
 
-Preserve the reusable `release-build.yml` signer identity, seven binary names, SPDX 2.3 predicate and companion names, signature-bundle names, `SHA256SUMS` rules, immutable build facts, runtime bind/port settings, publication/signing variable gate and stable/prerelease Latest behavior. New assets are additive.
+Preserve the reusable `release-build.yml` signer identity, four binary names, SPDX 2.3 predicate and companion names, signature-bundle names, `SHA256SUMS` rules, immutable build facts, runtime bind/port settings, publication/signing variable gate and stable/prerelease Latest behavior. New assets are additive.
 
 All uninhabited `Qualified*` enums remain uninhabited; production and qualified selectors remain closed. Ordinary-CI and rehearsal evidence remains `release_qualification:false`. New triggers, maintainer settings/authority, qualification resources, and missing integration designs require separate approval.
 

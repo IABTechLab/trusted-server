@@ -164,9 +164,10 @@ fn emit_git_version() {
     let control = env::var_os("TRUSTED_SERVER__RELEASE_BUILD");
     let source = env::var_os(OVERRIDE_ENV);
     if control.is_none()
-        && let Some(value) = source.as_deref().and_then(std::ffi::OsStr::to_str)
-        && !is_usable(value)
-        && !value.trim().is_empty()
+        && let Some(value) = source.as_deref()
+        && value
+            .to_str()
+            .is_none_or(|value| !is_usable(value) && !value.trim().is_empty())
     {
         println!(
             "cargo:warning={OVERRIDE_ENV}={value:?} is not visible ASCII; \

@@ -134,57 +134,18 @@ fn compiled_contract_maps_exactly_four_fixed_assets() {
 }
 
 #[test]
-fn ordinary_seven_asset_cohort_does_not_select_controlled_axum_recipes() {
-    check_inputs(COHORT, TOOLS, CLI_POLICY).expect("should validate all seven ordinary asset rows");
+fn ordinary_cohort_is_exactly_the_fixed_release_assets() {
+    check_inputs(COHORT, TOOLS, CLI_POLICY).expect("should validate the tracked cohort");
     let cohort = value(COHORT);
-    let rows = cohort["artifacts"]
+    let names: Vec<_> = cohort["artifacts"]
         .as_array()
-        .expect("should list cohort rows");
-    assert_eq!(rows.len(), 7, "should validate the actual ordinary cohort");
-    for asset in rows.iter().skip(4) {
-        let name = asset["name"].as_str().expect("should name the Axum asset");
-        assert!(
-            crate::recipe::AssetId::parse(name).is_err(),
-            "should not grant controlled recipe selection for {name}"
-        );
-    }
-    assert_eq!(
-        value(CLI_POLICY)["artifacts"]
-            .as_array()
-            .expect("should list controlled consumer rows")
-            .len(),
-        4,
-        "should preserve the separately gated index destination contract"
-    );
-}
-
-#[test]
-fn ordinary_axum_rows_reject_every_changed_identity_and_missing_row() {
-    for index in 4..7 {
-        for field in [
-            "package",
-            "bin",
-            "target",
-            "role",
-            "kind",
-            "assurance_profile",
-            "variant",
-        ] {
-            let mut cohort = value(COHORT);
-            cohort["artifacts"][index][field] = json!("example-invalid");
-            assert!(
-                check_inputs(&encode(&cohort), TOOLS, CLI_POLICY).is_err(),
-                "should reject Axum identity change {index}/{field}"
-            );
-        }
-        for field in ["architecture", "minimum_version", "runtime"] {
-            let mut cohort = value(COHORT);
-            cohort["artifacts"][index]["compatibility"][field] = json!("example-invalid");
-            assert!(
-                check_inputs(&encode(&cohort), TOOLS, CLI_POLICY).is_err(),
-                "should reject Axum compatibility change {index}/{field}"
-            );
-        }
+        .expect("should list cohort rows")
+        .iter()
+        .map(|asset| asset["name"].as_str().expect("should name the asset"))
+        .collect();
+    let fixed: Vec<_> = FIXED_ARTIFACTS.iter().map(|fixed| fixed.name).collect();
+    assert_eq!(names, fixed, "should list exactly the fixed release assets");
+    for index in 0..names.len() {
         let mut cohort = value(COHORT);
         cohort["artifacts"]
             .as_array_mut()
@@ -192,9 +153,26 @@ fn ordinary_axum_rows_reject_every_changed_identity_and_missing_row() {
             .remove(index);
         assert!(
             check_inputs(&encode(&cohort), TOOLS, CLI_POLICY).is_err(),
-            "should require Axum row {index}"
+            "should require row {index}"
         );
     }
+}
+
+#[test]
+fn ordinary_cohort_rejects_an_axum_row() {
+    let mut cohort = value(COHORT);
+    let mut row = cohort["artifacts"][3].clone();
+    row["name"] = json!("trusted-server-axum-x86_64-unknown-linux-gnu");
+    row["package"] = json!("trusted-server-adapter-axum");
+    row["bin"] = json!("trusted-server-axum");
+    cohort["artifacts"]
+        .as_array_mut()
+        .expect("should list cohort rows")
+        .push(row);
+    assert!(
+        check_inputs(&encode(&cohort), TOOLS, CLI_POLICY).is_err(),
+        "should refuse release assets outside the fixed set"
+    );
 }
 
 #[test]

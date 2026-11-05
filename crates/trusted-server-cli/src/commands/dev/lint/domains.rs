@@ -94,7 +94,7 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "docs.github.com",
     "help.github.com",
     "token.actions.githubusercontent.com",
-    // GitHub Actions SLSA buildType URI cited by the release spec and compatibility record:
+    // GitHub Actions SLSA buildType URI pinned by the release producer and the CLI release policy:
     // https://actions.github.io/buildtypes/workflow/v1
     "actions.github.io",
     // Git commit conventions
@@ -125,7 +125,7 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "rslstandard.org",
     // SLSA: canonical provenance predicate and build specification references.
     "slsa.dev",
-    // SPDX: canonical document predicate in the retained reviewed contract.
+    // SPDX: canonical document predicate in the release verification guide.
     "spdx.dev",
     // Specs (other)
     "webassembly.org",

@@ -2,7 +2,7 @@
 
 **Phase 2 spec:** [ordinary Fastly release equality](../specs/2026-10-28-1235-binary-attestations-phase2-design.md), with its own source-checked review rounds. Tracking issue: #1235.
 
-**Current verification:** Rehearsal `.20` passed at exact reviewed source `5163241b947b1aa335987bd832b9205e4364e4bb`: [all 18 jobs](https://github.com/prk-Jr/trusted-server/actions/runs/40812416995) succeeded, publishing 30 immutable prerelease assets, not Latest. Independent [transcript parts 1](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6487647974), [2](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6487649518) and [3](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6487649861) verify all release memberships and checksums, both predicates and reusable signer identities online/offline for all seven binaries, 14 SPDX equalities and negative controls, companion joins, native smoke and pinned Fastly packaging. The exact published Wasm also passed the local Viceroy 0.21.0 publisher/JS/source-header/logging check, with zero build-fact lines and owned-listener cleanup. Current-source CI passed 29 checks with four expected skips. This completion record is docs-only since rehearsed `5163241b9`; its subsequent hosted checks are assessed separately. Keep #1449 draft, without reviewers. Historical `.16` remains at `5fa384336`, and `.13` at `770a425df`. Qualification and Phase 3/4 production gates remain closed; Phase 3 is draft #1463.
+**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). The Phase 1 narrowing merge (four binaries, 18 files) needs a fresh rehearsal; see the [compatibility and rehearsal record](binary-attestations-phase2-fastly-integration.md#phase-1-narrowing-merge). Historical `.16` remains at `5fa384336`, and `.13` at `770a425df`. Qualification and Phase 3/4 production gates remain closed; Phase 3 is draft #1463.
 
 **Tracking issue:** #1235. The earlier separate tracking-issue draft is retained as planning history, not an additional issue prerequisite.
 
@@ -132,7 +132,7 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 
 | Frozen-source path                                                                                             | Landing phase | State                                                     |
 | -------------------------------------------------------------------------------------------------------------- | ------------- | --------------------------------------------------------- |
-| `docs/superpowers/plans/2026-10-13-attested-release-implementation.md`                                         | 1 — carried   | Carried in #1435                                          |
+| `docs/superpowers/plans/2026-10-13-attested-release-implementation.md`                                         | 1 — removed   | Removed from #1435; frozen at `122b78664`                 |
 | `docs/superpowers/plans/2026-10-13-cli-packaging-attestation-integration.md`                                   | 1 — carried   | Carried in #1435                                          |
 | `docs/superpowers/plans/2026-10-13-fastly-prebuilt-edgezero-integration.md`                                    | 1 — carried   | Carried in #1435                                          |
 | `docs/superpowers/specs/2026-01-15-attestation-design.md`                                                      | 1 — carried   | Carried in #1435                                          |
@@ -186,7 +186,7 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `crates/trusted-server-release/tests/commands.rs`                                                              | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/tests/fixtures/sha-mbles-1.bin`                                                 | 2             | Ported Phase 2 source or approved split                   |
 | `scripts/release/bootstrap.sh`                                                                                 | 2             | Ported Phase 2 source or approved split                   |
-| `scripts/release/release-cohort.json`                                                                          | 2             | Retained current seven rows; strict metadata validation   |
+| `scripts/release/release-cohort.json`                                                                          | 2             | Restored with the four fixed rows; strict validation      |
 | `scripts/release/release-tools.json`                                                                           | 2             | Already identical; retain, no port                        |
 | `crates/trusted-server-release/src/boundary.rs`                                                                | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/boundary/cleanup_and_system_root_tests.rs`                                  | 2             | Ported Phase 2 source or approved split                   |
@@ -571,7 +571,7 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 
 The dependency-coupled producer graph is ported with the approved Phase 3 evidence-test splits. Its frozen diagnostic/preflight, package inspection, GNU measurement and loopback probe commands are present; no build/equality/export/publication command or inhabited qualified selector is introduced. The ordinary adapter remains a separate implementation group. Host all-target check, strict clippy, documentation and 229 audited pure tests pass; process and ignored tests remain CI-only.
 
-The tracked cohort is validated as exactly seven ordinary rows. The four `FIXED_ARTIFACTS` rows remain the closed controlled-recipe/consumer/index destination contract; source-owned projection joins those exact names and order to the unchanged four-row consumer policy. Ordinary Axum metadata cannot select a controlled recipe. The seven-asset index amendment and controlled Axum integration are not implied by this metadata adaptation.
+The tracked cohort is validated as exactly the four `FIXED_ARTIFACTS` rows, which remain the closed controlled-recipe/consumer/index destination contract; source-owned projection joins those exact names and order to the unchanged four-row consumer policy. A row outside that set, such as a former Axum row, is refused. An Axum distribution would need its own reviewed phase.
 
 The retained tools/consumer policy selects GitHub CLI 2.97.0 for its destination contract. The current operator guide uses 2.102.0 and the ordinary publisher records its installed version; carrying the destination pins does not enforce them in the ordinary path. Other selected tool versions match current source pins.
 

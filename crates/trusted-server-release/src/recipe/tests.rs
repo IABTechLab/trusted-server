@@ -35,13 +35,10 @@ fn asset_selection_comes_from_fixed_table_not_json() {
         .expect("should list cohort artifacts")
     {
         let name = entry["name"].as_str().expect("should name artifact");
-        let Some(fixed) = FIXED_ARTIFACTS.iter().find(|fixed| fixed.name == name) else {
-            assert!(
-                AssetId::parse(name).is_err(),
-                "should not select ordinary-only Axum metadata as a controlled recipe"
-            );
-            continue;
-        };
+        let fixed = FIXED_ARTIFACTS
+            .iter()
+            .find(|fixed| fixed.name == name)
+            .expect("should list only fixed release assets");
         let asset = AssetId::parse(name).expect("should accept every controlled destination asset");
         assert_eq!(
             asset.artifact().package,

@@ -17,9 +17,8 @@ import * as fs from 'node:fs'
 import vm from 'node:vm'
 import { fileURLToPath } from 'node:url'
 import {
-  audit,
   checkBinary,
-  checkSource,
+  checkCliVersion,
   mergeSboms,
   sentinels,
 } from './phase1.mjs'
@@ -445,19 +444,6 @@ test('ordinary transport acquires exactly the four Rust-bound archives in fixed 
   }
 })
 
-test('checked JS inventory metadata is confined to its exact build script', () => {
-  const source = 'option_env!("TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY")'
-  assert.doesNotThrow(() =>
-    checkSource('crates/trusted-server-js/build.rs', source)
-  )
-  for (const file of [
-    'crates/example/build.rs',
-    'crates/trusted-server-js/src/lib.rs',
-    'crates/trusted-server-js-other/build.rs',
-    'other/crates/trusted-server-js/build.rs',
-  ])
-    assert.throws(() => checkSource(file, source), /compile-time/)
-})
 test('rejects every planted operator value, including inside binary data', () => {
   for (const marker of sentinels) {
     assert.throws(
@@ -477,32 +463,22 @@ test('rejects every planted operator value, including inside binary data', () =>
   )
   assert.throws(() => checkBinary(Buffer.alloc(0)), /empty/)
 })
-test('rejects deployment compile inputs while permitting product inputs', () => {
-  for (const source of [
-    'env!("TRUSTED_SERVER__EC__PASSPHRASE")',
-    'option_env!("EDGEZERO__STORES__CONFIG__NAME")',
-    'include_str!("../../trusted-server.toml")',
-    'include_bytes!(".env.production")',
-  ]) {
-    assert.throws(() => checkSource('src/lib.rs', source), /compile-time/)
-  }
-  assert.throws(
-    () => checkSource('build.rs', 'fs::read("trusted-server.toml")'),
-    /compile-time/
-  )
-  assert.doesNotThrow(() =>
-    checkSource(
-      'src/lib.rs',
-      'option_env!("TRUSTED_SERVER__GIT_VERSION"); include_str!("trusted-server.example.toml")'
-    )
-  )
-})
 test('merges independent graphs without colliding references and binds binary bytes', () => {
   const bom = (name) => ({
     bomFormat: 'CycloneDX',
     specVersion: '1.5',
     version: 1,
-    metadata: { component: { type: 'application', name, 'bom-ref': 'root' } },
+    metadata: {
+      component: {
+        type: 'application',
+        name,
+        version: '1.2.3',
+        'bom-ref': 'root',
+        components: [
+          { type: 'library', name: `${name}-nested`, 'bom-ref': 'nested' },
+        ],
+      },
+    },
     components: [
       { type: 'library', name: `${name}-dependency`, 'bom-ref': 'dependency' },
     ],
@@ -518,13 +494,18 @@ test('merges independent graphs without colliding references and binds binary by
     'example.wasm'
   )
   assert.equal(output.metadata.component.name, 'example.wasm')
+  // The release tag stays external; the root keeps Cargo's package version,
+  // matching its purl and `ts --version`.
+  assert.equal(output.metadata.component.version, '1.2.3')
+  // The root's nested components are listed once, at the top level.
+  assert.equal(output.metadata.component.components, undefined)
   assert.equal(output.metadata.component.hashes[0].alg, 'SHA-256')
   assert.equal(output.metadata.component.hashes[0].content.length, 64)
   assert.deepEqual(
     output.dependencies.find(
       (d) => d.ref === output.metadata.component['bom-ref']
     ).dependsOn,
-    [output.components[0]['bom-ref'], output.components[1]['bom-ref']]
+    [output.components[0]['bom-ref'], output.components[2]['bom-ref']]
   )
   assert.equal(
     new Set(output.components.map((c) => c['bom-ref'])).size,
@@ -721,6 +702,8 @@ test('signing job shell refuses symlinked, extra, empty and changed inputs', () 
   }
 })
 const assets = releaseAssets
+// The publisher fixture shadows `execFileSync`; this runs a real child process.
+const realExecFileSync = execFileSync
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex')
 
 test('isolated signing accepts only bound 3/2 input sets and retains exact provenance subjects', () => {
@@ -896,58 +879,22 @@ const canonicalBlock = (markdown) => {
   assert.ok(block, 'should mark the canonical verification block')
   return block[1]
 }
-const normalizePins = (code) =>
-  code.replace(/^(REPO|TAG|COMMIT|ASSETS)=.*$/gm, '$1=<pin>').trim()
-test('release notes match the guide and never pre-fill reviewed pins', () => {
+test('release notes link to the guide at the tag and carry no commands', () => {
   const body = releaseNotes('example/project', 'v1.2.3-rc.1')
-  const code = body.match(/```bash\n([\s\S]*?)\n```/)[1]
-  assert.equal(
-    normalizePins(code),
-    normalizePins(
-      canonicalBlock(readFileSync('docs/guide/release-verification.md', 'utf8'))
+  assert.ok(
+    body.includes(
+      '(https://github.com/example/project/blob/v1.2.3-rc.1/docs/guide/release-verification.md)'
     ),
-    'release commands should match the guide'
+    'should link to the guide at the tag'
   )
-  assert.match(code, /^REPO=$/m, 'should leave REPO for independent review')
-  assert.match(code, /^TAG=$/m, 'should leave TAG for independent review')
-  assert.match(code, /^COMMIT=$/m, 'should leave COMMIT for independent review')
-  assert.match(code, new RegExp(`^ASSETS=\\(${assets.join(' ')}\\)$`, 'm'))
   assert.match(body, /stay editable after publication/)
-  assert.match(
-    body,
-    /blob\/v1\.2\.3-rc\.1\/docs\/guide\/release-verification\.md/
-  )
-  assert.doesNotMatch(body, /\{\{/)
-  execFileSync('bash', ['-n'], { input: code })
-  // The unset pins must stop the block before any verification runs.
-  const bin = mkdtempSync(join(tmpdir(), 'phase1-notes-'))
-  try {
-    writeFileSync(join(bin, 'gh'), '#!/bin/sh\necho ran >> "$0.log"\n', {
-      mode: 0o755,
-    })
-    // macOS ships bash 3.2, where a failing `[[ ]]` alone does not trigger
-    // `set -e`; check it wherever it is installed.
-    for (const shell of ['bash', '/bin/bash'].filter(
-      (shell) => shell === 'bash' || fs.existsSync(shell)
-    ))
-      for (const input of [
-        code,
-        code
-          .replace(/^REPO=$/m, 'REPO=example/project')
-          .replace(/^TAG=$/m, 'TAG=v1.2.3'),
-      ]) {
-        assert.throws(() =>
-          execFileSync(shell, ['-c', input], {
-            cwd: bin,
-            env: { PATH: `${bin}:${process.env.PATH}` },
-            stdio: 'pipe',
-          })
-        )
-        assert.equal(fs.existsSync(join(bin, 'gh.log')), false, shell)
-      }
-  } finally {
-    rmSync(bin, { recursive: true, force: true })
-  }
+  assert.doesNotMatch(body, /\{\{|```/)
+  // The guide's block is the only copy of the verification commands.
+  execFileSync('bash', ['-n'], {
+    input: canonicalBlock(
+      readFileSync('docs/guide/release-verification.md', 'utf8')
+    ),
+  })
 })
 test('publication binds exact signing handoffs and refuses drafts, corruption and partial uploads', async (t) => {
   // Record each read's command timeout so availability reads can be bounded.
@@ -969,15 +916,12 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'wrong-tag-commit',
     'missing-tag',
     'malformed-tag',
-    'download-corrupt',
-    'download-missing',
-    'download-extra',
-    'download-manifest',
-    'download-transient',
-    'download-never',
+    'bundle-verification-failure',
+    'bundle-sbom-mismatch',
+    'identity-late',
+    'large-sbom-output',
     'publication-disabled',
     'prerelease-mismatch',
-    'post-read-error',
     'draft',
     'draft-page-2',
     'api-error',
@@ -1001,6 +945,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'wrong-id',
     'published-asset-digest',
     'published-asset-extra',
+    'published-asset-renamed',
     'attestation-404-then-present',
     'attestation-after-two-waits',
     'attestation-404-never',
@@ -1030,6 +975,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'attestation-verification-failure',
     'attestation-verify-transient',
     'attestation-verify-past-deadline',
+    'attestation-proof-late-failure',
     'attestation-late-reads',
     'attestation-list-past-deadline',
     'attestation-null-bundle',
@@ -1053,11 +999,19 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
               ? 'v1.0.0'
               : 'v0.0.0-example'
     const opaque = mode.startsWith('attestation-null-bundle')
+    // Real SBOM results embed the whole SPDX document and exceed 1 MiB.
+    const spdxDocument = (asset) =>
+      mode === 'large-sbom-output'
+        ? { fixture: asset, padding: 'x'.repeat(2 * 1024 * 1024) }
+        : { fixture: asset }
     const waits = [],
       ignored = []
-    let downloads = 0,
-      verifies = 0,
-      now = 0
+    // Whether a gh command ran since the last API call.
+    let ghSinceFetch = false
+    let verifies = 0,
+      now = 0,
+      // The availability window starts when the identity reads finish.
+      availabilityEnd = 60000
     let polls = 0,
       observed = []
     try {
@@ -1073,7 +1027,11 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           '.provenance.sigstore.json',
           '.sbom.sigstore.json',
         ]) {
-          const bytes = Buffer.from(`fixture ${asset}${suffix}`)
+          const bytes = Buffer.from(
+            suffix === '.spdx.json'
+              ? JSON.stringify(spdxDocument(asset))
+              : `fixture ${asset}${suffix}`
+          )
           writeFileSync(
             join(suffix.includes('sigstore') ? signed : build, asset + suffix),
             bytes
@@ -1193,12 +1151,15 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           method === 'GET',
           `should time-bound every read and only reads: ${method} ${u.pathname}`
         )
+        // A synchronous gh check between API calls leaves pooled sockets
+        // idle, and the server may close them meanwhile.
         if (
-          calls.some(([kind]) => kind === 'gh') &&
-          (mode === 'post-read-error' ||
-            (mode === 'idle-socket' && options.headers.Connection !== 'close'))
+          mode === 'idle-socket' &&
+          ghSinceFetch &&
+          options.headers.Connection !== 'close'
         )
           throw new TypeError('other side closed')
+        ghSinceFetch = false
         calls.push([method, u.pathname + u.search])
         const response = (body, status = 200, headers = {}) =>
           new Response(
@@ -1225,10 +1186,13 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           polls++
           assert.equal(method, 'GET')
           assert.equal(u.searchParams.get('predicate_type'), 'release')
-          assert.ok(now < 60000, 'should not start a read after the deadline')
+          assert.ok(
+            now < availabilityEnd,
+            'should not start a read after the deadline'
+          )
           assert.equal(
             timeouts.get(options.signal),
-            Math.min(4000, 60000 - now),
+            Math.min(4000, availabilityEnd - now),
             'should bound every availability read by the availability deadline'
           )
           // Two transient failures push the third read close to the deadline.
@@ -1307,10 +1271,19 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           return response(mode === 'draft' ? [release(true)] : [])
         }
         if (u.pathname.endsWith('/releases') && method === 'POST') {
-          const creation = JSON.parse(options.body)
-          assert.equal(creation.prerelease, !stable)
-          assert.equal(creation.make_latest, stable ? 'legacy' : 'false')
-          assert.equal(creation.body, releaseNotes('example/project', tag))
+          assert.deepEqual(
+            JSON.parse(options.body),
+            {
+              tag_name: tag,
+              target_commitish: 'a'.repeat(40),
+              name: tag,
+              draft: true,
+              prerelease: !stable,
+              make_latest: stable ? 'legacy' : 'false',
+              body: releaseNotes('example/project', tag),
+            },
+            'should create exactly one draft for the tag'
+          )
           return response(
             mode === 'created-wrong-tag'
               ? { ...release(true), tag_name: 'v9.9.9' }
@@ -1342,53 +1315,140 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             201
           )
         }
-        if (u.pathname.includes('/releases/tags/'))
+        if (method === 'GET' && /\/releases\/(?:42|tags\/)/.test(u.pathname))
+          assert.equal(
+            timeouts.get(options.signal),
+            Math.min(10000, 180000 - now),
+            'should bound every identity read by the post-publish window'
+          )
+        if (u.pathname.includes('/releases/tags/')) {
+          availabilityEnd = Math.min(180000, now + 60000)
           return response({
             ...release(false),
             id: mode === 'wrong-id' ? 43 : 42,
           })
+        }
         if (u.pathname.endsWith('/releases/42')) {
+          if (method === 'PATCH')
+            assert.deepEqual(
+              JSON.parse(options.body),
+              {
+                draft: false,
+                prerelease: !stable,
+                make_latest: stable ? 'legacy' : 'false',
+              },
+              'should publish with the release type and Latest policy'
+            )
+          // The first identity read ends late in the post-publish window.
+          else if (mode === 'identity-late') now = 175000
           const current = release(method !== 'PATCH' && uploaded.length === 0)
           if (mode === 'published-asset-extra')
             current.assets.push({ name: 'unexpected', size: 1 })
+          // Same count and unique names, but one name is not in the set.
+          if (mode === 'published-asset-renamed' && current.assets.length)
+            current.assets[0] = { ...current.assets[0], name: 'unexpected' }
           return response(current)
         }
         throw Error(`Unexpected ${method} ${url}`)
       }
       const execFileSync = (...args) => {
         calls.push(['gh', args])
-        if (args[1][1] === 'download') {
-          downloads++
+        ghSinceFetch = true
+        if (args[1][0] === 'attestation') {
+          const index =
+            calls.filter(
+              ([kind, call]) => kind === 'gh' && call[1][0] === 'attestation'
+            ).length - 1
+          // Two predicates per binary; the Fastly provenance also names its
+          // rebuild check.
+          const [name, subject, kind] = assets.flatMap((asset) => [
+            [asset, asset, 'provenance'],
+            [asset, asset, 'sbom'],
+            ...(asset === 'trusted-server-fastly.wasm'
+              ? [[asset, `${asset}.rebuild-check.json`, 'provenance']]
+              : []),
+          ])[index]
+          assert.deepEqual(
+            args,
+            [
+              'gh',
+              [
+                'attestation',
+                'verify',
+                join(root, 'release-assets', subject),
+                '--repo',
+                'example/project',
+                '--bundle',
+                join(root, 'release-assets', `${name}.${kind}.sigstore.json`),
+                '--source-ref',
+                `refs/tags/${tag}`,
+                '--source-digest',
+                'a'.repeat(40),
+                '--signer-digest',
+                'a'.repeat(40),
+                '--deny-self-hosted-runners',
+                '--predicate-type',
+                kind === 'sbom'
+                  ? 'https://spdx.dev/Document/v2.3'
+                  : 'https://slsa.dev/provenance/v1',
+                '--signer-workflow',
+                'example/project/.github/workflows/release-build.yml',
+                '--format',
+                'json',
+              ],
+              {
+                timeout: 60000,
+                stdio: 'pipe',
+                maxBuffer: 256 * 1024 * 1024,
+              },
+            ],
+            'should verify each signing bundle for its asset and predicate'
+          )
           assert.ok(
-            args[2].timeout > 10000 && args[2].timeout <= 60000,
-            'should allow bulk transfers within the shared deadline'
+            !calls.some(([method]) => method !== 'gh'),
+            'should verify signing bundles before any API call'
           )
-          const dir = args[1][args[1].indexOf('--dir') + 1]
-          if (
-            mode === 'download-never' ||
-            (mode === 'download-transient' && downloads === 1)
+          if (mode === 'bundle-verification-failure' && index === 3)
+            throw Error('Signature verification failed')
+          const output = JSON.stringify([
+            {
+              verificationResult: {
+                statement: {
+                  predicate:
+                    mode === 'bundle-sbom-mismatch'
+                      ? { fixture: 'other' }
+                      : spdxDocument(name),
+                },
+              },
+            },
+          ])
+          if (mode !== 'large-sbom-output') return Buffer.from(output)
+          // Pass the large result through a real child process with the
+          // publisher's own options, so Node's output buffer limit applies.
+          const file = join(root, 'gh-output.json')
+          writeFileSync(file, output)
+          return realExecFileSync(
+            process.execPath,
+            [
+              '-e',
+              "process.stdout.write(require('node:fs').readFileSync(process.argv[1]))",
+              file,
+            ],
+            args[2]
           )
-            throw Object.assign(Error('timeout'), { code: 'ETIMEDOUT' })
-          for (const item of uploaded)
-            fs.writeFileSync(join(dir, item.name), item.bytes)
-          if (mode === 'download-corrupt')
-            fs.writeFileSync(join(dir, assets[0]), 'corrupt')
-          if (mode === 'download-manifest')
-            fs.writeFileSync(join(dir, 'SHA256SUMS'), 'corrupt')
-          if (mode === 'download-missing') fs.unlinkSync(join(dir, assets[0]))
-          if (mode === 'download-extra')
-            fs.writeFileSync(join(dir, 'extra'), 'extra')
-          return Buffer.from('downloaded')
         }
-        if (args[1][1] !== 'verify') return Buffer.from('verified asset')
         verifies++
         const verifiedTag = args[1].at(-1)
         assert.equal(verifiedTag, tag, 'should verify only the current tag')
         assert.equal(
           args[2].timeout,
-          Math.min(10000, 60000 - now),
+          Math.min(10000, availabilityEnd - now),
           'should bound proof verification by the availability deadline'
         )
+        // The first proof fails, so the next availability check reads the
+        // API again after a gh command.
+        if (mode === 'idle-socket' && verifies === 1)
+          throw Error('Signature verification failed')
         if (mode === 'attestation-verify-transient' && verifies === 1)
           throw Object.assign(Error('gh failed'), {
             stderr: Buffer.from('HTTP 503: Service Unavailable'),
@@ -1397,6 +1457,12 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         if (mode === 'attestation-verify-past-deadline' && verifies <= 2) {
           now += args[2].timeout
           throw Object.assign(Error('timeout'), { code: 'ETIMEDOUT' })
+        }
+        // Every failed proof fetch runs until its command timeout, so the
+        // check before the next wait finds the deadline too close.
+        if (mode === 'attestation-proof-late-failure') {
+          now += args[2].timeout
+          throw Error('Signature verification failed')
         }
         if (
           mode === 'attestation-verification-failure' ||
@@ -1461,7 +1527,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'success',
         'idle-socket',
         'stable',
-        'download-transient',
+        'identity-late',
+        'large-sbom-output',
         'attestation-404-then-present',
         'attestation-after-two-waits',
         'attestation-other-tag',
@@ -1480,6 +1547,9 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'leading-zero-tag': /Invalid repository or tag/,
         'upload-size': /Upload mismatch/,
         'attestation-verification-failure': /Signature verification failed/,
+        'attestation-proof-late-failure': /Signature verification failed/,
+        'bundle-verification-failure': /Signature verification failed/,
+        'bundle-sbom-mismatch': /Signed SBOM differs from the shipped SPDX/,
         'attestation-truncated': /truncated/,
         'attestation-duplicate-subject': /Invalid release attestation subjects/,
         'attestation-payload-type': /Malformed release attestation bundle/,
@@ -1488,6 +1558,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'upload-digest': /Upload mismatch/,
         'published-asset-digest': /Published asset digest mismatch/,
         'published-asset-extra': /Published asset set mismatch/,
+        'published-asset-renamed': /Unexpected published asset/,
         'attestation-404-never': /unavailable after five checks/,
         // The deadline names its window and keeps the failure that caused the
         // retry.
@@ -1511,15 +1582,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'attestation-null-bundle-wrong-assets': /identity or assets mismatch/,
       }[mode]
       if (successful) await execute()
-      else
-        await assert.rejects(
-          execute,
-          expectedError ??
-            (mode.startsWith('download-') && mode !== 'download-never'
-              ? /mismatch|Unexpected artifact contents|ENOENT/
-              : undefined),
-          mode
-        )
+      else await assert.rejects(execute, expectedError, mode)
       if (
         [
           'draft',
@@ -1543,11 +1606,18 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           'unsigned-companion',
           'symlink-input',
           'signed-extra',
+          'bundle-verification-failure',
+          'bundle-sbom-mismatch',
         ].includes(mode)
       )
         assert.ok(
           !calls.some(([method]) => ['POST', 'PATCH'].includes(method)),
           mode
+        )
+      if (mode.startsWith('bundle-'))
+        assert.ok(
+          !calls.some(([method]) => method !== 'gh'),
+          'should call no API after a signing bundle fails'
         )
       if (mode === 'draft-page-2')
         assert.ok(
@@ -1556,8 +1626,13 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           ),
           'should read the second release page'
         )
+      // Two predicates per binary, plus the Fastly rebuild check.
+      const bundleChecks = releaseAssets.length * 2 + 1
       if (mode === 'api-error' || mode === 'upload-error')
-        assert.equal(calls.length, mode === 'api-error' ? 2 : 4)
+        assert.equal(
+          calls.length,
+          bundleChecks + (mode === 'api-error' ? 2 : 4)
+        )
       if (mode.startsWith('created-'))
         assert.ok(
           !calls.some(([method, path]) =>
@@ -1570,43 +1645,33 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       if (['upload-error', 'upload-digest', 'upload-size'].includes(mode))
         assert.ok(!calls.some(([method]) => method === 'PATCH'), mode)
       if (successful) {
-        assert.equal(uploaded.length, 30)
+        // Four files per binary, the Fastly rebuild check and SHA256SUMS.
+        assert.equal(uploaded.length, assets.length * 4 + 2)
+        // Two-space lines are what `shasum -a 256 --check` accepts.
+        assert.equal(
+          uploaded.find((item) => item.name === 'SHA256SUMS').bytes.toString(),
+          uploaded
+            .filter((item) => item.name !== 'SHA256SUMS')
+            .map((item) => `${hash(item.bytes)}  ${item.name}\n`)
+            .join(''),
+          'should publish checksums in the checker format'
+        )
         assert.equal(
           calls.filter(
-            ([method, args]) => method === 'gh' && args[1][1] === 'verify-asset'
+            ([kind, args]) => kind === 'gh' && args[1][0] === 'attestation'
           ).length,
-          30
+          bundleChecks
         )
         assert.equal(
           verifies,
           [
+            'idle-socket',
             'attestation-verify-transient',
             'attestation-null-bundle-late',
           ].includes(mode)
             ? 2
             : 1,
           mode
-        )
-      }
-      assert.equal(
-        fs
-          .readdirSync(root)
-          .some((name) => name.startsWith('published-download-')),
-        false,
-        'should clean every download attempt'
-      )
-      if (mode.startsWith('download-')) {
-        assert.equal(
-          downloads,
-          mode === 'download-transient' ? 2 : mode === 'download-never' ? 3 : 1
-        )
-        assert.deepEqual(
-          waits,
-          mode === 'download-transient'
-            ? [2000]
-            : mode === 'download-never'
-              ? [2000, 5000]
-              : []
         )
       }
       if (mode.startsWith('attestation-')) {
@@ -1644,6 +1709,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             6,
           ],
           'attestation-non-200': [[2000, 5000], 3],
+          'attestation-proof-late-failure': [[2000, 5000, 10000], 4],
         }[mode]
         assert.deepEqual(waits, retried?.[0] ?? expectedWaits, mode)
         assert.equal(polls, retried?.[1] ?? expectedWaits.length + 1, mode)
@@ -1659,7 +1725,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             ([method, path]) =>
               method === 'POST' && path.split('?')[0].endsWith('/assets')
           ).length,
-          30,
+          assets.length * 4 + 2,
           mode
         )
         assert.equal(
@@ -1810,6 +1876,17 @@ test('SPDX rejects root/hash ambiguity and lost package identities', () => {
     mutate(document)
     assert.throws(() => validateSpdx(document, binary, original))
   }
+  // A converter package named like the root, listed before it, must not stand
+  // in for the described root.
+  const { document, original } = spdxFixture()
+  document.packages.unshift({
+    SPDXID: 'SPDXRef-Impostor',
+    name: document.packages[0].name,
+  })
+  assert.throws(
+    () => validateSpdx(document, binary, original),
+    /SPDX describes a different inventory root/
+  )
 })
 test('SPDX validation rescans the final binary for planted operator values', () => {
   const planted = Buffer.concat([binary, Buffer.from(sentinels[0])])
@@ -1937,6 +2014,17 @@ test('every canary the release build plants is a scanned sentinel', () => {
     [...sentinels].sort(),
     'should scan for exactly the planted canaries'
   )
+  // The GNU builds run in a container that sees only the variables passed in.
+  for (const name of [
+    'TRUSTED_SERVER__RELEASE_BUILD',
+    'TRUSTED_SERVER__GIT_VERSION',
+    ...exported.map((entry) => entry.split('=')[0]),
+  ])
+    assert.match(
+      script,
+      new RegExp(`--env ${name} `),
+      `should pass ${name} into the GNU builder`
+    )
 })
 test('post-publish retries distinguish transient failures and cap Retry-After', async () => {
   for (const [error, failures, expected] of [
@@ -1979,7 +2067,7 @@ test('post-publish retries distinguish transient failures and cap Retry-After', 
   }
 })
 
-test('rejects invalid wasm, GNU symbols above 2.34 and dynamic musl', () => {
+test('rejects invalid wasm, foreign ELF and GNU symbols above 2.34', () => {
   const wasm = Buffer.from('0061736d01000000', 'hex')
   checkReleaseFormat(wasm, 'wasm32-wasip1')
   for (const bytes of [
@@ -1988,49 +2076,67 @@ test('rejects invalid wasm, GNU symbols above 2.34 and dynamic musl', () => {
     Buffer.from('0061736d02000000', 'hex'),
   ])
     assert.throws(() => checkReleaseFormat(bytes, 'wasm32-wasip1'), /wasm/)
-  const elf = Buffer.from('7f454c46', 'hex')
-  const gnu = 'x86_64-unknown-linux-gnu',
-    musl = 'x86_64-unknown-linux-musl'
-  checkReleaseFormat(elf, gnu, 'GLIBC_2.2.5 GLIBC_2.34')
+  // A 64-bit little-endian ELF header with the given e_machine.
+  const elf = (machine = 0x3e, elfClass = 2) => {
+    const bytes = Buffer.alloc(64)
+    Buffer.from('7f454c46', 'hex').copy(bytes)
+    bytes[4] = elfClass
+    bytes[5] = 1
+    bytes.writeUInt16LE(machine, 18)
+    return bytes
+  }
+  const gnu = 'x86_64-unknown-linux-gnu'
+  checkReleaseFormat(elf(), gnu, 'GLIBC_2.2.5 GLIBC_2.34')
   for (const versions of [
     'GLIBC_2.35',
     'GLIBC_3.0',
     'GLIBC_2.34.1',
     'GLIBC_ABI_DT_RELR',
   ])
-    assert.throws(() => checkReleaseFormat(elf, gnu, versions), /GLIBC/)
-  checkReleaseFormat(elf, musl, 'There is no dynamic section')
-  for (const dynamic of ['INTERP', '(NEEDED) libgcc_s.so.1'])
-    assert.throws(() => checkReleaseFormat(elf, musl, dynamic), /static/)
-  assert.throws(() => checkReleaseFormat(wasm, gnu, 'GLIBC_2.34'), /ELF/)
+    assert.throws(() => checkReleaseFormat(elf(), gnu, versions), /GLIBC/)
+  // aarch64 (EM_AARCH64) and 32-bit ELF are refused for the x86_64 target.
+  for (const bytes of [elf(0xb7), elf(0x3e, 1), wasm])
+    assert.throws(() => checkReleaseFormat(bytes, gnu, 'GLIBC_2.34'), /ELF/)
+  assert.throws(
+    () => checkReleaseFormat(elf(), 'x86_64-unknown-linux-musl'),
+    /Unsupported release target/
+  )
 })
-test('audit resolves raw and nested concatenated deployment inputs', () => {
-  for (const source of [
-    'include_str!(concat!("trusted-", "server.toml"))',
-    'include_bytes!(concat!(".en", r#"v.production"#))',
-    'env!(r#"TRUSTED_SERVER__EC__PASSPHRASE"#)',
-    'option_env!(concat!("EDGEZERO__", concat!("STORE", "S")))',
-  ])
-    assert.throws(() => checkSource('src/lib.rs', source), /compile-time/)
-  for (const source of [
-    'std::env::var("TRUSTED_SERVER__EC__PASSPHRASE")',
-    'std::env::var_os(concat!("EDGEZERO__", "STORE"))',
-    'const SECRET: &str = r#"TRUSTED_SERVER__SECRET"#; env::var(SECRET)',
-  ])
-    assert.throws(() => checkSource('build.rs', source), /compile-time/)
-  for (const source of [
-    'include_str!(concat!(env!("OUT_DIR"), "/generated.rs"))',
-    'include_str!("trusted-server.example.toml")',
-    '// env!("EDGEZERO__SECRET")\nlet product = "literal";',
-    '/* include_str!("trusted-server.toml") */',
-  ])
-    assert.doesNotThrow(() => checkSource('src/lib.rs', source))
-  assert.doesNotThrow(() =>
-    checkSource('build.rs', 'env::var("TRUSTED_SERVER__GIT_VERSION")')
-  )
-  assert.doesNotThrow(() =>
-    checkSource('src/lib.rs', 'std::env::var("EDGEZERO__ADAPTER__HOST")')
-  )
+test('smoke reads glibc version needs from the final Linux bytes', () => {
+  const root = mkdtempSync(join(tmpdir(), 'phase1-smoke-'))
+  try {
+    const bin = join(root, 'bin')
+    mkdirSync(bin)
+    // Report a glibc 2.35 need only when version information is requested.
+    writeFileSync(
+      join(bin, 'readelf'),
+      '#!/bin/sh\ncase " $* " in *" --version-info "*) echo "Name: GLIBC_2.35" ;; esac\n',
+      { mode: 0o755 }
+    )
+    const header = Buffer.alloc(64)
+    Buffer.from('7f454c460201', 'hex').copy(header)
+    header.writeUInt16LE(0x3e, 18)
+    const asset = join(root, 'ts-x86_64-unknown-linux-gnu')
+    writeFileSync(asset, header)
+    const result = spawnSync(
+      process.execPath,
+      [
+        fileURLToPath(new URL('./phase1.mjs', import.meta.url)),
+        'smoke',
+        asset,
+        'x86_64-unknown-linux-gnu',
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { PATH: `${bin}:${process.env.PATH}` },
+      }
+    )
+    assert.equal(result.status, 1, 'should refuse a glibc 2.35 need')
+    assert.match(result.stderr, /GLIBC requirement exceeds 2\.34/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 })
 test('rejects non-Mach-O, wrong CPU and newer or absent macOS floor', () => {
   const macho = (cpu = 0x0100000c, minimum = 0x000d0000) => {
@@ -2060,9 +2166,8 @@ test('rejects non-Mach-O, wrong CPU and newer or absent macOS floor', () => {
       /Mach-O|macOS/
     )
 })
-test('workflows select exactly the descriptive cohort and restrict actual build jobs', () => {
-  const cohort = JSON.parse(readFileSync('scripts/release/release-cohort.json'))
-  const names = cohort.artifacts.map((a) => a.name).sort()
+test('workflows build, sign and publish exactly the release assets and restrict their jobs', () => {
+  const names = [...releaseAssets].sort()
   const build = readFileSync('.github/workflows/release-build.yml', 'utf8')
   const release = readFileSync('.github/workflows/release.yml', 'utf8')
   const canonical = build
@@ -2121,6 +2226,31 @@ test('workflows select exactly the descriptive cohort and restrict actual build 
     build.split('\n  sign:')[1]?.split('\n  release:')[0].includes(gate),
     'should gate signing on a v* tag push and enablement'
   )
+  // Tag checks run before any build; only tag builds upload signing inputs.
+  const checks = build.split('\n  checks:')[1].split('\n  build:')[0]
+  for (const step of [
+    'Refuse non-SemVer release tags',
+    'Refuse annotated release tags',
+  ])
+    assert.ok(checks.includes(`\n      - name: ${step}\n`), step)
+  assert.ok(actualBuild.startsWith('\n    needs: checks\n'))
+  assert.match(
+    actualBuild,
+    /- uses: actions\/upload-artifact@v\d+\n {8}if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n/
+  )
+  // Each job keeps exactly its own permissions.
+  const permissions = (job) =>
+    job
+      .match(/\n {4}permissions:\n((?: {6}\S.*\n)+)/)[1]
+      .trim()
+      .split(/\s+/)
+  assert.deepEqual(permissions(checks), ['contents:', 'read'])
+  // A queued run must never cancel a publication in progress.
+  assert.match(release, /\n  cancel-in-progress: false\n/)
+  assert.deepEqual(permissions(release.split('\n  release:')[1]), [
+    'contents:',
+    'write',
+  ])
 })
 
 test('ordinary Fastly gate binds dedicated A and B uploads before isolated signing', () => {
@@ -2372,6 +2502,11 @@ test('release build keeps locked builds, pinned generators and final integrity c
     /if \[\[ "\$build_target" != wasm32-wasip1 \]\]; then\n {2}export CARGO_PROFILE_RELEASE_STRIP=debuginfo\nfi\n/
   )
   assert.match(script, /--env CARGO_PROFILE_RELEASE_STRIP /)
+  assert.ok(
+    script.indexOf('export CARGO_PROFILE_RELEASE_STRIP=debuginfo') <
+      script.search(/\bcargo build\b/),
+    'should set the strip before either build'
+  )
   // The copied release bytes are scanned and smoke-checked before any
   // inventory is generated for them.
   const step = (command) => {
@@ -2394,6 +2529,17 @@ test('release build keeps locked builds, pinned generators and final integrity c
       smoked < commands.findIndex((line) => line.startsWith('tool_root=')),
     'should check and smoke the copied binary before generating inventories'
   )
+  // The published SPDX gains its binary-bound root and is validated only by
+  // the completion step after conversion.
+  const merged = step('node scripts/release/phase1.mjs merge \\')
+  const converted = commands.findIndex((line) =>
+    line.startsWith('"$tool_root/converter" convert ')
+  )
+  const completed = step('node scripts/release/phase1.mjs validate-spdx \\')
+  assert.ok(
+    smoked < merged && merged < converted && converted < completed,
+    'should merge, convert, then complete and validate the SPDX'
+  )
   assert.match(script, /cargo install \\\n[^\n]*--locked/)
   assert.match(script, /cargo metadata --locked/)
   // Generator crate and every converter binary are checksum-pinned before use.
@@ -2401,7 +2547,7 @@ test('release build keeps locked builds, pinned generators and final integrity c
     script,
     /printf '%s {2}%s\\n' [a-f0-9]{64} "\$tool_root\/generator\.crate" \| shasum -a 256 --check\n/
   )
-  assert.equal((script.match(/converter_sha=[a-f0-9]{64} ;;/g) ?? []).length, 4)
+  assert.equal((script.match(/converter_sha=[a-f0-9]{64} ;;/g) ?? []).length, 3)
   assert.match(
     script,
     /printf '%s {2}%s\\n' "\$converter_sha" "\$tool_root\/converter" \| shasum -a 256 --check\n/
@@ -2449,14 +2595,16 @@ test('release preflight rejects inherited controls in an isolated script fixture
       `test "$*" = "rev-parse HEAD" || exit 96; printf '%s\\n' "$PREFLIGHT_FIXTURE_COMMIT"`
     )
     stub('printenv', 'exec /usr/bin/printenv "$@"')
+    // The cleanup trap removes the partly written config.
+    stub('rm', 'exec /bin/rm "$@"')
     for (const tool of [
+      'cat',
       'node',
       'npm',
       'docker',
       'cargo',
       'rustup',
       'curl',
-      'sudo',
     ])
       stub(tool, `printf '%s\\n' "$0" >> "$PREFLIGHT_TOOL_LOG"; exit 97`)
     const execute = (extra) => {
@@ -2494,9 +2642,9 @@ test('release preflight rejects inherited controls in an isolated script fixture
     assert.equal(
       execute({}).status,
       97,
-      'should reach the safe node stub when preflight passes'
+      'should reach the first safe tool stub when preflight passes'
     )
-    assert.equal(readFileSync(marker, 'utf8').trim(), join(bin, 'node'))
+    assert.equal(readFileSync(marker, 'utf8').trim(), join(bin, 'cat'))
     assert.equal(fs.existsSync(join(root, 'trusted-server.toml')), false)
   } finally {
     rmSync(root, { recursive: true, force: true })
@@ -2522,168 +2670,6 @@ test('SPDX identifies all producing tools and normalizes license spacing', () =>
     output.creationInfo.creators.includes('Tool: trusted-server-phase1')
   )
 })
-test('audit handles Rust escapes and every macro delimiter', () => {
-  for (const source of [
-    String.raw`env!("\x54RUSTED_SERVER__SECRET")`,
-    String.raw`env!("\u{54}RUSTED_SERVER__SECRET")`,
-    String.raw`include_str!("\x2eenv.production")`,
-    'env![concat!["TRUSTED_SERVER__", "SECRET"]]',
-    'env!{concat!{"TRUSTED_SERVER__", "SECRET"}}',
-  ])
-    assert.throws(() => checkSource('src/lib.rs', source), /compile-time/)
-})
-test('audit handles ordinary char literals and generated include prefixes', () => {
-  assert.doesNotThrow(() =>
-    checkSource('src/lib.rs', `const QUOTE: char = '"';`)
-  )
-  assert.throws(
-    () =>
-      checkSource(
-        'src/lib.rs',
-        'include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/trusted-server.toml"))'
-      ),
-    /compile-time/
-  )
-  assert.doesNotThrow(() =>
-    checkSource(
-      'src/lib.rs',
-      'include_str!(concat!(env!("OUT_DIR"), "/generated.rs"))'
-    )
-  )
-})
-
-test('audit tokenizes byte and C raw strings and astral char literals', () => {
-  const planted = 'env!("TRUSTED_SERVER__EC__PASSPHRASE")'
-  for (const source of [
-    `const A: &[u8] = br#"a"#; ${planted}; const B: &[u8] = br#"b"#;`,
-    `const A: &core::ffi::CStr = cr#"a"#; ${planted}; const B: &core::ffi::CStr = cr#"b"#;`,
-    `const A: [char; 2] = ['😀','"']; ${planted}; const B: char = '"';`,
-    // Each body below holds a quote that ends the literal early if the
-    // tokenizer misses C raw strings, raw-string hash counts, nested block
-    // comments or escapes, which would hide the planted read.
-    `const A: &core::ffi::CStr = cr#"x"y"#; ${planted}; const B: &str = "z";`,
-    `const A: &str = r##"x"#y"##; ${planted}; const B: &str = "z";`,
-    `/* outer /* inner */ " */ ${planted}; const B: &str = "z";`,
-    `const A: &str = "x\\"y"; ${planted}; const B: &str = "z";`,
-  ])
-    assert.throws(
-      () => checkSource('src/lib.rs', source),
-      /compile-time/,
-      source
-    )
-  assert.doesNotThrow(() =>
-    checkSource(
-      'src/lib.rs',
-      'const P: &[u8] = br"C:\\"; const Q: char = \'😀\';'
-    )
-  )
-})
-test('build-script rule covers modules build scripts load and build helper directories', () => {
-  const root = mkdtempSync(join(tmpdir(), 'phase1-audit-'))
-  const write = (file, source) => {
-    mkdirSync(join(root, file, '..'), { recursive: true })
-    writeFileSync(join(root, file), source)
-  }
-  const leak = 'const NAME: &str = "TRUSTED_SERVER__PUBLISHER__ORIGIN_URL";'
-  try {
-    write(
-      'a/build.rs',
-      '#[path = "../b/helper/x.rs"]\nmod x;\nmod y;\nmod sub;\nmod helpers;\nfn main() {}'
-    )
-    write('b/helper/x.rs', 'mod nested;')
-    write('b/helper/nested.rs', '')
-    write('a/y.rs', '')
-    write('a/sub/mod.rs', '')
-    // A non-mod.rs file `helpers.rs` loads `mod names;` from `helpers/`.
-    write('a/helpers.rs', 'pub mod names;\npub mod more;')
-    write('a/helpers/names.rs', '')
-    write('a/helpers/more/mod.rs', '')
-    write('c/build_support/z.rs', '')
-    write('c/build/w.rs', '')
-    write('c/src/lib.rs', leak)
-    audit(root)
-    const restore = {
-      'b/helper/x.rs': 'mod nested;',
-      'a/helpers.rs': 'pub mod names;\npub mod more;',
-    }
-    for (const file of [
-      'b/helper/x.rs',
-      'b/helper/nested.rs',
-      'a/y.rs',
-      'a/sub/mod.rs',
-      'a/helpers/names.rs',
-      'a/helpers/more/mod.rs',
-      'c/build_support/z.rs',
-      'c/build/w.rs',
-    ]) {
-      write(file, leak)
-      assert.throws(
-        () => audit(root),
-        new RegExp(
-          `${file.replaceAll('/', '[/\\\\]')}: operator compile-time build input`
-        ),
-        file
-      )
-      write(file, restore[file] ?? '')
-    }
-    // A build script the audit cannot recognise is refused; `build.rs` is not.
-    for (const build of ['"build.rs"', "'build.rs'", 'false']) {
-      write('c/Cargo.toml', `[package]\nname = "c"\nbuild = ${build}\n`)
-      audit(root)
-    }
-    for (const manifest of [
-      '[package]\nname = "c"\nbuild = "tools/generate.rs"\n',
-      'package.build = "tools/generate.rs"\n',
-    ]) {
-      write('c/Cargo.toml', manifest)
-      assert.throws(() => audit(root), /custom build script/, manifest)
-    }
-    write('c/Cargo.toml', '[package]\nname = "c"\n')
-    // A `#[path]` module that is not an audited `.rs` file is refused, even
-    // when the file exists: a non-`.rs` file inside the root, or a `.rs` file
-    // outside it, reached relatively or absolutely.
-    write('b/helper/x.txt', '')
-    // rustc loads `/x.rs` as given, not the audited `c/src/x.rs`.
-    write('c/src/x.rs', '')
-    const outside = `${root}-outside.rs`
-    writeFileSync(outside, leak)
-    try {
-      for (const target of [
-        '../../b/helper/x.txt',
-        `../../../${root.split(/[/\\]/).at(-1)}-outside.rs`,
-        outside,
-        '/x.rs',
-      ]) {
-        write('c/src/lib.rs', `#[path = "${target}"]\nmod hidden;`)
-        assert.throws(() => audit(root), /#\[path\] module outside/, target)
-      }
-    } finally {
-      rmSync(outside, { force: true })
-    }
-    write('c/src/lib.rs', leak)
-    // Messages that name a variable are not variable names.
-    write(
-      'c/build/w.rs',
-      'const M: &str = "TRUSTED_SERVER__RELEASE_BUILD must be exactly 1";'
-    )
-    audit(root)
-    // A padded or templated deployment name is still a deployment name.
-    for (const name of [
-      'TRUSTED_SERVER__EC__PASSPHRASE ',
-      'TRUSTED_SERVER__EC__PASSPHRASE\\n',
-      'TRUSTED_SERVER__{} must be set',
-    ]) {
-      write('c/build/w.rs', `const M: &str = "${name}";`)
-      assert.throws(
-        () => audit(root),
-        /operator compile-time build input/,
-        name
-      )
-    }
-  } finally {
-    rmSync(root, { recursive: true, force: true })
-  }
-})
 test('post-publish reads cannot succeed after the shared deadline', async () => {
   let now = 0
   const retry = readRetrier({
@@ -2698,6 +2684,11 @@ test('post-publish reads cannot succeed after the shared deadline', async () => 
         return 'late success'
       }),
     /window exhausted/
+  )
+  await assert.rejects(
+    () =>
+      retry(() => assert.fail('should not start a read after the deadline')),
+    /^Error: Post-publish verification window exhausted$/
   )
 })
 
@@ -2796,14 +2787,20 @@ test('release build cleans owned config and inventory on success and failure', (
     'existing-inventory',
     'inventory-symlink',
     'config-symlink',
+    'member-inventory',
+    'existing-target',
+    'nonempty-assets',
   ]) {
     const root = mkdtempSync(join(tmpdir(), 'phase1-cleanup-'))
     const bin = join(root, 'bin')
     const inventory = join(root, 'crates/trusted-server-cli/phase1.json')
+    // The generator also writes beside every other workspace member.
+    const member = join(root, 'crates/trusted-server-core/phase1.json')
     const config = join(root, 'trusted-server.toml')
     try {
       mkdirSync(bin)
       mkdirSync(join(root, 'crates/trusted-server-cli'), { recursive: true })
+      mkdirSync(join(root, 'crates/trusted-server-core'), { recursive: true })
       const script = join(root, 'build.sh')
       fs.copyFileSync('scripts/release/phase1-build.sh', script)
       const stub = (name, body) =>
@@ -2831,7 +2828,7 @@ test('release build cleans owned config and inventory on success and failure', (
           printf binary > "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/ts" ;;
         install)
           mkdir -p "$RUNNER_TEMP/phase1-cyclonedx/install/bin"
-          printf '%s\\n' '#!/bin/bash' 'printf "{}" > crates/trusted-server-cli/phase1.json' 'if [[ "$FIXTURE_MODE" == generator-failure ]]; then exit 98; fi' > "$RUNNER_TEMP/phase1-cyclonedx/install/bin/cargo-cyclonedx"
+          printf '%s\\n' '#!/bin/bash' 'printf "{}" > crates/trusted-server-cli/phase1.json' 'printf "{}" > crates/trusted-server-core/phase1.json' 'if [[ "$FIXTURE_MODE" == generator-failure ]]; then exit 98; fi' > "$RUNNER_TEMP/phase1-cyclonedx/install/bin/cargo-cyclonedx"
           chmod +x "$RUNNER_TEMP/phase1-cyclonedx/install/bin/cargo-cyclonedx" ;;
         metadata) echo '{}' ;;
         *) exit 96 ;;
@@ -2849,6 +2846,13 @@ test('release build cleans owned config and inventory on success and failure', (
         writeFileSync(inventory, 'operator inventory')
       if (mode === 'inventory-symlink')
         fs.symlinkSync('missing-user-file', inventory)
+      if (mode === 'member-inventory')
+        fs.symlinkSync('missing-user-file', member)
+      if (mode === 'existing-target') mkdirSync(join(root, 'phase1-target'))
+      if (mode === 'nonempty-assets') {
+        mkdirSync(join(root, 'release-assets'))
+        writeFileSync(join(root, 'release-assets/stale'), 'stale')
+      }
       let error
       try {
         execFileSync(
@@ -2901,8 +2905,119 @@ test('release build cleans owned config and inventory on success and failure', (
           false,
           `${mode}: inventory cleanup`
         )
+      if (mode === 'member-inventory')
+        assert.equal(fs.readlinkSync(member), 'missing-user-file')
+      else
+        assert.equal(
+          fs.existsSync(member),
+          false,
+          `${mode}: member inventory cleanup`
+        )
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
+  }
+})
+test('smoke accepts only the release build facts in ts --version', () => {
+  const manifest = '[workspace.package]\nversion = "1.2.3"\n'
+  const source = 'a'.repeat(40)
+  const target = 'x86_64-unknown-linux-gnu'
+  const facts = `ts package=1.2.3 source=${source} target=${target} variant=default`
+  checkCliVersion(`${facts}\n`, manifest, source, target)
+  for (const output of [
+    `ts package=1.2.3 source=unknown target=${target} variant=default`,
+    `ts package=1.2.4 source=${source} target=${target} variant=default`,
+    `ts package=1.2.3 source=${source} target=aarch64-apple-darwin variant=default`,
+    `${facts} extra`,
+    'ts 1.2.3',
+  ])
+    assert.throws(
+      () => checkCliVersion(output, manifest, source, target),
+      /Unexpected CLI version/,
+      output
+    )
+})
+// Runs a workflow step's shell with stub tools, as GitHub's `bash -eo pipefail`.
+const runStep = (workflow, step, stubs, env) => {
+  const bin = mkdtempSync(join(tmpdir(), 'phase1-step-'))
+  try {
+    for (const [name, body] of Object.entries(stubs))
+      writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 })
+    return spawnSync(
+      'bash',
+      [
+        '--noprofile',
+        '--norc',
+        '-eo',
+        'pipefail',
+        '-c',
+        runBlock(workflow, step),
+      ],
+      {
+        cwd: bin,
+        encoding: 'utf8',
+        env: { PATH: `${bin}:${process.env.PATH}`, ...env },
+      }
+    )
+  } finally {
+    rmSync(bin, { recursive: true, force: true })
+  }
+}
+test('build checks refuse a tag reference that is not a lightweight tag at the commit', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const commit = 'a'.repeat(40)
+  for (const [reference, status] of [
+    [`commit ${commit}`, 0],
+    [`tag ${commit}`, 1],
+    [`commit ${'b'.repeat(40)}`, 1],
+    [null, 1],
+  ]) {
+    const result = runStep(
+      workflow,
+      'Refuse annotated release tags',
+      {
+        gh:
+          reference === null
+            ? 'echo "HTTP 404: Not Found" >&2; exit 1'
+            : `printf '%s\\n' '${reference}'`,
+      },
+      {
+        GITHUB_REPOSITORY: 'example/project',
+        GITHUB_SHA: commit,
+        RELEASE_TAG: 'v1.2.3',
+      }
+    )
+    assert.equal(result.status, status, `${reference}: ${result.stderr}`)
+    if (reference?.startsWith('tag'))
+      assert.match(result.stdout, /::error::Release tags must be lightweight/)
+  }
+})
+test('publisher step refuses a Node other than the pinned version before publishing', () => {
+  const release = readFileSync('.github/workflows/release.yml', 'utf8')
+  const step = 'Verify handoff, create once, publish by release ID and verify'
+  assert.match(
+    release.split(`- name: ${step}`)[1],
+    /\n {10}NODE_VERSION: \$\{\{ steps\.tools\.outputs\.node \}\}\n/,
+    'should compare against the Node version the job installed'
+  )
+  for (const [installed, status] of [
+    ['v24.20.0', 0],
+    ['v20.20.2', 1],
+  ]) {
+    const result = runStep(
+      release,
+      step,
+      {
+        gh: 'echo "gh version 2.102.0 (2026-01-01)"',
+        node: `if [ "$1" = --version ]; then echo ${installed}; else echo published; fi`,
+      },
+      { NODE_VERSION: '24.20.0' }
+    )
+    assert.equal(result.status, status, `${installed}: ${result.stderr}`)
+    assert.equal(
+      result.stdout.includes('published'),
+      status === 0,
+      `${installed}: should run the publisher only on the pinned Node`
+    )
   }
 })

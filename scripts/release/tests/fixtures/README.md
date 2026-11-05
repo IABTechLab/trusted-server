@@ -4,7 +4,7 @@ Phase 2 staging note: this catalog includes controlled destination fixtures, not
 a claim that their qualification or index/publication integrations are active.
 Controlled JS preparation still pins esbuild 0.27.3 while the current lock uses
 0.28.2; ordinary releases and Gate 1 do not use that observer. See the
-[compatibility notes](../../../../docs/superpowers/plans/binary-attestations-phase1-compatibility.md#controlled-js-observer-gap).
+[compatibility notes](../../../../docs/superpowers/plans/binary-attestations-phase2-fastly-integration.md#controlled-js-observer-gap).
 
 The host-only `crates/trusted-server-release` implements current strict document/schema utilities. Introduced Python utilities and requirements are removed; their behavior/results do not establish replacement Rust execution. The [migration addendum](../../../../docs/superpowers/specs/2026-10-14-release-tooling-rust-migration.md) and [primary plan](../../../../docs/superpowers/plans/2026-10-13-attested-release-implementation.md#rust-migration-and-current-execution-boundary) describe remaining source/bootstrap/qualification gates.
 

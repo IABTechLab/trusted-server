@@ -8,9 +8,6 @@ import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
 
 export const releaseAssets = [
-  'trusted-server-axum-x86_64-unknown-linux-gnu',
-  'trusted-server-axum-x86_64-unknown-linux-musl',
-  'trusted-server-axum-aarch64-unknown-linux-gnu',
   'trusted-server-fastly.wasm',
   'ts-aarch64-apple-darwin',
   'ts-x86_64-apple-darwin',
@@ -44,7 +41,6 @@ export function releaseNotes(repo, tag) {
     .readFileSync(notesTemplate, 'utf8')
     .replaceAll('{{REPOSITORY}}', repo)
     .replaceAll('{{TAG}}', tag)
-    .replace('{{ASSETS}}', releaseAssets.join(' '))
     .trimEnd()
 }
 
@@ -162,8 +158,8 @@ export function readRetrier({
 }
 
 /**
- * Verifies the signing handoff, creates one draft, uploads, publishes it as an
- * immutable release and verifies the published result.
+ * Verifies the signing handoff and its bundles, creates one draft, uploads,
+ * publishes it as an immutable release and verifies the published result.
  *
  * Every dependency with an outside effect is injected so tests can drive the
  * real program.
@@ -246,6 +242,67 @@ export async function publish({
   )
   files.push('SHA256SUMS')
   const asset = (file) => regular(path('release-assets', file))
+  // Verify every signing bundle before anything is created: a defective bundle
+  // would otherwise become a permanent part of the immutable release. Nothing
+  // exists yet, so a failure here is safe to rerun.
+  // The Fastly provenance also names the rebuild-check companion as a subject.
+  const checks = releaseAssets.flatMap((name) => [
+    [name, name, 'provenance', 'https://slsa.dev/provenance/v1'],
+    [name, name, 'sbom', 'https://spdx.dev/Document/v2.3'],
+    ...(name === 'trusted-server-fastly.wasm'
+      ? [
+          [
+            name,
+            `${name}.rebuild-check.json`,
+            'provenance',
+            'https://slsa.dev/provenance/v1',
+          ],
+        ]
+      : []),
+  ])
+  for (const [name, subject, kind, predicate] of checks) {
+    const verified = JSON.parse(
+      execFileSync(
+        'gh',
+        [
+          'attestation',
+          'verify',
+          path('release-assets', subject),
+          '--repo',
+          repo,
+          '--bundle',
+          path('release-assets', `${name}.${kind}.sigstore.json`),
+          '--source-ref',
+          `refs/tags/${tag}`,
+          '--source-digest',
+          source,
+          '--signer-digest',
+          source,
+          '--deny-self-hosted-runners',
+          '--predicate-type',
+          predicate,
+          '--signer-workflow',
+          `${repo}/.github/workflows/release-build.yml`,
+          '--format',
+          'json',
+        ],
+        // The SBOM result embeds the whole SPDX document, which exceeds
+        // Node's 1 MiB default output buffer.
+        { timeout: 60000, stdio: 'pipe', maxBuffer: 256 * 1024 * 1024 }
+      )
+    )
+    // The signed SBOM predicate must be the SPDX document shipped beside it.
+    if (
+      kind === 'sbom' &&
+      (!Array.isArray(verified) ||
+        verified.length !== 1 ||
+        !isDeepStrictEqual(
+          verified[0]?.verificationResult?.statement?.predicate,
+          JSON.parse(asset(`${name}.spdx.json`))
+        ))
+    )
+      throw Error(`Signed SBOM differs from the shipped SPDX: ${name}`)
+  }
   // Close API connections before synchronous gh checks can leave pooled
   // sockets idle. Every read is time-bounded. Mutations are single-shot and
   // rely on the job timeout: a client-side abort cannot cancel a create,
@@ -300,6 +357,8 @@ export async function publish({
     make_latest,
     body: releaseNotes(repo, tag),
   })
+  // Log the ID before checking it: recovery starts from this line.
+  log(`Created release ID: ${created.id}`)
   if (
     !Number.isSafeInteger(created.id) ||
     created.id <= 0 ||
@@ -309,7 +368,6 @@ export async function publish({
   )
     throw Error('Invalid created release identity')
   const id = created.id
-  log(`Created release ID: ${id}`)
   for (const file of files) {
     const bytes = asset(file)
     const response = await fetch(
@@ -531,53 +589,6 @@ export async function publish({
     )
     await sleep(delay)
   }
-  for (const file of files)
-    log(
-      'Verified asset:',
-      file,
-      (
-        await retryRead(() =>
-          execFileSync(
-            'gh',
-            [
-              'release',
-              'verify-asset',
-              tag,
-              path('release-assets', file),
-              '--repo',
-              repo,
-            ],
-            { timeout: remaining(10000) }
-          )
-        )
-      ).toString()
-    )
-  // Re-download into a fresh directory on every transport retry; verify bytes
-  // outside retries.
-  let download
-  try {
-    await retryRead(() => {
-      if (download) fs.rmSync(download, { recursive: true, force: true })
-      download = fs.mkdtempSync(path('published-download-'))
-      return execFileSync(
-        'gh',
-        ['release', 'download', tag, '--repo', repo, '--dir', download],
-        { timeout: remaining(60000), stdio: 'pipe' }
-      )
-    })
-    exact(download, files)
-    for (const file of files)
-      if (!regular(join(download, file)).equals(asset(file)))
-        throw Error(`Downloaded asset mismatch: ${file}`)
-    log(
-      'Verified post-publish re-download: all',
-      files.length,
-      'assets byte-identical to signed checksums and handoff'
-    )
-  } finally {
-    if (download) fs.rmSync(download, { recursive: true, force: true })
-  }
-  await verifyIdentity()
 }
 
 if (import.meta.main)

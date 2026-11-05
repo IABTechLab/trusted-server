@@ -131,10 +131,9 @@ impl FixedArtifact {
     }
 }
 
-/// The four controlled destination rows, not the seven ordinary release assets.
+/// The four controlled destination rows, which are also the ordinary release assets.
 ///
-/// These recipes and index identities remain closed. Ordinary Axum metadata
-/// below grants neither a controlled recipe nor seven-asset index authority.
+/// These recipes and index identities remain closed.
 pub(crate) const FIXED_ARTIFACTS: [FixedArtifact; 4] = [
     FixedArtifact {
         name: "trusted-server-fastly.wasm",
@@ -210,7 +209,7 @@ struct OrdinaryArtifact {
 }
 
 fn ordinary_artifacts() -> Vec<OrdinaryArtifact> {
-    let mut artifacts: Vec<_> = FIXED_ARTIFACTS
+    FIXED_ARTIFACTS
         .iter()
         .map(|fixed| OrdinaryArtifact {
             name: fixed.name,
@@ -225,45 +224,7 @@ fn ordinary_artifacts() -> Vec<OrdinaryArtifact> {
             minimum_version: fixed.minimum_version,
             runtime: fixed.runtime,
         })
-        .collect();
-    for (name, target, architecture, minimum_version, runtime) in [
-        (
-            "trusted-server-axum-x86_64-unknown-linux-gnu",
-            "x86_64-unknown-linux-gnu",
-            "x86_64",
-            "glibc-2.34",
-            "linux-gnu",
-        ),
-        (
-            "trusted-server-axum-x86_64-unknown-linux-musl",
-            "x86_64-unknown-linux-musl",
-            "x86_64",
-            "static",
-            "linux-musl",
-        ),
-        (
-            "trusted-server-axum-aarch64-unknown-linux-gnu",
-            "aarch64-unknown-linux-gnu",
-            "aarch64",
-            "glibc-2.34",
-            "linux-gnu",
-        ),
-    ] {
-        artifacts.push(OrdinaryArtifact {
-            name,
-            target,
-            architecture,
-            minimum_version,
-            runtime,
-            package: "trusted-server-adapter-axum",
-            bin: "trusted-server-axum",
-            kind: "native-executable",
-            role: "server",
-            assurance_profile: "provenance-sbom",
-            capability: "axum-evaluation",
-        });
-    }
-    artifacts
+        .collect()
 }
 
 /// Test-only rows naming the members of the Cargo denial fixture workspace.
@@ -772,8 +733,7 @@ fn check_cli_policy(policy: &Value, cohort: &Value) -> Result<(), Report<Release
 
 /// Joins the exact four controlled destination rows plus read-only actions.
 ///
-/// The ordinary seven-row cohort has already passed strict validation. Its
-/// additional Axum metadata cannot expand the carried consumer/index contract.
+/// The ordinary cohort has already passed strict validation.
 fn check_policy_artifacts(policy: &Value, cohort: &Value) -> Result<(), Report<ReleaseError>> {
     let policy_artifacts = policy
         .as_array()

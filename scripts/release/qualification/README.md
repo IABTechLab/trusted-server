@@ -4,7 +4,7 @@ Phase 2 staging note: this catalog includes controlled destination fixtures, not
 a claim that their qualification or index/publication integrations are active.
 Controlled JS preparation still pins esbuild 0.27.3 while the current lock uses
 0.28.2; ordinary releases and Gate 1 do not use that observer. See the
-[compatibility notes](../../../docs/superpowers/plans/binary-attestations-phase1-compatibility.md#controlled-js-observer-gap).
+[compatibility notes](../../../docs/superpowers/plans/binary-attestations-phase2-fastly-integration.md#controlled-js-observer-gap).
 
 Status: **Rust migration in progress; candidate recipes for all four assets pass ordinary CI, but Tasks 8–9 qualification remains incomplete**. No tool,
 SDK, OCI image or recipe has become qualified. `release-tools.json` retains null
