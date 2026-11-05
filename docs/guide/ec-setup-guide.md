@@ -43,10 +43,8 @@ do not call either API may omit it. Provision high-entropy values under
 [Configuration](/guide/configuration#secret-store-migration).
 
 A partner with pull sync enabled (`pull_sync_enabled` and `pull_sync_url`)
-owns its source through the pull-sync provider, so batch sync rejects every
-mapping for it with `provider_owned`. Trusted Server logs a warning at config
-load when such a partner also sets `api_token`; use either pull sync or batch
-sync for a partner, not both. See
+owns its source through the pull-sync provider, so browser EID ingestion skips
+it. Batch sync keeps accepting its mappings, so a partner may use both. See
 [Pull Sync on Navigations](/guide/edge-cookies#pull-sync-on-navigations).
 
 Required behavior assumptions:

@@ -805,7 +805,7 @@ EID persistence, and, when `tcf_vendor_id` is set and TCF applies to the
 request, only with TCF vendor consent for that vendor.
 
 A provider owns its `sources`: its results replace whatever the row holds for
-them, and batch sync rejects them and pull sync skips them. Browser-resolved IDs
+them, and batch sync rejects them. Browser-resolved IDs
 (`ts-eids`, `sharedId`) are never stored for an owned source, so a source a
 provider cleared on an opt-out is not refilled from the browser.
 
