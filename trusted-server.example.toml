@@ -245,7 +245,8 @@ pull_sync_concurrency = 3
 # refreshed server side from `refresh_from`, with no API key and no email.
 # Tokens are never generated: that needs an email or phone number. Without
 # `endpoint`, the refresh token is never stored. The authenticated
-# `/_ts/admin/ec/{id}` view shows refresh state as "[redacted]".
+# `/_ts/admin/ec/{id}` view shows refresh state as "[redacted]". UID2 is not
+# offered where GDPR applies, so it is skipped there.
 # [[ec.identity_providers]]
 # id = "uid2"
 # kind = "uid2"
