@@ -808,6 +808,10 @@ them, and batch sync rejects them and pull sync skips them. Browser-resolved IDs
 (`ts-eids`, `sharedId`) are never stored for an owned source, so a source a
 provider cleared on an opt-out is not refilled from the browser.
 
+When a provider reports an opt-out, its sources are cleared and the row
+remembers the opt-out for 30 days. The provider is not called for that EC
+again until the 30 days pass.
+
 | Field             | Type    | Required | Description                                                             |
 | ----------------- | ------- | -------- | ----------------------------------------------------------------------- |
 | `id`              | String  | Yes      | Stable provider ID used in logs, metrics and KV ownership               |

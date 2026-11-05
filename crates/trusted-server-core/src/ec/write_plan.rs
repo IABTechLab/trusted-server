@@ -9,7 +9,7 @@
 //! browser's `ts-eids` cookie.
 
 use super::EcKvSnapshot;
-use super::coordinator::results::LookupResults;
+use super::coordinator::results::{LookupResults, LookupStatus, SkipReason};
 use super::eid_types::{SourceDomain, UnixSeconds};
 use super::kv::PartnerIdUpdate;
 use super::kv_types::{KvEntry, KvPartnerId, MAX_ENTRY_BYTES};
@@ -77,6 +77,7 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
     for record in entry.ids.values_mut() {
         record.prune_expired(input.now);
     }
+    entry.prune_opt_outs(input.now);
     entry.ids.retain(|_, record| !record.uid.is_empty());
     enforce_size_cap(&mut entry, &written);
 
@@ -120,6 +121,9 @@ fn apply_lookups(
                 entry.ids.insert(source.as_str().to_owned(), record);
                 written.push(source.clone());
             }
+        }
+        if lookup.status == LookupStatus::Skipped(SkipReason::OptedOut) {
+            entry.remember_opt_out(&lookup.provider, now);
         }
         for source in &lookup.cleared {
             if entry.ids.remove(source.as_str()).is_some() {
@@ -213,7 +217,7 @@ mod tests {
     use crate::ec::coordinator::results::{DropCounts, LookupStatus, ProviderLookup, SkipReason};
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, SourceDomain, UidValue};
     use crate::ec::kv::KvIdentityGraph;
-    use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
+    use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid, OPT_OUT_MEMORY_SECONDS};
     use crate::settings::EcPartner;
 
     const EC_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123";
@@ -537,6 +541,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn opt_out_is_remembered_without_extending_it() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let ingest: [PartnerIdUpdate; 0] = [];
+        let provider = ProviderId::new("example-provider");
+        let lookups = failed_lookup(LookupStatus::Skipped(SkipReason::OptedOut));
+
+        // Act: the first opt-out is remembered.
+        let first = plan_write(&input(
+            &present(&provider_entry(&["p-1"])),
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ))
+        .expect("should plan update");
+
+        // Assert
+        let RowChange::Update { entry, .. } = first else {
+            panic!("should update existing row")
+        };
+        let until = entry.opt_outs[&provider];
+        assert_eq!(
+            until,
+            2000 + OPT_OUT_MEMORY_SECONDS,
+            "should remember the opt-out for the memory period"
+        );
+
+        // Act: a skip because of the remembered opt-out changes nothing.
+        let again = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+
+        // Assert
+        assert!(again.is_none(), "should not extend a remembered opt-out");
+    }
+
+    #[test]
+    fn lapsed_opt_out_is_pruned() {
+        let registry = registry(&["ids.example.com"]);
+        let ingest: [PartnerIdUpdate; 0] = [];
+        let mut entry = live_entry();
+        entry
+            .opt_outs
+            .insert(ProviderId::new("example-provider"), 1000);
+        let lookups = LookupResults::default();
+
+        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry))
+            .expect("should plan update");
+
+        let RowChange::Update { entry, .. } = change else {
+            panic!("should update existing row")
+        };
+        assert!(entry.opt_outs.is_empty(), "should forget a lapsed opt-out");
+    }
+
     fn provider_entry(ids: &[&str]) -> KvEntry {
         let mut entry = live_entry();
         let lookups = found("ids.example.com", ids);
@@ -559,7 +618,6 @@ mod tests {
             LookupStatus::NoMatch,
             LookupStatus::Timeout,
             LookupStatus::Skipped(SkipReason::NotDue),
-            LookupStatus::Skipped(SkipReason::OptedOut),
         ] {
             let lookups = failed_lookup(status);
 

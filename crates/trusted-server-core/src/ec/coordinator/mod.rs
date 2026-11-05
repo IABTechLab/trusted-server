@@ -499,6 +499,12 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 pending.early.push(skip(SkipReason::Consent));
                 continue;
             }
+            // A remembered opt-out keeps the provider from being called until
+            // it lapses.
+            if entry.is_some_and(|entry| entry.opted_out(&registered.id, lookup.now)) {
+                pending.early.push(skip(SkipReason::OptedOut));
+                continue;
+            }
             let (due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
             if due.is_empty() {
                 pending.early.push(skip(if input_blocked {
@@ -1348,6 +1354,53 @@ mod tests {
             "should not refresh before the refresh time"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn remembered_opt_out_skips_the_provider_until_it_lapses() {
+        // Arrange
+        let coordinator = coordinator("");
+        let provider = ProviderId::new("example-provider");
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.opt_outs.insert(provider.clone(), 1001);
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::OptedOut),
+            "should skip a provider whose opt-out is remembered"
+        );
+        assert!(
+            transport.sent.borrow().is_empty(),
+            "should not call a provider the visitor opted out of"
+        );
+
+        // Arrange: the opt-out lapsed.
+        entry.opt_outs.insert(provider, 1000);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+        );
+
+        // Assert
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should call the provider again once the opt-out lapses"
+        );
     }
 
     #[test]
