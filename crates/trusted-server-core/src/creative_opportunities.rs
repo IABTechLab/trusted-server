@@ -2421,7 +2421,7 @@ mod tests {
 
         assert_eq!(routed.inputs().len(), 1);
         assert!(routed.inputs()[0].slots()[0].allows_stored_fallback_without_candidates());
-        assert_eq!(routed.inputs()[0].slots()[0].prebid_zone(), Some("header"));
+        assert_eq!(routed.inputs()[0].slots()[0].zone(), Some("header"));
         assert!(
             routed.inputs()[0].slots().iter().all(|slot| {
                 !slot

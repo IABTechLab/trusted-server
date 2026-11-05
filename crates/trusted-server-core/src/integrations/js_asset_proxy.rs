@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
-use http::{Method, Request, Response, StatusCode, header};
+use http::{Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use validator::{Validate, ValidationError, ValidationErrors};
@@ -23,7 +23,8 @@ use crate::constants::{
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    IntegrationDeclaration, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    ScriptSourceAction, ScriptSourceClaim, ScriptSourceContext, ScriptSourceTransition,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{ProxyRequestConfig, proxy_request};
@@ -258,24 +259,6 @@ impl JsAssetProxyIntegration {
             .find(|asset| asset.proxy == JsAssetProxyMode::Enabled && asset.path == path)
     }
 
-    fn asset_for_origin_url(&self, origin_url: &str) -> Option<&JsAssetProxyAsset> {
-        self.config
-            .assets
-            .iter()
-            .find(|asset| asset.origin_url == origin_url)
-    }
-
-    fn asset_for_script_src(
-        &self,
-        script_src: &str,
-        ctx: &IntegrationAttributeContext<'_>,
-    ) -> Option<&JsAssetProxyAsset> {
-        self.asset_for_origin_url(script_src).or_else(|| {
-            let normalized_src = normalize_script_src(script_src, ctx.request_scheme)?;
-            self.asset_for_origin_url(&normalized_src)
-        })
-    }
-
     fn build_proxy_config<'a>(
         origin_url: &'a str,
         req: &Request<EdgeBody>,
@@ -443,6 +426,91 @@ impl JsAssetProxyIntegration {
     }
 }
 
+fn source_routes(config: &JsAssetProxyConfig) -> Vec<IntegrationEndpoint> {
+    config
+        .assets
+        .iter()
+        .filter(|asset| asset.proxy == JsAssetProxyMode::Enabled)
+        .map(|asset| IntegrationEndpoint::get(asset.path.clone()))
+        .collect()
+}
+
+fn source_transition(
+    config: &JsAssetProxyConfig,
+    source: &str,
+    request_scheme: &str,
+) -> ScriptSourceAction {
+    let asset = config
+        .assets
+        .iter()
+        .find(|asset| asset.origin_url == source)
+        .or_else(|| {
+            let normalized = normalize_script_src(source, request_scheme)?;
+            config
+                .assets
+                .iter()
+                .find(|asset| asset.origin_url == normalized)
+        });
+    match asset.map(|asset| (asset.proxy, &asset.path)) {
+        Some((JsAssetProxyMode::Enabled, path)) => ScriptSourceAction::Replace(path.clone()),
+        Some((JsAssetProxyMode::Blocked, _)) => ScriptSourceAction::Remove,
+        Some((JsAssetProxyMode::Disabled, _)) | None => ScriptSourceAction::Unchanged,
+    }
+}
+
+struct JsAssetSourceRule {
+    config: JsAssetProxyConfig,
+}
+
+impl ScriptSourceTransition for JsAssetSourceRule {
+    fn apply_script_source(&self, context: &ScriptSourceContext<'_>) -> ScriptSourceAction {
+        if context.kind().is_none() {
+            return ScriptSourceAction::Unchanged;
+        }
+        source_transition(&self.config, context.source, context.base_url.scheme())
+    }
+}
+
+/// Declare source-visible asset routes and transitions without runtime services.
+///
+/// Disabled parent definitions contribute nothing. The declaration and native
+/// implementation call the same exact-URL transition and route enumerator.
+///
+/// # Errors
+///
+/// Returns a non-disclosing configuration error if enabled asset configuration
+/// is invalid. No secret resolution, client construction or network access occurs.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::integrations::js_asset_proxy::{declare, JsAssetProxyConfig};
+/// let config = JsAssetProxyConfig { enabled: false, cache_ttl_seconds: None, assets: vec![] };
+/// assert!(declare(&config).expect("should retain disabled definition").is_none());
+/// ```
+pub fn declare(
+    config: &JsAssetProxyConfig,
+) -> Result<Option<IntegrationDeclaration>, Report<TrustedServerError>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    let mut config = config.clone();
+    config.normalize_origin_urls();
+    config.validate().map_err(|_| {
+        Report::new(TrustedServerError::Configuration {
+            message: "Invalid js_asset_proxy source declaration".to_owned(),
+        })
+    })?;
+    let mut declaration = IntegrationDeclaration::new(JS_ASSET_PROXY_INTEGRATION_ID);
+    declaration.routes = source_routes(&config);
+    declaration.script_sources.push(ScriptSourceClaim::new(
+        JS_ASSET_PROXY_INTEGRATION_ID,
+        "assets",
+        Arc::new(JsAssetSourceRule { config }),
+    ));
+    Ok(Some(declaration))
+}
+
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<JsAssetProxyIntegration>>, Report<TrustedServerError>> {
@@ -483,12 +551,7 @@ impl IntegrationProxy for JsAssetProxyIntegration {
     }
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        self.config
-            .assets
-            .iter()
-            .filter(|asset| asset.proxy == JsAssetProxyMode::Enabled)
-            .map(|asset| IntegrationEndpoint::new(Method::GET, asset.path.clone()))
-            .collect()
+        source_routes(&self.config)
     }
 
     async fn handle(
@@ -552,14 +615,10 @@ impl IntegrationAttributeRewriter for JsAssetProxyIntegration {
             return AttributeRewriteAction::keep();
         }
 
-        let Some(asset) = self.asset_for_script_src(attr_value, ctx) else {
-            return AttributeRewriteAction::keep();
-        };
-
-        match asset.proxy {
-            JsAssetProxyMode::Enabled => AttributeRewriteAction::replace(asset.path.clone()),
-            JsAssetProxyMode::Disabled => AttributeRewriteAction::keep(),
-            JsAssetProxyMode::Blocked => AttributeRewriteAction::remove_element(),
+        match source_transition(&self.config, attr_value, ctx.request_scheme) {
+            ScriptSourceAction::Unchanged => AttributeRewriteAction::keep(),
+            ScriptSourceAction::Replace(value) => AttributeRewriteAction::replace(value),
+            ScriptSourceAction::Remove => AttributeRewriteAction::remove_element(),
         }
     }
 }
@@ -574,11 +633,12 @@ mod tests {
     use crate::html_processor::{BodyCloseInjection, HtmlProcessorConfig, create_html_processor};
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeRewriter, IntegrationRegistry,
+        evaluate_script_sources,
     };
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
-    use http::header;
+    use http::{Method, header};
     use serde_json::json;
 
     fn build_http_request(method: Method, uri: &str) -> Request<EdgeBody> {
@@ -587,6 +647,118 @@ mod tests {
             .uri(uri)
             .body(EdgeBody::empty())
             .expect("should build HTTP request")
+    }
+
+    #[test]
+    fn declaration_and_execution_share_exact_asset_transitions_and_routes() {
+        let base = Url::parse("https://example.com/").expect("should parse publisher base");
+        for mode in [
+            JsAssetProxyMode::Enabled,
+            JsAssetProxyMode::Disabled,
+            JsAssetProxyMode::Blocked,
+        ] {
+            let config = JsAssetProxyConfig {
+                enabled: true,
+                cache_ttl_seconds: None,
+                assets: vec![asset(
+                    "/asset.js",
+                    "https://scripts.example.com/asset.js",
+                    mode,
+                )],
+            };
+            let declaration = declare(&config)
+                .expect("should declare enabled parent")
+                .expect("should have declaration");
+            let integration = JsAssetProxyIntegration::new(config);
+            let native_routes = integration.routes();
+            assert_eq!(
+                declaration.routes.len(),
+                native_routes.len(),
+                "should share route selection"
+            );
+            for (declared, executable) in declaration.routes.iter().zip(&native_routes) {
+                assert_eq!(
+                    (&declared.method, &declared.path),
+                    (&executable.method, &executable.path),
+                    "should share route method and exact path"
+                );
+            }
+            for source in [
+                "https://scripts.example.com/asset.js",
+                "https://scripts.example.com:443/asset.js",
+                "//scripts.example.com/asset.js",
+                "https://scripts.example.com/asset.js?different",
+                "https://scripts.example.com/asset.js#different",
+            ] {
+                let parsed = base.join(source).ok();
+                let context = ScriptSourceContext {
+                    element_name: "script",
+                    attribute_name: "src",
+                    source,
+                    parsed_url: parsed.as_ref(),
+                    base_url: &base,
+                    rel: "",
+                    as_token: "",
+                };
+                let declared =
+                    evaluate_script_sources(&context, &declaration.script_sources).action;
+                let native = match integration.rewrite("src", source, &rewrite_context()) {
+                    AttributeRewriteAction::Keep => ScriptSourceAction::Unchanged,
+                    AttributeRewriteAction::Replace(value) => ScriptSourceAction::Replace(value),
+                    AttributeRewriteAction::RemoveElement => ScriptSourceAction::Remove,
+                };
+                assert_eq!(
+                    declared, native,
+                    "should call the same canonical exact-URL rule"
+                );
+                let preload = ScriptSourceContext {
+                    element_name: "link",
+                    attribute_name: "href",
+                    rel: "preload",
+                    as_token: "script",
+                    ..context
+                };
+                assert_eq!(
+                    evaluate_script_sources(&preload, &declaration.script_sources).action,
+                    native,
+                    "should simulate script preload as the same policy subject"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn declaration_errors_and_debug_output_do_not_disclose_asset_values() {
+        let config = JsAssetProxyConfig {
+            enabled: true,
+            cache_ttl_seconds: None,
+            assets: vec![asset(
+                "/path-credential-sentinel",
+                "https://user-credential-sentinel@scripts.example.com/source-credential-sentinel?q=query-credential-sentinel",
+                JsAssetProxyMode::Enabled,
+            )],
+        };
+        let declaration = declare(&config)
+            .expect("should preserve accepted credential-bearing URL")
+            .expect("should declare enabled parent");
+        assert!(
+            !format!("{declaration:?}").contains("credential-sentinel"),
+            "should redact all configured asset values"
+        );
+        let mut invalid = config;
+        invalid.assets[0].path = "invalid-credential-sentinel".to_owned();
+        let error = declare(&invalid).expect_err("should reject invalid enabled declaration");
+        assert!(
+            !format!("{error:?}").contains("credential-sentinel"),
+            "should not attach value-bearing validation errors"
+        );
+        invalid.enabled = false;
+        assert!(
+            declare(&invalid)
+                .expect("should defer active-only validation for disabled parent")
+                .is_none(),
+            "should not activate retained disabled values"
+        );
     }
 
     fn asset(path: &str, origin_url: &str, proxy: JsAssetProxyMode) -> JsAssetProxyAsset {
@@ -638,9 +810,8 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         });
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,

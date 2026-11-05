@@ -39,14 +39,16 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{Request, Response, header};
 use serde::{Deserialize, Serialize};
+use url::Url;
 use validator::Validate;
 
 use crate::constants::{HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE};
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
-    IntegrationRegistration,
+    IntegrationDeclaration, IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
+    IntegrationProxy, IntegrationRegistration, ScriptSourceAction, ScriptSourceClaim,
+    ScriptSourceContext, ScriptSourceTransition,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{ProxyRequestConfig, proxy_request};
@@ -100,6 +102,71 @@ impl IntegrationConfig for GptConfig {
     fn is_enabled(&self) -> bool {
         self.enabled
     }
+}
+
+fn owns_script_url(url: &Url) -> bool {
+    url.host_str() == Some(SECUREPUBADS_HOST) && url.path().eq_ignore_ascii_case("/tag/js/gpt.js")
+}
+
+struct GptSourceRule {
+    rewrite: bool,
+}
+
+impl ScriptSourceTransition for GptSourceRule {
+    fn apply_script_source(&self, context: &ScriptSourceContext<'_>) -> ScriptSourceAction {
+        if self.rewrite && super::script_url::http_source_url(context).is_some_and(owns_script_url)
+        {
+            ScriptSourceAction::Replace("/integrations/gpt/script".to_owned())
+        } else {
+            ScriptSourceAction::Unchanged
+        }
+    }
+}
+
+fn source_routes() -> Vec<IntegrationEndpoint> {
+    vec![
+        IntegrationEndpoint::get(format!("{ROUTE_PREFIX}/script")),
+        IntegrationEndpoint::get(format!("{ROUTE_PREFIX}/pagead/*")),
+        IntegrationEndpoint::get(format!("{ROUTE_PREFIX}/tag/*")),
+    ]
+}
+
+/// Declare GPT source capabilities without resolving secrets or constructing clients.
+///
+/// # Errors
+///
+/// Returns a non-disclosing error for invalid active configuration.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use trusted_server_core::integrations::gpt::{declare, GptConfig};
+/// # fn declaration(config: &GptConfig) {
+/// let declaration = declare(config).expect("should validate source configuration");
+/// # }
+/// ```
+pub fn declare(
+    config: &GptConfig,
+) -> Result<Option<IntegrationDeclaration>, Report<TrustedServerError>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    config.validate().map_err(|_| {
+        Report::new(TrustedServerError::Configuration {
+            message: "Invalid gpt source declaration".to_owned(),
+        })
+    })?;
+    let mut declaration = IntegrationDeclaration::new(GPT_INTEGRATION_ID);
+    declaration.routes = source_routes();
+    declaration.browser_modules.push(GPT_INTEGRATION_ID);
+    declaration.script_sources.push(ScriptSourceClaim::new(
+        GPT_INTEGRATION_ID,
+        "rewrite_script",
+        Arc::new(GptSourceRule {
+            rewrite: config.rewrite_script,
+        }),
+    ));
+    Ok(Some(declaration))
 }
 
 /// Google Publisher Tags integration implementation.
@@ -294,11 +361,11 @@ impl GptIntegration {
     /// This matcher is intentionally strict and only controls HTML attribute
     /// rewriting for the initial bootstrap tag. The `script_url` config option
     /// still controls which upstream URL `/integrations/gpt/script` fetches.
+    #[cfg(test)]
     fn is_gpt_script_url(value: &str, ctx: &IntegrationAttributeContext<'_>) -> bool {
-        super::script_url::parse_script_url(value, ctx).is_some_and(|url| {
-            url.host_str() == Some(SECUREPUBADS_HOST)
-                && url.path().eq_ignore_ascii_case("/tag/js/gpt.js")
-        })
+        super::script_url::parse_script_url(value, ctx)
+            .as_ref()
+            .is_some_and(owns_script_url)
     }
 
     /// Fetch and serve the GPT bootstrap script (`gpt.js`).
@@ -392,11 +459,7 @@ impl IntegrationProxy for GptIntegration {
     }
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![
-            self.get("/script"),
-            self.get("/pagead/*"),
-            self.get("/tag/*"),
-        ]
+        source_routes()
     }
 
     async fn handle(
@@ -438,19 +501,15 @@ impl IntegrationAttributeRewriter for GptIntegration {
         ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         if !self.config.rewrite_script {
-            return AttributeRewriteAction::keep();
+            return AttributeRewriteAction::Keep;
         }
-
-        if Self::is_gpt_script_url(attr_value, ctx) {
-            // Root-relative so the browser resolves it against the page host.
-            // Note: a page-level `<base href>` participates in this resolution,
-            // so on pages that set an external base URL these resolve against
-            // that base rather than the address-bar origin — an accepted
-            // tradeoff, matching GTM/Didomi/Testlight which are also relative.
-            AttributeRewriteAction::replace("/integrations/gpt/script".to_string())
-        } else {
-            AttributeRewriteAction::keep()
-        }
+        super::script_url::rewrite_source(
+            &GptSourceRule {
+                rewrite: self.config.rewrite_script,
+            },
+            attr_value,
+            ctx,
+        )
     }
 }
 
@@ -566,6 +625,13 @@ mod tests {
     fn script_url_ownership_corpus() {
         let integration = GptIntegration::new(test_config());
         crate::integrations::script_url::tests::assert_ownership("gpt", &*integration);
+        let declaration = declare(&integration.config)
+            .expect("should validate pure source")
+            .expect("should declare enabled owner");
+        crate::integrations::script_url::tests::assert_claim_ownership(
+            "gpt",
+            &declaration.script_sources[0],
+        );
     }
 
     fn test_context() -> IntegrationAttributeContext<'static> {

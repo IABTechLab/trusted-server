@@ -17,12 +17,13 @@ pub mod config;
 pub mod context;
 pub mod endpoints;
 pub mod formats;
-pub(crate) mod openrtb;
+pub mod mediator;
+pub mod openrtb;
 pub mod orchestrator;
 pub mod plan;
-pub(crate) mod profile;
+pub mod profile;
 pub mod provider;
-pub(crate) mod routing;
+pub mod routing;
 pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -86,21 +87,7 @@ pub fn build_orchestrator_with_plan(
 ) -> Result<AuctionOrchestrator, Report<TrustedServerError>> {
     log::info!("Building plan-backed auction orchestrator");
 
-    let mediator = if let Some(expected_id) = plan.mediator() {
-        let provider = crate::integrations::adserver_mock::register_providers(settings)?
-            .into_iter()
-            .find(|provider| provider.provider_name() == expected_id)
-            .ok_or_else(|| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "auction mediator `{expected_id}` must reference a separately registered enabled integration with the exact same ID"
-                    ),
-                })
-            })?;
-        Some(provider)
-    } else {
-        None
-    };
+    let mediator = crate::integrations::compile_legacy_mediator(settings, plan.mediator())?;
     let orchestrator = AuctionOrchestrator::from_plan(plan, mediator);
 
     log::info!(

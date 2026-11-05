@@ -7,34 +7,33 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use error_stack::Report;
 use serde_json::{Map, Value, json};
-use url::Url;
 
-use super::plan::{NotificationPolicy, ProviderPlan};
-use super::profile::{
-    ApsProfilePlan, CompiledOpenRtbProfile, PrebidProfilePlan, StandardProfilePlan,
-};
-use super::routing::{
-    PrebidTransportHeaders, ProviderAuctionInput, ProviderSlotInput, RoutedAuction,
-};
+use super::plan::NotificationPolicy;
+#[cfg(test)]
+use super::plan::ProviderPlan;
+
+use super::routing::{ProviderAuctionInput, ProviderSlotInput, RoutedAuction, TransportHeaders};
 use super::types::{AdFormat, AdSlot, AuctionResponse, Bid};
 use crate::error::TrustedServerError;
 use crate::openrtb::{
-    Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs,
-    RegsExt, Site, ToExt as _, TrustedServerExt, User, UserExt, to_openrtb_i32,
+    Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, ToExt as _,
+    TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
 use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 
 const DEFAULT_CURRENCY: &str = "USD";
-const APS_SDK_SOURCE: &str = "prebid";
-const APS_SDK_VERSION: &str = "2.2.0";
 const MAX_CONSERVATIVE_LANGUAGE_BYTES: usize = 8;
 
 /// Fixed reasons why an upstream bid failed response admission.
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum BidRejectionReason {
+pub enum BidRejectionReason {
+    /// Required bid data is absent, malformed, or outside the admitted range.
     InvalidBid,
+    /// The bid names an impression absent from this provider request.
     UnrequestedImpression,
+    /// Returned dimensions cannot match a requested banner format.
     DimensionMismatch,
+    /// Missing dimensions match more than one requested banner format.
     AmbiguousDimensions,
 }
 
@@ -51,21 +50,45 @@ impl BidRejectionReason {
 
 /// Bounded aggregate diagnostics for rejected upstream bids.
 #[derive(Debug, Default)]
-pub(crate) struct ResponseAdmissionDiagnostics {
+pub struct ResponseAdmissionDiagnostics {
     rejected_bid_count: u32,
     reason_counts: BTreeMap<BidRejectionReason, u32>,
 }
 
 impl ResponseAdmissionDiagnostics {
     /// Record one rejected bid without retaining upstream payload data.
-    pub(crate) fn record(&mut self, reason: BidRejectionReason) {
+    ///
+    /// Counts saturate rather than overflow.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::openrtb::{BidRejectionReason, ResponseAdmissionDiagnostics};
+    /// let mut diagnostics = ResponseAdmissionDiagnostics::default();
+    /// diagnostics.record(BidRejectionReason::InvalidBid);
+    /// ```
+    pub fn record(&mut self, reason: BidRejectionReason) {
         self.rejected_bid_count = self.rejected_bid_count.saturating_add(1);
         let count = self.reason_counts.entry(reason).or_default();
         *count = count.saturating_add(1);
     }
 
     /// Attach fixed-cardinality rejection counts to a provider response.
-    pub(crate) fn attach_to(self, response: &mut AuctionResponse) {
+    ///
+    /// An empty diagnostic set leaves response metadata unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::openrtb::{BidRejectionReason, ResponseAdmissionDiagnostics};
+    /// use trusted_server_core::auction::AuctionResponse;
+    /// let mut diagnostics = ResponseAdmissionDiagnostics::default();
+    /// diagnostics.record(BidRejectionReason::InvalidBid);
+    /// let mut response = AuctionResponse::no_bid("example-provider", 1);
+    /// diagnostics.attach_to(&mut response);
+    /// assert_eq!(response.metadata["response_admission"]["rejected_bid_count"], 1);
+    /// ```
+    pub fn attach_to(self, response: &mut AuctionResponse) {
         if self.rejected_bid_count == 0 {
             return;
         }
@@ -106,7 +129,7 @@ impl DimensionMatch {
 }
 
 /// Precomputed dimension resolutions for one requested impression.
-pub(crate) struct SlotBidDimensions {
+pub struct SlotBidDimensions {
     exact: BTreeSet<(u32, u32)>,
     by_width: BTreeMap<u32, DimensionMatch>,
     by_height: BTreeMap<u32, DimensionMatch>,
@@ -149,17 +172,36 @@ impl SlotBidDimensions {
 }
 
 /// Precomputed requested banner dimensions keyed by impression ID.
-pub(crate) type BidDimensionIndex = BTreeMap<String, SlotBidDimensions>;
+pub type BidDimensionIndex = BTreeMap<String, SlotBidDimensions>;
 
 /// Build the requested-dimension index once for one provider response.
-pub(crate) fn build_bid_dimension_index(input: &ProviderAuctionInput) -> BidDimensionIndex {
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::auction::openrtb::{BidDimensionIndex, build_bid_dimension_index};
+/// use trusted_server_core::auction::routing::ProviderAuctionInput;
+/// fn response_index(input: &ProviderAuctionInput) -> BidDimensionIndex {
+///     build_bid_dimension_index(input)
+/// }
+/// ```
+pub fn build_bid_dimension_index(input: &ProviderAuctionInput) -> BidDimensionIndex {
     build_bid_dimension_index_from_slots(input.slots().iter().map(ProviderSlotInput::slot))
 }
 
 /// Build the requested-dimension index from plain [`AdSlot`]s.
 ///
 /// The first slot wins when several share an ID.
-pub(crate) fn build_bid_dimension_index_from_slots<'a>(
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::auction::openrtb::build_bid_dimension_index_from_slots;
+/// use trusted_server_core::auction::types::AdSlot;
+/// let slots: Vec<AdSlot> = Vec::new();
+/// assert!(build_bid_dimension_index_from_slots(&slots).is_empty());
+/// ```
+pub fn build_bid_dimension_index_from_slots<'a>(
     slots: impl IntoIterator<Item = &'a AdSlot>,
 ) -> BidDimensionIndex {
     let mut index = BidDimensionIndex::new();
@@ -172,7 +214,21 @@ pub(crate) fn build_bid_dimension_index_from_slots<'a>(
 }
 
 /// Parse an optional positive `OpenRTB` bid dimension.
-pub(crate) fn parse_optional_bid_dimension(
+///
+/// Missing or null dimensions remain absent for later inference.
+///
+/// # Errors
+///
+/// Returns [`BidRejectionReason::InvalidBid`] for non-positive, fractional,
+/// nonnumeric, or out-of-range dimensions.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::auction::openrtb::parse_optional_bid_dimension;
+/// assert_eq!(parse_optional_bid_dimension(&serde_json::json!({"w": 300}), "w"), Ok(Some(300)));
+/// ```
+pub fn parse_optional_bid_dimension(
     value: &Value,
     key: &str,
 ) -> Result<Option<u32>, BidRejectionReason> {
@@ -200,7 +256,22 @@ pub(crate) fn parse_optional_bid_dimension(
 }
 
 /// Validate explicit dimensions or infer them from one matching banner format.
-pub(crate) fn resolve_bid_dimensions(
+///
+/// # Errors
+///
+/// Returns [`BidRejectionReason::UnrequestedImpression`] for an unknown slot,
+/// [`BidRejectionReason::DimensionMismatch`] for no matching format, or
+/// [`BidRejectionReason::AmbiguousDimensions`] when inference is not unique.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::auction::openrtb::{BidDimensionIndex, BidRejectionReason, resolve_bid_dimensions};
+/// let index = BidDimensionIndex::new();
+/// assert_eq!(resolve_bid_dimensions(&index, "slot", Some(300), Some(250)),
+///     Err(BidRejectionReason::UnrequestedImpression));
+/// ```
+pub fn resolve_bid_dimensions(
     dimensions_by_slot: &BidDimensionIndex,
     slot_id: &str,
     width: Option<u32>,
@@ -241,15 +312,19 @@ pub(crate) fn resolve_bid_dimensions(
     clippy::large_enum_variant,
     reason = "Ready carries the full built request by design"
 )]
-pub(crate) enum OpenRtbBuildOutcome {
+pub enum OpenRtbBuildOutcome {
+    /// Finalized `OpenRTB` envelope ready for HTTP serialization.
     Ready(OpenRtbRequest),
+    /// No usable impressions remain after routing and specialization.
     NoImpressions,
 }
 
 /// Explicit, deterministic signing input. No signer is loaded by this driver.
-pub(crate) struct RequestFinalization<'a> {
-    pub(crate) signer: Option<&'a RequestSigner>,
-    pub(crate) signing_params: SigningParams,
+pub struct RequestFinalization<'a> {
+    /// Optional auction-local signer, loaded by the caller.
+    pub signer: Option<&'a RequestSigner>,
+    /// Fixed request identity and timestamp to bind during finalization.
+    pub signing_params: SigningParams,
 }
 
 /// Build one provider request from its immutable routed input.
@@ -258,6 +333,7 @@ pub(crate) struct RequestFinalization<'a> {
 ///
 /// Returns an auction error when static/profile extensions cannot be merged or
 /// the supplied signing input does not bind the already-fixed request ID.
+#[cfg(test)]
 pub(crate) fn build_request(
     input: &ProviderAuctionInput,
     routed: &RoutedAuction,
@@ -265,116 +341,38 @@ pub(crate) fn build_request(
     effective_timeout_ms: u32,
     finalization: &RequestFinalization<'_>,
 ) -> Result<OpenRtbBuildOutcome, Report<TrustedServerError>> {
-    let policy = ProfilePolicy::from(&provider.profile);
-    let mut request = build_common_request(input, routed, policy, effective_timeout_ms);
-    if request.imp.is_empty() {
-        return Ok(OpenRtbBuildOutcome::NoImpressions);
-    }
-    policy.augment_request(&mut request, input, routed)?;
-    if request.imp.is_empty() {
-        return Ok(OpenRtbBuildOutcome::NoImpressions);
-    }
-    finalize_request(&mut request, policy, finalization)?;
-    Ok(OpenRtbBuildOutcome::Ready(request))
+    super::profile::build_profile_request(
+        provider.profile.as_ref(),
+        input,
+        routed,
+        effective_timeout_ms,
+        finalization,
+    )
 }
 
-#[derive(Clone, Copy)]
-enum ProfilePolicy<'a> {
-    Standard(&'a StandardProfilePlan),
-    Prebid(&'a PrebidProfilePlan),
-    Aps(&'a ApsProfilePlan),
-}
-
-impl<'a> From<&'a CompiledOpenRtbProfile> for ProfilePolicy<'a> {
-    fn from(profile: &'a CompiledOpenRtbProfile) -> Self {
-        match profile {
-            CompiledOpenRtbProfile::Standard(plan) => Self::Standard(plan),
-            CompiledOpenRtbProfile::PrebidServer(plan) => Self::Prebid(plan),
-            CompiledOpenRtbProfile::Aps(plan) => Self::Aps(plan),
-        }
-    }
-}
-
-impl ProfilePolicy<'_> {
-    fn augment_request(
-        self,
-        request: &mut OpenRtbRequest,
-        input: &ProviderAuctionInput,
-        routed: &RoutedAuction,
-    ) -> Result<(), Report<TrustedServerError>> {
-        match self {
-            Self::Standard(plan) => apply_standard(request, plan),
-            Self::Prebid(plan) => apply_prebid(request, input, routed, plan),
-            Self::Aps(plan) => apply_aps(request, plan),
-        }
-    }
-
-    fn keeps_pbs_identity_when_unsigned(self) -> bool {
-        matches!(self, Self::Prebid(_))
-    }
-}
-
-fn build_common_request(
+pub(crate) fn build_common_request(
     input: &ProviderAuctionInput,
     routed: &RoutedAuction,
-    policy: ProfilePolicy<'_>,
     effective_timeout_ms: u32,
 ) -> OpenRtbRequest {
     let common = input.common_request();
-    let imps = input
-        .slots()
-        .iter()
-        .filter_map(|slot| build_imp(slot, policy))
-        .collect();
-    let site_domain = match policy {
-        ProfilePolicy::Aps(plan) => plan
-            .inventory_domain
-            .clone()
-            .unwrap_or_else(|| common.publisher.domain.clone()),
-        _ => common.publisher.domain.clone(),
-    };
-    let page = match policy {
-        ProfilePolicy::Aps(plan) => {
-            aps_inventory_page(plan, common.publisher.page_url.as_deref(), &site_domain)
-        }
-        ProfilePolicy::Prebid(plan) => common.publisher.page_url.as_deref().map(|page| {
-            plan.debug_query_params.as_deref().map_or_else(
-                || page.to_string(),
-                |query| append_query_fragment(page, query),
-            )
-        }),
-        ProfilePolicy::Standard(_) => common.publisher.page_url.clone(),
-    };
-    let consent = common.user.consent.as_ref();
-    let selected_consent = match policy {
-        ProfilePolicy::Prebid(plan) => routed
-            .prebid_transport_headers()
-            .consent_cookies()
-            .body_consent(consent, plan.consent_forwarding),
-        _ => consent.map(std::borrow::Cow::Borrowed),
-    };
-    let body_consent = selected_consent.as_deref();
+    let imps = input.slots().iter().filter_map(build_imp).collect();
+    let site_domain = common.publisher.domain.clone();
+    let page = common.publisher.page_url.clone();
+    let body_consent = common.user.consent.as_ref();
     let raw_tc = body_consent.and_then(|value| value.raw_tc_string.clone());
     let user = Some(User {
         id: common.user.id.clone(),
         consent: raw_tc.clone(),
         ext: UserExt {
             consent: raw_tc,
-            consented_providers_settings: matches!(policy, ProfilePolicy::Prebid(_))
-                .then(|| {
-                    body_consent
-                        .and_then(|value| value.raw_ac_string.clone())
-                        .map(|consented_providers| ConsentedProvidersSettings {
-                            consented_providers: Some(consented_providers),
-                        })
-                })
-                .flatten(),
+            consented_providers_settings: None,
             eids: common.user.eids.clone(),
         }
         .to_ext(),
         ..Default::default()
     });
-    let language = normalized_language(routed.prebid_transport_headers(), policy);
+    let language = normalized_language(routed.transport_headers(), true);
     let device = common
         .device
         .as_ref()
@@ -385,8 +383,8 @@ fn build_common_request(
                 country: Some(geo.country.clone()),
                 region: geo.region.clone(),
                 city: Some(geo.city.clone()),
-                lat: matches!(policy, ProfilePolicy::Prebid(_)).then_some(geo.latitude),
-                lon: matches!(policy, ProfilePolicy::Prebid(_)).then_some(geo.longitude),
+                lat: None,
+                lon: None,
                 metro: (geo.metro_code > 0).then(|| geo.metro_code.to_string()),
                 r#type: Some(2),
                 ..Default::default()
@@ -409,9 +407,7 @@ fn build_common_request(
         site: Some(Site {
             domain: Some(site_domain.clone()),
             page,
-            r#ref: matches!(policy, ProfilePolicy::Prebid(_))
-                .then(|| header_string(routed.prebid_transport_headers().referer()))
-                .flatten(),
+            r#ref: None,
             publisher: Some(Publisher {
                 domain: Some(site_domain),
                 ..Default::default()
@@ -420,11 +416,8 @@ fn build_common_request(
         }),
         user,
         device,
-        regs: build_regs(body_consent, policy),
-        test: match policy {
-            ProfilePolicy::Prebid(plan) => plan.test_mode.then_some(true),
-            _ => None,
-        },
+        regs: build_regs(body_consent, false),
+        test: None,
         tmax: to_openrtb_i32(
             effective_timeout_ms,
             "tmax",
@@ -435,7 +428,7 @@ fn build_common_request(
     }
 }
 
-fn build_imp(slot: &ProviderSlotInput, policy: ProfilePolicy<'_>) -> Option<Imp> {
+fn build_imp(slot: &ProviderSlotInput) -> Option<Imp> {
     let formats = slot
         .slot()
         .formats
@@ -449,19 +442,17 @@ fn build_imp(slot: &ProviderSlotInput, policy: ProfilePolicy<'_>) -> Option<Imp>
             .filter(|value| value.w.is_some() && value.h.is_some())
         })
         .collect::<Vec<_>>();
-    let first_width = formats.first()?.w;
-    let first_height = formats.first()?.h;
-    let aps_banner = matches!(policy, ProfilePolicy::Aps(_));
+    formats.first()?;
     Some(Imp {
         id: Some(slot.slot().id.clone()),
         banner: Some(Banner {
             format: formats,
-            w: aps_banner.then_some(first_width).flatten(),
-            h: aps_banner.then_some(first_height).flatten(),
-            topframe: aps_banner.then_some(false),
+            w: None,
+            h: None,
+            topframe: None,
             ..Default::default()
         }),
-        tagid: matches!(policy, ProfilePolicy::Prebid(_)).then(|| slot.slot().id.clone()),
+        tagid: None,
         bidfloor: slot.slot().floor_price,
         bidfloorcur: slot
             .slot()
@@ -472,99 +463,9 @@ fn build_imp(slot: &ProviderSlotInput, policy: ProfilePolicy<'_>) -> Option<Imp>
     })
 }
 
-fn apply_standard(
+pub(crate) fn finalize_request(
     request: &mut OpenRtbRequest,
-    plan: &StandardProfilePlan,
-) -> Result<(), Report<TrustedServerError>> {
-    request.ext = nonempty_map(plan.request_ext.as_object().clone());
-    for imp in &mut request.imp {
-        imp.ext = nonempty_map(plan.imp_ext.as_object().clone());
-    }
-    Ok(())
-}
-
-fn apply_prebid(
-    request: &mut OpenRtbRequest,
-    input: &ProviderAuctionInput,
-    _routed: &RoutedAuction,
-    plan: &PrebidProfilePlan,
-) -> Result<(), Report<TrustedServerError>> {
-    // Routing admits only slots with positive banner dimensions that fit in i32,
-    // so build_imp produces one impression per routed slot, in the same order.
-    debug_assert_eq!(
-        request.imp.len(),
-        input.slots().len(),
-        "should keep one impression per routed slot"
-    );
-    // Filter paired impressions and slots together so later demand keeps its slot ID.
-    request.imp = std::mem::take(&mut request.imp)
-        .into_iter()
-        .zip(input.slots())
-        .filter_map(|(mut imp, slot)| {
-            let bidder = slot
-                .bidder_params()
-                .iter()
-                .filter_map(|(bidder, params)| {
-                    let mut params = params.clone();
-                    plan.override_engine.apply_routed(
-                        bidder.as_str(),
-                        slot.prebid_zone(),
-                        &mut params,
-                    );
-                    params
-                        .as_object()
-                        .is_some_and(|params| !params.is_empty())
-                        .then(|| (bidder.as_str().to_string(), params))
-                })
-                .collect::<Map<_, _>>();
-            let mut prebid = Map::new();
-            if !bidder.is_empty() {
-                prebid.insert("bidder".to_string(), Value::Object(bidder));
-            } else if slot.allows_stored_fallback() {
-                prebid.insert("storedrequest".to_string(), json!({"id": slot.slot().id}));
-            }
-            if prebid.is_empty() {
-                return None;
-            }
-            imp.ext = Some(Map::from_iter([(
-                "prebid".to_string(),
-                Value::Object(prebid),
-            )]));
-            Some(imp)
-        })
-        .collect();
-    let mut prebid_request = Map::new();
-    if plan.debug {
-        prebid_request.insert("debug".to_string(), Value::Bool(true));
-        prebid_request.insert("returnallbidstatus".to_string(), Value::Bool(true));
-    }
-    request.ext = Some(Map::from_iter([(
-        "prebid".to_string(),
-        Value::Object(prebid_request),
-    )]));
-    Ok(())
-}
-
-fn apply_aps(
-    request: &mut OpenRtbRequest,
-    plan: &ApsProfilePlan,
-) -> Result<(), Report<TrustedServerError>> {
-    request.ext = Some(Map::from_iter([
-        (
-            "account".to_string(),
-            Value::String(plan.account_id.clone()),
-        ),
-        (
-            "sdk".to_string(),
-            json!({"source": APS_SDK_SOURCE, "version": APS_SDK_VERSION}),
-        ),
-    ]));
-    Ok(())
-}
-
-fn finalize_request(
-    request: &mut OpenRtbRequest,
-    policy: ProfilePolicy<'_>,
+    retains_unsigned_identity: bool,
     finalization: &RequestFinalization<'_>,
 ) -> Result<(), Report<TrustedServerError>> {
     let request_id = request.id.as_deref().ok_or_else(|| {
@@ -587,7 +488,7 @@ fn finalize_request(
             request_scheme: Some(finalization.signing_params.request_scheme.clone()),
             ts: Some(finalization.signing_params.timestamp),
         })
-    } else if policy.keeps_pbs_identity_when_unsigned() {
+    } else if retains_unsigned_identity {
         Some(TrustedServerExt {
             version: None,
             signature: None,
@@ -611,14 +512,26 @@ fn finalize_request(
     Ok(())
 }
 
-fn build_regs(
+/// Build consent regulation fields under an explicit empty-context policy.
+///
+/// `retain_empty_context` preserves every admitted consent context and uses only
+/// its GDPR applicability bit. Otherwise empty contexts are omitted and GDPR
+/// follows the existing jurisdiction-aware inference.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::auction::openrtb::build_regs;
+/// assert!(build_regs(None, false).is_none());
+/// ```
+pub fn build_regs(
     consent: Option<&crate::consent::ConsentContext>,
-    policy: ProfilePolicy<'_>,
+    retain_empty_context: bool,
 ) -> Option<Regs> {
     let consent = consent?;
-    if matches!(policy, ProfilePolicy::Aps(_)) {
-        // Preserve APS exactly: any admitted context produces regs and GDPR is
-        // derived only from the applicability bit, without jurisdiction rules.
+    if retain_empty_context {
+        // This wire policy retains every admitted consent context and derives
+        // GDPR only from applicability, without jurisdiction inference.
         let ext = RegsExt {
             gdpr: Some(u8::from(consent.gdpr_applies)),
             us_privacy: consent.raw_us_privacy.clone(),
@@ -639,8 +552,8 @@ fn build_regs(
         });
     }
 
-    // Standard deliberately shares PBS's conservative consent baseline. Keep
-    // the legacy PBS empty-context and jurisdiction behavior byte-for-byte.
+    // Conservative consent omits empty contexts and retains jurisdiction-aware
+    // GDPR inference.
     let has_data = consent.gdpr_applies
         || consent.raw_us_privacy.is_some()
         || consent.raw_gpp_string.is_some()
@@ -684,74 +597,39 @@ fn build_regs(
     })
 }
 
-fn normalized_language(
-    headers: &PrebidTransportHeaders,
-    policy: ProfilePolicy<'_>,
-) -> Option<String> {
+/// Normalize the first language range to its primary language subtag.
+///
+/// The conservative policy omits subtags longer than eight bytes.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::auction::{openrtb::normalized_language, routing::TransportHeaders};
+/// assert!(normalized_language(&TransportHeaders::default(), true).is_none());
+/// ```
+pub fn normalized_language(headers: &TransportHeaders, conservative: bool) -> Option<String> {
     let value = header_string(headers.accept_language())
         .and_then(|value| value.split(',').next().map(str::to_string))
         .and_then(|value| value.split(';').next().map(str::to_string))
         .and_then(|value| value.split('-').next().map(str::to_string))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())?;
-    match policy {
-        ProfilePolicy::Prebid(_) => Some(value),
-        ProfilePolicy::Aps(_) | ProfilePolicy::Standard(_) => {
-            (value.len() <= MAX_CONSERVATIVE_LANGUAGE_BYTES).then_some(value)
-        }
-    }
+    (!conservative || value.len() <= MAX_CONSERVATIVE_LANGUAGE_BYTES).then_some(value)
 }
 
-fn header_string(value: Option<&http::HeaderValue>) -> Option<String> {
+/// Copy a UTF-8 transport header, omitting non-UTF-8 values.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::auction::openrtb::header_string;
+/// let value = http::HeaderValue::from_static("en");
+/// assert_eq!(header_string(Some(&value)).as_deref(), Some("en"));
+/// ```
+pub fn header_string(value: Option<&http::HeaderValue>) -> Option<String> {
     value
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
-}
-
-fn aps_inventory_page(
-    plan: &ApsProfilePlan,
-    publisher_page: Option<&str>,
-    domain: &str,
-) -> Option<String> {
-    let fallback = publisher_page
-        .and_then(valid_aps_page_url)
-        .unwrap_or_else(|| format!("https://{domain}"));
-    let Some(origin) = plan.inventory_page_origin.as_deref() else {
-        return Some(fallback);
-    };
-    let (Ok(mut canonical), Ok(current)) = (Url::parse(origin), Url::parse(&fallback)) else {
-        return Some(fallback);
-    };
-    canonical.set_path(current.path());
-    canonical.set_query(current.query());
-    canonical.set_fragment(None);
-    Some(canonical.to_string())
-}
-
-fn append_query_fragment(url: &str, query: &str) -> String {
-    if query.is_empty() || url.contains(query) {
-        return url.to_string();
-    }
-    let separator = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{separator}{query}")
-}
-
-fn valid_aps_page_url(value: &str) -> Option<String> {
-    const MAX_APS_PAGE_URL_BYTES: usize = 8192;
-
-    if value.len() > MAX_APS_PAGE_URL_BYTES {
-        return None;
-    }
-    let parsed = Url::parse(value).ok()?;
-    (matches!(parsed.scheme(), "http" | "https")
-        && parsed.host_str().is_some()
-        && parsed.username().is_empty()
-        && parsed.password().is_none())
-    .then(|| parsed.to_string())
-}
-
-fn nonempty_map(value: Map<String, Value>) -> Option<Map<String, Value>> {
-    (!value.is_empty()).then_some(value)
 }
 
 /// Suppress notification URLs using exact returned-seat identity.
@@ -900,18 +778,27 @@ fn extract_standard_bid(
 /// Count bidder parameter objects a profile did not consume.
 #[must_use]
 pub(crate) fn unused_bidder_params_count(
-    profile: &CompiledOpenRtbProfile,
+    profile: &std::sync::Arc<dyn super::profile::CompiledOpenRtbProfile>,
     input: &ProviderAuctionInput,
 ) -> u32 {
-    if profile.is_prebid_server() {
+    if profile.routing_policy().consumes_bidder_params {
         return 0;
     }
     ignored_bidder_params_count(input)
 }
 
-/// Count routed bidder params for a profile known to ignore them.
+/// Count routed bidder parameter objects for a profile that ignores them.
+///
+/// Counts saturate at the diagnostic field's maximum value.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::auction::{openrtb::ignored_bidder_params_count, routing::ProviderAuctionInput};
+/// fn ignored(input: &ProviderAuctionInput) -> u32 { ignored_bidder_params_count(input) }
+/// ```
 #[must_use]
-pub(crate) fn ignored_bidder_params_count(input: &ProviderAuctionInput) -> u32 {
+pub fn ignored_bidder_params_count(input: &ProviderAuctionInput) -> u32 {
     saturating_bidder_param_counts(input.slots().iter().map(|slot| slot.bidder_params().len()))
 }
 

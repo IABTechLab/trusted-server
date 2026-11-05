@@ -595,8 +595,9 @@ async fn execute_named(
         return Ok(response);
     }
 
-    if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+    if let Err(report) = trusted_server_core::integrations::prepare_request(
         &state.settings,
+        Some(&state.registry),
         &mut req,
     ) {
         return Ok(http_error(&report));
@@ -785,8 +786,9 @@ async fn dispatch_fallback(
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
-    if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+    if let Err(report) = trusted_server_core::integrations::prepare_request(
         &state.settings,
+        Some(&state.registry),
         &mut req,
     ) {
         return http_error(&report);

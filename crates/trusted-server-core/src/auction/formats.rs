@@ -595,9 +595,8 @@ mod tests {
         AuctionPlan, AuctionPlanConfig, NotificationConfig, ProviderConfig, ProviderId, RoutingMode,
     };
     use crate::auction::routing::route_auction;
-    use crate::auction::types::{
-        ApsRendererV1, ApsTagType, AuctionResponse, Bid, BidRenderer, BidStatus,
-    };
+    use crate::auction::types::{AuctionResponse, Bid, BidRenderer, BidStatus};
+    use crate::integrations::aps::{ApsRendererV1, ApsTagType};
     use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
@@ -1608,7 +1607,7 @@ mod tests {
         renderer.creative = Some("<script>reject()</script>".to_string());
         renderer.bid_id = Some("upstream-renderer-bid".to_string());
         renderer.creative_id = None;
-        renderer.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+        renderer.renderer = Some(BidRenderer::from(ApsRendererV1 {
             version: 1,
             account_id: "example-account".to_string(),
             bid_id: "upstream-renderer-bid".to_string(),
@@ -1706,7 +1705,7 @@ mod tests {
         let settings = make_settings();
         let auction_request = make_auction_request();
         let mut bid = make_bid("div-gpt-top", "aps", Some(2.75));
-        bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+        bid.renderer = Some(BidRenderer::from(ApsRendererV1 {
             version: 1,
             account_id: "example-account".to_string(),
             bid_id: "fictional-bid".to_string(),
@@ -1746,7 +1745,7 @@ mod tests {
         bid.bid_id = Some("fictional-bid".to_string());
         bid.ad_id = Some("fictional-ad".to_string());
         bid.creative_id = Some("fictional-creative".to_string());
-        bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+        bid.renderer = Some(BidRenderer::from(ApsRendererV1 {
             version: 1,
             account_id: "example-account".to_string(),
             bid_id: "fictional-bid".to_string(),

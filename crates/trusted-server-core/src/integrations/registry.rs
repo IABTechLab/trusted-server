@@ -1,5 +1,4 @@
 use std::any::{Any, TypeId};
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -7,7 +6,13 @@ use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
 use http::{Method, Request, Response};
-use matchit::{InsertError, Router};
+use matchit::Router;
+
+use super::declaration::{ReservedRouteClaim, RouteClaims, router_path};
+use super::processing::{
+    IntegrationRequestLifecycle, RequestProcessingState, ReservedInputNormalizer,
+    ReservedInputsNormalized,
+};
 
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
@@ -620,6 +625,12 @@ pub struct IntegrationRegistration {
     pub html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    /// Stateless factories for request-local decisions.
+    pub lifecycles: Vec<Arc<dyn IntegrationRequestLifecycle>>,
+    /// Owner assets served outside unified and deferred bundles.
+    pub standalone_js_ids: Vec<&'static str>,
+    /// Whether to emit fresh public auction correlation identifiers.
+    pub auction_correlation: bool,
 }
 
 impl IntegrationRegistration {
@@ -646,6 +657,9 @@ impl IntegrationRegistrationBuilder {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                lifecycles: Vec::new(),
+                standalone_js_ids: Vec::new(),
+                auction_correlation: false,
             },
         }
     }
@@ -689,6 +703,48 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_request_filter(mut self, filter: Arc<dyn IntegrationRequestFilter>) -> Self {
         self.registration.request_filters.push(filter);
+        self
+    }
+
+    /// Register a stateless request lifecycle factory.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let builder = IntegrationRegistration::builder("example").with_request_lifecycle(lifecycle);
+    /// ```
+    #[must_use]
+    pub fn with_request_lifecycle(
+        mut self,
+        lifecycle: Arc<dyn IntegrationRequestLifecycle>,
+    ) -> Self {
+        self.registration.lifecycles.push(lifecycle);
+        self
+    }
+
+    /// Expose an owner's synchronous standalone browser asset.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let builder = IntegrationRegistration::builder("example").with_standalone_js("example");
+    /// ```
+    #[must_use]
+    pub fn with_standalone_js(mut self, module_id: &'static str) -> Self {
+        self.registration.standalone_js_ids.push(module_id);
+        self
+    }
+
+    /// Enable deployment-scoped fresh auction correlation identifiers.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let builder = IntegrationRegistration::builder("example").with_auction_correlation();
+    /// ```
+    #[must_use]
+    pub fn with_auction_correlation(mut self) -> Self {
+        self.registration.auction_correlation = true;
         self
     }
 
@@ -736,6 +792,9 @@ struct IntegrationRegistryInner {
     html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    lifecycles: Vec<Arc<dyn IntegrationRequestLifecycle>>,
+    standalone_js_ids: Vec<&'static str>,
+    auction_correlation: bool,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -757,6 +816,9 @@ impl Default for IntegrationRegistryInner {
             html_stream_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            lifecycles: Vec::new(),
+            standalone_js_ids: Vec::new(),
+            auction_correlation: false,
         }
     }
 }
@@ -805,37 +867,95 @@ pub struct ProxyDispatchInput<'a> {
 pub struct IntegrationRegistry {
     inner: Arc<IntegrationRegistryInner>,
     plan: Option<Arc<AuctionPlan>>,
-}
-
-fn router_path(path: &str) -> Cow<'_, str> {
-    match path.strip_suffix("/*") {
-        Some(prefix) => Cow::Owned(format!("{prefix}/{{*rest}}")),
-        None => Cow::Borrowed(path),
-    }
-}
-
-fn conflicting_route_owner(
-    registered: &[(IntegrationEndpoint, &'static str)],
-    incoming: &IntegrationEndpoint,
-) -> Option<&'static str> {
-    registered.iter().find_map(|(route, owner)| {
-        if route.method != incoming.method {
-            return None;
-        }
-        // Ask the same router about each pair only after a conflict. Its error
-        // text can unescape literal braces, so text lookup cannot identify owners.
-        let mut pair = Router::new();
-        pair.insert(router_path(&route.path), ())
-            .expect("should reinsert a previously validated route");
-        matches!(
-            pair.insert(router_path(&incoming.path), ()),
-            Err(InsertError::Conflict { .. })
-        )
-        .then_some(*owner)
-    })
+    reserved_input_normalizers: Arc<[ReservedInputNormalizer]>,
 }
 
 impl IntegrationRegistry {
+    /// Install static ingress normalization independent of enabled registrations.
+    ///
+    /// Composition supplies the fixed compiled catalog's idempotent normalizers.
+    /// This consumes the registry and leaves existing clones unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let registry = registry.with_reserved_input_normalizers(normalizers);
+    /// ```
+    #[must_use]
+    pub fn with_reserved_input_normalizers(
+        mut self,
+        normalizers: Vec<ReservedInputNormalizer>,
+    ) -> Self {
+        self.reserved_input_normalizers = Arc::from(normalizers);
+        self
+    }
+
+    /// Prepare registered owner decisions once per request.
+    ///
+    /// Fixed static normalizers run before enabled lifecycle factories. Both
+    /// normalization and preparation preserve the first decision on reentry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the owner's existing preparation error.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let state = registry.prepare_request(&settings, &mut request)?;
+    /// ```
+    pub fn prepare_request(
+        &self,
+        settings: &Settings,
+        request: &mut Request<EdgeBody>,
+    ) -> Result<RequestProcessingState, Report<TrustedServerError>> {
+        if !self.reserved_input_normalizers.is_empty()
+            && request
+                .extensions()
+                .get::<ReservedInputsNormalized>()
+                .is_none()
+        {
+            for normalize in self.reserved_input_normalizers.iter() {
+                normalize(request)?;
+            }
+            request.extensions_mut().insert(ReservedInputsNormalized);
+        }
+        let mut state = RequestProcessingState::from_request(request);
+        for lifecycle in &self.inner.lifecycles {
+            if state.contains(lifecycle.integration_id()) {
+                continue;
+            }
+            let prepared = lifecycle.prepare(settings, request)?;
+            state.insert(lifecycle.integration_id(), prepared);
+        }
+        request.extensions_mut().insert(state.clone());
+        Ok(state)
+    }
+
+    /// Whether an owner declares a standalone asset.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let serve_separately = registry.serves_standalone_js("example");
+    /// ```
+    #[must_use]
+    pub fn serves_standalone_js(&self, module_id: &str) -> bool {
+        self.inner.standalone_js_ids.contains(&module_id)
+    }
+
+    /// Whether enabled capabilities consume public auction correlation.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let enabled = registry.auction_correlation_enabled();
+    /// ```
+    #[must_use]
+    pub fn auction_correlation_enabled(&self) -> bool {
+        self.inner.auction_correlation
+    }
+
     /// Build a registry and auction plan from the provided settings for tests.
     ///
     /// Runtime adapters should compile one plan and pass it to [`Self::with_plan`].
@@ -876,16 +996,26 @@ impl IntegrationRegistry {
     /// # use trusted_server_core::settings::Settings;
     /// # fn assemble(settings: &Settings, plan: Arc<AuctionPlan>, registrations: Vec<IntegrationRegistration>)
     /// #     -> Result<IntegrationRegistry, Report<TrustedServerError>> {
-    /// IntegrationRegistry::from_registrations(settings, plan, registrations)
+    /// IntegrationRegistry::from_registrations(settings, plan, registrations, &[])
     /// # }
     /// ```
     pub fn from_registrations(
         settings: &Settings,
         plan: Arc<AuctionPlan>,
         registrations: impl IntoIterator<Item = IntegrationRegistration>,
+        reserved_routes: &[ReservedRouteClaim],
     ) -> Result<Self, Report<TrustedServerError>> {
+        let mut claims = RouteClaims::with_reserved(reserved_routes)?;
         let mut inner = IntegrationRegistryInner::default();
         for registration in registrations {
+            if inner
+                .enabled_integration_ids
+                .contains(&registration.integration_id)
+            {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!("Duplicate integration ID {}", registration.integration_id),
+                }));
+            }
             inner
                 .enabled_integration_ids
                 .push(registration.integration_id);
@@ -914,26 +1044,17 @@ impl IntegrationRegistry {
                         }
                     };
 
-                    if let Err(error) = router.insert(matchit_path, value) {
-                        let message = if matches!(error, InsertError::Conflict { .. }) {
-                            match conflicting_route_owner(&inner.routes, &route) {
-                                Some(owner) => format!(
-                                    "Integration route conflict between {owner} and {} for {}",
-                                    registration.integration_id, route.method,
-                                ),
-                                None => format!(
-                                    "Integration route conflict while registering {}",
-                                    registration.integration_id,
-                                ),
-                            }
-                        } else {
-                            format!(
-                                "Invalid integration route declaration for {}",
-                                registration.integration_id,
-                            )
-                        };
-                        return Err(Report::new(TrustedServerError::Configuration { message }));
-                    }
+                    claims.integration(registration.integration_id, &route)?;
+                    // Both paths use the same method partition, normalization and
+                    // pinned router. Keep even invariant failures non-disclosing.
+                    router.insert(matchit_path, value).map_err(|_| {
+                        Report::new(TrustedServerError::Configuration {
+                            message: format!(
+                                "Validated route insertion failed for integration {}",
+                                registration.integration_id
+                            ),
+                        })
+                    })?;
 
                     inner.routes.push((route, registration.integration_id));
                 }
@@ -947,6 +1068,11 @@ impl IntegrationRegistry {
                 .extend(registration.html_stream_processors);
             inner.head_injectors.extend(registration.head_injectors);
             inner.request_filters.extend(registration.request_filters);
+            inner.lifecycles.extend(registration.lifecycles);
+            inner
+                .standalone_js_ids
+                .extend(registration.standalone_js_ids);
+            inner.auction_correlation |= registration.auction_correlation;
             if registration.js_disabled {
                 inner.disabled_js_ids.push(registration.integration_id);
             } else if registration.js_deferred {
@@ -957,6 +1083,7 @@ impl IntegrationRegistry {
         let registry = Self {
             inner: Arc::new(inner),
             plan: Some(plan),
+            reserved_input_normalizers: Arc::from([]),
         };
         registry.ensure_async_html_finish_allowed(settings)?;
         Ok(registry)
@@ -1188,6 +1315,7 @@ impl IntegrationRegistry {
                 ..Default::default()
             }),
             plan: None,
+            reserved_input_normalizers: Arc::from([]),
         }
     }
 
@@ -1339,6 +1467,7 @@ impl IntegrationRegistry {
         Self {
             inner: Arc::new(IntegrationRegistryInner::default()),
             plan: None,
+            reserved_input_normalizers: Arc::from([]),
         }
     }
 
@@ -1364,10 +1493,14 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                lifecycles: Vec::new(),
+                standalone_js_ids: Vec::new(),
+                auction_correlation: false,
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
             plan: None,
+            reserved_input_normalizers: Arc::from([]),
         }
     }
 
@@ -1394,10 +1527,14 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors,
                 request_filters: Vec::new(),
+                lifecycles: Vec::new(),
+                standalone_js_ids: Vec::new(),
+                auction_correlation: false,
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
             plan: None,
+            reserved_input_normalizers: Arc::from([]),
         }
     }
 
@@ -1420,10 +1557,14 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters,
+                lifecycles: Vec::new(),
+                standalone_js_ids: Vec::new(),
+                auction_correlation: false,
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
             plan: None,
+            reserved_input_normalizers: Arc::from([]),
         }
     }
 
@@ -1486,10 +1627,14 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                lifecycles: Vec::new(),
+                standalone_js_ids: Vec::new(),
+                auction_correlation: false,
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
             plan: None,
+            reserved_input_normalizers: Arc::from([]),
         }
     }
 }
@@ -1567,6 +1712,60 @@ mod tests {
     }
 
     #[test]
+    fn explicit_registrations_reject_duplicate_ids() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let registrations = [
+            IntegrationRegistration::builder("owner").build(),
+            IntegrationRegistration::builder("owner").build(),
+        ];
+        let error = IntegrationRegistry::from_registrations(
+            &settings,
+            compile_registry_test_plan(&settings),
+            registrations,
+            &[],
+        )
+        .err()
+        .expect("should reject duplicate integration registration identity");
+        assert!(
+            format!("{error:?}").contains("Duplicate integration ID owner"),
+            "should identify the duplicated catalog owner"
+        );
+    }
+
+    #[test]
+    fn explicit_registrations_reject_reserved_routes_without_disclosure() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let reserved = [ReservedRouteClaim::new(
+            "application.discovery",
+            Method::GET,
+            "/credential-sentinel/{id}",
+        )];
+        let registration = IntegrationRegistration::builder("owner")
+            .with_proxy(Arc::new(DeclaredRouteProxy {
+                id: "owner",
+                path: "/credential-sentinel/{other}",
+            }))
+            .build();
+        let error = IntegrationRegistry::from_registrations(
+            &settings,
+            compile_registry_test_plan(&settings),
+            [registration],
+            &reserved,
+        )
+        .err()
+        .expect("should reject collision with a fixed application route");
+        let diagnostic = format!("{error:?}");
+        assert!(
+            diagnostic.contains("application.discovery") && diagnostic.contains("owner"),
+            "should identify both resource owners"
+        );
+        assert!(
+            !diagnostic.contains("credential-sentinel"),
+            "should not disclose configured route paths"
+        );
+    }
+
+    #[test]
     fn explicit_registrations_do_not_construct_the_builtin_catalog() {
         let settings = crate::test_support::tests::create_test_settings();
         let plan = compile_registry_test_plan(&settings);
@@ -1577,7 +1776,7 @@ mod tests {
             "should use settings that would otherwise construct builtin registrations"
         );
         let registry =
-            IntegrationRegistry::from_registrations(&settings, Arc::clone(&plan), Vec::new())
+            IntegrationRegistry::from_registrations(&settings, Arc::clone(&plan), Vec::new(), &[])
                 .expect("should assemble only the explicit registrations");
         assert!(
             registry.registered_integrations().is_empty(),
@@ -1611,6 +1810,7 @@ mod tests {
             &settings,
             compile_registry_test_plan(&settings),
             registrations,
+            &[],
         )
         .expect("should assemble interleaved capabilities");
         let state = IntegrationDocumentState::default();
@@ -1664,6 +1864,7 @@ mod tests {
                 &settings,
                 compile_registry_test_plan(&settings),
                 registrations,
+                &[],
             )
             .err()
             .expect("should reject conflicting explicit route claims");
@@ -1698,6 +1899,7 @@ mod tests {
             &settings,
             compile_registry_test_plan(&settings),
             [registration],
+            &[],
         )
         .err()
         .expect("should reject an invalid explicit route declaration");
@@ -1723,6 +1925,7 @@ mod tests {
             &settings,
             compile_registry_test_plan(&settings),
             [registration],
+            &[],
         )
         .err()
         .expect("should validate explicit asynchronous completion metadata");

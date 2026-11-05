@@ -78,6 +78,7 @@ use crate::html_processor::{
     BodyCloseInjection, HtmlProcessorConfig, create_html_processor_with_document_state,
 };
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
+use crate::integrations::processing::{RequestProcessingState, ResponsePrivacyScope};
 use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
 use crate::platform::{
     ClientInfo, GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices,
@@ -573,10 +574,9 @@ pub fn handle_tsjs_dynamic(
         // are served as content-addressed standalone assets. Delivery remains
         // cookie-independent so the static response can stay publicly cached.
         let deferred_ids = integration_registry.js_module_ids_deferred();
-        let diagnostics_standalone = module_id
-            == crate::integrations::gpt_diagnostics::GPT_DIAGNOSTICS_INTEGRATION_ID
-            && integration_registry.integration_enabled(module_id);
-        if !deferred_ids.contains(&module_id) && !diagnostics_standalone {
+        if !deferred_ids.contains(&module_id)
+            && !integration_registry.serves_standalone_js(module_id)
+        {
             return Ok(not_found_response());
         }
         if let (Some(content), Some(hash)) = (
@@ -648,9 +648,7 @@ struct ProcessResponseParams<'a> {
     integration_registry: &'a IntegrationRegistry,
     ad_slots_script: Option<&'a str>,
     ad_bids_state: &'a Arc<Mutex<Option<String>>>,
-    suppress_datadome_client_side_tag: bool,
-    gpt_diagnostics:
-        Option<&'a crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
+    request_processing: Option<&'a RequestProcessingState>,
     trace_bootstrap: Option<&'a str>,
     /// See [`HtmlStreamProcessorParams::shared_template_authorized`].
     shared_template_authorized: bool,
@@ -692,8 +690,7 @@ impl PublisherBodyProcessor {
                 integration_registry,
                 ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
                 ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
-                suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
-                gpt_diagnostics: params.gpt_diagnostics.clone(),
+                request_processing: params.request_processing.clone(),
                 trace_bootstrap: params.trace_bootstrap.clone(),
                 shared_template_authorized: params.template_cache_key.is_some(),
                 csp_nonce_observed: params.csp_nonce_observed.clone(),
@@ -780,8 +777,7 @@ fn process_response_streaming<W: Write>(
             integration_registry: params.integration_registry,
             ad_slots_script: params.ad_slots_script.map(str::to_string),
             ad_bids_state: params.ad_bids_state.clone(),
-            suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
-            gpt_diagnostics: params.gpt_diagnostics.cloned(),
+            request_processing: params.request_processing.cloned(),
             trace_bootstrap: params.trace_bootstrap.map(str::to_owned),
             shared_template_authorized: params.shared_template_authorized,
             csp_nonce_observed: params.csp_nonce_observed.cloned(),
@@ -1360,8 +1356,7 @@ struct HtmlStreamProcessorParams<'a> {
     integration_registry: &'a IntegrationRegistry,
     ad_slots_script: Option<String>,
     ad_bids_state: Arc<Mutex<Option<String>>>,
-    suppress_datadome_client_side_tag: bool,
-    gpt_diagnostics: Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
+    request_processing: Option<RequestProcessingState>,
     trace_bootstrap: Option<String>,
     /// Whether a shared template was authorized for this response.
     ///
@@ -1387,10 +1382,10 @@ struct HtmlStreamProcessorParams<'a> {
 /// with nothing enforcing the relationship. This makes the guarantee explicit;
 /// `requires_private_no_store_is_a_superset_of_injection` keeps the coincidence as a
 /// backstop if this gate is ever removed.
-pub(crate) fn template_gpt_diagnostics(
+pub(crate) fn template_request_processing(
     mode: AssemblyMode,
-    decision: Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
-) -> Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision> {
+    decision: Option<RequestProcessingState>,
+) -> Option<RequestProcessingState> {
     match mode {
         AssemblyMode::Inline => decision,
         AssemblyMode::Esi => None,
@@ -1566,7 +1561,7 @@ fn create_html_stream_processor_with_document_state(
         _ => body_close_injection(assembly_mode, request_body_seam),
     };
 
-    let gpt_diagnostics = template_gpt_diagnostics(assembly_mode, params.gpt_diagnostics);
+    let request_processing = template_request_processing(assembly_mode, params.request_processing);
 
     // Only a response that can be stored has a consumer for the observation, so the
     // handlers are not registered for ordinary inline traffic.
@@ -1577,14 +1572,13 @@ fn create_html_stream_processor_with_document_state(
 
     let config = config
         .with_ad_state(params.ad_slots_script, params.ad_bids_state)
-        .with_gpt_diagnostics(gpt_diagnostics)
+        .with_request_processing(request_processing)
         .with_trace_bootstrap(match assembly_mode {
             AssemblyMode::Inline => params.trace_bootstrap,
             AssemblyMode::Esi => None,
         })
         .with_body_close(body_close)
-        .with_csp_nonce_observer(csp_nonce_observed)
-        .with_datadome_client_tag_suppression(params.suppress_datadome_client_side_tag);
+        .with_csp_nonce_observer(csp_nonce_observed);
 
     let processor = create_html_processor_with_document_state(config, document_state);
     processor
@@ -1786,10 +1780,8 @@ pub struct OwnedProcessResponseParams {
     /// Price granularity used to bucket bids when building `tsjs.bids`.
     pub(crate) price_granularity: PriceGranularity,
     /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
-    pub(crate) suppress_datadome_client_side_tag: bool,
     /// Request-scoped conditional diagnostics delivery decision.
-    pub(crate) gpt_diagnostics:
-        Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
+    pub(crate) request_processing: Option<RequestProcessingState>,
     /// Request-only trace bootstrap, excluded from shared templates and ESI.
     pub(crate) trace_bootstrap: Option<String>,
     /// Set by the transform when the document carries a response-bound CSP nonce.
@@ -2258,9 +2250,8 @@ fn build_template_assembly_params(
         auction_request: None,
         dispatched_auction: None,
         price_granularity,
-        gpt_diagnostics: None,
+        request_processing: None,
         trace_bootstrap: None,
-        suppress_datadome_client_side_tag: false,
     }
 }
 
@@ -2957,15 +2948,16 @@ fn response_is_range_associated(response: &Response<EdgeBody>) -> bool {
 }
 
 /// Prevent shared caches from replaying tag-suppressed HTML to other clients.
-fn apply_datadome_client_tag_cache_privacy(
+fn apply_processing_cache_privacy(
     response: &mut Response<EdgeBody>,
     method: &Method,
-    suppress_datadome_client_side_tag: bool,
+    privacy: ResponsePrivacyScope,
     content_type: &str,
 ) {
-    if suppress_datadome_client_side_tag
-        && response_carries_body(method, response.status())
-        && is_html_content_type(content_type)
+    if privacy == ResponsePrivacyScope::AllResponses
+        || (privacy == ResponsePrivacyScope::SynthesizedHtml
+            && response_carries_body(method, response.status())
+            && is_html_content_type(content_type))
     {
         enforce_synthesized_html_cache_privacy(response);
     }
@@ -3116,8 +3108,7 @@ pub fn stream_publisher_body<W: Write>(
         integration_registry,
         ad_slots_script: params.ad_slots_script.as_deref(),
         ad_bids_state: params.ad_bids_state.script_cell(),
-        suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
-        gpt_diagnostics: params.gpt_diagnostics.as_ref(),
+        request_processing: params.request_processing.as_ref(),
         trace_bootstrap: params.trace_bootstrap.as_deref(),
         shared_template_authorized: params.template_cache_key.is_some(),
         csp_nonce_observed: params.csp_nonce_observed.as_ref(),
@@ -3353,8 +3344,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         integration_registry,
         ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
         ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
-        suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
-        gpt_diagnostics: params.gpt_diagnostics.clone(),
+        request_processing: params.request_processing.clone(),
         trace_bootstrap: params.trace_bootstrap.clone(),
         shared_template_authorized: params.template_cache_key.is_some(),
         csp_nonce_observed: params.csp_nonce_observed.clone(),
@@ -3615,6 +3605,8 @@ pub(crate) struct AdBidsState {
     trace: Option<TraceAuctionCarry>,
     /// Withheld ad-slot injection permits only trace observation at the body seam.
     trace_only: bool,
+    /// Deployment-scoped capability, independent of navigation activation.
+    auction_correlation_enabled: bool,
 }
 
 #[cfg(test)]
@@ -4651,10 +4643,9 @@ async fn collect_non_html_auction(
         .trace()
         .map(|trace| trace.token().to_string())
         .or_else(|| {
-            telemetry
-                .auction_request
-                .as_ref()
-                .and_then(|_| diagnostics_auction_id(settings))
+            telemetry.auction_request.as_ref().and_then(|_| {
+                auction_correlation_id(params.ad_bids_state.auction_correlation_enabled)
+            })
         });
     let placeholder = mediator_placeholder_request();
     // Auction collection nests deadline and trace futures. Keep its future off
@@ -4714,7 +4705,7 @@ async fn collect_stream_auction(
             telemetry
                 .auction_request
                 .as_ref()
-                .and_then(|_| diagnostics_auction_id(settings))
+                .and_then(|_| auction_correlation_id(ad_bids_state.auction_correlation_enabled))
         });
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
@@ -4910,8 +4901,9 @@ pub async fn handle_publisher_request(
 
     // Adapter fallbacks prepare this before EC/cookie handling. Keep this
     // idempotent call as a direct-handler safety net and for focused tests.
-    let gpt_diagnostics =
-        crate::integrations::gpt_diagnostics::prepare_request(settings, &mut req)?;
+    auction
+        .integration_registry
+        .prepare_request(settings, &mut req)?;
     let trace_gate = req.extensions().get::<TraceCaptureGate>().copied();
 
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
@@ -5073,7 +5065,10 @@ pub async fn handle_publisher_request(
         .and_then(|co| co.auction_timeout_ms)
         .unwrap_or(settings.auction.timeout_ms);
 
-    let mut ad_bids_state = AdBidsState::default();
+    let mut ad_bids_state = AdBidsState {
+        auction_correlation_enabled: auction.integration_registry.auction_correlation_enabled(),
+        ..AdBidsState::default()
+    };
 
     let price_granularity = settings
         .creative_opportunities
@@ -5131,25 +5126,20 @@ pub async fn handle_publisher_request(
             TemplateCacheBypassReason::CookiePolicy
         );
     }
-    let suppress_datadome_client_side_tag = req
-        .extensions()
-        .get::<crate::integrations::datadome::DataDomeClientTagSuppressed>()
-        .is_some();
+    let request_processing = RequestProcessingState::from_request(&req);
+    let requirements = request_processing.requirements();
     // Tag suppression is request-scoped (for example, an IP exclusion), while a template cache
     // template is shared across readers. A shared template can represent neither the
     // suppressed nor unsuppressed variant safely for the other population.
-    let datadome_suppression_requires_origin = suppress_datadome_client_side_tag;
-    let datadome_suppression_requires_full_body =
-        suppress_datadome_client_side_tag && is_html_document_request(&req);
-    let diagnostics_requires_full_body =
-        gpt_diagnostics.requires_private_no_store() && is_html_document_request(&req);
+    let integration_requires_origin = requirements.bypass_shared();
+    let integration_requires_full_body =
+        requirements.requires_full_html() && is_html_document_request(&req);
     // The reader's own request semantics, read before any stripping. A reader who asked
     // for a range or a conditional response must not be handed a full document
     // synthesized from a template shared with other readers, whatever the origin is then
     // asked for on their behalf.
-    let reader_requires_origin = request_bypasses_template_cache(req.headers())
-        || gpt_diagnostics.requires_private_no_store()
-        || datadome_suppression_requires_origin;
+    let reader_requires_origin =
+        request_bypasses_template_cache(req.headers()) || integration_requires_origin;
     let reader_compression = negotiate_reader_compression(req.headers());
     let reader_supports_assembly = reader_compression.is_ok();
     // A failed negotiation bypasses template cache below, so this value is used only on an
@@ -5158,8 +5148,7 @@ pub async fn handle_publisher_request(
     let reader_compression = reader_compression.unwrap_or(Compression::None);
 
     if should_run_ad_stack
-        || datadome_suppression_requires_full_body
-        || diagnostics_requires_full_body
+        || integration_requires_full_body
         || (async_html_finish_present
             && req.method() == Method::GET
             && is_html_document_request(&req))
@@ -5180,9 +5169,8 @@ pub async fn handle_publisher_request(
     // The strip removes four headers; this predicate tests six plus `Cache-Control`
     // request directives, so `If-Match`, `If-Unmodified-Since` and a `no-store` reader
     // still disqualify, stripped or not.
-    let request_requires_origin = request_bypasses_template_cache(req.headers())
-        || gpt_diagnostics.requires_private_no_store()
-        || datadome_suppression_requires_origin;
+    let request_requires_origin =
+        request_bypasses_template_cache(req.headers()) || integration_requires_origin;
 
     let method_is_cacheable = req.method() == Method::GET;
     // Read while the request is still in hand: the readthrough policy below applies to
@@ -5372,7 +5360,7 @@ pub async fn handle_publisher_request(
     let mut auction_observation: Option<AuctionObservationContext> = None;
 
     let mut trace_request = trace_gate
-        .filter(|gate| gate.document_eligible(&gpt_diagnostics))
+        .filter(|gate| gate.document_eligible(request_processing.document_trace_enabled()))
         .map(|_| {
             build_auction_request(
                 &MatchedSlotsContext {
@@ -5726,7 +5714,7 @@ pub async fn handle_publisher_request(
         response.headers().len()
     );
 
-    if (should_run_ad_stack || diagnostics_requires_full_body)
+    if (should_run_ad_stack || (requirements.rejects_not_modified_html() && request_is_document))
         && response.status() == StatusCode::NOT_MODIFIED
     {
         if let Some(dispatched) = dispatched_auction.take() {
@@ -5926,10 +5914,10 @@ pub async fn handle_publisher_request(
         }
     }
     if !range_associated_html_bypass {
-        apply_datadome_client_tag_cache_privacy(
+        apply_processing_cache_privacy(
             &mut response,
             &request_method,
-            suppress_datadome_client_side_tag,
+            requirements.privacy,
             &origin_content_type,
         );
     }
@@ -5941,7 +5929,10 @@ pub async fn handle_publisher_request(
         &mut response,
     )?;
 
-    crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
+    request_processing.finalize_response(&mut response);
+    if requirements.privacy == ResponsePrivacyScope::AllResponses {
+        enforce_synthesized_html_cache_privacy(&mut response);
+    }
 
     let content_type = response
         .headers()
@@ -6056,7 +6047,8 @@ pub async fn handle_publisher_request(
             response.headers_mut().remove(header::CONTENT_LENGTH);
             let trace_bootstrap = trace_gate
                 .filter(|gate| {
-                    is_html_content_type(&content_type) && gate.document_eligible(&gpt_diagnostics)
+                    is_html_content_type(&content_type)
+                        && gate.document_eligible(request_processing.document_trace_enabled())
                 })
                 .map(|gate| {
                     trace_document_bootstrap(
@@ -6092,12 +6084,12 @@ pub async fn handle_publisher_request(
                     content_type,
                     ad_slots_script: ad_slots_script.clone(),
                     ad_bids_state: ad_bids_state.clone(),
-                    suppress_datadome_client_side_tag,
+
                     auction_observation,
                     auction_request: auction_request_for_telemetry,
                     dispatched_auction,
                     price_granularity,
-                    gpt_diagnostics: Some(gpt_diagnostics),
+                    request_processing: Some(request_processing),
                     trace_bootstrap,
                 }),
             })
@@ -6242,9 +6234,8 @@ pub(crate) fn build_auction_request(
 ///
 /// Returns `None` unless the GPT diagnostics integration is enabled, since
 /// nothing else consumes the value.
-fn diagnostics_auction_id(settings: &Settings) -> Option<String> {
-    crate::integrations::gpt_diagnostics::is_enabled(settings)
-        .then(|| format!("ts-auc-{}", uuid::Uuid::new_v4().simple()))
+fn auction_correlation_id(enabled: bool) -> Option<String> {
+    enabled.then(|| format!("ts-auc-{}", uuid::Uuid::new_v4().simple()))
 }
 
 /// Escape a JSON string so it is safe to embed inside a JS double-quoted string literal
@@ -6406,11 +6397,7 @@ pub(crate) fn build_bid_map_with_auction_id(
                 // OpenRTB bid ID. The latter is the last resort: it is unique per
                 // bid instance rather than a creative, but GAM echoes it verbatim
                 // so the render bridge can find the exact winning bid.
-                let renderer_bid_id = bid.renderer.as_ref().and_then(|renderer| {
-                    renderer
-                        .as_aps()
-                        .map(|renderer| renderer.bid_id.as_str())
-                });
+                let renderer_bid_id = bid.renderer.as_ref().and_then(|renderer| renderer.targeting_bid_id.as_deref());
                 let hb_adid = non_empty(bid.cache_id.as_deref())
                     .or_else(|| renderer_bid_id.and_then(|id| non_empty(Some(id))))
                     .or_else(|| non_empty(bid.ad_id.as_deref()))
@@ -7899,7 +7886,11 @@ pub async fn handle_page_bids(
                     let auction_id = trace_auction
                         .as_ref()
                         .map(|trace| trace.token().to_string())
-                        .or_else(|| diagnostics_auction_id(settings));
+                        .or_else(|| {
+                            auction_correlation_id(
+                                auction.integration_registry.auction_correlation_enabled(),
+                            )
+                        });
                     let bid_map = build_bid_map_with_auction_id(
                         &winning_bids,
                         co_config.price_granularity,
@@ -8601,9 +8592,7 @@ mod tests {
             .header(header::USER_AGENT, "scheduling-browser")
             .body(EdgeBody::empty())
             .expect("should build navigation request");
-        request
-            .extensions_mut()
-            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+        crate::integrations::datadome::suppress_client_tag(&mut request);
         request
     }
 
@@ -9949,9 +9938,8 @@ mod tests {
             auction_request: None,
             dispatched_auction: None,
             price_granularity: Default::default(),
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -10013,12 +10001,11 @@ mod tests {
             .header("sec-fetch-dest", "document")
             .body(EdgeBody::empty())
             .expect("should build activation request");
-        let decision =
-            crate::integrations::gpt_diagnostics::prepare_request(&settings, &mut request)
-                .expect("should prepare diagnostics request");
+        let decision = crate::integrations::prepare_request(&settings, None, &mut request)
+            .expect("should prepare diagnostics request");
         let mut params = make_stream_params(&settings, "");
         params.content_type = "text/html".to_owned();
-        params.gpt_diagnostics = Some(decision);
+        params.request_processing = Some(decision);
         let mut output = Vec::new();
 
         stream_publisher_body(
@@ -10160,12 +10147,7 @@ mod tests {
         };
         use crate::trace::{TracePreDispatchHook, TraceTerminalResponse};
 
-        fn gate_and_decision(
-            settings: &Settings,
-        ) -> (
-            TraceCaptureGate,
-            crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision,
-        ) {
+        fn gate_and_decision(settings: &Settings) -> (TraceCaptureGate, RequestProcessingState) {
             let mut request = request("", Some("__Host-ts-console=1"), "document");
             let hook = TracePreDispatchHook::new(
                 Arc::new(settings.clone()),
@@ -10177,9 +10159,8 @@ mod tests {
                     .is_none(),
                 "should continue publisher routing"
             );
-            let decision =
-                crate::integrations::gpt_diagnostics::prepare_request(settings, &mut request)
-                    .expect("should prepare active navigation decision");
+            let decision = crate::integrations::prepare_request(settings, None, &mut request)
+                .expect("should prepare active navigation decision");
             let gate = *request
                 .extensions()
                 .get::<TraceCaptureGate>()
@@ -10270,7 +10251,7 @@ mod tests {
                     .is_none(),
                 "should continue ordinary publisher routing"
             );
-            crate::integrations::gpt_diagnostics::prepare_request(settings, &mut request)
+            crate::integrations::prepare_request(settings, None, &mut request)
                 .expect("should prepare effective diagnostics decision");
             assert!(
                 !request
@@ -10609,7 +10590,7 @@ mod tests {
             );
             let mut params = make_stream_params(&settings, "");
             params.content_type = "text/html".to_owned();
-            params.gpt_diagnostics = Some(decision);
+            params.request_processing = Some(decision);
             params.trace_bootstrap = Some(bootstrap);
             let registry =
                 IntegrationRegistry::new(&settings).expect("should build publisher registry");
@@ -10702,7 +10683,7 @@ mod tests {
                 "should omit a serialization failure without publishing error text"
             );
             let mut response = Response::new(EdgeBody::empty());
-            crate::integrations::gpt_diagnostics::finalize_response(&decision, &mut response);
+            decision.finalize_response(&mut response);
             crate::response_privacy::apply_response_headers_with_cache_privacy(
                 &settings,
                 &mut response,
@@ -10732,7 +10713,7 @@ mod tests {
             );
             let mut params = make_stream_params(&settings, "");
             params.content_type = "text/html".to_owned();
-            params.gpt_diagnostics = Some(decision);
+            params.request_processing = Some(decision);
             params.trace_bootstrap = Some(bootstrap);
             let mut output = Vec::new();
             stream_publisher_body(
@@ -10771,8 +10752,7 @@ mod tests {
                 integration_registry: &registry,
                 ad_slots_script: None,
                 ad_bids_state: Arc::new(Mutex::new(None)),
-                suppress_datadome_client_side_tag: false,
-                gpt_diagnostics: Some(decision),
+                request_processing: Some(decision),
                 trace_bootstrap: Some(trace_document_bootstrap(
                     &gate,
                     &ClientInfo::default(),
@@ -10904,11 +10884,11 @@ mod tests {
             let ad_slots_script =
                 template_ad_slots_script(mode, shape.ad_stack_ran, &settings, &slots, "/");
             let body_close = body_close_injection(mode, ad_slots_script.is_some());
-            let gpt_diagnostics = template_gpt_diagnostics(
+            let gpt_diagnostics = template_request_processing(
                 mode,
                 shape
                     .diagnostics_active
-                    .then(GptDiagnosticsRequestDecision::active_for_tests),
+                    .then(|| GptDiagnosticsRequestDecision::active_for_tests().into()),
             );
 
             let ad_bids_state =
@@ -10925,10 +10905,9 @@ mod tests {
                 ad_slots_script,
                 ad_bids_state,
                 max_buffered_body_bytes: 16 * 1024 * 1024,
-                gpt_diagnostics,
+                request_processing: gpt_diagnostics,
                 trace_bootstrap: None,
                 body_close,
-                suppress_datadome_client_side_tag: false,
             };
 
             let mut processor = create_html_processor(config);
@@ -11945,9 +11924,9 @@ mod tests {
         /// parameter.
         fn diagnostics_navigation_request() -> Request<EdgeBody> {
             let mut request = navigation_request();
-            request.extensions_mut().insert(
+            request.extensions_mut().insert(RequestProcessingState::from(
                 crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision::active_for_tests(),
-            );
+            ));
             request
         }
 
@@ -12294,9 +12273,7 @@ mod tests {
                     let mut ec_context = EcContext::new_for_test(None, consent);
                     let mut request = navigation_request();
                     if suppressed {
-                        request
-                            .extensions_mut()
-                            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+                        crate::integrations::datadome::suppress_client_tag(&mut request);
                     }
                     let publisher = handle_publisher_request(
                         &settings,
@@ -15566,9 +15543,9 @@ mod tests {
         // preparation removes malformed pairs before generic cookie handling.
         fn prepared_cookie_policy_request(fields: &[&[u8]]) -> Request<EdgeBody> {
             let mut request = cookie_policy_request(fields);
-            request.extensions_mut().insert(
-                crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision::default(),
-            );
+            request
+                .extensions_mut()
+                .insert(crate::integrations::processing::ReservedInputsNormalized);
             request
         }
 
@@ -16902,11 +16879,8 @@ mod tests {
                         .handle(&mut request)
                         .await
                         .expect("should freeze document gate");
-                        crate::integrations::gpt_diagnostics::prepare_request(
-                            &settings,
-                            &mut request,
-                        )
-                        .expect("should freeze diagnostics decision");
+                        crate::integrations::prepare_request(&settings, None, &mut request)
+                            .expect("should freeze diagnostics decision");
                         let mut ec_context = EcContext::new_for_test(None, scheduling_consent());
                         let slots = [article_slot()];
                         let registry = IntegrationRegistry::new(&settings)
@@ -17040,10 +17014,9 @@ mod tests {
                         .is_none(),
                     "should continue publisher routing"
                 );
-                crate::integrations::gpt_diagnostics::prepare_request(settings, &mut request)
-                    .expect(
-                        "should freeze effective document diagnostics before publisher processing",
-                    );
+                crate::integrations::prepare_request(settings, None, &mut request).expect(
+                    "should freeze effective document diagnostics before publisher processing",
+                );
                 run(settings, services, request).await
             }
 
@@ -17270,11 +17243,8 @@ mod tests {
                         .handle(&mut request)
                         .await
                         .expect("should freeze trace gate");
-                        crate::integrations::gpt_diagnostics::prepare_request(
-                            &settings,
-                            &mut request,
-                        )
-                        .expect("should freeze diagnostics decision");
+                        crate::integrations::prepare_request(&settings, None, &mut request)
+                            .expect("should freeze diagnostics decision");
                         let mut ec_context = EcContext::new_for_test(
                             None,
                             crate::consent::ConsentContext {
@@ -17543,6 +17513,322 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             }
         }
 
+        #[derive(Clone, Copy)]
+        struct PrivacyOnlyRequested;
+
+        struct PrivacyOnlyLifecycle;
+        struct PrivacyOnlyPrepared {
+            private: bool,
+        }
+
+        impl crate::integrations::processing::IntegrationRequestLifecycle for PrivacyOnlyLifecycle {
+            fn integration_id(&self) -> &'static str {
+                "privacy-only-fixture"
+            }
+
+            fn prepare(
+                &self,
+                _settings: &Settings,
+                request: &mut Request<EdgeBody>,
+            ) -> Result<
+                Arc<dyn crate::integrations::processing::PreparedIntegrationRequest>,
+                Report<TrustedServerError>,
+            > {
+                Ok(Arc::new(PrivacyOnlyPrepared {
+                    private: request.extensions().get::<PrivacyOnlyRequested>().is_some(),
+                }))
+            }
+        }
+
+        impl crate::integrations::processing::PreparedIntegrationRequest for PrivacyOnlyPrepared {
+            fn requirements(
+                &self,
+            ) -> crate::integrations::processing::RequestProcessingRequirements {
+                crate::integrations::processing::RequestProcessingRequirements {
+                    origin: crate::integrations::processing::OriginRequirement::Ordinary,
+                    privacy: if self.private {
+                        ResponsePrivacyScope::AllResponses
+                    } else {
+                        ResponsePrivacyScope::Unchanged
+                    },
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn privacy_only_requirements_preserve_private_terminal_policy_on_warm_template_hits()
+        {
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                let settings = Arc::new(settings_with_mode("esi"));
+                let plan = Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile neutral privacy test plan"),
+                );
+                let registration =
+                    crate::integrations::IntegrationRegistration::builder("privacy-only-fixture")
+                        .without_js()
+                        .with_request_lifecycle(Arc::new(PrivacyOnlyLifecycle))
+                        .build();
+                let registry =
+                    IntegrationRegistry::from_registrations(&settings, plan, [registration], &[])
+                        .expect("should assemble the same privacy-only lifecycle for both readers");
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                queue_shareable_html(&stub);
+                let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+                for private in [false, true] {
+                    let mut request = navigation_request();
+                    if private {
+                        request.extensions_mut().insert(PrivacyOnlyRequested);
+                    }
+                    let state = registry
+                        .prepare_request(&settings, &mut request)
+                        .expect("should prepare independent privacy-only axes");
+                    assert_eq!(
+                        state.requirements().origin,
+                        crate::integrations::processing::OriginRequirement::Ordinary,
+                        "should never escalate privacy into an origin-sharing veto"
+                    );
+                    assert_eq!(
+                        state.requirements().privacy,
+                        if private {
+                            ResponsePrivacyScope::AllResponses
+                        } else {
+                            ResponsePrivacyScope::Unchanged
+                        },
+                        "should apply all-response privacy only to the second reader"
+                    );
+                    let mut ec_context = EcContext::new_for_test(
+                        None,
+                        crate::consent::ConsentContext {
+                            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                            ..Default::default()
+                        },
+                    );
+                    let publisher_response = handle_publisher_request(
+                        &settings,
+                        &services,
+                        None,
+                        &mut ec_context,
+                        AuctionDispatch {
+                            integration_registry: &registry,
+                            orchestrator: &orchestrator,
+                            slots: &[article_slot()],
+                            registry: None,
+                        },
+                        request,
+                        EdgeCacheHeader::SMaxageFallback,
+                    )
+                    .await
+                    .expect("should serve the real shared-template path");
+                    if private {
+                        assert!(
+                            matches!(
+                                &publisher_response,
+                                PublisherResponse::AssembleTemplate { .. }
+                            ),
+                            "should exercise a legitimate warm hit, not a privacy-driven origin bypass"
+                        );
+                    }
+                    let response = finalize_test_publisher_response(
+                        publisher_response,
+                        &settings,
+                        &services,
+                        &registry,
+                        Arc::clone(&orchestrator),
+                        finalizer,
+                    )
+                    .await;
+                    if private {
+                        assert_eq!(
+                            response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                            "hit",
+                            "should retain warm-hit eligibility"
+                        );
+                        assert_eq!(
+                            looked_up_cache_keys(&cache).last(),
+                            stored_cache_keys(&cache).first(),
+                            "should hit exactly the template key the ordinary reader stored"
+                        );
+                        assert_eq!(
+                            response.headers()[header::CACHE_CONTROL],
+                            "no-store, private",
+                            "should enforce all-response privacy before returning a warm hit"
+                        );
+                        assert!(
+                            response
+                                .extensions()
+                                .get::<crate::response_privacy::TerminalPrivateResponse>()
+                                .is_some(),
+                            "should retain the terminal marker for later adapter policy"
+                        );
+                        assert!(
+                            !response.headers().contains_key("surrogate-control"),
+                            "should not advertise shared response freshness"
+                        );
+                    }
+                    let html = String::from_utf8(body_of(response).await)
+                        .expect("should assemble UTF8 template HTML");
+                    assert!(
+                        html.contains("origin"),
+                        "should deliver the stored origin content"
+                    );
+                    assert_eq!(
+                        stored_cache_keys(&cache).len(),
+                        1,
+                        "should retain only the original shared template"
+                    );
+                    assert_eq!(
+                        stub.recorded_request_uris().len(),
+                        1,
+                        "should not fetch origin again for the privacy-only warm reader"
+                    );
+                }
+                assert_eq!(
+                    looked_up_cache_keys(&cache).len(),
+                    2,
+                    "should look up both readers without adding an origin veto"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn processing_requirements_veto_warm_lookup_cold_store_and_readthrough_for_cookie_matrix()
+         {
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                for warm in [false, true] {
+                    for independent in [false, true] {
+                        for key_names in [None, Some(["ab_bucket"].as_slice())] {
+                            for fields in [
+                                Vec::<&[u8]>::new(),
+                                vec![b"".as_slice()],
+                                vec![b"ab_bucket=A".as_slice()],
+                                vec![b"session=".as_slice()],
+                                vec![b"broken; ab_bucket=A".as_slice()],
+                                vec![b"unlisted=example".as_slice()],
+                            ] {
+                                for (directive, suppress) in [
+                                    (None, true),
+                                    (Some("1"), false),
+                                    (Some("0"), false),
+                                    (Some("invalid"), false),
+                                    (Some("1&ts_console=0"), true),
+                                ] {
+                                    let mut settings = cookie_policy_settings(
+                                        key_names,
+                                        Some(&["session"]),
+                                        independent,
+                                    );
+                                    let raw = Arc::make_mut(&mut settings);
+                                    raw.creative_opportunities
+                                        .as_mut()
+                                        .expect("should configure opportunities")
+                                        .origin_readthrough_enabled = Some(true);
+                                    raw.integrations
+                                        .insert_config(
+                                            "gpt_diagnostics",
+                                            &serde_json::json!({"enabled": true}),
+                                        )
+                                        .expect("should enable lifecycle fixture");
+                                    raw.integrations.insert_config("datadome", &serde_json::json!({"enabled": true, "client_side_key": "example-client-key"}))
+                                        .expect("should enable suppressed tag fixture");
+                                    let stub = Arc::new(StubHttpClient::new());
+                                    let cache = Arc::new(MemoryTemplateCache::default());
+                                    let sink = Arc::new(RecordingTelemetrySink::default());
+                                    let services = services_with_cache_and_telemetry(
+                                        Arc::clone(&stub),
+                                        Arc::clone(&cache),
+                                        Arc::clone(&sink),
+                                    );
+                                    if warm {
+                                        queue_shareable_html(&stub);
+                                        let response = run_via(
+                                            &settings,
+                                            &services,
+                                            navigation_request(),
+                                            finalizer,
+                                        )
+                                        .await;
+                                        let _ = body_of(response).await;
+                                        assert_eq!(
+                                            stored_cache_keys(&cache).len(),
+                                            1,
+                                            "should populate the shared cache before testing the lookup veto"
+                                        );
+                                    }
+                                    let lookups = looked_up_cache_keys(&cache).len();
+                                    let stores = stored_cache_keys(&cache).len();
+                                    queue_shareable_html(&stub);
+                                    let mut request = cookie_policy_request(&fields);
+                                    if let Some(directive) = directive {
+                                        *request.uri_mut() = format!(
+                                            "https://ts.example.com/article?ts_console={directive}"
+                                        )
+                                        .parse()
+                                        .expect("should construct reserved directive");
+                                    }
+                                    if suppress {
+                                        crate::integrations::datadome::suppress_client_tag(
+                                            &mut request,
+                                        );
+                                    }
+                                    let response =
+                                        run_via(&settings, &services, request, finalizer).await;
+                                    assert_eq!(
+                                        response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                                        "bypass-request",
+                                        "should veto warm and cold admission independently of cookie policy"
+                                    );
+                                    assert_eq!(
+                                        response.headers()[header::CACHE_CONTROL],
+                                        "no-store, private",
+                                        "should enforce the declared HTML privacy"
+                                    );
+                                    let html = String::from_utf8(body_of(response).await)
+                                        .expect("should decode synthesized HTML");
+                                    if suppress {
+                                        assert!(
+                                            !html.contains("/integrations/datadome/tags.js"),
+                                            "should preserve the owner's opaque suppression fact"
+                                        );
+                                    }
+                                    assert_eq!(
+                                        looked_up_cache_keys(&cache).len(),
+                                        lookups,
+                                        "should never consult a warm template"
+                                    );
+                                    assert_eq!(
+                                        stored_cache_keys(&cache).len(),
+                                        stores,
+                                        "should never store request-local output"
+                                    );
+                                    assert_eq!(
+                                        stub.recorded_cache_intents().last(),
+                                        Some(&PlatformCacheIntent::Bypass),
+                                        "should independently veto origin readthrough"
+                                    );
+                                    assert_eq!(
+                                        last_summary_row(&sink)
+                                            .expect("should emit origin shareability")
+                                            .origin_cache_shareable,
+                                        Some(0),
+                                        "should retain readthrough shareability telemetry"
+                                    );
+                                    assert!(
+                                        stub.recorded_request_uris()
+                                            .last()
+                                            .is_some_and(|uri| !uri.contains("ts_console")),
+                                        "should scrub reserved inputs before origin selection"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         #[tokio::test]
         async fn datadome_suppressed_request_bypasses_a_warm_shared_template() {
             let stub = Arc::new(StubHttpClient::new());
@@ -17574,9 +17860,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             suppressed_request
                 .headers_mut()
                 .insert("sec-fetch-dest", HeaderValue::from_static("script"));
-            suppressed_request
-                .extensions_mut()
-                .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+            crate::integrations::datadome::suppress_client_tag(&mut suppressed_request);
             let suppressed = run(&settings, &services, suppressed_request).await;
             assert_eq!(
                 suppressed
@@ -20802,6 +21086,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         async fn inactive_ad_stack_preserves_gpt_diagnostics_cache_privacy() {
             // Arrange
             let mut settings = settings_with_disabled_ad_templates();
+            settings.proxy.allowed_domains =
+                vec!["*.example".to_string(), "*.example.com".to_string()];
             settings
                 .integrations
                 .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
@@ -20820,7 +21106,26 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 .expect("should build GPT diagnostics request");
 
             // Act
-            let response = run_with_slots(&settings, &services, &[article_slot()], request).await;
+            let registry = IntegrationRegistry::new(&settings)
+                .expect("should construct configured diagnostics capability");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut ec_context = EcContext::new_for_test(None, non_regulated_consent());
+            let response = handle_publisher_request(
+                &settings,
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    integration_registry: &registry,
+                    orchestrator: &orchestrator,
+                    slots: &[article_slot()],
+                    registry: None,
+                },
+                request,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should preserve configured request privacy");
             let response_head = response_head(response);
 
             // Assert
@@ -21166,8 +21471,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .header(header::IF_RANGE, "\"cached-page\"")
             .body(EdgeBody::empty())
             .expect("should build conditional request");
-        req.extensions_mut()
-            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+        crate::integrations::datadome::suppress_client_tag(&mut req);
 
         let _response = run_publisher_proxy(&settings, &services, req).await;
 
@@ -21214,8 +21518,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .header(header::IF_RANGE, "\"cached-frame\"")
             .body(EdgeBody::empty())
             .expect("should build conditional iframe request");
-        req.extensions_mut()
-            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+        crate::integrations::datadome::suppress_client_tag(&mut req);
 
         let _response = run_publisher_proxy(&settings, &services, req).await;
 
@@ -21262,8 +21565,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .header(header::IF_RANGE, "\"cached-video\"")
             .body(EdgeBody::empty())
             .expect("should build conditional subresource request");
-        req.extensions_mut()
-            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+        crate::integrations::datadome::suppress_client_tag(&mut req);
 
         let _response = run_publisher_proxy(&settings, &services, req).await;
 
@@ -21478,6 +21780,290 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         );
     }
 
+    struct AllResponsesLifecycle;
+    struct AllResponsesPrepared;
+
+    impl crate::integrations::processing::IntegrationRequestLifecycle for AllResponsesLifecycle {
+        fn integration_id(&self) -> &'static str {
+            "neutral-privacy-fixture"
+        }
+
+        fn prepare(
+            &self,
+            _settings: &Settings,
+            _request: &mut Request<EdgeBody>,
+        ) -> Result<
+            Arc<dyn crate::integrations::processing::PreparedIntegrationRequest>,
+            Report<TrustedServerError>,
+        > {
+            Ok(Arc::new(AllResponsesPrepared))
+        }
+    }
+
+    impl crate::integrations::processing::PreparedIntegrationRequest for AllResponsesPrepared {
+        fn requirements(&self) -> crate::integrations::processing::RequestProcessingRequirements {
+            crate::integrations::processing::RequestProcessingRequirements {
+                origin: crate::integrations::processing::OriginRequirement::BypassShared,
+                privacy: ResponsePrivacyScope::AllResponses,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn neutral_all_response_privacy_is_enforced_without_an_owner_finalizer() {
+        for (method, status, content_type) in [
+            (Method::GET, 200, "text/html"),
+            (Method::GET, 200, "application/json"),
+            (Method::GET, 204, "text/html"),
+            (Method::HEAD, 200, "text/html"),
+            (Method::GET, 304, "text/html"),
+            (Method::GET, 206, "text/html"),
+        ] {
+            let mut settings = create_test_settings();
+            settings.auction.enabled = false;
+            let plan = Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile neutral test plan"),
+            );
+            let registration =
+                crate::integrations::IntegrationRegistration::builder("neutral-privacy-fixture")
+                    .without_js()
+                    .with_request_lifecycle(Arc::new(AllResponsesLifecycle))
+                    .build();
+            let registry =
+                IntegrationRegistry::from_registrations(&settings, plan, [registration], &[])
+                    .expect("should assemble only the neutral privacy fixture");
+            let stub = Arc::new(StubHttpClient::new());
+            let mut headers = vec![
+                ("content-type", content_type),
+                ("cache-control", "public, max-age=60"),
+                ("surrogate-control", "max-age=60"),
+                ("etag", "\"example-origin\""),
+            ];
+            if status == 206 {
+                headers.push(("content-range", "bytes 0-6/7"));
+            }
+            stub.push_response_with_headers(status, b"example".to_vec(), headers);
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let request = HttpRequest::builder()
+                .method(method.clone())
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should construct neutral privacy request");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut ec_context = EcContext::default();
+            let response = handle_publisher_request(
+                &settings,
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    integration_registry: &registry,
+                    orchestrator: &orchestrator,
+                    slots: &[],
+                    registry: None,
+                },
+                request,
+                EdgeCacheHeader::SurrogateControl,
+            )
+            .await
+            .expect("should enforce neutral privacy before response routing");
+            let response = buffer_publisher_response_async(
+                response,
+                &method,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("should finalize HTML, non-HTML and bodiless responses");
+            assert_eq!(
+                response.status().as_u16(),
+                status,
+                "should not derive strict origin policy from response privacy"
+            );
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "no-store, private",
+                "should enforce privacy for {method} {status} {content_type} without owner finalization"
+            );
+            assert!(
+                !response.headers().contains_key("surrogate-control"),
+                "should remove shared freshness directives"
+            );
+            assert!(
+                !response.headers().contains_key(header::ETAG),
+                "should remove origin validators"
+            );
+            assert!(
+                response
+                    .extensions()
+                    .get::<crate::response_privacy::TerminalPrivateResponse>()
+                    .is_some(),
+                "should retain terminal privacy for later adapter mutations"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_origin_requirements_preserve_distinct_unexpected_304_outcomes() {
+        for (suppress, activate, expected) in [
+            (true, false, StatusCode::NOT_MODIFIED),
+            (false, true, StatusCode::BAD_GATEWAY),
+            (true, true, StatusCode::BAD_GATEWAY),
+        ] {
+            let mut settings = create_test_settings();
+            settings.auction.enabled = false;
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({"enabled": true}))
+                .expect("should configure diagnostics owner");
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should assemble lifecycle registry");
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                304,
+                Vec::new(),
+                vec![
+                    ("content-type", "text/html"),
+                    ("cache-control", "public, max-age=60"),
+                ],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let mut request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(if activate {
+                    "https://publisher.example/page?ts_console=1"
+                } else {
+                    "https://publisher.example/page"
+                })
+                .header(header::HOST, "publisher.example")
+                .header("sec-fetch-dest", "document")
+                .header(header::IF_NONE_MATCH, "\"example-origin\"")
+                .body(EdgeBody::empty())
+                .expect("should construct conditional document");
+            if suppress {
+                crate::integrations::datadome::suppress_client_tag(&mut request);
+            }
+            let state = registry
+                .prepare_request(&settings, &mut request)
+                .expect("should prepare owner requirements");
+            assert!(
+                state.requirements().requires_full_html(),
+                "should request unconditional HTML for either owner"
+            );
+            assert_eq!(
+                state.requirements().rejects_not_modified_html(),
+                activate,
+                "should join strict origin-response policy independently of privacy"
+            );
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut ec_context = EcContext::default();
+            let response = handle_publisher_request(
+                &settings,
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    integration_registry: &registry,
+                    orchestrator: &orchestrator,
+                    slots: &[],
+                    registry: None,
+                },
+                request,
+                EdgeCacheHeader::SurrogateControl,
+            )
+            .await
+            .expect("should preserve owner-specific 304 policy");
+            let response = buffer_publisher_response_async(
+                response,
+                &Method::GET,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("should finalize bodiless or rejected origin response");
+            assert_eq!(
+                response.status(),
+                expected,
+                "should preserve baseline suppression={suppress}, activation={activate} outcome"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_html_requirement_does_not_route_suppressed_documents_through_a_size_bounded_buffer()
+     {
+        let mut settings = create_test_settings();
+        settings.publisher.max_buffered_body_bytes = 64;
+        settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enabled": true,
+                    "client_side_key": "example-client-key"
+                }),
+            )
+            .expect("should configure owner");
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should assemble lifecycle registry");
+        let stub = Arc::new(StubHttpClient::new());
+        let content = "example-content".repeat(512);
+        stub.push_response_with_headers(
+            200,
+            format!("<html><head></head><body>{content}</body></html>").into_bytes(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let mut request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "document")
+            .header(header::RANGE, "bytes=0-10")
+            .body(EdgeBody::empty())
+            .expect("should construct conditional document");
+        crate::integrations::datadome::suppress_client_tag(&mut request);
+        let publisher = run_publisher_proxy(&settings, &services, request).await;
+        let PublisherResponse::Stream {
+            response,
+            body,
+            params,
+        } = publisher
+        else {
+            panic!("should retain streaming routing for full HTML requirements");
+        };
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, private",
+            "should retain scoped HTML privacy"
+        );
+        let mut output = Vec::new();
+        stream_publisher_body(body, &mut output, &params, &settings, &registry)
+            .expect("should stream a document larger than the buffering budget");
+        let html = String::from_utf8(output).expect("should emit UTF8 document");
+        assert!(
+            html.contains(&content),
+            "should retain the complete origin representation"
+        );
+        assert!(
+            !html.contains("/integrations/datadome/tags.js"),
+            "should retain opaque suppression during streaming"
+        );
+    }
+
     #[test]
     fn suppressed_datadome_tag_reaches_publisher_html_pipeline() {
         let mut settings = create_test_settings();
@@ -21495,7 +22081,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .expect("should create integration registry with DataDome");
         let mut params = make_stream_params(&settings, "identity");
         params.content_type = "text/html; charset=utf-8".to_string();
-        params.suppress_datadome_client_side_tag = true;
+        params.request_processing =
+            Some(crate::integrations::datadome::DataDomeClientTagSuppressed.into());
         let mut output = Vec::new();
 
         stream_publisher_body(
@@ -21532,10 +22119,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .body(EdgeBody::empty())
             .expect("should build cacheable HTML response");
 
-        super::apply_datadome_client_tag_cache_privacy(
+        super::apply_processing_cache_privacy(
             &mut response,
             &Method::GET,
-            true,
+            ResponsePrivacyScope::SynthesizedHtml,
             "text/html; charset=utf-8",
         );
 
@@ -21578,10 +22165,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .header(header::CACHE_CONTROL, "no-store")
             .body(EdgeBody::empty())
             .expect("should build no-store HTML response");
-        super::apply_datadome_client_tag_cache_privacy(
+        super::apply_processing_cache_privacy(
             &mut no_store_response,
             &Method::GET,
-            true,
+            ResponsePrivacyScope::SynthesizedHtml,
             "text/html; charset=utf-8",
         );
         assert_eq!(
@@ -21603,10 +22190,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .body(EdgeBody::empty())
             .expect("should build cacheable response");
 
-        super::apply_datadome_client_tag_cache_privacy(
+        super::apply_processing_cache_privacy(
             &mut response,
             &Method::GET,
-            false,
+            ResponsePrivacyScope::Unchanged,
             "text/html; charset=utf-8",
         );
         assert_eq!(
@@ -21618,10 +22205,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             "unsuppressed HTML should retain its existing cache policy"
         );
 
-        super::apply_datadome_client_tag_cache_privacy(
+        super::apply_processing_cache_privacy(
             &mut response,
             &Method::GET,
-            true,
+            ResponsePrivacyScope::SynthesizedHtml,
             "text/css",
         );
         assert_eq!(
@@ -23147,9 +23734,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
 
         let mut output = Vec::new();
@@ -23209,9 +23795,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
 
         let mut output = Vec::new();
@@ -23260,9 +23845,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
         let body = EdgeBody::from_stream(futures::stream::iter(vec![Ok::<_, io::Error>(
             bytes::Bytes::from_static(b"<html><body>live</body></html>"),
@@ -23389,9 +23973,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 auction_request: None,
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                gpt_diagnostics: None,
+                request_processing: None,
                 trace_bootstrap: None,
-                suppress_datadome_client_side_tag: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![
                 bytes::Bytes::from_static(b"body{background:url('https://origin.example.com/"),
@@ -23456,9 +24039,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 auction_request: None,
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                gpt_diagnostics: None,
+                request_processing: None,
                 trace_bootstrap: None,
-                suppress_datadome_client_side_tag: false,
             };
             let compressed =
                 gzip_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -23526,9 +24108,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 auction_request: None,
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                gpt_diagnostics: None,
+                request_processing: None,
                 trace_bootstrap: None,
-                suppress_datadome_client_side_tag: false,
             };
             let compressed =
                 deflate_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -23596,9 +24177,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 auction_request: None,
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                gpt_diagnostics: None,
+                request_processing: None,
                 trace_bootstrap: None,
-                suppress_datadome_client_side_tag: false,
             };
             let compressed =
                 brotli_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -23666,9 +24246,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 auction_request: None,
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                gpt_diagnostics: None,
+                request_processing: None,
                 trace_bootstrap: None,
-                suppress_datadome_client_side_tag: false,
             };
             let compressed =
                 brotli_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -23718,9 +24297,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -23944,9 +24522,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     10,
                 )),
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                gpt_diagnostics: None,
+                request_processing: None,
                 trace_bootstrap: None,
-                suppress_datadome_client_side_tag: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![
                 bytes::Bytes::from_static(b"<html><head></head><body>hello"),
@@ -24022,9 +24599,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     10,
                 )),
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                gpt_diagnostics: None,
+                request_processing: None,
                 trace_bootstrap: None,
-                suppress_datadome_client_side_tag: false,
             };
             // The `</body>` that triggers bid injection lives in the SECOND gzip
             // member. `flate2::read::GzDecoder` decodes only the first member, so
@@ -24099,9 +24675,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     10,
                 )),
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                gpt_diagnostics: None,
+                request_processing: None,
                 trace_bootstrap: None,
-                suppress_datadome_client_side_tag: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
                 b"body{background:url('https://origin.example.com/asset.png')}",
@@ -24170,9 +24745,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
         let publisher_response = PublisherResponse::Stream {
             response,
@@ -25478,8 +26052,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             integration_registry: &control_registry,
             ad_slots_script: html_stream_params("", None).ad_slots_script,
             ad_bids_state: Arc::new(Mutex::new(None)),
-            suppress_datadome_client_side_tag: false,
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
             shared_template_authorized: false,
             csp_nonce_observed: None,
@@ -26137,9 +26710,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             auction_request: dispatched_auction.as_ref().map(|_| test_auction_request()),
             dispatched_auction,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -26860,9 +27432,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     10,
                 )),
                 price_granularity: PriceGranularity::default(),
-                gpt_diagnostics: None,
+                request_processing: None,
                 trace_bootstrap: None,
-                suppress_datadome_client_side_tag: false,
             }
         };
         let make_stream_response = || PublisherResponse::Stream {
@@ -27054,9 +27625,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 10,
             )),
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
         let publisher_response = PublisherResponse::Stream {
             response,
@@ -27135,9 +27705,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
         let mut output = Vec::new();
 
@@ -27199,9 +27768,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
 
         let bogus_body = EdgeBody::from(b"<html>not gzip</html>".to_vec());
@@ -27320,9 +27888,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
         let mut output = Vec::new();
         stream_publisher_body(body, &mut output, &params, &settings, &registry)
@@ -27390,9 +27957,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
 
         let mut output = Vec::new();
@@ -27423,16 +27989,18 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
     #[cfg(test)]
     mod creative_opportunities_tests {
         use super::super::{
-            AdBidsState, MatchedSlotsContext, build_ad_slots_script, build_auction_request,
-            build_bid_map, build_bids_script, diagnostics_auction_id, html_escape_for_script,
+            AdBidsState, MatchedSlotsContext, auction_correlation_id, build_ad_slots_script,
+            build_auction_request, build_bid_map, build_bids_script, html_escape_for_script,
             write_bids_to_state,
         };
-        use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderer, MediaType};
+        use crate::auction::types::{Bid, BidRenderer, MediaType};
         use crate::consent::ConsentContext;
         use crate::creative_opportunities::{
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
         };
         use crate::http_util::RequestInfo;
+        use crate::integrations::IntegrationRegistry;
+        use crate::integrations::aps::{ApsRendererV1, ApsTagType};
         use crate::price_bucket::PriceGranularity;
         use crate::settings::Settings;
         use std::collections::HashMap;
@@ -27695,10 +28263,14 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         /// Guards the browser-visible token every auction path shares: it must
         /// be fresh per auction and absent unless diagnostics can consume it.
         #[test]
-        fn diagnostics_auction_id_is_fresh_and_gated() {
+        fn auction_correlation_id_is_fresh_and_gated() {
             let mut settings = test_settings();
             assert_eq!(
-                diagnostics_auction_id(&settings),
+                auction_correlation_id(
+                    IntegrationRegistry::new(&settings)
+                        .expect("should build correlation registry")
+                        .auction_correlation_enabled()
+                ),
                 None,
                 "no token should be minted without the diagnostics integration"
             );
@@ -27707,10 +28279,18 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 .integrations
                 .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
                 .expect("should enable diagnostics");
-            let first =
-                diagnostics_auction_id(&settings).expect("enabled diagnostics should mint a token");
-            let second =
-                diagnostics_auction_id(&settings).expect("enabled diagnostics should mint a token");
+            let first = auction_correlation_id(
+                IntegrationRegistry::new(&settings)
+                    .expect("should build correlation registry")
+                    .auction_correlation_enabled(),
+            )
+            .expect("enabled diagnostics should mint a token");
+            let second = auction_correlation_id(
+                IntegrationRegistry::new(&settings)
+                    .expect("should build correlation registry")
+                    .auction_correlation_enabled(),
+            )
+            .expect("enabled diagnostics should mint a token");
 
             assert!(
                 first.starts_with("ts-auc-"),
@@ -28652,7 +29232,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             bid.creative = Some("<script>reject()</script>".to_string());
             bid.nurl = None;
             bid.burl = None;
-            bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+            bid.renderer = Some(BidRenderer::from(ApsRendererV1 {
                 version: 1,
                 account_id: "example-account".to_string(),
                 bid_id: "selected-bid".to_string(),
@@ -29688,6 +30268,28 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             }
         }
 
+        fn configured_auction_id_registry(settings: &Settings) -> IntegrationRegistry {
+            // The bidder is an injected legacy test mock, not a catalog provider.
+            // Install the real configured diagnostics capability around a neutral plan.
+            let plan = crate::auction::AuctionPlan::compile_ordered(
+                crate::auction::plan::AuctionPlanConfig {
+                    timeout_ms: 100,
+                    ..Default::default()
+                },
+                Vec::new(),
+                &[],
+                &[],
+            )
+            .expect("should compile neutral plan for injected auction mock");
+            let registration = crate::integrations::gpt_diagnostics::register(settings)
+                .expect("should register configured diagnostics capability");
+            IntegrationRegistry::from_registrations(settings, Arc::new(plan), registration, &[])
+                .expect("should assemble actual enabled diagnostics capability")
+                .with_reserved_input_normalizers(vec![
+                    crate::integrations::gpt_diagnostics::normalize_reserved_inputs,
+                ])
+        }
+
         #[tokio::test]
         async fn page_bids_response_includes_auction_id_only_for_winning_bids() {
             let mut settings = settings_with_co();
@@ -29719,7 +30321,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 &winning_services,
                 None,
                 AuctionDispatch {
-                    integration_registry: &IntegrationRegistry::empty_for_tests(),
+                    integration_registry: &configured_auction_id_registry(&settings),
                     orchestrator: &winning_orchestrator,
                     slots: &slots,
                     registry: None,
@@ -29775,7 +30377,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 &no_winner_services,
                 None,
                 AuctionDispatch {
-                    integration_registry: &IntegrationRegistry::empty_for_tests(),
+                    integration_registry: &configured_auction_id_registry(&settings),
                     orchestrator: &no_winner_orchestrator,
                     slots: &slots,
                     registry: None,
@@ -29828,7 +30430,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     &services,
                     None,
                     AuctionDispatch {
-                        integration_registry: &IntegrationRegistry::empty_for_tests(),
+                        integration_registry: &configured_auction_id_registry(settings),
                         orchestrator: &orchestrator,
                         slots: &slots,
                         registry: None,

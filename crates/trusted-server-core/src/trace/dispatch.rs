@@ -15,9 +15,7 @@ use super::routes::{TraceRoute, state_response};
 use super::shell::render_setup_shell;
 use super::{TraceCookies, TracePreflight, inspect_cookies, preflight, project_request_context};
 use crate::forwarder::prepare_trusted_forwarder;
-use crate::integrations::gpt_diagnostics::{
-    GPT_DIAGNOSTICS_INTEGRATION_ID, GptDiagnosticsConfig, GptDiagnosticsRequestDecision,
-};
+use crate::integrations::gpt_diagnostics::{GPT_DIAGNOSTICS_INTEGRATION_ID, GptDiagnosticsConfig};
 use crate::platform::{ClientInfo, GeoInfo};
 use crate::settings::{Settings, TrustedClientIpConfig};
 
@@ -71,11 +69,11 @@ impl TraceCaptureGate {
     /// # Examples
     ///
     /// ```ignore
-    /// let eligible = gate.document_eligible(&diagnostics_decision);
+    /// let eligible = gate.document_eligible(document_trace_enabled);
     /// ```
     #[must_use]
-    pub fn document_eligible(&self, decision: &GptDiagnosticsRequestDecision) -> bool {
-        self.base_active && decision.active()
+    pub fn document_eligible(&self, document_trace_enabled: bool) -> bool {
+        self.base_active && document_trace_enabled
     }
 }
 
@@ -696,7 +694,7 @@ mod tests {
                     .expect("should preserve console preparation");
             let decision = request
                 .extensions()
-                .get::<GptDiagnosticsRequestDecision>()
+                .get::<crate::integrations::processing::RequestProcessingState>()
                 .expect("should store existing decision");
             assert_eq!(
                 gate.base_active(),
@@ -704,7 +702,7 @@ mod tests {
                 "should evaluate incoming session only once"
             );
             assert_eq!(
-                gate.document_eligible(decision),
+                gate.document_eligible(decision.document_trace_enabled()),
                 expected_document,
                 "should combine frozen validity with effective navigation eligibility"
             );

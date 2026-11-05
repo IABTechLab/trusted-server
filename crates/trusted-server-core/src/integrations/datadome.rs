@@ -100,6 +100,46 @@ pub(crate) const HEADER_DATADOME_TEST_BYPASS: &str = "x-ts-datadome-bypass";
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DataDomeClientTagSuppressed;
 
+impl super::processing::PreparedIntegrationRequest for DataDomeClientTagSuppressed {
+    fn requirements(&self) -> super::processing::RequestProcessingRequirements {
+        super::processing::RequestProcessingRequirements {
+            origin: super::processing::OriginRequirement::FullHtmlRepresentation,
+            privacy: super::processing::ResponsePrivacyScope::SynthesizedHtml,
+        }
+    }
+
+    fn initialize_document(&self, state: &super::IntegrationDocumentState) {
+        state.get_or_insert_with(DATADOME_INTEGRATION_ID, || Self);
+    }
+}
+
+impl From<DataDomeClientTagSuppressed> for super::processing::RequestProcessingState {
+    fn from(decision: DataDomeClientTagSuppressed) -> Self {
+        let mut state = Self::default();
+        state.insert(DATADOME_INTEGRATION_ID, Arc::new(decision));
+        state
+    }
+}
+
+/// Apply this owner's tag suppression and neutral origin/privacy restrictions.
+///
+/// The protection filter calls this only at its existing suppression decisions.
+/// Calling it again preserves the first immutable request decision.
+///
+/// # Examples
+///
+/// ```ignore
+/// suppress_client_tag(&mut request);
+/// ```
+pub fn suppress_client_tag(request: &mut http::Request<EdgeBody>) {
+    request.extensions_mut().insert(DataDomeClientTagSuppressed);
+    super::processing::RequestProcessingState::attach(
+        request,
+        DATADOME_INTEGRATION_ID,
+        Arc::new(DataDomeClientTagSuppressed),
+    );
+}
+
 /// Regex pattern for matching and rewriting `DataDome` URLs in script content.
 ///
 /// Pattern breakdown:

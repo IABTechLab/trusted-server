@@ -278,8 +278,9 @@ where
         Box::pin(async move {
             let services = s.services_for_request(&ctx);
             let mut req = ctx.into_request();
-            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+            if let Err(error) = trusted_server_core::integrations::prepare_request(
                 &s.settings,
+                Some(&s.registry),
                 &mut req,
             ) {
                 return Ok(http_error(&error));
@@ -517,8 +518,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
-            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+            if let Err(error) = trusted_server_core::integrations::prepare_request(
                 &state.settings,
+                Some(&state.registry),
                 &mut req,
             ) {
                 return Ok(http_error(&error));

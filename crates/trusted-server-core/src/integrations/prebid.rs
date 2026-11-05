@@ -28,10 +28,12 @@ use crate::auction::openrtb::{
 };
 use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
 use crate::auction::plan::AuctionPlan;
-use crate::auction::profile::PrebidProfilePlan;
+pub(crate) mod profile;
+#[cfg(test)]
+use self::profile::PrebidProfilePlan;
 #[cfg(test)]
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
-use crate::auction::routing::{PrebidTransportHeaders, ProviderAuctionInput};
+use crate::auction::routing::{ProviderAuctionInput, TransportHeaders};
 #[cfg(test)]
 use crate::auction::types::{AuctionContext, AuctionRequest, MediaType};
 use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
@@ -2016,13 +2018,13 @@ fn copy_request_headers(
 
 /// Applies the common browser-header and consent-cookie policy for PBS.
 pub(crate) fn apply_prebid_transport_headers(
-    from: &PrebidTransportHeaders,
+    from: &TransportHeaders,
     to: &mut http::Request<EdgeBody>,
     consent_forwarding: ConsentForwardingMode,
     client_ip: Option<std::net::IpAddr>,
 ) {
     apply_prebid_header_values(
-        from.consent_cookies(),
+        &PrebidConsentCookies::from_header(from.cookie()),
         from.user_agent(),
         from.referer(),
         from.accept_language(),
@@ -2249,13 +2251,13 @@ fn append_query_params(url: &str, params: &str) -> String {
     }
 }
 
-/// Parse a planned PBS response with the configured profile behavior.
+/// Parse a planned PBS response with its request-captured debug policy.
 ///
 /// This preserves the legacy PBS status, body, bid, cache, and metadata
 /// semantics while allowing each planned provider to retain its own identity.
 pub(crate) async fn parse_planned_prebid_response(
     provider_id: &str,
-    profile: &PrebidProfilePlan,
+    debug: bool,
     input: &ProviderAuctionInput,
     response: PlatformResponse,
     response_time_ms: u64,
@@ -2289,9 +2291,7 @@ pub(crate) async fn parse_planned_prebid_response(
                 None
             }
         };
-        if profile.debug
-            && let Some(body_bytes) = body_bytes.as_deref()
-        {
+        if debug && let Some(body_bytes) = body_bytes.as_deref() {
             match prebid_body_preview(body_bytes) {
                 Some(preview) => {
                     let truncation = if preview.truncated {
@@ -2318,7 +2318,7 @@ pub(crate) async fn parse_planned_prebid_response(
                 "message",
                 serde_json::json!(format!("Prebid Server returned HTTP {status_code}")),
             );
-        if profile.debug
+        if debug
             && let Some(message) = body_bytes
                 .as_deref()
                 .and_then(|body| extract_prebid_error_message(body, content_type.as_deref()))
@@ -2340,7 +2340,7 @@ pub(crate) async fn parse_planned_prebid_response(
         serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
             message: "Failed to parse Prebid response".to_string(),
         })?;
-    if profile.debug && log::log_enabled!(log::Level::Trace) {
+    if debug && log::log_enabled!(log::Level::Trace) {
         match serde_json::to_string_pretty(&response_json) {
             Ok(json) => log::trace!("Prebid OpenRTB response:\n{json}"),
             Err(error) => log::warn!("Prebid: failed to serialize response for logging: {error}"),
@@ -2349,7 +2349,7 @@ pub(crate) async fn parse_planned_prebid_response(
 
     let mut parsed =
         parse_planned_prebid_openrtb(provider_id, input, &response_json, response_time_ms);
-    enrich_planned_prebid_metadata(profile, &response_json, &mut parsed);
+    enrich_planned_prebid_metadata(debug, &response_json, &mut parsed);
     log::info!(
         "Prebid provider {provider_id} returned {} bids in {}ms",
         parsed.bids.len(),
@@ -2426,18 +2426,14 @@ fn parse_planned_prebid_openrtb(
     parsed
 }
 
-fn enrich_planned_prebid_metadata(
-    profile: &PrebidProfilePlan,
-    response_json: &Json,
-    parsed: &mut AuctionResponse,
-) {
+fn enrich_planned_prebid_metadata(debug: bool, response_json: &Json, parsed: &mut AuctionResponse) {
     let ext = response_json.get("ext");
     for key in ["responsetimemillis", "errors", "warnings"] {
         if let Some(value) = ext.and_then(|ext| ext.get(key)) {
             parsed.metadata.insert(key.to_string(), value.clone());
         }
     }
-    if profile.debug {
+    if debug {
         if let Some(value) = ext.and_then(|ext| ext.get("debug")) {
             parsed.metadata.insert("debug".to_string(), value.clone());
         }
@@ -9148,7 +9144,7 @@ set = { networkId = 42 }
         let profile = planned_prebid_profile(true);
         let error = futures::executor::block_on(parse_planned_prebid_response(
             "pbs-instance",
-            &profile,
+            profile.debug,
             &planned_prebid_input(&["fictional-slot"]),
             prebid_platform_response(
                 StatusCode::BAD_GATEWAY,
@@ -9168,7 +9164,7 @@ set = { networkId = 42 }
 
         let no_content = futures::executor::block_on(parse_planned_prebid_response(
             "pbs-instance",
-            &profile,
+            profile.debug,
             &planned_prebid_input(&["fictional-slot"]),
             prebid_platform_response(StatusCode::NO_CONTENT, None, Vec::new()),
             7,
@@ -9248,7 +9244,7 @@ set = { networkId = 42 }
             }
             let parsed = futures::executor::block_on(parse_planned_prebid_response(
                 "pbs-instance",
-                &profile,
+                profile.debug,
                 &input,
                 prebid_platform_response(
                     StatusCode::OK,
@@ -9301,7 +9297,7 @@ set = { networkId = 42 }
         let profile = planned_prebid_profile(false);
         let mut parsed = futures::executor::block_on(parse_planned_prebid_response(
             "pbs-instance",
-            &profile,
+            profile.debug,
             &planned_prebid_input(&["literal", "missing", "non-string"]),
             prebid_platform_response(
                 StatusCode::OK,
@@ -9347,7 +9343,7 @@ set = { networkId = 42 }
         let input = planned_prebid_input(&["requested"]);
         let parsed = futures::executor::block_on(parse_planned_prebid_response(
             "pbs-instance",
-            &profile,
+            profile.debug,
             &input,
             prebid_platform_response(
                 StatusCode::OK,
@@ -9393,7 +9389,7 @@ set = { networkId = 42 }
         let input = planned_prebid_input(&["requested"]);
         let inferred = futures::executor::block_on(parse_planned_prebid_response(
             "pbs-instance",
-            &profile,
+            profile.debug,
             &input,
             prebid_platform_response(
                 StatusCode::OK,
@@ -9433,7 +9429,7 @@ set = { networkId = 42 }
         let input = planned_prebid_input_with_formats(&["requested"], &formats);
         let ambiguous = futures::executor::block_on(parse_planned_prebid_response(
             "pbs-instance",
-            &profile,
+            profile.debug,
             &input,
             prebid_platform_response(
                 StatusCode::OK,
@@ -9487,7 +9483,7 @@ set = { networkId = 42 }
         ] {
             let parsed = futures::executor::block_on(parse_planned_prebid_response(
                 "pbs-instance",
-                &debug_profile,
+                debug_profile.debug,
                 &planned_prebid_input(&["fictional-slot"]),
                 prebid_platform_response(StatusCode::BAD_REQUEST, content_type, body.to_vec()),
                 42,
@@ -9507,7 +9503,7 @@ set = { networkId = 42 }
         let no_debug = planned_prebid_profile(false);
         let parsed = futures::executor::block_on(parse_planned_prebid_response(
             "pbs-instance",
-            &no_debug,
+            no_debug.debug,
             &planned_prebid_input(&["fictional-slot"]),
             prebid_platform_response(
                 StatusCode::BAD_REQUEST,
@@ -9546,7 +9542,7 @@ set = { networkId = 42 }
             assert!(
                 futures::executor::block_on(parse_planned_prebid_response(
                     "pbs-instance",
-                    &profile,
+                    profile.debug,
                     &planned_prebid_input(&["fictional-slot"]),
                     response,
                     42,
@@ -9575,7 +9571,7 @@ set = { networkId = 42 }
             let expected_status = response.response.status().as_u16();
             let parsed = futures::executor::block_on(parse_planned_prebid_response(
                 "pbs-instance",
-                &profile,
+                profile.debug,
                 &planned_prebid_input(&["fictional-slot"]),
                 response,
                 42,
@@ -9908,7 +9904,7 @@ set = { networkId = 42 }
             .expect("should build outbound request");
 
         apply_prebid_transport_headers(
-            routed.prebid_transport_headers(),
+            routed.transport_headers(),
             &mut outbound,
             ConsentForwardingMode::OpenrtbOnly,
             routed.attested_client_ip(),

@@ -13,8 +13,10 @@ use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
-    UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_body_bounded, collect_response_bounded,
+    IntegrationAttributeRewriter, IntegrationDeclaration, IntegrationEndpoint, IntegrationProxy,
+    IntegrationRegistration, ScriptSourceAction, ScriptSourceClaim, ScriptSourceContext,
+    ScriptSourceTransition, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_body_bounded,
+    collect_response_bounded,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{ProxyRequestConfig, proxy_request};
@@ -81,13 +83,90 @@ struct TestlightResponseBody {
     fields: Map<String, Value>,
 }
 
+struct TestlightSourceRule {
+    rewrite: bool,
+    shim_src: String,
+}
+
+impl From<&TestlightConfig> for TestlightSourceRule {
+    fn from(config: &TestlightConfig) -> Self {
+        Self {
+            rewrite: config.rewrite_scripts,
+            shim_src: config.shim_src.clone(),
+        }
+    }
+}
+
+impl ScriptSourceTransition for TestlightSourceRule {
+    fn apply_script_source(&self, context: &ScriptSourceContext<'_>) -> ScriptSourceAction {
+        if self.rewrite
+            && super::script_url::http_source_url(context).is_some_and(|url| {
+                url.path()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case("testlight.js")
+            })
+        {
+            ScriptSourceAction::Replace(self.shim_src.clone())
+        } else {
+            ScriptSourceAction::Unchanged
+        }
+    }
+}
+
+fn source_routes() -> Vec<IntegrationEndpoint> {
+    vec![IntegrationEndpoint::post("/integrations/testlight/auction")]
+}
+
+/// Declare Testlight source capabilities without constructing a client.
+///
+/// # Errors
+///
+/// Returns a non-disclosing error for invalid active configuration.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use trusted_server_core::integrations::testlight::{declare, TestlightConfig};
+/// # fn declaration(config: &TestlightConfig) {
+/// let declaration = declare(config).expect("should validate source configuration");
+/// # }
+/// ```
+pub fn declare(
+    config: &TestlightConfig,
+) -> Result<Option<IntegrationDeclaration>, Report<TrustedServerError>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    config.validate().map_err(|_| {
+        Report::new(TrustedServerError::Configuration {
+            message: "Invalid testlight source declaration".to_owned(),
+        })
+    })?;
+    let mut declaration = IntegrationDeclaration::new(TESTLIGHT_INTEGRATION_ID);
+    declaration.routes = source_routes();
+    declaration.browser_modules.push(TESTLIGHT_INTEGRATION_ID);
+    declaration.script_sources.push(ScriptSourceClaim::new(
+        TESTLIGHT_INTEGRATION_ID,
+        "rewrite_scripts",
+        Arc::new(TestlightSourceRule::from(config)),
+    ));
+    Ok(Some(declaration))
+}
+
 pub struct TestlightIntegration {
     config: TestlightConfig,
+    source_rule: TestlightSourceRule,
 }
 
 impl TestlightIntegration {
     fn new(config: TestlightConfig) -> Arc<Self> {
-        Arc::new(Self { config })
+        let source_rule = TestlightSourceRule::from(&config);
+        Arc::new(Self {
+            config,
+            source_rule,
+        })
     }
 
     fn error(message: impl Into<String>) -> TrustedServerError {
@@ -169,7 +248,7 @@ impl IntegrationProxy for TestlightIntegration {
     }
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![self.post("/auction")]
+        source_routes()
     }
 
     async fn handle(
@@ -246,19 +325,10 @@ impl IntegrationAttributeRewriter for TestlightIntegration {
         attr_value: &str,
         ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
-        if !self.config.rewrite_scripts {
-            return AttributeRewriteAction::keep();
+        if !self.source_rule.rewrite {
+            return AttributeRewriteAction::Keep;
         }
-
-        let Some(url) = super::script_url::parse_script_url(attr_value, ctx) else {
-            return AttributeRewriteAction::keep();
-        };
-        let filename = url.path().rsplit('/').next().unwrap_or("");
-        if filename.eq_ignore_ascii_case("testlight.js") {
-            AttributeRewriteAction::replace(self.config.shim_src.clone())
-        } else {
-            AttributeRewriteAction::keep()
-        }
+        super::script_url::rewrite_source(&self.source_rule, attr_value, ctx)
     }
 }
 
@@ -308,6 +378,13 @@ mod tests {
             rewrite_scripts: true,
         });
         crate::integrations::script_url::tests::assert_ownership("testlight", &*integration);
+        let declaration = declare(&integration.config)
+            .expect("should validate pure source")
+            .expect("should declare enabled owner");
+        crate::integrations::script_url::tests::assert_claim_ownership(
+            "testlight",
+            &declaration.script_sources[0],
+        );
     }
 
     #[test]

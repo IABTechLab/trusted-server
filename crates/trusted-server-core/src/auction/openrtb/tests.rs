@@ -13,7 +13,7 @@ use crate::auction::plan::{
     AuctionPlan, AuctionPlanConfig, BidderId, BidderRouteConfig, NotificationConfig,
     ProviderConfig, ProviderId, RoutingMode,
 };
-use crate::auction::provider::{GenericOpenRtbProvider, ProviderRequestOutcome};
+use crate::auction::provider::GenericOpenRtbProvider;
 use crate::auction::routing::route_auction;
 use crate::auction::test_support::canonical_parity_auction_request;
 use crate::auction::types::{AdFormat, AdSlot, BidStatus, MediaType};
@@ -1532,7 +1532,10 @@ fn prebid_endpoint_normalization_reaches_generic_execution_and_preserves_custom_
                 )
                 .await
                 .expect("should launch one Prebid Server request");
-            let ProviderRequestOutcome::Pending { request, .. } = outcome else {
+            let crate::auction::provider::PlannedProviderRequestOutcome::Pending {
+                request, ..
+            } = outcome
+            else {
                 panic!("should launch a pending Prebid Server request");
             };
             let selected = services

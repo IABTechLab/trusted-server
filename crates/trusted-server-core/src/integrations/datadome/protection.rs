@@ -43,10 +43,7 @@ impl DataDomeIntegration {
     ) -> RequestFilterDecision {
         let test_bypass_matched = self.take_protection_test_bypass_header(input.request);
         if test_bypass_matched {
-            input
-                .request
-                .extensions_mut()
-                .insert(super::DataDomeClientTagSuppressed);
+            super::suppress_client_tag(input.request);
             log_protection_test_bypass(&input);
             return RequestFilterDecision::Continue(RequestFilterEffects::default());
         }
@@ -159,10 +156,7 @@ impl DataDomeIntegration {
                 suppress_client_tag,
             } => {
                 if suppress_client_tag {
-                    input
-                        .request
-                        .extensions_mut()
-                        .insert(super::DataDomeClientTagSuppressed);
+                    super::suppress_client_tag(input.request);
                 }
                 log_protection_skip(input, &rule_id, reason, suppress_client_tag);
                 return false;

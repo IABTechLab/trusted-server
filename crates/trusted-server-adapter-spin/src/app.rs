@@ -671,12 +671,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // OpenRTB metadata that auction signing derives from
                 // `RequestInfo::from_request` uses the trusted runtime authority.
                 let mut req = ctx.into_request();
-                if let Err(error) =
-                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-                        &s.settings,
-                        &mut req,
-                    )
-                {
+                if let Err(error) = trusted_server_core::integrations::prepare_request(
+                    &s.settings,
+                    Some(&s.registry),
+                    &mut req,
+                ) {
                     return Ok(http_error(&error));
                 }
                 // Build the geo-aware EC context so the auction consent gate sees
@@ -704,12 +703,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             async move {
                 let services = s.services_for_request(&ctx);
                 let mut req = ctx.into_request();
-                if let Err(error) =
-                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-                        &s.settings,
-                        &mut req,
-                    )
-                {
+                if let Err(error) = trusted_server_core::integrations::prepare_request(
+                    &s.settings,
+                    Some(&s.registry),
+                    &mut req,
+                ) {
                     return Ok(http_error(&error));
                 }
                 let mut ec_context = build_ec_context(&s.settings, &services, &req);
@@ -802,8 +800,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
-            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+            if let Err(error) = trusted_server_core::integrations::prepare_request(
                 &state.settings,
+                Some(&state.registry),
                 &mut req,
             ) {
                 return Ok(http_error(&error));

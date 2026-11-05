@@ -1211,7 +1211,8 @@ mod tests {
             timeout_ms: 500,
             ..Default::default()
         });
-        let orchestrator = AuctionOrchestrator::from_plan(plan, Some(Arc::new(mediator)));
+        let orchestrator =
+            AuctionOrchestrator::from_legacy_plan_for_test(plan, Some(Arc::new(mediator)));
         let http = Arc::new(StubHttpClient::new());
         http.push_response(204, Vec::new());
         http.push_response(204, Vec::new());

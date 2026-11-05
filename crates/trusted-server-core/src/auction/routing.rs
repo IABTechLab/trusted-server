@@ -9,7 +9,6 @@ use serde_json::Value;
 
 use super::plan::{AuctionPlan, BidderId, ProviderId, RoutingMode};
 use super::types::{AdSlot, AuctionRequest, MediaType};
-use crate::integrations::prebid::PrebidConsentCookies;
 
 const TRUSTED_SERVER_ENVELOPE: &str = "trustedServer";
 const BIDDER_PARAMS_FIELD: &str = "bidderParams";
@@ -19,20 +18,32 @@ const STORED_REQUEST_FIELD: &str = "storedRequest";
 /// Maximum bidder entries admitted from one browser `bidderParams` envelope.
 pub(crate) const MAX_BIDDER_ENTRIES: usize = 128;
 /// Maximum UTF-8 byte length of the optional Prebid zone fact.
-pub(crate) const MAX_PREBID_ZONE_BYTES: usize = 256;
+pub(crate) const MAX_ZONE_BYTES: usize = 256;
 
 /// Immutable provider-local routing output in deterministic provider-ID order.
 #[derive(Debug, Clone)]
-pub(crate) struct RoutedAuction {
+pub struct RoutedAuction {
     inputs: Vec<ProviderAuctionInput>,
     skipped_no_eligible_provider_ids: Vec<ProviderId>,
     diagnostics: RoutingDiagnostics,
-    transport_headers: PrebidTransportHeaders,
+    transport_headers: TransportHeaders,
     attested_client_ip: Option<IpAddr>,
     dnt: Option<bool>,
 }
 
 impl RoutedAuction {
+    #[cfg(test)]
+    pub(crate) fn for_response_test() -> Self {
+        Self {
+            inputs: Vec::new(),
+            skipped_no_eligible_provider_ids: Vec::new(),
+            diagnostics: RoutingDiagnostics::default(),
+            transport_headers: TransportHeaders::default(),
+            attested_client_ip: None,
+            dnt: None,
+        }
+    }
+
     pub(crate) fn inputs(&self) -> &[ProviderAuctionInput] {
         &self.inputs
     }
@@ -48,18 +59,39 @@ impl RoutedAuction {
         self.diagnostics
     }
 
-    /// Request headers approved for later Prebid transport forwarding.
-    pub(crate) fn prebid_transport_headers(&self) -> &PrebidTransportHeaders {
+    /// Borrow exact ingress headers for profile-owned transport policy.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::RoutedAuction;
+    /// fn has_cookie(facts: &RoutedAuction) -> bool { facts.transport_headers().cookie().is_some() }
+    /// ```
+    pub fn transport_headers(&self) -> &TransportHeaders {
         &self.transport_headers
     }
 
-    /// Platform-attested client IP for transport forwarding.
-    pub(crate) fn attested_client_ip(&self) -> Option<IpAddr> {
+    /// Return the platform-attested client IP, never a client-supplied forwarding header.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::RoutedAuction;
+    /// fn client_ip(facts: &RoutedAuction) -> Option<std::net::IpAddr> { facts.attested_client_ip() }
+    /// ```
+    pub fn attested_client_ip(&self) -> Option<IpAddr> {
         self.attested_client_ip
     }
 
-    /// Normalized Do Not Track fact; raw request headers are not exposed to profiles.
-    pub(crate) fn dnt(&self) -> Option<bool> {
+    /// Return the normalized Do Not Track fact.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::RoutedAuction;
+    /// fn dnt(facts: &RoutedAuction) -> Option<bool> { facts.dnt() }
+    /// ```
+    pub fn dnt(&self) -> Option<bool> {
         self.dnt
     }
 }
@@ -123,7 +155,7 @@ impl RoutingDiagnostics {
 
 /// Provider-local immutable auction input.
 #[derive(Debug, Clone)]
-pub(crate) struct ProviderAuctionInput {
+pub struct ProviderAuctionInput {
     provider_id: ProviderId,
     #[cfg_attr(
         not(test),
@@ -138,7 +170,16 @@ pub(crate) struct ProviderAuctionInput {
 }
 
 impl ProviderAuctionInput {
-    pub(crate) fn provider_id(&self) -> &ProviderId {
+    /// Borrow the provider identity stamped by the auction router.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::ProviderAuctionInput;
+    /// fn label(input: &ProviderAuctionInput) -> &str { input.provider_id().as_str() }
+    /// ```
+    #[must_use]
+    pub fn provider_id(&self) -> &ProviderId {
         &self.provider_id
     }
 
@@ -147,17 +188,45 @@ impl ProviderAuctionInput {
         self.timeout_ms
     }
 
-    /// Common privacy-approved request data. Its slot list is always empty.
-    pub(crate) fn common_request(&self) -> &AuctionRequest {
+    /// Borrow common privacy-approved request data. Its slot list is always empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::ProviderAuctionInput;
+    /// fn auction_id(input: &ProviderAuctionInput) -> &str { &input.common_request().id }
+    /// ```
+    #[must_use]
+    pub fn common_request(&self) -> &AuctionRequest {
         &self.common_request
     }
 
-    pub(crate) fn slots(&self) -> &[ProviderSlotInput] {
+    /// Borrow only slots admitted to this provider, in their original order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::ProviderAuctionInput;
+    /// fn impression_count(input: &ProviderAuctionInput) -> usize { input.slots().len() }
+    /// ```
+    #[must_use]
+    pub fn slots(&self) -> &[ProviderSlotInput] {
         &self.slots
     }
 
     /// Clone this input while retaining only slots accepted by `keep`.
-    pub(crate) fn filtered_slots(&self, mut keep: impl FnMut(&ProviderSlotInput) -> bool) -> Self {
+    ///
+    /// All retained request facts and slot order remain unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::ProviderAuctionInput;
+    /// fn sent_slot(input: &ProviderAuctionInput) -> ProviderAuctionInput {
+    ///     input.filtered_slots(|slot| slot.slot().id == "sent-slot")
+    /// }
+    /// ```
+    pub fn filtered_slots(&self, mut keep: impl FnMut(&ProviderSlotInput) -> bool) -> Self {
         let mut filtered = self.clone();
         filtered.slots.retain(|slot| keep(slot));
         filtered
@@ -166,25 +235,51 @@ impl ProviderAuctionInput {
 
 /// One eligible slot with only the demand assigned to this provider.
 #[derive(Debug, Clone)]
-pub(crate) struct ProviderSlotInput {
+pub struct ProviderSlotInput {
     slot: AdSlot,
     bidder_params: BTreeMap<BidderId, Value>,
-    prebid_zone: Option<String>,
+    zone: Option<String>,
     stored_request: StoredRequestIntent,
 }
 
 impl ProviderSlotInput {
-    /// Common slot facts. The legacy `bidders` map is always empty.
-    pub(crate) fn slot(&self) -> &AdSlot {
+    /// Borrow common slot facts. The legacy `bidders` map is always empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::ProviderSlotInput;
+    /// fn impression_id(input: &ProviderSlotInput) -> &str { &input.slot().id }
+    /// ```
+    #[must_use]
+    pub fn slot(&self) -> &AdSlot {
         &self.slot
     }
 
-    pub(crate) fn bidder_params(&self) -> &BTreeMap<BidderId, Value> {
+    /// Borrow bidder parameter objects admitted only to this provider.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::ProviderSlotInput;
+    /// fn bidder_count(input: &ProviderSlotInput) -> usize { input.bidder_params().len() }
+    /// ```
+    #[must_use]
+    pub fn bidder_params(&self) -> &BTreeMap<BidderId, Value> {
         &self.bidder_params
     }
 
-    pub(crate) fn prebid_zone(&self) -> Option<&str> {
-        self.prebid_zone.as_deref()
+    /// Borrow the admitted optional zone fact.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::ProviderSlotInput;
+    /// fn zone(input: &ProviderSlotInput) -> Option<&str> { input.zone() }
+    /// ```
+    #[must_use]
+    pub fn zone(&self) -> Option<&str> {
+        self.zone.as_deref()
     }
 
     #[cfg(test)]
@@ -192,48 +287,85 @@ impl ProviderSlotInput {
         self.bidder_params.is_empty() && self.allows_stored_fallback()
     }
 
-    pub(crate) fn allows_stored_fallback(&self) -> bool {
+    /// Return whether trusted demand permits a stored-request fallback.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::ProviderSlotInput;
+    /// fn use_stored_demand(input: &ProviderSlotInput) -> bool { input.allows_stored_fallback() }
+    /// ```
+    #[must_use]
+    pub fn allows_stored_fallback(&self) -> bool {
         self.stored_request
             .allows_fallback(!self.bidder_params.is_empty())
     }
 }
 
-/// Request headers approved for later Prebid transport forwarding.
+/// Neutral ingress transport snapshot. Only the profile interprets Cookie bytes.
 ///
-/// The inbound `Cookie` header is reduced to [`PrebidConsentCookies`] when the
-/// snapshot is taken, so publisher session and identity cookies are never
-/// retained for the auction. Other captured headers retain their bytes as
-/// [`HeaderValue`] instances. Client-supplied `X-Forwarded-For` is never read.
+/// Captured headers retain their exact bytes. Client-supplied forwarding headers
+/// are never read; client IP comes separately from runtime attestation.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PrebidTransportHeaders {
-    consent_cookies: PrebidConsentCookies,
+pub struct TransportHeaders {
+    cookie: Option<HeaderValue>,
     user_agent: Option<HeaderValue>,
     referer: Option<HeaderValue>,
     accept_language: Option<HeaderValue>,
 }
 
-impl PrebidTransportHeaders {
-    pub(crate) fn consent_cookies(&self) -> &PrebidConsentCookies {
-        &self.consent_cookies
+impl TransportHeaders {
+    /// Borrow raw Cookie bytes for profile-owned interpretation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::TransportHeaders;
+    /// assert!(TransportHeaders::default().cookie().is_none());
+    /// ```
+    pub fn cookie(&self) -> Option<&HeaderValue> {
+        self.cookie.as_ref()
     }
 
-    pub(crate) fn user_agent(&self) -> Option<&HeaderValue> {
+    /// Borrow exact User-Agent bytes without UTF-8 conversion.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::TransportHeaders;
+    /// assert!(TransportHeaders::default().user_agent().is_none());
+    /// ```
+    pub fn user_agent(&self) -> Option<&HeaderValue> {
         self.user_agent.as_ref()
     }
 
-    pub(crate) fn referer(&self) -> Option<&HeaderValue> {
+    /// Borrow exact Referer bytes without UTF-8 conversion.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::TransportHeaders;
+    /// assert!(TransportHeaders::default().referer().is_none());
+    /// ```
+    pub fn referer(&self) -> Option<&HeaderValue> {
         self.referer.as_ref()
     }
 
-    pub(crate) fn accept_language(&self) -> Option<&HeaderValue> {
+    /// Borrow exact Accept-Language bytes without UTF-8 conversion.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::routing::TransportHeaders;
+    /// assert!(TransportHeaders::default().accept_language().is_none());
+    /// ```
+    pub fn accept_language(&self) -> Option<&HeaderValue> {
         self.accept_language.as_ref()
     }
 
     fn snapshot(request: &Request<EdgeBody>) -> Self {
         Self {
-            consent_cookies: PrebidConsentCookies::from_header(
-                request.headers().get(header::COOKIE),
-            ),
+            cookie: request.headers().get(header::COOKIE).cloned(),
             user_agent: request.headers().get(header::USER_AGENT).cloned(),
             referer: request.headers().get(header::REFERER).cloned(),
             accept_language: request.headers().get(header::ACCEPT_LANGUAGE).cloned(),
@@ -291,14 +423,14 @@ impl StoredRequestIntent {
 struct NormalizedSlotDemand {
     bidder_params: BTreeMap<BidderId, Value>,
     stored_request: StoredRequestIntent,
-    prebid_zone: Option<String>,
+    zone: Option<String>,
 }
 
 #[derive(Debug)]
 struct ProviderInputBuilder {
     provider_id: ProviderId,
     timeout_ms: u32,
-    is_prebid: bool,
+    recognizes_stored_requests: bool,
     routing: RoutingMode,
     slots: Vec<ProviderSlotInput>,
 }
@@ -335,7 +467,7 @@ pub(crate) fn route_auction_with_trusted_routes(
 ) -> RoutedAuction {
     let slots = std::mem::take(&mut request.slots);
     let common_request = request;
-    let transport_headers = PrebidTransportHeaders::snapshot(inbound_request);
+    let transport_headers = TransportHeaders::snapshot(inbound_request);
     let dnt = inbound_request
         .headers()
         .get("dnt")
@@ -349,7 +481,10 @@ pub(crate) fn route_auction_with_trusted_routes(
         .map(|provider| ProviderInputBuilder {
             provider_id: provider.id.clone(),
             timeout_ms: provider.timeout_ms,
-            is_prebid: provider.profile.is_prebid_server(),
+            recognizes_stored_requests: provider
+                .profile
+                .routing_policy()
+                .recognizes_stored_requests,
             routing: provider.routing,
             slots: Vec::new(),
         })
@@ -390,7 +525,7 @@ pub(crate) fn route_auction_with_trusted_routes(
             let trusted_route = trusted_provider_indices.contains(&provider_index);
             let include = !bidder_params.is_empty()
                 || trusted_route
-                || if builder.is_prebid {
+                || if builder.recognizes_stored_requests {
                     demand.stored_request.allows_fallback(false)
                 } else {
                     builder.routing == RoutingMode::AllEligible
@@ -401,9 +536,9 @@ pub(crate) fn route_auction_with_trusted_routes(
             builder.slots.push(ProviderSlotInput {
                 slot: common_slot.clone(),
                 bidder_params,
-                prebid_zone: builder
-                    .is_prebid
-                    .then(|| demand.prebid_zone.clone())
+                zone: builder
+                    .recognizes_stored_requests
+                    .then(|| demand.zone.clone())
                     .flatten(),
                 stored_request: demand.stored_request,
             });
@@ -518,9 +653,9 @@ fn normalize_envelope(envelope: &Value) -> Option<NormalizedSlotDemand> {
     }) {
         return None;
     }
-    let prebid_zone = match object.get(ZONE_FIELD) {
+    let zone = match object.get(ZONE_FIELD) {
         None => None,
-        Some(Value::String(zone)) if zone.len() <= MAX_PREBID_ZONE_BYTES => Some(zone.clone()),
+        Some(Value::String(zone)) if zone.len() <= MAX_ZONE_BYTES => Some(zone.clone()),
         Some(_) => return None,
     };
     let params = match object.get(BIDDER_PARAMS_FIELD) {
@@ -538,7 +673,7 @@ fn normalize_envelope(envelope: &Value) -> Option<NormalizedSlotDemand> {
     let Some(params) = params else {
         return Some(NormalizedSlotDemand {
             stored_request,
-            prebid_zone,
+            zone,
             ..Default::default()
         });
     };
@@ -557,7 +692,7 @@ fn normalize_envelope(envelope: &Value) -> Option<NormalizedSlotDemand> {
     Some(NormalizedSlotDemand {
         bidder_params,
         stored_request,
-        prebid_zone,
+        zone,
     })
 }
 
@@ -799,7 +934,7 @@ mod tests {
                     if direct {
                         let slot = &input(&routed, "pbs-a").slots()[0];
                         assert!(!slot.allows_stored_fallback());
-                        assert_eq!(slot.prebid_zone(), None);
+                        assert_eq!(slot.zone(), None);
                         assert_eq!(
                             slot.bidder_params().values().collect::<Vec<_>>(),
                             vec![&json!({"direct":1})]
@@ -926,7 +1061,7 @@ mod tests {
             ("too many bidders", envelope(Some(too_many))),
             (
                 "oversized zone",
-                json!({"bidderParams": {}, "zone": "z".repeat(MAX_PREBID_ZONE_BYTES + 1)}),
+                json!({"bidderParams": {}, "zone": "z".repeat(MAX_ZONE_BYTES + 1)}),
             ),
             ("nonstring zone", json!({"bidderParams": {}, "zone": 1})),
         ];
@@ -1140,20 +1275,20 @@ mod tests {
             aps.bidder_params().is_empty(),
             "APS must receive no foreign params"
         );
-        assert_eq!(aps.prebid_zone(), None, "APS must receive no Prebid zone");
+        assert_eq!(aps.zone(), None, "APS must receive no Prebid zone");
         let pbs_a = &input(&routed, "pbs-a").slots()[0];
         assert_eq!(pbs_a.bidder_params().len(), 1);
         assert!(
             !pbs_a.allows_stored_fallback_without_candidates(),
             "inline params should win for this PBS provider"
         );
-        assert_eq!(pbs_a.prebid_zone(), Some("home"));
+        assert_eq!(pbs_a.zone(), Some("home"));
         let pbs_b = &input(&routed, "pbs-b").slots()[0];
         assert!(pbs_b.bidder_params().is_empty());
         assert!(pbs_b.allows_stored_fallback_without_candidates());
         let direct = &input(&routed, "standard-direct").slots()[0];
         assert_eq!(direct.bidder_params().len(), 1);
-        assert!(direct.prebid_zone().is_none());
+        assert!(direct.zone().is_none());
         for provider in routed.inputs() {
             assert!(provider.common_request().slots.is_empty());
             assert!(provider.slots()[0].slot().bidders.is_empty());
@@ -1343,11 +1478,13 @@ mod tests {
             &plan(),
             Some(attested),
         );
-        let headers = routed.prebid_transport_headers();
+        let headers = routed.transport_headers();
         assert_eq!(
-            headers.consent_cookies().header(),
-            Some(&HeaderValue::from_static("euconsent-v2=TC")),
-            "should retain only consent cookies from the first Cookie header"
+            headers.cookie(),
+            Some(&HeaderValue::from_static(
+                "session_id=example-session; ts-ec=example-ec; euconsent-v2=TC"
+            )),
+            "should retain exact first Cookie header for profile-owned interpretation"
         );
         assert_eq!(
             headers.user_agent().expect("should retain UA").as_bytes(),

@@ -9,7 +9,7 @@ use cookie::{Cookie, CookieJar};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
 use http::header;
-use http::{HeaderMap, Request};
+use http::{HeaderMap, HeaderValue, Request};
 
 use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
 use crate::error::TrustedServerError;
@@ -94,6 +94,34 @@ pub(crate) fn parse_cookie_pairs<'a>(
         log::debug!("Dropped Cookie pairs: {sanitation:?}");
     }
     (retained, sanitation)
+}
+
+/// Sanitize and merge all Cookie fields, removing only exact reserved names.
+///
+/// Retained pairs and sanitation provenance follow the same neutral parsing
+/// rules used by EC and template-cache policy. No cookie values are logged.
+pub(crate) fn sanitize_request_cookies(request: &mut Request<EdgeBody>, reserved_names: &[&str]) {
+    let pairs = cookie_header_pairs(request.headers()).filter(|pair| {
+        let name = pair
+            .split(|byte| *byte == b'=')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii();
+        !reserved_names
+            .iter()
+            .any(|reserved| name == reserved.as_bytes())
+    });
+    let (retained, sanitation) = parse_cookie_pairs(pairs);
+    let retained = retained.join("; ");
+    if sanitation.discarded_textual_pairs() {
+        request.extensions_mut().insert(sanitation);
+    }
+    request.headers_mut().remove(header::COOKIE);
+    if !retained.is_empty() {
+        let value = HeaderValue::from_str(&retained)
+            .expect("should preserve already-valid cookie header values");
+        request.headers_mut().insert(header::COOKIE, value);
+    }
 }
 
 fn is_cookie_name(name: &[u8]) -> bool {

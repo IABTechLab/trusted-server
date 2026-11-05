@@ -340,7 +340,7 @@ fn observations() -> (Vec<Observation>, Vec<u8>) {
         ("diagnostics.html", true, false),
         ("suppressed-datadome.html", false, true),
     ] {
-        let decision = diagnostics.then(|| {
+        let mut decision = diagnostics.then(|| {
             let mut request = Request::builder()
                 .uri("https://edge.example.com/article?ts_console=1&section=example")
                 .header("accept", "text/html")
@@ -352,8 +352,17 @@ fn observations() -> (Vec<Observation>, Vec<u8>) {
                 decision.active(),
                 "should activate diagnostics in its baseline case"
             );
-            decision
+            trusted_server_core::integrations::processing::RequestProcessingState::from(decision)
         });
+        if suppress_datadome {
+            let mut request = Request::new(Body::empty());
+            trusted_server_core::integrations::datadome::suppress_client_tag(&mut request);
+            decision = Some(
+                trusted_server_core::integrations::processing::RequestProcessingState::from_request(
+                    &request,
+                ),
+            );
+        }
         let config = HtmlProcessorConfig::from_settings(
             &settings,
             &registry,
@@ -361,8 +370,7 @@ fn observations() -> (Vec<Observation>, Vec<u8>) {
             "edge.example.com",
             "https",
         )
-        .with_gpt_diagnostics(decision)
-        .with_datadome_client_tag_suppression(suppress_datadome);
+        .with_request_processing(decision);
         let html = create_html_processor(config)
             .process_chunk(DOCUMENT.as_bytes(), true)
             .expect("should finish the baseline document");

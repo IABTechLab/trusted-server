@@ -21,15 +21,15 @@ use crate::auction::openrtb::ignored_bidder_params_count;
 use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
 #[cfg(test)]
 use crate::auction::plan::{AuctionPlanConfig, NotificationConfig, ProviderConfig, RoutingMode};
-use crate::auction::profile::ApsProfilePlan;
+pub(crate) mod profile;
+pub(crate) mod renderer;
+use self::profile::ApsProfilePlan;
 #[cfg(test)]
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::routing::ProviderAuctionInput;
 #[cfg(test)]
 use crate::auction::types::{AdSlot, AuctionContext, AuctionRequest};
-use crate::auction::types::{
-    ApsRendererV1, ApsTagType, AuctionResponse, Bid, BidRenderer, MediaType,
-};
+use crate::auction::types::{AuctionResponse, Bid, BidRenderer, MediaType};
 use crate::error::TrustedServerError;
 use crate::integrations::{
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
@@ -50,6 +50,9 @@ use crate::openrtb::{
 use crate::platform::PlatformHttpRequest;
 use crate::platform::{PlatformResponse, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
+#[cfg(test)]
+use renderer::ApsRendererDescriptor as _;
+pub(crate) use renderer::{ApsRendererV1, ApsTagType};
 
 const APS_INTEGRATION_ID: &str = "aps";
 const APS_RENDERER_ROUTE: &str = "/integrations/aps/renderer";
@@ -615,7 +618,7 @@ fn planned_aps_renderer(
     if serialized.len() > MAX_RENDER_ENVELOPE_BYTES {
         return None;
     }
-    Some(BidRenderer::Aps(ApsRendererV1 {
+    Some(BidRenderer::from(ApsRendererV1 {
         version: 1,
         account_id: policy.account_id.to_string(),
         bid_id: input.bid_id.to_string(),
@@ -1330,7 +1333,7 @@ impl ApsAuctionProvider {
         if serialized.len() > MAX_RENDER_ENVELOPE_BYTES {
             return None;
         }
-        Some(BidRenderer::Aps(ApsRendererV1 {
+        Some(BidRenderer::from(ApsRendererV1 {
             version: 1,
             account_id: self.config.account_id.clone(),
             bid_id: input.bid_id.to_string(),

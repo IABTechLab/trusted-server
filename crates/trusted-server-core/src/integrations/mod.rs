@@ -16,6 +16,7 @@ use crate::settings::Settings;
 pub mod adserver_mock;
 pub mod aps;
 pub mod datadome;
+mod declaration;
 pub mod didomi;
 pub mod google_tag_manager;
 pub mod gpt;
@@ -23,10 +24,18 @@ pub mod gpt_diagnostics;
 pub mod js_asset_proxy;
 pub mod lockr;
 pub mod nextjs;
+pub(crate) mod openrtb;
 pub mod osano;
 pub mod permutive;
 pub mod prebid;
+pub mod processing;
 mod registry;
+pub use declaration::{
+    IntegrationDeclaration, ReservedIntegrationInput, ReservedRouteClaim, ScriptAssetPolicy,
+    ScriptSourceAction, ScriptSourceActionKind, ScriptSourceClaim, ScriptSourceContext,
+    ScriptSourceKind, ScriptSourceOutcome, ScriptSourceStep, ScriptSourceTransition,
+    evaluate_script_sources, validate_integration_declarations, validate_script_asset_policy,
+};
 mod script_url;
 pub mod sourcepoint;
 pub mod testlight;
@@ -41,6 +50,83 @@ pub use registry::{
     ProxyDispatchInput, RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
     RequestFilterRegistryInput, RequestFilterRegistryOutcome, ScriptRewriteAction,
 };
+
+/// Sole schema-one profile catalog until application composition moves owners.
+pub(crate) fn profile_definitions() -> &'static [crate::auction::profile::OpenRtbProfileDefinition]
+{
+    &[
+        openrtb::DEFINITION,
+        prebid::profile::DEFINITION,
+        aps::profile::DEFINITION,
+    ]
+}
+
+/// Normalize reserved ingress inputs before integration request preparation.
+///
+/// Settings-only startup failures retain the same reserved-input handling even
+/// when no executable registry is available. The legacy catalog owns concrete
+/// normalizer selection until the application composition root moves.
+///
+/// # Errors
+///
+/// Returns an integration error when reserved-input normalization or request
+/// preparation fails.
+///
+/// # Examples
+///
+/// ```
+/// use edgezero_core::body::Body;
+/// use error_stack::Report;
+/// use trusted_server_core::{error::TrustedServerError, settings::Settings,
+///     integrations::{prepare_request, processing::RequestProcessingState}};
+/// fn prepare(settings: &Settings, request: &mut http::Request<Body>)
+///     -> Result<RequestProcessingState, Report<TrustedServerError>> {
+///     prepare_request(settings, None, request)
+/// }
+/// ```
+pub fn prepare_request(
+    settings: &Settings,
+    registry: Option<&IntegrationRegistry>,
+    request: &mut http::Request<EdgeBody>,
+) -> Result<processing::RequestProcessingState, Report<TrustedServerError>> {
+    gpt_diagnostics::normalize_reserved_inputs(request)?;
+    if let Some(registry) = registry {
+        registry.prepare_request(settings, request)
+    } else {
+        gpt_diagnostics::prepare_request(settings, request)?;
+        Ok(processing::RequestProcessingState::from_request(request))
+    }
+}
+
+/// Sole schema-one mediator catalog, removed when application composition moves.
+pub(crate) fn mediator_definitions() -> &'static [crate::auction::mediator::MediatorDefinition] {
+    &[adserver_mock::mediator::DEFINITION]
+}
+
+pub(crate) fn compile_legacy_mediator(
+    settings: &Settings,
+    selected: Option<&str>,
+) -> Result<Option<Arc<dyn crate::auction::mediator::CompiledMediator>>, Report<TrustedServerError>>
+{
+    let Some(id) = selected else {
+        return Ok(None);
+    };
+    let definition = mediator_definitions()
+        .iter()
+        .find(|definition| definition.id == id)
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("unknown mediator `{id}`"),
+            })
+        })?;
+    let config = settings.integration_config::<adserver_mock::AdServerMockConfig>(id)?
+        .ok_or_else(|| Report::new(TrustedServerError::Configuration { message: format!("auction mediator `{id}` must reference a separately registered enabled integration with the exact same ID") }))?;
+    let config =
+        serde_json::to_value(config).change_context(TrustedServerError::Configuration {
+            message: "cannot compile mediator configuration".to_string(),
+        })?;
+    (definition.compile)(&config).map(Some)
+}
 
 impl IntegrationRegistry {
     /// Build registrations from the existing catalog around a shared plan.
@@ -76,7 +162,10 @@ impl IntegrationRegistry {
                 registrations.push(registration);
             }
         }
-        Self::from_registrations(settings, plan, registrations)
+        Self::from_registrations(settings, plan, registrations, &[]).map(|registry| {
+            registry
+                .with_reserved_input_normalizers(vec![gpt_diagnostics::normalize_reserved_inputs])
+        })
     }
 }
 
@@ -121,6 +210,7 @@ pub(crate) fn ensure_integration_backend(
 ///
 /// Returns an error when `url` cannot be parsed, is missing a host, or the
 /// backend registration fails.
+#[cfg(test)]
 pub(crate) fn ensure_integration_backend_with_timeout(
     services: &RuntimeServices,
     url: &str,
@@ -150,6 +240,7 @@ pub(crate) fn ensure_integration_backend_with_timeout(
 ///
 /// Returns an error when the URL cannot be parsed, is missing a host, or the
 /// platform backend cannot predict a name for the spec.
+#[cfg(test)]
 pub(crate) fn predict_integration_backend_name(
     services: &RuntimeServices,
     url: &str,
@@ -170,7 +261,26 @@ pub(crate) fn predict_integration_backend_name(
         })
 }
 
-fn integration_backend_spec(
+/// Describe a bounded backend without registering or opening a connection.
+///
+/// `integration` is the stable owner discriminator used for response
+/// correlation. Both transport timers retain the supplied timeout.
+///
+/// # Errors
+///
+/// Returns an integration error if the endpoint is not an absolute URL with a host.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use trusted_server_core::integrations::integration_backend_spec;
+/// let spec = integration_backend_spec("http://mediator.example/mediate", "example-owner",
+///     true, Duration::from_millis(20)).expect("should describe a bounded backend");
+/// assert_eq!(spec.discriminator.as_deref(), Some("example-owner"));
+/// assert_eq!(spec.first_byte_timeout, Duration::from_millis(20));
+/// ```
+pub fn integration_backend_spec(
     url: &str,
     integration: &'static str,
     certificate_check: bool,
@@ -207,7 +317,7 @@ fn integration_backend_spec(
 pub(crate) const INTEGRATION_MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// Maximum response body size from RTB providers (prebid, aps, mediator).
-pub(crate) const UPSTREAM_RTB_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+pub const UPSTREAM_RTB_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum response body size from SDK/proxy integrations.
 pub(crate) const UPSTREAM_SDK_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -279,7 +389,19 @@ pub(crate) async fn collect_body_bounded(
 /// Returns an error when:
 /// - The body exceeds `max_bytes` (mapped to [`TrustedServerError::Integration`]).
 /// - A streaming body chunk cannot be read (same error type).
-pub(crate) async fn collect_response_bounded(
+///
+/// # Examples
+///
+/// ```
+/// use edgezero_core::body::Body;
+/// use error_stack::Report;
+/// use trusted_server_core::{error::TrustedServerError,
+///     integrations::{collect_response_bounded, UPSTREAM_RTB_MAX_RESPONSE_BYTES}};
+/// async fn collect(body: Body) -> Result<Vec<u8>, Report<TrustedServerError>> {
+///     collect_response_bounded(body, UPSTREAM_RTB_MAX_RESPONSE_BYTES, "example-owner").await
+/// }
+/// ```
+pub async fn collect_response_bounded(
     body: EdgeBody,
     max_bytes: usize,
     integration: &'static str,

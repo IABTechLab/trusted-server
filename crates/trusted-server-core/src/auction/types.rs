@@ -182,56 +182,86 @@ pub struct AuctionResponse {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
-/// APS creative tag type accepted by the Trusted Server renderer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ApsTagType {
-    /// APS loads the creative URL in a nested iframe.
-    Iframe,
-    /// APS fetches creative HTML and executes it in its nested renderer frame.
-    Script,
-}
-
-/// Version 1 APS renderer descriptor shared with browser clients.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApsRendererV1 {
-    /// Renderer contract version.
-    pub version: u8,
-    /// APS account identifier used to initialize the fixed runner.
-    pub account_id: String,
-    /// Selected `OpenRTB` bid identifier.
-    pub bid_id: String,
-    /// Optional `OpenRTB` creative identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub creative_id: Option<String>,
-    /// APS creative delivery mode.
-    pub tag_type: ApsTagType,
-    /// HTTPS creative URL consumed by the fixed APS runner.
-    pub creative_url: String,
-    /// Base64-encoded exact one-bid APS response envelope.
-    pub aax_response: String,
-    /// Creative width.
-    pub width: u32,
-    /// Creative height.
-    pub height: u32,
-}
-
-/// Typed browser renderer capability carried by a bid.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum BidRenderer {
-    /// APS renderer version 1.
-    Aps(ApsRendererV1),
+/// Renderer descriptor. Only its registered handler interprets the opaque payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BidRenderer {
+    /// Registered renderer handler identifier.
+    pub renderer_type: String,
+    /// Version and opaque wire fields in handler-supplied order.
+    pub payload: Vec<(String, serde_json::Value)>,
+    /// Trusted handler-supplied targeting ID. Never accepted from wire input.
+    pub targeting_bid_id: Option<String>,
 }
 
 impl BidRenderer {
-    /// Return the APS renderer descriptor when this is an APS renderer.
+    /// Construct a descriptor without interpreting handler-owned fields.
+    ///
+    /// The handler includes its wire version in the opaque payload. Targeting
+    /// metadata is carried separately and omitted from serialization.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::types::BidRenderer;
+    /// let descriptor = BidRenderer::new("example-renderer",
+    ///     vec![("version".to_string(), serde_json::json!(1))], Some("selected-bid".to_string()));
+    /// assert_eq!(descriptor.targeting_bid_id.as_deref(), Some("selected-bid"));
+    /// ```
     #[must_use]
-    pub fn as_aps(&self) -> Option<&ApsRendererV1> {
-        match self {
-            Self::Aps(renderer) => Some(renderer),
+    pub fn new(
+        renderer_type: impl Into<String>,
+        payload: Vec<(String, serde_json::Value)>,
+        targeting_bid_id: Option<String>,
+    ) -> Self {
+        Self {
+            renderer_type: renderer_type.into(),
+            payload,
+            targeting_bid_id,
         }
+    }
+}
+
+impl Serialize for BidRenderer {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serde::Serializer::serialize_map(serializer, Some(self.payload.len() + 1))?;
+        serde::ser::SerializeMap::serialize_entry(&mut map, "type", &self.renderer_type)?;
+        for (key, value) in &self.payload {
+            serde::ser::SerializeMap::serialize_entry(&mut map, key, value)?;
+        }
+        serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> Deserialize<'de> for BidRenderer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DescriptorVisitor;
+        impl<'de> serde::de::Visitor<'de> for DescriptorVisitor {
+            type Value = BidRenderer;
+            fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                formatter.write_str("a tagged renderer descriptor")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut renderer_type = None;
+                let mut payload = Vec::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "type" {
+                        renderer_type = Some(map.next_value::<String>()?);
+                    } else {
+                        payload.push((key, map.next_value()?));
+                    }
+                }
+                Ok(BidRenderer {
+                    renderer_type: renderer_type
+                        .ok_or_else(|| serde::de::Error::missing_field("type"))?,
+                    payload,
+                    targeting_bid_id: None,
+                })
+            }
+        }
+        deserializer.deserialize_map(DescriptorVisitor)
     }
 }
 
@@ -600,13 +630,33 @@ mod tests {
     }
 
     #[test]
+    fn neutral_renderer_preserves_ordered_wire_and_handler_targeting() {
+        let descriptor = BidRenderer::new(
+            "fictional-renderer",
+            vec![
+                ("version".to_string(), json!(1)),
+                ("opaque".to_string(), json!({"notAnApsBidId": "payload"})),
+            ],
+            Some("handler-selected-bid".to_string()),
+        );
+        assert_eq!(
+            descriptor.targeting_bid_id.as_deref(),
+            Some("handler-selected-bid")
+        );
+        assert_eq!(
+            serde_json::to_string(&descriptor).expect("should serialize neutral renderer"),
+            r#"{"type":"fictional-renderer","version":1,"opaque":{"notAnApsBidId":"payload"}}"#
+        );
+    }
+
+    #[test]
     fn aps_renderer_serializes_to_versioned_camel_case_contract() {
-        let renderer = BidRenderer::Aps(ApsRendererV1 {
+        let renderer = BidRenderer::from(crate::integrations::aps::ApsRendererV1 {
             version: 1,
             account_id: "example-account-id".to_string(),
             bid_id: "fictional-bid-id".to_string(),
             creative_id: Some("fictional-creative-id".to_string()),
-            tag_type: ApsTagType::Iframe,
+            tag_type: crate::integrations::aps::ApsTagType::Iframe,
             creative_url: "https://creative.example/render".to_string(),
             aax_response: "base64-data".to_string(),
             width: 300,
@@ -635,12 +685,12 @@ mod tests {
 
     #[test]
     fn aps_renderer_omits_absent_creative_id() {
-        let renderer = BidRenderer::Aps(ApsRendererV1 {
+        let renderer = BidRenderer::from(crate::integrations::aps::ApsRendererV1 {
             version: 1,
             account_id: "example-account-id".to_string(),
             bid_id: "fictional-bid-id".to_string(),
             creative_id: None,
-            tag_type: ApsTagType::Iframe,
+            tag_type: crate::integrations::aps::ApsTagType::Iframe,
             creative_url: "https://creative.example/render".to_string(),
             aax_response: "base64-data".to_string(),
             width: 300,

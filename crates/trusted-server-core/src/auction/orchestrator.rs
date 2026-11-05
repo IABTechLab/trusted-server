@@ -13,10 +13,16 @@ use crate::platform::{PlatformPendingRequest, RuntimeServices};
 
 #[cfg(test)]
 use super::config::AuctionConfig;
+#[cfg(test)]
+use super::mediator::legacy_test_mediator;
+use super::mediator::{CompiledMediator, MediatorRequestOutcome, launch_mediator};
 use super::openrtb::unused_bidder_params_count;
 use super::plan::AuctionPlan;
+#[cfg(test)]
+use super::provider::ProviderRequestOutcome;
 use super::provider::{
-    AuctionProvider, GenericOpenRtbProvider, ProviderParseState, ProviderRequestOutcome,
+    AuctionProvider, BoundProviderResponse, GenericOpenRtbProvider, PlannedProviderRequestOutcome,
+    ProviderParseState,
 };
 #[cfg(test)]
 use super::routing::RoutedAuction;
@@ -331,7 +337,7 @@ pub struct AuctionOrchestrator {
     plan_backed: bool,
     plan: Arc<AuctionPlan>,
     planned_providers: Vec<Arc<GenericOpenRtbProvider>>,
-    mediator: Option<Arc<dyn AuctionProvider>>,
+    mediator: Option<Arc<dyn CompiledMediator>>,
     #[cfg(test)]
     config: AuctionConfig,
     #[cfg(test)]
@@ -343,13 +349,13 @@ pub struct AuctionOrchestrator {
 pub(crate) struct AuctionOrchestratorHarness {
     plan: Arc<AuctionPlan>,
     providers: Vec<Arc<GenericOpenRtbProvider>>,
-    mediator: Option<Arc<dyn AuctionProvider>>,
+    mediator: Option<Arc<dyn CompiledMediator>>,
 }
 
 struct PlannedLaunchState {
     provider: Arc<GenericOpenRtbProvider>,
     started_at: Instant,
-    parse_state: Option<ProviderParseState>,
+    parse_state: Option<Box<BoundProviderResponse>>,
     trace_observation: Option<TraceProviderObservation>,
 }
 
@@ -363,6 +369,7 @@ impl AuctionOrchestratorHarness {
         plan: impl Into<Arc<AuctionPlan>>,
         mediator: Option<Arc<dyn AuctionProvider>>,
     ) -> Self {
+        let mediator = mediator.map(legacy_test_mediator);
         let plan = plan.into();
         let providers = plan
             .providers()
@@ -382,7 +389,7 @@ impl AuctionOrchestratorHarness {
         self.providers.len()
     }
 
-    pub(crate) fn mediator(&self) -> Option<&Arc<dyn AuctionProvider>> {
+    pub(crate) fn mediator(&self) -> Option<&Arc<dyn CompiledMediator>> {
         self.mediator.as_ref()
     }
 
@@ -508,7 +515,7 @@ impl AuctionOrchestratorHarness {
                 )
                 .await
             {
-                Ok(ProviderRequestOutcome::Pending {
+                Ok(PlannedProviderRequestOutcome::Pending {
                     request: launched,
                     parse_state,
                 }) => {
@@ -546,7 +553,7 @@ impl AuctionOrchestratorHarness {
                         }
                     }
                 }
-                Ok(ProviderRequestOutcome::Immediate(response)) => responses.push(response),
+                Ok(PlannedProviderRequestOutcome::Immediate(response)) => responses.push(response),
                 Err(error) => {
                     log::warn!(
                         "Planned provider '{}' failed to launch: {:?}",
@@ -604,7 +611,7 @@ impl AuctionOrchestratorHarness {
                             .parse_response_with_state(
                                 platform_response,
                                 elapsed_ms,
-                                state.parse_state.as_deref(),
+                                state.parse_state,
                             )
                             .await
                         {
@@ -714,21 +721,25 @@ impl AuctionOrchestratorHarness {
                 let mediator_start = Instant::now();
                 let mediator_deadline = collection_deadline(auction_start, context.timeout_ms)
                     .min(collection_deadline(mediator_start, logical_budget_ms));
-                let mediated = match mediator
-                    .request_bids(original_request, &mediator_context)
-                    .await
+                let mediated = match launch_mediator(
+                    mediator.as_ref(),
+                    original_request,
+                    &mediator_context,
+                )
+                .await
                 {
                     Ok(_) if Instant::now() >= mediator_deadline => {
                         log::debug!(
                             "Mediator '{}' exhausted its response budget during launch; using local ranking",
-                            mediator.provider_name()
+                            mediator.id()
                         );
                         None
                     }
-                    Ok(ProviderRequestOutcome::Immediate(response)) => Some(response),
-                    Ok(ProviderRequestOutcome::Pending {
+                    #[cfg(test)]
+                    Ok(MediatorRequestOutcome::Immediate(response)) => Some(response),
+                    Ok(MediatorRequestOutcome::Pending {
                         request: pending,
-                        parse_state,
+                        parser,
                     }) => match context
                         .services
                         .http_client()
@@ -740,24 +751,18 @@ impl AuctionOrchestratorHarness {
                             if Instant::now() >= mediator_deadline {
                                 log::debug!(
                                     "Planned mediator '{}' completed after its response deadline; using local ranking ({}ms)",
-                                    mediator.provider_name(),
+                                    mediator.id(),
                                     response_time_ms
                                 );
                                 None
                             } else {
-                                mediator
-                                    .parse_response_with_context_and_state(
-                                        platform_response,
-                                        response_time_ms,
-                                        original_request,
-                                        &mediator_context,
-                                        parse_state.as_deref(),
-                                    )
+                                parser
+                                    .parse(platform_response, response_time_ms)
                                     .await
                                     .map_err(|error| {
                                         log::warn!(
                                             "Planned mediator '{}' parse failed: {:?}",
-                                            mediator.provider_name(),
+                                            mediator.id(),
                                             error
                                         );
                                     })
@@ -771,12 +776,12 @@ impl AuctionOrchestratorHarness {
                             ) {
                                 log::debug!(
                                     "Planned mediator '{}' exhausted its response budget; using local ranking",
-                                    mediator.provider_name()
+                                    mediator.id()
                                 );
                             } else {
                                 log::warn!(
                                     "Planned mediator '{}' request failed: {:?}",
-                                    mediator.provider_name(),
+                                    mediator.id(),
                                     error
                                 );
                             }
@@ -786,7 +791,7 @@ impl AuctionOrchestratorHarness {
                     Err(error) => {
                         log::warn!(
                             "Planned mediator '{}' failed to launch: {:?}",
-                            mediator.provider_name(),
+                            mediator.id(),
                             error
                         );
                         None
@@ -846,9 +851,31 @@ impl AuctionOrchestrator {
         }
     }
 
-    /// Create the live orchestrator from one shared compiled auction plan.
+    /// Adapt legacy orchestration test doubles until their neutral migration.
     #[must_use]
-    pub fn from_plan(plan: Arc<AuctionPlan>, mediator: Option<Arc<dyn AuctionProvider>>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_legacy_plan_for_test(
+        plan: Arc<AuctionPlan>,
+        mediator: Option<Arc<dyn AuctionProvider>>,
+    ) -> Self {
+        Self::from_plan(plan, mediator.map(legacy_test_mediator))
+    }
+
+    /// Create the live orchestrator from one shared plan and compiled mediator.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use trusted_server_core::auction::{AuctionOrchestrator, plan::{AuctionPlan, AuctionPlanConfig}};
+    /// let plan = AuctionPlan::compile_ordered(
+    ///     AuctionPlanConfig { timeout_ms: 100, ..AuctionPlanConfig::default() }, Vec::new(), &[], &[])
+    ///     .expect("should compile an empty plan");
+    /// let orchestrator = AuctionOrchestrator::from_plan(Arc::new(plan), None);
+    /// assert_eq!(orchestrator.provider_count(), 0);
+    /// ```
+    #[must_use]
+    pub fn from_plan(plan: Arc<AuctionPlan>, mediator: Option<Arc<dyn CompiledMediator>>) -> Self {
         let planned_providers = plan
             .providers()
             .iter()
@@ -1854,7 +1881,7 @@ impl AuctionOrchestrator {
                 )
                 .await
             {
-                Ok(ProviderRequestOutcome::Pending {
+                Ok(PlannedProviderRequestOutcome::Pending {
                     request: pending,
                     parse_state,
                 }) => {
@@ -1891,7 +1918,7 @@ impl AuctionOrchestrator {
                         }
                     }
                 }
-                Ok(ProviderRequestOutcome::Immediate(response)) => {
+                Ok(PlannedProviderRequestOutcome::Immediate(response)) => {
                     if let (Some(trace), Some(observation)) = (&trace, trace_observation) {
                         trace.observe_response(observation, &response);
                     }
@@ -2380,7 +2407,7 @@ impl AuctionOrchestrator {
                             .parse_response_with_state(
                                 platform_response,
                                 response_time_ms,
-                                state.parse_state.as_deref(),
+                                state.parse_state,
                             )
                             .await
                         {
@@ -2505,12 +2532,15 @@ impl AuctionOrchestrator {
         #[cfg(not(test))]
         let mediator = self.mediator.as_ref();
         #[cfg(test)]
-        let mediator = self.mediator.as_ref().or_else(|| {
-            self.config
-                .mediator
-                .as_ref()
-                .and_then(|name| self.providers.get(name))
-        });
+        let legacy_mediator = self
+            .config
+            .mediator
+            .as_ref()
+            .and_then(|name| self.providers.get(name))
+            .cloned()
+            .map(legacy_test_mediator);
+        #[cfg(test)]
+        let mediator = self.mediator.as_ref().or(legacy_mediator.as_ref());
         let (mediator_response, winning_bids) = if let Some(mediator) = mediator {
             {
                 // Cap the mediator at whichever is tighter: its own configured
@@ -2528,7 +2558,7 @@ impl AuctionOrchestrator {
                     }
                     log::warn!(
                         "A_deadline exhausted before mediator '{}' — returning {} SSP bids without mediation",
-                        mediator.provider_name(),
+                        mediator.id(),
                         responses.len(),
                     );
                     let winning = self.select_winning_bids(&responses, &floor_prices);
@@ -2549,7 +2579,7 @@ impl AuctionOrchestrator {
                     }
                     log::warn!(
                         "Mediator '{}' transport budget canonicalized to zero — returning {} SSP bids without mediation",
-                        mediator.provider_name(),
+                        mediator.id(),
                         responses.len(),
                     );
                     let winning = self.select_winning_bids(&responses, &floor_prices);
@@ -2565,7 +2595,7 @@ impl AuctionOrchestrator {
                 // This logs a configured mediator identifier and timeout values, not request data or secrets.
                 log::info!(
                     "Running mediator '{}' with {}ms logical budget and {}ms transport timeout (A_deadline remaining: {}ms, configured: {}ms)",
-                    mediator.provider_name(),
+                    mediator.id(),
                     logical_budget_ms,
                     transport_timeout_ms,
                     remaining,
@@ -2594,27 +2624,31 @@ impl AuctionOrchestrator {
                 let mut trace_observation = trace
                     .as_ref()
                     .map(|trace| trace.launch_provider(TraceProviderRole::Mediator));
-                let mediator_response = match mediator
-                    .request_bids(&request, &mediator_context)
-                    .await
+                let mediator_response = match launch_mediator(
+                    mediator.as_ref(),
+                    &request,
+                    &mediator_context,
+                )
+                .await
                 {
                     Ok(_) if Instant::now() >= mediator_deadline => {
                         log::debug!(
                             "Mediator '{}' exhausted its response budget during launch; using local ranking",
-                            mediator.provider_name()
+                            mediator.id()
                         );
                         None
                     }
-                    Ok(ProviderRequestOutcome::Immediate(response)) => {
+                    #[cfg(test)]
+                    Ok(MediatorRequestOutcome::Immediate(response)) => {
                         if let (Some(trace), Some(observation)) = (&trace, trace_observation.take())
                         {
                             trace.observe_response(observation, &response);
                         }
                         Some(response)
                     }
-                    Ok(ProviderRequestOutcome::Pending {
+                    Ok(MediatorRequestOutcome::Pending {
                         request: pending,
-                        parse_state,
+                        parser,
                     }) => match services
                         .http_client()
                         .wait_until(pending, mediator_deadline)
@@ -2625,21 +2659,12 @@ impl AuctionOrchestrator {
                             if Instant::now() >= mediator_deadline {
                                 log::debug!(
                                     "Mediator '{}' completed after its response deadline; using local ranking ({}ms)",
-                                    mediator.provider_name(),
+                                    mediator.id(),
                                     response_time_ms
                                 );
                                 None
                             } else {
-                                match mediator
-                                    .parse_response_with_context_and_state(
-                                        platform_resp,
-                                        response_time_ms,
-                                        &request,
-                                        &mediator_context,
-                                        parse_state.as_deref(),
-                                    )
-                                    .await
-                                {
+                                match parser.parse(platform_resp, response_time_ms).await {
                                     Ok(response) => {
                                         if let (Some(trace), Some(observation)) =
                                             (&trace, trace_observation.take())
@@ -2651,7 +2676,7 @@ impl AuctionOrchestrator {
                                     Err(error) => {
                                         log::warn!(
                                             "Mediator '{}' parse failed: {:?}",
-                                            mediator.provider_name(),
+                                            mediator.id(),
                                             error
                                         );
                                         None
@@ -2666,7 +2691,7 @@ impl AuctionOrchestrator {
                             ) {
                                 log::debug!(
                                     "Mediator '{}' exhausted its response budget; using local ranking",
-                                    mediator.provider_name()
+                                    mediator.id()
                                 );
                             } else {
                                 log::warn!("Mediator request failed: {:?}", error);
@@ -2677,7 +2702,7 @@ impl AuctionOrchestrator {
                     Err(error) => {
                         log::warn!(
                             "Mediator '{}' failed to dispatch: {:?}",
-                            mediator.provider_name(),
+                            mediator.id(),
                             error
                         );
                         None
@@ -2773,6 +2798,8 @@ impl OrchestrationResult {
 
 #[cfg(test)]
 mod tests {
+    use crate::integrations::aps::renderer::ApsRendererDescriptor;
+    use crate::integrations::aps::{ApsRendererV1, ApsTagType};
     use std::str::FromStr as _;
     use std::time::Duration;
 
@@ -2793,8 +2820,8 @@ mod tests {
     };
     use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, ApsRendererV1, ApsTagType, AuctionContext, AuctionRequest,
-        AuctionResponse, Bid, BidRenderer, BidStatus, MediaType, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionContext, AuctionRequest, AuctionResponse, Bid, BidRenderer,
+        BidStatus, MediaType, PublisherInfo, UserInfo,
     };
     use crate::error::TrustedServerError;
     use crate::integrations::adserver_mock::{AdServerMockConfig, AdServerMockProvider};
@@ -2984,7 +3011,7 @@ mod tests {
                 AuctionPlan::compile(planned_config(&[], false))
                     .expect("should compile an empty plan"),
             );
-            let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+            let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(plan, None);
             let http = Arc::new(StubHttpClient::new());
             let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
             let settings = create_test_settings();
@@ -3050,7 +3077,7 @@ mod tests {
                 ))
                 .expect("should compile the launch-failure plan"),
             );
-            let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+            let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(plan, None);
             let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
             backend.fail_ensure_for("launch-fail");
             let http = Arc::new(StubHttpClient::new());
@@ -3112,7 +3139,7 @@ mod tests {
                 ))
                 .expect("should compile the ordered plan"),
             );
-            let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+            let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(plan, None);
             let request = planned_request();
             let settings = create_test_settings();
             let (inbound, carry) = captured_request(&request);
@@ -3167,8 +3194,10 @@ mod tests {
                 ))
                 .expect("should compile bidder plan"),
             );
-            let orchestrator =
-                AuctionOrchestrator::from_plan(plan, Some(Arc::new(ImmediateNoBidProvider)));
+            let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(
+                plan,
+                Some(Arc::new(ImmediateNoBidProvider)),
+            );
             let request = planned_request();
             let settings = create_test_settings();
             let (inbound, carry) = captured_request(&request);
@@ -3241,8 +3270,10 @@ mod tests {
                 ))
                 .expect("should compile the bidder plan"),
             );
-            let orchestrator =
-                AuctionOrchestrator::from_plan(plan, Some(Arc::new(NeverFinishesMediator)));
+            let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(
+                plan,
+                Some(Arc::new(NeverFinishesMediator)),
+            );
             let request = planned_request();
             let settings = create_test_settings();
             let (inbound, carry) = captured_request(&request);
@@ -3298,8 +3329,10 @@ mod tests {
                 ))
                 .expect("should compile the bidder plan"),
             );
-            let orchestrator =
-                AuctionOrchestrator::from_plan(plan, Some(Arc::new(LaunchFailingProvider)));
+            let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(
+                plan,
+                Some(Arc::new(LaunchFailingProvider)),
+            );
             let request = planned_request();
             let settings = create_test_settings();
             let (inbound, carry) = captured_request(&request);
@@ -3347,8 +3380,10 @@ mod tests {
                 ))
                 .expect("should compile the bidder plan"),
             );
-            let orchestrator =
-                AuctionOrchestrator::from_plan(plan, Some(Arc::new(NeverFinishesMediator)));
+            let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(
+                plan,
+                Some(Arc::new(NeverFinishesMediator)),
+            );
             let request = planned_request();
             let settings = create_test_settings();
             let (inbound, carry) = captured_request(&request);
@@ -3388,7 +3423,7 @@ mod tests {
             .expect("should compile plan")
             .with_enabled(false),
         );
-        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(plan, None);
         let http = Arc::new(StubHttpClient::new());
         let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
         let settings = create_test_settings();
@@ -3421,7 +3456,7 @@ mod tests {
         let plan = Arc::new(
             AuctionPlan::compile(planned_config(&[], false)).expect("should compile empty plan"),
         );
-        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(plan, None);
         let http = Arc::new(StubHttpClient::new());
         let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
         let settings = create_test_settings();
@@ -3458,7 +3493,7 @@ mod tests {
             ))
             .expect("should compile launch-failure plan"),
         );
-        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(plan, None);
         let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
         backend.fail_ensure_for("launch-fail");
         let http = Arc::new(StubHttpClient::new());
@@ -3529,7 +3564,7 @@ mod tests {
             ))
             .expect("should compile mixed-outcome plan"),
         );
-        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(plan, None);
         let backend = Arc::new(FailThenZeroCanonicalBackend::new());
         let http = Arc::new(StubHttpClient::new());
         let services = build_services_with_backend_and_http_client(
@@ -3589,7 +3624,7 @@ mod tests {
                 AuctionPlan::compile(planned_config(&[("skipped", RoutingMode::Explicit)], false))
                     .expect("should compile all-skipped plan"),
             );
-            let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+            let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(plan, None);
             let http = Arc::new(StubHttpClient::new());
             let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
             let settings = create_test_settings();
@@ -4477,7 +4512,7 @@ mod tests {
 
     fn auction_bid(bidder: &str, price: f64) -> Bid {
         let renderer = (bidder == "aps").then(|| {
-            BidRenderer::Aps(ApsRendererV1 {
+            BidRenderer::from(ApsRendererV1 {
                 version: 1,
                 account_id: "example-account".to_string(),
                 bid_id: "aps-selected-bid".to_string(),
@@ -5985,7 +6020,7 @@ mod tests {
             })
             .expect("should compile mediator-only plan")
             .with_enabled(true);
-            let orchestrator = AuctionOrchestrator::from_plan(
+            let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(
                 Arc::new(plan),
                 Some(Arc::new(DeadlineRecordingMediator {
                     launches: Arc::clone(&launches),
@@ -6256,7 +6291,7 @@ mod tests {
             ))
             .expect("should compile planned auction"),
         );
-        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(plan, None);
         let request = planned_request();
         let settings = create_test_settings();
         let inbound = http::Request::builder()
@@ -6305,7 +6340,7 @@ mod tests {
             ))
             .expect("should compile planned auction"),
         );
-        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(plan, None);
         let request = planned_request();
         let settings = create_test_settings();
         let inbound = http::Request::new(edgezero_core::body::Body::empty());
@@ -6579,7 +6614,7 @@ mod tests {
                 },
             );
             let plan = Arc::new(AuctionPlan::compile(config).expect("should compile plan"));
-            let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+            let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(plan, None);
             let mut request = planned_request();
             request.slots[0].bidders.insert(
                 "routed-bidder".to_string(),
@@ -6723,7 +6758,7 @@ mod tests {
                 false,
             ))
             .expect("should compile two providers");
-            let orchestrator = AuctionOrchestrator::from_plan(Arc::new(plan), None);
+            let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(Arc::new(plan), None);
             let request = planned_request();
             let settings = create_test_settings();
             let inbound = http::Request::new(edgezero_core::body::Body::empty());
@@ -6820,7 +6855,8 @@ mod tests {
             launches: Arc::clone(&launches),
             budgets: None,
         });
-        let orchestrator = AuctionOrchestrator::from_plan(Arc::new(plan), Some(mediator));
+        let orchestrator =
+            AuctionOrchestrator::from_legacy_plan_for_test(Arc::new(plan), Some(mediator));
         let request = planned_request();
         let settings = create_test_settings();
         let inbound = http::Request::new(edgezero_core::body::Body::empty());
@@ -6893,7 +6929,7 @@ mod tests {
             false,
         ))
         .expect("should compile provider");
-        let orchestrator = AuctionOrchestrator::from_plan(Arc::new(plan), None);
+        let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(Arc::new(plan), None);
         let request = planned_request();
         let settings = create_test_settings();
         let inbound = http::Request::new(edgezero_core::body::Body::empty());
@@ -6954,7 +6990,7 @@ mod tests {
             false,
         ))
         .expect("should compile planned auction");
-        let orchestrator = AuctionOrchestrator::from_plan(
+        let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(
             Arc::new(plan),
             Some(Arc::new(PendingDeadlineMediator(mediator_timeout_ms))),
         );
@@ -7057,7 +7093,10 @@ mod tests {
                             false,
                         ))
                         .expect("should compile planned auction");
-                        AuctionOrchestrator::from_plan(Arc::new(plan), Some(mediator))
+                        AuctionOrchestrator::from_legacy_plan_for_test(
+                            Arc::new(plan),
+                            Some(mediator),
+                        )
                     } else {
                         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
                             enabled: true,
@@ -8251,7 +8290,7 @@ mod tests {
         let renderer = bid
             .renderer
             .as_ref()
-            .and_then(BidRenderer::as_aps)
+            .and_then(ApsRendererDescriptor::as_aps)
             .expect("should construct typed APS renderer");
         assert_eq!(renderer.account_id, "example-account");
         let decoded = base64::engine::general_purpose::STANDARD
@@ -8393,7 +8432,7 @@ mod tests {
             (serde_json::json!(""), None),
             (serde_json::json!("exact-seat"), Some("exact-seat")),
         ] {
-            let state = provider.parse_state_for_test(routed.inputs()[0].clone());
+            let state = provider.parse_state_for_test(&routed.inputs()[0]);
             let response = PlatformResponse::new(
                 edgezero_core::http::response_builder()
                     .status(200)
@@ -8408,7 +8447,7 @@ mod tests {
                     .expect("should build seat identity response"),
             );
             let parsed = provider
-                .parse_response_with_state(response, 4, Some(state.as_ref()))
+                .parse_response_with_state(response, 4, Some(state))
                 .await
                 .expect("should parse seat identity response");
             assert_eq!(parsed.bids[0].returned_seat.as_deref(), expected);
@@ -8459,7 +8498,7 @@ mod tests {
             ),
         ];
         for (status, body, expected, reason, error_type) in cases {
-            let state = provider.parse_state_for_test(routed.inputs()[0].clone());
+            let state = provider.parse_state_for_test(&routed.inputs()[0]);
             let response = PlatformResponse::new(
                 edgezero_core::http::response_builder()
                     .status(status)
@@ -8467,7 +8506,7 @@ mod tests {
                     .expect("should build APS matrix response"),
             );
             let parsed = provider
-                .parse_response_with_state(response, 4, Some(state.as_ref()))
+                .parse_response_with_state(response, 4, Some(state))
                 .await
                 .expect("should classify APS matrix response");
             assert_eq!(parsed.status, expected, "status {status}");
@@ -8525,7 +8564,7 @@ mod tests {
                 None,
             );
             let provider = GenericOpenRtbProvider::new(plan.providers()[0].clone());
-            let state = provider.parse_state_for_test(routed.inputs()[0].clone());
+            let state = provider.parse_state_for_test(&routed.inputs()[0]);
             let response = PlatformResponse::new(
                 edgezero_core::http::response_builder()
                     .status(status)
@@ -8533,7 +8572,7 @@ mod tests {
                     .expect("should build provider matrix response"),
             );
             let parsed = provider
-                .parse_response_with_state(response, 4, Some(state.as_ref()))
+                .parse_response_with_state(response, 4, Some(state))
                 .await
                 .expect("should classify provider matrix response");
             assert_eq!(parsed.status, expected, "status {status}");
@@ -8574,7 +8613,7 @@ mod tests {
             None,
         );
         let provider = GenericOpenRtbProvider::new(plan.providers()[0].clone());
-        let state = provider.parse_state_for_test(routed.inputs()[0].clone());
+        let state = provider.parse_state_for_test(&routed.inputs()[0]);
         let response = PlatformResponse::new(
             edgezero_core::http::response_builder()
                 .status(200)
@@ -8594,7 +8633,7 @@ mod tests {
         );
 
         let parsed = provider
-            .parse_response_with_state(response, 3, Some(state.as_ref()))
+            .parse_response_with_state(response, 3, Some(state))
             .await
             .expect("should parse APS renderer fixture response");
 
@@ -8606,7 +8645,7 @@ mod tests {
         let renderer = parsed.bids[0]
             .renderer
             .as_ref()
-            .and_then(BidRenderer::as_aps)
+            .and_then(ApsRendererDescriptor::as_aps)
             .expect("should construct APS renderer");
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(&renderer.aax_response)
@@ -8637,7 +8676,7 @@ mod tests {
             None,
         );
         let provider = GenericOpenRtbProvider::new(plan.providers()[0].clone());
-        let state = provider.parse_state_for_test(routed.inputs()[0].clone());
+        let state = provider.parse_state_for_test(&routed.inputs()[0]);
         let response = PlatformResponse::new(
             edgezero_core::http::response_builder()
                 .status(200)
@@ -8648,7 +8687,7 @@ mod tests {
         );
 
         let parsed = provider
-            .parse_response_with_state(response, 3, Some(state.as_ref()))
+            .parse_response_with_state(response, 3, Some(state))
             .await
             .expect("should parse debug APS response");
 
@@ -8955,7 +8994,7 @@ mod tests {
         );
         let provider_a = GenericOpenRtbProvider::new(plan.providers()[0].clone());
         let provider_b = GenericOpenRtbProvider::new(plan.providers()[1].clone());
-        let parse_state = provider_a.parse_state_for_test(routed.inputs()[0].clone());
+        let parse_state = provider_a.parse_state_for_test(&routed.inputs()[0]);
         let response = PlatformResponse::new(
             edgezero_core::http::response_builder()
                 .status(204)
@@ -8964,7 +9003,7 @@ mod tests {
         );
 
         let error = provider_b
-            .parse_response_with_state(response, 1, Some(parse_state.as_ref()))
+            .parse_response_with_state(response, 1, Some(parse_state))
             .await
             .expect_err("should reject another provider's parse state");
 
@@ -8997,7 +9036,7 @@ mod tests {
         );
         let provider_a = GenericOpenRtbProvider::new(plan.providers()[0].clone());
         let provider_b = GenericOpenRtbProvider::new(plan.providers()[1].clone());
-        let parse_state = provider_a.parse_state_for_test(routed.inputs()[0].clone());
+        let parse_state = provider_a.parse_state_for_test(&routed.inputs()[0]);
         let response = PlatformResponse::new(
             edgezero_core::http::response_builder()
                 .status(200)
@@ -9006,7 +9045,7 @@ mod tests {
         );
 
         let error = provider_b
-            .parse_response_with_state(response, 1, Some(parse_state.as_ref()))
+            .parse_response_with_state(response, 1, Some(parse_state))
             .await
             .expect_err("should reject another PBS provider's parse state");
 
@@ -9090,7 +9129,8 @@ mod tests {
                 &mediator_predicted,
                 &mediator_requested,
             ));
-            let orchestrator = AuctionOrchestrator::from_plan(Arc::new(plan), Some(mediator));
+            let orchestrator =
+                AuctionOrchestrator::from_legacy_plan_for_test(Arc::new(plan), Some(mediator));
             let request = planned_request();
             let settings = create_test_settings();
             let inbound = http::Request::new(edgezero_core::body::Body::empty());
@@ -9495,7 +9535,7 @@ mod tests {
                 },
             );
             let plan = Arc::new(AuctionPlan::compile(config).expect("should compile signed plan"));
-            let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+            let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(plan, None);
             let mut request = planned_request();
             request.slots[0].bidders.insert(
                 "unroutable-private-id".to_string(),
@@ -9634,7 +9674,7 @@ mod tests {
             .expect("should compile signed plan"),
         );
         let mediator_launches = Arc::new(AtomicUsize::new(0));
-        let orchestrator = AuctionOrchestrator::from_plan(
+        let orchestrator = AuctionOrchestrator::from_legacy_plan_for_test(
             plan,
             Some(Arc::new(DeadlineRecordingMediator {
                 launches: Arc::clone(&mediator_launches),

@@ -4,6 +4,9 @@
 //! This integration acts as a mediator in the auction flow, selecting winning bids
 //! based on price (highest price wins).
 
+pub(crate) mod mediator;
+
+#[cfg(test)]
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
@@ -11,27 +14,36 @@ use http::{Method, header};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
 use validator::Validate;
 
 use crate::auction::context::{ContextQueryParams, build_url_with_context_params};
+#[cfg(test)]
+use crate::auction::openrtb::build_bid_dimension_index_from_slots;
 use crate::auction::openrtb::{
-    BidDimensionIndex, BidRejectionReason, build_bid_dimension_index_from_slots,
-    parse_optional_bid_dimension, resolve_bid_dimensions,
+    BidDimensionIndex, BidRejectionReason, parse_optional_bid_dimension, resolve_bid_dimensions,
 };
 use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
+#[cfg(test)]
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
-use crate::auction::types::{
-    AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
-};
+#[cfg(test)]
+use crate::auction::types::AuctionContext;
+use crate::auction::types::{AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType};
 use crate::error::TrustedServerError;
+use crate::integrations::{UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded};
+#[cfg(test)]
 use crate::integrations::{
-    UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
     ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
-use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
-use crate::settings::{IntegrationConfig, Settings};
+use crate::platform::PlatformResponse;
+#[cfg(test)]
+use crate::platform::{PlatformHttpRequest, RuntimeServices};
+use crate::settings::IntegrationConfig;
+#[cfg(test)]
+use crate::settings::Settings;
 
 // ============================================================================
 // Configuration
@@ -159,6 +171,69 @@ impl AdServerMockProvider {
             &request.context,
             &self.config.context_query_params,
         )
+    }
+
+    /// Build the finalized HTTP request shared by both mediation dispatch paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an auction error when payload construction, serialization or HTTP
+    /// request construction fails.
+    fn build_mediation_http_request(
+        &self,
+        request: &AuctionRequest,
+        bidder_responses: &[AuctionResponse],
+    ) -> Result<http::Request<EdgeBody>, Report<TrustedServerError>> {
+        // Build mediation request
+        let mediation_req = self
+            .build_mediation_request(request, bidder_responses)
+            .change_context(TrustedServerError::Auction {
+                message: "Failed to build mediation request".to_string(),
+            })?;
+
+        log::trace!("AdServer Mock: mediation request: {:?}", mediation_req);
+
+        // Build endpoint URL with context-driven query parameters
+        let endpoint_url = self.build_endpoint_url(request);
+
+        // Create HTTP POST request
+        let mediation_body =
+            serde_json::to_vec(&mediation_req).change_context(TrustedServerError::Auction {
+                message: "Failed to serialize mediation request".to_string(),
+            })?;
+        let mut req = http::Request::builder()
+            .method(Method::POST)
+            .uri(&endpoint_url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(mediation_body))
+            .change_context(TrustedServerError::Auction {
+                message: "Failed to build mediation request".to_string(),
+            })?;
+
+        // Set Host header with port to ensure mocktioneer generates correct iframe URLs
+        if let Ok(url) = url::Url::parse(&self.config.endpoint)
+            && let Some(host) = url.host_str()
+        {
+            let host_with_port = if let Some(port) = url.port() {
+                format!("{}:{}", host, port)
+            } else {
+                host.to_string()
+            };
+            match header::HeaderValue::from_str(&host_with_port) {
+                Ok(value) => {
+                    req.headers_mut().insert(header::HOST, value);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to build Host header for '{}': {}",
+                        host_with_port,
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(req)
     }
 
     /// Build mediation request from auction request and bidder responses.
@@ -429,6 +504,7 @@ impl AdServerMockProvider {
     }
 }
 
+#[cfg(test)]
 #[async_trait(?Send)]
 impl AuctionProvider for AdServerMockProvider {
     fn provider_name(&self) -> &str {
@@ -449,54 +525,7 @@ impl AuctionProvider for AdServerMockProvider {
             bidder_responses.len()
         );
 
-        // Build mediation request
-        let mediation_req = self
-            .build_mediation_request(request, bidder_responses)
-            .change_context(TrustedServerError::Auction {
-                message: "Failed to build mediation request".to_string(),
-            })?;
-
-        log::trace!("AdServer Mock: mediation request: {:?}", mediation_req);
-
-        // Build endpoint URL with context-driven query parameters
-        let endpoint_url = self.build_endpoint_url(request);
-
-        // Create HTTP POST request
-        let mediation_body =
-            serde_json::to_vec(&mediation_req).change_context(TrustedServerError::Auction {
-                message: "Failed to serialize mediation request".to_string(),
-            })?;
-        let mut req = http::Request::builder()
-            .method(Method::POST)
-            .uri(&endpoint_url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(EdgeBody::from(mediation_body))
-            .change_context(TrustedServerError::Auction {
-                message: "Failed to build mediation request".to_string(),
-            })?;
-
-        // Set Host header with port to ensure mocktioneer generates correct iframe URLs
-        if let Ok(url) = url::Url::parse(&self.config.endpoint)
-            && let Some(host) = url.host_str()
-        {
-            let host_with_port = if let Some(port) = url.port() {
-                format!("{}:{}", host, port)
-            } else {
-                host.to_string()
-            };
-            match header::HeaderValue::from_str(&host_with_port) {
-                Ok(value) => {
-                    req.headers_mut().insert(header::HOST, value);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Failed to build Host header for '{}': {}",
-                        host_with_port,
-                        e
-                    );
-                }
-            }
-        }
+        let req = self.build_mediation_http_request(request, bidder_responses)?;
 
         // Uses the auction-scoped canonical transport timeout rather than the
         // 15 s fixed timeout in ensure_integration_backend, which is for proxy
@@ -604,6 +633,7 @@ impl AuctionProvider for AdServerMockProvider {
 ///
 /// Returns an error when the ad server mock provider is enabled with invalid
 /// configuration.
+#[cfg(test)]
 pub fn register_providers(
     settings: &Settings,
 ) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
@@ -637,6 +667,8 @@ mod tests {
     use super::*;
     use crate::auction::context::ContextValue;
     use crate::auction::types::*;
+    use crate::integrations::aps::renderer::ApsRendererDescriptor as _;
+    use crate::integrations::aps::{ApsRendererV1, ApsTagType};
 
     fn create_test_auction_request() -> AuctionRequest {
         AuctionRequest {
@@ -687,7 +719,7 @@ mod tests {
             bid_id: Some(bid_id.to_string()),
             ad_id: None,
             creative_id: Some(format!("creative-{bid_id}")),
-            renderer: Some(BidRenderer::Aps(ApsRendererV1 {
+            renderer: Some(BidRenderer::from(ApsRendererV1 {
                 version: 1,
                 account_id: "example-account".to_string(),
                 bid_id: bid_id.to_string(),
@@ -931,7 +963,7 @@ mod tests {
                 bid_id: Some("source-bid-id".to_string()),
                 ad_id: Some("bid-impression-id".to_string()),
                 creative_id: Some("source-creative-id".to_string()),
-                renderer: Some(BidRenderer::Aps(ApsRendererV1 {
+                renderer: Some(BidRenderer::from(ApsRendererV1 {
                     version: 1,
                     account_id: "example-account".to_string(),
                     bid_id: "source-bid-id".to_string(),

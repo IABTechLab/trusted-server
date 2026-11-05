@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use error_stack::{Report, ResultExt as _};
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
-use super::profile::{CompiledOpenRtbProfile, ProfileTimeoutDefault, find_profile};
+use super::profile::{CompiledOpenRtbProfile, OpenRtbProfileDefinition, ProfileTimeoutDefault};
 use crate::error::TrustedServerError;
 use crate::platform::{AuctionTargetId, PlatformBackendSpec};
 use crate::settings::RequestSigning;
@@ -17,6 +18,7 @@ use crate::settings::RequestSigning;
 const MAX_ID_BYTES: usize = 128;
 const MAX_SUPPRESS_SEATS: usize = 128;
 const MAX_SUPPRESS_SEAT_BYTES: usize = 128;
+#[cfg(test)]
 const MOCK_MEDIATOR_ID: &str = "adserver_mock";
 const RESERVED_BROWSER_ENVELOPE_BIDDER_ID: &str = "trustedServer";
 
@@ -149,6 +151,17 @@ pub struct ProviderConfig {
     pub profile_config: Value,
 }
 
+/// One provider in the composition root's explicit execution sequence.
+#[derive(Debug, Clone)]
+pub struct ProviderCompilationInput {
+    /// Declaration ordinal retained for diagnostics, never used to sort the sequence.
+    pub ordinal: usize,
+    /// Validated provider identity.
+    pub id: ProviderId,
+    /// Source-neutral provider configuration.
+    pub config: ProviderConfig,
+}
+
 /// Raw central bidder route.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -248,7 +261,9 @@ pub struct ProviderPlan {
     /// Compiled protocol behavior.
     pub protocol: ProtocolPlan,
     /// Compiled typed profile behavior.
-    pub profile: CompiledOpenRtbProfile,
+    pub profile: Arc<dyn CompiledOpenRtbProfile>,
+    /// Declaration ordinal retained from the flat compiler input.
+    pub ordinal: usize,
 }
 
 /// Immutable target-independent auction plan.
@@ -281,32 +296,93 @@ impl AuctionPlan {
     /// Returns a configuration error for invalid identifiers, protocol/profile
     /// declarations, endpoints, profile configuration, routes, notifications,
     /// signing structure, or mediator selection.
-    pub fn compile(config: AuctionPlanConfig) -> Result<Self, Report<TrustedServerError>> {
+    pub fn compile(mut config: AuctionPlanConfig) -> Result<Self, Report<TrustedServerError>> {
+        // Schema one alone obtains its global lexical order from the legacy map.
+        let providers = std::mem::take(&mut config.providers)
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (id, config))| ProviderCompilationInput {
+                ordinal,
+                id,
+                config,
+            })
+            .collect();
+        Self::compile_ordered(
+            config,
+            providers,
+            crate::integrations::profile_definitions(),
+            crate::integrations::mediator_definitions(),
+        )
+    }
+
+    /// Compile the supplied provider sequence without sorting by identity or ordinal.
+    ///
+    /// # Errors
+    /// Returns a configuration error for invalid or duplicate declarations,
+    /// nonempty legacy provider maps, unsupported protocols/profiles, invalid
+    /// endpoints, routing, notification, signing or mediator configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::auction::plan::{AuctionPlan, AuctionPlanConfig};
+    /// let config = AuctionPlanConfig { timeout_ms: 100, ..AuctionPlanConfig::default() };
+    /// let plan = AuctionPlan::compile_ordered(config, Vec::new(), &[], &[])
+    ///     .expect("should compile an empty explicit plan");
+    /// assert!(plan.providers().is_empty());
+    /// ```
+    pub fn compile_ordered(
+        config: AuctionPlanConfig,
+        input: Vec<ProviderCompilationInput>,
+        definitions: &[OpenRtbProfileDefinition],
+        mediators: &[super::mediator::MediatorDefinition],
+    ) -> Result<Self, Report<TrustedServerError>> {
+        if !config.providers.is_empty() {
+            return Err(configuration_error(
+                "ordered compilation requires providers only in its explicit sequence",
+            ));
+        }
         if config.timeout_ms == 0 {
             return Err(configuration_error(
                 "auction timeout_ms must be greater than zero",
             ));
         }
-        validate_mediator(config.mediator.as_deref())?;
+        validate_mediator(config.mediator.as_deref(), mediators)?;
         let signing_enabled = compile_signing_enabled(config.request_signing.as_ref())?;
-        let mut providers = Vec::with_capacity(config.providers.len());
+        let mut providers = Vec::with_capacity(input.len());
         let mut provider_indices = BTreeMap::new();
-        for (id, raw) in config.providers {
+        for ProviderCompilationInput {
+            ordinal,
+            id,
+            config: raw,
+        } in input
+        {
+            if provider_indices.contains_key(&id) {
+                return Err(configuration_error(format!(
+                    "provider `{id}` is duplicated"
+                )));
+            }
             if raw.protocol != "openrtb-2.6" {
                 return Err(configuration_error(format!(
                     "provider `{id}` uses unsupported protocol `{}`",
                     raw.protocol
                 )));
             }
-            let registration = find_profile(&raw.profile).ok_or_else(|| {
-                configuration_error(format!(
-                    "provider `{id}` uses unknown OpenRTB profile `{}`",
-                    raw.profile
-                ))
-            })?;
-            if registration.id == "prebid-server" && raw.routing == RoutingMode::AllEligible {
+            let registration = definitions
+                .iter()
+                .find(|definition| definition.id == raw.profile)
+                .ok_or_else(|| {
+                    configuration_error(format!(
+                        "provider `{id}` uses unknown OpenRTB profile `{}`",
+                        raw.profile
+                    ))
+                })?;
+            if !registration.routing_policy.allows_all_eligible
+                && raw.routing == RoutingMode::AllEligible
+            {
                 return Err(configuration_error(format!(
-                    "provider `{id}` cannot use routing `all_eligible` with profile `prebid-server`; configure explicit bidder routes"
+                    "provider `{id}` cannot use routing `all_eligible` with profile `{}`; configure explicit bidder routes",
+                    registration.id
                 )));
             }
             if !raw.profile_config.is_object() {
@@ -314,7 +390,7 @@ impl AuctionPlan {
                     "provider `{id}` profile_config must be an object"
                 )));
             }
-            let endpoint = canonicalize_endpoint(&id, registration.id, &raw.endpoint)?;
+            let endpoint = canonicalize_endpoint(&id, registration, &raw.endpoint)?;
             let timeout_ms = raw
                 .timeout_ms
                 .unwrap_or(match registration.default_timeout {
@@ -327,10 +403,11 @@ impl AuctionPlan {
                 )));
             }
             let notifications = compile_notifications(&id, raw.notifications)?;
-            let profile = registration.compile(&raw.profile_config)?;
+            let profile = (registration.compile)(&raw.profile_config)?;
             let index = providers.len();
             provider_indices.insert(id.clone(), index);
             providers.push(ProviderPlan {
+                ordinal,
                 id,
                 endpoint,
                 timeout_ms,
@@ -553,10 +630,18 @@ fn compile_signing_enabled(
     Ok(request_signing.enabled)
 }
 
-fn validate_mediator(mediator: Option<&str>) -> Result<(), Report<TrustedServerError>> {
-    if mediator.is_some_and(|value| value != MOCK_MEDIATOR_ID) {
+fn validate_mediator(
+    mediator: Option<&str>,
+    definitions: &[super::mediator::MediatorDefinition],
+) -> Result<(), Report<TrustedServerError>> {
+    if mediator.is_some_and(|value| !definitions.iter().any(|definition| definition.id == value)) {
+        let ids = definitions
+            .iter()
+            .map(|definition| format!("`{}`", definition.id))
+            .collect::<Vec<_>>()
+            .join(" or ");
         return Err(configuration_error(format!(
-            "auction mediator must be `{MOCK_MEDIATOR_ID}` when configured"
+            "auction mediator must be {ids} when configured"
         )));
     }
     Ok(())
@@ -564,7 +649,7 @@ fn validate_mediator(mediator: Option<&str>) -> Result<(), Report<TrustedServerE
 
 fn canonicalize_endpoint(
     provider_id: &ProviderId,
-    profile_id: &str,
+    definition: &OpenRtbProfileDefinition,
     value: &str,
 ) -> Result<CanonicalProviderEndpoint, Report<TrustedServerError>> {
     let mut endpoint = Url::parse(value).map_err(|error| {
@@ -582,28 +667,15 @@ fn canonicalize_endpoint(
             "provider `{provider_id}` endpoint must be absolute HTTPS with a host and no credentials or fragment"
         )));
     }
-    if profile_id == "aps"
-        && endpoint
-            .path()
-            .trim_end_matches('/')
-            .ends_with("/e/dtb/bid")
-    {
-        return Err(configuration_error(format!(
-            "provider `{provider_id}` uses unsupported legacy APS endpoint `/e/dtb/bid`"
-        )));
-    }
-    if profile_id == "prebid-server" {
-        normalize_prebid_server_endpoint(&mut endpoint);
-    }
+    (definition.canonicalize_endpoint)(&mut endpoint).map_err(|error| {
+        match error.current_context() {
+            TrustedServerError::Configuration { message } => {
+                configuration_error(format!("provider `{provider_id}` {message}"))
+            }
+            _ => error,
+        }
+    })?;
     Ok(CanonicalProviderEndpoint(endpoint))
-}
-
-fn normalize_prebid_server_endpoint(endpoint: &mut Url) {
-    match endpoint.path() {
-        "" | "/" => endpoint.set_path("/openrtb2/auction"),
-        "/openrtb2/auction/" => endpoint.set_path("/openrtb2/auction"),
-        _ => {}
-    }
 }
 
 fn compile_notifications(
@@ -640,7 +712,6 @@ fn compile_notifications(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auction::profile::CompiledOpenRtbProfile;
 
     fn provider(profile: &str) -> ProviderConfig {
         ProviderConfig {
@@ -687,6 +758,61 @@ mod tests {
             value = Value::Array(vec![value]);
         }
         value
+    }
+
+    #[test]
+    fn explicit_provider_sequence_is_not_sorted_by_id_or_ordinal() {
+        let inputs = vec![
+            ProviderCompilationInput {
+                ordinal: 17,
+                id: id("z-provider"),
+                config: provider("standard"),
+            },
+            ProviderCompilationInput {
+                ordinal: 3,
+                id: id("a-provider"),
+                config: provider("standard"),
+            },
+        ];
+        let plan = AuctionPlan::compile_ordered(
+            config(BTreeMap::new()),
+            inputs,
+            crate::integrations::profile_definitions(),
+            crate::integrations::mediator_definitions(),
+        )
+        .expect("should compile explicit provider order");
+        assert_eq!(
+            plan.providers()
+                .iter()
+                .map(|provider| (provider.id.as_str(), provider.ordinal))
+                .collect::<Vec<_>>(),
+            vec![("z-provider", 17), ("a-provider", 3)]
+        );
+    }
+
+    #[test]
+    fn explicit_provider_sequence_rejects_duplicate_identity() {
+        let inputs = vec![
+            ProviderCompilationInput {
+                ordinal: 0,
+                id: id("same-provider"),
+                config: provider("standard"),
+            },
+            ProviderCompilationInput {
+                ordinal: 1,
+                id: id("same-provider"),
+                config: provider("standard"),
+            },
+        ];
+        assert!(
+            AuctionPlan::compile_ordered(
+                config(BTreeMap::new()),
+                inputs,
+                crate::integrations::profile_definitions(),
+                crate::integrations::mediator_definitions()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1003,10 +1129,9 @@ mod tests {
         let plan = AuctionPlan::compile(config(providers)).expect("should compile two PBS plans");
         assert_eq!(plan.providers().len(), 2);
         assert!(
-            plan.providers().iter().all(|provider| matches!(
-                provider.profile,
-                CompiledOpenRtbProfile::PrebidServer(_)
-            ))
+            plan.providers()
+                .iter()
+                .all(|provider| provider.profile.routing_policy().recognizes_stored_requests)
         );
     }
 
@@ -1044,7 +1169,7 @@ mod tests {
 
     #[test]
     fn profile_registry_is_independent_of_browser_configuration() {
-        let ids = crate::auction::profile::profile_registrations()
+        let ids = crate::integrations::profile_definitions()
             .iter()
             .map(|registration| registration.id)
             .collect::<Vec<_>>();
@@ -1186,17 +1311,40 @@ mod tests {
     #[test]
     fn standard_extensions_are_typed_bounded_and_cannot_claim_reserved_fields() {
         let mut valid = provider("standard");
+        valid.routing = RoutingMode::AllEligible;
         valid.profile_config = serde_json::json!({
             "request_ext": {"fictional_account": "example"},
             "imp_ext": {"placement_group": "display"}
         });
         let plan = AuctionPlan::compile(config(BTreeMap::from([(id("one"), valid)])))
             .expect("should compile static extensions");
-        let CompiledOpenRtbProfile::Standard(standard) = &plan.providers()[0].profile else {
-            panic!("should compile standard profile")
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let routed = crate::auction::routing::route_auction(
+            crate::auction::test_support::canonical_parity_auction_request(),
+            &inbound,
+            &plan,
+            None,
+        );
+        let request = crate::auction::openrtb::build_request(
+            &routed.inputs()[0],
+            &routed,
+            &plan.providers()[0],
+            100,
+            &crate::auction::openrtb::RequestFinalization {
+                signer: None,
+                signing_params: crate::request_signing::SigningParams::new(
+                    routed.inputs()[0].common_request().id.clone(),
+                    routed.inputs()[0].common_request().publisher.domain.clone(),
+                    "https".to_string(),
+                ),
+            },
+        )
+        .expect("should build static extensions");
+        let crate::auction::openrtb::OpenRtbBuildOutcome::Ready(request) = request else {
+            panic!("should retain request")
         };
         assert_eq!(
-            standard.request_ext.as_object()["fictional_account"],
+            request.ext.expect("should retain static extension")["fictional_account"],
             "example"
         );
 

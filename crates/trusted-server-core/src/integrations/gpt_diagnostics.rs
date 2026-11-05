@@ -9,6 +9,7 @@ use error_stack::{Report, ResultExt};
 use http::{HeaderValue, Method, Request, Response, Uri, header, uri::PathAndQuery};
 use serde::Deserialize;
 use std::borrow::Cow;
+use std::sync::Arc;
 use validator::{Validate, ValidationError};
 
 use edgezero_core::body::Body as EdgeBody;
@@ -20,6 +21,11 @@ use crate::settings::{IntegrationConfig, Settings};
 use crate::tsjs;
 
 use super::IntegrationRegistration;
+use super::processing::{
+    IntegrationRequestLifecycle, OriginRequirement, PreparedIntegrationRequest,
+    RequestProcessingRequirements, RequestProcessingState, ReservedInputState,
+    ResponsePrivacyScope,
+};
 
 /// Stable integration identifier.
 pub const GPT_DIAGNOSTICS_INTEGRATION_ID: &str = "gpt_diagnostics";
@@ -255,6 +261,9 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(GPT_DIAGNOSTICS_INTEGRATION_ID)
             .without_js()
+            .with_standalone_js(GPT_DIAGNOSTICS_INTEGRATION_ID)
+            .with_auction_correlation()
+            .with_request_lifecycle(Arc::new(GptDiagnosticsLifecycle))
             .build(),
     ))
 }
@@ -284,6 +293,17 @@ pub fn is_enabled(settings: &Settings) -> bool {
 /// # Errors
 ///
 /// Returns an error when configuration parsing or URI reconstruction fails.
+///
+/// # Panics
+///
+/// Panics if reserved-input normalization returns without recording its captured
+/// state, violating the normalization/preparation invariant.
+///
+/// # Examples
+///
+/// ```ignore
+/// let decision = prepare_request(&settings, &mut request)?;
+/// ```
 pub fn prepare_request(
     settings: &Settings,
     request: &mut Request<EdgeBody>,
@@ -295,17 +315,32 @@ pub fn prepare_request(
     let integration_enabled = settings
         .integration_config::<GptDiagnosticsConfig>(GPT_DIAGNOSTICS_INTEGRATION_ID)?
         .is_some();
-    let (directive, clean_path, had_reserved_query) = console_query(request.uri());
-    let cookie_state = console_cookie_state(request);
+    normalize_reserved_inputs(request)?;
+    let captured = request
+        .extensions()
+        .get::<ReservedInputState>()
+        .and_then(|state| {
+            state
+                .0
+                .get::<ConsoleReservedInput>(GPT_DIAGNOSTICS_INTEGRATION_ID)
+        })
+        .expect("should capture reserved inputs before preparation");
+    let ConsoleReservedInput {
+        directive,
+        clean_path,
+        had_reserved_query,
+        cookie_state,
+    } = &*captured;
+    let (directive, clean_path, had_reserved_query, cookie_state) = (
+        *directive,
+        clean_path.clone(),
+        *had_reserved_query,
+        *cookie_state,
+    );
     let eligible_navigation = request.method() == Method::GET
         && is_navigation_request(request)
         && !crate::publisher::is_prefetch_request(request)
         && !crate::publisher::is_bot_user_agent(request);
-
-    sanitize_console_cookie(request);
-    if had_reserved_query {
-        replace_path_and_query(request, &clean_path)?;
-    }
 
     let mut decision = GptDiagnosticsRequestDecision::default();
     if integration_enabled && eligible_navigation && had_reserved_query {
@@ -330,6 +365,11 @@ pub fn prepare_request(
     }
 
     request.extensions_mut().insert(decision.clone());
+    RequestProcessingState::attach(
+        request,
+        GPT_DIAGNOSTICS_INTEGRATION_ID,
+        Arc::new(decision.clone()),
+    );
     Ok(decision)
 }
 
@@ -359,6 +399,109 @@ pub fn finalize_response(
         // and the adapter's terminal guard had no marker to re-enforce from, so
         // request-scoped diagnostics HTML became shared-cacheable.
         enforce_synthesized_html_cache_privacy(response);
+    }
+}
+
+#[derive(Clone)]
+struct ConsoleReservedInput {
+    directive: QueryDirective,
+    clean_path: String,
+    had_reserved_query: bool,
+    cookie_state: ConsoleCookieState,
+}
+
+/// Capture and remove reserved inputs independently of runtime enablement.
+///
+/// # Errors
+///
+/// Returns the existing URI reconstruction error.
+///
+/// # Examples
+///
+/// ```ignore
+/// normalize_reserved_inputs(&mut request)?;
+/// ```
+pub fn normalize_reserved_inputs(
+    request: &mut Request<EdgeBody>,
+) -> Result<(), Report<TrustedServerError>> {
+    let reserved = request
+        .extensions()
+        .get::<ReservedInputState>()
+        .cloned()
+        .unwrap_or_default();
+    if reserved
+        .0
+        .get::<ConsoleReservedInput>(GPT_DIAGNOSTICS_INTEGRATION_ID)
+        .is_some()
+    {
+        return Ok(());
+    }
+    let (directive, clean_path, had_reserved_query) = console_query(request.uri());
+    let cookie_state = console_cookie_state(request);
+    sanitize_console_cookie(request);
+    if had_reserved_query {
+        replace_path_and_query(request, &clean_path)?;
+    }
+    reserved
+        .0
+        .get_or_insert_with(GPT_DIAGNOSTICS_INTEGRATION_ID, || ConsoleReservedInput {
+            directive,
+            clean_path,
+            had_reserved_query,
+            cookie_state,
+        });
+    request.extensions_mut().insert(reserved);
+    Ok(())
+}
+
+struct GptDiagnosticsLifecycle;
+
+impl IntegrationRequestLifecycle for GptDiagnosticsLifecycle {
+    fn integration_id(&self) -> &'static str {
+        GPT_DIAGNOSTICS_INTEGRATION_ID
+    }
+
+    fn prepare(
+        &self,
+        settings: &Settings,
+        request: &mut Request<EdgeBody>,
+    ) -> Result<Arc<dyn PreparedIntegrationRequest>, Report<TrustedServerError>> {
+        prepare_request(settings, request)
+            .map(|decision| Arc::new(decision) as Arc<dyn PreparedIntegrationRequest>)
+    }
+}
+
+impl PreparedIntegrationRequest for GptDiagnosticsRequestDecision {
+    fn requirements(&self) -> RequestProcessingRequirements {
+        if self.requires_private_no_store() {
+            RequestProcessingRequirements {
+                origin: OriginRequirement::FullHtmlRepresentationStrict,
+                privacy: ResponsePrivacyScope::AllResponses,
+            }
+        } else {
+            RequestProcessingRequirements::default()
+        }
+    }
+
+    fn before_unified(&self) -> Option<String> {
+        self.bootstrap_script()
+    }
+    fn after_unified(&self) -> Option<String> {
+        self.module_script_tag()
+    }
+    fn document_trace_enabled(&self) -> bool {
+        self.active()
+    }
+    fn finalize_response(&self, response: &mut Response<EdgeBody>) {
+        finalize_response(self, response);
+    }
+}
+
+impl From<GptDiagnosticsRequestDecision> for RequestProcessingState {
+    fn from(decision: GptDiagnosticsRequestDecision) -> Self {
+        let mut state = Self::default();
+        state.insert(GPT_DIAGNOSTICS_INTEGRATION_ID, Arc::new(decision));
+        state
     }
 }
 
@@ -405,26 +548,7 @@ fn console_cookie_state(request: &Request<EdgeBody>) -> ConsoleCookieState {
 }
 
 fn sanitize_console_cookie(request: &mut Request<EdgeBody>) {
-    let pairs = crate::cookies::cookie_header_pairs(request.headers()).filter(|pair| {
-        let name = pair
-            .split(|byte| *byte == b'=')
-            .next()
-            .unwrap_or_default()
-            .trim_ascii();
-        name != GPT_DIAGNOSTICS_COOKIE.as_bytes()
-    });
-    let (retained, sanitation) = crate::cookies::parse_cookie_pairs(pairs);
-    let retained = retained.join("; ");
-
-    if sanitation.discarded_textual_pairs() {
-        request.extensions_mut().insert(sanitation);
-    }
-    request.headers_mut().remove(header::COOKIE);
-    if !retained.is_empty() {
-        let value = HeaderValue::from_str(&retained)
-            .expect("should preserve already-valid cookie header values");
-        request.headers_mut().insert(header::COOKIE, value);
-    }
+    crate::cookies::sanitize_request_cookies(request, &[GPT_DIAGNOSTICS_COOKIE]);
 }
 
 fn replace_path_and_query(
@@ -497,6 +621,110 @@ mod tests {
                 .js_module_ids_deferred()
                 .contains(&GPT_DIAGNOSTICS_INTEGRATION_ID)
         );
+    }
+
+    #[test]
+    fn static_normalization_and_lifecycle_are_independent_of_enablement() {
+        for enabled in [None, Some(false), Some(true)] {
+            let mut settings = create_test_settings();
+            if let Some(enabled) = enabled {
+                settings
+                    .integrations
+                    .insert_config(GPT_DIAGNOSTICS_INTEGRATION_ID, &json!({"enabled": enabled}))
+                    .expect("should configure enabled or disabled owner");
+            }
+            let registry = IntegrationRegistry::new(&settings).expect("should assemble catalog");
+            for directive in ["1", "0", "invalid", "1&ts_console=0"] {
+                let mut request = navigation(
+                    &format!("https://publisher.example/page?keep=example&ts_console={directive}"),
+                    Some("first=example; __Host-ts-console=1; broken; last=example"),
+                );
+                let first =
+                    crate::integrations::prepare_request(&settings, Some(&registry), &mut request)
+                        .expect("should normalize before lifecycle");
+                let second =
+                    crate::integrations::prepare_request(&settings, Some(&registry), &mut request)
+                        .expect("should tolerate a reentered adapter boundary");
+                assert_eq!(
+                    request.uri().query(),
+                    Some("keep=example"),
+                    "should remove reserved query even without an enabled capability"
+                );
+                assert_eq!(
+                    request.headers()[header::COOKIE],
+                    "first=example; last=example",
+                    "should preserve valid malformed-cookie neighbors"
+                );
+                assert_eq!(
+                    first.requirements(),
+                    second.requirements(),
+                    "should retain the first request decision"
+                );
+                assert_eq!(
+                    first.before_unified(),
+                    second.before_unified(),
+                    "should preserve activation facts across reentry"
+                );
+                let mut response = Response::builder()
+                    .status(304)
+                    .header(header::CACHE_CONTROL, "public, max-age=60")
+                    .body(EdgeBody::empty())
+                    .expect("should build a bodiless response");
+                second.finalize_response(&mut response);
+                if enabled == Some(true) {
+                    assert!(
+                        second.requirements().bypass_shared(),
+                        "should veto reuse even for scrub-only directives"
+                    );
+                    assert_eq!(
+                        second.requirements().privacy,
+                        ResponsePrivacyScope::AllResponses,
+                        "should declare all-response privacy before origin selection"
+                    );
+                    assert_eq!(
+                        response.headers()[header::CACHE_CONTROL],
+                        "no-store, private",
+                        "should finalize bodiless responses too"
+                    );
+                } else {
+                    assert_eq!(
+                        second.requirements(),
+                        RequestProcessingRequirements::default(),
+                        "should not invent a veto for an absent or disabled owner"
+                    );
+                    assert_eq!(
+                        response.headers()[header::CACHE_CONTROL],
+                        "public, max-age=60",
+                        "should preserve disabled-owner response behavior"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_input_state_debug_never_contains_query_cookie_or_neighbor_values() {
+        let mut request = navigation(
+            "https://publisher.example/page?ts_console=private-query-sentinel&keep=private-url-sentinel",
+            Some("__Host-ts-console=private-cookie-sentinel; ordinary=private-neighbor-sentinel"),
+        );
+        let state = crate::integrations::prepare_request(&settings(true), None, &mut request)
+            .expect("should prepare sentinel request");
+        let debug = format!(
+            "{state:?} {:?}",
+            request.extensions().get::<ReservedInputState>()
+        );
+        for secret in [
+            "private-query-sentinel",
+            "private-url-sentinel",
+            "private-cookie-sentinel",
+            "private-neighbor-sentinel",
+        ] {
+            assert!(
+                !debug.contains(secret),
+                "should keep reserved lifecycle diagnostics value-free"
+            );
+        }
     }
 
     #[test]

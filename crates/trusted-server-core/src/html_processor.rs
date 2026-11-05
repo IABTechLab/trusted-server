@@ -14,8 +14,7 @@ use lol_html::{
     text,
 };
 
-use crate::integrations::datadome::{DATADOME_INTEGRATION_ID, DataDomeClientTagSuppressed};
-use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
+use crate::integrations::processing::RequestProcessingState;
 use crate::integrations::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
     IntegrationHtmlContext, IntegrationRegistry, IntegrationScriptContext, ScriptRewriteAction,
@@ -115,8 +114,8 @@ pub struct HtmlProcessorConfig {
     /// Maximum bytes an integration may retain while processing one script or
     /// unresolved streaming group.
     pub max_buffered_body_bytes: usize,
-    /// Request-scoped conditional diagnostics delivery decision.
-    pub gpt_diagnostics: Option<GptDiagnosticsRequestDecision>,
+    /// Immutable request-local processing decisions, excluded from shared templates.
+    pub request_processing: Option<RequestProcessingState>,
     /// Request-only trace bootstrap, excluded from shared templates and ESI.
     ///
     /// The publisher supplies script-safe bytes only for an eligible document.
@@ -124,8 +123,7 @@ pub struct HtmlProcessorConfig {
     /// What the `</body>` seam injects. Decided by the caller rather than inferred
     /// from [`Self::ad_slots_script`].
     pub body_close: BodyCloseInjection,
-    /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
-    pub suppress_datadome_client_side_tag: bool,
+
     /// Set when the document delivers a response-bound CSP nonce in its own markup.
     ///
     /// `None` on every path that cannot store a shared template, so an ordinary inline
@@ -151,10 +149,9 @@ impl HtmlProcessorConfig {
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
             body_close: BodyCloseInjection::None,
-            suppress_datadome_client_side_tag: false,
             csp_nonce_observed: None,
         }
     }
@@ -188,10 +185,16 @@ impl HtmlProcessorConfig {
         self
     }
 
-    /// Attach the request-scoped conditional diagnostics decision.
+    /// Attach immutable request-local processing decisions.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let config = config.with_request_processing(Some(state));
+    /// ```
     #[must_use]
-    pub fn with_gpt_diagnostics(mut self, decision: Option<GptDiagnosticsRequestDecision>) -> Self {
-        self.gpt_diagnostics = decision;
+    pub fn with_request_processing(mut self, decision: Option<RequestProcessingState>) -> Self {
+        self.request_processing = decision;
         self
     }
 
@@ -209,13 +212,6 @@ impl HtmlProcessorConfig {
     #[must_use]
     pub fn with_csp_nonce_observer(mut self, observed: Option<Arc<AtomicBool>>) -> Self {
         self.csp_nonce_observed = observed;
-        self
-    }
-
-    /// Attach the request-scoped `DataDome` client-tag suppression decision.
-    #[must_use]
-    pub fn with_datadome_client_tag_suppression(mut self, suppress: bool) -> Self {
-        self.suppress_datadome_client_side_tag = suppress;
         self
     }
 }
@@ -245,8 +241,8 @@ pub(crate) fn create_html_processor_with_document_state(
 ) -> HtmlWithStreamingProcessors {
     let stream_processor_factories = config.integrations.html_stream_processor_factories();
 
-    if config.suppress_datadome_client_side_tag {
-        document_state.get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
+    if let Some(processing) = &config.request_processing {
+        processing.initialize_document(document_state);
     }
 
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
@@ -319,7 +315,7 @@ pub(crate) fn create_html_processor_with_document_state(
     let ad_slots_script = config.ad_slots_script.clone();
     let body_close = config.body_close.clone();
     let ad_bids_state = config.ad_bids_state.clone();
-    let gpt_diagnostics = config.gpt_diagnostics.clone();
+    let request_processing = config.request_processing.clone();
     let trace_bootstrap = config.trace_bootstrap.clone();
 
     // No source-comment neutralization here: rewriting a publisher comment that happens
@@ -350,7 +346,7 @@ pub(crate) fn create_html_processor_with_document_state(
             let patterns = patterns.clone();
             let document_state = document_state.clone();
             let ad_slots_script = ad_slots_script.clone();
-            let gpt_diagnostics = gpt_diagnostics.clone();
+            let request_processing = request_processing.clone();
             let trace_bootstrap = trace_bootstrap.clone();
             move |el| {
                 if !injected_tsjs.get() {
@@ -370,11 +366,8 @@ pub(crate) fn create_html_processor_with_document_state(
                     for insert in integrations.head_inserts(&ctx) {
                         snippet.push_str(&insert);
                     }
-                    if let Some(bootstrap) = gpt_diagnostics
-                        .as_ref()
-                        .and_then(GptDiagnosticsRequestDecision::bootstrap_script)
-                    {
-                        snippet.push_str(&bootstrap);
+                    if let Some(processing) = &request_processing {
+                        snippet.push_str(&processing.before_unified());
                     }
                     if let Some(bootstrap) = &trace_bootstrap {
                         snippet.push_str(bootstrap);
@@ -386,13 +379,9 @@ pub(crate) fn create_html_processor_with_document_state(
                         &immediate_ids,
                         &script_attributes,
                     ));
-                    // Active diagnostics loads synchronously after core so its
-                    // GPT listeners precede publisher scripts in the origin head.
-                    if let Some(module_tag) = gpt_diagnostics
-                        .as_ref()
-                        .and_then(GptDiagnosticsRequestDecision::module_script_tag)
-                    {
-                        snippet.push_str(&module_tag);
+                    // Fixed synchronous owner assets precede publisher head scripts.
+                    if let Some(processing) = &request_processing {
+                        snippet.push_str(&processing.after_unified());
                     }
                     // Deferred bundles: large modules like prebid loaded after
                     // HTML parsing completes. Empty when none are enabled.
@@ -835,9 +824,8 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -1184,7 +1172,7 @@ mod tests {
             ),
         )
         .expect("should build integration registry");
-        config.gpt_diagnostics = Some(decision);
+        config.request_processing = Some(decision.into());
 
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -1377,7 +1365,9 @@ mod tests {
             "test.example.com",
             "https",
         )
-        .with_datadome_client_tag_suppression(true);
+        .with_request_processing(Some(
+            crate::integrations::datadome::DataDomeClientTagSuppressed.into(),
+        ));
         let mut processor = create_html_processor(config);
 
         let output = processor
@@ -1829,9 +1819,8 @@ mod tests {
             ),
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1907,9 +1896,8 @@ mod tests {
             ),
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1947,9 +1935,8 @@ mod tests {
             ),
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         // Malformed HTML with two <body> elements (common in CMS template pages)
@@ -1986,9 +1973,8 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2043,9 +2029,8 @@ mod tests {
             ),
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2074,9 +2059,8 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2100,9 +2084,8 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -2362,9 +2345,8 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
+            request_processing: None,
             trace_bootstrap: None,
-            suppress_datadome_client_side_tag: false,
         };
         let source =
             format!(r#"<html><head></head><script>var collision="{MARKER}";</script></html>"#);
