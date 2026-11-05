@@ -117,6 +117,10 @@ pub struct HtmlProcessorConfig {
     pub max_buffered_body_bytes: usize,
     /// Request-scoped conditional diagnostics delivery decision.
     pub gpt_diagnostics: Option<GptDiagnosticsRequestDecision>,
+    /// Request-only trace bootstrap, excluded from shared templates and ESI.
+    ///
+    /// The publisher supplies script-safe bytes only for an eligible document.
+    pub trace_bootstrap: Option<String>,
     /// What the `</body>` seam injects. Decided by the caller rather than inferred
     /// from [`Self::ad_slots_script`].
     pub body_close: BodyCloseInjection,
@@ -148,6 +152,7 @@ impl HtmlProcessorConfig {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
             gpt_diagnostics: None,
+            trace_bootstrap: None,
             body_close: BodyCloseInjection::None,
             suppress_datadome_client_side_tag: false,
             csp_nonce_observed: None,
@@ -187,6 +192,13 @@ impl HtmlProcessorConfig {
     #[must_use]
     pub fn with_gpt_diagnostics(mut self, decision: Option<GptDiagnosticsRequestDecision>) -> Self {
         self.gpt_diagnostics = decision;
+        self
+    }
+
+    /// Attach the already gated, request-only trace bootstrap.
+    #[must_use]
+    pub(crate) fn with_trace_bootstrap(mut self, bootstrap: Option<String>) -> Self {
+        self.trace_bootstrap = bootstrap;
         self
     }
 
@@ -308,6 +320,7 @@ pub(crate) fn create_html_processor_with_document_state(
     let body_close = config.body_close.clone();
     let ad_bids_state = config.ad_bids_state.clone();
     let gpt_diagnostics = config.gpt_diagnostics.clone();
+    let trace_bootstrap = config.trace_bootstrap.clone();
 
     // No source-comment neutralization here: rewriting a publisher comment that happens
     // to match the reserved marker would change publisher content bytes. Collisions are
@@ -338,6 +351,7 @@ pub(crate) fn create_html_processor_with_document_state(
             let document_state = document_state.clone();
             let ad_slots_script = ad_slots_script.clone();
             let gpt_diagnostics = gpt_diagnostics.clone();
+            let trace_bootstrap = trace_bootstrap.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
@@ -361,6 +375,9 @@ pub(crate) fn create_html_processor_with_document_state(
                         .and_then(GptDiagnosticsRequestDecision::bootstrap_script)
                     {
                         snippet.push_str(&bootstrap);
+                    }
+                    if let Some(bootstrap) = &trace_bootstrap {
+                        snippet.push_str(bootstrap);
                     }
                     // Main bundle: core + non-deferred integrations (synchronous).
                     let immediate_ids = integrations.js_module_ids_immediate();
@@ -819,6 +836,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            trace_bootstrap: None,
             suppress_datadome_client_side_tag: false,
         }
     }
@@ -1280,6 +1298,61 @@ mod tests {
         assert_eq!(config.origin_host, "origin.test-publisher.com");
         assert_eq!(config.request_host, "proxy.example.com");
         assert_eq!(config.request_scheme, "https");
+    }
+
+    #[test]
+    fn lockr_static_sdk_rewriting_preserves_page_origin_with_external_base() {
+        for rewrite_sdk in [true, false] {
+            let mut settings = create_test_settings();
+            settings
+                .integrations
+                .insert_config(
+                    "lockr",
+                    &json!({
+                        "enabled": true,
+                        "app_id": "example-lockr-app",
+                        "rewrite_sdk": rewrite_sdk,
+                    }),
+                )
+                .expect("should configure Lockr integration");
+            let registry = IntegrationRegistry::new(&settings)
+                .expect("should create integration registry with Lockr");
+            let config = HtmlProcessorConfig::from_settings(
+                &settings,
+                &registry,
+                "origin.example.com",
+                "publisher.example:8080",
+                "http",
+            );
+            let mut processor = create_html_processor(config);
+            let output = processor
+                .process_chunk(
+                    br#"<html><head>
+                        <base href="https://external-base.example/assets/">
+                        <link rel="preload" as="script" href="https://aim.loc.kr/identity-lockr-trust-server.js">
+                        <script src="https://aim.loc.kr/identity-lockr-trust-server.js"></script>
+                    </head><body></body></html>"#,
+                    true,
+                )
+                .expect("should process Lockr HTML with external base");
+            let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
+            let expected = if rewrite_sdk {
+                "http://publisher.example:8080/integrations/lockr/sdk"
+            } else {
+                "https://aim.loc.kr/identity-lockr-trust-server.js"
+            };
+
+            for attribute in ["src", "href"] {
+                assert!(
+                    html.contains(&format!("{attribute}=\"{expected}\"")),
+                    "should rewrite SDK scripts and preloads only when enabled"
+                );
+            }
+            assert!(
+                html.contains(r#"href="https://external-base.example/assets/""#),
+                "should preserve the publisher's external base URL"
+            );
+        }
     }
 
     #[test]
@@ -1757,6 +1830,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            trace_bootstrap: None,
             suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
@@ -1834,6 +1908,7 @@ mod tests {
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            trace_bootstrap: None,
             suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
@@ -1873,6 +1948,7 @@ mod tests {
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            trace_bootstrap: None,
             suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
@@ -1911,6 +1987,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            trace_bootstrap: None,
             suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
@@ -1967,6 +2044,7 @@ mod tests {
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            trace_bootstrap: None,
             suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
@@ -1997,6 +2075,7 @@ mod tests {
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            trace_bootstrap: None,
             suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
@@ -2022,6 +2101,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            trace_bootstrap: None,
             suppress_datadome_client_side_tag: false,
         }
     }
@@ -2283,6 +2363,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            trace_bootstrap: None,
             suppress_datadome_client_side_tag: false,
         };
         let source =

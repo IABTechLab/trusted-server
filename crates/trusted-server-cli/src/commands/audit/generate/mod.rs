@@ -11,7 +11,7 @@ mod validate;
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use rand::RngCore as _;
@@ -783,6 +783,10 @@ pub(crate) struct UpdateSlotsRequest<'a> {
     pub(crate) cookies: &'a [(String, String)],
     /// Print the candidate instead of writing it.
     pub(crate) dry_run: bool,
+    /// Apply a changed candidate without prompting (`--yes`).
+    pub(crate) yes: bool,
+    /// Whether an operator can see the confirmation prompt and answer it.
+    pub(crate) interactive: bool,
     /// Whether the crawl used the deterministic scroll pass.
     pub(crate) scroll: bool,
     /// Crawl bounds.
@@ -799,19 +803,24 @@ const MAX_EMPTY_PAGE_SHARE: f64 = 0.25;
 
 /// Runs `ts audit ad-templates generate`: crawl the site's sections, reconcile
 /// what each slot looked like across them, infer a `{section}` ad-unit template
-/// where the evidence proves one, and rewrite the config's slot array in place.
+/// where the evidence proves one, preview the managed-field diff, and rewrite
+/// the config's slot array in place once the change is approved.
 ///
 /// # Errors
 ///
 /// Returns an error when the config cannot be read, the root page cannot be
 /// collected, no slots are discovered, too many pages came back empty, the
 /// pages disagree about the GAM network id, or the resulting config would not
-/// load.
+/// load. A changed candidate also fails without being written when the
+/// operator declines it (including an empty line, EOF, or an answer that is
+/// not UTF-8), when the run is not interactive and `--yes` was not given, or
+/// when the config changed during the crawl or while the prompt was open.
 pub(crate) fn run_update_slots(
     request: &UpdateSlotsRequest<'_>,
     collectors: &[(&str, &dyn AuditCollector)],
     out: &mut dyn Write,
     err: &mut dyn Write,
+    input: &mut dyn BufRead,
 ) -> CliResult<()> {
     let Some((first_label, first_collector)) = collectors.first() else {
         return cli_error("no device profile was selected to audit with");
@@ -1081,52 +1090,43 @@ pub(crate) fn run_update_slots(
     notes.extend(validate::check_candidate(&updated, &existing)?);
 
     emit_notes(err, &mut notes)?;
-    if policy.is_some() {
-        writeln!(
-            err,
-            "note: this config now uses a {{section}} ad-unit template. Deploy a \
-             template-aware binary BEFORE pushing it, and do not roll that binary \
-             back while this config is live — an older binary rejects the whole \
-             config and serves an error on every route."
-        )
-        .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
-    }
+    // The "now uses" deploy-order note describes the config as written, so it
+    // is held back until the candidate is the config (or is only being
+    // previewed); a changed candidate's preview carries a conditionally worded
+    // warning instead (see `PREVIEW_TEMPLATE_NOTE`).
+    let uses_template = policy.is_some();
 
-    if request.dry_run {
-        let old_managed = managed_creative_projection(&existing)?;
-        let new_managed = managed_creative_projection(&updated)?;
-        if old_managed == new_managed {
-            // Stdout is the diff surface, so an English sentence there would
-            // break a redirected `--dry-run`; an empty diff is the stdout answer.
-            writeln!(err, "No managed creative-opportunity changes.").map_err(|error| {
-                report_error(format!("failed to write preview output: {error}"))
-            })?;
-            return Ok(());
-        }
-        let diff = similar::TextDiff::from_lines(&old_managed, &new_managed);
-        writeln!(
-            out,
-            "{}",
-            diff.unified_diff().context_radius(0).header(
-                "configured creative opportunities",
-                "generated creative opportunities"
+    let old_managed = managed_creative_projection(&existing)?;
+    let new_managed = managed_creative_projection(&updated)?;
+    if old_managed == new_managed {
+        // Stdout is the diff surface, so an English sentence there would
+        // break a redirected `--dry-run`; an empty diff is the stdout answer.
+        // Outside a dry run there is nothing to confirm, and rewriting the file
+        // would only churn its formatting.
+        let message = if request.dry_run {
+            "No managed creative-opportunity changes.".to_string()
+        } else {
+            format!(
+                "No managed creative-opportunity changes; {} left unchanged.",
+                request.config_path.display()
             )
-        )
-        .map_err(|error| report_error(format!("failed to write preview diff: {error}")))?;
+        };
+        writeln!(err, "{message}")
+            .map_err(|error| report_error(format!("failed to write preview output: {error}")))?;
+        return emit_template_note(err, uses_template);
+    }
+    let diff = managed_diff(&old_managed, &new_managed);
+    if request.dry_run {
+        emit_template_note(err, uses_template)?;
+        writeln!(out, "{diff}")
+            .map_err(|error| report_error(format!("failed to write preview diff: {error}")))?;
         return Ok(());
     }
-    let current = fs::read_to_string(request.config_path).map_err(|error| {
-        report_error(format!(
-            "failed to re-read config {} before writing: {error}",
-            request.config_path.display()
-        ))
-    })?;
-    if current != existing {
-        return cli_error(format!(
-            "refusing to overwrite {} because it changed during the browser audit; re-run against the current file",
-            request.config_path.display()
-        ));
-    }
+    // Checked before asking too, so the operator is not asked to approve a
+    // write that is already certain to be refused.
+    ensure_config_unchanged(request.config_path, &existing)?;
+    confirm_config_write(request, &diff, uses_template, err, input)?;
+    ensure_config_unchanged(request.config_path, &existing)?;
     // A writer could still land between this check and the rename below. That
     // window is microseconds against a browser crawl's minutes, and the rename
     // is atomic, so the loser of the race loses a whole write rather than half
@@ -1138,6 +1138,7 @@ pub(crate) fn run_update_slots(
             request.config_path.display()
         ))
     })?;
+    emit_template_note(err, uses_template)?;
     writeln!(
         out,
         "Wrote {} slot(s) to {} ({} slot(s) seen across {} page(s))",
@@ -1149,12 +1150,145 @@ pub(crate) fn run_update_slots(
     .map_err(|error| report_error(format!("failed to write command output: {error}")))
 }
 
+/// Warns that a `{section}` template config needs a template-aware binary
+/// deployed first, when `uses_template` is set.
+///
+/// # Errors
+///
+/// Returns an error when the note cannot be written.
+fn emit_template_note(err: &mut dyn Write, uses_template: bool) -> CliResult<()> {
+    if !uses_template {
+        return Ok(());
+    }
+    writeln!(
+        err,
+        "note: this config now uses a {{section}} ad-unit template. Deploy a \
+         template-aware binary BEFORE pushing it, and do not roll that binary \
+         back while this config is live — an older binary rejects the whole \
+         config and serves an error on every route."
+    )
+    .map_err(|error| report_error(format!("failed to write command output: {error}")))
+}
+
+/// Renders the zero-context unified diff between two managed projections.
+fn managed_diff(old_managed: &str, new_managed: &str) -> String {
+    similar::TextDiff::from_lines(old_managed, new_managed)
+        .unified_diff()
+        .context_radius(0)
+        .header(
+            "configured creative opportunities",
+            "generated creative opportunities",
+        )
+        .to_string()
+}
+
+/// Refuses the write when the config no longer matches the copy the candidate
+/// was built from.
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be re-read or has changed.
+fn ensure_config_unchanged(config_path: &Path, existing: &str) -> CliResult<()> {
+    let current = fs::read_to_string(config_path).map_err(|error| {
+        report_error(format!(
+            "failed to re-read config {} before writing: {error}",
+            config_path.display()
+        ))
+    })?;
+    if current != existing {
+        return cli_error(format!(
+            "refusing to overwrite {} because it changed during the browser audit or while awaiting confirmation; re-run against the current file",
+            config_path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Deploy-order warning shown in the preview of a `{section}` candidate,
+/// worded for a write that has not happened yet.
+const PREVIEW_TEMPLATE_NOTE: &str = "note: this candidate uses a {section} ad-unit \
+     template; deploy a template-aware binary BEFORE pushing the config.";
+
+/// Previews a changed candidate on `err` and requires approval to write it.
+///
+/// `--yes` approves without reading `input`. Otherwise an operator at a
+/// terminal must answer `y` or `yes`; any other answer, including an empty
+/// line, bytes that are not UTF-8, or EOF, declines. Without a terminal the run
+/// fails instead of guessing.
+///
+/// # Errors
+///
+/// Returns an error when the operator declines, when the run is not interactive
+/// and `--yes` was not given, or when the preview or the answer cannot be
+/// written or read.
+fn confirm_config_write(
+    request: &UpdateSlotsRequest<'_>,
+    diff: &str,
+    uses_template: bool,
+    err: &mut dyn Write,
+    input: &mut dyn BufRead,
+) -> CliResult<()> {
+    let path = request.config_path.display();
+    let write_error =
+        |error: std::io::Error| report_error(format!("failed to write confirmation: {error}"));
+    writeln!(
+        err,
+        "Changes to managed creative-opportunity fields in {path}:"
+    )
+    .map_err(write_error)?;
+    // Slot ids, div ids and unit paths come from the audited page. Escaped
+    // per line (the helper would also escape the newlines), so bidi overrides
+    // and control sequences cannot reorder or hide what is being approved.
+    for line in diff.lines() {
+        writeln!(
+            err,
+            "{}",
+            crate::ad_templates::output::escape_terminal_text(line)
+        )
+        .map_err(write_error)?;
+    }
+    // Shown before the question rather than only after the write, because the
+    // deploy order is what the operator has to weigh before approving.
+    if uses_template {
+        writeln!(err, "{PREVIEW_TEMPLATE_NOTE}").map_err(write_error)?;
+    }
+    if request.replace {
+        writeln!(
+            err,
+            "warning: --replace discards every configured slot this crawl did not observe, \
+             and every hand-written field on the slots it did rediscover."
+        )
+        .map_err(write_error)?;
+    }
+    if request.yes {
+        return Ok(());
+    }
+    if !request.interactive {
+        return cli_error(format!(
+            "refusing to update {path} without confirmation because stdin or stderr is not a terminal; re-run with --yes to apply these changes, or with --dry-run to preview only"
+        ));
+    }
+    write!(err, "Apply these changes to {path}? [y/N] ").map_err(write_error)?;
+    err.flush().map_err(write_error)?;
+    // Bytes rather than a `String`, so an answer that is not UTF-8 is a
+    // decline instead of a read failure.
+    let mut answer = Vec::new();
+    input
+        .read_until(b'\n', &mut answer)
+        .map_err(|error| report_error(format!("failed to read confirmation: {error}")))?;
+    let answer = answer.trim_ascii().to_ascii_lowercase();
+    if answer != b"y" && answer != b"yes" {
+        return cli_error(format!("not applied; {path} left unchanged"));
+    }
+    Ok(())
+}
+
 /// Renders only fields managed by ad-template generation, excluding secrets and
-/// unrelated operator configuration from dry-run output.
+/// unrelated operator configuration from the previewed diff.
 fn managed_creative_projection(document: &str) -> CliResult<String> {
     let value = toml::from_str::<toml::Value>(document).map_err(|error| {
         report_error(format!(
-            "failed to parse config for dry-run diff{}",
+            "failed to parse config for the managed-field diff{}",
             toml_error_location(document, error.span())
         ))
     })?;
@@ -1820,12 +1954,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut out,
             &mut progress_writer,
+            &mut io::empty(),
         )
         .expect("should generate slots");
 
@@ -2910,12 +3047,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut out,
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect("should update slots");
 
@@ -2978,12 +3118,15 @@ mod tests {
                     replace: false,
                     cookies: &[],
                     dry_run: true,
+                    yes: false,
+                    interactive: false,
                     scroll,
                     budget: CrawlBudget::default(),
                 },
                 &[("desktop", &collector)],
                 &mut out,
                 &mut notes,
+                &mut io::empty(),
             )
             .expect("should preserve unobserved slot");
 
@@ -3070,12 +3213,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: true,
+                yes: false,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &desktop), ("mobile", &mobile)],
             &mut out,
             &mut notes,
+            &mut io::empty(),
         )
         .expect("the accepted slot should let generation complete");
 
@@ -3126,12 +3272,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: true,
+                yes: false,
+                interactive: false,
                 scroll: true,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut std::io::sink(),
             &mut notes,
+            &mut io::empty(),
         )
         .expect("should preserve the configured ambiguous placement");
 
@@ -3207,12 +3356,15 @@ mod tests {
                     replace: false,
                     cookies: &[],
                     dry_run: true,
+                    yes: false,
+                    interactive: false,
                     scroll: true,
                     budget: CrawlBudget::default(),
                 },
                 &[("desktop", &collector)],
                 &mut std::io::sink(),
                 &mut notes,
+                &mut io::empty(),
             )
             .expect("the stable slot should let generation complete");
 
@@ -3261,12 +3413,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut std::io::sink(),
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect("should write static locale-root slot");
 
@@ -3307,12 +3462,15 @@ mod tests {
                 replace: false,
                 cookies: &[("session".to_string(), "secret".to_string())],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut std::io::sink(),
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect_err("cross-origin redirect must leave the requested trust boundary");
 
@@ -3365,12 +3523,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 budget: CrawlBudget::default(),
                 scroll: false,
             },
             &[("desktop", &collector)],
             &mut std::io::sink(),
             &mut err,
+            &mut io::empty(),
         )
         .expect("should generate from the same-origin evidence alone");
 
@@ -3449,12 +3610,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 budget: CrawlBudget::default(),
                 scroll: false,
             },
             &[("desktop", &desktop), ("mobile", &mobile)],
             &mut std::io::sink(),
             &mut err,
+            &mut io::empty(),
         )
         .expect("the same-origin pages of both profiles agree");
 
@@ -3503,12 +3667,15 @@ mod tests {
                 replace: false,
                 cookies: &[("session".to_string(), "secret".to_string())],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut std::io::sink(),
             &mut notes,
+            &mut io::empty(),
         )
         .expect("a same-host HTTPS upgrade should not be treated as cross-origin");
 
@@ -3550,12 +3717,15 @@ mod tests {
                 replace: false,
                 cookies: &[("session".to_string(), "secret".to_string())],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut std::io::sink(),
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect_err("an HTTPS downgrade must leave the requested trust boundary");
 
@@ -3584,12 +3754,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &desktop), ("mobile", &FailingCollector)],
             &mut std::io::sink(),
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect_err("a selected profile with no usable page must refuse generation");
 
@@ -3619,12 +3792,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut out,
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect_err("should reject an invalid glob");
 
@@ -3687,12 +3863,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut std::io::sink(),
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect_err("explicit patterns cannot preserve borrowed-root safety");
 
@@ -3729,12 +3908,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut out,
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect("should accept a runtime-normalisable pattern");
 
@@ -3767,12 +3949,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut out,
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect("should update slots");
 
@@ -3819,17 +4004,11 @@ mod tests {
             )
     }
 
-    #[test]
-    fn a_crawl_writes_a_section_template_and_per_section_patterns() {
-        // The end-to-end payoff: crawl sections, reconcile the slot across them,
-        // infer `{section}`, and write a config the runtime loads.
-        let temp = TempDir::new().expect("should create temp dir");
-        let config_path = temp.path().join("trusted-server.toml");
-        let original = loadable_config();
-        fs::write(&config_path, &original).expect("should write config");
-
+    /// A three-page site whose header ad unit tracks the section, so the crawl
+    /// infers a `{section}` template.
+    fn templated_site_collector() -> SiteCollector {
         let nav = ["/news", "/deals"];
-        let collector = SiteCollector::new(vec![
+        SiteCollector::new(vec![
             (
                 "https://publisher.example/",
                 site_page(
@@ -3854,7 +4033,19 @@ mod tests {
                     &nav,
                 ),
             ),
-        ]);
+        ])
+    }
+
+    #[test]
+    fn a_crawl_writes_a_section_template_and_per_section_patterns() {
+        // The end-to-end payoff: crawl sections, reconcile the slot across them,
+        // infer `{section}`, and write a config the runtime loads.
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let original = loadable_config();
+        fs::write(&config_path, &original).expect("should write config");
+
+        let collector = templated_site_collector();
         let mut out = Vec::new();
         let mut err = Vec::new();
 
@@ -3867,12 +4058,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut out,
             &mut err,
+            &mut io::empty(),
         )
         .expect("should crawl and update slots");
 
@@ -3974,12 +4168,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &desktop), ("mobile", &mobile)],
             &mut out,
             &mut err,
+            &mut io::empty(),
         )
         .expect_err("an all-refused crawl must not write an empty slot array");
 
@@ -4050,12 +4247,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &desktop), ("mobile", &mobile)],
             &mut out,
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect_err("an all-refused crawl must not write an empty slot array");
 
@@ -4110,12 +4310,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut out,
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect_err("a mostly-challenged crawl should refuse");
 
@@ -4156,6 +4359,8 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget {
                     max_sections: 8,
@@ -4165,6 +4370,7 @@ mod tests {
             &[("desktop", &collector)],
             &mut out,
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect("should update from the single page");
 
@@ -4211,12 +4417,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut out,
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect("should update slots");
 
@@ -4309,12 +4518,15 @@ mod tests {
                         replace: false,
                         cookies: &[],
                         dry_run: true,
+                        yes: false,
+                        interactive: false,
                         scroll: false,
                         budget: CrawlBudget::default(),
                     },
                     &[("desktop", &collector)],
                     &mut out,
                     &mut std::io::sink(),
+                    &mut io::empty(),
                 )
                 .expect("should render dry-run update");
 
@@ -4360,12 +4572,15 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                yes: true,
+                interactive: false,
                 scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
             &mut std::io::sink(),
             &mut std::io::sink(),
+            &mut io::empty(),
         )
         .expect_err("a stale update should be refused");
 
@@ -4374,6 +4589,717 @@ mod tests {
             fs::read_to_string(&config_path).expect("should re-read config"),
             replacement,
             "the concurrent edit must not be overwritten"
+        );
+    }
+
+    /// The prompt line every interactive confirmation ends with.
+    const APPLY_PROMPT: &str = "? [y/N] ";
+
+    /// Write-gate settings for one `run_update_slots` call.
+    struct WriteGate<'a> {
+        existing_creative: Option<&'a CreativeOpportunitiesConfig>,
+        replace: bool,
+        dry_run: bool,
+        yes: bool,
+        interactive: bool,
+    }
+
+    /// What a write-gate run returned and printed.
+    struct WriteGateRun {
+        result: CliResult<()>,
+        stdout: String,
+        stderr: String,
+    }
+
+    /// Runs a header-slot crawl against `config_path` through the write gate.
+    fn run_write_gate(
+        config_path: &Path,
+        gate: &WriteGate<'_>,
+        input: &mut dyn BufRead,
+    ) -> WriteGateRun {
+        let collector = FakeCollector::new(collected_page_with_header_slot());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path,
+                existing_creative: gate.existing_creative,
+                page_patterns: &[],
+                replace: gate.replace,
+                cookies: &[],
+                dry_run: gate.dry_run,
+                yes: gate.yes,
+                interactive: gate.interactive,
+                scroll: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut out,
+            &mut err,
+            input,
+        );
+        WriteGateRun {
+            result,
+            stdout: String::from_utf8(out).expect("should decode stdout as UTF-8"),
+            stderr: String::from_utf8(err).expect("should decode stderr as UTF-8"),
+        }
+    }
+
+    /// An interactive run with no prior slots, so the crawl changes the config.
+    fn interactive_gate() -> WriteGate<'static> {
+        WriteGate {
+            existing_creative: None,
+            replace: false,
+            dry_run: false,
+            yes: false,
+            interactive: true,
+        }
+    }
+
+    /// A loadable config whose managed fields the header-slot crawl changes.
+    fn write_changing_config(temp: &TempDir) -> (std::path::PathBuf, String) {
+        let config_path = temp.path().join("trusted-server.toml");
+        let original = loadable_config();
+        fs::write(&config_path, &original).expect("should write config");
+        (config_path, original)
+    }
+
+    /// A loadable config already holding the header slot plus an unobserved
+    /// sidebar slot, under the crawl's network id.
+    fn write_config_with_header_and_sidebar(temp: &TempDir) -> (std::path::PathBuf, String) {
+        let config_path = temp.path().join("trusted-server.toml");
+        let mut original =
+            loadable_config().replace("gam_network_id = \"123456789\"", "gam_network_id = \"222\"");
+        original.push_str(
+            "\n[[creative_opportunities.slot]]\n\
+             id = \"header\"\n\
+             div_id = \"div-gpt-ad-header\"\n\
+             gam_unit_path = \"/222/homepage/header\"\n\
+             page_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n\n\
+             [[creative_opportunities.slot]]\n\
+             id = \"sidebar\"\n\
+             div_id = \"ad-sidebar\"\n\
+             gam_unit_path = \"/222/sidebar\"\n\
+             page_patterns = [\"/news/*\"]\n\
+             formats = [{ width = 300, height = 250 }]\n",
+        );
+        fs::write(&config_path, &original).expect("should write config");
+        (config_path, original)
+    }
+
+    /// Asserts the run declined: a non-zero outcome that says the file was kept.
+    fn assert_declined(run: &WriteGateRun, case: &str) {
+        let error = run
+            .result
+            .as_ref()
+            .expect_err(&format!("should fail a declined update ({case})"));
+        assert!(
+            format!("{error:?}").contains("left unchanged"),
+            "a decline ({case}) should say the config was left alone, got {error:?}"
+        );
+    }
+
+    fn read_config(config_path: &Path) -> String {
+        fs::read_to_string(config_path).expect("should read config")
+    }
+
+    #[test]
+    fn update_slots_prompt_shows_target_and_diff_then_writes_after_yes() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+        let mut input = io::Cursor::new(b"yes\n".to_vec());
+
+        let run = run_write_gate(&config_path, &interactive_gate(), &mut input);
+
+        run.result.expect("should apply a confirmed update");
+        let written = read_config(&config_path);
+        assert_ne!(
+            written, original,
+            "a confirmed update should write the config"
+        );
+        assert!(
+            written.contains("div-gpt-ad-header"),
+            "the written config should carry the discovered slot, got {written:?}"
+        );
+        let target = config_path.display().to_string();
+        assert!(
+            run.stderr.contains(&target),
+            "the preview should name the target path, got {:?}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("+++ generated creative opportunities")
+                && run.stderr.contains("div-gpt-ad-header"),
+            "the preview should show the managed-field diff, got {:?}",
+            run.stderr
+        );
+        let diff_at = run
+            .stderr
+            .find("+++ generated creative opportunities")
+            .expect("should print the diff");
+        let prompt_at = run
+            .stderr
+            .find(APPLY_PROMPT)
+            .expect("should ask before writing");
+        assert!(diff_at < prompt_at, "the diff should precede the prompt");
+        assert!(
+            !run.stdout.contains("+++"),
+            "the prompt preview must stay off stdout, got {:?}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("Wrote 1 slot(s)"),
+            "should report the write on stdout, got {:?}",
+            run.stdout
+        );
+        assert!(
+            !run.stderr.contains("{section} ad-unit template"),
+            "a literal-path candidate must not carry a template deploy note, got {:?}",
+            run.stderr
+        );
+    }
+
+    #[test]
+    fn update_slots_prompt_accepts_only_an_explicit_yes() {
+        for answer in ["y\n", "Y\n", "yes\n", "YES\n", "  yes  \n", "yes"] {
+            let temp = TempDir::new().expect("should create temp dir");
+            let (config_path, original) = write_changing_config(&temp);
+            let mut input = io::Cursor::new(answer.as_bytes().to_vec());
+
+            let run = run_write_gate(&config_path, &interactive_gate(), &mut input);
+
+            run.result.expect("should apply an accepted update");
+            assert_ne!(
+                read_config(&config_path),
+                original,
+                "answer {answer:?} should apply the update"
+            );
+        }
+        for answer in [
+            "\n",
+            "n\n",
+            "no\n",
+            "yess\n",
+            "yes please\n",
+            "ye\n",
+            "\u{feff}yes\n",
+        ] {
+            let temp = TempDir::new().expect("should create temp dir");
+            let (config_path, original) = write_changing_config(&temp);
+            let mut input = io::Cursor::new(answer.as_bytes().to_vec());
+
+            let run = run_write_gate(&config_path, &interactive_gate(), &mut input);
+
+            assert_declined(&run, &format!("answer {answer:?}"));
+            assert_eq!(
+                read_config(&config_path),
+                original,
+                "answer {answer:?} should leave the config untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn update_slots_prompt_decline_leaves_config_untouched() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+        let mut input = io::Cursor::new(b"no\n".to_vec());
+
+        let run = run_write_gate(&config_path, &interactive_gate(), &mut input);
+
+        assert_declined(&run, "a declined update");
+        assert_eq!(
+            read_config(&config_path),
+            original,
+            "declining should leave the config byte-for-byte unchanged"
+        );
+        assert!(
+            run.stderr.contains(APPLY_PROMPT),
+            "should have asked, got {:?}",
+            run.stderr
+        );
+        assert!(
+            !run.stdout.contains("Wrote"),
+            "a declined update must not report a write, got {:?}",
+            run.stdout
+        );
+        let entries = fs::read_dir(temp.path())
+            .expect("should read temp dir")
+            .count();
+        assert_eq!(entries, 1, "declining should leave no temp file behind");
+    }
+
+    #[test]
+    fn update_slots_prompt_eof_declines() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+
+        let run = run_write_gate(&config_path, &interactive_gate(), &mut io::empty());
+
+        assert_declined(&run, "EOF");
+        assert_eq!(
+            read_config(&config_path),
+            original,
+            "EOF should leave the config untouched"
+        );
+    }
+
+    #[test]
+    fn update_slots_without_a_terminal_refuses_unless_preapproved() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+        let mut input = io::Cursor::new(b"yes\n".to_vec());
+        let gate = WriteGate {
+            interactive: false,
+            ..interactive_gate()
+        };
+
+        let run = run_write_gate(&config_path, &gate, &mut input);
+
+        let error = run
+            .result
+            .expect_err("should refuse a non-interactive run without --yes");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("--yes") && message.contains("--dry-run"),
+            "the refusal should name both ways forward, got {message}"
+        );
+        assert_eq!(
+            read_config(&config_path),
+            original,
+            "a refused run should leave the config untouched"
+        );
+        assert_eq!(
+            input.position(),
+            0,
+            "a non-interactive run must not read an answer from piped input"
+        );
+        assert!(
+            !run.stderr.contains(APPLY_PROMPT),
+            "a non-interactive run must not prompt, got {:?}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("+++ generated creative opportunities"),
+            "the refused changes should still be previewed on stderr, got {:?}",
+            run.stderr
+        );
+    }
+
+    #[test]
+    fn update_slots_yes_writes_without_prompting() {
+        for interactive in [false, true] {
+            let temp = TempDir::new().expect("should create temp dir");
+            let (config_path, original) = write_changing_config(&temp);
+            let mut input = io::Cursor::new(b"no\n".to_vec());
+            let gate = WriteGate {
+                yes: true,
+                interactive,
+                ..interactive_gate()
+            };
+
+            let run = run_write_gate(&config_path, &gate, &mut input);
+
+            run.result.expect("should apply the update with --yes");
+            assert_ne!(
+                read_config(&config_path),
+                original,
+                "--yes should write the config (interactive: {interactive})"
+            );
+            assert_eq!(
+                input.position(),
+                0,
+                "--yes must not read an answer (interactive: {interactive})"
+            );
+            assert!(
+                !run.stderr.contains(APPLY_PROMPT),
+                "--yes must not prompt (interactive: {interactive}), got {:?}",
+                run.stderr
+            );
+        }
+    }
+
+    #[test]
+    fn update_slots_replace_warns_before_the_prompt() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_config_with_header_and_sidebar(&temp);
+        let existing = crate::commands::audit::creative_config(&original, &config_path)
+            .expect("should parse config")
+            .expect("should have creative opportunities");
+        let mut input = io::Cursor::new(b"n\n".to_vec());
+        let gate = WriteGate {
+            existing_creative: Some(&existing),
+            replace: true,
+            ..interactive_gate()
+        };
+
+        let run = run_write_gate(&config_path, &gate, &mut input);
+
+        assert_declined(&run, "a declined --replace");
+        assert_eq!(
+            read_config(&config_path),
+            original,
+            "a declined replace must keep every configured slot"
+        );
+        let warning_at = run
+            .stderr
+            .find("--replace discards")
+            .expect("should warn about what --replace discards");
+        let prompt_at = run
+            .stderr
+            .find(APPLY_PROMPT)
+            .expect("should still ask before writing");
+        assert!(
+            warning_at < prompt_at,
+            "the --replace warning should precede the prompt, got {:?}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("hand-written"),
+            "the warning should say hand-written fields are lost, got {:?}",
+            run.stderr
+        );
+        assert!(
+            run.stderr
+                .lines()
+                .any(|line| line.starts_with('-') && line.contains("sidebar")),
+            "the preview should show the pruned slot as removed, got {:?}",
+            run.stderr
+        );
+    }
+
+    #[test]
+    fn update_slots_without_replace_does_not_warn_about_replace() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, _) = write_changing_config(&temp);
+
+        let run = run_write_gate(&config_path, &interactive_gate(), &mut io::empty());
+
+        assert_declined(&run, "a declined update");
+        assert!(
+            !run.stderr.contains("--replace discards"),
+            "a merge must not carry the --replace warning, got {:?}",
+            run.stderr
+        );
+    }
+
+    #[test]
+    fn update_slots_unchanged_candidate_neither_prompts_nor_writes() {
+        for interactive in [false, true] {
+            let temp = TempDir::new().expect("should create temp dir");
+            let (config_path, original) = write_config_with_header_and_sidebar(&temp);
+            let existing = crate::commands::audit::creative_config(&original, &config_path)
+                .expect("should parse config")
+                .expect("should have creative opportunities");
+            let modified_before = fs::metadata(&config_path)
+                .and_then(|metadata| metadata.modified())
+                .expect("should read config mtime");
+            let mut input = io::Cursor::new(b"yes\n".to_vec());
+            let gate = WriteGate {
+                existing_creative: Some(&existing),
+                interactive,
+                ..interactive_gate()
+            };
+
+            let run = run_write_gate(&config_path, &gate, &mut input);
+
+            run.result
+                .expect("should succeed for an unchanged candidate without --yes");
+            assert_eq!(
+                read_config(&config_path),
+                original,
+                "an unchanged candidate must not rewrite the config"
+            );
+            assert_eq!(
+                fs::metadata(&config_path)
+                    .and_then(|metadata| metadata.modified())
+                    .expect("should read config mtime"),
+                modified_before,
+                "an unchanged candidate must not replace the file"
+            );
+            assert_eq!(input.position(), 0, "nothing to apply means no prompt");
+            assert!(
+                run.stderr
+                    .contains("No managed creative-opportunity changes"),
+                "should report that there is nothing to apply, got {:?}",
+                run.stderr
+            );
+            assert!(
+                !run.stdout.contains("Wrote"),
+                "should not report a write, got {:?}",
+                run.stdout
+            );
+        }
+    }
+
+    #[test]
+    fn update_slots_dry_run_never_prompts() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+        let mut input = io::Cursor::new(b"yes\n".to_vec());
+        let gate = WriteGate {
+            dry_run: true,
+            ..interactive_gate()
+        };
+
+        let run = run_write_gate(&config_path, &gate, &mut input);
+
+        run.result.expect("should render the dry run");
+        assert_eq!(
+            read_config(&config_path),
+            original,
+            "dry run must stay read-only"
+        );
+        assert_eq!(input.position(), 0, "dry run must not read an answer");
+        assert!(
+            !run.stderr.contains(APPLY_PROMPT),
+            "dry run must not prompt, got {:?}",
+            run.stderr
+        );
+        assert!(
+            run.stdout
+                .starts_with("--- configured creative opportunities\n"),
+            "dry run should keep its stdout diff, got {:?}",
+            run.stdout
+        );
+    }
+
+    /// Input that edits the config while the operator is "reading" the prompt,
+    /// then answers yes.
+    struct EditingAnswer {
+        config_path: std::path::PathBuf,
+        replacement: String,
+        answer: io::Cursor<Vec<u8>>,
+        edited: bool,
+    }
+
+    impl io::Read for EditingAnswer {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let available = self.fill_buf()?;
+            let count = available.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&available[..count]);
+            self.consume(count);
+            Ok(count)
+        }
+    }
+
+    impl BufRead for EditingAnswer {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if !self.edited {
+                self.edited = true;
+                fs::write(&self.config_path, &self.replacement)?;
+            }
+            self.answer.fill_buf()
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.answer.consume(amount);
+        }
+    }
+
+    #[test]
+    fn update_slots_refuses_to_overwrite_a_config_changed_during_the_prompt() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+        let replacement = format!("{original}\n# edited while the prompt was open\n");
+        let mut input = EditingAnswer {
+            config_path: config_path.clone(),
+            replacement: replacement.clone(),
+            answer: io::Cursor::new(b"yes\n".to_vec()),
+            edited: false,
+        };
+
+        let run = run_write_gate(&config_path, &interactive_gate(), &mut input);
+
+        assert!(input.edited, "the prompt should have read an answer");
+        let error = run
+            .result
+            .expect_err("should refuse an update confirmed against a stale file");
+        assert!(
+            format!("{error:?}").contains("refusing to overwrite"),
+            "the refusal should say the file changed, got {error:?}"
+        );
+        assert_eq!(
+            read_config(&config_path),
+            replacement,
+            "the edit made during the prompt must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn update_slots_does_not_ask_to_apply_a_config_changed_during_the_crawl() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+        let replacement = format!("{original}\n# edited while the browser was running\n");
+        let collector = MutatingCollector {
+            collected: collected_page_with_header_slot(),
+            config_path: config_path.clone(),
+            replacement: replacement.clone(),
+        };
+        let mut input = io::Cursor::new(b"yes\n".to_vec());
+        let mut err = Vec::new();
+
+        let result = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                yes: false,
+                interactive: true,
+                scroll: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut io::sink(),
+            &mut err,
+            &mut input,
+        );
+
+        let stderr = String::from_utf8(err).expect("should decode stderr as UTF-8");
+        let error = result.expect_err("should refuse an update built from a stale file");
+        assert!(
+            format!("{error:?}").contains("refusing to overwrite"),
+            "the refusal should say the file changed, got {error:?}"
+        );
+        assert!(
+            !stderr.contains(APPLY_PROMPT),
+            "a write already certain to be refused must not be offered, got {stderr:?}"
+        );
+        assert_eq!(
+            input.position(),
+            0,
+            "a stale file should be refused before an answer is read"
+        );
+        assert_eq!(
+            read_config(&config_path),
+            replacement,
+            "the edit made during the crawl must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn update_slots_prompt_treats_a_non_utf8_answer_as_a_decline() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+        let mut input = io::Cursor::new(b"\xffyes\n".to_vec());
+
+        let run = run_write_gate(&config_path, &interactive_gate(), &mut input);
+
+        assert_declined(&run, "a non-UTF-8 answer");
+        assert_eq!(
+            read_config(&config_path),
+            original,
+            "a non-UTF-8 answer should leave the config untouched"
+        );
+    }
+
+    #[test]
+    fn update_slots_prompt_escapes_page_controlled_text_in_the_preview() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+        let mut collected = collected_page_with_header_slot();
+        collected.gpt_slots[0].div_id = "div-gpt-ad-\u{202e}redaeh".to_string();
+        let collector = FakeCollector::new(collected);
+        let mut err = Vec::new();
+
+        let result = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                yes: false,
+                interactive: true,
+                scroll: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut io::sink(),
+            &mut err,
+            &mut io::empty(),
+        );
+
+        let stderr = String::from_utf8(err).expect("should decode stderr as UTF-8");
+        assert!(
+            stderr.contains("+++ generated creative opportunities"),
+            "the run should reach the preview, got {result:?} with {stderr:?}"
+        );
+        assert!(
+            !stderr.contains('\u{202e}'),
+            "a page-supplied bidi override must not reach the terminal, got {stderr:?}"
+        );
+        assert!(
+            stderr.contains("\\u{202E}"),
+            "the override should be shown escaped, got {stderr:?}"
+        );
+        assert_eq!(
+            read_config(&config_path),
+            original,
+            "EOF at the prompt should leave the config untouched"
+        );
+    }
+
+    #[test]
+    fn update_slots_declined_template_omits_the_deploy_order_note() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+        let collector = templated_site_collector();
+        let mut input = io::Cursor::new(b"n\n".to_vec());
+        let mut err = Vec::new();
+
+        let result = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                yes: false,
+                interactive: true,
+                scroll: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut io::sink(),
+            &mut err,
+            &mut input,
+        );
+
+        let stderr = String::from_utf8(err).expect("should decode stderr as UTF-8");
+        result.expect_err("should fail a declined update");
+        assert!(
+            stderr.contains("+section_root = "),
+            "the preview should show the templated candidate, got {stderr:?}"
+        );
+        let note = stderr
+            .find(PREVIEW_TEMPLATE_NOTE)
+            .expect("the preview should warn about deploy order before asking");
+        let prompt = stderr
+            .find(APPLY_PROMPT)
+            .expect("the run should reach the prompt");
+        assert!(
+            note < prompt,
+            "the deploy-order warning should precede the question, got {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("this config now uses"),
+            "a declined write must not claim the config now uses a template, got {stderr:?}"
+        );
+        assert_eq!(
+            read_config(&config_path),
+            original,
+            "a declined template should leave the config untouched"
         );
     }
 

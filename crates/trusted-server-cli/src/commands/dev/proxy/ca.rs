@@ -305,6 +305,7 @@ mod tests {
 
     #[test]
     fn leaf_cache_returns_same_arc_for_same_host() {
+        crate::tls::install_crypto_provider();
         let dir = tempfile::tempdir().expect("should create tempdir");
         let ca = CertAuthority::load_or_generate(dir.path()).expect("should generate");
         let a = ca
@@ -322,6 +323,7 @@ mod tests {
 
     #[test]
     fn leaf_cache_normalizes_dns_case() {
+        crate::tls::install_crypto_provider();
         let dir = tempfile::tempdir().expect("should create tempdir");
         let ca = CertAuthority::load_or_generate(dir.path()).expect("should generate");
         let lower = ca
@@ -335,6 +337,7 @@ mod tests {
 
     #[test]
     fn mints_leaf_for_ip_literal_host() {
+        crate::tls::install_crypto_provider();
         // An IP-literal host must mint successfully (IP-type SAN, not DNS) — spec §8.3.
         let dir = tempfile::tempdir().expect("should create tempdir");
         let ca = CertAuthority::load_or_generate(dir.path()).expect("should generate");
