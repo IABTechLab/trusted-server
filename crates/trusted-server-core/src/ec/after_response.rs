@@ -55,27 +55,28 @@ pub fn after_response_lookups_allowed(
 
 /// Applies after-response lookup results to the row of `ec_id`.
 ///
-/// Plans an update from `lookups` alone against `snapshot`, the row read
-/// after the response was sent, and writes it once, guarded by the snapshot's
-/// generation. The `permit` is consumed whether or not a write is
-/// made.
+/// Re-reads the row just before writing, plans an update from `lookups`
+/// alone against it, and writes it once, guarded by that read's generation.
+/// Reading here rather than before dispatch keeps the window in which another
+/// write can conflict to the gap between this read and the write. The
+/// `permit` is consumed whether or not a write is made.
 ///
 /// # Performance
 ///
-/// At most one conditional KV write; the row is read by the caller.
-/// Runs after the response has been sent, so it adds no page latency.
+/// One KV read and at most one conditional KV write. Runs after the response
+/// has been sent, so it adds no page latency.
 #[must_use]
 pub fn commit_after_response_lookups(
     graph: &KvIdentityGraph,
     permit: AfterResponseWrite,
     registry: &PartnerRegistry,
     ec_id: &str,
-    snapshot: &EcKvSnapshot,
     lookups: &LookupResults,
 ) -> AfterResponseOutcome {
     if lookups.is_empty() {
         return AfterResponseOutcome::Unchanged;
     }
+    let snapshot = &graph.load_snapshot(ec_id);
     if !matches!(snapshot, EcKvSnapshot::Present { .. }) {
         log::info!(
             "After-response lookups: no row for '{}', skipping write",
@@ -205,7 +206,6 @@ mod tests {
             AfterResponseWrite::for_test(),
             &registry(),
             EC_ID,
-            &graph.load_snapshot(EC_ID),
             &found(EC_ID, "p-1"),
         );
 
@@ -227,6 +227,48 @@ mod tests {
     }
 
     #[test]
+    fn writes_against_the_row_as_read_just_before_the_write() {
+        // Arrange
+        let graph = KvIdentityGraph::in_memory("after-response-reread");
+        graph.create(EC_ID, &live_entry()).expect("should seed row");
+        let read_before_dispatch = graph.load_snapshot(EC_ID);
+        graph
+            .upsert_partner_id(EC_ID, "browser.example.com", "b-2")
+            .expect("should rewrite the row as another request would");
+        assert_ne!(
+            graph.load_snapshot(EC_ID),
+            read_before_dispatch,
+            "should change the row after the dispatch read"
+        );
+
+        // Act
+        let outcome = commit_after_response_lookups(
+            &graph,
+            AfterResponseWrite::for_test(),
+            &registry(),
+            EC_ID,
+            &found(EC_ID, "p-1"),
+        );
+
+        // Assert
+        assert_eq!(
+            outcome,
+            AfterResponseOutcome::Written,
+            "should not conflict with a write made while the lookups ran"
+        );
+        assert_eq!(
+            stored_uid(&graph, "browser.example.com").as_deref(),
+            Some("b-2"),
+            "should keep the other request's write"
+        );
+        assert_eq!(
+            stored_uid(&graph, "ids.example.com").as_deref(),
+            Some("p-1"),
+            "should store the provider UID"
+        );
+    }
+
+    #[test]
     fn replaces_a_browser_fallback_for_an_owned_source() {
         let graph = KvIdentityGraph::in_memory("after-response");
         let mut entry = live_entry();
@@ -241,7 +283,6 @@ mod tests {
             AfterResponseWrite::for_test(),
             &registry(),
             EC_ID,
-            &graph.load_snapshot(EC_ID),
             &found(EC_ID, "p-1"),
         );
 
@@ -266,7 +307,6 @@ mod tests {
             AfterResponseWrite::for_test(),
             &registry(),
             EC_ID,
-            &graph.load_snapshot(EC_ID),
             &found(EC_ID, "p-1"),
         );
         assert_eq!(first, AfterResponseOutcome::Written, "should write first");
@@ -276,7 +316,6 @@ mod tests {
             AfterResponseWrite::for_test(),
             &registry(),
             EC_ID,
-            &graph.load_snapshot(EC_ID),
             &found(EC_ID, "p-1"),
         );
 
@@ -296,7 +335,6 @@ mod tests {
             AfterResponseWrite::for_test(),
             &registry(),
             EC_ID,
-            &graph.load_snapshot(EC_ID),
             &found(EC_ID, "p-1"),
         );
 
@@ -323,7 +361,6 @@ mod tests {
             AfterResponseWrite::for_test(),
             &registry(),
             EC_ID,
-            &graph.load_snapshot(EC_ID),
             &found(EC_ID, "p-1"),
         );
 
@@ -349,7 +386,6 @@ mod tests {
             AfterResponseWrite::for_test(),
             &registry(),
             EC_ID,
-            &graph.load_snapshot(EC_ID),
             &found(other, "p-1"),
         );
 
@@ -374,7 +410,6 @@ mod tests {
             AfterResponseWrite::for_test(),
             &registry(),
             EC_ID,
-            &graph.load_snapshot(EC_ID),
             &LookupResults::new(EC_ID, Vec::new()),
         );
 

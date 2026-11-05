@@ -826,14 +826,8 @@ fn run_after_response_lookups(
         return;
     }
     let results = futures::executor::block_on(coordinator.collect(&transport, pending));
-    let outcome = commit_after_response_lookups(
-        &graph,
-        permit,
-        partner_registry,
-        &lookups.ec_id,
-        &snapshot,
-        &results,
-    );
+    let outcome =
+        commit_after_response_lookups(&graph, permit, partner_registry, &lookups.ec_id, &results);
     log::info!("After-response lookups: write outcome={outcome}");
 }
 
