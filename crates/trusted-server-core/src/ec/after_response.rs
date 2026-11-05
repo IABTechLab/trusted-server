@@ -35,6 +35,24 @@ pub enum AfterResponseOutcome {
     Failed,
 }
 
+/// Whether after-response lookups may be dispatched for `ec_id`.
+///
+/// They run only for an EC that existed before this navigation and whose row,
+/// read after the response was sent, is live and consented. An EC minted on
+/// this navigation is skipped: no partner can know it yet, and its new row
+/// may not be readable so soon. Its lookups run from the next navigation.
+#[must_use]
+pub fn after_response_lookups_allowed(
+    snapshot: &EcKvSnapshot,
+    ec_id: &str,
+    ec_generated: bool,
+) -> bool {
+    !ec_generated
+        && snapshot
+            .entry_for(ec_id)
+            .is_some_and(|entry| entry.consent.ok)
+}
+
 /// Applies after-response lookup results to the row of `ec_id`.
 ///
 /// Plans an update from `lookups` alone against `snapshot`, the row read
@@ -364,6 +382,38 @@ mod tests {
             outcome,
             AfterResponseOutcome::Unchanged,
             "should make no write without results"
+        );
+    }
+
+    #[test]
+    fn lookups_run_only_for_an_existing_consented_row() {
+        // Arrange
+        let graph = KvIdentityGraph::in_memory("after_response_allowed");
+        let missing = graph.load_snapshot(EC_ID);
+        graph.create(EC_ID, &live_entry()).expect("should seed row");
+        let present = graph.load_snapshot(EC_ID);
+        let withdrawn_graph = KvIdentityGraph::in_memory("after_response_withdrawn");
+        withdrawn_graph
+            .create(EC_ID, &KvEntry::tombstone(1000))
+            .expect("should seed tombstone");
+        let withdrawn = withdrawn_graph.load_snapshot(EC_ID);
+
+        // Act + Assert
+        assert!(
+            after_response_lookups_allowed(&present, EC_ID, false),
+            "should run for a returning EC with a live row"
+        );
+        assert!(
+            !after_response_lookups_allowed(&present, EC_ID, true),
+            "should not run for an EC minted on this navigation"
+        );
+        assert!(
+            !after_response_lookups_allowed(&missing, EC_ID, false),
+            "should not run when the row does not exist"
+        );
+        assert!(
+            !after_response_lookups_allowed(&withdrawn, EC_ID, false),
+            "should not run for a withdrawn row"
         );
     }
 }
