@@ -251,6 +251,31 @@ fn a_confirmed_or_pre_approved_delete_sends_delete_true() {
 }
 
 #[test]
+fn minimal_2xx_failure_body_surfaces_the_error_field() {
+    let server = FixtureServer::start(|_request| {
+        FixtureResponse::html(
+            serde_json::json!({
+                "success": false,
+                "error": "cannot deactivate the current signing key"
+            })
+            .to_string(),
+        )
+    });
+
+    let (outcome, rendered) = run_with(
+        deactivate(&server, false, false),
+        &mut ScriptedConfirm::new(false, false),
+    );
+
+    let error = outcome.expect_err("should exit non-zero on a refusal");
+    assert!(
+        error.contains("cannot deactivate the current signing key"),
+        "should show the server's error, not a missing-field parse error: {error}"
+    );
+    assert!(rendered.is_empty(), "should print no success output");
+}
+
+#[test]
 fn server_refusals_exit_non_zero_with_the_error_field() {
     for (status, error_text) in [
         (400u16, "kid must start with a lowercase ASCII letter"),

@@ -137,7 +137,6 @@ fn deactivate_body(args: &DeactivateArgs) -> String {
 
 #[derive(Deserialize)]
 struct RotateResponse {
-    success: bool,
     new_kid: String,
     previous_kid: Option<String>,
     active_kids: Vec<String>,
@@ -145,10 +144,15 @@ struct RotateResponse {
 
 #[derive(Deserialize)]
 struct DeactivateResponse {
-    success: bool,
     deactivated_kid: String,
     deleted: bool,
     remaining_active_kids: Vec<String>,
+}
+
+/// The `success` flag every key route returns, read before the full body.
+#[derive(Deserialize)]
+struct SuccessFlag {
+    success: bool,
 }
 
 /// The failure fields every key route returns.
@@ -234,17 +238,16 @@ fn join_kids(kids: &[String]) -> String {
 /// deactivating the current kid, deactivating the last active key) reach the operator.
 fn parse_success<T>(response: &AdminResponse, operation: &str) -> CliResult<T>
 where
-    T: for<'de> Deserialize<'de> + HasSuccess,
+    T: for<'de> Deserialize<'de>,
 {
     let status = response.status;
-    if status.is_success() {
-        match serde_json::from_str::<T>(&response.body) {
-            Ok(parsed) if parsed.success() => return Ok(parsed),
-            Ok(_) => {}
-            Err(error) => {
-                return cli_error(format!("{operation} returned an invalid response: {error}"));
-            }
-        }
+    // A `success: false` body may omit the success fields, so check the flag first.
+    let reported_success =
+        serde_json::from_str::<SuccessFlag>(&response.body).is_ok_and(|flag| flag.success);
+    if status.is_success() && reported_success {
+        return serde_json::from_str::<T>(&response.body).or_else(|error| {
+            cli_error(format!("{operation} returned an invalid response: {error}"))
+        });
     }
 
     let hint = match status.as_u16() {
@@ -260,23 +263,6 @@ where
         cli_error(format!("{operation} failed: {status}{hint}"))
     } else {
         cli_error(format!("{operation} failed: {status}{hint}\n{detail}"))
-    }
-}
-
-/// Access to the `success` flag every key-route response carries.
-trait HasSuccess {
-    fn success(&self) -> bool;
-}
-
-impl HasSuccess for RotateResponse {
-    fn success(&self) -> bool {
-        self.success
-    }
-}
-
-impl HasSuccess for DeactivateResponse {
-    fn success(&self) -> bool {
-        self.success
     }
 }
 
