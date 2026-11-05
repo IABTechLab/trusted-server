@@ -586,6 +586,79 @@ impl Default for PrebidIntegrationConfig {
     }
 }
 
+impl PrebidIntegrationConfig {
+    /// Reports whether Prebid's script interception removes a `<script src>` URL.
+    ///
+    /// The query and fragment are ignored, and the URL path is matched against
+    /// [`Self::script_patterns`] case-insensitively.
+    pub(crate) fn matches_script_url(&self, attr_value: &str) -> bool {
+        let trimmed = attr_value.trim();
+        let without_query = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+
+        if self.matches_script_pattern(without_query) {
+            return true;
+        }
+
+        if !without_query.starts_with('/')
+            && !without_query.starts_with("//")
+            && !without_query.contains("://")
+        {
+            let with_slash = format!("/{without_query}");
+            if self.matches_script_pattern(&with_slash) {
+                return true;
+            }
+        }
+
+        let parsed = if without_query.starts_with("//") {
+            ParsedUrl::parse(&format!("https:{without_query}"))
+        } else {
+            ParsedUrl::parse(without_query)
+        };
+
+        parsed
+            .ok()
+            .is_some_and(|url| self.matches_script_pattern(url.path()))
+    }
+
+    /// Reports whether a request path matches one of [`Self::script_patterns`].
+    fn matches_script_pattern(&self, path: &str) -> bool {
+        // Normalize path to lowercase for case-insensitive matching
+        let path_lower = path.to_ascii_lowercase();
+
+        // Check if path matches any configured pattern
+        for pattern in &self.script_patterns {
+            let pattern_lower = pattern.to_ascii_lowercase();
+
+            // Check for wildcard patterns: /* or {*name}
+            if pattern_lower.ends_with("/*") || pattern_lower.contains("{*") {
+                // Extract prefix before the wildcard
+                let prefix = if pattern_lower.ends_with("/*") {
+                    &pattern_lower[..pattern_lower.len() - 1] // Remove trailing *
+                } else {
+                    // Find {* and extract prefix before it
+                    pattern_lower.split("{*").next().unwrap_or("")
+                };
+
+                if path_lower.starts_with(prefix) {
+                    // Check if it ends with a known Prebid script suffix
+                    if PREBID_SCRIPT_SUFFIXES
+                        .iter()
+                        .any(|suffix| path_lower.ends_with(suffix))
+                    {
+                        return true;
+                    }
+                }
+            } else {
+                // Exact match or suffix match
+                if path_lower.ends_with(&pattern_lower) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 impl IntegrationConfig for PrebidIntegrationConfig {
     fn is_enabled(&self) -> bool {
         self.enabled
@@ -1024,69 +1097,11 @@ impl PrebidIntegration {
     }
 
     fn matches_script_url(&self, attr_value: &str) -> bool {
-        let trimmed = attr_value.trim();
-        let without_query = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
-
-        if self.matches_script_pattern(without_query) {
-            return true;
-        }
-
-        if !without_query.starts_with('/')
-            && !without_query.starts_with("//")
-            && !without_query.contains("://")
-        {
-            let with_slash = format!("/{without_query}");
-            if self.matches_script_pattern(&with_slash) {
-                return true;
-            }
-        }
-
-        let parsed = if without_query.starts_with("//") {
-            ParsedUrl::parse(&format!("https:{without_query}"))
-        } else {
-            ParsedUrl::parse(without_query)
-        };
-
-        parsed
-            .ok()
-            .is_some_and(|url| self.matches_script_pattern(url.path()))
+        self.config.matches_script_url(attr_value)
     }
 
     fn matches_script_pattern(&self, path: &str) -> bool {
-        // Normalize path to lowercase for case-insensitive matching
-        let path_lower = path.to_ascii_lowercase();
-
-        // Check if path matches any configured pattern
-        for pattern in &self.config.script_patterns {
-            let pattern_lower = pattern.to_ascii_lowercase();
-
-            // Check for wildcard patterns: /* or {*name}
-            if pattern_lower.ends_with("/*") || pattern_lower.contains("{*") {
-                // Extract prefix before the wildcard
-                let prefix = if pattern_lower.ends_with("/*") {
-                    &pattern_lower[..pattern_lower.len() - 1] // Remove trailing *
-                } else {
-                    // Find {* and extract prefix before it
-                    pattern_lower.split("{*").next().unwrap_or("")
-                };
-
-                if path_lower.starts_with(prefix) {
-                    // Check if it ends with a known Prebid script suffix
-                    if PREBID_SCRIPT_SUFFIXES
-                        .iter()
-                        .any(|suffix| path_lower.ends_with(suffix))
-                    {
-                        return true;
-                    }
-                }
-            } else {
-                // Exact match or suffix match
-                if path_lower.ends_with(&pattern_lower) {
-                    return true;
-                }
-            }
-        }
-        false
+        self.config.matches_script_pattern(path)
     }
 
     fn handle_script_handler(

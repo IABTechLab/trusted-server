@@ -23,7 +23,7 @@ use crate::integrations::{
     google_tag_manager::GoogleTagManagerConfig,
     gpt::GptConfig,
     gpt_diagnostics::{GPT_DIAGNOSTICS_INTEGRATION_ID, GptDiagnosticsConfig},
-    js_asset_proxy::{JS_ASSET_PROXY_INTEGRATION_ID, JsAssetProxyConfig},
+    js_asset_proxy::{JS_ASSET_PROXY_INTEGRATION_ID, JsAssetProxyConfig, JsAssetProxyMode},
     lockr::LockrConfig,
     nextjs::NextJsIntegrationConfig,
     osano::OsanoConfig,
@@ -330,7 +330,39 @@ fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<Trus
                 "integration startup failed for `{JS_ASSET_PROXY_INTEGRATION_ID}`: {error}"
             ),
         })
-    })
+    })?;
+    validate_js_asset_proxy_prebid_overlap(settings, &config)
+}
+
+/// Rejects `enabled` JS assets that Prebid's script interception would remove.
+///
+/// Prebid removes publisher Prebid.js tags to keep a single Prebid instance next
+/// to the managed bundle. An `enabled` asset for such a URL is either a dead
+/// entry or loads a second Prebid.js copy, so it is contradictory config.
+fn validate_js_asset_proxy_prebid_overlap(
+    settings: &Settings,
+    config: &JsAssetProxyConfig,
+) -> Result<(), Report<TrustedServerError>> {
+    if !config.enabled {
+        return Ok(());
+    }
+    let Some(prebid_config) =
+        settings.integration_config::<prebid::PrebidIntegrationConfig>("prebid")?
+    else {
+        return Ok(());
+    };
+    let Some(asset) = config.assets.iter().find(|asset| {
+        asset.proxy == JsAssetProxyMode::Enabled
+            && prebid_config.matches_script_url(&asset.origin_url)
+    }) else {
+        return Ok(());
+    };
+    Err(Report::new(TrustedServerError::Configuration {
+        message: format!(
+            "integration startup failed for `{JS_ASSET_PROXY_INTEGRATION_ID}`: asset `{}` with origin_url `{}` has proxy = \"enabled\" in [[integrations.js_asset_proxy.assets]], but [integrations.prebid] script_patterns intercept that URL to prevent duplicate Prebid instances; set proxy = \"disabled\" to keep Prebid's interception, set proxy = \"blocked\" to remove the script, or remove the matching pattern from [integrations.prebid] script_patterns (not recommended; may duplicate the managed bundle)",
+            asset.path, asset.origin_url
+        ),
+    }))
 }
 
 fn validate_enabled_integrations(
@@ -1587,6 +1619,72 @@ password = "production-admin-password-32-bytes"
             message.contains("empty_assets") || message.contains("assets"),
             "error should mention the missing assets"
         );
+    }
+
+    fn settings_with_prebid_script_asset(mode: &str) -> Settings {
+        // `valid_settings` enables `[integrations.prebid]` with the default
+        // `script_patterns`, which match `/prebid.min.js`.
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert_config(
+                JS_ASSET_PROXY_INTEGRATION_ID,
+                &serde_json::json!({
+                    "enabled": true,
+                    "assets": [{
+                        "path": "/assets/vendor-pb.js",
+                        "origin_url": "https://cdn.example.com/prebid.min.js",
+                        "proxy": mode
+                    }]
+                }),
+            )
+            .expect("should insert JS asset proxy config");
+        settings
+    }
+
+    #[test]
+    fn validation_rejects_enabled_js_asset_intercepted_by_prebid() {
+        let settings = settings_with_prebid_script_asset("enabled");
+
+        for result in [
+            validate_settings_for_deploy(&settings),
+            validate_settings_for_runtime(&settings),
+        ] {
+            let message = result
+                .expect_err("should reject enabled asset intercepted by Prebid")
+                .to_string();
+            assert!(
+                message.contains("[[integrations.js_asset_proxy.assets]]")
+                    && message.contains("[integrations.prebid]"),
+                "error should name both tables: {message}"
+            );
+            assert!(
+                message.contains("/assets/vendor-pb.js"),
+                "error should name the conflicting asset: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_accepts_disabled_and_blocked_js_assets_intercepted_by_prebid() {
+        for mode in ["disabled", "blocked"] {
+            let settings = settings_with_prebid_script_asset(mode);
+
+            validate_settings_for_deploy(&settings)
+                .expect("should accept non-enabled asset intercepted by Prebid");
+        }
+    }
+
+    #[test]
+    fn validation_accepts_enabled_prebid_script_asset_when_prebid_disabled() {
+        let mut settings = settings_with_prebid_script_asset("enabled");
+        settings
+            .integrations
+            .insert_config("prebid", &serde_json::json!({ "enabled": false }))
+            .expect("should insert disabled prebid config");
+
+        validate_settings_for_deploy(&settings)
+            .expect("should accept enabled asset when Prebid interception is off");
     }
 
     #[test]

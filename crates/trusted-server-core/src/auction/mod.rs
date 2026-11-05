@@ -230,4 +230,67 @@ mod plan_sharing_tests {
 
         assert!(registry.has_route(&http::Method::GET, "/integrations/aps/renderer"));
     }
+
+    #[test]
+    fn js_asset_proxy_rewriter_runs_before_plan_registered_rewriters() {
+        // `create_test_settings` enables Prebid; add an APS profile, GPT and
+        // `js_asset_proxy` so plan registrations precede the builder table.
+        let mut settings = create_test_settings();
+        settings.auction.providers = std::collections::BTreeMap::from([(
+            "aps-main".parse().expect("should parse APS provider ID"),
+            ProviderConfig {
+                protocol: "openrtb-2.6".to_string(),
+                profile: "aps".to_string(),
+                endpoint: "https://aps.example/e/pb/bid".to_string(),
+                timeout_ms: None,
+                routing: RoutingMode::AllEligible,
+                notifications: NotificationConfig::default(),
+                profile_config: serde_json::json!({"account_id":"example-account"}),
+            },
+        )]);
+        settings
+            .integrations
+            .insert_config("gpt", &serde_json::json!({ "enabled": true }))
+            .expect("should insert GPT config");
+        settings
+            .integrations
+            .insert_config(
+                "js_asset_proxy",
+                &serde_json::json!({
+                    "enabled": true,
+                    "assets": [{
+                        "path": "/assets/vendor.js",
+                        "origin_url": "https://cdn.example.com/vendor.js"
+                    }]
+                }),
+            )
+            .expect("should insert JS asset proxy config");
+        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile APS plan"));
+
+        let registry =
+            IntegrationRegistry::with_plan(&settings, plan).expect("should build registry");
+
+        assert!(
+            registry.integration_enabled("aps") && registry.integration_enabled("prebid"),
+            "should register APS and Prebid from the plan"
+        );
+        let ids = registry.attribute_rewriter_ids();
+        assert_eq!(
+            ids.first(),
+            Some(&"js_asset_proxy"),
+            "js_asset_proxy should be the first attribute rewriter: {ids:?}"
+        );
+        let prebid_index = ids
+            .iter()
+            .position(|id| *id == "prebid")
+            .expect("should register Prebid attribute rewriter");
+        let gpt_index = ids
+            .iter()
+            .position(|id| *id == "gpt")
+            .expect("should register GPT attribute rewriter");
+        assert!(
+            prebid_index < gpt_index,
+            "other rewriters should keep registration order: {ids:?}"
+        );
+    }
 }
