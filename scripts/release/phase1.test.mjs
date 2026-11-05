@@ -2238,8 +2238,14 @@ test('workflows build, sign and publish exactly the release assets and restrict 
   for (const step of [
     'Refuse non-SemVer release tags',
     'Refuse annotated release tags',
+    'Refuse tags on commits outside every branch',
   ])
     assert.ok(checks.includes(`\n      - name: ${step}\n`), step)
+  // The branch check needs every branch's history.
+  assert.match(
+    checks,
+    /- uses: actions\/checkout@v\d+\n {8}with:\n {10}persist-credentials: false\n {10}fetch-depth: 0\n/
+  )
   assert.ok(actualBuild.startsWith('\n    needs: checks\n'))
   assert.match(
     actualBuild,
@@ -2997,6 +3003,38 @@ test('build checks refuse a tag reference that is not a lightweight tag at the c
     assert.equal(result.status, status, `${reference}: ${result.stderr}`)
     if (reference?.startsWith('tag'))
       assert.match(result.stdout, /::error::Release tags must be lightweight/)
+  }
+})
+test('build checks refuse a tagged commit that is on no branch', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const commit = 'a'.repeat(40)
+  for (const [branches, status] of [
+    ['  origin/main', 0],
+    ['  origin/main\n  origin/release/v1', 0],
+    ['', 1],
+    [null, 1],
+  ]) {
+    const result = runStep(
+      workflow,
+      'Refuse tags on commits outside every branch',
+      {
+        // Answer only the exact containment query for the tagged commit.
+        git:
+          branches === null
+            ? 'echo "fatal: malformed object name" >&2; exit 129'
+            : `test "$*" = "branch -r --contains ${commit}" || exit 97; printf '%s' '${branches}'`,
+      },
+      { GITHUB_SHA: commit }
+    )
+    // A failing git query stops the step with git's own status.
+    if (branches === null)
+      assert.notEqual(result.status, 0, 'should stop when git fails')
+    else assert.equal(result.status, status, `${branches}: ${result.stderr}`)
+    if (branches === '')
+      assert.match(
+        result.stdout,
+        new RegExp(`::error::Push ${commit} to a branch before tagging it`)
+      )
   }
 })
 test('publisher step refuses a Node other than the pinned version before publishing', () => {

@@ -528,13 +528,14 @@ commands below only inspect settings; this workflow applies none of them.
   commit. Source eligibility and the later policy reader are not enforced by
   Phase 1.
 - Push the commit to a branch, normally `main`, before pushing its lightweight
-  tag. In fork rehearsals, draft creation returned HTTP 403 when the tagged commit
-  was reachable only through the new tag. That failure creates nothing: if the
-  release listing shows no release or draft for the tag, push the commit to a
-  branch and re-run only the failed release job within the 7-day artifact
-  retention. This rerun is the approved recovery for that failure only; other
-  failed mutations follow the recovery rules above. An annotated tag is refused
-  before building.
+  tag. The build `checks` job refuses a tagged commit that is on no branch,
+  before anything is built or signed: in fork rehearsals, draft creation
+  returned HTTP 403 for such a commit. After that refusal, push the commit to a
+  branch and use a fresh tag. If a draft creation still returns HTTP 403 and the
+  release listing shows no release or draft for the tag, re-run only the failed
+  release job within the 7-day artifact retention. This rerun is the approved
+  recovery for that failure only; other failed mutations follow the recovery
+  rules above. An annotated tag is refused before building.
 
 ```bash
 REPO=IABTechLab/trusted-server
