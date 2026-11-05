@@ -9,9 +9,11 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Full history, so the branch check below can see every branch.
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Read pinned Node version
         id: tools
         run: echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
@@ -42,6 +44,18 @@ jobs:
             echo "::error::Release tags must be lightweight tags at $GITHUB_SHA; found $ref"
             exit 1
           fi
+      # Draft creation failed with HTTP 403 in rehearsals when the tagged commit
+      # was on no branch. Refuse that before building and signing. Which
+      # branches may be released stays a maintainer decision.
+      - name: Refuse tags on commits outside every branch
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          branches="$(git branch -r --contains "$GITHUB_SHA")"
+          if [ -z "$branches" ]; then
+            echo "::error::Push $GITHUB_SHA to a branch before tagging it"
+            exit 1
+          fi
+          printf 'Tagged commit is on:\n%s\n' "$branches"
   build:
     needs: checks
     name: Build ${{ matrix.asset }}

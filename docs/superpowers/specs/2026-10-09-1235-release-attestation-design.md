@@ -62,9 +62,10 @@ The caller invokes the local reusable `.github/workflows/release-build.yml`,
 which owns building and signing:
 
 1. **checks** (`contents: read`) runs `node --test scripts/release/phase1.test.mjs`.
-   On a tag it refuses a tag that is not strict SemVer, and a tag reference that
-   is not a lightweight tag at the built commit. Both fail before any build or
-   signing writes public attestations.
+   On a tag it refuses a tag that is not strict SemVer, a tag reference that is
+   not a lightweight tag at the built commit, and a tagged commit that is on no
+   branch. All three fail before any build or signing writes public
+   attestations.
 2. **build** (`needs: checks`, `contents: read`) builds each matrix entry with
    `scripts/release/phase1-build.sh` under `env -i`. Only tag builds upload
    their binary and SPDX document.
@@ -158,9 +159,12 @@ All builds use `--release --locked` and strip native debug info
 
 Release tags are strict SemVer with a `v` prefix and no build metadata
 (`vMAJOR.MINOR.PATCH[-PRERELEASE]`), and must be lightweight tags at the built
-commit. The build `checks` job and the publisher both enforce these rules.
-Branch eligibility (for example, whether rc branches may be tagged) is a
-maintainer decision; Phase 1 does not validate ancestry or rulesets.
+commit. The build `checks` job and the publisher both enforce these rules. The
+`checks` job also requires the tagged commit to be on at least one branch: in
+fork rehearsals, draft creation returned HTTP 403 for a commit reachable only
+through its tag. Which branches may be released (for example, whether rc
+branches may be tagged) is a maintainer decision; Phase 1 does not validate
+ancestry or rulesets.
 
 ### R-SIGN — signer
 
