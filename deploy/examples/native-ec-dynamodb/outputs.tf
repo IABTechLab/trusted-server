@@ -8,13 +8,13 @@ output "task_policy_json" {
   value       = jsonencode(local.task_policy)
 }
 
-output "runtime_environment" {
-  description = "Non-secret ECS app-container environment. No execution-role or credential changes."
+output "ec_storage" {
+  description = "Non-secret ec.storage object to publish in the existing Trusted Server app-config envelope. No credential or execution-role changes."
   value = {
-    TS_EC_DYNAMODB_ENABLED   = "true"
-    TS_EC_DYNAMODB_REGION    = var.aws_region
-    TS_EC_DYNAMODB_TABLE     = aws_dynamodb_table.ec.name
-    TS_EC_DYNAMODB_NAMESPACE = var.namespace
+    provider  = "dynamodb"
+    region    = var.aws_region
+    table     = aws_dynamodb_table.ec.name
+    namespace = var.namespace
   }
 }
 

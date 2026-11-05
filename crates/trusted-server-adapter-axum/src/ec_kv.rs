@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use edgezero_core::EdgeError;
 use error_stack::Report;
 use trusted_server_core::ec::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteOutcome};
+use trusted_server_core::ec::storage::DynamoDbEcStorage;
 use trusted_server_core::error::TrustedServerError;
 
 /// Cloneable live provider. Clones share the SDK connection pool, not a cache.
@@ -40,29 +41,32 @@ fn store_error() -> Report<TrustedServerError> {
     })
 }
 
-/// Prepare the explicitly selected EC backend before accepting requests.
-///
-/// `TS_EC_DYNAMODB_ENABLED=true` selects this backend. Absent or `false` leaves
-/// it off, regardless of AWS configuration. Selection requires REGION, TABLE,
-/// and NAMESPACE under the same prefix, and the `aws-dynamodb-ec` build feature.
-/// Credentials use the normal AWS SDK chain. For isolated local tests only,
-/// `TS_EC_DYNAMODB_LOCAL_ENDPOINT` accepts an HTTP root URL at `127.0.0.1` with
-/// an explicit port and bypasses the credential chain with dummy credentials.
-/// Provider errors never include SDK responses, identifiers, endpoint URLs,
-/// credentials, or record contents.
+/// Reject obsolete native launch selection without preparing from environment.
 ///
 /// # Errors
-/// Returns a sanitized error on invalid selection or failed preparation.
-pub async fn prepare_from_env() -> Result<Option<Arc<DynamoDbEcKv>>, EdgeError> {
+/// Enabled or malformed legacy selection must be migrated to published config.
+pub fn reject_legacy_configuration() -> Result<(), EdgeError> {
     match std::env::var("TS_EC_DYNAMODB_ENABLED") {
-        Err(std::env::VarError::NotPresent) => return Ok(None),
-        Ok(value) if value == "false" => return Ok(None),
-        Ok(value) if value == "true" => {}
-        _ => return Err(preparation_error()),
+        Err(std::env::VarError::NotPresent) => Ok(()),
+        Ok(value) if value == "false" => Ok(()),
+        Ok(value) if value == "true" => Err(EdgeError::internal(std::io::Error::other(
+            "TS_EC_DYNAMODB_ENABLED is obsolete; publish ec.storage and remove legacy EC environment selection",
+        ))),
+        _ => Err(EdgeError::internal(std::io::Error::other(
+            "TS_EC_DYNAMODB_ENABLED is malformed; migrate to published ec.storage configuration",
+        ))),
     }
+}
+
+/// Prepare the explicitly selected typed `DynamoDB` provider before readiness.
+///
+/// # Errors
+/// Returns a sanitized error on invalid input, missing feature or failed preparation.
+pub async fn prepare(config: &DynamoDbEcStorage) -> Result<Arc<DynamoDbEcKv>, EdgeError> {
+    config.validate().map_err(|_| preparation_error())?;
     #[cfg(feature = "aws-dynamodb-ec")]
     {
-        enabled::prepare_from_env().await.map(Some)
+        enabled::prepare(config).await
     }
     #[cfg(not(feature = "aws-dynamodb-ec"))]
     Err(EdgeError::internal(std::io::Error::other(
@@ -126,26 +130,16 @@ mod enabled {
     type Item = HashMap<String, AttributeValue>;
     type StoreResult<T> = Result<T, Report<TrustedServerError>>;
 
-    pub(super) async fn prepare_from_env() -> Result<Arc<DynamoDbEcKv>, EdgeError> {
-        let required = |suffix: &str| {
-            std::env::var(format!("TS_EC_DYNAMODB_{suffix}")).map_err(|_| preparation_error())
-        };
-        let region = required("REGION")?;
-        let table = required("TABLE")?;
-        let namespace = required("NAMESPACE")?;
-        if region.is_empty() || region.chars().any(char::is_whitespace) {
-            return Err(preparation_error());
-        }
-        validate_binding(&table, &namespace)?;
+    pub(super) async fn prepare(
+        config: &super::DynamoDbEcStorage,
+    ) -> Result<Arc<DynamoDbEcKv>, EdgeError> {
         tokio::time::timeout(PREPARATION_TIMEOUT, async {
-            let builder = match std::env::var("TS_EC_DYNAMODB_LOCAL_ENDPOINT") {
-                Ok(endpoint) => {
-                    validate_local_endpoint(&endpoint)?;
-                    // Explicit emulator mode never reads local AWS files or
-                    // sends real workload credentials to the test endpoint.
+            let builder = match &config.local_endpoint {
+                Some(endpoint) => {
+                    // Explicit emulator mode never reads ambient credentials.
                     aws_sdk_dynamodb::Config::builder()
                         .behavior_version(BehaviorVersion::v2026_01_12())
-                        .region(Region::new(region))
+                        .region(Region::new(config.region.clone()))
                         .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
                             "local",
                             "local",
@@ -155,48 +149,30 @@ mod enabled {
                         ))
                         .endpoint_url(endpoint)
                 }
-                Err(std::env::VarError::NotPresent) => {
+                None => {
                     let shared = aws_config::defaults(BehaviorVersion::v2026_01_12())
-                        .region(Region::new(region))
+                        .region(Region::new(config.region.clone()))
                         .load()
                         .await;
                     let mut builder = aws_sdk_dynamodb::Config::from(&shared).to_builder();
-                    // Clear both global and service-specific endpoint URLs
-                    // copied from the shared config. Resolve normal AWS endpoints.
+                    // Production ignores ambient endpoint overrides.
                     builder.set_endpoint_url(None);
                     builder
                 }
-                Err(_) => return Err(preparation_error()),
             };
-            let config = builder
+            let config_sdk = builder
                 .retry_config(RetryConfig::standard().with_max_attempts(1))
                 .timeout_config(timeout_config())
                 .build();
             DynamoDbEcKv::prepare_with_client(
-                aws_sdk_dynamodb::Client::from_conf(config),
-                table,
-                namespace,
+                aws_sdk_dynamodb::Client::from_conf(config_sdk),
+                config.table.clone(),
+                config.namespace.clone(),
             )
             .await
         })
         .await
         .map_err(|_| preparation_error())?
-    }
-
-    pub(super) fn validate_local_endpoint(endpoint: &str) -> Result<(), EdgeError> {
-        let url = reqwest::Url::parse(endpoint).map_err(|_| preparation_error())?;
-        if url.scheme() != "http"
-            || url.host_str() != Some("127.0.0.1")
-            || url.port().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.path() != "/"
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(preparation_error());
-        }
-        Ok(())
     }
 
     fn validate_binding(table: &str, namespace: &str) -> Result<(), EdgeError> {

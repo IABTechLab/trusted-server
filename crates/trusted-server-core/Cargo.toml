@@ -23,6 +23,7 @@ cssparser = { workspace = true }
 derive_more = { workspace = true }
 ed25519-dalek = { workspace = true }
 edgezero-core = { workspace = true }
+edgezero-store-celld = { workspace = true }
 error-stack = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }

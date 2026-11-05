@@ -37,7 +37,7 @@ Provider initialization, planning and any application need separate authorizatio
 
 The root attaches the policy to `task_role_name`; that is not enough when the existing task boundary explicitly denies DynamoDB. Have the boundary owner review both its action ceiling and its constrained allow statements, then review the task inline policy. Do not remove the boundary, broaden the execution role, or weaken the deny to get a successful test. Other policies can still deny the calls.
 
-`runtime_environment` supplies only the four non-secret `TS_EC_DYNAMODB_*` settings. It must reach the app container built with `aws-dynamodb-ec`. The ordinary AWS workload credential chain supplies task credentials. Do not add access keys to Terraform or the task definition.
+`ec_storage` replaces the former `runtime_environment` output. Publish this non-secret object as `[ec.storage]` in the existing Trusted Server app-config BlobEnvelope before launching an application built with `aws-dynamodb-ec`. Use `terraform output -json ec_storage` only against the separately approved retained state; this guide does not run it. Keep the exact table and namespace unchanged. Config publication is the existing `ts config push`/AppConfig workflow, not container environment injection or another envelope format. The old enabled `TS_EC_DYNAMODB_ENABLED` launch contract now fails before readiness, even alongside new config. Remove the old selection and binding variables after preparing publication. External consumers of the removed output must migrate with this change. The ordinary AWS workload credential chain still supplies task credentials. Do not add access keys to Terraform or the task definition.
 
 ## Retirement
 
