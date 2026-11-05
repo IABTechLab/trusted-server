@@ -141,10 +141,11 @@ fn stored_uid(
         return Ok(stored);
     };
     // Unusable refresh state is dropped, never the UID: a refresh with no
-    // stated time, or with empty or oversized state, is simply not stored.
+    // stated time, with empty or oversized state, or due already (which
+    // would make the source due on every navigation) is simply not stored.
     let usable = !refresh.state.is_empty() && refresh.state.len() <= MAX_REFRESH_STATE_BYTES;
     match resolve_expiry(refresh.from, policy.now) {
-        Some(from) if usable => Ok(stored.with_refresh(KvRefresh {
+        Some(from) if usable && from > policy.now => Ok(stored.with_refresh(KvRefresh {
             state: refresh.state.into_owned(),
             from,
         })),
@@ -275,6 +276,21 @@ mod tests {
             (String::new(), in_a_minute, None),
             ("x".repeat(MAX_REFRESH_STATE_BYTES + 1), in_a_minute, None),
             ("state".to_owned(), ProviderExpiry::Unspecified, None),
+            (
+                "state".to_owned(),
+                ProviderExpiry::After(Duration::ZERO),
+                None,
+            ),
+            (
+                "state".to_owned(),
+                ProviderExpiry::At(UnixSeconds::new(1000)),
+                None,
+            ),
+            (
+                "state".to_owned(),
+                ProviderExpiry::At(UnixSeconds::new(999)),
+                None,
+            ),
         ];
 
         for (state, from, expected) in cases {
