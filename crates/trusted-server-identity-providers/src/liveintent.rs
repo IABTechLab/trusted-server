@@ -444,7 +444,7 @@ mod tests {
             },
             publisher_domain: "www.example.com",
             due_sources: &due,
-            current: OwnedEntries::new(None, &[]),
+            current: OwnedEntries::empty(),
             cookies,
             hashed_email: None,
         };
@@ -485,7 +485,7 @@ mod tests {
             },
             publisher_domain: "www.example.com",
             due_sources: &due[..1],
-            current: OwnedEntries::new(None, &[]),
+            current: OwnedEntries::empty(),
             cookies: RequestCookies::default(),
             hashed_email: None,
         };
@@ -675,7 +675,7 @@ mod tests {
             },
             publisher_domain: "www.example.com",
             due_sources: &due,
-            current: OwnedEntries::new(None, &[]),
+            current: OwnedEntries::empty(),
             cookies: RequestCookies::default(),
             hashed_email: None,
         };

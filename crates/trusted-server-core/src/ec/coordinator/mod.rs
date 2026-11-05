@@ -300,7 +300,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 .filter(|record| record.is_provider_written());
             // A UID whose provider asked for a refresh makes its source due;
             // the stored refresh state is the lookup's input.
-            if record.is_some_and(|record| record.refresh_due(now)) {
+            if record.is_some_and(|record| record.refresh_due_for(&registered.id, now)) {
                 due.push(source.clone());
                 continue;
             }
@@ -503,6 +503,12 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 pending.early.push(skip(SkipReason::Consent));
                 continue;
             }
+            // A remembered opt-out keeps the provider from being called until
+            // it lapses.
+            if entry.is_some_and(|entry| entry.opted_out(&registered.id, lookup.now)) {
+                pending.early.push(skip(SkipReason::OptedOut));
+                continue;
+            }
             let (mut due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
             // The vendor's own first-party cookies are read on every
             // navigation, so an opt-out or a changed ID is noticed while the
@@ -557,7 +563,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 client: lookup.client,
                 publisher_domain: lookup.publisher_domain,
                 due_sources: &due,
-                current: OwnedEntries::new(entry, &registered.policy.sources),
+                current: OwnedEntries::new(entry, &registered.policy.sources, &registered.id),
                 cookies: lookup.cookies,
                 hashed_email: None,
             };
@@ -1683,11 +1689,15 @@ mod tests {
     }
 
     fn refreshable_record(from: u64) -> KvPartnerId {
+        refreshable_record_owned_by("example-provider", from)
+    }
+
+    fn refreshable_record_owned_by(owner: &str, from: u64) -> KvPartnerId {
         let uid = KvUid::new(
             UidValue::try_from("p-1").expect("should build uid"),
             AgentType::try_from(1).expect("should build atype"),
             None,
-            Some(ProviderId::new("example-provider")),
+            Some(ProviderId::new(owner)),
             Expiry::At(UnixSeconds::new(5000)),
         )
         .with_refresh(KvRefresh {
@@ -1745,6 +1755,80 @@ mod tests {
             "should not refresh before the refresh time"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn remembered_opt_out_skips_the_provider_until_it_lapses() {
+        // Arrange
+        let coordinator = coordinator("");
+        let provider = ProviderId::new("example-provider");
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.opt_outs.insert(provider.clone(), 1001);
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::OptedOut),
+            "should skip a provider whose opt-out is remembered"
+        );
+        assert!(
+            transport.sent.borrow().is_empty(),
+            "should not call a provider the visitor opted out of"
+        );
+
+        // Arrange: the opt-out lapsed.
+        entry.opt_outs.insert(provider, 1000);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+        );
+
+        // Assert
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should call the provider again once the opt-out lapses"
+        );
+    }
+
+    #[test]
+    fn another_providers_refresh_state_is_never_handed_over() {
+        // Arrange: a live UID with due refresh state written by a provider that
+        // no longer owns the source.
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record_owned_by("former-provider", 900)),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NotDue),
+            "should not refresh a UID another provider wrote"
+        );
+        assert!(
+            transport.sent.borrow().is_empty(),
+            "should not send another provider's refresh state"
+        );
     }
 
     fn optout_reply() -> Result<TransportResponse, Report<TransportError>> {

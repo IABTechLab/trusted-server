@@ -41,6 +41,10 @@ pub const MAX_STORED_DOMAIN_LENGTH: usize = 255;
 /// consistent validation.
 pub const MAX_UID_LENGTH: usize = 1024;
 
+/// How long a provider opt-out keeps that provider from being called again,
+/// in seconds. Matches the longest lifetime a provider UID may have.
+pub const OPT_OUT_MEMORY_SECONDS: u64 = 30 * 24 * 60 * 60;
+
 /// Full KV entry stored as the body of an EC identity graph record.
 ///
 /// **KV key:** Full EC ID (`{64hex}.{6alnum}`).
@@ -69,6 +73,10 @@ pub struct KvEntry {
     /// Populated by pixel sync, batch sync, and pull sync operations.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ids: BTreeMap<String, KvPartnerId>,
+    /// Provider ID → Unix time until which that provider's opt-out is
+    /// honoured without calling the provider again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub opt_outs: BTreeMap<ProviderId, u64>,
 }
 
 /// Consent state within a KV entry.
@@ -157,13 +165,16 @@ impl KvPartnerId {
         !self.eids.is_empty()
     }
 
-    /// Whether a UID in the record asks its provider for a refresh by `now`.
+    /// Whether a UID `owner` wrote asks it for a refresh by `now`.
+    ///
+    /// UIDs another provider wrote never make the record refresh-due for
+    /// `owner`, so their refresh state is never handed to it.
     #[must_use]
-    pub fn refresh_due(&self, now: UnixSeconds) -> bool {
+    pub fn refresh_due_for(&self, owner: &ProviderId, now: UnixSeconds) -> bool {
         self.eids
             .iter()
             .flat_map(KvEid::uids)
-            .any(|uid| uid.refresh_due(now))
+            .any(|uid| uid.owner() == Some(owner) && uid.refresh_due(now))
     }
 
     /// Whether the record holds a UID that may be served at `now`.
@@ -655,7 +666,35 @@ impl KvEntry {
             device: None,
             network: None,
             ids: BTreeMap::new(),
+            opt_outs: BTreeMap::new(),
         }
+    }
+
+    /// Whether `provider` opted out and must not be called again by `now`.
+    #[must_use]
+    pub fn opted_out(&self, provider: &ProviderId, now: UnixSeconds) -> bool {
+        self.opt_outs
+            .get(provider)
+            .is_some_and(|until| *until > now.get())
+    }
+
+    /// Remembers an opt-out by `provider` for [`OPT_OUT_MEMORY_SECONDS`].
+    ///
+    /// An opt-out already remembered keeps its end time, so a provider skipped
+    /// because of it is asked again once the time passes.
+    pub fn remember_opt_out(&mut self, provider: &ProviderId, now: UnixSeconds) {
+        if self.opted_out(provider, now) {
+            return;
+        }
+        self.opt_outs.insert(
+            provider.clone(),
+            now.saturating_add_secs(OPT_OUT_MEMORY_SECONDS).get(),
+        );
+    }
+
+    /// Forgets opt-outs whose time has passed.
+    pub fn prune_opt_outs(&mut self, now: UnixSeconds) {
+        self.opt_outs.retain(|_, until| *until > now.get());
     }
 
     /// Creates a minimal live entry.
@@ -685,6 +724,7 @@ impl KvEntry {
             device: None,
             network: None,
             ids,
+            opt_outs: BTreeMap::new(),
         }
     }
 
@@ -717,6 +757,7 @@ impl KvEntry {
             device: None,
             network: None,
             ids: BTreeMap::new(),
+            opt_outs: BTreeMap::new(),
         }
     }
 

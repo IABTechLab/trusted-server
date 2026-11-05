@@ -157,8 +157,7 @@ pub(crate) fn collect_eid_updates(
     {
         updates.push(update);
     }
-    // Provider-owned sources stay in the list: the write planner ingests them
-    // only as a fallback when the provider left the source empty.
+    // Provider-owned sources stay in the list; the write planner skips them.
     dedupe_partner_updates(updates)
 }
 

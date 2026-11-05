@@ -706,6 +706,7 @@ mod tests {
         let entry = stored_entry();
         let sources = [SourceDomain::try_from("uid2.example.com").expect("should build source")];
         let consent = ConsentContext::default();
+        let owner = ProviderId::new("uid2");
         let lookup = LookupInput {
             ec_id: "ec-example",
             consent: &consent,
@@ -715,7 +716,7 @@ mod tests {
             },
             publisher_domain: "www.example.com",
             due_sources: &sources,
-            current: OwnedEntries::new(Some(&entry), &sources),
+            current: OwnedEntries::new(Some(&entry), &sources, &owner),
             cookies: RequestCookies::default(),
             hashed_email: None,
         };
@@ -747,6 +748,7 @@ mod tests {
         let entry = stored_entry();
         let sources = [SourceDomain::try_from("uid2.example.com").expect("should build source")];
         let consent = ConsentContext::default();
+        let owner = ProviderId::new("uid2");
         let lookup = LookupInput {
             ec_id: "ec-example",
             consent: &consent,
@@ -756,7 +758,7 @@ mod tests {
             },
             publisher_domain: "www.example.com",
             due_sources: &sources,
-            current: OwnedEntries::new(Some(&entry), &sources),
+            current: OwnedEntries::new(Some(&entry), &sources, &owner),
             cookies: RequestCookies::default(),
             hashed_email: None,
         };

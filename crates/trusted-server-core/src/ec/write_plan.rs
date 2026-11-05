@@ -4,14 +4,12 @@
 //! (replace the provider's sources, or remove them on an opt-out), prunes expired UIDs and enforces
 //! [`MAX_ENTRY_BYTES`]. Pure: no I/O.
 //!
-//! A provider-owned source takes a browser UID only as a fallback: when the
-//! row holds no live UID for it and the provider kept nothing for it on this
-//! navigation. The fallback is a single-UID record without provider `eids`,
-//! so the coordinator still treats the source as due and a later provider
-//! result replaces it.
+//! Browser ingest skips provider-owned sources entirely (spec §8.4), so a
+//! source the provider cleared on an opt-out is never refilled from the
+//! browser's `ts-eids` cookie.
 
 use super::EcKvSnapshot;
-use super::coordinator::results::LookupResults;
+use super::coordinator::results::{LookupResults, LookupStatus, SkipReason};
 use super::eid_types::{SourceDomain, UnixSeconds};
 use super::kv::PartnerIdUpdate;
 use super::kv_types::{KvEntry, KvPartnerId, MAX_ENTRY_BYTES};
@@ -64,30 +62,7 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
 
     let mut entry = base.clone();
     let lookups_apply = input.lookups.is_for(input.ec_id);
-    let provider_filled: Vec<&SourceDomain> = if lookups_apply {
-        input
-            .lookups
-            .iter()
-            .flat_map(|lookup| {
-                lookup
-                    .entries
-                    .iter()
-                    .map(|(source, _)| source)
-                    .chain(&lookup.cleared)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    apply_browser_ingest(
-        &mut entry,
-        input.browser_ingest,
-        &BrowserIngestRules {
-            registry: input.registry,
-            provider_filled: &provider_filled,
-            now: input.now,
-        },
-    );
+    apply_browser_ingest(&mut entry, input.browser_ingest, input.registry);
     let written = if lookups_apply {
         apply_lookups(&mut entry, input.lookups, input.now)
     } else {
@@ -102,6 +77,7 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
     for record in entry.ids.values_mut() {
         record.prune_expired(input.now);
     }
+    entry.prune_opt_outs(input.now);
     entry.ids.retain(|_, record| !record.uid.is_empty());
     enforce_size_cap(&mut entry, &written);
 
@@ -112,46 +88,24 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
     }
 }
 
-/// What browser ingest needs to decide provider-owned fallbacks.
-struct BrowserIngestRules<'a> {
-    registry: &'a PartnerRegistry,
-    /// Sources the provider returned entries for on this navigation.
-    provider_filled: &'a [&'a SourceDomain],
-    now: UnixSeconds,
-}
-
+/// Fills missing sources from the browser, skipping provider-owned ones.
 fn apply_browser_ingest(
     entry: &mut KvEntry,
     updates: &[PartnerIdUpdate],
-    rules: &BrowserIngestRules<'_>,
+    registry: &PartnerRegistry,
 ) {
     for update in updates {
-        if !rules.registry.is_provider_owned(&update.partner_id) {
-            entry
-                .ids
-                .entry(update.partner_id.clone())
-                .or_insert_with(|| KvPartnerId::single(update.uid.clone()));
+        if registry.is_provider_owned(&update.partner_id) {
+            log::trace!(
+                "EC write planner: skipping browser UID for provider-owned source '{}'",
+                update.partner_id
+            );
             continue;
         }
-        let provider_filled = rules
-            .provider_filled
-            .iter()
-            .any(|source| source.as_str() == update.partner_id);
-        let held = entry
+        entry
             .ids
-            .get(&update.partner_id)
-            .is_some_and(|record| record.has_live_uid(rules.now));
-        if provider_filled || held {
-            continue;
-        }
-        log::debug!(
-            "EC write planner: ingesting browser fallback for provider-owned source '{}'",
-            update.partner_id
-        );
-        entry.ids.insert(
-            update.partner_id.clone(),
-            KvPartnerId::single(update.uid.clone()),
-        );
+            .entry(update.partner_id.clone())
+            .or_insert_with(|| KvPartnerId::single(update.uid.clone()));
     }
 }
 
@@ -162,6 +116,9 @@ fn apply_lookups(
 ) -> Vec<SourceDomain> {
     let mut written = Vec::new();
     for lookup in lookups.iter() {
+        if lookup.status == LookupStatus::Skipped(SkipReason::OptedOut) {
+            entry.remember_opt_out(&lookup.provider, now);
+        }
         for source in &lookup.cleared {
             if entry.ids.remove(source.as_str()).is_some() {
                 log::info!(
@@ -260,7 +217,7 @@ mod tests {
     use crate::ec::coordinator::results::{DropCounts, LookupStatus, ProviderLookup, SkipReason};
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, SourceDomain, UidValue};
     use crate::ec::kv::KvIdentityGraph;
-    use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
+    use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid, OPT_OUT_MEMORY_SECONDS};
     use crate::settings::EcPartner;
 
     const EC_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123";
@@ -596,7 +553,62 @@ mod tests {
     }
 
     #[test]
-    fn provider_owned_source_takes_browser_fallback_when_lookup_fails() {
+    fn opt_out_is_remembered_without_extending_it() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let ingest: [PartnerIdUpdate; 0] = [];
+        let provider = ProviderId::new("example-provider");
+        let lookups = failed_lookup(LookupStatus::Skipped(SkipReason::OptedOut));
+
+        // Act: the first opt-out is remembered.
+        let first = plan_write(&input(
+            &present(&provider_entry(&["p-1"])),
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ))
+        .expect("should plan update");
+
+        // Assert
+        let RowChange::Update { entry, .. } = first else {
+            panic!("should update existing row")
+        };
+        let until = entry.opt_outs[&provider];
+        assert_eq!(
+            until,
+            2000 + OPT_OUT_MEMORY_SECONDS,
+            "should remember the opt-out for the memory period"
+        );
+
+        // Act: a skip because of the remembered opt-out changes nothing.
+        let again = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+
+        // Assert
+        assert!(again.is_none(), "should not extend a remembered opt-out");
+    }
+
+    #[test]
+    fn lapsed_opt_out_is_pruned() {
+        let registry = registry(&["ids.example.com"]);
+        let ingest: [PartnerIdUpdate; 0] = [];
+        let mut entry = live_entry();
+        entry
+            .opt_outs
+            .insert(ProviderId::new("example-provider"), 1000);
+        let lookups = LookupResults::default();
+
+        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry))
+            .expect("should plan update");
+
+        let RowChange::Update { entry, .. } = change else {
+            panic!("should update existing row")
+        };
+        assert!(entry.opt_outs.is_empty(), "should forget a lapsed opt-out");
+    }
+
+    #[test]
+    fn browser_ingest_skips_a_provider_owned_source() {
         // Arrange
         let registry = registry(&["ids.example.com"]);
         let snapshot = present(&live_entry());
@@ -604,32 +616,42 @@ mod tests {
 
         for status in [
             LookupStatus::NoMatch,
+            LookupStatus::Timeout,
             LookupStatus::Skipped(SkipReason::NotDue),
         ] {
             let lookups = failed_lookup(status);
 
             // Act
-            let change = plan_write(&input(&snapshot, None, &ingest, &lookups, &registry))
-                .expect("should plan update");
+            let change = plan_write(&input(&snapshot, None, &ingest, &lookups, &registry));
 
             // Assert
-            let RowChange::Update { entry, .. } = change else {
-                panic!("should update existing row")
-            };
-            let record = &entry.ids["ids.example.com"];
-            assert_eq!(
-                record.uid, "browser-id",
-                "should store the browser fallback"
-            );
             assert!(
-                !record.is_provider_written(),
-                "should mark the fallback as not provider-written"
+                change.is_none(),
+                "should not store a browser UID for a provider-owned source"
             );
         }
     }
 
     #[test]
-    fn provider_owned_source_takes_browser_fallback_without_lookups() {
+    fn opted_out_source_is_not_refilled_from_the_browser_on_the_next_navigation() {
+        // Arrange: the row after an opt-out holds nothing for the source.
+        let registry = registry(&["ids.example.com"]);
+        let snapshot = present(&live_entry());
+        let ingest = ingest_owned();
+        let lookups = LookupResults::default();
+
+        // Act
+        let change = plan_write(&input(&snapshot, None, &ingest, &lookups, &registry));
+
+        // Assert
+        assert!(
+            change.is_none(),
+            "should not restore an opted-out provider UID from the browser cookie"
+        );
+    }
+
+    #[test]
+    fn new_row_skips_browser_uid_for_a_provider_owned_source() {
         let registry = registry(&["ids.example.com"]);
         let snapshot = EcKvSnapshot::Missing {
             ec_id: EC_ID.to_owned(),
@@ -650,9 +672,9 @@ mod tests {
         let RowChange::Create(entry) = change else {
             panic!("should create a new row")
         };
-        assert_eq!(
-            entry.ids["ids.example.com"].uid, "browser-id",
-            "should store the browser fallback when no provider ran"
+        assert!(
+            !entry.ids.contains_key("ids.example.com"),
+            "should not store a browser UID when creating the row"
         );
     }
 

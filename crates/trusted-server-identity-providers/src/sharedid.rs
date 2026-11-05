@@ -203,7 +203,7 @@ mod tests {
             },
             publisher_domain: "www.example.com",
             due_sources: &[],
-            current: trusted_server_core::ec::provider::OwnedEntries::new(None, &[]),
+            current: trusted_server_core::ec::provider::OwnedEntries::empty(),
             cookies: RequestCookies::default(),
             hashed_email: None,
         };

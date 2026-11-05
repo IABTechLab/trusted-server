@@ -806,11 +806,12 @@ request, only with TCF vendor consent for that vendor.
 
 A provider owns its `sources`: its results replace whatever the row holds for
 them, and batch sync rejects them and pull sync skips them. Browser-resolved IDs
-(`ts-eids`, `sharedId`) for an owned source are stored only as a fallback, when
-the row has no live provider-written UID for the source and the provider kept
-nothing for it on that navigation. The fallback follows the normal browser
-ingest rules, never overwrites an existing value, and does not stop later
-lookups: the next successful lookup replaces it.
+(`ts-eids`, `sharedId`) are never stored for an owned source, so a source a
+provider cleared on an opt-out is not refilled from the browser.
+
+When a provider reports an opt-out, its sources are cleared and the row
+remembers the opt-out for 30 days. The provider is not called for that EC
+again until the 30 days pass.
 
 A provider set to `collect = "after_response"` looks up only after the response
 is sent, within `identity_after_response_budget_ms`, and its results go into one
