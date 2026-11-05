@@ -19,8 +19,8 @@ feature_ifs=$IFS
 IFS=,
 for feature in $NATIVE_FEATURES; do
   case "$feature" in
-    aws-appconfig-agent|aws-secrets-manager|aws-dynamodb-ec|geo-cloudfront|geo-maxmind|celld-config|celld-kv|lab-store-check) ;;
-    *) echo 'Only the declared native store, Geo and lab diagnostic features are supported' >&2; exit 1 ;;
+    aws-appconfig-agent|aws-secrets-manager|aws-dynamodb-ec|celld-ec|geo-cloudfront|geo-maxmind|celld-config|celld-kv|lab-store-check) ;;
+    *) echo 'Only the declared native store, EC, Geo and lab diagnostic features are supported' >&2; exit 1 ;;
   esac
 done
 IFS=$feature_ifs
