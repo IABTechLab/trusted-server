@@ -2,13 +2,16 @@
 
 use std::collections::BTreeSet;
 
+use edgezero_adapter_axum::context::AxumRequestContext;
 use edgezero_adapter_axum::dev_server::AxumRunOptions;
+use edgezero_adapter_axum::diagnostics::NativeIngressMetadata;
 use edgezero_adapter_axum::native_bindings::{
     NativeBindingsLimits, NativeConfigBinding, NativeKvBinding, NativeStoreBindings,
 };
 use edgezero_core::body::Body;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use edgezero_core::ingress::CheckedHostSource;
 use error_stack::Report;
 use serde::Deserialize;
 use serde_json::json;
@@ -189,8 +192,11 @@ fn failure(status: StatusCode, message: &str) -> Response {
 ///
 /// PUT accepts `{"value":"proof"}` and verifies the read-back. GET never
 /// writes, allowing retention checks after restart. DELETE verifies absence.
-/// Only checked ingress facts and the verified, pre-secret payload checksum
-/// are returned. Provider errors are redacted.
+/// Checked reader IP/source and immutable request geography are returned only
+/// through this admin-protected route. The socket peer is IP-only. Fly's raw
+/// client header is labeled separately and is never used as the checked reader.
+/// Raw forwarding headers are unavailable after SDK sanitization, not empty.
+/// The checksum covers the verified, pre-secret payload. Provider errors are redacted.
 ///
 /// # Errors
 /// Uses ordinary handler error typing; expected diagnostic failures are explicit
@@ -212,6 +218,33 @@ pub async fn handle(
             "checked native ingress is unavailable",
         ));
     };
+    let socket_peer = AxumRequestContext::get(&request)
+        .and_then(|context| context.remote_addr)
+        .map(|address| address.ip());
+    let ingress = request.extensions().get::<NativeIngressMetadata>();
+    let reader_ip = ingress.and_then(NativeIngressMetadata::effective_client);
+    let reader_source = ingress.and_then(|metadata| match metadata.client_source() {
+        CheckedHostSource::Direct => Some("direct_peer"),
+        CheckedHostSource::TrustedForwarded => Some("trusted_forwarded"),
+        CheckedHostSource::TrustedXForwarded => Some("trusted_x_forwarded"),
+        _ => None,
+    });
+    let fly_client_ip = request
+        .headers()
+        .get("fly-client-ip")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    // This service projects the immutable GeoOutcome captured before into_request.
+    // It never looks up a raw header or resolves the provider a second time.
+    let geo = services.geo().lookup(reader_ip).ok().flatten();
+    let ingress = json!({
+        "socket_peer": socket_peer,
+        "reader_ip": reader_ip,
+        "reader_source": reader_source,
+        "forwarded_for": null,
+        "forwarding_headers_stripped": true,
+        "fly_client_ip": fly_client_ip,
+    });
     let method = request.method().clone();
     if !matches!(method, Method::GET | Method::PUT | Method::DELETE) {
         let mut result = failure(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
@@ -288,6 +321,12 @@ pub async fn handle(
             "host": info.host,
             "key": PROOF_KEY,
             "value": value,
+            "ingress": ingress,
+            "geo": {
+                "available": geo.is_some(),
+                "country": geo.as_ref().map(|location| location.country.as_str()),
+                "region": geo.as_ref().and_then(|location| location.region.as_deref()),
+            },
         }),
     ))
 }

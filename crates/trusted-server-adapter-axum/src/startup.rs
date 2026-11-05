@@ -313,6 +313,10 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
     Ok(())
 }
 
+#[cfg(all(test, feature = "lab-store-check", feature = "geo-maxmind", unix))]
+#[path = "lab_store_check_tests.rs"]
+mod lab_store_check_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
