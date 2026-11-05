@@ -177,7 +177,7 @@ pub struct ClientSignals<'a> {
 pub struct OwnedEntries<'a> {
     entry: Option<&'a KvEntry>,
     sources: &'a [SourceDomain],
-    owner: &'a ProviderId,
+    owner: Option<&'a ProviderId>,
 }
 
 impl<'a> OwnedEntries<'a> {
@@ -191,7 +191,17 @@ impl<'a> OwnedEntries<'a> {
         Self {
             entry,
             sources,
-            owner,
+            owner: Some(owner),
+        }
+    }
+
+    /// A view holding no entries, for a provider with nothing stored.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            entry: None,
+            sources: &[],
+            owner: None,
         }
     }
 
@@ -207,7 +217,7 @@ impl<'a> OwnedEntries<'a> {
                     record
                         .eids()
                         .iter()
-                        .filter(move |eid| eid.uids().iter().all(|uid| uid.owner() == Some(owner)))
+                        .filter(move |eid| eid.uids().iter().all(|uid| uid.owner() == owner))
                         .map(move |eid| (key.as_str(), eid))
                 })
         })
@@ -741,6 +751,15 @@ mod tests {
             owned,
             ["ids.example.com"],
             "should yield owned sources only"
+        );
+    }
+
+    #[test]
+    fn empty_owned_entries_yields_nothing() {
+        assert_eq!(
+            OwnedEntries::empty().iter().count(),
+            0,
+            "should yield no entries"
         );
     }
 
