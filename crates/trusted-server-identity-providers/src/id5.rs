@@ -36,10 +36,12 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use bytes::Bytes;
+use chrono::{DateTime, SecondsFormat, Utc};
 use error_stack::{Report, ResultExt as _};
 use http::header::{CONTENT_TYPE, ORIGIN};
 use http::{HeaderMap, HeaderValue, Method};
 use serde::{Deserialize, Serialize};
+use trusted_server_core::ec::current_timestamp;
 use trusted_server_core::ec::eid_types::SourceDomain;
 use trusted_server_core::ec::provider::{
     CookieRead, EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
@@ -55,6 +57,14 @@ use crate::common::{
     CookieReader, LockrSettings, ReadsLockr, VendorEid, bounded_expiry, is_routable_ip,
     is_usable_id, percent_decoded,
 };
+
+/// Formats the current time as the RFC 3339 `ts` the `/gs/v2` fetch requires.
+fn request_timestamp() -> Result<String, Report<ProviderError>> {
+    let now = i64::try_from(current_timestamp()).change_context(ProviderError::Request)?;
+    DateTime::<Utc>::from_timestamp(now, 0)
+        .map(|time| time.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .ok_or_else(|| Report::new(ProviderError::Request).attach("current time is out of range"))
+}
 
 /// The UID ID5 returns for a visitor who opted out.
 const OPTED_OUT_UID: &str = "0";
@@ -171,6 +181,7 @@ struct FetchBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     gpp_sid: Option<&'a [u16]>,
     tml: &'a str,
+    ts: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     ua: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -343,6 +354,7 @@ impl IdentityProvider for Id5Provider {
             gpp_string: consent.raw_gpp_string.as_deref(),
             gpp_sid: consent.gpp_section_ids.as_deref(),
             tml: &origin,
+            ts: request_timestamp()?,
             ua: lookup.client.user_agent,
             ip: lookup
                 .client
@@ -524,6 +536,8 @@ mod tests {
             "should send the publisher origin"
         );
         assert_eq!(body["partner"], 1234, "should send the partner");
+        let ts = body["ts"].as_str().expect("should send a ts string");
+        DateTime::parse_from_rfc3339(ts).expect("should send ts as an RFC 3339 timestamp");
         assert_eq!(body["gdpr"], 0, "should send that GDPR does not apply");
         assert_eq!(body["us_privacy"], "1YNN", "should send US privacy");
         assert_eq!(
