@@ -155,8 +155,8 @@ mod tests {
             );
         }
         for service in [
-            "http://192.0.2.1",
-            "http://[2001:db8::1]",
+            "http://192.0.2.1",     // allow-domain: 192.0.2.1
+            "http://[2001:db8::1]", // allow-domain: 2001:db8::1
             "http://localhost.example.com",
         ] {
             assert!(
