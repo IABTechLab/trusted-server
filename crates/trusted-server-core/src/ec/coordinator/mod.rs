@@ -558,10 +558,8 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 });
                 continue;
             }
-            if Self::rate_limited(registered, lookup) {
-                pending.early.push(skip(SkipReason::RateLimited));
-                continue;
-            }
+            // The request is built before the rate limit is checked, so a
+            // provider that makes no lookup spends none of its budget.
             let mut request = match registered.provider.build_request(&input) {
                 Ok(request) => request,
                 Err(report) => {
@@ -574,6 +572,10 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                     continue;
                 }
             };
+            if Self::rate_limited(registered, lookup) {
+                pending.early.push(skip(SkipReason::RateLimited));
+                continue;
+            }
             if !destination_allowed(&request.url, &registered.policy.allowed_domains) {
                 pending.early.push(skip(SkipReason::Destination));
                 continue;
@@ -708,7 +710,7 @@ mod tests {
     use crate::error::TrustedServerError;
     use crate::settings::EcPartner;
     use std::borrow::Cow;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::num::NonZeroUsize;
 
     const EC_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123";
@@ -1730,5 +1732,70 @@ mod tests {
             LookupStatus::Skipped(SkipReason::NotDue),
             "should keep the held ID"
         );
+    }
+
+    /// An echo provider that makes no lookup.
+    struct NoLookupProvider(EchoProvider);
+
+    impl IdentityProvider for NoLookupProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            _lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            Err(Report::new(ProviderError::Request))
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+    }
+
+    /// A limiter that counts the checks it is asked for.
+    #[derive(Default)]
+    struct CountingLimiter(Cell<u32>);
+
+    impl RateLimiter for CountingLimiter {
+        fn exceeded(
+            &self,
+            _key: &str,
+            _hourly_limit: u32,
+        ) -> Result<bool, Report<TrustedServerError>> {
+            self.0.set(self.0.get() + 1);
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn a_provider_making_no_lookup_spends_no_rate_limit() {
+        let coordinator = ProviderCoordinator::new(
+            vec![
+                RegisteredProvider::new(
+                    provider_config(""),
+                    NoLookupProvider(echo_provider(SourceInput::Anonymous)),
+                )
+                .with_rate_limit(NonZeroU32::new(1).expect("should be non-zero")),
+            ],
+            partners(),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator");
+        let transport = CannedTransport::new(ok_reply);
+        let limiter = CountingLimiter::default();
+
+        let results = run_with(&coordinator, &transport, &missing(), &granting(), &limiter);
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Input),
+            "should skip a provider that builds no request"
+        );
+        assert_eq!(limiter.0.get(), 0, "should not check the rate limit");
     }
 }
