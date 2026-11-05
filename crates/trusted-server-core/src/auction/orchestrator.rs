@@ -1570,6 +1570,11 @@ impl AuctionOrchestrator {
     }
 
     /// Select the best decoded-price bid for each slot from all responses.
+    ///
+    /// Winning bids are verbatim clones of provider bids, and floor enforcement
+    /// only removes entries. Auction telemetry attributes local wins by matching
+    /// `bid_id` and `price`, so any future change that rewrites a winner (for
+    /// example currency conversion or bid shading) must update that matching too.
     fn select_winning_bids(
         &self,
         responses: &[AuctionResponse],

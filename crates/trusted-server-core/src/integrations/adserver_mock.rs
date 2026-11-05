@@ -390,7 +390,10 @@ impl AdServerMockProvider {
 
         if !response.status().is_success() {
             return Err(Report::new(TrustedServerError::Auction {
-                message: format!("AdServer Mock returned HTTP {}", response.status()),
+                message: format!(
+                    "AdServer Mock returned non-success HTTP {}",
+                    response.status()
+                ),
             }));
         }
 
