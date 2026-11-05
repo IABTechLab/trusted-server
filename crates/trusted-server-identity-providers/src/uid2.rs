@@ -31,6 +31,9 @@
 //! A `latestToken` of `"optout"` in any of those cookies reports an opt-out:
 //! no lookup is made and stored UID2 UIDs are removed.
 //!
+//! UID2 is not offered where GDPR applies: there the provider is skipped
+//! for consent, so its cookies are not read and no refresh is made.
+//!
 //! Parsing is lenient: an undecodable cookie, a missing token or expiry,
 //! or a blank or opt-out token reads as no ID. A JSON value is never stored
 //! as a token.
@@ -276,6 +279,11 @@ impl IdentityProvider for Uid2Provider {
         &self.capabilities
     }
 
+    /// UID2 is not offered where GDPR applies, so it is skipped there.
+    fn runs_where_gdpr_applies(&self) -> bool {
+        false
+    }
+
     fn build_request(
         &self,
         lookup: &LookupInput<'_>,
@@ -418,6 +426,16 @@ mod tests {
 
     fn identity_cookie(identity: &serde_json::Value) -> String {
         format!("__uid_2={}", urlencoding::encode(&identity.to_string()))
+    }
+
+    #[test]
+    fn is_not_run_where_gdpr_applies() {
+        let provider = provider(&json!({}));
+
+        assert!(
+            !provider.runs_where_gdpr_applies(),
+            "should not run UID2 where GDPR applies"
+        );
     }
 
     #[test]
