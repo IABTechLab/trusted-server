@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-17
 
-**Status:** Draft for the EdgeZero implementers, in agent review
+**Status:** Handed to EdgeZero on 2026-10-18. PR 275 added its own edited copy in commit `bc300ace` and has amended it since, including its 2026-10-24 Scoped Amendment. EdgeZero's copy is the contract EdgeZero is measured against. This file is the text Trusted Server handed over.
 
 **EdgeZero base:** PR 275 head `f6c708ccb5be19ba9fa92575db3c08c0f17e0d72` (branch `docs/outbound-http-spec`), called **F** below
 
