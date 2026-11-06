@@ -97,22 +97,22 @@ pub fn build_coordinator_with(
 }
 
 /// Builds the coordinator for enabled providers collected after the response
-/// has been sent (`collect = "after_response"`).
+/// has been sent (`collect = "after_response"`), against an already built
+/// partner registry.
 ///
 /// Its budget is `identity_after_response_budget_ms`. Returns `None` when no
 /// such provider is enabled.
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`build_coordinator`].
+/// Returns the same errors as [`build_coordinator_with`].
 pub fn build_after_response_coordinator(
     settings: &Settings,
+    partners: Arc<PartnerRegistry>,
 ) -> Result<Option<ProviderCoordinator>, Report<ProviderConfigError>> {
-    let partners = partner_registry(&settings.ec)
-        .map_err(|report| report.change_context(ProviderConfigError::Invalid))?;
     build_phase_coordinator(
         settings,
-        Arc::new(partners),
+        partners,
         CollectTiming::AfterResponse,
         Duration::from_millis(settings.ec.identity_after_response_budget_ms),
     )

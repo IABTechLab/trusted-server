@@ -19,6 +19,7 @@ use trusted_server_core::ec::after_response::{
 use trusted_server_core::ec::coordinator::IdentityCoordinator as _;
 use trusted_server_core::ec::coordinator::LookupContext;
 use trusted_server_core::ec::coordinator::transport::PlatformLookupTransport;
+use trusted_server_core::ec::current_timestamp;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::finalize::ec_finalize_response;
@@ -764,7 +765,7 @@ fn run_edgezero_pull_sync_after_send(
 /// for.
 fn run_after_response_lookups(
     settings: &Settings,
-    partner_registry: &PartnerRegistry,
+    partner_registry: &Arc<PartnerRegistry>,
     ec_state: &mut EcFinalizeState,
     lookups: Option<AfterResponseLookups>,
 ) {
@@ -781,7 +782,8 @@ fn run_after_response_lookups(
         log::debug!("After-response lookups skipped: EC changed during the request");
         return;
     }
-    let coordinator = match build_after_response_coordinator(settings) {
+    let coordinator = match build_after_response_coordinator(settings, Arc::clone(partner_registry))
+    {
         Ok(Some(coordinator)) => coordinator,
         Ok(None) => return,
         Err(report) => {
@@ -804,9 +806,7 @@ fn run_after_response_lookups(
     let transport =
         PlatformLookupTransport::new(&ec_state.services, settings.proxy.certificate_check);
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+    let now = current_timestamp();
     let pending = futures::executor::block_on(coordinator.dispatch(
         &transport,
         &LookupContext {
