@@ -354,7 +354,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
     }
 
     /// Whether the provider's hourly per-EC limit is reached. Limiter errors
-    /// fail open, matching pull sync.
+    /// fail closed, as pull sync always has: an unknown count skips the lookup.
     fn rate_limited(registered: &Registered<P>, lookup: &LookupContext<'_>) -> bool {
         let Some(limit) = registered.policy.rate_limit_per_hour else {
             return false;
@@ -365,10 +365,10 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
             Ok(exceeded) => exceeded,
             Err(report) => {
                 log::warn!(
-                    "Identity lookup: provider={} rate limiter failed, allowing lookup: {report:?}",
+                    "Identity lookup: provider={} rate limiter failed, skipping lookup: {report:?}",
                     registered.id
                 );
-                false
+                true
             }
         }
     }
@@ -1361,6 +1361,45 @@ mod tests {
             only_status(&results),
             LookupStatus::Skipped(SkipReason::RateLimited),
             "should skip a rate-limited provider"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    struct FailingLimiter;
+
+    impl RateLimiter for FailingLimiter {
+        fn exceeded(
+            &self,
+            _key: &str,
+            _hourly_limit: u32,
+        ) -> Result<bool, Report<TrustedServerError>> {
+            Err(Report::new(TrustedServerError::KvStore {
+                store_name: "example-counter".to_owned(),
+                message: "unavailable".to_owned(),
+            }))
+        }
+    }
+
+    #[test]
+    fn limiter_failure_skips_the_lookup() {
+        let coordinator = coordinator_with(
+            RegisteredProvider::new(provider_config(""), echo_provider(SourceInput::Anonymous))
+                .with_rate_limit(NonZeroU32::new(1).expect("should be non-zero")),
+        );
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run_with(
+            &coordinator,
+            &transport,
+            &missing(),
+            &granting(),
+            &FailingLimiter,
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::RateLimited),
+            "should skip when the limiter cannot count"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
     }
