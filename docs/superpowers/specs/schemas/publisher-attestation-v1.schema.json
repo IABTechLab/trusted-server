@@ -1,5 +1,5 @@
 {
-  "$comment": "JSON Schema draft-07. Local references only. Structural validation is necessary but never verifies cryptography, trust, authorization, provider qualification or current acceptance under independently configured policy. Reject duplicate members/trailing bytes and enforce depth <=16, UTF-8 byte limits (ordinary strings <=256), HTTP limits and canonical encodings before validation. External checks include JWK thumbprints, JCS hashes, equality of projected/bound/enrolled identities, ASCII-only host canonicalization, time ordering/lifetimes/key validity, nonce consumption, policy-required checks, release eligibility/digest equality, status sequence/withdrawal and independent trust settings. Evidence/status lifetime <=60 seconds; assessment expiry <=observed_from+900, issued_at<=observed_until+60; key validity <=90 days; challenge expiry <=creation+600. No schema alone establishes these relationships. Assessment expiry must not exceed independently authorized operator-record, enrollment, publisher-key or verifier-key expiry. Current status expiry must not exceed those bounds, assessment expiry or issued_at+60. Recheck authority at publication/commit and status reuse even when authorization generation is unchanged; expired operator authority stops positive assessment/current status. Configuration checks concern signed publisher-declared identity/enrollment consistency only, never a registry read of full configuration. Default acceptance is expiry-only (require_status=false); live status is an optional stricter policy. Non-null operator identity requires independent exact operator DNS/account proof; null denotes self-operated with no distinct operator claim.",
+  "$comment": "JSON Schema draft-07. Local references only. Structural validation is necessary but never verifies cryptography, trust, authorization, provider qualification or current acceptance under independently configured policy. Reject duplicate members/trailing bytes and enforce depth <=16, UTF-8 byte limits (ordinary strings <=256), HTTP limits and canonical encodings before validation. External checks include JWK thumbprints, JCS hashes, equality of projected/bound/enrolled identities, ASCII-only host canonicalization, time ordering/lifetimes/key validity, nonce consumption, policy-required checks, release eligibility/digest equality, status sequence/withdrawal and independent trust settings. Ed25519 verification is strict: reject non-canonical S, non-canonical R or public-key encodings and small-order R points or public keys. Times are exclusive at expiry (valid while now < expires_at) and inclusive at not_before. Evidence/status lifetime <=60 seconds; assessment expiry <=observed_from+900, issued_at<=observed_until+60; key validity <=90 days; challenge expiry <=issued_at+600. No schema alone establishes these relationships. Assessment expiry must not exceed independently authorized operator-record, enrollment, publisher-key or verifier-key expiry. Current status expiry must not exceed those bounds, assessment expiry or issued_at+60. Recheck authority at publication/commit and status reuse even when authorization generation is unchanged; expired operator authority stops positive assessment/current status. Configuration checks concern signed publisher-declared identity/enrollment consistency only, never a registry read of full configuration. Default acceptance is expiry-only (require_status=false); live status is an optional stricter policy. A cached positive consumer result never outlives the earliest accepted-threshold assessment expiry, independently configured trust-key acceptance deadline, original observation time plus configured observation age, evaluated_at plus configured cache lifetime, or required live-status expiry and original issued_at plus configured status maximum age (at most 60 seconds); expiry-only acceptance adds no status-expiry dependency. Non-null operator identity requires independent exact operator DNS/account proof; null denotes self-operated with no distinct operator claim.",
   "title": "Publisher attestation version 1 structural contract",
   "oneOf": [
     {
@@ -40,6 +40,15 @@
     },
     {
       "$ref": "#/definitions/keyHistory"
+    },
+    {
+      "$ref": "#/definitions/policyDocument"
+    },
+    {
+      "$ref": "#/definitions/verifierMetadata"
+    },
+    {
+      "$ref": "#/definitions/errorBody"
     }
   ],
   "definitions": {
@@ -86,8 +95,8 @@
     "httpsIdentifier": {
       "type": "string",
       "maxLength": 256,
-      "pattern": "^https://[^/?#@\\s]+(?:/[^?#\\s]*)?$",
-      "$comment": "Additionally parse as HTTPS, reject userinfo/query/fragment and validate authority; this pattern is a structural filter, not a URL parser."
+      "pattern": "^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?:/(?!\\.\\.?(?:/|$))[A-Za-z0-9._~-]+)*$",
+      "$comment": "Canonical HTTPS identifier (PA-IDENTIFIER): lowercase ASCII host without port, trailing dot or IP literal; optional path of non-empty unreserved-character segments, no trailing slash, no dot segments, no percent-encoding, userinfo, query or fragment. Compared as exact bytes. Host label/total length limits are enforced outside this pattern."
     },
     "environment": {
       "enum": ["production", "staging", "development"]
@@ -702,7 +711,11 @@
           ]
         },
         "coverage": {
-          "enum": ["selected_executable_only", "declaration_only"]
+          "enum": [
+            "selected_executable_only",
+            "provider_package_fingerprint",
+            "declaration_only"
+          ]
         }
       },
       "allOf": [
@@ -762,6 +775,9 @@
               },
               "release": {
                 "type": "null"
+              },
+              "coverage": {
+                "const": "provider_package_fingerprint"
               }
             }
           }
@@ -1116,6 +1132,7 @@
         "environment",
         "publisher_key_kid",
         "nonce",
+        "issued_at",
         "expires_at"
       ],
       "additionalProperties": false,
@@ -1167,6 +1184,9 @@
         "nonce": {
           "$ref": "#/definitions/base64url32"
         },
+        "issued_at": {
+          "$ref": "#/definitions/time"
+        },
         "expires_at": {
           "$ref": "#/definitions/time"
         }
@@ -1204,7 +1224,8 @@
             }
           }
         }
-      ]
+      ],
+      "$comment": "issued_at < expires_at <= issued_at + 600 is checked outside JSON Schema."
     },
     "keyMetadata": {
       "type": "object",
@@ -1300,6 +1321,230 @@
         }
       },
       "$comment": "Untrusted transport of historical signed objects. Aggregate decoded HTTP body limit 524288 bytes is enforced externally before schema validation. Assessment JWS <=32768 ASCII bytes; status JWS <=8192 ASCII bytes. Pagination cursor is opaque printable ASCII; it confers no authority."
+    },
+    "policyCheck": {
+      "type": "object",
+      "required": ["requirement", "methods"],
+      "additionalProperties": false,
+      "properties": {
+        "requirement": {
+          "enum": ["pass", "pass_or_not_assessed"]
+        },
+        "methods": {
+          "anyOf": [
+            {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/definitions/nonemptyText"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "$comment": "methods null means the consumer's method allowlist governs this check; an array fixes the permitted methods."
+    },
+    "policyDocument": {
+      "type": "object",
+      "required": [
+        "schema",
+        "id",
+        "version",
+        "checks",
+        "build",
+        "max_assessment_lifetime_seconds",
+        "extensions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-policy-v1"
+        },
+        "id": {
+          "$ref": "#/definitions/nonemptyText"
+        },
+        "version": {
+          "$ref": "#/definitions/positiveInteger"
+        },
+        "checks": {
+          "type": "object",
+          "required": [
+            "host_authorization",
+            "key_possession",
+            "host_service_binding",
+            "active_version",
+            "configuration"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "host_authorization": {
+              "$ref": "#/definitions/policyCheck"
+            },
+            "key_possession": {
+              "$ref": "#/definitions/policyCheck"
+            },
+            "host_service_binding": {
+              "$ref": "#/definitions/policyCheck"
+            },
+            "active_version": {
+              "$ref": "#/definitions/policyCheck"
+            },
+            "configuration": {
+              "$ref": "#/definitions/policyCheck"
+            }
+          }
+        },
+        "build": {
+          "type": "object",
+          "required": [
+            "assurance",
+            "declared_methods",
+            "fingerprint_methods",
+            "artifact_methods"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "assurance": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "uniqueItems": true,
+              "items": {
+                "enum": ["artifact_bound", "fingerprint_only", "declared"]
+              }
+            },
+            "declared_methods": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "maxItems": 16,
+                  "uniqueItems": true,
+                  "items": {
+                    "$ref": "#/definitions/nonemptyText"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "fingerprint_methods": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "maxItems": 16,
+                  "uniqueItems": true,
+                  "items": {
+                    "$ref": "#/definitions/nonemptyText"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "artifact_methods": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "maxItems": 16,
+                  "uniqueItems": true,
+                  "items": {
+                    "$ref": "#/definitions/nonemptyText"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        "max_assessment_lifetime_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 900
+        },
+        "extensions": {
+          "$ref": "#/definitions/extensions"
+        }
+      },
+      "$comment": "Canonical built-in policy document. The assessment policy.digest is SHA-256 of JCS(this document)."
+    },
+    "verifierMetadata": {
+      "type": "object",
+      "required": [
+        "schema",
+        "issuer",
+        "publication_bases",
+        "keys",
+        "policies",
+        "live_status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-verifier-metadata-v1"
+        },
+        "issuer": {
+          "$ref": "#/definitions/httpsIdentifier"
+        },
+        "publication_bases": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/definitions/httpsIdentifier"
+          }
+        },
+        "keys": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/definitions/keyValidity"
+          }
+        },
+        "policies": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/definitions/policy"
+          }
+        },
+        "live_status": {
+          "type": "boolean"
+        }
+      },
+      "$comment": "Unsigned convenience document at {issuer}/v1/issuer. Untrusted until confirmed out of band and pinned; never changes trust by itself."
+    },
+    "errorBody": {
+      "type": "object",
+      "required": ["schema", "error"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-error-v1"
+        },
+        "error": {
+          "enum": [
+            "invalid_request",
+            "unknown_kid",
+            "not_found",
+            "misdirected_request",
+            "conflict",
+            "rate_limited",
+            "unavailable"
+          ]
+        }
+      },
+      "$comment": "Closed error body for publisher endpoints and registry read surfaces; at most 256 bytes."
     }
   }
 }
