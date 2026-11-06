@@ -2099,11 +2099,15 @@ mod tests {
     }
 
     fn provider_found(source: &str) -> LookupResults {
+        provider_found_by(source, "example-provider")
+    }
+
+    fn provider_found_by(source: &str, owner: &str) -> LookupResults {
         let uid = KvUid::new(
             UidValue::try_from("provider-uid").expect("should build uid"),
             AgentType::try_from(1).expect("should build atype"),
             None,
-            Some(ProviderId::new("example-provider")),
+            Some(ProviderId::new(owner)),
             Expiry::Never,
         );
         // Made for the EC ID `run_mirror_navigation` seeds.
@@ -2129,6 +2133,15 @@ mod tests {
         mirror: Option<&str>,
         kv_read_failed: bool,
     ) -> Response<EdgeBody> {
+        run_mirror_request(lookups, mirror, kv_read_failed, true)
+    }
+
+    fn run_mirror_request(
+        lookups: LookupResults,
+        mirror: Option<&str>,
+        kv_read_failed: bool,
+        navigation: bool,
+    ) -> Response<EdgeBody> {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("mirr01");
         let graph = KvIdentityGraph::in_memory("mirror_store");
@@ -2148,7 +2161,7 @@ mod tests {
         } else {
             graph.load_snapshot(&ec_id)
         };
-        let mut ec_context = returning_user_context(&ec_id, snapshot, true);
+        let mut ec_context = returning_user_context(&ec_id, snapshot, navigation);
         ec_context.set_mirror_cookie_for_test(mirror);
         ec_context.set_lookup_results(lookups);
         let mut registry = PartnerRegistry::from_config(&[make_partner("ids.example.com")])
@@ -2181,6 +2194,36 @@ mod tests {
         assert!(
             !cookies[0].contains("HttpOnly") && !cookies[0].contains("Domain="),
             "should be JS-readable and host-only"
+        );
+    }
+
+    #[test]
+    fn pull_sync_result_is_mirrored_with_its_owner() {
+        let response = run_mirror_navigation(
+            provider_found_by("ids.example.com", "pull-sync:ids.example.com"),
+            None,
+            false,
+        );
+
+        assert_eq!(
+            mirror_cookies(&response).len(),
+            1,
+            "should mirror a provider-owned pull-sync UID"
+        );
+    }
+
+    #[test]
+    fn consented_non_navigation_leaves_the_mirror_untouched() {
+        let response = run_mirror_request(
+            provider_found("ids.example.com"),
+            Some("stale"),
+            false,
+            false,
+        );
+
+        assert!(
+            mirror_cookies(&response).is_empty(),
+            "should neither set nor expire the mirror outside a navigation"
         );
     }
 
