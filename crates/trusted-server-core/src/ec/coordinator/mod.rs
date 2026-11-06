@@ -272,6 +272,20 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         self.providers.is_empty()
     }
 
+    /// Whether `source` holds a UID of this provider whose refresh is due.
+    fn refresh_due(
+        registered: &Registered<P>,
+        entry: Option<&KvEntry>,
+        source: &SourceDomain,
+        now: UnixSeconds,
+    ) -> bool {
+        entry
+            .and_then(|entry| entry.ids.get(source.as_str()))
+            .is_some_and(|record| {
+                record.is_provider_written() && record.refresh_due_for(&registered.id, now)
+            })
+    }
+
     /// Whether the row holds a live provider-written UID for `source`.
     fn holds_live_uid(entry: Option<&KvEntry>, source: &str, now: UnixSeconds) -> bool {
         entry
@@ -576,8 +590,18 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                         // Only the sources the cookies filled are spared a
                         // lookup; the provider's other due sources are
                         // still looked up.
+                        // A refresh-due source whose cookie only repeats the
+                        // held UID stays due, so its refresh still runs before
+                        // the UID expires.
                         due.retain(|source| {
-                            found.entries.iter().all(|(filled, _)| filled != source)
+                            found
+                                .entries
+                                .iter()
+                                .find(|(filled, _)| filled == source)
+                                .is_none_or(|(_, eids)| {
+                                    Self::refresh_due(registered, entry, source, lookup.now)
+                                        && holds_same_uids_for(entry, source, eids, lookup.now)
+                                })
                         });
                         // A cookie repeating the held UIDs is not rewritten,
                         // so its relative expiry does not cause a write on
@@ -807,24 +831,35 @@ fn holds_same_uids(entry: Option<&KvEntry>, found: &ProviderLookup, now: UnixSec
     let Some(entry) = entry else {
         return false;
     };
-    found.entries.iter().all(|(source, eids)| {
-        let Some(record) = entry.ids.get(source.as_str()) else {
-            return false;
-        };
-        let held: HashSet<&str> = record
-            .eids()
-            .iter()
-            .flat_map(KvEid::uids)
-            .filter(|uid| uid.is_live(now))
-            .map(|uid| uid.id().as_str())
-            .collect();
-        let read: HashSet<&str> = eids
-            .iter()
-            .flat_map(KvEid::uids)
-            .map(|uid| uid.id().as_str())
-            .collect();
-        held == read
-    })
+    found
+        .entries
+        .iter()
+        .all(|(source, eids)| holds_same_uids_for(Some(entry), source, eids, now))
+}
+
+/// Whether the row holds exactly the live UIDs in `eids` for `source`.
+fn holds_same_uids_for(
+    entry: Option<&KvEntry>,
+    source: &SourceDomain,
+    eids: &[KvEid],
+    now: UnixSeconds,
+) -> bool {
+    let Some(record) = entry.and_then(|entry| entry.ids.get(source.as_str())) else {
+        return false;
+    };
+    let held: HashSet<&str> = record
+        .eids()
+        .iter()
+        .flat_map(KvEid::uids)
+        .filter(|uid| uid.is_live(now))
+        .map(|uid| uid.id().as_str())
+        .collect();
+    let read: HashSet<&str> = eids
+        .iter()
+        .flat_map(KvEid::uids)
+        .map(|uid| uid.id().as_str())
+        .collect();
+    held == read
 }
 
 fn log_outcome(lookup: &ProviderLookup) {
@@ -851,6 +886,7 @@ fn log_outcome(lookup: &ProviderLookup) {
 mod tests {
     use super::*;
     use crate::consent::types::TcfConsent;
+    use crate::ec::coordinator::results::DropCounts;
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, UidValue};
     use crate::ec::kv::KvIdentityGraph;
     use crate::ec::kv_types::{KvEid, KvPartnerId, KvRefresh, KvUid};
@@ -1871,6 +1907,117 @@ mod tests {
             "should refresh a live UID whose refresh time has passed"
         );
         assert_eq!(transport.sent.borrow().len(), 1, "should send the refresh");
+    }
+
+    #[test]
+    fn a_due_refresh_runs_while_the_cookie_repeats_the_held_uid() {
+        let coordinator = cookie_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record(900)),
+            &granting(),
+            &Limiter(false),
+            "vendor_id=p-1",
+        );
+
+        assert_eq!(
+            transport.sent.borrow().len(),
+            1,
+            "should send the refresh although the cookie holds the same UID"
+        );
+    }
+
+    #[test]
+    fn a_newer_cookie_uid_replaces_a_refresh() {
+        let coordinator = cookie_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record(900)),
+            &granting(),
+            &Limiter(false),
+            "vendor_id=c-2",
+        );
+
+        assert!(
+            transport.sent.borrow().is_empty(),
+            "should take the newer cookie UID instead of refreshing"
+        );
+    }
+
+    fn found_lookup(source: &str, id: &str) -> ProviderLookup {
+        let uid = KvUid::new(
+            UidValue::try_from(id).expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            Expiry::Never,
+        );
+        ProviderLookup {
+            provider: ProviderId::new("example-provider"),
+            status: LookupStatus::Found {
+                kept: 1,
+                dropped: DropCounts::default(),
+            },
+            entries: vec![(
+                SourceDomain::try_from(source).expect("should build source"),
+                vec![KvEid::new(EidFields::default(), vec![uid])],
+            )],
+            cleared: Vec::new(),
+        }
+    }
+
+    fn status_lookup(status: LookupStatus) -> ProviderLookup {
+        ProviderLookup {
+            provider: ProviderId::new("example-provider"),
+            status,
+            entries: Vec::new(),
+            cleared: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn merging_keeps_cookie_ids_when_the_lookup_fails_and_lets_an_opt_out_win() {
+        for failed in [
+            LookupStatus::Timeout,
+            LookupStatus::HttpError(http::StatusCode::BAD_GATEWAY),
+        ] {
+            let merged = merge_lookups(found_lookup("a.example.com", "c-1"), status_lookup(failed));
+            assert!(
+                matches!(merged.status, LookupStatus::Found { kept: 1, .. }),
+                "should keep the cookie IDs when the lookup fails"
+            );
+        }
+
+        let merged = merge_lookups(
+            found_lookup("a.example.com", "c-1"),
+            status_lookup(LookupStatus::Skipped(SkipReason::OptedOut)),
+        );
+
+        assert_eq!(
+            merged.status,
+            LookupStatus::Skipped(SkipReason::OptedOut),
+            "should let a lookup opt-out win over cookie IDs"
+        );
+    }
+
+    #[test]
+    fn merging_combines_cookie_and_lookup_sources() {
+        let merged = merge_lookups(
+            found_lookup("a.example.com", "c-1"),
+            found_lookup("b.example.com", "l-1"),
+        );
+
+        assert!(
+            matches!(merged.status, LookupStatus::Found { kept: 2, .. }),
+            "should count both sources"
+        );
+        assert_eq!(merged.entries.len(), 2, "should keep both sources");
     }
 
     #[test]
