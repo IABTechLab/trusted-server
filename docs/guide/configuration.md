@@ -749,16 +749,17 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
 be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
-| Field                     | Type           | Required | Description                                                             |
-| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
-| `partners`                | Array          | No       | Static partner registry entries                                         |
-| `identity_budget_ms`      | Integer        | No       | Shared time budget for identity provider lookups (default 200)          |
-| `identity_providers`      | Array          | No       | Server-side identity providers (see below)                              |
+| Field                               | Type           | Required | Description                                                             |
+| ----------------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
+| `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                   |
+| `ec_store`                          | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
+| `pull_sync_concurrency`             | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
+| `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                     |
+| `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
+| `partners`                          | Array          | No       | Static partner registry entries                                         |
+| `identity_budget_ms`                | Integer        | No       | Shared time budget for identity provider lookups (default 200)          |
+| `identity_after_response_budget_ms` | Integer        | No       | Time budget for `collect = "after_response"` lookups (default 2000)     |
+| `identity_providers`                | Array          | No       | Server-side identity providers (see below)                              |
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
@@ -812,17 +813,19 @@ When a provider reports an opt-out, its sources are cleared and the row
 remembers the opt-out for 30 days. The provider is not called for that EC
 again until the 30 days pass.
 
-| Field             | Type    | Required | Description                                                             |
-| ----------------- | ------- | -------- | ----------------------------------------------------------------------- |
-| `id`              | String  | Yes      | Stable provider ID used in logs, metrics and KV ownership               |
-| `kind`            | String  | Yes      | Provider implementation built into this release                         |
-| `enabled`         | Boolean | No       | Whether the provider runs (default `true`)                              |
-| `endpoint`        | String  | Yes      | HTTPS lookup URL; its host must be in `allowed_domains`                 |
-| `allowed_domains` | Array   | Yes      | Hosts the provider may call                                             |
-| `sources`         | Array   | Yes      | Source domains the provider owns; each needs an `[[ec.partners]]` entry |
-| `tcf_vendor_id`   | Integer | No       | TCF vendor ID that must have vendor consent                             |
-| `secrets.token`   | String  | No       | Key in `trusted_server_secrets` for the provider's API token            |
-| `settings`        | Table   | No       | Provider-specific settings, parsed by the provider kind                 |
+| Field                 | Type    | Required | Description                                                             |
+| --------------------- | ------- | -------- | ----------------------------------------------------------------------- |
+| `id`                  | String  | Yes      | Stable provider ID used in logs, metrics and KV ownership               |
+| `kind`                | String  | Yes      | Provider implementation built into this release                         |
+| `enabled`             | Boolean | No       | Whether the provider runs (default `true`)                              |
+| `endpoint`            | String  | Yes      | HTTPS lookup URL; its host must be in `allowed_domains`                 |
+| `allowed_domains`     | Array   | Yes      | Hosts the provider may call                                             |
+| `sources`             | Array   | Yes      | Source domains the provider owns; each needs an `[[ec.partners]]` entry |
+| `tcf_vendor_id`       | Integer | No       | TCF vendor ID that must have vendor consent                             |
+| `collect`             | String  | No       | `"page"` (default) or `"after_response"`; see below                     |
+| `rate_limit_per_hour` | Integer | No       | Most lookups per EC per hour; unset means unlimited. See the note below |
+| `secrets.token`       | String  | No       | Key in `trusted_server_secrets` for the provider's API token            |
+| `settings`            | Table   | No       | Provider-specific settings, parsed by the provider kind                 |
 
 **Example**:
 
@@ -840,6 +843,16 @@ sources = ["ids.example.com"]
 [ec.identity_providers.secrets]
 token = "example_provider_token"
 ```
+
+`collect = "after_response"` lookups run after the response is sent, within
+`identity_after_response_budget_ms`, and only for an EC whose row already
+existed before the navigation. Their results reach the row in a follow-up write.
+
+::: warning Rate limit granularity
+On Fastly, `rate_limit_per_hour` is enforced as a per-minute budget rounded up
+to at least one lookup per minute, so any value below 60 behaves like 60 per
+hour. Values of 60 and above are enforced as `ceil(value / 60)` per minute.
+:::
 
 **Validation**: configuration validation fails when an enabled provider's
 `endpoint` is not HTTPS or its host is not in `allowed_domains`, when a source

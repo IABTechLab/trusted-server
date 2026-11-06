@@ -110,6 +110,9 @@ pull_sync_concurrency = 3
 # Optional server-side identity providers, looked up on publisher navigations
 # before the origin fetch. Every enabled provider shares one time budget:
 # identity_budget_ms = 200  # default 200
+# Budget for providers with collect = "after_response", which run after the
+# response is sent and write their results in a follow-up write:
+# identity_after_response_budget_ms = 2000
 #
 # [[ec.identity_providers]]
 # id = "example-provider"
@@ -124,6 +127,12 @@ pull_sync_concurrency = 3
 # sources = ["ids.example.com"]
 # Optional: require TCF vendor consent for this provider.
 # tcf_vendor_id = 9999
+# "page" (default) collects before the response; "after_response" collects
+# after it is sent, only for an EC whose row already exists.
+# collect = "page"
+# Optional: most lookups per EC per hour. On Fastly this is enforced per
+# minute with a minimum of one, so values below 60 behave like 60.
+# rate_limit_per_hour = 60
 # Secret Store key name, resolved like other secret references.
 # [ec.identity_providers.secrets]
 # token = "example_provider_token"
