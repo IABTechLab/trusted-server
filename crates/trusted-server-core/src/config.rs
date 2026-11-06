@@ -15,7 +15,7 @@ use url::{Host, Url};
 use validator::{Validate, ValidationError, ValidationErrors};
 
 use crate::ec::provider::validate_enabled_configs;
-use crate::ec::registry::PartnerRegistry;
+use crate::ec::registry::{PULL_SYNC_KIND, PartnerRegistry};
 use crate::error::TrustedServerError;
 use crate::integrations::{
     adserver_mock::AdServerMockConfig,
@@ -427,6 +427,20 @@ pub fn with_placeholder_partner_tokens(ec: &Ec) -> Ec {
 fn validate_identity_providers(ec: &Ec) -> Result<(), Report<TrustedServerError>> {
     if ec.identity_providers.is_empty() {
         return Ok(());
+    }
+    // Pull-sync providers come only from partner config, which carries the
+    // pull token and rate limit; configuring the kind directly bypasses both.
+    if let Some(config) = ec
+        .identity_providers
+        .iter()
+        .find(|config| config.kind() == PULL_SYNC_KIND)
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "ec.identity_providers: provider `{}` uses kind `{PULL_SYNC_KIND}`; configure pull sync on its [[ec.partners]] entry instead",
+                config.id
+            ),
+        }));
     }
     let partners = PartnerRegistry::from_ec(ec)?;
     validate_enabled_configs(&ec.identity_providers, &partners).map_err(|report| {
@@ -1680,6 +1694,21 @@ gam_network_id = "99999"
         assert!(
             err.to_string().contains("pull-sync partner"),
             "should explain the double claim: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_a_directly_configured_pull_sync_provider() {
+        let settings = settings_with_identity_provider(serde_json::json!({
+            "kind": PULL_SYNC_KIND,
+        }));
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject the pull-sync kind in identity providers");
+
+        assert!(
+            err.to_string().contains("[[ec.partners]]"),
+            "should point to partner config: {err:?}"
         );
     }
 
