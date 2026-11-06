@@ -239,6 +239,22 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         })
     }
 
+    /// The order providers are dispatched in: configured providers first,
+    /// then pull-sync partners rotated by the hour, so that under
+    /// `pull_sync_concurrency` every partner gets a turn, as pull sync did
+    /// before it became a provider.
+    fn dispatch_order(&self, now: UnixSeconds) -> Vec<usize> {
+        let (mut order, mut pull_sync): (Vec<usize>, Vec<usize>) =
+            (0..self.providers.len()).partition(|&index| !self.providers[index].policy.pull_sync);
+        if !pull_sync.is_empty() {
+            let hour = usize::try_from(now.get() / 3600).unwrap_or(0);
+            let offset = hour % pull_sync.len();
+            pull_sync.rotate_left(offset);
+        }
+        order.append(&mut pull_sync);
+        order
+    }
+
     /// Caps the pull-sync lookups dispatched per navigation
     /// (`ec.pull_sync_concurrency`). Due pull-sync partners past the cap are
     /// skipped as rate limited and retried on a later navigation.
@@ -557,7 +573,8 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         let deadline = Deadline::after(self.budget);
         pending.deadline = Some(deadline);
         let mut pull_sync_dispatched = 0_usize;
-        for (index, registered) in self.providers.iter().enumerate() {
+        for index in self.dispatch_order(lookup.now) {
+            let registered = &self.providers[index];
             let provider = ProviderIndex::new(index);
             let skip = |reason| Tagged {
                 provider,
@@ -1525,6 +1542,23 @@ mod tests {
             LookupStatus::Skipped(SkipReason::RateLimited),
             "should skip the pull-sync lookup past the cap"
         );
+    }
+
+    #[test]
+    fn pull_sync_rotates_the_partner_past_the_cap_by_the_hour() {
+        let coordinator = pull_sync_pair(NonZeroUsize::new(1));
+
+        let first_hour = coordinator.dispatch_order(UnixSeconds::new(0));
+        let next_hour = coordinator.dispatch_order(UnixSeconds::new(3600));
+
+        assert_ne!(
+            first_hour.first(),
+            next_hour.first(),
+            "should give the other partner the first slot the next hour"
+        );
+        let mut sorted = next_hour.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1], "should still dispatch every provider");
     }
 
     #[test]
