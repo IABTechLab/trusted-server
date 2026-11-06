@@ -360,6 +360,24 @@ mod tests {
     }
 
     #[test]
+    fn tombstoned_row_expires_the_mirror_even_with_consent_on_the_request() {
+        let mut entry = row(vec![uid("live", Expiry::Never)]);
+        entry.consent.ok = false;
+
+        let decision = build_mirror(
+            Some(&entry),
+            &granting(),
+            &partners(true),
+            UnixSeconds::new(1000),
+        );
+
+        assert!(
+            matches!(decision, MirrorCookie::Expire),
+            "should expire the mirror for a withdrawn row"
+        );
+    }
+
+    #[test]
     fn mirrors_several_eids_as_valid_json() {
         let mut entry = row(vec![uid("one", Expiry::Never), uid("two", Expiry::Never)]);
         let record = KvPartnerId::from_eids(
