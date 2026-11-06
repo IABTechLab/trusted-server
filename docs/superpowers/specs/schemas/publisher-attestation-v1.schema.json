@@ -1,0 +1,1550 @@
+{
+  "$comment": "JSON Schema draft-07. Local references only. Structural validation is necessary but never verifies cryptography, trust, authorization, provider qualification or current acceptance under independently configured policy. Reject duplicate members/trailing bytes and enforce depth <=16, UTF-8 byte limits (ordinary strings <=256), HTTP limits and canonical encodings before validation. External checks include JWK thumbprints, JCS hashes, equality of projected/bound/enrolled identities, ASCII-only host canonicalization, time ordering/lifetimes/key validity, nonce consumption, policy-required checks, release eligibility/digest equality, status sequence/withdrawal and independent trust settings. Ed25519 verification is strict: reject non-canonical S, non-canonical R or public-key encodings and small-order R points or public keys. Times are exclusive at expiry (valid while now < expires_at) and inclusive at not_before. Evidence/status lifetime <=60 seconds; assessment expiry <=observed_from+900, issued_at<=observed_until+60; key validity <=90 days; challenge expiry <=issued_at+600. No schema alone establishes these relationships. Assessment expiry must not exceed independently authorized operator-record, enrollment, publisher-key or verifier-key expiry. Current status expiry must not exceed those bounds, assessment expiry or issued_at+60. Recheck authority at publication/commit and status reuse even when authorization generation is unchanged; expired operator authority stops positive assessment/current status. Configuration checks concern signed publisher-declared identity/enrollment consistency only, never a registry read of full configuration. Default acceptance is expiry-only (require_status=false); live status is an optional stricter policy. A cached positive consumer result never outlives the earliest accepted-threshold assessment expiry, independently configured trust-key acceptance deadline, original observation time plus configured observation age, evaluated_at plus configured cache lifetime, or required live-status expiry and original issued_at plus configured status maximum age (at most 60 seconds); expiry-only acceptance adds no status-expiry dependency. Non-null operator identity requires independent exact operator DNS/account proof; null denotes self-operated with no distinct operator claim.",
+  "title": "Publisher attestation version 1 structural contract",
+  "oneOf": [
+    {
+      "$ref": "#/definitions/evidenceProtectedHeader"
+    },
+    {
+      "$ref": "#/definitions/assessmentProtectedHeader"
+    },
+    {
+      "$ref": "#/definitions/statusProtectedHeader"
+    },
+    {
+      "$ref": "#/definitions/identityProjection"
+    },
+    {
+      "$ref": "#/definitions/binding"
+    },
+    {
+      "$ref": "#/definitions/evidence"
+    },
+    {
+      "$ref": "#/definitions/assessment"
+    },
+    {
+      "$ref": "#/definitions/status"
+    },
+    {
+      "$ref": "#/definitions/keyDiscovery"
+    },
+    {
+      "$ref": "#/definitions/assessmentList"
+    },
+    {
+      "$ref": "#/definitions/enrollmentChallenge"
+    },
+    {
+      "$ref": "#/definitions/keyMetadata"
+    },
+    {
+      "$ref": "#/definitions/keyHistory"
+    },
+    {
+      "$ref": "#/definitions/policyDocument"
+    },
+    {
+      "$ref": "#/definitions/verifierMetadata"
+    },
+    {
+      "$ref": "#/definitions/errorBody"
+    }
+  ],
+  "definitions": {
+    "text": {
+      "type": "string",
+      "maxLength": 256
+    },
+    "nonemptyText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "integer": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "positiveInteger": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "time": {
+      "$ref": "#/definitions/integer"
+    },
+    "hex256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "base64url32": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+    },
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "host": {
+      "type": "string",
+      "maxLength": 253,
+      "pattern": "^(?=.{1,253}$)(?![0-9]+(?:\\.[0-9]+)*$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$",
+      "$comment": "Protocol boundary accepts ASCII DNS only; canonicalize ASCII letters to lowercase, remove one terminal dot, reject invalid DNS syntax and IP literals. Already-encoded xn-- labels are opaque ASCII DNS labels; Unicode input is rejected, with no Unicode/UTS dependency."
+    },
+    "httpsIdentifier": {
+      "type": "string",
+      "maxLength": 256,
+      "pattern": "^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?:/(?!\\.\\.?(?:/|$))[A-Za-z0-9._~-]+)*$",
+      "$comment": "Canonical HTTPS identifier (PA-IDENTIFIER): lowercase ASCII host without port, trailing dot or IP literal; optional path of non-empty unreserved-character segments, no trailing slash, no dot segments, no percent-encoding, userinfo, query or fragment. Compared as exact bytes. Host label/total length limits are enforced outside this pattern."
+    },
+    "environment": {
+      "enum": ["production", "staging", "development"]
+    },
+    "extensions": {
+      "type": "object",
+      "required": [],
+      "additionalProperties": false,
+      "properties": {}
+    },
+    "digest": {
+      "type": "object",
+      "required": ["algorithm", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": {
+          "const": "sha256"
+        },
+        "value": {
+          "$ref": "#/definitions/hex256"
+        }
+      }
+    },
+    "publicJwk": {
+      "type": "object",
+      "required": ["kty", "crv", "x"],
+      "additionalProperties": false,
+      "properties": {
+        "kty": {
+          "const": "OKP"
+        },
+        "crv": {
+          "const": "Ed25519"
+        },
+        "x": {
+          "$ref": "#/definitions/base64url32"
+        }
+      }
+    },
+    "keyValidity": {
+      "type": "object",
+      "required": ["kid", "jwk", "not_before", "not_after"],
+      "additionalProperties": false,
+      "properties": {
+        "kid": {
+          "$ref": "#/definitions/base64url32"
+        },
+        "jwk": {
+          "$ref": "#/definitions/publicJwk"
+        },
+        "not_before": {
+          "$ref": "#/definitions/time"
+        },
+        "not_after": {
+          "$ref": "#/definitions/time"
+        }
+      }
+    },
+    "evidenceProtectedHeader": {
+      "type": "object",
+      "required": ["alg", "kid", "typ"],
+      "additionalProperties": false,
+      "properties": {
+        "alg": {
+          "const": "Ed25519"
+        },
+        "kid": {
+          "$ref": "#/definitions/base64url32"
+        },
+        "typ": {
+          "const": "ts-publisher-evidence+jws"
+        }
+      }
+    },
+    "assessmentProtectedHeader": {
+      "type": "object",
+      "required": ["alg", "kid", "typ"],
+      "additionalProperties": false,
+      "properties": {
+        "alg": {
+          "const": "Ed25519"
+        },
+        "kid": {
+          "$ref": "#/definitions/base64url32"
+        },
+        "typ": {
+          "const": "ts-publisher-assessment+jws"
+        }
+      }
+    },
+    "statusProtectedHeader": {
+      "type": "object",
+      "required": ["alg", "kid", "typ"],
+      "additionalProperties": false,
+      "properties": {
+        "alg": {
+          "const": "Ed25519"
+        },
+        "kid": {
+          "$ref": "#/definitions/base64url32"
+        },
+        "typ": {
+          "const": "ts-publisher-status+jws"
+        }
+      }
+    },
+    "platform": {
+      "type": "object",
+      "required": ["provider", "service_id", "service_version", "staging"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "enum": ["fastly", "axum"]
+        },
+        "service_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/nonemptyText"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "service_version": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/positiveInteger"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "staging": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "provider": {
+                "const": "fastly"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "service_id": {
+                "$ref": "#/definitions/nonemptyText"
+              },
+              "service_version": {
+                "$ref": "#/definitions/positiveInteger"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "provider": {
+                "const": "axum"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "service_id": {
+                "type": "null"
+              },
+              "service_version": {
+                "type": "null"
+              },
+              "staging": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "identityProjection": {
+      "type": "object",
+      "required": [
+        "schema",
+        "host",
+        "publisher_id",
+        "operator_id",
+        "deployment_id",
+        "environment"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-identity-v1"
+        },
+        "host": {
+          "$ref": "#/definitions/host"
+        },
+        "publisher_id": {
+          "$ref": "#/definitions/uuid"
+        },
+        "operator_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/httpsIdentifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deployment_id": {
+          "$ref": "#/definitions/uuid"
+        },
+        "environment": {
+          "$ref": "#/definitions/environment"
+        }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "required": ["schema", "digest", "projection"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-identity-v1"
+        },
+        "digest": {
+          "$ref": "#/definitions/digest"
+        },
+        "projection": {
+          "$ref": "#/definitions/identityProjection"
+        }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "required": [
+        "schema",
+        "host",
+        "publisher_id",
+        "operator_id",
+        "deployment_id",
+        "environment",
+        "platform",
+        "attestation_key",
+        "configuration",
+        "extensions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-binding-v1"
+        },
+        "host": {
+          "$ref": "#/definitions/host"
+        },
+        "publisher_id": {
+          "$ref": "#/definitions/uuid"
+        },
+        "operator_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/httpsIdentifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deployment_id": {
+          "$ref": "#/definitions/uuid"
+        },
+        "environment": {
+          "$ref": "#/definitions/environment"
+        },
+        "platform": {
+          "$ref": "#/definitions/platform"
+        },
+        "attestation_key": {
+          "$ref": "#/definitions/keyValidity"
+        },
+        "configuration": {
+          "$ref": "#/definitions/configuration"
+        },
+        "extensions": {
+          "$ref": "#/definitions/extensions"
+        }
+      }
+    },
+    "buildReport": {
+      "type": "object",
+      "required": [
+        "declared_class",
+        "source_commit",
+        "package_version",
+        "target",
+        "variant"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "declared_class": {
+          "enum": ["custom", "unspecified"]
+        },
+        "source_commit": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "package_version": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "target": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "variant": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": [
+        "schema",
+        "binding",
+        "binding_id",
+        "nonce",
+        "issued_at",
+        "expires_at",
+        "build_report",
+        "extensions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-evidence-v1"
+        },
+        "binding": {
+          "$ref": "#/definitions/binding"
+        },
+        "binding_id": {
+          "$ref": "#/definitions/hex256"
+        },
+        "nonce": {
+          "$ref": "#/definitions/base64url32"
+        },
+        "issued_at": {
+          "$ref": "#/definitions/time"
+        },
+        "expires_at": {
+          "$ref": "#/definitions/time"
+        },
+        "build_report": {
+          "$ref": "#/definitions/buildReport"
+        },
+        "extensions": {
+          "$ref": "#/definitions/extensions"
+        }
+      }
+    },
+    "check": {
+      "type": "object",
+      "required": ["outcome", "method", "observed_at", "evidence_digest"],
+      "additionalProperties": false,
+      "properties": {
+        "outcome": {
+          "enum": ["pass", "fail", "unavailable", "not_assessed"]
+        },
+        "method": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/nonemptyText"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observed_at": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "pass"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "observed_at": {
+                "$ref": "#/definitions/time"
+              },
+              "evidence_digest": {
+                "$ref": "#/definitions/digest"
+              },
+              "method": {
+                "$ref": "#/definitions/nonemptyText"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "not_assessed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "method": {
+                "type": "null"
+              },
+              "observed_at": {
+                "type": "null"
+              },
+              "evidence_digest": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "method": {
+                "$ref": "#/definitions/nonemptyText"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "checks": {
+      "type": "object",
+      "required": [
+        "host_authorization",
+        "key_possession",
+        "host_service_binding",
+        "active_version",
+        "configuration"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "host_authorization": {
+          "$ref": "#/definitions/check"
+        },
+        "key_possession": {
+          "$ref": "#/definitions/check"
+        },
+        "host_service_binding": {
+          "$ref": "#/definitions/check"
+        },
+        "active_version": {
+          "$ref": "#/definitions/check"
+        },
+        "configuration": {
+          "$ref": "#/definitions/check"
+        }
+      }
+    },
+    "release": {
+      "type": "object",
+      "required": [
+        "repository",
+        "tag",
+        "source_commit",
+        "asset_name",
+        "artifact_sha256",
+        "verification_evidence_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "type": "string",
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+          "$comment": "Layer 1 owner/name identity; independently configured release eligibility remains mandatory."
+        },
+        "tag": {
+          "$ref": "#/definitions/nonemptyText"
+        },
+        "source_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "asset_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^/\\\\\\s]+$",
+          "$comment": "Simple asset basename; dot and dot-dot names are rejected.",
+          "not": {
+            "enum": [".", ".."]
+          }
+        },
+        "artifact_sha256": {
+          "$ref": "#/definitions/digest"
+        },
+        "verification_evidence_digest": {
+          "$ref": "#/definitions/digest"
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "required": [
+        "provenance",
+        "assurance",
+        "method",
+        "artifact_sha256",
+        "provider_files_hash",
+        "release",
+        "coverage"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "provenance": {
+          "enum": ["official", "custom", "unknown"]
+        },
+        "assurance": {
+          "enum": ["artifact_bound", "fingerprint_only", "declared"]
+        },
+        "method": {
+          "$ref": "#/definitions/nonemptyText"
+        },
+        "artifact_sha256": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider_files_hash": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{128}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "release": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/release"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "coverage": {
+          "enum": [
+            "selected_executable_only",
+            "provider_package_fingerprint",
+            "declaration_only"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "provenance": {
+                "const": "official"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "assurance": {
+                "const": "artifact_bound"
+              },
+              "artifact_sha256": {
+                "$ref": "#/definitions/digest"
+              },
+              "release": {
+                "$ref": "#/definitions/release"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "assurance": {
+                "const": "artifact_bound"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "artifact_sha256": {
+                "$ref": "#/definitions/digest"
+              },
+              "coverage": {
+                "const": "selected_executable_only"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "assurance": {
+                "const": "fingerprint_only"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "artifact_sha256": {
+                "type": "null"
+              },
+              "release": {
+                "type": "null"
+              },
+              "coverage": {
+                "const": "provider_package_fingerprint"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "assurance": {
+                "const": "declared"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "artifact_sha256": {
+                "type": "null"
+              },
+              "release": {
+                "type": "null"
+              },
+              "coverage": {
+                "const": "declaration_only"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "provenance": {
+                "const": "custom"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "release": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "reasonCodes": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "enum": [
+          "malformed",
+          "signature_invalid",
+          "host_mismatch",
+          "environment_mismatch",
+          "key_unauthorized",
+          "key_compromised",
+          "nonce_mismatch",
+          "stale",
+          "binding_mismatch",
+          "release_ineligible",
+          "artifact_mismatch",
+          "artifact_binding_unproven",
+          "configuration_unobservable",
+          "provider_unavailable",
+          "observation_race",
+          "withdrawn",
+          "status_unavailable",
+          "policy_untrusted",
+          "clock_unavailable",
+          "operator_unauthorized",
+          "state_recovery_required"
+        ]
+      },
+      "uniqueItems": true,
+      "$comment": "Lexicographic ordering is checked outside JSON Schema."
+    },
+    "policy": {
+      "type": "object",
+      "required": ["id", "version", "digest"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/nonemptyText"
+        },
+        "version": {
+          "$ref": "#/definitions/positiveInteger"
+        },
+        "digest": {
+          "$ref": "#/definitions/digest"
+        }
+      }
+    },
+    "assessment": {
+      "type": "object",
+      "required": [
+        "schema",
+        "issuer",
+        "assessment_id",
+        "enrollment_id",
+        "binding",
+        "binding_id",
+        "evidence_digest",
+        "observed_from",
+        "observed_until",
+        "issued_at",
+        "expires_at",
+        "policy",
+        "result",
+        "checks",
+        "build",
+        "reason_codes",
+        "extensions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-assessment-v1"
+        },
+        "issuer": {
+          "$ref": "#/definitions/httpsIdentifier"
+        },
+        "assessment_id": {
+          "$ref": "#/definitions/uuid"
+        },
+        "enrollment_id": {
+          "$ref": "#/definitions/uuid"
+        },
+        "binding": {
+          "$ref": "#/definitions/binding"
+        },
+        "binding_id": {
+          "$ref": "#/definitions/hex256"
+        },
+        "evidence_digest": {
+          "$ref": "#/definitions/digest"
+        },
+        "observed_from": {
+          "$ref": "#/definitions/time"
+        },
+        "observed_until": {
+          "$ref": "#/definitions/time"
+        },
+        "issued_at": {
+          "$ref": "#/definitions/time"
+        },
+        "expires_at": {
+          "$ref": "#/definitions/time"
+        },
+        "policy": {
+          "$ref": "#/definitions/policy"
+        },
+        "result": {
+          "enum": ["satisfied", "not_satisfied", "indeterminate"]
+        },
+        "checks": {
+          "$ref": "#/definitions/checks"
+        },
+        "build": {
+          "$ref": "#/definitions/build"
+        },
+        "reason_codes": {
+          "$ref": "#/definitions/reasonCodes"
+        },
+        "extensions": {
+          "$ref": "#/definitions/extensions"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "build": {
+                "properties": {
+                  "provider_files_hash": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "binding": {
+                "properties": {
+                  "platform": {
+                    "properties": {
+                      "provider": {
+                        "const": "fastly"
+                      }
+                    }
+                  }
+                }
+              },
+              "checks": {
+                "properties": {
+                  "host_service_binding": {
+                    "properties": {
+                      "outcome": {
+                        "const": "pass"
+                      }
+                    }
+                  },
+                  "active_version": {
+                    "properties": {
+                      "outcome": {
+                        "const": "pass"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "status": {
+      "type": "object",
+      "required": [
+        "schema",
+        "issuer",
+        "enrollment_id",
+        "assessment_id",
+        "binding_id",
+        "publisher_key_kid",
+        "sequence",
+        "assessment_status",
+        "enrollment_status",
+        "publisher_key_status",
+        "reason_codes",
+        "issued_at",
+        "expires_at",
+        "extensions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-status-v1"
+        },
+        "issuer": {
+          "$ref": "#/definitions/httpsIdentifier"
+        },
+        "enrollment_id": {
+          "$ref": "#/definitions/uuid"
+        },
+        "assessment_id": {
+          "$ref": "#/definitions/uuid"
+        },
+        "binding_id": {
+          "$ref": "#/definitions/hex256"
+        },
+        "publisher_key_kid": {
+          "$ref": "#/definitions/base64url32"
+        },
+        "sequence": {
+          "$ref": "#/definitions/positiveInteger"
+        },
+        "assessment_status": {
+          "enum": ["current", "withdrawn"]
+        },
+        "enrollment_status": {
+          "enum": ["active", "withdrawn"]
+        },
+        "publisher_key_status": {
+          "enum": ["active", "compromised", "retired"]
+        },
+        "reason_codes": {
+          "$ref": "#/definitions/reasonCodes"
+        },
+        "issued_at": {
+          "$ref": "#/definitions/time"
+        },
+        "expires_at": {
+          "$ref": "#/definitions/time"
+        },
+        "extensions": {
+          "$ref": "#/definitions/extensions"
+        }
+      }
+    },
+    "keyDiscovery": {
+      "type": "object",
+      "required": ["schema", "host", "keys", "verifiers"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-key-discovery-v1"
+        },
+        "host": {
+          "$ref": "#/definitions/host"
+        },
+        "keys": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/definitions/keyValidity"
+          },
+          "minItems": 1
+        },
+        "verifiers": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/definitions/httpsIdentifier"
+          },
+          "$comment": "Untrusted HTTPS issuer discovery hints only. Never imports trust roots or enables a policy."
+        }
+      }
+    },
+    "compactJws": {
+      "type": "string",
+      "maxLength": 32768,
+      "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{85}[AQgw]$",
+      "$comment": "Explicit exception to the 256-byte string limit. Header/payload parsing, base64url canonicality and signature verification are external."
+    },
+    "assessmentList": {
+      "type": "object",
+      "required": ["schema", "host", "environment", "assessments"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-assessment-list-v1"
+        },
+        "host": {
+          "$ref": "#/definitions/host"
+        },
+        "environment": {
+          "$ref": "#/definitions/environment"
+        },
+        "assessments": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/definitions/compactJws"
+          }
+        }
+      },
+      "$comment": "Aggregate decoded HTTP body limit: 524288 bytes, checked before JSON Schema validation; each compact JWS is at most 32768 ASCII bytes."
+    },
+    "enrollmentChallenge": {
+      "type": "object",
+      "required": [
+        "schema",
+        "issuer",
+        "host",
+        "publisher_id",
+        "operator_id",
+        "deployment_id",
+        "provider",
+        "service_id",
+        "environment",
+        "publisher_key_kid",
+        "nonce",
+        "issued_at",
+        "expires_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-enrollment-challenge-v1"
+        },
+        "issuer": {
+          "$ref": "#/definitions/httpsIdentifier"
+        },
+        "host": {
+          "$ref": "#/definitions/host"
+        },
+        "publisher_id": {
+          "$ref": "#/definitions/uuid"
+        },
+        "operator_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/httpsIdentifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deployment_id": {
+          "$ref": "#/definitions/uuid"
+        },
+        "provider": {
+          "enum": ["fastly", "axum"]
+        },
+        "service_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/nonemptyText"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "environment": {
+          "$ref": "#/definitions/environment"
+        },
+        "publisher_key_kid": {
+          "$ref": "#/definitions/base64url32"
+        },
+        "nonce": {
+          "$ref": "#/definitions/base64url32"
+        },
+        "issued_at": {
+          "$ref": "#/definitions/time"
+        },
+        "expires_at": {
+          "$ref": "#/definitions/time"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "provider": {
+                "const": "fastly"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "service_id": {
+                "$ref": "#/definitions/nonemptyText"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "provider": {
+                "const": "axum"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "service_id": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ],
+      "$comment": "issued_at < expires_at <= issued_at + 600 is checked outside JSON Schema."
+    },
+    "keyMetadata": {
+      "type": "object",
+      "required": [
+        "schema",
+        "kid",
+        "jwk",
+        "not_before",
+        "not_after",
+        "secret_name"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-key-metadata-v1"
+        },
+        "kid": {
+          "$ref": "#/definitions/base64url32"
+        },
+        "jwk": {
+          "$ref": "#/definitions/publicJwk"
+        },
+        "not_before": {
+          "$ref": "#/definitions/time"
+        },
+        "not_after": {
+          "$ref": "#/definitions/time"
+        },
+        "secret_name": {
+          "type": "string",
+          "pattern": "^ts-publisher-[a-z][a-z0-9-]{0,47}$"
+        }
+      },
+      "$comment": "Read metadata at ts-publisher-key-<localname> in existing trusted_server_config; secret_name must equal ts-publisher-<same-localname> in existing trusted_server_secrets. Cross-entry equality is external."
+    },
+    "compactStatusJws": {
+      "type": "string",
+      "maxLength": 8192,
+      "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{85}[AQgw]$",
+      "$comment": "Explicit exception to the 256-byte string limit. Header/payload parsing, base64url canonicality and signature verification are external."
+    },
+    "keyHistory": {
+      "type": "object",
+      "required": ["schema", "host", "environment", "entries", "next_cursor"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-key-history-v1"
+        },
+        "host": {
+          "$ref": "#/definitions/host"
+        },
+        "environment": {
+          "$ref": "#/definitions/environment"
+        },
+        "entries": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "required": ["assessment", "status"],
+            "additionalProperties": false,
+            "properties": {
+              "assessment": {
+                "$ref": "#/definitions/compactJws"
+              },
+              "status": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/compactStatusJws"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[\\x20-\\x7e]+$"
+            }
+          ]
+        }
+      },
+      "$comment": "Untrusted transport of historical signed objects. Aggregate decoded HTTP body limit 524288 bytes is enforced externally before schema validation. Assessment JWS <=32768 ASCII bytes; status JWS <=8192 ASCII bytes. Pagination cursor is opaque printable ASCII; it confers no authority."
+    },
+    "policyCheck": {
+      "type": "object",
+      "required": ["requirement", "methods"],
+      "additionalProperties": false,
+      "properties": {
+        "requirement": {
+          "enum": ["pass", "pass_or_not_assessed"]
+        },
+        "methods": {
+          "anyOf": [
+            {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/definitions/nonemptyText"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "$comment": "methods null means the consumer's method allowlist governs this check; an array fixes the permitted methods."
+    },
+    "policyDocument": {
+      "type": "object",
+      "required": [
+        "schema",
+        "id",
+        "version",
+        "checks",
+        "build",
+        "max_assessment_lifetime_seconds",
+        "extensions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-policy-v1"
+        },
+        "id": {
+          "$ref": "#/definitions/nonemptyText"
+        },
+        "version": {
+          "$ref": "#/definitions/positiveInteger"
+        },
+        "checks": {
+          "type": "object",
+          "required": [
+            "host_authorization",
+            "key_possession",
+            "host_service_binding",
+            "active_version",
+            "configuration"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "host_authorization": {
+              "$ref": "#/definitions/policyCheck"
+            },
+            "key_possession": {
+              "$ref": "#/definitions/policyCheck"
+            },
+            "host_service_binding": {
+              "$ref": "#/definitions/policyCheck"
+            },
+            "active_version": {
+              "$ref": "#/definitions/policyCheck"
+            },
+            "configuration": {
+              "$ref": "#/definitions/policyCheck"
+            }
+          }
+        },
+        "build": {
+          "type": "object",
+          "required": [
+            "assurance",
+            "declared_methods",
+            "fingerprint_methods",
+            "artifact_methods"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "assurance": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "uniqueItems": true,
+              "items": {
+                "enum": ["artifact_bound", "fingerprint_only", "declared"]
+              }
+            },
+            "declared_methods": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "maxItems": 16,
+                  "uniqueItems": true,
+                  "items": {
+                    "$ref": "#/definitions/nonemptyText"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "fingerprint_methods": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "maxItems": 16,
+                  "uniqueItems": true,
+                  "items": {
+                    "$ref": "#/definitions/nonemptyText"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "artifact_methods": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "maxItems": 16,
+                  "uniqueItems": true,
+                  "items": {
+                    "$ref": "#/definitions/nonemptyText"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        "max_assessment_lifetime_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 900
+        },
+        "extensions": {
+          "$ref": "#/definitions/extensions"
+        }
+      },
+      "$comment": "Canonical built-in policy document. The assessment policy.digest is SHA-256 of JCS(this document)."
+    },
+    "verifierMetadata": {
+      "type": "object",
+      "required": [
+        "schema",
+        "issuer",
+        "publication_bases",
+        "keys",
+        "policies",
+        "live_status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-verifier-metadata-v1"
+        },
+        "issuer": {
+          "$ref": "#/definitions/httpsIdentifier"
+        },
+        "publication_bases": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/definitions/httpsIdentifier"
+          }
+        },
+        "keys": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/definitions/keyValidity"
+          }
+        },
+        "policies": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/definitions/policy"
+          }
+        },
+        "live_status": {
+          "type": "boolean"
+        }
+      },
+      "$comment": "Unsigned convenience document at {issuer}/v1/issuer. Untrusted until confirmed out of band and pinned; never changes trust by itself."
+    },
+    "errorBody": {
+      "type": "object",
+      "required": ["schema", "error"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "ts-publisher-error-v1"
+        },
+        "error": {
+          "enum": [
+            "invalid_request",
+            "unknown_kid",
+            "not_found",
+            "misdirected_request",
+            "conflict",
+            "rate_limited",
+            "unavailable"
+          ]
+        }
+      },
+      "$comment": "Closed error body for publisher endpoints and registry read surfaces; at most 256 bytes."
+    }
+  }
+}
