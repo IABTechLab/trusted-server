@@ -13,7 +13,9 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
-use trusted_server_core::ec::after_response::commit_after_response_lookups;
+use trusted_server_core::ec::after_response::{
+    after_response_lookups_allowed, commit_after_response_lookups,
+};
 use trusted_server_core::ec::coordinator::IdentityCoordinator as _;
 use trusted_server_core::ec::coordinator::LookupContext;
 use trusted_server_core::ec::coordinator::transport::PlatformLookupTransport;
@@ -791,6 +793,14 @@ fn run_after_response_lookups(
         return;
     };
     let snapshot = graph.load_snapshot(&lookups.ec_id);
+    if !after_response_lookups_allowed(
+        &snapshot,
+        &lookups.ec_id,
+        ec_state.ec_context.ec_generated(),
+    ) {
+        log::debug!("After-response lookups skipped: new EC or no live row");
+        return;
+    }
     let transport =
         PlatformLookupTransport::new(&ec_state.services, settings.proxy.certificate_check);
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
@@ -815,14 +825,8 @@ fn run_after_response_lookups(
         return;
     }
     let results = futures::executor::block_on(coordinator.collect(&transport, pending));
-    let outcome = commit_after_response_lookups(
-        &graph,
-        permit,
-        partner_registry,
-        &lookups.ec_id,
-        &snapshot,
-        &results,
-    );
+    let outcome =
+        commit_after_response_lookups(&graph, permit, partner_registry, &lookups.ec_id, &results);
     log::info!("After-response lookups: write outcome={outcome}");
 }
 
