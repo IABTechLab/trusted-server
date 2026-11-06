@@ -74,6 +74,8 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
         }
         Vec::new()
     };
+    // Pruning alone never triggers a write; it rides along with a real change.
+    let changed = entry != base;
     for record in entry.ids.values_mut() {
         record.prune_expired(input.now);
     }
@@ -83,7 +85,7 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
 
     match expected {
         None => Some(RowChange::Create(entry)),
-        Some(_) if entry == base => None,
+        Some(_) if !changed || entry == base => None,
         Some(expected) => Some(RowChange::Update { entry, expected }),
     }
 }
@@ -589,9 +591,24 @@ mod tests {
     }
 
     #[test]
-    fn lapsed_opt_out_is_pruned() {
+    fn lapsed_opt_out_alone_plans_no_write() {
         let registry = registry(&["ids.example.com"]);
         let ingest: [PartnerIdUpdate; 0] = [];
+        let mut entry = live_entry();
+        entry
+            .opt_outs
+            .insert(ProviderId::new("example-provider"), 1000);
+        let lookups = LookupResults::default();
+
+        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+
+        assert!(change.is_none(), "should not write only to prune");
+    }
+
+    #[test]
+    fn lapsed_opt_out_is_pruned_with_a_real_change() {
+        let registry = registry(&["ids.example.com"]);
+        let ingest = [PartnerIdUpdate::new("browser.example.com", "b-1")];
         let mut entry = live_entry();
         entry
             .opt_outs
@@ -605,6 +622,44 @@ mod tests {
             panic!("should update existing row")
         };
         assert!(entry.opt_outs.is_empty(), "should forget a lapsed opt-out");
+    }
+
+    #[test]
+    fn not_due_skip_with_an_expired_uid_plans_no_write() {
+        let registry = registry(&["ids.example.com"]);
+        let ingest: [PartnerIdUpdate; 0] = [];
+        let mut entry = live_entry();
+        let expired = KvUid::new(
+            UidValue::try_from("old-1").expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            Expiry::At(UnixSeconds::new(1500)),
+        );
+        entry.ids.insert(
+            "ids.example.com".to_owned(),
+            KvPartnerId::from_eids(
+                vec![KvEid::new(EidFields::default(), vec![expired])],
+                UnixSeconds::new(1000),
+            )
+            .expect("should build provider record"),
+        );
+        let lookups = LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::Skipped(SkipReason::NotDue),
+                entries: Vec::new(),
+                cleared: Vec::new(),
+            }],
+        );
+
+        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+
+        assert!(
+            change.is_none(),
+            "should not write only to prune an expired UID"
+        );
     }
 
     #[test]

@@ -140,22 +140,22 @@ pub fn build_coordinator_with(
 }
 
 /// Builds the coordinator for enabled providers collected after the response
-/// has been sent (`collect = "after_response"`).
+/// has been sent (`collect = "after_response"`), against an already built
+/// partner registry.
 ///
 /// Its budget is `identity_after_response_budget_ms`. Returns `None` when no
 /// such provider is enabled.
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`build_coordinator`].
+/// Returns the same errors as [`build_coordinator_with`].
 pub fn build_after_response_coordinator(
     settings: &Settings,
+    partners: Arc<PartnerRegistry>,
 ) -> Result<Option<ProviderCoordinator>, Report<ProviderConfigError>> {
-    let partners = partner_registry(&settings.ec)
-        .map_err(|report| report.change_context(ProviderConfigError::Invalid))?;
     build_phase_coordinator(
         settings,
-        Arc::new(partners),
+        partners,
         CollectTiming::AfterResponse,
         Duration::from_millis(settings.ec.identity_after_response_budget_ms),
     )
@@ -506,8 +506,11 @@ mod tests {
         ];
 
         let page = build_coordinator(&settings).expect("should build page coordinator");
-        let after = build_after_response_coordinator(&settings)
-            .expect("should build after-response coordinator");
+        let after = build_after_response_coordinator(
+            &settings,
+            Arc::new(partner_registry(&settings.ec).expect("should build partners")),
+        )
+        .expect("should build after-response coordinator");
 
         assert!(
             page.is_some(),
@@ -526,9 +529,12 @@ mod tests {
         let page = build_coordinator(&settings)
             .expect("should build page coordinator")
             .expect("should have a page provider");
-        let after = build_after_response_coordinator(&settings)
-            .expect("should build after-response coordinator")
-            .expect("should have an after-response provider");
+        let after = build_after_response_coordinator(
+            &settings,
+            Arc::new(partner_registry(&settings.ec).expect("should build partners")),
+        )
+        .expect("should build after-response coordinator")
+        .expect("should have an after-response provider");
 
         assert!(!page.is_empty(), "should hold the page provider");
         assert!(!after.is_empty(), "should hold the after-response provider");
@@ -539,8 +545,11 @@ mod tests {
         let settings = settings_with_cookie_providers("after_response", "after_response");
 
         let page = build_coordinator(&settings).expect("should build page coordinator");
-        let after = build_after_response_coordinator(&settings)
-            .expect("should build after-response coordinator");
+        let after = build_after_response_coordinator(
+            &settings,
+            Arc::new(partner_registry(&settings.ec).expect("should build partners")),
+        )
+        .expect("should build after-response coordinator");
 
         assert!(page.is_none(), "should build no page coordinator");
         assert!(

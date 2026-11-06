@@ -365,7 +365,10 @@ impl fmt::Debug for ProviderRequest {
 }
 
 /// A provider response, borrowed from the transport.
-#[derive(Debug, Clone, Copy)]
+///
+/// Its `Debug` output omits the body, headers and context, which can hold
+/// identifiers or a reply-decryption key.
+#[derive(Clone, Copy)]
 pub struct ProviderResponse<'body> {
     /// Response status.
     pub status: http::StatusCode,
@@ -375,6 +378,16 @@ pub struct ProviderResponse<'body> {
     pub body: &'body [u8],
     /// The [`ProviderRequest::context`] of the request this answers.
     pub context: Option<&'body str>,
+}
+
+impl fmt::Debug for ProviderResponse<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderResponse")
+            .field("status", &self.status)
+            .field("body_len", &self.body.len())
+            .field("has_context", &self.context.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// A parsed provider response.
@@ -785,6 +798,29 @@ mod tests {
             "should not print secrets"
         );
         assert!(printed.contains("ids.example.com"), "should print host");
+    }
+
+    #[test]
+    fn response_debug_hides_body_and_context() {
+        let headers = http::HeaderMap::new();
+        let response = ProviderResponse {
+            status: http::StatusCode::OK,
+            headers: &headers,
+            body: b"example-uid",
+            context: Some("example-key"),
+        };
+
+        let printed = format!("{response:?}");
+
+        assert!(
+            !printed.contains("example-uid"),
+            "should not print the body"
+        );
+        assert!(
+            !printed.contains("example-key"),
+            "should not print the context"
+        );
+        assert!(printed.contains("200"), "should print the status");
     }
 
     #[test]

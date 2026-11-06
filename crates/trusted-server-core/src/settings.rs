@@ -613,6 +613,9 @@ pub struct IdentityProviderConfig {
     #[serde(default)]
     pub collect: CollectTiming,
     /// Most lookups per EC per hour, when set; unset means unlimited.
+    ///
+    /// The Fastly limiter enforces this as a per-minute budget of at least
+    /// one, so values below 60 behave like 60 per hour.
     #[serde(default)]
     pub rate_limit_per_hour: Option<NonZeroU32>,
     /// Secret Store key references, resolved at startup.

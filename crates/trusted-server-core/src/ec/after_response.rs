@@ -128,7 +128,9 @@ mod tests {
     use super::*;
     use crate::ec::coordinator::results::{DropCounts, LookupStatus, ProviderLookup};
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, SourceDomain, UidValue};
+    use crate::ec::kv::TombstoneOutcome;
     use crate::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvUid};
+    use crate::ec::page_load::{Generation, KvWriteError};
     use crate::settings::EcPartner;
 
     const EC_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123";
@@ -265,6 +267,72 @@ mod tests {
             stored_uid(&graph, "ids.example.com").as_deref(),
             Some("p-1"),
             "should store the provider UID"
+        );
+    }
+
+    #[test]
+    fn follow_up_write_conflicts_when_the_row_changed_after_its_read() {
+        // Arrange
+        let graph = KvIdentityGraph::in_memory("after-response-conflict");
+        graph.create(EC_ID, &live_entry()).expect("should seed row");
+        let read = graph.load_snapshot(EC_ID);
+        let expected = Generation::of(&read, EC_ID).expect("should read a generation");
+        graph
+            .upsert_partner_id(EC_ID, "browser.example.com", "b-2")
+            .expect("should rewrite the row as another request would");
+
+        // Act
+        let result = graph.commit_after_response(
+            AfterResponseWrite::for_test(),
+            EC_ID,
+            &live_entry(),
+            expected,
+        );
+
+        // Assert
+        let report = result.expect_err("should refuse a stale generation");
+        assert!(
+            matches!(report.current_context(), KvWriteError::Conflict),
+            "should report a conflict"
+        );
+        assert_eq!(
+            stored_uid(&graph, "browser.example.com").as_deref(),
+            Some("b-2"),
+            "should keep the other request's write"
+        );
+    }
+
+    #[test]
+    fn follow_up_write_never_revives_a_row_withdrawn_after_its_read() {
+        // Arrange: scenario 23, the row is tombstoned between read and CAS.
+        let graph = KvIdentityGraph::in_memory("after-response-withdrawn");
+        graph.create(EC_ID, &live_entry()).expect("should seed row");
+        let read = graph.load_snapshot(EC_ID);
+        let expected = Generation::of(&read, EC_ID).expect("should read a generation");
+        assert_eq!(
+            graph
+                .write_withdrawal_tombstone(EC_ID, drop)
+                .expect("should withdraw the row"),
+            TombstoneOutcome::Written,
+            "should tombstone the row"
+        );
+
+        // Act
+        let result = graph.commit_after_response(
+            AfterResponseWrite::for_test(),
+            EC_ID,
+            &live_entry(),
+            expected,
+        );
+
+        // Assert
+        assert!(result.is_err(), "should refuse to overwrite the tombstone");
+        assert!(
+            graph
+                .load_snapshot(EC_ID)
+                .entry_for(EC_ID)
+                .is_none_or(|entry| !entry.consent.ok),
+            "should leave the row withdrawn"
         );
     }
 

@@ -111,7 +111,8 @@ pull_sync_concurrency = 3
 # before the origin fetch. Every enabled provider shares one time budget:
 # identity_budget_ms = 200  # default 200
 # Budget for providers with collect = "after_response", which look up after the
-# response is sent (Fastly only); results are served from the next page load:
+# response is sent (Fastly only), only for an EC whose row already exists;
+# results are served from the next page load:
 # identity_after_response_budget_ms = 2000  # default 2000
 #
 # [[ec.identity_providers]]
@@ -132,8 +133,10 @@ pull_sync_concurrency = 3
 # Optional: "page" (default) or "after_response". Keep cookie-only kinds on "page".
 # collect = "page"
 # Optional: most lookups per EC per hour; unset means unlimited. Useful for
-# kinds whose unresolved sources stay due, such as LiveIntent partner IDs.
-# rate_limit_per_hour = 4
+# kinds whose unresolved sources stay due, such as LiveIntent partner IDs. On
+# Fastly this is enforced per minute with a minimum of one, so values below 60
+# behave like 60.
+# rate_limit_per_hour = 60
 # Secret Store key name, resolved like other secret references.
 # [ec.identity_providers.secrets]
 # token = "example_provider_token"

@@ -814,7 +814,8 @@ remembers the opt-out for 30 days. The provider is not called for that EC
 again until the 30 days pass.
 
 A provider set to `collect = "after_response"` looks up only after the response
-is sent, within `identity_after_response_budget_ms`, and its results go into one
+is sent, within `identity_after_response_budget_ms`, and only for an EC whose
+row already existed before the navigation. Its results go into one
 follow-up compare-and-swap write that never creates or revives a row. They are
 served from the next page load. Only the Fastly adapter runs this phase. The
 instance stays busy after the response, which lowers throughput when sandboxes
@@ -836,7 +837,7 @@ the EC row when the cookies hold none; no cookie is set.
 | `sources`             | Array   | Yes      | Source domains the provider owns; each needs an `[[ec.partners]]` entry               |
 | `tcf_vendor_id`       | Integer | No       | TCF vendor ID that must have vendor consent                                           |
 | `collect`             | String  | No       | `page` (default) or `after_response`                                                  |
-| `rate_limit_per_hour` | Integer | No       | Most lookups per EC per hour; unset means unlimited                                   |
+| `rate_limit_per_hour` | Integer | No       | Most lookups per EC per hour; unset means unlimited. See the note below               |
 | `secrets.token`       | String  | No       | Key in `trusted_server_secrets` for the provider's API token                          |
 | `settings`            | Table   | No       | Provider-specific settings, parsed by the provider kind                               |
 
@@ -856,6 +857,12 @@ sources = ["ids.example.com"]
 [ec.identity_providers.secrets]
 token = "example_provider_token"
 ```
+
+::: warning Rate limit granularity
+On Fastly, `rate_limit_per_hour` is enforced as a per-minute budget rounded up
+to at least one lookup per minute, so any value below 60 behaves like 60 per
+hour. Values of 60 and above are enforced as `ceil(value / 60)` per minute.
+:::
 
 **Validation**: configuration validation fails when an enabled provider's
 `endpoint` is not HTTPS or its host is not in `allowed_domains`, when a source
