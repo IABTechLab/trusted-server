@@ -184,12 +184,23 @@ impl<'a> RequestCookies<'a> {
     /// reads as absent.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&'a str> {
+        self.get_all(name).next()
+    }
+
+    /// Every non-empty value of the cookie `name`, in header order.
+    ///
+    /// A request can carry several cookies with one name (set on different
+    /// paths or domains); opt-out checks must look at all of them.
+    pub fn get_all<'name>(&self, name: &'name str) -> impl Iterator<Item = &'a str> + 'name
+    where
+        'a: 'name,
+    {
         self.0
             .split(';')
             .filter_map(|pair| pair.split_once('='))
-            .filter(|(key, _)| key.trim() == name)
+            .filter(move |(key, _)| key.trim() == name)
             .map(|(_, value)| value.trim().trim_matches('"'))
-            .find(|value| !value.is_empty())
+            .filter(|value| !value.is_empty())
     }
 }
 
@@ -813,6 +824,22 @@ mod tests {
             parsed.settings.get("max_eids"),
             Some(&json!(3)),
             "should keep provider settings"
+        );
+    }
+
+    #[test]
+    fn cookies_get_all_returns_every_non_empty_duplicate() {
+        let cookies = RequestCookies::new("id=; other=x; id=first; id=second");
+
+        assert_eq!(
+            cookies.get_all("id").collect::<Vec<_>>(),
+            vec!["first", "second"],
+            "should return every non-empty value in order"
+        );
+        assert_eq!(
+            cookies.get("id"),
+            Some("first"),
+            "should get the first value"
         );
     }
 

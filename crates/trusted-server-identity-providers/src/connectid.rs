@@ -32,7 +32,8 @@ use trusted_server_core::ec::provider::{
 };
 
 use crate::common::{
-    CookieReader, DEFAULT_TTL, cookie_capabilities, cookie_eid, is_usable_id, percent_decoded,
+    CookieReader, DEFAULT_TTL, cookie_capabilities, cookie_eid, is_expired, is_usable_id,
+    percent_decoded,
 };
 
 /// Longest time a `ConnectID` is kept after its last sync.
@@ -112,10 +113,9 @@ fn connect_id(value: &str) -> Option<(String, ProviderExpiry)> {
     }
     let ttl = cookie.ttl.map_or(DEFAULT_TTL, from_millis).min(MAX_TTL);
     let expires = from_millis(cookie.last_synced_ms).saturating_add(ttl);
-    Some((
-        cookie.connect_id,
-        ProviderExpiry::At(UnixSeconds::new(expires.as_secs())),
-    ))
+    let expiry = ProviderExpiry::At(UnixSeconds::new(expires.as_secs()));
+    // An expired cookie never hides a later live one.
+    (!is_expired(&expiry)).then_some((cookie.connect_id, expiry))
 }
 
 impl IdentityProvider for ConnectIdProvider {
@@ -194,8 +194,8 @@ mod tests {
             "connectId": "cid-example-1",
             "he": "example-hashed-email",
             "puid": "example-puid",
-            "lastSynced": 1_700_000_000_000_u64,
-            "lastUsed": 1_700_000_100_000_u64,
+            "lastSynced": 4_700_000_000_000_u64,
+            "lastUsed": 4_700_000_100_000_u64,
             "ttl": 86_400_000,
         });
 
@@ -208,25 +208,48 @@ mod tests {
         );
         assert_eq!(
             expires_at(read),
-            1_700_086_400,
+            4_700_086_400,
             "should expire at lastSynced + ttl"
         );
     }
 
     #[test]
     fn caps_the_ttl_and_defaults_a_missing_one() {
-        let long = json!({ "connectId": "cid", "lastSynced": 0, "ttl": 1e15 });
-        let missing = json!({ "connectId": "cid", "lastSynced": 0 });
+        // A far-future sync keeps the cookie live whatever today's date is.
+        let synced_secs = 4_700_000_000_u64;
+        let long = json!({ "connectId": "cid", "lastSynced": synced_secs * 1000, "ttl": 1e15 });
+        let missing = json!({ "connectId": "cid", "lastSynced": synced_secs * 1000 });
 
         assert_eq!(
             expires_at(read(&long)),
-            MAX_TTL.as_secs(),
+            synced_secs + MAX_TTL.as_secs(),
             "should cap at 14 days"
         );
         assert_eq!(
             expires_at(read(&missing)),
-            DEFAULT_TTL.as_secs(),
+            synced_secs + DEFAULT_TTL.as_secs(),
             "should use the default"
+        );
+    }
+
+    #[test]
+    fn an_expired_cookie_does_not_hide_a_later_live_one() {
+        let expired = json!({ "connectId": "cid-old", "lastSynced": 1000, "ttl": 1000 });
+        let live = json!({ "connectId": "cid-live", "lastSynced": 4_700_000_000_000_u64 });
+        let header = format!(
+            "connectId={}; connectId={}",
+            urlencoding::encode(&expired.to_string()),
+            urlencoding::encode(&live.to_string())
+        );
+
+        let eids = provider()
+            .read_request_cookies(RequestCookies::new(&header))
+            .into_found()
+            .expect("should read the live cookie");
+
+        assert_eq!(
+            eids[0].uids[0].id, "cid-live",
+            "should skip the expired cookie"
         );
     }
 
