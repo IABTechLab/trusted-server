@@ -653,7 +653,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let req = ctx.into_request();
-                let result = PartnerRegistry::from_config(&s.settings.ec.partners)
+                let result = PartnerRegistry::from_ec(&s.settings.ec)
                     .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
                 Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
             }
@@ -817,15 +817,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
                 handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback)
             } else if state.registry.has_route(&method, &path) {
-                let mut ec_context = EcContext::default();
                 state
                     .registry
                     .handle_proxy(ProxyDispatchInput {
                         method: &method,
                         path: &path,
                         settings: &state.settings,
-                        kv: None,
-                        ec_context: &mut ec_context,
                         services: &services,
                         req,
                     })

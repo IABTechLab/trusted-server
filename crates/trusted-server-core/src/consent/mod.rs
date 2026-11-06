@@ -41,6 +41,7 @@ pub use types::{
     ConsentContext, ConsentSource, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
 };
 
+use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use web_time::{SystemTime, UNIX_EPOCH};
@@ -285,6 +286,23 @@ fn effective_tcf(ctx: &ConsentContext) -> Option<&types::TcfConsent> {
         let g = ctx.gpp.as_ref()?;
         g.eu_tcf.as_ref()
     })
+}
+
+/// Whether the effective TCF string grants vendor consent to `vendor_id`.
+///
+/// Returns `false` when no TCF string applies.
+#[must_use]
+pub fn has_tcf_vendor_consent(ctx: &ConsentContext, vendor_id: NonZeroU16) -> bool {
+    effective_tcf(ctx).is_some_and(|tcf| tcf.has_vendor_consent(vendor_id.get()))
+}
+
+/// Whether TCF rules apply and withhold vendor consent from `vendor_id`.
+///
+/// Returns `false` when no TCF string applies and GDPR does not, so a TCF
+/// vendor requirement only gates traffic that TCF governs.
+#[must_use]
+pub fn tcf_vendor_consent_denied(ctx: &ConsentContext, vendor_id: NonZeroU16) -> bool {
+    (ctx.gdpr_applies || effective_tcf(ctx).is_some()) && !has_tcf_vendor_consent(ctx, vendor_id)
 }
 
 /// Returns whether a server-side auction may be dispatched for this request.
@@ -685,6 +703,7 @@ mod tests {
         ConsentPipelineInput, allows_ec_creation, allows_eid_persistence, apply_expiration_check,
         apply_tcf_conflict_resolution, build_consent_context, build_context_from_signals,
         consent_allows_server_side_auction, gate_eids_by_consent, has_explicit_ec_withdrawal,
+        has_tcf_vendor_consent,
     };
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{
@@ -692,6 +711,7 @@ mod tests {
     };
     use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
     use crate::cookies::parse_cookies_to_jar;
+    use std::num::NonZeroU16;
 
     fn build_request() -> Request<EdgeBody> {
         Request::builder()
@@ -753,6 +773,32 @@ mod tests {
                 special_feature_opt_ins: vec![false; 12],
             }
         }
+    }
+
+    #[test]
+    fn tcf_vendor_consent_reads_the_effective_tcf_string() {
+        let mut tcf = TcfBuilder::new().with_storage(true).build();
+        tcf.vendor_consents = vec![9999];
+        let context = ConsentContext {
+            gdpr_applies: true,
+            tcf: Some(tcf),
+            ..ConsentContext::default()
+        };
+        let granted = NonZeroU16::new(9999).expect("should be non-zero");
+        let other = NonZeroU16::new(1234).expect("should be non-zero");
+
+        assert!(
+            has_tcf_vendor_consent(&context, granted),
+            "should grant consented vendor"
+        );
+        assert!(
+            !has_tcf_vendor_consent(&context, other),
+            "should deny other vendor"
+        );
+        assert!(
+            !has_tcf_vendor_consent(&ConsentContext::default(), granted),
+            "should deny when no TCF string applies"
+        );
     }
 
     fn make_tcf(last_updated_ds: u64, allows_eids: bool) -> TcfConsent {

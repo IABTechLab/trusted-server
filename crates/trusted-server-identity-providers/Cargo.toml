@@ -1,0 +1,22 @@
+[package]
+name = "trusted-server-identity-providers"
+description = "Identity provider implementations for Trusted Server."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+error-stack = { workspace = true }
+log = { workspace = true }
+trusted-server-core = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }

@@ -535,15 +535,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     EdgeCacheHeader::CloudflareCdnCacheControl,
                 )
             } else if state.registry.has_route(&method, &path) {
-                let mut ec_context = EcContext::default();
                 state
                     .registry
                     .handle_proxy(ProxyDispatchInput {
                         method: &method,
                         path: &path,
                         settings: &state.settings,
-                        kv: None,
-                        ec_context: &mut ec_context,
                         services: &services,
                         req,
                     })
@@ -655,7 +652,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get(
                 "/_ts/admin/eids",
                 make_handler(Arc::clone(&state), |s, _services, req| async move {
-                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
+                    let partner_registry = PartnerRegistry::from_ec(&s.settings.ec)?;
                     handle_admin_eids_lookup(&partner_registry, &req)
                 }),
             )

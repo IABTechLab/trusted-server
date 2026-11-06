@@ -92,14 +92,14 @@ pub(crate) fn canonical_parity_auction_request() -> AuctionRequest {
                 raw_ac_string: Some("fictional-ac".to_string()),
                 ..Default::default()
             }),
-            eids: Some(vec![Eid {
-                source: "identity.example".to_string(),
-                uids: vec![Uid {
+            eids: Some(vec![Eid::new(
+                "identity.example".to_string(),
+                vec![Uid {
                     id: "fictional-uid".to_string(),
                     atype: Some(1),
                     ext: None,
                 }],
-            }]),
+            )]),
         },
         device: Some(DeviceInfo {
             user_agent: Some("Fictional Browser".to_string()),

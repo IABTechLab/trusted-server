@@ -13,6 +13,7 @@ use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use validator::{Validate, ValidationError, ValidationErrors};
 
+use crate::ec::provider::validate_enabled_configs;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::integrations::{
@@ -32,7 +33,8 @@ use crate::integrations::{
     sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
-use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
+use crate::redacted::Redacted;
+use crate::settings::{AssetOriginAuth, Ec, IntegrationConfig, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 #[cfg(test)]
@@ -169,6 +171,16 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             ),
             field(
                 vec![
+                    object("ec"),
+                    optional_object("identity_providers"),
+                    SecretPathSegment::ArrayEach,
+                    optional_object("secrets"),
+                    object("token"),
+                ],
+                true,
+            ),
+            field(
+                vec![
                     object("handlers"),
                     SecretPathSegment::ArrayEach,
                     object("password"),
@@ -268,6 +280,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, false)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
+    validate_identity_providers(&with_placeholder_partner_tokens(&settings.ec))?;
     Ok(())
 }
 
@@ -286,7 +299,8 @@ pub fn validate_settings_for_runtime(
     settings.validate_admin_handler_passwords()?;
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, true)?;
-    PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
+    PartnerRegistry::from_ec(&settings.ec).map(|_| ())?;
+    validate_identity_providers(&settings.ec)?;
     Ok(())
 }
 
@@ -308,6 +322,46 @@ fn validate_gpt_diagnostics_config(settings: &Settings) -> Result<(), Report<Tru
             message: format!(
                 "integration startup failed for `{GPT_DIAGNOSTICS_INTEGRATION_ID}`: {error}"
             ),
+        })
+    })
+}
+
+/// Returns a copy of `ec` whose partner tokens are unique placeholders.
+///
+/// Deploy validation runs before secret references are resolved, so partner
+/// tokens still hold secret key names that would fail the runtime length
+/// check when the partner registry is built.
+fn with_placeholder_partner_tokens(ec: &Ec) -> Ec {
+    let mut ec = ec.clone();
+    for (index, partner) in ec.partners.iter_mut().enumerate() {
+        if partner.api_token.is_some() {
+            partner.api_token = Some(Redacted::new(format!("{index:0>64}")));
+        }
+        if partner.ts_pull_token.is_some() {
+            partner.ts_pull_token = Some(Redacted::new(format!("{index:1>64}")));
+        }
+    }
+    ec
+}
+
+/// Checks the identity-provider rules core owns (spec §12.1).
+///
+/// Unknown kinds and capability checks need the provider crate and are
+/// enforced when the adapter builds the coordinator.
+fn validate_identity_providers(ec: &Ec) -> Result<(), Report<TrustedServerError>> {
+    if ec.identity_providers.is_empty() {
+        return Ok(());
+    }
+    let partners = PartnerRegistry::from_ec(ec)?;
+    validate_enabled_configs(&ec.identity_providers, &partners).map_err(|report| {
+        let detail = report
+            .frames()
+            .filter_map(|frame| frame.downcast_ref::<String>())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
+        report.change_context(TrustedServerError::Configuration {
+            message: format!("ec.identity_providers: {detail}"),
         })
     })
 }
@@ -442,6 +496,15 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         if let Some(token) = &partner.ts_pull_token {
             validate_secret_key_reference(
                 &format!("ec.partners[{index}].ts_pull_token"),
+                token.expose(),
+            )?;
+        }
+    }
+
+    for (index, provider) in settings.ec.identity_providers.iter().enumerate() {
+        if let Some(token) = &provider.secrets.token {
+            validate_secret_key_reference(
+                &format!("ec.identity_providers[{index}].secrets.token"),
                 token.expose(),
             )?;
         }
@@ -947,6 +1010,7 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.passphrase".to_owned(), false),
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
+                ("ec.identity_providers[*].secrets.token".to_owned(), true,),
                 ("handlers[*].password".to_owned(), false),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
                 ("trusted_forwarder.shared_secret".to_owned(), false),
@@ -1275,6 +1339,127 @@ gam_network_id = "99999"
         assert!(
             err.to_string().contains("invalid_publisher_domain"),
             "error should identify the structural validation failure: {err:?}"
+        );
+    }
+
+    fn settings_with_identity_provider(provider: serde_json::Value) -> Settings {
+        let mut settings = valid_settings();
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "ids", "source_domain": "ids.example.com"
+            }))
+            .expect("should build partner"),
+        ];
+        let mut config = serde_json::json!({
+            "id": "example-provider",
+            "kind": "example-kind",
+            "endpoint": "https://ids.example.com/v1/lookup",
+            "allowed_domains": ["ids.example.com"],
+            "sources": ["ids.example.com"],
+        });
+        if let (Some(base), serde_json::Value::Object(overrides)) =
+            (config.as_object_mut(), provider)
+        {
+            base.extend(overrides);
+        }
+        settings.ec.identity_providers =
+            vec![serde_json::from_value(config).expect("should build provider config")];
+        settings
+    }
+
+    #[test]
+    fn runtime_validation_accepts_valid_identity_provider() {
+        let settings = settings_with_identity_provider(serde_json::json!({}));
+
+        validate_settings_for_runtime(&settings).expect("should accept valid identity provider");
+    }
+
+    #[test]
+    fn deploy_validation_accepts_provider_with_unresolved_partner_token() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({}));
+        settings.ec.partners[0].api_token =
+            Some(Redacted::new("example_partner_api_token".to_owned()));
+
+        validate_settings_for_deploy(&settings)
+            .expect("should not length-check a partner token secret key name");
+    }
+
+    #[test]
+    fn runtime_validation_rejects_provider_endpoint_outside_allowlist() {
+        let settings = settings_with_identity_provider(serde_json::json!({
+            "endpoint": "https://other.example.com/v1/lookup"
+        }));
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject endpoint outside allowlist");
+
+        assert!(
+            err.to_string().contains("allowed_domains"),
+            "should explain the allowlist rule: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_provider_source_without_partner() {
+        let settings = settings_with_identity_provider(serde_json::json!({
+            "sources": ["unknown.example.com"]
+        }));
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject source without partner");
+
+        assert!(
+            err.to_string().contains("[[ec.partners]]"),
+            "should explain the partner rule: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_source_claimed_by_two_providers() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({}));
+        let mut second = settings.ec.identity_providers[0].clone();
+        second.id = "second-provider".to_owned();
+        settings.ec.identity_providers.push(second);
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject double-claimed source");
+
+        assert!(
+            err.to_string()
+                .contains("claimed by another enabled provider"),
+            "should explain the claim rule: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_empty_provider_token_reference() {
+        let settings = settings_with_identity_provider(serde_json::json!({
+            "secrets": { "token": " " }
+        }));
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject empty provider token reference");
+
+        assert!(
+            err.to_string()
+                .contains("ec.identity_providers[0].secrets.token"),
+            "should identify the provider token reference: {err:?}"
+        );
+    }
+
+    #[test]
+    fn app_config_keeps_provider_token_key_reference() {
+        let settings = settings_with_identity_provider(serde_json::json!({
+            "secrets": { "token": "example_provider_token" }
+        }));
+
+        let app_config =
+            TrustedServerAppConfig::new(settings).expect("should validate provider token key name");
+
+        let serialized = serde_json::to_string(&app_config).expect("should serialize app config");
+        assert!(
+            serialized.contains("example_provider_token"),
+            "should keep the provider token key reference"
         );
     }
 

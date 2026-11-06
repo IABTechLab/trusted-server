@@ -357,8 +357,8 @@ mod tests {
     fn settings_and_registry(domains: &[&str]) -> (Settings, PartnerRegistry) {
         let mut settings = create_test_settings();
         settings.ec.partners = domains.iter().map(|domain| pull_partner(domain)).collect();
-        let registry = PartnerRegistry::from_config(&settings.ec.partners)
-            .expect("should build pull partner registry");
+        let registry =
+            PartnerRegistry::from_ec(&settings.ec).expect("should build pull partner registry");
         (settings, registry)
     }
 
@@ -375,9 +375,7 @@ mod tests {
         for domain in domains {
             entry.ids.insert(
                 (*domain).to_owned(),
-                crate::ec::kv_types::KvPartnerId {
-                    uid: format!("uid-{domain}"),
-                },
+                crate::ec::kv_types::KvPartnerId::single(format!("uid-{domain}")),
             );
         }
         EcKvSnapshot::Present {
@@ -510,9 +508,7 @@ mod tests {
         let mut tombstone = KvEntry::tombstone(1_000);
         tombstone.ids.insert(
             "a.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "stale".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::single("stale".to_owned()),
         );
         let snapshots = [
             live_snapshot(EC_ID, &[]),

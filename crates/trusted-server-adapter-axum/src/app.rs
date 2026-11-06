@@ -224,15 +224,12 @@ async fn dispatch_fallback(
     }
 
     if state.registry.has_route(&method, &path) {
-        let mut ec_context = EcContext::default();
         return state
             .registry
             .handle_proxy(ProxyDispatchInput {
                 method: &method,
                 path: &path,
                 settings: &state.settings,
-                kv: None,
-                ec_context: &mut ec_context,
                 services,
                 req,
             })
@@ -499,8 +496,7 @@ fn named_route_handler(
                         Ok(admin_ec_lookup_not_supported())
                     }
                     NamedRouteHandler::AdminEidsLookup => {
-                        let partner_registry =
-                            PartnerRegistry::from_config(&state.settings.ec.partners)?;
+                        let partner_registry = PartnerRegistry::from_ec(&state.settings.ec)?;
                         handle_admin_eids_lookup(&partner_registry, &req)
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),

@@ -31,7 +31,8 @@ use crate::cookies::extract_cookie_value;
 use crate::error::TrustedServerError;
 use crate::openrtb::Eid;
 
-use super::eids::{resolve_partner_ids, to_eids};
+use super::current_timestamp;
+use super::eid_types::UnixSeconds;
 use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
 use super::kv_backend::EcKvLookup;
@@ -251,8 +252,8 @@ struct AuctionEidsView {
 struct SkippedPartnerId {
     /// Partner namespace key in the entry's `ids` map.
     source_domain: String,
-    /// Why the auction resolution skips it: `empty_uid`, `not_in_registry`,
-    /// or `bidstream_disabled`.
+    /// Why the auction resolution skips it: `empty_uid`, `expired` (provider
+    /// record with no live UID), `not_in_registry`, or `bidstream_disabled`.
     reason: &'static str,
 }
 
@@ -394,6 +395,7 @@ fn build_lookup_response(
     match serde_json::from_slice::<JsonValue>(&lookup.body) {
         Ok(mut entry_json) => {
             add_iso_timestamp_companions(&mut entry_json);
+            redact_refresh_state(&mut entry_json);
             payload.entry = Some(entry_json);
 
             match serde_json::from_slice::<KvEntry>(&lookup.body) {
@@ -470,6 +472,30 @@ fn add_iso_timestamp_companions(entry_json: &mut JsonValue) {
     }
 }
 
+/// Placeholder served in place of a provider's private refresh state.
+const REDACTED: &str = "[redacted]";
+
+/// Replaces every provider refresh `state` in the entry with [`REDACTED`].
+///
+/// Refresh state can hold a provider credential (for example a refresh
+/// token), so the admin view shows only that it exists and when it is due.
+fn redact_refresh_state(value: &mut JsonValue) {
+    match value {
+        JsonValue::Object(object) => {
+            if let Some(state) = object
+                .get_mut("refresh")
+                .and_then(JsonValue::as_object_mut)
+                .and_then(|refresh| refresh.get_mut("state"))
+            {
+                *state = JsonValue::String(REDACTED.to_owned());
+            }
+            object.values_mut().for_each(redact_refresh_state);
+        }
+        JsonValue::Array(items) => items.iter_mut().for_each(redact_refresh_state),
+        _ => {}
+    }
+}
+
 /// Formats a unix-seconds timestamp as ISO 8601 (`yyyy-MM-ddTHH:mm:ss.SSSZ`).
 ///
 /// Returns `None` for values outside the representable date range.
@@ -479,22 +505,25 @@ fn iso_timestamp(unix_seconds: u64) -> Option<String> {
         .map(|datetime| datetime.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
 }
 
-/// Derives the auction EID view for a valid entry, mirroring the filters in
-/// [`resolve_partner_ids`] and reporting why each stored ID was skipped.
+/// Derives the auction EID view for a valid entry through the same
+/// [`KvEntry::live_eids`] resolution the live auction uses, reporting why each
+/// stored ID was skipped.
 fn build_auction_view(registry: &PartnerRegistry, entry: &KvEntry) -> AuctionEidsView {
-    let resolved = resolve_partner_ids(registry, entry);
-    let eids = to_eids(&resolved);
+    let now = UnixSeconds::new(current_timestamp());
+    let eids = entry.live_eids(registry, now).map(Eid::from).collect();
 
     let mut skipped = Vec::new();
     for (source_domain, partner_uid) in &entry.ids {
-        let reason = if partner_uid.uid.is_empty() {
-            "empty_uid"
-        } else {
+        let reason = if partner_uid.has_live_uid(now) {
             match registry.get(source_domain) {
                 None => "not_in_registry",
                 Some(partner) if !partner.bidstream_enabled => "bidstream_disabled",
                 Some(_) => continue,
             }
+        } else if partner_uid.is_provider_written() {
+            "expired"
+        } else {
+            "empty_uid"
         };
         skipped.push(SkippedPartnerId {
             source_domain: source_domain.clone(),
@@ -682,9 +711,10 @@ mod tests {
     use crate::ec::kv::TombstoneOutcome;
 
     use super::*;
+    use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue};
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{EcKvStore as _, EcKvWrite, EcKvWriteMode};
-    use crate::ec::kv_types::KvPartnerId;
+    use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
 
@@ -778,15 +808,11 @@ mod tests {
         let mut entry = KvEntry::minimal("bidstream.example", "uid-live", 1_741_824_000);
         entry.ids.insert(
             "disabled.example".to_owned(),
-            KvPartnerId {
-                uid: "uid-disabled".to_owned(),
-            },
+            KvPartnerId::single("uid-disabled".to_owned()),
         );
         entry.ids.insert(
             "unknown.example".to_owned(),
-            KvPartnerId {
-                uid: "uid-unknown".to_owned(),
-            },
+            KvPartnerId::single("uid-unknown".to_owned()),
         );
         entry
     }
@@ -1416,7 +1442,7 @@ mod tests {
 
     #[test]
     fn eids_lookup_reports_configured_source_without_valid_uid() {
-        let oversized_uid = "x".repeat(513);
+        let oversized_uid = "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1);
         let cookie = eids_cookie_for(&serde_json::json!([{
             "source": "bidstream.example",
             "uids": [
@@ -1532,5 +1558,78 @@ mod tests {
         assert_eq!(matched.len(), 1, "should match the sharedid partner");
         assert_eq!(matched[0]["source_domain"], "sharedid.org");
         assert_eq!(matched[0]["uid"], "shared-uid-123");
+    }
+
+    #[test]
+    fn auction_view_matches_live_auction_for_provider_records() {
+        let registry = PartnerRegistry::from_config(&[
+            make_test_partner("expired.example", true),
+            make_test_partner("live.example", true),
+        ])
+        .expect("should build registry");
+        let provider_record = |id: &str, expiry: Expiry| {
+            let uid = KvUid::new(
+                UidValue::try_from(id).expect("should build uid"),
+                AgentType::try_from(1).expect("should build atype"),
+                None,
+                Some(ProviderId::new("example-provider")),
+                expiry,
+            );
+            KvPartnerId::from_eids(
+                vec![KvEid::new(EidFields::default(), vec![uid])],
+                UnixSeconds::new(0),
+            )
+            .expect("should build record")
+        };
+        let mut entry = KvEntry::tombstone(1);
+        entry.consent.ok = true;
+        entry.ids.insert(
+            "expired.example".to_owned(),
+            provider_record("old", Expiry::At(UnixSeconds::new(1))),
+        );
+        entry.ids.insert(
+            "live.example".to_owned(),
+            provider_record("new", Expiry::Never),
+        );
+
+        let view = build_auction_view(&registry, &entry);
+
+        let view_json = serde_json::to_value(&view.eids).expect("should serialize view eids");
+        let live: Vec<Eid> = entry
+            .live_eids(&registry, UnixSeconds::new(current_timestamp()))
+            .map(Eid::from)
+            .collect();
+        assert_eq!(
+            view_json,
+            serde_json::to_value(&live).expect("should serialize live eids"),
+            "should show exactly what the live auction resolves"
+        );
+        assert_eq!(view.eids.len(), 1, "should omit the expired provider UID");
+        assert_eq!(view.eids[0].uids[0].id, "new", "should keep the live UID");
+        assert_eq!(view.skipped.len(), 1, "should report the expired record");
+        assert_eq!(view.skipped[0].source_domain, "expired.example");
+        assert_eq!(view.skipped[0].reason, "expired", "should report expiry");
+    }
+
+    #[test]
+    fn redacts_provider_refresh_state() {
+        let mut entry = serde_json::json!({
+            "ids": {"token.example": {"eids": [{"source": "token.example", "uids": [
+                {"id": "token", "refresh": {"state": "secret-refresh", "from": 1_000}}
+            ]}]}}
+        });
+
+        redact_refresh_state(&mut entry);
+
+        let refresh = &entry["ids"]["token.example"]["eids"][0]["uids"][0]["refresh"];
+        assert_eq!(refresh["state"], REDACTED, "should hide the refresh state");
+        assert_eq!(
+            refresh["from"], 1_000,
+            "should keep when the refresh is due"
+        );
+        assert_eq!(
+            entry["ids"]["token.example"]["eids"][0]["uids"][0]["id"], "token",
+            "should keep the UID"
+        );
     }
 }

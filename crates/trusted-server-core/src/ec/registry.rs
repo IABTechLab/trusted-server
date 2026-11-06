@@ -10,7 +10,7 @@ use error_stack::{Report, ResultExt as _};
 
 use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
-use crate::settings::EcPartner;
+use crate::settings::{Ec, EcPartner};
 
 use super::partner::{hash_api_key, normalize_partner_source_domain};
 
@@ -47,6 +47,9 @@ pub struct PartnerConfig {
     pub pull_sync_rate_limit: u32,
     /// Outbound bearer token for pull sync requests.
     pub ts_pull_token: Option<Redacted<String>>,
+    /// Whether an enabled identity provider claims this source. Browser
+    /// ingest skips it and batch sync rejects it.
+    pub provider_owned: bool,
 }
 
 /// In-memory partner registry with O(1) lookups by source domain and API key hash.
@@ -205,6 +208,51 @@ impl PartnerRegistry {
         })
     }
 
+    /// Builds the registry from `[ec]` settings without provider ownership.
+    ///
+    /// For adapters with no identity-provider implementations: no source is
+    /// provider-owned, so browser-supplied IDs are ingested for every source.
+    /// Kind registration is unknown here, so no unregistered-kind warning is
+    /// logged; use [`Self::from_ec_with_kinds`] where kinds are known.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::from_config`].
+    pub fn from_ec(ec: &Ec) -> Result<Self, Report<TrustedServerError>> {
+        Self::from_config(&ec.partners)
+    }
+
+    /// Builds the registry from `[ec]` settings and marks every source claimed
+    /// by an enabled identity provider whose kind is registered as
+    /// provider-owned.
+    ///
+    /// An enabled provider with an unregistered kind never runs, so its
+    /// sources stay open to browser ingest and a warning is logged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::from_config`].
+    pub fn from_ec_with_kinds(
+        ec: &Ec,
+        is_registered_kind: impl Fn(&str) -> bool,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let mut registry = Self::from_config(&ec.partners)?;
+        for provider in ec.identity_providers.iter().filter(|p| p.enabled) {
+            if !is_registered_kind(provider.kind()) {
+                log::warn!(
+                    "Identity provider '{}' has unregistered kind '{}'; its sources stay browser-ingested",
+                    provider.id,
+                    provider.kind()
+                );
+                continue;
+            }
+            for source in &provider.sources {
+                registry.mark_provider_owned(source);
+            }
+        }
+        Ok(registry)
+    }
+
     /// Returns an empty registry (no partners configured).
     #[must_use]
     pub fn empty() -> Self {
@@ -234,12 +282,39 @@ impl PartnerRegistry {
         self.get(domain)
     }
 
-    /// Returns all partners with `pull_sync_enabled = true`.
+    /// Marks `source` as owned by an enabled identity provider.
+    ///
+    /// Returns `false` when the source has no `[[ec.partners]]` entry.
+    pub fn mark_provider_owned(&mut self, source: &str) -> bool {
+        let Ok(normalized) = normalize_partner_source_domain(source) else {
+            return false;
+        };
+        match self.by_source_domain.get_mut(&normalized) {
+            Some(partner) => {
+                partner.provider_owned = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether an enabled identity provider owns `source`.
+    #[must_use]
+    pub fn is_provider_owned(&self, source: &str) -> bool {
+        self.find_by_source_domain(source)
+            .is_some_and(|partner| partner.provider_owned)
+    }
+
+    /// Returns all partners with `pull_sync_enabled = true` whose source no
+    /// identity provider owns.
+    ///
+    /// A provider writes full-fidelity records for the sources it owns, so a
+    /// pull-sync write there would overwrite them with a single UID.
     #[must_use]
     pub fn pull_enabled_partners(&self) -> Vec<&PartnerConfig> {
         self.by_source_domain
             .values()
-            .filter(|p| p.pull_sync_enabled)
+            .filter(|p| p.pull_sync_enabled && !p.provider_owned)
             .collect()
     }
 
@@ -305,6 +380,7 @@ fn build_partner_config(
         pull_sync_ttl_sec: partner.pull_sync_ttl_sec,
         pull_sync_rate_limit: partner.pull_sync_rate_limit,
         ts_pull_token: partner.ts_pull_token.clone(),
+        provider_owned: false,
     }
 }
 
@@ -433,6 +509,65 @@ mod tests {
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
             ts_pull_token: None,
         }
+    }
+
+    #[test]
+    fn from_ec_marks_enabled_provider_sources_only() {
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        ec.partners = vec![
+            make_partner("ids.example.com", &valid_api_token("ids-partner")),
+            make_partner("other.example.com", &valid_api_token("other-partner")),
+        ];
+        ec.identity_providers = vec![
+            toml::from_str(
+                "id = \"a\"\nkind = \"k\"\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse enabled provider"),
+            toml::from_str(
+                "id = \"b\"\nkind = \"k\"\nenabled = false\nendpoint = \"https://ids.example.com/\"\nsources = [\"other.example.com\"]",
+            )
+            .expect("should parse disabled provider"),
+        ];
+
+        let registry = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
+            .expect("should build registry");
+
+        assert!(
+            registry.is_provider_owned("ids.example.com"),
+            "should mark enabled provider source"
+        );
+        assert!(
+            !registry.is_provider_owned("other.example.com"),
+            "should not mark disabled provider source"
+        );
+    }
+
+    #[test]
+    fn from_ec_skips_providers_with_unregistered_kinds() {
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        ec.partners = vec![make_partner(
+            "ids.example.com",
+            &valid_api_token("ids-partner"),
+        )];
+        ec.identity_providers = vec![
+            toml::from_str(
+                "id = \"a\"\nkind = \"missing\"\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse enabled provider"),
+        ];
+
+        let with_kinds = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
+            .expect("should build registry");
+        let plain = PartnerRegistry::from_ec(&ec).expect("should build registry");
+
+        assert!(
+            !with_kinds.is_provider_owned("ids.example.com"),
+            "should not claim sources for an unregistered kind"
+        );
+        assert!(
+            !plain.is_provider_owned("ids.example.com"),
+            "should not claim sources without provider implementations"
+        );
     }
 
     #[test]
@@ -567,6 +702,25 @@ mod tests {
         )];
         let result = PartnerRegistry::from_config(&partners);
         assert!(result.is_err(), "should reject invalid source domain");
+    }
+
+    #[test]
+    fn pull_enabled_partners_excludes_provider_owned_sources() {
+        let mut pull_partner = make_partner("pull.example.com", &valid_api_token("token-p"));
+        pull_partner.api_token = None;
+        pull_partner.pull_sync_enabled = true;
+        pull_partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
+        pull_partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];
+        pull_partner.ts_pull_token = Some(Redacted::new("outbound-token".to_owned()));
+        let mut registry =
+            PartnerRegistry::from_config(&[pull_partner]).expect("should build registry");
+
+        registry.mark_provider_owned("pull.example.com");
+
+        assert!(
+            registry.pull_enabled_partners().is_empty(),
+            "should not pull sources an identity provider owns"
+        );
     }
 
     #[test]

@@ -14,7 +14,8 @@ use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
-use crate::ec::eids::{resolve_partner_ids, to_eids};
+use crate::ec::current_timestamp;
+use crate::ec::eid_types::UnixSeconds;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::MAX_UID_LENGTH;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
@@ -535,8 +536,8 @@ pub(crate) fn resolve_auction_eids(
         return Some(Vec::new());
     }
 
-    let resolved = resolve_partner_ids(registry, entry);
-    Some(to_eids(&resolved))
+    let now = UnixSeconds::new(current_timestamp());
+    Some(entry.live_eids(registry, now).map(Eid::from).collect())
 }
 
 pub(crate) fn resolve_client_auction_eids(
@@ -600,7 +601,7 @@ fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
             continue;
         }
 
-        eids.push(Eid { source, uids });
+        eids.push(Eid::new(source, uids));
     }
 
     if eids.is_empty() { None } else { Some(eids) }
@@ -635,8 +636,9 @@ pub(crate) fn merge_auction_eids(
     client_eids: Option<Vec<Eid>>,
     resolved_eids: Option<Vec<Eid>>,
 ) -> Option<Vec<Eid>> {
-    let mut merged = Vec::new();
+    let mut merged: Vec<Eid> = Vec::new();
 
+    // Server-resolved entries come first so their fields win on duplicates.
     for eid in resolved_eids
         .into_iter()
         .flatten()
@@ -645,50 +647,65 @@ pub(crate) fn merge_auction_eids(
         if eid.source.is_empty() {
             continue;
         }
-
-        let source_index = match merged
-            .iter()
-            .position(|existing: &Eid| existing.source == eid.source)
-        {
-            Some(index) => index,
-            None => {
-                merged.push(Eid {
-                    source: eid.source.clone(),
-                    uids: Vec::new(),
-                });
-                merged.len() - 1
-            }
-        };
-
-        for uid in eid.uids {
+        let Eid {
+            source,
+            inserter,
+            matcher,
+            mm,
+            ext,
+            uids,
+        } = eid;
+        let mut kept = Vec::with_capacity(uids.len());
+        for uid in uids {
             if uid.id.trim().is_empty() || uid.id.len() > MAX_UID_LENGTH {
                 continue;
             }
-
-            if let Some(existing_uid) = merged[source_index]
-                .uids
+            // A duplicate keeps the earlier UID's fields but fills its
+            // missing `atype` and `ext` from the later one.
+            let duplicate = merged
                 .iter_mut()
-                .find(|existing| existing.id == uid.id)
-            {
-                if existing_uid.atype.is_none() {
-                    existing_uid.atype = uid.atype;
+                .filter(|existing| existing.source == source)
+                .flat_map(|existing| existing.uids.iter_mut())
+                .chain(kept.iter_mut())
+                .find(|existing: &&mut Uid| existing.id == uid.id);
+            match duplicate {
+                Some(existing) => {
+                    if existing.atype.is_none() {
+                        existing.atype = uid.atype;
+                    }
+                    if existing.ext.is_none() {
+                        existing.ext = uid.ext;
+                    }
                 }
-                if existing_uid.ext.is_none() {
-                    existing_uid.ext = uid.ext;
-                }
-            } else {
-                merged[source_index].uids.push(uid);
+                None => kept.push(uid),
             }
+        }
+        if kept.is_empty() {
+            continue;
+        }
+        // Entries are distinct when any EID-level field differs, including
+        // `ext` (compared by JSON value), so no entry's fields are lost.
+        let same_entry = merged.iter_mut().find(|existing| {
+            existing.source == source
+                && existing.inserter == inserter
+                && existing.matcher == matcher
+                && existing.mm == mm
+                && existing.ext == ext
+        });
+        match same_entry {
+            Some(existing) => existing.uids.extend(kept),
+            None => merged.push(Eid {
+                source,
+                inserter,
+                matcher,
+                mm,
+                ext,
+                uids: kept,
+            }),
         }
     }
 
-    merged.retain(|eid| !eid.uids.is_empty());
-
-    if merged.is_empty() {
-        None
-    } else {
-        Some(merged)
-    }
+    (!merged.is_empty()).then_some(merged)
 }
 
 #[cfg(test)]
@@ -782,10 +799,9 @@ mod tests {
     #[tokio::test]
     async fn auction_endpoint_snapshot_is_reused_by_response_finalization() {
         // `/auction` loads the identity-graph row to resolve server-side EIDs.
-        // Finalization runs afterwards on the same EC context and ingests
-        // `ts-eids`/`sharedId` updates. Both must be served by a single billable
-        // read: before the snapshot was shared, finalization saw `NotRead` and
-        // paid for a second lookup.
+        // Finalization runs afterwards on the same EC context. It must not pay
+        // for a second lookup, and it never writes KV: only the page load's
+        // navigation may write (spec D1).
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
@@ -869,21 +885,17 @@ mod tests {
             .get(&ec_id)
             .expect("should read store")
             .expect("row should exist");
-        assert_eq!(
-            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
-            Some("shared-cookie-id"),
-            "the sharedId update must still be ingested from the shared snapshot"
+        assert!(
+            stored.ids.is_empty(),
+            "an auction request must leave the row unchanged"
         );
     }
 
     #[tokio::test]
-    async fn auction_body_eids_reach_kv_even_when_the_ts_eids_cookie_is_absent() {
-        // Regression test for #1184: `/auction` sends every EID it has in the
-        // request body, but response finalization used to ingest identity
-        // graph updates only from the `ts-eids` cookie — which the browser
-        // caps in size and may not have sent at all. `handle_auction` must
-        // hand its parsed body EIDs to `ec_context` so finalization ingests
-        // them regardless of what the cookie carried.
+    async fn auction_body_eids_reach_context_but_never_kv() {
+        // `handle_auction` hands its parsed body EIDs to `ec_context`, but body
+        // EIDs go to bidders on that request only: finalization of an
+        // `/auction` request never writes them to KV (spec §5.1, D1).
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
@@ -962,10 +974,9 @@ mod tests {
             .get(&ec_id)
             .expect("should read store")
             .expect("row should exist");
-        assert_eq!(
-            stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
-            Some("ID5_from_body"),
-            "the body's EID must be ingested into KV without a ts-eids cookie"
+        assert!(
+            stored.ids.is_empty(),
+            "the body's EIDs must not be persisted from an auction request"
         );
     }
 
@@ -2059,32 +2070,131 @@ mod tests {
     }
 
     #[test]
+    fn merge_auction_eids_keeps_distinct_eid_level_entries_per_source() {
+        let resolved = Some(vec![Eid {
+            inserter: Some("a.example.com".to_owned()),
+            ..Eid::new(
+                "ids.example.com",
+                vec![Uid {
+                    id: "u1".to_owned(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+            )
+        }]);
+        let client = Some(vec![
+            Eid {
+                inserter: Some("b.example.com".to_owned()),
+                ..Eid::new(
+                    "ids.example.com",
+                    vec![Uid {
+                        id: "u2".to_owned(),
+                        atype: Some(1),
+                        ext: None,
+                    }],
+                )
+            },
+            Eid::new(
+                "ids.example.com",
+                vec![Uid {
+                    id: "u1".to_owned(),
+                    atype: Some(2),
+                    ext: None,
+                }],
+            ),
+        ]);
+
+        let merged = merge_auction_eids(client, resolved).expect("should merge");
+
+        assert_eq!(
+            merged.len(),
+            2,
+            "should keep entries with different inserters"
+        );
+        assert_eq!(
+            merged[0].uids.len(),
+            1,
+            "should drop duplicate u1 from client"
+        );
+        assert_eq!(
+            merged[0].uids[0].atype,
+            Some(1),
+            "should keep server fields for duplicate"
+        );
+        assert_eq!(
+            merged[1].uids[0].id, "u2",
+            "should keep distinct client uid"
+        );
+    }
+
+    #[test]
+    fn merge_auction_eids_keeps_entries_with_different_ext_separate() {
+        let resolved = Some(vec![Eid {
+            ext: Some(json!({ "k": "server" })),
+            ..Eid::new(
+                "ids.example.com",
+                vec![Uid {
+                    id: "u1".to_owned(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+            )
+        }]);
+        let client = Some(vec![Eid {
+            ext: Some(json!({ "k": "client" })),
+            ..Eid::new(
+                "ids.example.com",
+                vec![Uid {
+                    id: "u2".to_owned(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+            )
+        }]);
+
+        let merged = merge_auction_eids(client, resolved).expect("should merge");
+
+        assert_eq!(merged.len(), 2, "should keep entries with different ext");
+        assert_eq!(
+            merged[0].ext,
+            Some(json!({ "k": "server" })),
+            "should keep server entry ext"
+        );
+        assert_eq!(
+            merged[1].ext,
+            Some(json!({ "k": "client" })),
+            "should keep client entry ext"
+        );
+        assert_eq!(merged[1].uids[0].id, "u2", "should keep client uid");
+    }
+
+    #[test]
     fn merge_auction_eids_deduplicates_client_and_resolved_ids() {
-        let client_eids = Some(vec![Eid {
-            source: "id5-sync.com".to_string(),
-            uids: vec![Uid {
+        let client_eids = Some(vec![Eid::new(
+            "id5-sync.com".to_string(),
+            vec![Uid {
                 id: "ID5_abc".to_string(),
                 atype: Some(1),
                 ext: None,
             }],
-        }]);
+        )]);
         let resolved_eids = Some(vec![
-            Eid {
-                source: "id5-sync.com".to_string(),
-                uids: vec![Uid {
+            Eid::new(
+                "id5-sync.com".to_string(),
+                vec![Uid {
                     id: "ID5_abc".to_string(),
                     atype: Some(1),
                     ext: None,
                 }],
-            },
-            Eid {
-                source: "liveramp.com".to_string(),
-                uids: vec![Uid {
+            ),
+            Eid::new(
+                "liveramp.com".to_string(),
+                vec![Uid {
                     id: "LR_xyz".to_string(),
                     atype: Some(3),
                     ext: None,
                 }],
-            },
+            ),
         ]);
 
         let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
@@ -2098,22 +2208,22 @@ mod tests {
 
     #[test]
     fn merge_auction_eids_preserves_multiple_uids_per_source() {
-        let client_eids = Some(vec![Eid {
-            source: "sharedid.org".to_string(),
-            uids: vec![Uid {
+        let client_eids = Some(vec![Eid::new(
+            "sharedid.org".to_string(),
+            vec![Uid {
                 id: "shared_client".to_string(),
                 atype: None,
                 ext: None,
             }],
-        }]);
-        let resolved_eids = Some(vec![Eid {
-            source: "sharedid.org".to_string(),
-            uids: vec![Uid {
+        )]);
+        let resolved_eids = Some(vec![Eid::new(
+            "sharedid.org".to_string(),
+            vec![Uid {
                 id: "shared_server".to_string(),
                 atype: Some(3),
                 ext: None,
             }],
-        }]);
+        )]);
 
         let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
 
@@ -2125,22 +2235,22 @@ mod tests {
 
     #[test]
     fn merge_auction_eids_prefers_server_resolved_metadata_on_conflict() {
-        let client_eids = Some(vec![Eid {
-            source: "adserver.org".to_string(),
-            uids: vec![Uid {
+        let client_eids = Some(vec![Eid::new(
+            "adserver.org".to_string(),
+            vec![Uid {
                 id: "shared_uid".to_string(),
                 atype: Some(1),
                 ext: Some(json!({ "provider": "client" })),
             }],
-        }]);
-        let resolved_eids = Some(vec![Eid {
-            source: "adserver.org".to_string(),
-            uids: vec![Uid {
+        )]);
+        let resolved_eids = Some(vec![Eid::new(
+            "adserver.org".to_string(),
+            vec![Uid {
                 id: "shared_uid".to_string(),
                 atype: Some(3),
                 ext: Some(json!({ "provider": "server" })),
             }],
-        }]);
+        )]);
 
         let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
 
@@ -2155,6 +2265,40 @@ mod tests {
             merged[0].uids[0].ext,
             Some(json!({ "provider": "server" })),
             "should prefer resolved ext"
+        );
+    }
+
+    #[test]
+    fn merge_auction_eids_fills_missing_atype_and_ext_from_duplicate() {
+        let client_eids = Some(vec![Eid::new(
+            "adserver.org".to_string(),
+            vec![Uid {
+                id: "shared_uid".to_string(),
+                atype: Some(1),
+                ext: Some(json!({ "provider": "client" })),
+            }],
+        )]);
+        let resolved_eids = Some(vec![Eid::new(
+            "adserver.org".to_string(),
+            vec![Uid {
+                id: "shared_uid".to_string(),
+                atype: None,
+                ext: None,
+            }],
+        )]);
+
+        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
+
+        assert_eq!(merged[0].uids.len(), 1, "should deduplicate duplicate uid");
+        assert_eq!(
+            merged[0].uids[0].atype,
+            Some(1),
+            "should fill missing atype from the duplicate"
+        );
+        assert_eq!(
+            merged[0].uids[0].ext,
+            Some(json!({ "provider": "client" })),
+            "should fill missing ext from the duplicate"
         );
     }
 

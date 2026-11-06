@@ -113,6 +113,7 @@ impl EcTestClient {
             .client
             .get(format!("{}{path}", self.base_url))
             .header("sec-fetch-dest", "document")
+            .header("sec-fetch-mode", "navigate")
             .header("accept", "text/html");
         for (key, value) in headers {
             builder = builder.header(*key, *value);

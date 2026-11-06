@@ -205,6 +205,7 @@ mod tests {
                 "s3-session-key" => "resolved-session-token",
                 "partner-api-token-key" => "resolved-partner-api-token-32-bytes-ok",
                 "partner-pull-token-key" => "resolved-partner-pull-token-32-bytes-ok",
+                "provider-token-key" => "resolved-provider-token",
                 "trusted-client-ip-key" => "resolved-trusted-client-ip-secret-32-bytes",
                 "trusted-forwarder-key" => "resolved-trusted-forwarder-secret-32-bytes",
                 _ => key,
@@ -329,6 +330,46 @@ mod tests {
         assert!(
             config.geo_query_parameters,
             "should preserve Didomi geo opt-in"
+        );
+    }
+
+    #[test]
+    fn resolves_identity_provider_token_from_the_mapped_default_store() {
+        let mut original = test_settings();
+        original.ec.partners.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "ids", "source_domain": "ids.example.com"
+            }))
+            .expect("should build partner"),
+        );
+        original.ec.identity_providers.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "example-provider",
+                "kind": "example-kind",
+                "endpoint": "https://ids.example.com/v1/lookup",
+                "allowed_domains": ["ids.example.com"],
+                "sources": ["ids.example.com"],
+                "secrets": { "token": "provider-token-key" },
+            }))
+            .expect("should build provider config"),
+        );
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve the provider token");
+
+        assert_eq!(
+            reconstructed.ec.identity_providers[0]
+                .secrets
+                .token
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-provider-token"),
+            "should resolve the provider token key"
         );
     }
 

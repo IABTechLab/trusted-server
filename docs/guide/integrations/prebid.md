@@ -902,20 +902,20 @@ server-to-server ATS API.
 
 ### Degraded behavior
 
-| Condition                                                | Result                                                                                             |
-| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| TCF Purpose 1 or LiveRamp vendor consent is denied       | Default `tcfControl` blocks IdentityLink resolution and storage                                    |
-| TCF Purpose 3 or 4 alone is denied                       | Resolution/storage continues under defaults; publisher rules may differ                            |
-| The user opts out under a US state signal                | No LiveRamp EID is forwarded; the auction continues                                                |
-| LiveRamp cannot recognize the browser                    | IdentityLink yields no EID; the auction continues                                                  |
-| LiveRamp network resolution fails                        | The current auction continues without RampID                                                       |
-| The managed module is missing from the bundle            | Existing diagnostics report the missing module; auctions continue                                  |
-| The origin is not approved by LiveRamp                   | Resolution yields no usable EID; the auction continues                                             |
-| EC/KV is unavailable                                     | A current-request EID can still reach `/auction`; persistence degrades                             |
-| The resolved envelope exceeds the 512-byte EID value cap | The envelope is dropped from both the `/auction` payload and EC persistence; the auction continues |
-| The CMP is callable but never returns a settled result   | The managed entry is never seeded; no vendor call, no identity storage, and the auction continues  |
-| Two managed entries address one Prebid submodule         | The later entry is dropped with a logged error; the first entry's configuration takes effect       |
-| A silent CMP stub is replaced by a working CMP           | The shim re-subscribes to the replacement; a CMP that already answered once keeps its own wait     |
+| Condition                                                 | Result                                                                                             |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| TCF Purpose 1 or LiveRamp vendor consent is denied        | Default `tcfControl` blocks IdentityLink resolution and storage                                    |
+| TCF Purpose 3 or 4 alone is denied                        | Resolution/storage continues under defaults; publisher rules may differ                            |
+| The user opts out under a US state signal                 | No LiveRamp EID is forwarded; the auction continues                                                |
+| LiveRamp cannot recognize the browser                     | IdentityLink yields no EID; the auction continues                                                  |
+| LiveRamp network resolution fails                         | The current auction continues without RampID                                                       |
+| The managed module is missing from the bundle             | Existing diagnostics report the missing module; auctions continue                                  |
+| The origin is not approved by LiveRamp                    | Resolution yields no usable EID; the auction continues                                             |
+| EC/KV is unavailable                                      | A current-request EID can still reach `/auction`; persistence degrades                             |
+| The resolved envelope exceeds the 1024-byte EID value cap | The envelope is dropped from both the `/auction` payload and EC persistence; the auction continues |
+| The CMP is callable but never returns a settled result    | The managed entry is never seeded; no vendor call, no identity storage, and the auction continues  |
+| Two managed entries address one Prebid submodule          | The later entry is dropped with a logged error; the first entry's configuration takes effect       |
+| A silent CMP stub is replaced by a working CMP            | The shim re-subscribes to the replacement; a CMP that already answered once keeps its own wait     |
 
 The TCF rows assume either the managed-ID automatic setup described above or a
 publisher-owned Prebid GDPR configuration. A CMP API and its policy remain
@@ -932,7 +932,7 @@ domain, booleans, source names, counts, and status codes:
    `identityLink` entry with the test Placement ID.
 2. With positive consent, confirm `idl_env` is created or refreshed.
 3. Record the byte length of the resolved envelope — the length only, never the
-   value — and confirm it is at or below the 512-byte EID value cap. Anything
+   value — and confirm it is at or below the 1024-byte EID value cap. Anything
    above it is dropped as described in the degraded-behavior table.
 4. Confirm `pbjs.getUserIdsAsEids()` reports source `liveramp.com` without
    recording its value.
