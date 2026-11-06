@@ -8,6 +8,7 @@ use std::time::Duration;
 use error_stack::Report;
 use serde::Deserialize;
 use serde_json::value::RawValue;
+use trusted_server_core::ec::current_timestamp;
 use trusted_server_core::ec::eid_types::SourceDomain;
 use trusted_server_core::ec::provider::{
     EidLevelFields, EidShape, ProviderCapabilities, ProviderCommon, ProviderConfigError,
@@ -298,12 +299,13 @@ impl CookieReader {
         self.own
             .iter()
             .chain(self.lockr.iter())
-            .filter_map(|name| cookies.get(name))
+            .flat_map(|name| cookies.get_all(name))
             .any(matches)
     }
 
-    /// Returns the first value `parse` accepts, trying the own cookies
-    /// before the Lockr cookies.
+    /// Returns the first value `parse` accepts, trying every value of each
+    /// own cookie before the Lockr cookies, so an unusable or expired value
+    /// never hides a later usable one.
     pub(crate) fn read<'cookie, T>(
         &self,
         cookies: RequestCookies<'cookie>,
@@ -312,13 +314,13 @@ impl CookieReader {
         if let Some(found) = self
             .own
             .iter()
-            .filter_map(|name| cookies.get(name))
+            .flat_map(|name| cookies.get_all(name))
             .find_map(&mut parse)
         {
             return Some(found);
         }
         let (name, found) = self.lockr.iter().find_map(|name| {
-            let found = parse(cookies.get(name)?)?;
+            let found = cookies.get_all(name).find_map(&mut parse)?;
             Some((name, found))
         })?;
         log::debug!(
@@ -327,6 +329,13 @@ impl CookieReader {
         );
         Some(found)
     }
+}
+
+/// Whether a cookie's stated expiry has already passed.
+///
+/// Cookie readers skip such a value so it never hides a later live one.
+pub(crate) fn is_expired(expiry: &ProviderExpiry) -> bool {
+    matches!(expiry, ProviderExpiry::At(at) if at.get() <= current_timestamp())
 }
 
 /// A complete `OpenRTB` EID as a vendor returns it, borrowed from the body.
