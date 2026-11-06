@@ -7,11 +7,14 @@
 //! opt-out, which removes a stored `SharedID`.
 //! No server call is made.
 //!
-//! `SharedID` is a publisher first-party ID with no vendor server, so when
-//! the cookies hold none and no live `SharedID` is stored, Trusted Server
-//! generates one itself: a random UUID v4, stored in the row only. No cookie
-//! is set, so Prebid's own cookie is never touched; when Prebid later writes
-//! one, the cookie's ID replaces the generated one.
+//! `SharedID` is a publisher first-party ID with no vendor server. With
+//! `generate = true`, when the cookies hold none and no live `SharedID` is
+//! stored, Trusted Server generates one itself: a random UUID v4, stored in
+//! the row only. No cookie is set, so Prebid's own cookie is never touched;
+//! when Prebid later writes one, the cookie's ID replaces the generated one.
+//! Generation is off by default: Prebid may keep its opt-out in localStorage,
+//! which the server cannot see, so only a publisher who knows its opt-out
+//! lives in the `_pubcid_optout` cookie should turn it on.
 
 use std::borrow::Cow;
 
@@ -42,6 +45,10 @@ pub struct SharedIdSettings {
     /// Cookies holding the `SharedID`, read in order.
     #[serde(default = "SharedIdSettings::default_cookie_names")]
     pub cookie_names: Vec<String>,
+    /// Whether to generate a `SharedID` when the cookies hold none. Off by
+    /// default, because a localStorage opt-out is invisible to the server.
+    #[serde(default)]
+    pub generate: bool,
 }
 
 impl SharedIdSettings {
@@ -56,6 +63,7 @@ pub struct SharedIdProvider {
     capabilities: ProviderCapabilities,
     source: SourceDomain,
     cookies: CookieReader,
+    generate: bool,
 }
 
 impl ProviderKind for SharedId {
@@ -76,6 +84,7 @@ impl ProviderKind for SharedId {
             capabilities,
             source,
             cookies: CookieReader::own(common, settings.cookie_names),
+            generate: settings.generate,
         })
     }
 }
@@ -120,6 +129,9 @@ impl IdentityProvider for SharedIdProvider {
     }
 
     fn generate(&self, _lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
+        if !self.generate {
+            return None;
+        }
         Some(vec![device_eid(
             &self.source,
             Cow::Owned(Uuid::new_v4().to_string()),
@@ -139,10 +151,15 @@ mod tests {
     use super::*;
 
     fn provider() -> Box<dyn IdentityProvider> {
+        provider_with(&json!({}))
+    }
+
+    fn provider_with(settings: &serde_json::Value) -> Box<dyn IdentityProvider> {
         let config: IdentityProviderConfig = serde_json::from_value(json!({
             "id": "sharedid",
             "kind": "sharedid",
             "sources": ["sharedid.example.com"],
+            "settings": settings,
         }))
         .expect("should parse provider config");
         build_kind::<SharedId>(&config, &ProviderSecrets::default()).expect("should build provider")
@@ -191,8 +208,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generates_a_random_uuid_when_none_is_held() {
+    fn generate_with(provider: &dyn IdentityProvider) -> Option<Vec<ProviderEid<'static>>> {
         let consent = trusted_server_core::consent::ConsentContext::default();
         let lookup = LookupInput {
             ec_id: "ec-example",
@@ -207,10 +223,23 @@ mod tests {
             cookies: RequestCookies::default(),
             hashed_email: None,
         };
-        let provider = provider();
+        provider.generate(&lookup)
+    }
 
-        let first = provider.generate(&lookup).expect("should generate an ID");
-        let second = provider.generate(&lookup).expect("should generate an ID");
+    #[test]
+    fn generates_nothing_by_default() {
+        assert!(
+            generate_with(&*provider()).is_none(),
+            "should not generate without generate = true"
+        );
+    }
+
+    #[test]
+    fn generates_a_random_uuid_when_none_is_held() {
+        let provider = provider_with(&json!({ "generate": true }));
+
+        let first = generate_with(&*provider).expect("should generate an ID");
+        let second = generate_with(&*provider).expect("should generate an ID");
 
         let uid = &first[0].uids[0];
         assert_eq!(
