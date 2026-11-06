@@ -281,6 +281,13 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         self.providers.is_empty()
     }
 
+    /// Whether the row holds a live provider-written UID for `source`.
+    fn holds_live_uid(entry: Option<&KvEntry>, source: &str, now: UnixSeconds) -> bool {
+        entry
+            .and_then(|entry| entry.ids.get(source))
+            .is_some_and(|record| record.is_provider_written() && record.has_live_uid(now))
+    }
+
     /// Claimed sources lacking a live provider-written UID (a browser
     /// fallback does not count), minus sources needing input V1
     /// never has; the flag reports whether any source was removed for input.
@@ -523,12 +530,20 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 current: OwnedEntries::new(entry, &registered.policy.sources, &registered.id),
                 hashed_email: None,
             };
-            if let Some(eids) = registered.provider.generate(&input) {
-                pending.generated.push(Tagged {
-                    provider,
-                    value: self.validated(provider, eids, lookup.now),
+            if let Some(mut eids) = registered.provider.generate(&input) {
+                // Only a due source without a live UID may take a generated
+                // ID: a refresh-due source keeps its UID and goes to lookup.
+                eids.retain(|eid| {
+                    due.iter().any(|source| source.as_str() == eid.source)
+                        && !Self::holds_live_uid(entry, &eid.source, lookup.now)
                 });
-                continue;
+                if !eids.is_empty() {
+                    pending.generated.push(Tagged {
+                        provider,
+                        value: self.validated(provider, eids, lookup.now),
+                    });
+                    continue;
+                }
             }
             if Self::rate_limited(registered, lookup) {
                 pending.early.push(skip(SkipReason::RateLimited));
@@ -1524,6 +1539,35 @@ mod tests {
             "should store the generated ID"
         );
         assert!(transport.sent.borrow().is_empty(), "should send no lookup");
+    }
+
+    #[test]
+    fn a_refresh_due_live_source_is_looked_up_not_regenerated() {
+        let coordinator = generating_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record(900)),
+            &granting(),
+        );
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            lookup
+                .entries
+                .iter()
+                .flat_map(|(_, eids)| eids)
+                .flat_map(KvEid::uids)
+                .all(|uid| uid.id().as_str() != "generated-1"),
+            "should not replace the live UID with a generated one"
+        );
+        assert_eq!(
+            transport.sent.borrow().len(),
+            1,
+            "should send the refresh lookup instead"
+        );
     }
 
     #[test]
