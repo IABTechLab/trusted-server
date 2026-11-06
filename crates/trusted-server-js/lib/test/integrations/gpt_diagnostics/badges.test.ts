@@ -112,6 +112,138 @@ describe('GptDiagnosticsBadgeManager', () => {
 
     expect(layer.querySelectorAll('.tsgd-badge')).toHaveLength(1);
     expect(layer.querySelector<HTMLElement>('.tsgd-badge')?.dataset.runtimeSlot).toBe('1');
+    expect(layer.querySelector<HTMLElement>('.tsgd-badge')?.textContent).toContain('Ad #1');
+    manager.destroy();
+  });
+
+  it('renders an accessible request-scoped control and activates its exact request', () => {
+    const frames: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+    const bindings = new FakeBindings();
+    const element = document.createElement('div');
+    document.body.append(element);
+    vi.spyOn(element, 'getBoundingClientRect').mockReturnValue(rectangle(10, 100, 300, 250));
+    const observedSlot = slot('accessible');
+    store.recordSlotRequested(observedSlot);
+    store.recordSlotRequested(observedSlot);
+    bindings.set(1, { status: 'bound' }, element, true);
+    const activate = vi.fn();
+    const layer = document.createElement('div');
+    document.body.append(layer);
+    const manager = new GptDiagnosticsBadgeManager(store, bindings, {
+      scheduleFrame: (callback) => frames.push(callback),
+      onActivate: activate,
+    });
+    manager.setLayer(layer);
+    runFrame(frames);
+
+    const badge = layer.querySelector<HTMLButtonElement>('.tsgd-badge-handle');
+    expect(badge).toBeInstanceOf(HTMLButtonElement);
+    expect(badge?.textContent).toBe('Ad #1');
+    expect(layer.querySelector('.tsgd-badge-evidence')?.textContent).toBe('Request #2 · Pending');
+    layer.querySelector<HTMLElement>('.tsgd-badge')?.click();
+    expect(activate).not.toHaveBeenCalled();
+    expect(badge?.getAttribute('aria-label')).toBe(
+      'Open diagnostics for Ad #1, Request #2: Pending'
+    );
+    badge?.click();
+    expect(activate).toHaveBeenCalledWith(1, 2);
+
+    badge?.focus();
+    store.recordSlotRequested(observedSlot);
+    runFrame(frames);
+    const updatedBadge = layer.querySelector<HTMLButtonElement>('.tsgd-badge-handle');
+    expect(updatedBadge).toBe(badge);
+    expect(document.activeElement).toBe(badge);
+    expect(updatedBadge?.textContent).toBe('Ad #1');
+    expect(layer.querySelector('.tsgd-badge-evidence')?.textContent).toBe('Request #3 · Pending');
+    updatedBadge?.click();
+    expect(activate).toHaveBeenLastCalledWith(1, 3);
+
+    const highlight = document.createElement('div');
+    highlight.className = 'tsgd-highlight';
+    layer.append(highlight);
+    manager.update();
+    expect(layer.querySelector('.tsgd-highlight')).toBe(highlight);
+    manager.destroy();
+  });
+
+  it.each([
+    { name: 'top-left clipping', bounds: rectangle(-100, -20, 500, 500), hidden: false },
+    { name: 'bottom-right clipping', bounds: rectangle(900, 700, 300, 250), hidden: false },
+    { name: 'full viewport creative', bounds: rectangle(0, 0, 1024, 768), hidden: true },
+    { name: 'creative larger than viewport', bounds: rectangle(-10, -10, 1044, 788), hidden: true },
+    { name: 'viewport narrower than handle', bounds: rectangle(10, 100, 30, 250), hidden: true },
+  ])('keeps the handle outside creative bounds with $name', ({ name, bounds, hidden }) => {
+    if (name === 'viewport narrower than handle') {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 60 });
+    }
+    const frames: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+    const bindings = new FakeBindings();
+    const creative = document.createElement('div');
+    const originalMarkup = creative.outerHTML;
+    document.body.append(creative);
+    vi.spyOn(creative, 'getBoundingClientRect').mockReturnValue(bounds);
+    store.recordSlotRequested(slot('geometry'));
+    bindings.set(1, { status: 'bound' }, creative, true);
+    const layer = document.createElement('div');
+    document.body.append(layer);
+    const manager = new GptDiagnosticsBadgeManager(store, bindings, {
+      scheduleFrame: (callback) => frames.push(callback),
+    });
+    manager.setLayer(layer);
+    runFrame(frames);
+    const handle = layer.querySelector<HTMLButtonElement>('.tsgd-badge-handle')!;
+    expect(handle.hidden).toBe(hidden);
+    if (!hidden) {
+      const left = Number.parseFloat(handle.style.left);
+      const top = Number.parseFloat(handle.style.top);
+      const right = left + Number.parseFloat(handle.style.width);
+      const bottom = top + Number.parseFloat(handle.style.height);
+      expect(left).toBeGreaterThanOrEqual(4);
+      expect(top).toBeGreaterThanOrEqual(4);
+      expect(right).toBeLessThanOrEqual(window.innerWidth - 4);
+      expect(bottom).toBeLessThanOrEqual(window.innerHeight - 4);
+      expect(
+        right <= bounds.left || left >= bounds.right || bottom <= bounds.top || top >= bounds.bottom
+      ).toBe(true);
+      handle.focus();
+      expect(document.activeElement).toBe(handle);
+    }
+    expect(layer.querySelector('.tsgd-badge-evidence')).not.toBeNull();
+    expect(creative.outerHTML).toBe(originalMarkup);
+    manager.destroy();
+  });
+
+  it('avoids neighboring creatives and clamps tall evidence to the viewport', () => {
+    const frames: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+    const bindings = new FakeBindings();
+    const creative = document.createElement('div');
+    const neighbor = document.createElement('div');
+    document.body.append(creative, neighbor);
+    vi.spyOn(creative, 'getBoundingClientRect').mockReturnValue(rectangle(100, 100, 300, 250));
+    vi.spyOn(neighbor, 'getBoundingClientRect').mockReturnValue(rectangle(0, 0, 1024, 100));
+    store.recordSlotRequested(slot('geometry'));
+    store.recordSlotRequested(slot('neighbor'));
+    bindings.set(1, { status: 'bound' }, creative, true);
+    bindings.set(2, { status: 'bound' }, neighbor, true);
+    const layer = document.createElement('div');
+    document.body.append(layer);
+    const manager = new GptDiagnosticsBadgeManager(store, bindings, {
+      scheduleFrame: (callback) => frames.push(callback),
+    });
+    manager.setLayer(layer);
+    runFrame(frames);
+    const badge = layer.querySelector<HTMLElement>('.tsgd-badge')!;
+    const evidence = badge.querySelector<HTMLElement>('.tsgd-badge-evidence')!;
+    vi.spyOn(evidence, 'getBoundingClientRect').mockReturnValue(rectangle(0, 0, 260, 700));
+    manager.update();
+    expect(badge.style.top).toBe('4px');
+    const handle = badge.querySelector<HTMLButtonElement>('.tsgd-badge-handle')!;
+    expect(handle.style.top).toBe('354px');
+    expect(handle.hidden).toBe(false);
     manager.destroy();
   });
 
@@ -153,6 +285,36 @@ describe('GptDiagnosticsBadgeManager', () => {
       delivery: 'not_applicable',
     });
     expect(emptyBadge, 'an empty cycle must not claim a Trusted Server response').toBe('Empty');
+  });
+
+  it('shows Multiple paths for a competing SPA auction without a redundant path badge', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const observedSlot = slot('competing-spa-badge');
+
+    store.recordTrustedServerOpportunity(
+      observedSlot,
+      'auction-slot',
+      'renderable_candidate',
+      undefined,
+      undefined,
+      {
+        auctionType: 'trusted_server',
+        serverTimings: { auctionDispatchedMs: 12, auctionResolvedMs: 84 },
+      }
+    );
+    store.recordPrebidRefresh([observedSlot]);
+    store.recordPrebidAuction(observedSlot, 'client-auction');
+    store.recordSlotRequested(observedSlot);
+
+    const cycle = store.snapshot().slots[0].requests[0];
+    expect(cycle).toMatchObject({
+      auctionType: 'competing',
+      serverAuctionTimingOrigin: 'spa_auction',
+      serverAuctionTimings: { auctionDispatchedMs: 12, auctionResolvedMs: 84 },
+    });
+    const badge = gptDiagnosticsBadgeTextForTest(cycle);
+    expect(badge).toContain('Multiple paths');
+    expect(badge).not.toContain('Competing paths');
   });
 
   it('renders compact evidence-safe labels for every delivery state', () => {
@@ -266,7 +428,7 @@ describe('GptDiagnosticsBadgeManager', () => {
         },
       })
     ).toBe(
-      'Filled · Req 728×90, 970×250 · Fill 728×90 · Box 980×270\nResponse 276 ms · Render 42 ms\nViewable after 1 s'
+      'Filled · Req 728×90, 970×250 · Fill 728×90 · Size filled 980×270\nGAM request → response 276 ms · GAM response → render 42 ms\nViewable after 1 s'
     );
     expect(
       gptDiagnosticsBadgeTextForTest({
@@ -282,6 +444,17 @@ describe('GptDiagnosticsBadgeManager', () => {
         durations: {},
       })
     ).toBe('Filled · Req 300×250, 320×50, 728×90 +1');
+    expect(
+      gptDiagnosticsBadgeTextForTest({
+        requestNumber: 1,
+        isEmpty: false,
+        size: [1, 1],
+        observedSlotSize: [728, 90],
+        auctionType: 'ssat',
+        incompleteSequence: false,
+        durations: {},
+      })
+    ).toBe('Filled · SSAT · Size filled 728×90');
     expect(
       gptDiagnosticsBadgeTextForTest({
         requestNumber: 1,
@@ -364,8 +537,11 @@ describe('GptDiagnosticsBadgeManager', () => {
 
     const firstBadge = layer.querySelector<HTMLElement>('.tsgd-badge')!;
     expect(firstBadge.style.left).toBe('100px');
-    expect(firstBadge.style.top).toBe('112px');
+    expect(firstBadge.style.top).toBe('116px');
     expect(firstBadge.style.maxWidth).toBe('260px');
+    const handle = firstBadge.querySelector<HTMLButtonElement>('button')!;
+    handle.focus();
+    expect(document.activeElement).toBe(handle);
 
     currentRectangle = rectangle(220, 260, 300, 250);
     window.dispatchEvent(new Event('scroll'));
@@ -373,8 +549,10 @@ describe('GptDiagnosticsBadgeManager', () => {
     expect(frames).toHaveLength(1);
     runFrame(frames);
     const movedBadge = layer.querySelector<HTMLElement>('.tsgd-badge')!;
+    expect(movedBadge).toBe(firstBadge);
+    expect(document.activeElement).toBe(handle);
     expect(movedBadge.style.left).toBe('220px');
-    expect(movedBadge.style.top).toBe('252px');
+    expect(movedBadge.style.top).toBe('256px');
     expect(element.getAttributeNames().map((name) => [name, element.getAttribute(name)])).toEqual(
       originalAttributes
     );

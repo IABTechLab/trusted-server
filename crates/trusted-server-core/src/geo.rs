@@ -48,6 +48,24 @@ impl GeoInfo {
     }
 }
 
+/// Carries the outcome of a request-phase geo lookup across to
+/// response-phase finalization, so a finalize consumer can reuse it instead
+/// of performing a second lookup for the same request.
+///
+/// Attached as a response extension on every exit path that attempted a
+/// lookup, including the asset-route fallback (which does not carry an EC
+/// finalize state).
+#[derive(Debug, Clone)]
+pub enum GeoLookupState {
+    /// No lookup has been attempted for this request.
+    NotAttempted,
+    /// A lookup ran and failed (or returned no result). This must not be
+    /// retried: finalize treats it the same as no geo info being available.
+    Attempted,
+    /// A lookup ran and resolved geo info.
+    Resolved(GeoInfo),
+}
+
 fn insert_geo_header(headers: &mut http::HeaderMap, name: http::header::HeaderName, value: &str) {
     match HeaderValue::from_str(value) {
         Ok(header_value) => {

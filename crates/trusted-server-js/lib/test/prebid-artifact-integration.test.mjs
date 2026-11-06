@@ -331,11 +331,17 @@ describe('tsjs-prebid production artifacts', () => {
     expect(shimCode).not.toContain(analyticsArtifact.manifest.prebidVersion);
     expect(shimCode).not.toContain('_pbjsGlobals');
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
-    // The original shim measures 40,354 characters. Shared strict trace JSON
-    // validation, request-ID hook association, and bounded pending lifecycle add
-    // 11,676 characters (52,030 total). Keep a narrow 52.5 KB guard: Prebid remains a separate artifact above 200 KB, and importing
-    // its runtime or private rendering helpers must still fail this regression.
-    expect(shimCode.length).toBeLessThan(52_500);
+    // Main's trace-enabled shim measures 52,464 bytes with these production
+    // options; the completed-auction bridge adds 188 bytes. Keep a narrow 53 KB
+    // budget while the optional diagnostics bundle owns Prebid evidence listeners.
+    expect(Buffer.byteLength(shimCode)).toBeLessThan(53_000);
+    // The optional diagnostics bundle owns subscription, correlation, and
+    // candidate reads. Only its completed-auction bridge remains in the shim.
+    expect(shimCode).not.toContain('bidWon');
+    expect(shimCode).not.toContain('latestTargetedAuctionId');
+    expect(shimCode).not.toContain('recordPrebidAuction');
+    expect(shimCode).not.toContain('recordPrebidWin');
+    expect(shimCode).toContain('recordCompletedPrebidAuction');
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 

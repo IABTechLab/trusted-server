@@ -139,8 +139,14 @@ describe('scheduleInitialAdInit', () => {
       expect(ts.traceEvidence!.snapshot().value?.serverAuctions).toEqual([evidence]);
       expect(ts.adSlots).toBe(slots);
       expect(ts.bids).toBe(bids);
+      expect(ts.auctionDiagnostics).toEqual({ auctionResolvedMs: 84 });
     });
-    ts.scheduleInitialAdInit!(bids, slots, { schema_version: 1, evidence });
+    ts.scheduleInitialAdInit!(
+      bids,
+      slots,
+      { schema_version: 1, evidence },
+      { auctionResolvedMs: 84 }
+    );
     expect(ts.traceEvidence!.snapshot().value?.serverAuctions).toEqual([]);
     flushFrame();
     flushFrame();
@@ -445,9 +451,13 @@ describe('scheduleInitialAdInit', () => {
     await flushAsync();
     expect(ts.navGeneration).toBe(1);
     ts.bids = { live_slot: { hb_pb: '2.50' } };
+    ts.auctionDiagnostics = { auctionResolvedMs: 10 };
 
-    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } });
+    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } }, undefined, undefined, {
+      auctionResolvedMs: 99,
+    });
     expect(ts.bids).toEqual({ live_slot: { hb_pb: '2.50' } });
+    expect(ts.auctionDiagnostics).toEqual({ auctionResolvedMs: 10 });
 
     window.dispatchEvent(new Event('load'));
     flushFrame();
@@ -466,6 +476,7 @@ describe('scheduleInitialAdInit', () => {
       json: async () => ({
         slots: [{ id: 's1', div_id: 'div-s1' }],
         bids: { s1: { hb_pb: '3.00' } },
+        auctionDiagnostics: { auctionResolvedMs: 84 },
       }),
     });
     await importGptModule();
@@ -476,6 +487,7 @@ describe('scheduleInitialAdInit', () => {
     history.pushState({}, '', '/b');
     await flushAsync();
     expect(ts.bids).toEqual({ s1: { hb_pb: '3.00' } });
+    expect(ts.auctionDiagnostics).toEqual({ auctionResolvedMs: 84 });
     expect(adInit).toHaveBeenCalledTimes(1);
 
     ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } });
@@ -484,6 +496,7 @@ describe('scheduleInitialAdInit', () => {
     flushFrame();
 
     expect(ts.bids).toEqual({ s1: { hb_pb: '3.00' } });
+    expect(ts.auctionDiagnostics).toEqual({ auctionResolvedMs: 84 });
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 
@@ -501,10 +514,23 @@ describe('scheduleInitialAdInit', () => {
       formats: [[728, 90]] as Array<[number, number]>,
     };
 
-    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } }, [ssrSlot]);
+    const auctionDiagnostics = {
+      auctionDispatchedMs: 4,
+      auctionResolvedMs: 84,
+      auctionCommittedMs: 85,
+      auctionWaitMs: 80,
+      auctionWaitPlacement: 'pre_header' as const,
+    };
+    ts.scheduleInitialAdInit!(
+      { ssr_slot: { hb_pb: '1.00' } },
+      [ssrSlot],
+      undefined,
+      auctionDiagnostics
+    );
 
     expect(ts.adSlots).toEqual([ssrSlot]);
     expect(ts.bids).toEqual({ ssr_slot: { hb_pb: '1.00' } });
+    expect(ts.auctionDiagnostics).toEqual(auctionDiagnostics);
   });
 
   it('preserves head-injected slots when initialSlots is omitted', async () => {

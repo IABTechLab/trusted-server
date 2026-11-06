@@ -1,4 +1,5 @@
 import type {
+  AuctionDiagnosticsData,
   GptDiagnosticsAdManagerIdentity,
   GptDiagnosticsAttributionIssue,
   GptDiagnosticsAttributionIssueReason,
@@ -8,10 +9,15 @@ import type {
   GptDiagnosticsCoverageCounters,
   GptDiagnosticsCreativeFailure,
   GptDiagnosticsDelivery,
+  GptDiagnosticsAuctionFacts,
+  GptDiagnosticsAuctionType,
+  GptDiagnosticsAuctionWinner,
+  GptDiagnosticsPrebidAuctionEvidence,
   GptDiagnosticsDurations,
   GptDiagnosticsRequestCycle,
   GptDiagnosticsRequestPath,
   GptDiagnosticsResponseClass,
+  GptDiagnosticsServerAuctionTimingOrigin,
   GptDiagnosticsSlotHandle,
   GptDiagnosticsTrustedServerOpportunity,
   Size,
@@ -19,6 +25,8 @@ import type {
 import { GPT_DIAGNOSTICS_CREATIVE_FAILURES } from '../../core/types';
 import type { TraceGptIdentity, TraceSlotCorrelationV1 } from '../../trace/types';
 import { validDiagnosticAuctionId, validTraceSlotRef } from '../../trace/validation';
+
+import { clonePrebidAuctionEvidence } from './evidence';
 
 function normalizedTraceIdentity(
   value: TraceGptIdentity | undefined
@@ -135,6 +143,10 @@ interface PendingSourceEvidence {
   trustedServerAuctionId?: string;
   requestedSlotSizes?: ReadonlyArray<Size>;
   traceIdentity?: TraceGptIdentity;
+  auctionType?: Extract<GptDiagnosticsAuctionType, 'ssat' | 'trusted_server'>;
+  auctionWinner?: GptDiagnosticsAuctionWinner;
+  prebidAuction?: GptDiagnosticsPrebidAuctionEvidence;
+  serverAuctionTimings?: AuctionDiagnosticsData;
 }
 
 interface PendingRequestIntent {
@@ -254,6 +266,78 @@ function normalizedRequestedSlotSizes(value: unknown): ReadonlyArray<Size> | und
   return requestedSlotSizes.length > 0 ? Object.freeze(requestedSlotSizes) : undefined;
 }
 
+function normalizedBoundedString(value: unknown, maxBytes: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || new TextEncoder().encode(trimmed).length > maxBytes) return undefined;
+  return trimmed;
+}
+
+function normalizedAuctionWinner(value: unknown): GptDiagnosticsAuctionWinner | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const candidate = value as Partial<GptDiagnosticsAuctionWinner>;
+  const bidder = normalizedBoundedString(candidate.bidder, 128);
+  const priceBucket = normalizedBoundedString(candidate.priceBucket, 64);
+  if (!bidder || !priceBucket || !/^\d+(?:\.\d+)?$/.test(priceBucket)) return undefined;
+  const currency = normalizedBoundedString(candidate.currency, 3)?.toUpperCase();
+  return Object.freeze({
+    bidder,
+    priceBucket,
+    ...(currency && /^[A-Z]{3}$/.test(currency) ? { currency } : {}),
+  });
+}
+
+const MAX_SERVER_AUCTION_TIMING_MS = 0xffffffff;
+
+function normalizedTiming(value: unknown): number | undefined {
+  return typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    value <= MAX_SERVER_AUCTION_TIMING_MS
+    ? value
+    : undefined;
+}
+
+function normalizedServerAuctionTimings(value: unknown): AuctionDiagnosticsData | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const candidate = value as AuctionDiagnosticsData;
+  const timings: AuctionDiagnosticsData = {
+    auctionDispatchedMs: normalizedTiming(candidate.auctionDispatchedMs),
+    auctionResolvedMs: normalizedTiming(candidate.auctionResolvedMs),
+    auctionCommittedMs: normalizedTiming(candidate.auctionCommittedMs),
+    auctionWaitMs: normalizedTiming(candidate.auctionWaitMs),
+    auctionWaitPlacement:
+      candidate.auctionWaitPlacement === 'pre_header' ||
+      candidate.auctionWaitPlacement === 'in_stream'
+        ? candidate.auctionWaitPlacement
+        : undefined,
+  };
+  return Object.values(timings).some((entry) => entry !== undefined)
+    ? Object.freeze(timings)
+    : undefined;
+}
+
+function normalizedAuctionFacts(
+  value: unknown
+): Omit<
+  PendingSourceEvidence,
+  'observedAtMs' | 'trustedServerOpportunity' | 'trustedServerAuctionId' | 'requestedSlotSizes'
+> {
+  if (typeof value !== 'object' || value === null) return {};
+  const candidate = value as GptDiagnosticsAuctionFacts;
+  const auctionType =
+    candidate.auctionType === 'ssat' || candidate.auctionType === 'trusted_server'
+      ? candidate.auctionType
+      : undefined;
+  const auctionWinner = normalizedAuctionWinner(candidate.winner);
+  const serverAuctionTimings = normalizedServerAuctionTimings(candidate.serverTimings);
+  return {
+    ...(auctionType ? { auctionType } : {}),
+    ...(auctionWinner ? { auctionWinner } : {}),
+    ...(serverAuctionTimings ? { serverAuctionTimings } : {}),
+  };
+}
+
 function responseClass(cycle: MutableRequestCycle): GptDiagnosticsResponseClass | undefined {
   if (cycle.renderAtMs === undefined) return undefined;
   if (cycle.isEmpty === true) return 'empty';
@@ -309,6 +393,13 @@ function copyCycle(cycle: MutableRequestCycle, nowMs: number): GptDiagnosticsReq
           companyIds: cycle.adManager.companyIds ? [...cycle.adManager.companyIds] : undefined,
         }
       : undefined,
+    ...(cycle.auctionWinner ? { auctionWinner: { ...cycle.auctionWinner } } : {}),
+    ...(cycle.prebidAuction
+      ? { prebidAuction: clonePrebidAuctionEvidence(cycle.prebidAuction) }
+      : {}),
+    ...(cycle.serverAuctionTimings
+      ? { serverAuctionTimings: { ...cycle.serverAuctionTimings } }
+      : {}),
     trustedServerCreativeFailures: cycle.trustedServerCreativeFailures
       ? [...cycle.trustedServerCreativeFailures]
       : undefined,
@@ -364,6 +455,7 @@ export class GptDiagnosticsStore {
     opportunity: GptDiagnosticsTrustedServerOpportunity,
     trustedServerAuctionId?: string,
     requestedSlotSizes?: ReadonlyArray<Size>,
+    auctionFacts?: GptDiagnosticsAuctionFacts,
     traceIdentity?: TraceGptIdentity
   ): void {
     if (
@@ -396,6 +488,7 @@ export class GptDiagnosticsStore {
       trustedServerAuctionId: auctionId,
       requestedSlotSizes: normalizedRequestedSlotSizes(requestedSlotSizes),
       ...(correlatedIdentity ? { traceIdentity: correlatedIdentity } : {}),
+      ...normalizedAuctionFacts(auctionFacts),
     });
   }
 
@@ -407,6 +500,47 @@ export class GptDiagnosticsStore {
       if (!isSlotObject(slot)) continue;
       this.recordRequestIntentSource(slot, 'prebid_refresh');
     }
+  }
+
+  /** Record a completed Prebid attempt for one exact slot's next request. */
+  recordPrebidAuction(
+    slot: GptDiagnosticsSlotLike,
+    auctionId: string,
+    targetingCandidate?: GptDiagnosticsAuctionWinner
+  ): void {
+    if (!isSlotObject(slot)) return;
+    const normalizedId = normalizedAuctionId(auctionId);
+    if (!normalizedId) return;
+    const candidate = normalizedAuctionWinner(targetingCandidate);
+    this.recordRequestIntentSource(slot, 'prebid_refresh', {
+      prebidAuction: Object.freeze({
+        auctionId: normalizedId,
+        ...(candidate ? { targetingCandidate: candidate } : {}),
+      }),
+    });
+  }
+
+  /** Attach a documented Prebid win only to its retained exact slot and attempt. */
+  recordPrebidWin(
+    slot: GptDiagnosticsSlotLike,
+    auctionId: string,
+    winner: GptDiagnosticsAuctionWinner
+  ): void {
+    if (!isSlotObject(slot)) return;
+    const normalizedId = normalizedAuctionId(auctionId);
+    const normalizedWinner = normalizedAuctionWinner(winner);
+    if (!normalizedId || !normalizedWinner) return;
+    const runtimeSlotNumber = this.slotNumbers.get(slot);
+    const record = runtimeSlotNumber === undefined ? undefined : this.slots.get(runtimeSlotNumber);
+    const matches = record?.requests.filter(
+      (cycle) => cycle.prebidAuction?.auctionId === normalizedId
+    );
+    if (!matches || matches.length !== 1 || !matches[0]?.prebidAuction) return;
+    matches[0].prebidAuction = Object.freeze({
+      ...matches[0].prebidAuction,
+      win: normalizedWinner,
+    });
+    this.notify();
   }
 
   /** Record publisher refresh observation from the private GPT diagnostics observer. */
@@ -630,6 +764,13 @@ export class GptDiagnosticsStore {
     const intent = this.consumeRequestIntent(slot, timestampMs);
     const trustedServerEvidence = intent?.sources.get('trusted_server_direct');
     const requestPath = this.requestPath(intent);
+    const auctionType = this.auctionType(intent, trustedServerEvidence);
+    const serverAuctionTimingOrigin: GptDiagnosticsServerAuctionTimingOrigin | undefined =
+      trustedServerEvidence?.auctionType === 'trusted_server'
+        ? 'spa_auction'
+        : trustedServerEvidence?.auctionType === 'ssat'
+          ? 'navigation'
+          : undefined;
     record.requests.push({
       requestNumber,
       requestedAtMs: timestampMs,
@@ -643,6 +784,17 @@ export class GptDiagnosticsStore {
       ...(trustedServerEvidence?.trustedServerAuctionId !== undefined
         ? { trustedServerAuctionId: trustedServerEvidence.trustedServerAuctionId }
         : {}),
+      ...(auctionType !== undefined ? { auctionType } : {}),
+      ...(trustedServerEvidence?.auctionWinner !== undefined
+        ? { auctionWinner: trustedServerEvidence.auctionWinner }
+        : {}),
+      ...(intent?.sources.get('prebid_refresh')?.prebidAuction !== undefined
+        ? { prebidAuction: intent.sources.get('prebid_refresh')?.prebidAuction }
+        : {}),
+      ...(trustedServerEvidence?.serverAuctionTimings !== undefined
+        ? { serverAuctionTimings: trustedServerEvidence.serverAuctionTimings }
+        : {}),
+      ...(serverAuctionTimingOrigin !== undefined ? { serverAuctionTimingOrigin } : {}),
       ...(trustedServerEvidence?.requestedSlotSizes !== undefined
         ? { requestedSlotSizes: trustedServerEvidence.requestedSlotSizes }
         : {}),
@@ -987,10 +1139,7 @@ export class GptDiagnosticsStore {
   private recordRequestIntentSource(
     slot: object,
     source: RequestIntentSource,
-    facts: Pick<
-      PendingSourceEvidence,
-      'trustedServerOpportunity' | 'trustedServerAuctionId' | 'requestedSlotSizes' | 'traceIdentity'
-    > = {}
+    facts: Omit<PendingSourceEvidence, 'observedAtMs'> = {}
   ): void {
     const observedAtMs = this.now();
     let intent = this.pendingRequestIntents.get(slot);
@@ -1005,6 +1154,8 @@ export class GptDiagnosticsStore {
       this.nextRequestIntentId += 1;
       this.pendingRequestIntents.set(slot, intent);
     }
+    // Replace rather than merge: a later bare refresh must not carry an
+    // earlier auction's evidence into the next GPT request.
     intent.sources.set(source, { observedAtMs, ...facts });
   }
 
@@ -1078,6 +1229,17 @@ export class GptDiagnosticsStore {
     return source ?? 'unattributed';
   }
 
+  private auctionType(
+    intent: PendingRequestIntent | undefined,
+    trustedServerEvidence: PendingSourceEvidence | undefined
+  ): GptDiagnosticsAuctionType | undefined {
+    const trustedServerAuction = trustedServerEvidence?.auctionType;
+    const hasClientSideAuction = intent?.sources.get('prebid_refresh')?.prebidAuction !== undefined;
+    if (trustedServerAuction && hasClientSideAuction) return 'competing';
+    if (hasClientSideAuction) return 'client_side';
+    return trustedServerAuction;
+  }
+
   private recordReplacement(record: MutableSlotRecord, cycle: MutableRequestCycle): void {
     const currentIndex = record.requests.indexOf(cycle);
     if (currentIndex <= 0) return;
@@ -1146,13 +1308,15 @@ export class GptDiagnosticsStore {
       }
     }
 
-    const runtimeSlotNumber = this.nextRuntimeSlotNumber;
-    this.nextRuntimeSlotNumber += 1;
+    const runtimeSlotNumber = existingNumber ?? this.nextRuntimeSlotNumber;
+    if (existingNumber === undefined) {
+      this.nextRuntimeSlotNumber += 1;
+      this.slotNumbers.set(slot, runtimeSlotNumber);
+    }
     const record: MutableSlotRecord = {
       runtimeSlotNumber,
       requests: [],
     };
-    this.slotNumbers.set(slot, runtimeSlotNumber);
     this.refreshSlotMetadata(record, slot);
     this.slots.set(runtimeSlotNumber, record);
     this.slotOrder.push(runtimeSlotNumber);

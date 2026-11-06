@@ -289,15 +289,18 @@ pub fn is_edge_cache_header_name(name: &str) -> bool {
 /// as `not-private` or `no-storey` do not match `private` / `no-store`.
 #[must_use]
 pub fn cache_control_value_has_directive(value: &str, directive: &str) -> bool {
-    let part_has_directive = |part: &str| {
+    cache_control_value_matches(value, |part| {
         let part = part.trim();
         let directive_name = part
             .find(['=', ';'])
             .map_or(part, |end| &part[..end])
             .trim();
         directive_name.eq_ignore_ascii_case(directive)
-    };
+    })
+}
 
+/// Tests comma-delimited directives without splitting quoted values.
+fn cache_control_value_matches(value: &str, part_matches: impl Fn(&str) -> bool) -> bool {
     let mut quoted = false;
     let mut escaped = false;
     let mut part_start = 0;
@@ -313,14 +316,14 @@ pub fn cache_control_value_has_directive(value: &str, directive: &str) -> bool {
         } else if character == '"' {
             quoted = true;
         } else if character == ',' {
-            if part_has_directive(&value[part_start..index]) {
+            if part_matches(&value[part_start..index]) {
                 return true;
             }
             part_start = index + character.len_utf8();
         }
     }
 
-    part_has_directive(&value[part_start..])
+    part_matches(&value[part_start..])
 }
 
 /// Return true when any `Cache-Control` header value contains `directive`.
@@ -333,11 +336,31 @@ pub fn cache_control_headers_have_directive(headers: &HeaderMap, directive: &str
         .any(|value| cache_control_value_has_directive(value, directive))
 }
 
-/// Return true when response cache-control contains exact `private` or `no-store`.
+/// Return true when response cache-control contains `private` or `no-store`,
+/// including directives with arguments.
 #[must_use]
 pub fn cache_control_headers_are_private_or_no_store(headers: &HeaderMap) -> bool {
     cache_control_headers_have_directive(headers, "private")
         || cache_control_headers_have_directive(headers, "no-store")
+}
+
+/// Return true when response cache-control contains a bare `private` or `no-store`.
+///
+/// Field-qualified `private` restricts only named headers, not the whole response,
+/// so it is insufficient permission to append request-specific timing headers.
+/// Directive-shaped text inside quoted values is not a bare directive.
+#[must_use]
+pub(crate) fn cache_control_headers_have_bare_private_or_no_store(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
+            cache_control_value_matches(value, |part| {
+                let part = part.trim();
+                part.eq_ignore_ascii_case("private") || part.eq_ignore_ascii_case("no-store")
+            })
+        })
 }
 
 /// Apply `Cache-Control: no-store, private` and strip all shared-cache headers.

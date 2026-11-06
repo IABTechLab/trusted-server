@@ -77,6 +77,48 @@ describe('explicit GPT public projection', () => {
       ).toBe(false);
     }
   );
+  it('projects Console auction facts without expanding the v1 public trace schema', () => {
+    const store = new GptDiagnosticsStore({ now: () => 1 });
+    const slot = { getSlotElementId: () => 'example' };
+    store.recordTrustedServerOpportunity(
+      slot,
+      'example',
+      'renderable_candidate',
+      undefined,
+      undefined,
+      {
+        auctionType: 'ssat',
+        winner: { bidder: 'private-server-bidder', priceBucket: '1.00' },
+        serverTimings: { auctionResolvedMs: 84 },
+      }
+    );
+    store.recordPrebidAuction(slot, 'private-prebid-auction', {
+      bidder: 'private-client-bidder',
+      priceBucket: '2.00',
+    });
+    store.recordSlotRequested(slot);
+    const source = observedGptSource(store);
+    expect(source.slots[0]!.requests[0]!).toMatchObject({
+      auctionType: 'competing',
+      serverAuctionTimingOrigin: 'navigation',
+      serverAuctionTimings: { auctionResolvedMs: 84 },
+      prebidAuction: { auctionId: 'private-prebid-auction' },
+    });
+    const projected = projectTraceGptDiagnostics(source, TRACE_ORIGIN);
+    expect(projected.ok).toBe(true);
+    if (!projected.ok) throw new Error('should project Console auction facts');
+    const cycle = projected.value.slots[0]!.requests[0]!;
+    expect(cycle.requestPath).toBe('competing');
+    for (const key of [
+      'auctionType',
+      'auctionWinner',
+      'prebidAuction',
+      'serverAuctionTimings',
+      'serverAuctionTimingOrigin',
+    ])
+      expect(cycle).not.toHaveProperty(key);
+    expect(JSON.stringify(projected.value)).not.toContain('private-');
+  });
   it('classifies inspection failures without reading caller-controlled errors', () => {
     let reads = 0;
     const failure = Object.defineProperty(new Error('private-message'), 'message', {
