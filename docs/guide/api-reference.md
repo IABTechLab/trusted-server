@@ -874,6 +874,7 @@ This lookup is implemented only by the Fastly adapter because the identity graph
 - `ec_id`, `store`, and `generation` identify the raw KV lookup.
 - `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
 - `metadata` preserves the stored metadata JSON shape.
+- Provider refresh state is private: every `refresh.state` in `entry` is shown as `"[redacted]"`, while `refresh.from` stays visible.
 - `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.
 - `auction.eids` previews the partner EIDs the stored record can contribute; `auction.skipped` explains filtered IDs.
 - `entry_error`, `metadata_error`, and `raw_body` keep malformed or schema-incompatible records inspectable.

@@ -118,12 +118,6 @@ fn apply_lookups(
 ) -> Vec<SourceDomain> {
     let mut written = Vec::new();
     for lookup in lookups.iter() {
-        for (source, eids) in &lookup.entries {
-            if let Some(record) = KvPartnerId::from_eids(eids.clone(), now) {
-                entry.ids.insert(source.as_str().to_owned(), record);
-                written.push(source.clone());
-            }
-        }
         if lookup.status == LookupStatus::Skipped(SkipReason::OptedOut) {
             entry.remember_opt_out(&lookup.provider, now);
         }
@@ -133,6 +127,12 @@ fn apply_lookups(
                     "EC write planner: removing '{source}' after provider '{}' opt-out",
                     lookup.provider
                 );
+            }
+        }
+        for (source, eids) in &lookup.entries {
+            if let Some(record) = KvPartnerId::from_eids(eids.clone(), now) {
+                entry.ids.insert(source.as_str().to_owned(), record);
+                written.push(source.clone());
             }
         }
     }
@@ -513,6 +513,17 @@ mod tests {
         )
     }
 
+    fn provider_entry(ids: &[&str]) -> KvEntry {
+        let mut entry = live_entry();
+        let lookups = found("ids.example.com", ids);
+        let (_, eids) = lookups.iter().next().expect("should hold a lookup").entries[0].clone();
+        entry.ids.insert(
+            "ids.example.com".to_owned(),
+            KvPartnerId::from_eids(eids, UnixSeconds::new(1000)).expect("should build record"),
+        );
+        entry
+    }
+
     #[test]
     fn opt_out_removes_the_provider_sources_and_blocks_browser_fallback() {
         // Arrange
@@ -649,17 +660,6 @@ mod tests {
             change.is_none(),
             "should not write only to prune an expired UID"
         );
-    }
-
-    fn provider_entry(ids: &[&str]) -> KvEntry {
-        let mut entry = live_entry();
-        let lookups = found("ids.example.com", ids);
-        let (_, eids) = lookups.iter().next().expect("should hold a lookup").entries[0].clone();
-        entry.ids.insert(
-            "ids.example.com".to_owned(),
-            KvPartnerId::from_eids(eids, UnixSeconds::new(1000)).expect("should build record"),
-        );
-        entry
     }
 
     #[test]

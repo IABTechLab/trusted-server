@@ -11,6 +11,10 @@ use crate::ec::kv_types::{KvEid, KvRefresh, KvUid};
 use crate::ec::provider::{EidLevelFields, EidShape, ProviderEid, ProviderExpiry, ProviderUid};
 use crate::ec::registry::PartnerRegistry;
 
+/// Longest a provider-stated absolute expiry may lie after the request:
+/// 30 days. Cookie- and vendor-supplied timestamps are clamped to it.
+const MAX_ABSOLUTE_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Largest private refresh state a provider may keep with one UID.
 const MAX_REFRESH_STATE_BYTES: usize = 2048;
 
@@ -117,7 +121,7 @@ fn eid_fields(
         inserter: bounded_field(eid.inserter.as_ref())?,
         matcher: bounded_field(eid.matcher.as_ref())?,
         mm: eid.mm.map(MatchMethod::try_from).transpose()?,
-        ext: eid.ext.map(RawJson::try_from).transpose()?,
+        ext: eid.ext.as_deref().map(RawJson::try_from).transpose()?,
     })
 }
 
@@ -128,7 +132,7 @@ fn stored_uid(
 ) -> Result<KvUid, EidValidationError> {
     let id = UidValue::try_from(uid.id.into_owned())?;
     let atype = AgentType::try_from(uid.atype.unwrap_or(default_atype))?;
-    let ext = uid.ext.map(RawJson::try_from).transpose()?;
+    let ext = uid.ext.as_deref().map(RawJson::try_from).transpose()?;
     let expiry = match resolve_expiry(uid.expiry, policy.now) {
         Some(at) => Expiry::At(at),
         None => Expiry::Never,
@@ -159,12 +163,12 @@ fn stored_uid(
     }
 }
 
-/// Resolves a provider-stated time against `now`. `None` when no time was
-/// stated.
+/// Resolves a provider-stated time against `now`, capping absolute times at
+/// [`MAX_ABSOLUTE_EXPIRY_SECS`]. `None` when no time was stated.
 fn resolve_expiry(expiry: ProviderExpiry, now: UnixSeconds) -> Option<UnixSeconds> {
     match expiry {
         ProviderExpiry::Unspecified => None,
-        ProviderExpiry::At(at) => Some(at),
+        ProviderExpiry::At(at) => Some(at.min(now.saturating_add_secs(MAX_ABSOLUTE_EXPIRY_SECS))),
         ProviderExpiry::After(after) => Some(now.saturating_add_secs(after.as_secs())),
     }
 }
@@ -317,6 +321,35 @@ mod tests {
     }
 
     #[test]
+    fn clamps_absolute_expiry_to_thirty_days() {
+        let partners = registry();
+        let provider = ProviderId::new("example-provider");
+        let claimed = claimed();
+        let mut far = uid("u-far");
+        far.expiry = ProviderExpiry::At(UnixSeconds::new(u64::MAX));
+        let mut near = uid("u-near");
+        near.expiry = ProviderExpiry::At(UnixSeconds::new(5000));
+
+        let (entries, dropped) = validate(
+            vec![eid("ids.example.com", vec![far, near])],
+            &policy(&provider, &claimed, &partners),
+        );
+
+        assert_eq!(dropped, DropCounts::default(), "should drop nothing");
+        let uids = entries[0].1[0].uids();
+        assert_eq!(
+            uids[0].expiry(),
+            Expiry::At(UnixSeconds::new(1000 + MAX_ABSOLUTE_EXPIRY_SECS)),
+            "should clamp a far expiry to now plus 30 days"
+        );
+        assert_eq!(
+            uids[1].expiry(),
+            Expiry::At(UnixSeconds::new(5000)),
+            "should keep a near expiry"
+        );
+    }
+
+    #[test]
     fn drops_invalid_values_by_reason() {
         let partners = registry();
         let provider = ProviderId::new("example-provider");
@@ -326,7 +359,7 @@ mod tests {
         expired.expiry = ProviderExpiry::At(UnixSeconds::new(1000));
         let array_ext = RawValue::from_string("[1]".to_owned()).expect("should build raw");
         let mut bad_ext = uid("u-ext");
-        bad_ext.ext = Some(&array_ext);
+        bad_ext.ext = Some(Cow::Borrowed(&array_ext));
 
         let (entries, dropped) = validate(
             vec![
@@ -432,6 +465,27 @@ mod tests {
             entries[0].1[0].fields().mm,
             Some(MatchMethod::Authenticated),
             "should keep valid mm"
+        );
+    }
+
+    #[test]
+    fn preserves_an_eid_ext_the_provider_built() {
+        let partners = registry();
+        let provider = ProviderId::new("example-provider");
+        let claimed = claimed();
+        let mut built = eid("ids.example.com", vec![uid("a")]);
+        built.ext = Some(Cow::Owned(
+            RawValue::from_string(serde_json::json!({ "segments": ["s1"] }).to_string())
+                .expect("should build raw"),
+        ));
+
+        let (entries, dropped) = validate(vec![built], &policy(&provider, &claimed, &partners));
+
+        assert_eq!(dropped, DropCounts::default(), "should drop nothing");
+        assert_eq!(
+            entries[0].1[0].fields().ext.as_ref().map(RawJson::to_value),
+            Some(serde_json::json!({ "segments": ["s1"] })),
+            "should keep the built ext"
         );
     }
 }

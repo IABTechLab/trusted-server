@@ -122,7 +122,7 @@ use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::page_load::NavigationPermit;
-use trusted_server_core::ec::provider::ClientSignals;
+use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
@@ -383,6 +383,7 @@ pub(crate) struct AfterResponseLookups {
     pub(crate) ec_id: String,
     pub(crate) client_ip: Option<IpAddr>,
     pub(crate) user_agent: Option<String>,
+    pub(crate) cookie_header: String,
 }
 
 /// Identity work a navigation hands to the entry point.
@@ -415,6 +416,7 @@ pub(crate) fn take_navigation_lookups() -> NavigationLookups {
 struct ProviderRequestSignals<'a> {
     client_ip: Option<IpAddr>,
     user_agent: Option<&'a str>,
+    cookie_header: String,
 }
 
 impl<'a> ProviderRequestSignals<'a> {
@@ -428,6 +430,13 @@ impl<'a> ProviderRequestSignals<'a> {
                 .headers()
                 .get(header::USER_AGENT)
                 .and_then(|value| value.to_str().ok()),
+            cookie_header: req
+                .headers()
+                .get_all(header::COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect::<Vec<_>>()
+                .join("; "),
         }
     }
 }
@@ -458,6 +467,7 @@ fn prepare_after_response_lookups(
         ec_id,
         client_ip: signals.client_ip,
         user_agent: signals.user_agent.map(str::to_owned),
+        cookie_header: signals.cookie_header,
     })
 }
 
@@ -518,6 +528,7 @@ async fn dispatch_identity_lookups(
                     user_agent: signals.user_agent,
                 },
                 publisher_domain: &state.settings.publisher.domain,
+                cookies: RequestCookies::new(&signals.cookie_header),
                 rate_limiter: &limiter,
                 now: UnixSeconds::new(now),
             },
@@ -1656,7 +1667,7 @@ mod tests {
     use trusted_server_core::ec::provider::{
         ClientSignals, EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
         ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry, ProviderRequest,
-        ProviderResponse, ProviderUid, SourceCapability, SourceInput,
+        ProviderResponse, ProviderUid, RequestCookies, SourceCapability, SourceInput,
     };
     use trusted_server_core::ec::rate_limiter::RateLimiter;
     use trusted_server_core::ec::registry::PartnerRegistry;
@@ -3105,6 +3116,7 @@ mod tests {
                     user_agent: None,
                 },
                 publisher_domain: "test-publisher.com",
+                cookies: RequestCookies::default(),
                 rate_limiter: &AllowAll,
                 now: UnixSeconds::new(1_700_000_000),
             },
