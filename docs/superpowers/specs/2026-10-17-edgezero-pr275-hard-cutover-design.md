@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-17, rewritten 2026-11-05
 
-**Status:** Draft, in agent review
+**Status:** Draft. Five agent review rounds done; the last found nothing blocking. Awaiting maintainer answers to Q1 to Q6.
 
 **EdgeZero target:** `IABTechLab/edgezero` PR 275 (branch
 `docs/outbound-http-spec`). Development and review use head
@@ -420,8 +420,11 @@ cache make no HTTP calls.
   (`orchestrator.rs:258`).
 - `collect_dispatched_auction` replaces its `select_until` loop
   (`orchestrator.rs:2286-2289`) with `batch.next()` until the batch reports
-  `Finished`. Where today's code polls without waiting, it calls
-  `batch.check()` (`edgezero:crates/edgezero-core/src/outbound/batch.rs:430`).
+  `Finished`. Where today's code polls without waiting before the deadline, it
+  calls `batch.check()` (`edgezero:crates/edgezero-core/src/outbound/batch.rs:430`),
+  which reports only outcomes an earlier wait or read recorded. Collection
+  after the cutoff calls `batch.next()`, because `check` then returns `Pending`
+  until something polls.
 - A `Cutoff` termination leaves slots `Unresolved`. Those become provider
   timeouts in the auction result, as expiry does today since #1433.
 - The mediator goes out after the batch finishes, with `client.send(..)`,
@@ -470,8 +473,13 @@ cache make no HTTP calls.
 which includes building and signing its request (`orchestrator.rs:1839`). The
 telemetry `response_time_ms` field changes meaning that much.
 
-On Fastly, EdgeZero records arrivals only during EdgeZero operations: an
-outbound wait, a body read, or a `check`. The publisher path reads the origin
+On Fastly, EdgeZero records arrivals only during an outbound wait or a body
+read. `batch.check()` reports only outcomes that an earlier wait or read
+recorded. It never polls the SDK and never waits
+(`edgezero:crates/edgezero-adapter-fastly/src/outbound.rs:5456-5494`), and
+after the cutoff it returns `Pending` until something polls. Collection after
+the cutoff therefore calls `batch.next()`, which returns `Finished(Cutoff)`
+without a host wait. The publisher path reads the origin
 body through EdgeZero while it streams. A long CPU stretch with no EdgeZero
 call can push a bid's observation past the cutoff, and the ledger then drops it
 (`batch.rs:645-650`). Whether streaming body reads keep arrivals current is
@@ -713,7 +721,7 @@ inside a handler, which panics (2.8).
 traits (`crates/trusted-server-core/src/platform/http.rs:301`), because
 `RuntimeServices` holds both stores as `Arc<dyn ..>` (`platform/types.rs:162-164`).
 The traits have no default bodies (`platform/traits.rs:12-36`, `:42-93`), so all
-38 implementers change in step 8. That includes the test stores in
+37 implementers in `crates/` change in step 8, and so does the guide snippet. That includes the test stores in
 `config_payload.rs`, `request_signing/jwks.rs`, `secret_resolution.rs`, and
 `settings_data.rs`. The Fastly
 implementations hold the request's `HttpClient` and send
@@ -1197,24 +1205,36 @@ backend (`edgezero:crates/edgezero-adapter-fastly/src/outbound.rs:977-1023`).
 
 - The cut moves the cases to a new test module in the Fastly adapter binary.
   Each case builds `HttpClient::with_client(FastlyOutboundClient::new())` and
-  calls `start_batch_until` with `http://127.0.0.1:<port>` URIs.
+  calls `start_batch_until` with `http://127.0.0.1:<port>` URIs. The module path
+  must not start with `platform::deadline`, because the dependents inventory
+  searches that string. A module at the crate root, such as
+  `deadline_network`, gives the filter `deadline_network::tests::network_`.
 - The harness writes the port into an inline Viceroy config store named
   `deadline_fixture`, in place of the static backend, and the tests read it
-  with `fastly::ConfigStore::open`. Whether `viceroy run` loads
-  `local_server.config_stores` is unverified. The first run of the ported
-  harness shows it.
+  with `fastly::ConfigStore::open`. Viceroy 0.21.0's `run` and `serve` both
+  build their context through `create_execution_context`, which installs the
+  config's dictionaries, and `config_stores` is a serde alias for
+  `dictionaries` (Viceroy `cli/src/execute_ctx.rs:96-113`, `src/config.rs:270`).
+  The current harness already relies on the same path for
+  `local_server.backends`.
 - Three cases keep their outcomes: stalled headers and a trickling body end at
   the cutoff, and a HEAD skips its declared length.
 - The fast-sibling case drops its missing-cache-bypass slot, because H accepts
   any cache policy in a batch (`outbound.rs:1082-1091`).
-- The expired-snapshot case changes. A reply that lands during
-  `std::thread::sleep` is stamped at the next poll, after the cutoff, and H
-  drops it (`outbound.rs:921-926`,
+- The expired-snapshot case changes. After the sleep it calls `batch.next()`.
+  That call expires both slots at the cutoff and returns `Finished(Cutoff)`
+  without a host wait, so H drops the fast reply that landed during the sleep
+  (`outbound.rs:921-926`,
   `edgezero:crates/edgezero-core/src/outbound/batch.rs:645-650`). The case
-  asserts that drop. A new case asserts that a reply observed during an
-  EdgeZero wait before the cutoff is kept. Whether an EdgeZero wait drives the
-  batch inside a `viceroy run` test binary is unverified, and that case shows
-  it.
+  asserts that drop. A `batch.check()` at the same point returns `Pending`,
+  because a check never polls the SDK. A new case asserts that a reply observed
+  during an EdgeZero wait before the cutoff is kept.
+- An EdgeZero wait drives a batch with no request lifecycle. With no canonical
+  owner, the batch gets a caller-owned scope
+  (`edgezero:crates/edgezero-core/src/outbound/scope.rs:314-338`), and
+  `batch.next()` reaches `fastly_async_io::select` through the native runtime
+  (`edgezero:crates/edgezero-adapter-fastly/src/outbound/progress.rs:315-383`).
+  Every ported case depends on that path.
 - The harness filter changes to the new module path, and the count assertion
   matches the number of ported cases. Gate 14's text stays, because it names
   only the harness path.
@@ -1256,7 +1276,7 @@ text or URLs (EZ-16).
   `async-trait` to that manifest at the workspace requirement, read the way it
   reads `error-stack` (`:50-59`), and `trusted_server_core::platform`
   re-exports `HttpClient` and `MonotonicClock`, as it re-exports the KV types
-  (`platform/mod.rs:55`). The snippet's `runtime_services` takes the client and
+  (`platform/mod.rs:54`). The snippet's `runtime_services` takes the client and
   clock as arguments, as adapters pass `ctx.http_client()` and
   `ctx.monotonic_clock()`.
 - `crates/trusted-server-core/src/auction/README.md` and `scripts/README.md`,
@@ -1333,8 +1353,9 @@ Outbound:
 20. Bidder requests leave together after all are built, not one at a time.
 21. Telemetry goes out after delivery. Pull sync and telemetry run only after a
     committed application body.
-22. A bid that completes while no EdgeZero operation runs, and is first polled
-    after the cutoff, is dropped. Today a snapshot after the deadline keeps it
+22. A bid that completes while no outbound wait or body read runs, and is first
+    observed after the cutoff, is dropped. A `batch.check()` does not observe
+    it. Today a snapshot after the deadline keeps it
     (#1433).
 23. Pull sync has a 15 s cutoff per group.
 24. Origin readthrough is unavailable (D9).
@@ -1610,7 +1631,8 @@ step 9 it prints only `docs/guide/architecture.md`,
 `crates/trusted-server-core/src/auction/README.md`, which step 11 rewrites.
 After step 11 it prints nothing. Historical plan and archive documents are
 excluded, because they stay as written records. The pattern avoids `\b`,
-which POSIX extended regular expressions do not define and macOS Git ignores.
+which POSIX extended regular expressions do not define. On macOS Git it matches
+nothing.
 
 ```sh
 git grep -lE 'PlatformHttpClient|PlatformHttpRequest|PlatformResponse([^A-Za-z0-9_]|$)|PlatformPendingRequest|PlatformPendingResponse|PlatformSelectResult|PlatformBackend|BackendNamingPolicy|PlatformCacheIntent|PlatformImageOptimizer|StubHttpClient|NoopHttpClient|StubBackend|NoopBackend|UnavailableHttpClient|canonicalize_transport_timeout_ms|supports_concurrent_fanout|supports_streaming_responses|supports_pending_streaming_responses|proxy_with_redirects|ProxyRedirectPolicy|startup_error_router|validate_for_target|AuctionTargetId|platform::deadline|build_services_with_.*http_client|collect_body_bounded|request_body_bytes|send_edgezero_response|stream_asset_body|into_core_request|EdgeZeroAxumService|predict_name' \
@@ -2030,3 +2052,14 @@ old layer. That transient dual path exists only inside the pull request.
   implementers, the guide snippet's test manifest and re-exports, every
   `RuntimeServices::builder()` call setting the new fields in step 3, the Spin
   GET reason in step 2, and a test for the moved Fastly backend bound.
+- **Round 5 (Claude Code, Opus, one fresh session: round-4 fixes, both
+  inventory commands, and cross-section consistency).** No blocking findings.
+  The config-store route to the origin port works, because Viceroy 0.21.0
+  loads `local_server.config_stores` under `viceroy run`, and an EdgeZero wait
+  drives a batch with no request lifecycle. Both "unverified" sentences now
+  carry that evidence. Two should-fix items adopted. `batch.check()` never
+  polls the SDK on Fastly, so 2.4, Fastly differences item 22, and the
+  expired-snapshot harness case now use `batch.next()` after the cutoff. The
+  new deadline test module must not sit under `platform::deadline`, which the
+  inventory searches. Nits adopted: 37 store implementers in `crates/` plus the
+  guide snippet, and a citation fix.
