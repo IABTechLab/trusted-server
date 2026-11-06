@@ -284,10 +284,12 @@ pull_sync_concurrency = 3
 # Prebid SharedID (kind "sharedid"): no lookup and no endpoint. Reads the
 # publisher common ID from Prebid's first-party `_sharedid` cookie, falling
 # back to the legacy `_pubcid`, as a device-based (atype 1) ID. The
-# `_pubcid_optout` cookie suppresses it. Takes exactly one source. When no
-# cookie holds an ID and none is stored, Trusted Server generates a random
-# UUID and stores it in the row only (no cookie is set); a later Prebid cookie
-# replaces it. SharedID is the publisher's own ID, so it has no TCF vendor.
+# `_pubcid_optout` cookie suppresses it. Takes exactly one source. With
+# generate = true, when no cookie holds an ID and none is stored, Trusted Server
+# generates a random UUID and stores it in the row only (no cookie is set); a
+# later Prebid cookie replaces it. Leave it off unless Prebid keeps its opt-out
+# in the `_pubcid_optout` cookie: a localStorage opt-out is invisible to the
+# server. SharedID is the publisher's own ID, so it has no TCF vendor.
 # [[ec.identity_providers]]
 # id = "sharedid"
 # kind = "sharedid"
@@ -295,6 +297,7 @@ pull_sync_concurrency = 3
 # sources = ["sharedid.example.com"]
 # [ec.identity_providers.settings]
 # cookie_names = ["_sharedid", "_pubcid"]
+# generate = false
 #
 # Criteo (kind "criteo"): no lookup and no endpoint. Reads Criteo's bid ID
 # from the first-party `cto_bidid` cookie Prebid's Criteo module keeps and
