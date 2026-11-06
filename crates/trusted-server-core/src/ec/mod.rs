@@ -196,8 +196,8 @@ struct RequestEc {
     cookie_ec: Option<String>,
     /// Whether the retired pull-sync completeness marker is present.
     pull_marker_present: bool,
-    /// Whether the mirror cookie is present.
-    mirror_cookie_present: bool,
+    /// The mirror cookie's value, when present.
+    mirror_cookie: Option<String>,
     /// The parsed cookie jar (retained for consent pipeline input).
     jar: Option<CookieJar>,
 }
@@ -217,14 +217,15 @@ fn parse_ec_from_request(req: &Request<EdgeBody>) -> Result<RequestEc, Report<Tr
     let pull_marker_present = jar
         .as_ref()
         .is_some_and(|j| j.get(COOKIE_TS_EC_PULL_COMPLETE).is_some());
-    let mirror_cookie_present = jar
+    let mirror_cookie = jar
         .as_ref()
-        .is_some_and(|j| j.get(COOKIE_TS_EIDS_MIRROR).is_some());
+        .and_then(|j| j.get(COOKIE_TS_EIDS_MIRROR))
+        .map(|cookie| cookie.value().to_owned());
 
     Ok(RequestEc {
         cookie_ec,
         pull_marker_present,
-        mirror_cookie_present,
+        mirror_cookie,
         jar,
     })
 }
@@ -318,8 +319,8 @@ pub struct EcContext {
     client_eids: Option<Vec<Eid>>,
     /// Whether the request carried the retired pull-sync marker cookie.
     pull_marker_present: bool,
-    /// Whether the request carried the mirror cookie.
-    mirror_cookie_present: bool,
+    /// The mirror cookie's value, when the request carried it.
+    mirror_cookie: Option<String>,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
     /// Navigation permit issued by the router for page-load navigations.
@@ -412,7 +413,7 @@ impl EcContext {
             recovery_eligible: false,
             client_eids: None,
             pull_marker_present: parsed.pull_marker_present,
-            mirror_cookie_present: parsed.mirror_cookie_present,
+            mirror_cookie: parsed.mirror_cookie,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
@@ -611,13 +612,19 @@ impl EcContext {
     /// Whether the request carried the mirror cookie.
     #[must_use]
     pub(crate) fn mirror_cookie_present(&self) -> bool {
-        self.mirror_cookie_present
+        self.mirror_cookie.is_some()
     }
 
-    /// Marks the mirror cookie as present, for tests.
+    /// The mirror cookie's value, when the request carried it.
+    #[must_use]
+    pub(crate) fn mirror_cookie(&self) -> Option<&str> {
+        self.mirror_cookie.as_deref()
+    }
+
+    /// Sets the mirror cookie the request carried, for tests.
     #[cfg(test)]
-    pub(crate) fn set_mirror_cookie_present_for_test(&mut self, present: bool) {
-        self.mirror_cookie_present = present;
+    pub(crate) fn set_mirror_cookie_for_test(&mut self, value: Option<&str>) {
+        self.mirror_cookie = value.map(str::to_owned);
     }
 
     /// Marks the retired pull-sync marker cookie as present, for tests.
@@ -730,7 +737,7 @@ impl EcContext {
             recovery_eligible: false,
             client_eids: None,
             pull_marker_present: false,
-            mirror_cookie_present: false,
+            mirror_cookie: None,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
@@ -760,7 +767,7 @@ impl EcContext {
             recovery_eligible: false,
             client_eids: None,
             pull_marker_present: false,
-            mirror_cookie_present: false,
+            mirror_cookie: None,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
@@ -793,7 +800,7 @@ impl EcContext {
             recovery_eligible: false,
             client_eids: None,
             pull_marker_present: false,
-            mirror_cookie_present: false,
+            mirror_cookie: None,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),

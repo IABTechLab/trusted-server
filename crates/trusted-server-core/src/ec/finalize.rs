@@ -81,9 +81,12 @@ pub fn ec_finalize_response(
 /// write landed. Without EC and EID consent it is expired on any response
 /// whose request carried it.
 ///
-/// The cookie is only expired when the request carried it, so responses to
-/// browsers without a mirror stay free of `Set-Cookie`. When the row could
-/// not be read authoritatively (KV failure), the mirror is left untouched.
+/// The cookie is only expired when the request carried it, and only set when
+/// its value differs from the one the request carried, so responses that
+/// leave the mirror as it was stay free of `Set-Cookie` and keep their
+/// cacheability. An unchanged mirror is therefore not re-extended; once it
+/// lapses, the next navigation sets it again. When the row could not be read
+/// authoritatively (KV failure), the mirror is left untouched.
 fn apply_mirror(
     ec_context: &EcContext,
     registry: &PartnerRegistry,
@@ -107,6 +110,7 @@ fn apply_mirror(
         return;
     };
     match decision {
+        MirrorCookie::Set(value) if ec_context.mirror_cookie() == Some(value.as_str()) => {}
         MirrorCookie::Set(value) => append_cookie(
             response,
             &format!(
@@ -2122,7 +2126,7 @@ mod tests {
 
     fn run_mirror_navigation(
         lookups: LookupResults,
-        mirror_present: bool,
+        mirror: Option<&str>,
         kv_read_failed: bool,
     ) -> Response<EdgeBody> {
         let settings = create_test_settings();
@@ -2145,7 +2149,7 @@ mod tests {
             graph.load_snapshot(&ec_id)
         };
         let mut ec_context = returning_user_context(&ec_id, snapshot, true);
-        ec_context.set_mirror_cookie_present_for_test(mirror_present);
+        ec_context.set_mirror_cookie_for_test(mirror);
         ec_context.set_lookup_results(lookups);
         let mut registry = PartnerRegistry::from_config(&[make_partner("ids.example.com")])
             .expect("should build registry");
@@ -2166,7 +2170,7 @@ mod tests {
 
     #[test]
     fn navigation_sets_mirror_from_committed_row() {
-        let response = run_mirror_navigation(provider_found("ids.example.com"), false, false);
+        let response = run_mirror_navigation(provider_found("ids.example.com"), None, false);
 
         let cookies = mirror_cookies(&response);
         assert_eq!(cookies.len(), 1, "should set one mirror cookie");
@@ -2181,8 +2185,36 @@ mod tests {
     }
 
     #[test]
+    fn navigation_with_an_unchanged_mirror_emits_no_cookie() {
+        // Arrange
+        let first = run_mirror_navigation(provider_found("ids.example.com"), None, false);
+        let set = mirror_cookies(&first);
+        let value = set[0]
+            .strip_prefix("__Host-ts-eids-mirror=")
+            .and_then(|rest| rest.split(';').next())
+            .expect("should set a mirror value");
+
+        // Act
+        let unchanged =
+            run_mirror_navigation(provider_found("ids.example.com"), Some(value), false);
+        let changed =
+            run_mirror_navigation(provider_found("ids.example.com"), Some("stale"), false);
+
+        // Assert
+        assert!(
+            mirror_cookies(&unchanged).is_empty(),
+            "should not re-set a mirror whose value is unchanged"
+        );
+        assert_eq!(
+            mirror_cookies(&changed).len(),
+            1,
+            "should set the mirror when its value changed"
+        );
+    }
+
+    #[test]
     fn navigation_without_provider_uids_expires_mirror() {
-        let response = run_mirror_navigation(LookupResults::default(), true, false);
+        let response = run_mirror_navigation(LookupResults::default(), Some("stale"), false);
 
         let cookies = mirror_cookies(&response);
         assert_eq!(cookies.len(), 1, "should emit one mirror cookie");
@@ -2194,7 +2226,7 @@ mod tests {
 
     #[test]
     fn navigation_without_mirror_cookie_emits_no_expiry() {
-        let response = run_mirror_navigation(LookupResults::default(), false, false);
+        let response = run_mirror_navigation(LookupResults::default(), None, false);
 
         assert!(
             mirror_cookies(&response).is_empty(),
@@ -2204,7 +2236,8 @@ mod tests {
 
     #[test]
     fn kv_read_failure_leaves_mirror_untouched() {
-        let response = run_mirror_navigation(provider_found("ids.example.com"), true, true);
+        let response =
+            run_mirror_navigation(provider_found("ids.example.com"), Some("stale"), true);
 
         assert!(
             mirror_cookies(&response).is_empty(),
@@ -2250,7 +2283,7 @@ mod tests {
             ..Default::default()
         };
         let mut ec_context = make_context_with_consent(None, None, false, false, consent);
-        ec_context.set_mirror_cookie_present_for_test(true);
+        ec_context.set_mirror_cookie_for_test(Some("stale"));
         let mut response = empty_response();
 
         ec_finalize_response(
