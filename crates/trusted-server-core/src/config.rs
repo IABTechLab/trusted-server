@@ -14,7 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use validator::{Validate, ValidationError, ValidationErrors};
 
 use crate::ec::provider::validate_enabled_configs;
-use crate::ec::registry::PartnerRegistry;
+use crate::ec::registry::{PULL_SYNC_KIND, PartnerRegistry};
 use crate::error::TrustedServerError;
 use crate::integrations::{
     adserver_mock::AdServerMockConfig,
@@ -352,6 +352,20 @@ fn validate_identity_providers(ec: &Ec) -> Result<(), Report<TrustedServerError>
     if ec.identity_providers.is_empty() {
         return Ok(());
     }
+    // Pull-sync providers come only from partner config, which carries the
+    // pull token and rate limit; configuring the kind directly bypasses both.
+    if let Some(config) = ec
+        .identity_providers
+        .iter()
+        .find(|config| config.kind() == PULL_SYNC_KIND)
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "ec.identity_providers: provider `{}` uses kind `{PULL_SYNC_KIND}`; configure pull sync on its [[ec.partners]] entry instead",
+                config.id
+            ),
+        }));
+    }
     let partners = PartnerRegistry::from_ec(ec)?;
     validate_enabled_configs(&ec.identity_providers, &partners).map_err(|report| {
         let detail = report
@@ -363,7 +377,24 @@ fn validate_identity_providers(ec: &Ec) -> Result<(), Report<TrustedServerError>
         report.change_context(TrustedServerError::Configuration {
             message: format!("ec.identity_providers: {detail}"),
         })
-    })
+    })?;
+    // Pull-sync partners run as providers too; a source claimed by both would
+    // fail the coordinator build on every request.
+    for config in ec.identity_providers.iter().filter(|config| config.enabled) {
+        if let Some(source) = config.sources.iter().find(|source| {
+            partners
+                .find_by_source_domain(source)
+                .is_some_and(|partner| partner.pull_sync_enabled && partner.pull_sync_url.is_some())
+        }) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "ec.identity_providers: source `{source}` of provider `{}` is also claimed by a pull-sync partner",
+                    config.id
+                ),
+            }));
+        }
+    }
+    Ok(())
 }
 
 fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
@@ -1396,6 +1427,45 @@ gam_network_id = "99999"
         assert!(
             err.to_string().contains("allowed_domains"),
             "should explain the allowlist rule: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_source_claimed_by_provider_and_pull_sync() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({}));
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "ids",
+                "source_domain": "ids.example.com",
+                "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"],
+                "ts_pull_token": "example-pull-token-32-bytes-minimum",
+            }))
+            .expect("should build partner"),
+        ];
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject a source claimed twice");
+
+        assert!(
+            err.to_string().contains("pull-sync partner"),
+            "should explain the double claim: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_a_directly_configured_pull_sync_provider() {
+        let settings = settings_with_identity_provider(serde_json::json!({
+            "kind": PULL_SYNC_KIND,
+        }));
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject the pull-sync kind in identity providers");
+
+        assert!(
+            err.to_string().contains("[[ec.partners]]"),
+            "should point to partner config: {err:?}"
         );
     }
 

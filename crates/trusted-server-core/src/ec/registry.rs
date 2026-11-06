@@ -14,6 +14,9 @@ use crate::settings::{Ec, EcPartner};
 
 use super::partner::{hash_api_key, normalize_partner_source_domain};
 
+/// Provider kind under which pull-sync partners run as identity providers.
+pub const PULL_SYNC_KIND: &str = "pull-sync";
+
 /// Minimum length for inbound partner Bearer API tokens.
 pub const MIN_API_TOKEN_LENGTH: usize = 32;
 
@@ -48,8 +51,13 @@ pub struct PartnerConfig {
     /// Outbound bearer token for pull sync requests.
     pub ts_pull_token: Option<Redacted<String>>,
     /// Whether an enabled identity provider claims this source. Browser
-    /// ingest skips it and batch sync rejects it.
+    /// ingest skips it.
     pub provider_owned: bool,
+    /// Whether batch sync rejects this source's mappings: an enabled
+    /// configured provider owns it. A source owned only by its partner's pull
+    /// sync keeps accepting batch mappings, as it did before pull sync became
+    /// a provider.
+    pub batch_sync_rejected: bool,
 }
 
 /// In-memory partner registry with O(1) lookups by source domain and API key hash.
@@ -61,6 +69,8 @@ pub struct PartnerConfig {
 pub struct PartnerRegistry {
     by_source_domain: HashMap<String, PartnerConfig>,
     by_api_key_hash: HashMap<String, String>,
+    /// Normalized source domains in `[[ec.partners]]` order.
+    order: Vec<String>,
 }
 
 impl PartnerRegistry {
@@ -146,6 +156,7 @@ impl PartnerRegistry {
     pub fn from_config(partners: &[EcPartner]) -> Result<Self, Report<TrustedServerError>> {
         let mut by_source_domain = HashMap::with_capacity(partners.len());
         let mut by_api_key_hash = HashMap::with_capacity(partners.len());
+        let mut order = Vec::with_capacity(partners.len());
 
         for partner in partners {
             let normalized_source = normalize_partner_source_domain(&partner.source_domain)
@@ -199,12 +210,14 @@ impl PartnerRegistry {
             if let Some(api_key_hash) = api_key_hash {
                 by_api_key_hash.insert(api_key_hash, normalized_source.clone());
             }
+            order.push(normalized_source.clone());
             by_source_domain.insert(normalized_source, config);
         }
 
         Ok(Self {
             by_source_domain,
             by_api_key_hash,
+            order,
         })
     }
 
@@ -223,7 +236,8 @@ impl PartnerRegistry {
     }
 
     /// Builds the registry from `[ec]` settings and marks every source claimed
-    /// by an enabled identity provider whose kind is registered as
+    /// by an enabled identity provider whose kind is registered, and every
+    /// pull-sync partner when the `pull-sync` kind is registered, as
     /// provider-owned.
     ///
     /// An enabled provider with an unregistered kind never runs, so its
@@ -248,7 +262,16 @@ impl PartnerRegistry {
             }
             for source in &provider.sources {
                 registry.mark_provider_owned(source);
+                registry.reject_batch_sync(source);
             }
+        }
+        let pull_sync_registered = is_registered_kind(PULL_SYNC_KIND);
+        for partner in ec
+            .partners
+            .iter()
+            .filter(|partner| pull_sync_registered && runs_pull_sync(partner))
+        {
+            registry.mark_provider_owned(&partner.source_domain);
         }
         Ok(registry)
     }
@@ -259,6 +282,7 @@ impl PartnerRegistry {
         Self {
             by_source_domain: HashMap::new(),
             by_api_key_hash: HashMap::new(),
+            order: Vec::new(),
         }
     }
 
@@ -305,17 +329,44 @@ impl PartnerRegistry {
             .is_some_and(|partner| partner.provider_owned)
     }
 
-    /// Returns all partners with `pull_sync_enabled = true` whose source no
-    /// identity provider owns.
-    ///
-    /// A provider writes full-fidelity records for the sources it owns, so a
-    /// pull-sync write there would overwrite them with a single UID.
+    /// Marks `source` as owned by an enabled configured provider, so batch
+    /// sync rejects its mappings. Returns whether `source` is registered.
+    pub fn reject_batch_sync(&mut self, source: &str) -> bool {
+        let Ok(normalized) = normalize_partner_source_domain(source) else {
+            return false;
+        };
+        match self.by_source_domain.get_mut(&normalized) {
+            Some(partner) => {
+                partner.batch_sync_rejected = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether batch sync rejects mappings for `source` (spec §8.5): an
+    /// enabled configured provider owns it. Pull-sync ownership alone does
+    /// not reject batch mappings.
+    #[must_use]
+    pub fn rejects_batch_sync(&self, source: &str) -> bool {
+        self.find_by_source_domain(source)
+            .is_some_and(|partner| partner.batch_sync_rejected)
+    }
+
+    /// Returns all partners with `pull_sync_enabled = true`.
     #[must_use]
     pub fn pull_enabled_partners(&self) -> Vec<&PartnerConfig> {
         self.by_source_domain
             .values()
-            .filter(|p| p.pull_sync_enabled && !p.provider_owned)
+            .filter(|p| p.pull_sync_enabled)
             .collect()
+    }
+
+    /// Partners in `[[ec.partners]]` order.
+    pub fn in_config_order(&self) -> impl Iterator<Item = &PartnerConfig> {
+        self.order
+            .iter()
+            .filter_map(|source| self.by_source_domain.get(source))
     }
 
     /// Returns an iterator over all configured partners.
@@ -337,6 +388,12 @@ impl PartnerRegistry {
     pub fn is_empty(&self) -> bool {
         self.by_source_domain.is_empty()
     }
+}
+
+/// Whether the partner runs pull sync as a provider, making its source
+/// provider-owned.
+fn runs_pull_sync(partner: &EcPartner) -> bool {
+    partner.pull_sync_enabled && partner.pull_sync_url.is_some()
 }
 
 fn validate_api_token(
@@ -381,6 +438,7 @@ fn build_partner_config(
         pull_sync_rate_limit: partner.pull_sync_rate_limit,
         ts_pull_token: partner.ts_pull_token.clone(),
         provider_owned: false,
+        batch_sync_rejected: false,
     }
 }
 
@@ -514,9 +572,15 @@ mod tests {
     #[test]
     fn from_ec_marks_enabled_provider_sources_only() {
         let mut ec = crate::test_support::tests::create_test_settings().ec;
+        let mut pull = make_partner("pull.example.com", &valid_api_token("pull-partner"));
+        pull.pull_sync_enabled = true;
+        pull.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
+        pull.pull_sync_allowed_domains = vec!["sync.example.com".to_owned()];
+        pull.ts_pull_token = Some(Redacted::new("example-pull-token".to_owned()));
         ec.partners = vec![
             make_partner("ids.example.com", &valid_api_token("ids-partner")),
             make_partner("other.example.com", &valid_api_token("other-partner")),
+            pull,
         ];
         ec.identity_providers = vec![
             toml::from_str(
@@ -529,8 +593,9 @@ mod tests {
             .expect("should parse disabled provider"),
         ];
 
-        let registry = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
-            .expect("should build registry");
+        let registry =
+            PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k" || kind == PULL_SYNC_KIND)
+                .expect("should build registry");
 
         assert!(
             registry.is_provider_owned("ids.example.com"),
@@ -539,6 +604,18 @@ mod tests {
         assert!(
             !registry.is_provider_owned("other.example.com"),
             "should not mark disabled provider source"
+        );
+        assert!(
+            registry.is_provider_owned("pull.example.com"),
+            "should mark pull-sync partner source"
+        );
+        assert!(
+            registry.rejects_batch_sync("ids.example.com"),
+            "should reject batch sync for a configured provider's source"
+        );
+        assert!(
+            !registry.rejects_batch_sync("pull.example.com"),
+            "should keep batch sync for a source owned only by pull sync"
         );
     }
 
@@ -567,6 +644,27 @@ mod tests {
         assert!(
             !plain.is_provider_owned("ids.example.com"),
             "should not claim sources without provider implementations"
+        );
+    }
+
+    #[test]
+    fn in_config_order_preserves_partner_order() {
+        let partners = vec![
+            make_partner("c.example.com", &valid_api_token("token-c")),
+            make_partner("a.example.com", &valid_api_token("token-a")),
+            make_partner("b.example.com", &valid_api_token("token-b")),
+        ];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+
+        let order: Vec<&str> = registry
+            .in_config_order()
+            .map(|partner| partner.source_domain.as_str())
+            .collect();
+
+        assert_eq!(
+            order,
+            ["c.example.com", "a.example.com", "b.example.com"],
+            "should keep config order"
         );
     }
 
@@ -702,25 +800,6 @@ mod tests {
         )];
         let result = PartnerRegistry::from_config(&partners);
         assert!(result.is_err(), "should reject invalid source domain");
-    }
-
-    #[test]
-    fn pull_enabled_partners_excludes_provider_owned_sources() {
-        let mut pull_partner = make_partner("pull.example.com", &valid_api_token("token-p"));
-        pull_partner.api_token = None;
-        pull_partner.pull_sync_enabled = true;
-        pull_partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
-        pull_partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];
-        pull_partner.ts_pull_token = Some(Redacted::new("outbound-token".to_owned()));
-        let mut registry =
-            PartnerRegistry::from_config(&[pull_partner]).expect("should build registry");
-
-        registry.mark_provider_owned("pull.example.com");
-
-        assert!(
-            registry.pull_enabled_partners().is_empty(),
-            "should not pull sources an identity provider owns"
-        );
     }
 
     #[test]

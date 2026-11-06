@@ -9,7 +9,7 @@ pub mod transport;
 mod validate;
 
 use std::collections::HashSet;
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ use crate::ec::provider::{
     validate_enabled_configs,
 };
 use crate::ec::rate_limiter::RateLimiter;
-use crate::ec::registry::PartnerRegistry;
+use crate::ec::registry::{PULL_SYNC_KIND, PartnerRegistry};
 use crate::ec::write_plan::{WritePlanInput, plan_write};
 use crate::settings::IdentityProviderConfig;
 
@@ -183,6 +183,9 @@ struct ProviderPolicy {
     allowed_domains: Box<[Box<str>]>,
     tcf_vendor_id: Option<NonZeroU16>,
     rate_limit_per_hour: Option<NonZeroU32>,
+    /// Whether this is a pull-sync partner, counted against
+    /// [`ProviderCoordinator::with_pull_sync_concurrency`].
+    pull_sync: bool,
 }
 
 /// The production coordinator, built per request from settings.
@@ -194,6 +197,8 @@ pub struct ProviderCoordinator<P = Box<dyn IdentityProvider>> {
     /// Partner config: `openrtb_atype` for validation.
     partners: Arc<PartnerRegistry>,
     budget: Duration,
+    /// Most pull-sync lookups dispatched per navigation; `None` is unlimited.
+    pull_sync_concurrency: Option<NonZeroUsize>,
 }
 
 impl<P: IdentityProvider> ProviderCoordinator<P> {
@@ -235,7 +240,33 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
             providers,
             partners,
             budget,
+            pull_sync_concurrency: None,
         })
+    }
+
+    /// The order providers are dispatched in: configured providers first,
+    /// then pull-sync partners rotated by the hour, so that under
+    /// `pull_sync_concurrency` every partner gets a turn, as pull sync did
+    /// before it became a provider.
+    fn dispatch_order(&self, now: UnixSeconds) -> Vec<usize> {
+        let (mut order, mut pull_sync): (Vec<usize>, Vec<usize>) =
+            (0..self.providers.len()).partition(|&index| !self.providers[index].policy.pull_sync);
+        if !pull_sync.is_empty() {
+            let hour = usize::try_from(now.get() / 3600).unwrap_or(0);
+            let offset = hour % pull_sync.len();
+            pull_sync.rotate_left(offset);
+        }
+        order.append(&mut pull_sync);
+        order
+    }
+
+    /// Caps the pull-sync lookups dispatched per navigation
+    /// (`ec.pull_sync_concurrency`). Due pull-sync partners past the cap are
+    /// skipped as rate limited and retried on a later navigation.
+    #[must_use]
+    pub fn with_pull_sync_concurrency(mut self, max: Option<NonZeroUsize>) -> Self {
+        self.pull_sync_concurrency = max;
+        self
     }
 
     fn register(
@@ -270,6 +301,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                     .collect(),
                 tcf_vendor_id: config.tcf_vendor_id,
                 rate_limit_per_hour,
+                pull_sync: config.kind() == PULL_SYNC_KIND,
             },
             provider,
         })
@@ -289,7 +321,8 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
     }
 
     /// Claimed sources lacking a live provider-written UID (a browser
-    /// fallback does not count), minus sources needing input V1
+    /// fallback does not count; for pull sync, any live UID counts), minus
+    /// sources needing input V1
     /// never has; the flag reports whether any source was removed for input.
     fn due_sources(
         registered: &Registered<P>,
@@ -300,16 +333,26 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         let mut input_blocked = false;
         let mut due = Vec::new();
         for source in &registered.policy.sources {
-            let record = entry
-                .and_then(|entry| entry.ids.get(source.as_str()))
-                .filter(|record| record.is_provider_written());
+            let record = entry.and_then(|entry| entry.ids.get(source.as_str()));
             // A UID whose provider asked for a refresh makes its source due;
             // the stored refresh state is the lookup's input.
-            if record.is_some_and(|record| record.refresh_due_for(&registered.id, now)) {
+            if record
+                .filter(|record| record.is_provider_written())
+                .is_some_and(|record| record.refresh_due_for(&registered.id, now))
+            {
                 due.push(source.clone());
                 continue;
             }
-            if record.is_some_and(|record| record.has_live_uid(now)) {
+            // A pull-sync source counts any live UID, owned or not, as held:
+            // like legacy pull sync, it pulls only for sources with no UID, so
+            // an ownerless browser, batch or legacy record does not trigger a
+            // lookup (and an EC ID send) on every navigation. Sources with no
+            // UID stay bounded by the partner's hourly pull rate limit.
+            let held = record.is_some_and(|record| {
+                (registered.policy.pull_sync || record.is_provider_written())
+                    && record.has_live_uid(now)
+            });
+            if held {
                 continue;
             }
             let needs_input = capabilities
@@ -327,7 +370,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
     }
 
     /// Whether the provider's hourly per-EC limit is reached. Limiter errors
-    /// fail open, matching pull sync.
+    /// fail closed, as pull sync always has: an unknown count skips the lookup.
     fn rate_limited(registered: &Registered<P>, lookup: &LookupContext<'_>) -> bool {
         let Some(limit) = registered.policy.rate_limit_per_hour else {
             return false;
@@ -338,10 +381,10 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
             Ok(exceeded) => exceeded,
             Err(report) => {
                 log::warn!(
-                    "Identity lookup: provider={} rate limiter failed, allowing lookup: {report:?}",
+                    "Identity lookup: provider={} rate limiter failed, skipping lookup: {report:?}",
                     registered.id
                 );
-                false
+                true
             }
         }
     }
@@ -481,23 +524,29 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         if self.providers.is_empty() {
             return pending;
         }
+        // A failed read cannot rule out a withdrawal tombstone, so no provider
+        // is contacted.
+        let snapshot_failed = matches!(lookup.snapshot, EcKvSnapshot::Failed { .. });
         let entry = lookup.snapshot.entry_for(lookup.ec_id);
-        // Missing EC or EID consent, a withdrawal tombstone, or an unreadable
-        // row (which may hide a tombstone) skips every provider: a lookup
-        // discloses the EC ID before finalize could decline it.
-        let readable = !matches!(lookup.snapshot, EcKvSnapshot::Failed { .. });
-        let consented = readable
-            && ec_consent_granted(lookup.consent)
+        // Missing EC or EID consent, or a withdrawal tombstone, skips every
+        // provider: a lookup discloses the EC ID before finalize could decline it.
+        let consented = ec_consent_granted(lookup.consent)
             && allows_eid_persistence(lookup.consent)
             && entry.is_none_or(|entry| entry.consent.ok);
         let deadline = Deadline::after(self.budget);
         pending.deadline = Some(deadline);
-        for (index, registered) in self.providers.iter().enumerate() {
+        let mut pull_sync_dispatched = 0_usize;
+        for index in self.dispatch_order(lookup.now) {
+            let registered = &self.providers[index];
             let provider = ProviderIndex::new(index);
             let skip = |reason| Tagged {
                 provider,
                 value: LookupStatus::Skipped(reason),
             };
+            if snapshot_failed {
+                pending.early.push(skip(SkipReason::SnapshotUnavailable));
+                continue;
+            }
             let vendor_denied = registered
                 .policy
                 .tcf_vendor_id
@@ -519,6 +568,14 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 } else {
                     SkipReason::NotDue
                 }));
+                continue;
+            }
+            if registered.policy.pull_sync
+                && self
+                    .pull_sync_concurrency
+                    .is_some_and(|max| pull_sync_dispatched >= max.get())
+            {
+                pending.early.push(skip(SkipReason::RateLimited));
                 continue;
             }
             let input = LookupInput {
@@ -568,6 +625,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             let context = request.context.take();
             match transport.start(request, deadline).await {
                 Ok(value) => {
+                    pull_sync_dispatched += usize::from(registered.policy.pull_sync);
                     pending.requests.push(Tagged { provider, value });
                     if let Some(value) = context {
                         pending.contexts.push(Tagged { provider, value });
@@ -1000,6 +1058,165 @@ mod tests {
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
     }
 
+    fn pull_sync_pair(max: Option<NonZeroUsize>) -> ProviderCoordinator<EchoProvider> {
+        let sources = ["a.example.com", "b.example.com"];
+        let partners: Vec<EcPartner> = sources
+            .iter()
+            .map(|source| {
+                serde_json::from_value(serde_json::json!({
+                    "name": source, "source_domain": source
+                }))
+                .expect("should build partner")
+            })
+            .collect();
+        let registered = sources
+            .iter()
+            .map(|source| {
+                let config: IdentityProviderConfig = toml::from_str(&format!(
+                    "id = \"pull-sync:{source}\"\nkind = \"{PULL_SYNC_KIND}\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"{source}\"]"
+                ))
+                .expect("should parse config");
+                let mut provider = echo_provider(SourceInput::Anonymous);
+                provider.0.sources = Box::new([SourceCapability {
+                    source: SourceDomain::try_from(*source).expect("should parse"),
+                    input: SourceInput::Anonymous,
+                }]);
+                RegisteredProvider::new(config, provider)
+            })
+            .collect();
+        ProviderCoordinator::new(
+            registered,
+            Arc::new(PartnerRegistry::from_config(&partners).expect("should build registry")),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator")
+        .with_pull_sync_concurrency(max)
+    }
+
+    #[test]
+    fn pull_sync_concurrency_caps_dispatched_lookups() {
+        let coordinator = pull_sync_pair(NonZeroUsize::new(1));
+        let transport = CannedTransport::new(not_found_reply);
+
+        let results = run(&coordinator, &transport, &missing(), &granting());
+
+        assert_eq!(transport.sent.borrow().len(), 1, "should send one lookup");
+        let statuses: Vec<LookupStatus> = results.iter().map(|lookup| lookup.status).collect();
+        assert_eq!(
+            statuses[1],
+            LookupStatus::Skipped(SkipReason::RateLimited),
+            "should skip the pull-sync lookup past the cap"
+        );
+    }
+
+    #[test]
+    fn pull_sync_rotates_the_partner_past_the_cap_by_the_hour() {
+        let coordinator = pull_sync_pair(NonZeroUsize::new(1));
+
+        let first_hour = coordinator.dispatch_order(UnixSeconds::new(0));
+        let next_hour = coordinator.dispatch_order(UnixSeconds::new(3600));
+
+        assert_ne!(
+            first_hour.first(),
+            next_hour.first(),
+            "should give the other partner the first slot the next hour"
+        );
+        let mut sorted = next_hour.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1], "should still dispatch every provider");
+    }
+
+    #[test]
+    fn pull_sync_holds_ownerless_uids_without_repulling() {
+        let coordinator = pull_sync_pair(None);
+        let transport = CannedTransport::new(not_found_reply);
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry
+            .ids
+            .insert("a.example.com".to_owned(), KvPartnerId::single("legacy"));
+        let snapshot = seeded_snapshot(&entry);
+
+        for _ in 0..2 {
+            run(&coordinator, &transport, &snapshot, &granting());
+        }
+
+        assert_eq!(
+            transport.sent.borrow().len(),
+            2,
+            "should look up only the empty source, once per navigation, after a no-match"
+        );
+        assert!(
+            transport
+                .sent
+                .borrow()
+                .iter()
+                .all(|url| url.ends_with("due=1")),
+            "should never include the ownerless source"
+        );
+    }
+
+    #[test]
+    fn pull_sync_drops_oversized_uid() {
+        let config: IdentityProviderConfig = toml::from_str(&format!(
+            "id = \"pull-sync:ids.example.com\"\nkind = \"{PULL_SYNC_KIND}\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]"
+        ))
+        .expect("should parse config");
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            config,
+            echo_provider(SourceInput::Anonymous),
+        ));
+        let transport = CannedTransport::new(|| {
+            Ok(TransportResponse {
+                status: http::StatusCode::OK,
+                headers: http::HeaderMap::new(),
+                body: bytes::Bytes::from("x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1)),
+            })
+        });
+
+        let results = run(&coordinator, &transport, &missing(), &granting());
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert_eq!(
+            lookup.status,
+            LookupStatus::NoMatch,
+            "should treat a pull with only an oversized UID as no match"
+        );
+        assert!(lookup.entries.is_empty(), "should store no oversized UID");
+    }
+
+    #[test]
+    fn pull_sync_concurrency_none_is_unlimited() {
+        let coordinator = pull_sync_pair(None);
+        let transport = CannedTransport::new(not_found_reply);
+
+        run(&coordinator, &transport, &missing(), &granting());
+
+        assert_eq!(transport.sent.borrow().len(), 2, "should send both lookups");
+    }
+
+    #[test]
+    fn failed_snapshot_skips_every_provider() {
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(
+            &coordinator,
+            &transport,
+            &EcKvSnapshot::Failed {
+                ec_id: EC_ID.to_owned(),
+            },
+            &granting(),
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::SnapshotUnavailable),
+            "should skip when the snapshot read failed"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
     #[test]
     fn tombstoned_row_skips_for_consent() {
         let coordinator = coordinator("");
@@ -1065,24 +1282,6 @@ mod tests {
                 "should send nothing for {label}"
             );
         }
-    }
-
-    #[test]
-    fn failed_snapshot_skips_every_provider() {
-        let coordinator = coordinator("");
-        let transport = CannedTransport::new(ok_reply);
-        let snapshot = EcKvSnapshot::Failed {
-            ec_id: EC_ID.to_owned(),
-        };
-
-        let results = run(&coordinator, &transport, &snapshot, &granting());
-
-        assert_eq!(
-            only_status(&results),
-            LookupStatus::Skipped(SkipReason::Consent),
-            "should skip when the row could not be read"
-        );
-        assert!(transport.sent.borrow().is_empty(), "should send nothing");
     }
 
     #[test]
@@ -1196,6 +1395,45 @@ mod tests {
             only_status(&results),
             LookupStatus::Skipped(SkipReason::RateLimited),
             "should skip a rate-limited provider"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    struct FailingLimiter;
+
+    impl RateLimiter for FailingLimiter {
+        fn exceeded(
+            &self,
+            _key: &str,
+            _hourly_limit: u32,
+        ) -> Result<bool, Report<TrustedServerError>> {
+            Err(Report::new(TrustedServerError::KvStore {
+                store_name: "example-counter".to_owned(),
+                message: "unavailable".to_owned(),
+            }))
+        }
+    }
+
+    #[test]
+    fn limiter_failure_skips_the_lookup() {
+        let coordinator = coordinator_with(
+            RegisteredProvider::new(provider_config(""), echo_provider(SourceInput::Anonymous))
+                .with_rate_limit(NonZeroU32::new(1).expect("should be non-zero")),
+        );
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run_with(
+            &coordinator,
+            &transport,
+            &missing(),
+            &granting(),
+            &FailingLimiter,
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::RateLimited),
+            "should skip when the limiter cannot count"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
     }

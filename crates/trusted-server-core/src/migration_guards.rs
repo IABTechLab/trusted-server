@@ -87,7 +87,6 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         ("ec/mod.rs", include_str!("ec/mod.rs")),
         ("ec/partner.rs", include_str!("ec/partner.rs")),
         ("ec/prebid_eids.rs", include_str!("ec/prebid_eids.rs")),
-        ("ec/pull_sync.rs", include_str!("ec/pull_sync.rs")),
         ("ec/rate_limiter.rs", include_str!("ec/rate_limiter.rs")),
         ("ec/registry.rs", include_str!("ec/registry.rs")),
         ("edge_cookie.rs", include_str!("edge_cookie.rs")),

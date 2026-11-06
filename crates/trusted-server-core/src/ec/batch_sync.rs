@@ -171,7 +171,7 @@ fn handle_batch_sync_with_writer(
     let (accepted, errors) = process_mappings_for_partner(
         writer,
         &partner.source_domain,
-        registry.is_provider_owned(&partner.source_domain),
+        registry.rejects_batch_sync(&partner.source_domain),
         &body.mappings,
     );
 
@@ -961,6 +961,75 @@ mod tests {
             writer.calls().len(),
             2,
             "should stop after the failing group"
+        );
+    }
+
+    #[test]
+    fn handle_batch_sync_accepts_mappings_for_a_pull_sync_owned_source() {
+        // Arrange: pull sync owns the source, but no configured provider does.
+        let mut registry = test_registry();
+        assert!(
+            registry.mark_provider_owned("ssp.example.com"),
+            "should mark the pull-sync source"
+        );
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        let body =
+            format!(r#"{{"mappings":[{{"ec_id":"{ec_id}","partner_uid":"one","timestamp":1}}]}}"#);
+
+        // Act
+        let response = handle_batch_sync_with_writer(
+            &writer,
+            &registry,
+            &limiter,
+            authorized_batch_request(&body),
+        )
+        .expect("should return success response");
+
+        // Assert
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should accept batch mappings for a pull-sync partner"
+        );
+        assert_eq!(
+            response_json(response)["accepted"],
+            1,
+            "should accept the mapping"
+        );
+    }
+
+    #[test]
+    fn handle_batch_sync_rejects_mappings_for_a_configured_provider_source() {
+        let mut registry = test_registry();
+        assert!(
+            registry.reject_batch_sync("ssp.example.com"),
+            "should mark the configured provider source"
+        );
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        let body =
+            format!(r#"{{"mappings":[{{"ec_id":"{ec_id}","partner_uid":"one","timestamp":1}}]}}"#);
+
+        let response = handle_batch_sync_with_writer(
+            &writer,
+            &registry,
+            &limiter,
+            authorized_batch_request(&body),
+        )
+        .expect("should return response");
+
+        let json = response_json(response);
+        assert_eq!(json["accepted"], 0, "should accept nothing");
+        assert_eq!(
+            json["errors"][0]["reason"], REASON_PROVIDER_OWNED,
+            "should report provider_owned"
         );
     }
 
