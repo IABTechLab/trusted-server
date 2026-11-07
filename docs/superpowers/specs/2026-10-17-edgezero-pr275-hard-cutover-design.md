@@ -1,9 +1,10 @@
 # EdgeZero PR 275 Hard Cutover
 
-**Date:** 2026-10-17, rewritten 2026-11-05, updated 2026-11-06
+**Date:** 2026-10-17, rewritten 2026-11-05, updated 2026-11-06 and 2026-11-07
 
 **Status:** Draft. Five agent review rounds, then a 2026-11-06 update against
-PR 275 head `9b31a697` and its review. Awaiting maintainer answers to Q1 to Q7.
+PR 275 head `9b31a697` and its review, and the 2026-11-07 fixes for GitHub
+review 5810751514. Awaiting maintainer answers to Q1 to Q7.
 
 **EdgeZero target:** `IABTechLab/edgezero` PR 275 (branch
 `docs/outbound-http-spec`). Development and review use head
@@ -109,8 +110,9 @@ until EdgeZero's follow-ups land.
   default (`crates/trusted-server-adapter-fastly/Cargo.toml:13-18`). EZ-2's
   reuse-mode parts are follow-ups.
 - Streaming publisher responses on Axum, Cloudflare, and Spin. They keep
-  collecting the response with `buffer_publisher_response_async`
-  (`crates/trusted-server-core/src/publisher.rs:1853`).
+  collecting every publisher response variant before egress, raw ones included,
+  with `buffer_publisher_response_async`
+  (`crates/trusted-server-core/src/publisher.rs:1853`) (2.5).
 - Declaring stores on Cloudflare and Spin. Their apps declare none today, and
   their config and KV fallbacks stay (section 7).
 - Toolchain changes. Rust 1.98.1, Viceroy 0.21.0, Fastly CLI 16.0.0, Node
@@ -134,7 +136,7 @@ until EdgeZero's follow-ups land.
 | D7  | Every request sets a constant 1 s connect timeout and a per-call `timeout` that never depends on a remaining budget. It is the site's configured timeout where the site map names one, 2 s for Tinybird, and otherwise 60 s streamed and 15 s buffered. Redirect chains get a 60 s deadline. The response write deadline is 60 s after egress starts.                                                                                                                                                        | Spec author, open as Q2                            |
 | D8  | Sites that relay bytes or run Trusted Server's own rewrite codec use `ResponseDecoding::Original`. Sites that parse a body Trusted Server does not decode itself use `Decode`.                                                                                                                                                                                                                                                                                                                               | Spec author                                        |
 | D9  | `ts config validate` and `push` reject `certificate_check = false` and `origin_readthrough_enabled = true`. At runtime both are ignored with a warning. Spin ignores `origin_host_header_override` with a warning, which deviates from the EZ-13 interim (Configuration explains why).                                                                                                                                                                                                                       | Spec author, from the interims, with one deviation |
-| D10 | Trusted Server never sends `Trailer`, and never sends `Content-Length` from operator config. Validate and push reject such operator entries. Runtime skips them with a warning.                                                                                                                                                                                                                                                                                                                              | Spec author                                        |
+| D10 | Trusted Server never sends `Trailer`, and never sends `Content-Length` or a hop-by-hop field from operator config. Validate and push reject such operator entries. Runtime skips them with a warning.                                                                                                                                                                                                                                                                                                        | Spec author                                        |
 | D11 | Fastly auction telemetry is queued during the request and sent after delivery inside the serving callback (EZ-15 interim).                                                                                                                                                                                                                                                                                                                                                                                   | Spec author, from the EZ-15 interim                |
 | D12 | Tests use a scripted `OutboundHttpClient` in Trusted Server test code until EZ-24 lands.                                                                                                                                                                                                                                                                                                                                                                                                                     | Spec author, from the EZ-24 interim                |
 | D13 | EZ-2 measurements baseline on the `main` commit the cut branch is based on at candidate freeze, instead of `a9037770a` plus #1123. EdgeZero acknowledges the change before its hosted phase.                                                                                                                                                                                                                                                                                                                 | Spec author                                        |
@@ -367,27 +369,27 @@ is not UTF-8 and would fail the whole call (`outbound.rs:1191-1211`).
 
 #### 2.3 Site map
 
-| Site                               | Trusted Server code                                                                                                                                                                                                                                                                 | Call on H                                    | Response                                                        | Timeout                                                                                                |
-| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| O1 Auction bidders                 | `GenericOpenRtbProvider::request_bids_routed` (`crates/trusted-server-core/src/auction/provider.rs:273-400`)                                                                                                                                                                        | One `start_batch_until` per auction (2.4)    | Buffered, 1 MiB (`provider.rs:30`), Decode                      | Configured provider timeout                                                                            |
-| O2 Auction mediator                | `AdServerMockProvider::request_bids` (`crates/trusted-server-core/src/integrations/adserver_mock.rs:435-523`)                                                                                                                                                                       | `send` after the batch (2.4)                 | Buffered 10 MiB, Decode                                         | Configured mediator timeout, plus the auction deadline                                                 |
-| O3 Auction entry points            | `/auction` `handle_auction` (`crates/trusted-server-core/src/auction/endpoints.rs:407`), page bids `handle_page_bids` (`crates/trusted-server-core/src/publisher.rs:7634`), and the publisher page path                                                                             | O1 and O2                                    | As O1 and O2                                                    | As O1 and O2                                                                                           |
-| O4 Publisher, overlapped           | `publisher.rs:5318-5352`, `:5676`                                                                                                                                                                                                                                                   | `begin` (2.5)                                | Streamed, Original                                              | 60 s                                                                                                   |
-| O5 Publisher, plain                | `publisher.rs:5683-5697`                                                                                                                                                                                                                                                            | `send` with `from_request` (2.5)             | Streamed, Original                                              | 60 s                                                                                                   |
-| O6 Redirecting proxies             | `proxy_request` (`crates/trusted-server-core/src/proxy.rs:795-843`) from the first-party proxy (`proxy.rs:1577-1610`), GTM (`integrations/google_tag_manager.rs:1081`), the Prebid bundle (`integrations/prebid.rs:1281-1288`), and testlight (`integrations/testlight.rs:199-216`) | `follow` (2.6), or `send` when not following | Buffered 10 MiB (testlight 2 MiB), Original                     | 15 s per hop, 60 s chain deadline                                                                      |
-| O7 GPT                             | `integrations/gpt.rs:282`                                                                                                                                                                                                                                                           | `send`                                       | Buffered 10 MiB, Original                                       | 15 s                                                                                                   |
-| O8 JS asset proxy                  | `integrations/js_asset_proxy.rs:509`                                                                                                                                                                                                                                                | `send`                                       | Streamed, Original                                              | 60 s                                                                                                   |
-| O9 Asset proxy                     | `handle_asset_proxy_request` (`proxy.rs:1096-1220`), S3 preflight (`proxy.rs:1025-1094`)                                                                                                                                                                                            | `send` (2.7)                                 | GET streamed, Original. Preflight HEAD buffered, Original       | 60 s GET, 15 s HEAD                                                                                    |
-| O10 Sourcepoint                    | `integrations/sourcepoint.rs:817-960`                                                                                                                                                                                                                                               | `send`                                       | Streamed, Original                                              | 60 s                                                                                                   |
-| O11 Lockr                          | SDK GET (`integrations/lockr.rs:108-170`), API proxy (`lockr.rs:179-260`)                                                                                                                                                                                                           | `send`                                       | SDK buffered 16 MiB, Decode. API buffered 10 MiB, Original      | 15 s                                                                                                   |
-| O12 Permutive                      | SDK GET (`integrations/permutive.rs:108-170`), proxy (`permutive.rs:183-260`)                                                                                                                                                                                                       | `send`                                       | As Lockr                                                        | 15 s                                                                                                   |
-| O13 DataDome                       | `tags.js` (`integrations/datadome.rs:633-700`), `js_api` (`datadome.rs:716-800`)                                                                                                                                                                                                    | `send`                                       | `tags.js` buffered 16 MiB, Decode. `js_api` 10 MiB, Original    | 15 s                                                                                                   |
-| O14 DataDome Protection            | `filter_protection_request_inner` (`integrations/datadome/protection.rs:78-135`)                                                                                                                                                                                                    | `send`                                       | Buffered 10 MiB, Decode                                         | `config.timeout_ms`                                                                                    |
-| O15 Didomi                         | `integrations/didomi.rs:407-510`                                                                                                                                                                                                                                                    | `send`                                       | Buffered 10 MiB, Original. Bypass or `PlatformDefault` as today | 15 s                                                                                                   |
-| O16 EC pull sync                   | `dispatch_pull_sync` (`crates/trusted-server-core/src/ec/pull_sync.rs:116-300`)                                                                                                                                                                                                     | `send_all_until` per group (2.8)             | Buffered 64 KiB (`pull_sync.rs:410`), Decode                    | 15 s                                                                                                   |
-| O17 Tinybird                       | `crates/trusted-server-adapter-fastly/src/tinybird.rs:133-182`                                                                                                                                                                                                                      | `send` after delivery (2.8)                  | Ignored                                                         | 2 s, today's timers (`tinybird.rs:19-20`)                                                              |
-| O18 Fastly management API          | `FastlyManagementApiClient::make_request` (`crates/trusted-server-adapter-fastly/src/management_api.rs:158-188`)                                                                                                                                                                    | `send` from the admin handler (2.9)          | Buffered 1 MiB, Decode                                          | 15 s                                                                                                   |
-| O19 EOF fixture, `test-utils` only | `crates/trusted-server-core/src/test_support/async_html_finalization.rs:126-181`                                                                                                                                                                                                    | `send` from the end-of-file finish hook      | Buffered 64 bytes, Decode, Bypass                               | `.timeout(transport_timeout_ms)`. On Fastly also `.deadline` at the remaining chain budget (see below) |
+| Site                               | Trusted Server code                                                                                                                                                                                                                                                                 | Call on H                                    | Response                                                                       | Timeout                                                                                                |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| O1 Auction bidders                 | `GenericOpenRtbProvider::request_bids_routed` (`crates/trusted-server-core/src/auction/provider.rs:273-400`)                                                                                                                                                                        | One `start_batch_until` per auction (2.4)    | Buffered, 1 MiB (`provider.rs:30`), Decode                                     | Configured provider timeout                                                                            |
+| O2 Auction mediator                | `AdServerMockProvider::request_bids` (`crates/trusted-server-core/src/integrations/adserver_mock.rs:435-523`)                                                                                                                                                                       | `send` after the batch (2.4)                 | Buffered 10 MiB, Decode                                                        | Configured mediator timeout, plus the auction deadline                                                 |
+| O3 Auction entry points            | `/auction` `handle_auction` (`crates/trusted-server-core/src/auction/endpoints.rs:407`), page bids `handle_page_bids` (`crates/trusted-server-core/src/publisher.rs:7634`), and the publisher page path                                                                             | O1 and O2                                    | As O1 and O2                                                                   | As O1 and O2                                                                                           |
+| O4 Publisher, overlapped           | `publisher.rs:5318-5352`, `:5676`                                                                                                                                                                                                                                                   | `begin` (2.5)                                | Streamed, Original                                                             | 60 s                                                                                                   |
+| O5 Publisher, plain                | `publisher.rs:5683-5697`                                                                                                                                                                                                                                                            | `send` with `from_request` (2.5)             | Streamed, Original                                                             | 60 s                                                                                                   |
+| O6 Redirecting proxies             | `proxy_request` (`crates/trusted-server-core/src/proxy.rs:795-843`) from the first-party proxy (`proxy.rs:1577-1610`), GTM (`integrations/google_tag_manager.rs:1081`), the Prebid bundle (`integrations/prebid.rs:1281-1288`), and testlight (`integrations/testlight.rs:199-216`) | `follow` (2.6), or `send` when not following | Buffered 10 MiB (testlight 2 MiB), Original                                    | 15 s per hop, 60 s chain deadline                                                                      |
+| O7 GPT                             | `integrations/gpt.rs:282`                                                                                                                                                                                                                                                           | `send`                                       | Buffered 10 MiB, Original                                                      | 15 s                                                                                                   |
+| O8 JS asset proxy                  | `integrations/js_asset_proxy.rs:509`                                                                                                                                                                                                                                                | `send`                                       | Streamed, Original                                                             | 60 s                                                                                                   |
+| O9 Asset proxy                     | `handle_asset_proxy_request` (`proxy.rs:1096-1220`), S3 preflight (`proxy.rs:1025-1094`)                                                                                                                                                                                            | `send` (2.7)                                 | Final GET streamed, Original. Final HEAD and preflight HEAD buffered, Original | 60 s GET, 15 s HEAD                                                                                    |
+| O10 Sourcepoint                    | `integrations/sourcepoint.rs:817-960`                                                                                                                                                                                                                                               | `send`                                       | Streamed, Original                                                             | 60 s                                                                                                   |
+| O11 Lockr                          | SDK GET (`integrations/lockr.rs:108-170`), API proxy (`lockr.rs:179-260`)                                                                                                                                                                                                           | `send`                                       | SDK buffered 16 MiB, Decode. API buffered 10 MiB, Original                     | 15 s                                                                                                   |
+| O12 Permutive                      | SDK GET (`integrations/permutive.rs:108-170`), proxy (`permutive.rs:183-260`)                                                                                                                                                                                                       | `send`                                       | As Lockr                                                                       | 15 s                                                                                                   |
+| O13 DataDome                       | `tags.js` (`integrations/datadome.rs:633-700`), `js_api` (`datadome.rs:716-800`)                                                                                                                                                                                                    | `send`                                       | `tags.js` buffered 16 MiB, Decode. `js_api` 10 MiB, Original                   | 15 s                                                                                                   |
+| O14 DataDome Protection            | `filter_protection_request_inner` (`integrations/datadome/protection.rs:78-135`)                                                                                                                                                                                                    | `send`                                       | Buffered 10 MiB, Decode                                                        | `config.timeout_ms`                                                                                    |
+| O15 Didomi                         | `integrations/didomi.rs:407-510`                                                                                                                                                                                                                                                    | `send`                                       | Buffered 10 MiB, Original. Bypass or `PlatformDefault` as today                | 15 s                                                                                                   |
+| O16 EC pull sync                   | `dispatch_pull_sync` (`crates/trusted-server-core/src/ec/pull_sync.rs:116-300`)                                                                                                                                                                                                     | `send_all_until` per group (2.8)             | Buffered 64 KiB (`pull_sync.rs:410`), Decode                                   | 15 s                                                                                                   |
+| O17 Tinybird                       | `crates/trusted-server-adapter-fastly/src/tinybird.rs:133-182`                                                                                                                                                                                                                      | `send` after delivery (2.8)                  | Ignored                                                                        | 2 s, today's timers (`tinybird.rs:19-20`)                                                              |
+| O18 Fastly management API          | `FastlyManagementApiClient::make_request` (`crates/trusted-server-adapter-fastly/src/management_api.rs:158-188`)                                                                                                                                                                    | `send` from the admin handler (2.9)          | Buffered 1 MiB, Decode                                                         | 15 s                                                                                                   |
+| O19 EOF fixture, `test-utils` only | `crates/trusted-server-core/src/test_support/async_html_finalization.rs:126-181`                                                                                                                                                                                                    | `send` from the end-of-file finish hook      | Buffered 64 bytes, Decode, Bypass                                              | `.timeout(transport_timeout_ms)`. On Fastly also `.deadline` at the remaining chain budget (see below) |
 
 GTM asks for `identity`, so `Original` and `Decode` behave the same for it
 when the origin honors that. The requirements doc lists it under decoding.
@@ -502,10 +504,15 @@ cache make no HTTP calls.
 - Batch slots must be buffered both ways (`outbound.rs:1924-1934`). Bidder
   requests are built fresh with buffered JSON bodies, so they qualify.
 
-`OutboundSlotResult::elapsed` runs from the batch's shared start
-(`outbound.rs:462-467`). Today each provider's time runs from its own launch,
-which includes building and signing its request (`orchestrator.rs:1839`). The
-telemetry `response_time_ms` field changes meaning that much.
+`OutboundSlotResult::elapsed` runs from the batch's shared start to the slot's
+recorded terminal observation, or its logical expiry for a classified timeout
+(`edgezero:crates/edgezero-core/src/outbound/batch.rs:653-674`). Today each
+provider's `response_time_ms` runs from its own launch, including request
+construction and signing (`orchestrator.rs:1839`), until publisher-side
+collection (`orchestrator.rs:2375`, `publisher.rs:4717-4723`). The new metric
+includes launch skew from the shared start but excludes the wait between a
+successful response's arrival and collection. Delaying collection after a
+timely response must not increase its reported slot elapsed time.
 
 On Fastly, EdgeZero records arrivals in any EdgeZero poll that services the
 provider. That covers outbound waits, body reads, EdgeZero's timers, and every
@@ -539,8 +546,20 @@ the scripted client (D12) or are deleted with their tests.
 
 The overlapped path runs today when
 `should_preload_ec && template_cache_key.is_none() && supports_concurrent_fanout && supports_pending_streaming_responses`
-(`publisher.rs:5318-5325`). The two capability terms are deleted, so the
-overlap runs on all four adapters.
+(`publisher.rs:5318-5325`). The two capability terms are deleted, and
+`should_preload_ec` stays. The overlap exists to hide the EC KV snapshot read
+behind the origin fetch, and `should_preload_ec` requires a KV graph
+(`publisher.rs:5298-5310`, `:3459-3466`). Axum, Cloudflare, and Spin pass no
+KV graph to `handle_publisher_request`
+(`crates/trusted-server-adapter-axum/src/app.rs:256-264`,
+`crates/trusted-server-adapter-cloudflare/src/app.rs:564-572`,
+`crates/trusted-server-adapter-spin/src/app.rs:846-854`), and the cut keeps
+their unavailable-KV fallbacks (section 7). So the overlap still runs only on
+Fastly navigation GETs that preload an EC snapshot. Everywhere else the plain
+path dispatches the auction first and then sends the origin request while the
+bids are in flight (`publisher.rs:5467-5470`, `:5673-5697`). EZ-6 describes
+the overlapped path the same way, so its Trusted Server check holds on both
+paths.
 
 The origin request:
 
@@ -573,25 +592,63 @@ batch must outlive the handler.
    in place of today's plain await (`publisher.rs:5467-5470`). The batch that
    `dispatch_planned_auction` starts captures the ambient scope at call time
    (`outbound.rs:739-741`), so the response body owns it.
-3. The adapter call site attaches the owner exactly once, after
+3. Both origin calls are also constructed inside `owner.run`:
+   `owner.run(async { client.send(origin).await })` on the plain path, and
+   `owner.run(async { client.begin(origin).await })` on the overlapped path. H
+   captures the ambient scope when `send` or `begin` is called, not when the
+   future is first polled (`outbound.rs:578-583`, `:700-705`), so
+   `owner.run(client.send(origin))` still captures the callback scope.
+   Outside the response-body scope, head finishing gives a streamed body its
+   own response-body owner (`edgezero:crates/edgezero-core/src/outbound/head.rs:296-302`,
+   `:384-400`). The raw `Buffered` and `PassThrough` conversions keep that body
+   (`publisher.rs:1868-1877`, `:2093-2095`, `:2546-2556`), so the attach below
+   would fail with "response body already owns an outbound scope". Inside the
+   scope, head finishing binds the body to the shared scope and adds no owner
+   (`head.rs:388-393`). Test 20 covers both calls and every raw variant.
+4. The adapter call site attaches the owner exactly once, after
    `publisher_response_into_streaming_response` (`publisher.rs:2500`, Fastly) or
    `buffer_publisher_response_async` (the other three) returns:
    `owner.attach(response)?` (`scope.rs:164`). Neither function attaches,
    because the Fastly function calls the buffering one itself on a
    template-cache miss (`publisher.rs:2530-2546`), and `attach` fails on a body
    that already has an owner (`scope.rs:164-175`).
-4. EdgeZero's egress releases the work when egress ends. Attaching to a
+5. EdgeZero's egress releases the work when egress ends. Attaching to a
    buffered body is harmless. A handler error drops `owner`, which cancels the
    batch. Code that rebuilds a response body after the attach converts with
    `into_stream()`, which carries the owner. It never splits with
    `into_parts()` and rebuilds with `from_stream`, because dropping the
    returned owner closes the batch.
 
+On Axum, Cloudflare, and Spin, `buffer_publisher_response_async` collects every
+variant before it returns, so nothing streams to egress there (Non-goals). H
+collects only `ResponseMode::Buffered` bodies (`head.rs:288-301`), and a
+streamed response has no byte cap by default (`outbound.rs:1514-1515`,
+`:1554-1556`). Without collection, the raw `Buffered` and `PassThrough`
+variants, which the function returns unchanged today (`publisher.rs:1868-1877`,
+`:2093-2095`), would stream, lose today's client caps, and fail during egress
+instead of before it.
+
+- The processed HTML output keeps its `publisher.max_buffered_body_bytes` cap
+  (`publisher.rs:1921`).
+- Raw bodies are collected with `Body::into_bytes_bounded(cap)`. `cap` is the
+  smaller of `publisher.max_buffered_body_bytes` and the adapter's current
+  client cap: 10 MiB on Cloudflare
+  (`crates/trusted-server-adapter-cloudflare/src/platform.rs:187`) and 8 MiB on
+  Spin (`crates/trusted-server-adapter-spin/src/platform.rs:33`). Axum's client
+  has no cap today (`crates/trusted-server-adapter-axum/src/platform.rs:364-366`),
+  so only the setting applies there. Each adapter passes its cap at the call
+  site, because the client modules that hold those constants are deleted.
+- Overflow and source errors map to `TrustedServerError::Proxy` (502) before
+  egress, as the client caps do today, not through the `PayloadTooLarge` rule
+  in 2.11.
+
+Test 21 covers this.
+
 The overlapped path (O4) adds the origin `begin`:
 
-1. `client.begin(origin).await?` (`outbound.rs:578`) before the auction is
-   dispatched. The request is on its way once this future resolves. A `begin`
-   future that is never awaited sends nothing.
+1. `owner.run(async { client.begin(origin).await }).await?` (`outbound.rs:578`)
+   before the auction is dispatched. The request is on its way once this future
+   resolves. A `begin` future that is never awaited sends nothing.
 2. Dispatch the auction under `owner.run`, as above.
 3. `pending.collect().await` returns the streamed origin response
    (`edgezero:crates/edgezero-core/src/outbound/progress.rs:106`). A collected
@@ -608,8 +665,9 @@ fetch starts milliseconds after the request arrives, so only pathological
 requests reach that.
 
 The plain path (O5) also covers POST, PUT, PATCH, DELETE, and OPTIONS. It calls
-`client.send(..)` with the same request and options, and hands the inbound body
-stream upward with `.max_request_body_bytes(16 MiB)`. Overflow returns 413
+`client.send(..)` inside `owner.run`, as above, with the same request and
+options, and hands the inbound body stream upward with
+`.max_request_body_bytes(16 MiB)`. Overflow returns 413
 (EZ-10). Axum and Cloudflare prebuffer the upload under the cap before they
 contact the origin (EZ-1.11, EZ-10.6), so their origin sees no request on
 overflow. Fastly and Spin stream it. On Fastly the overflow is found after
@@ -701,9 +759,14 @@ Accepted differences:
   Trusted Server signed. H re-parses the URI as a WHATWG URL
   (`outbound.rs:1953-1989`), so they must agree byte for byte.
 - Image Optimizer options go on with `.image_optimizer(opts)`
-  (`outbound.rs:1263`), on the GET only, never on the preflight. H requires GET
-  or HEAD, `PlatformDefault` caching, and a region, and returns 400 otherwise
+  (`outbound.rs:1263`), on the final client GET or HEAD, never on the diagnostic
+  S3 HEAD preflight. H requires GET or HEAD, `PlatformDefault` caching, and a
+  region, and returns 400 otherwise
   (`edgezero:crates/edgezero-core/src/outbound/image_optimizer.rs:197-217`).
+  The asset route admits HEAD, a successful preflight proceeds to the final
+  request, and the final request keeps the client's method and attaches the
+  options today (`proxy.rs:1052-1057`, `:1171-1174`), so a final HEAD keeps its
+  options. Test 3 and the EZ-8 hosted leg cover the final HEAD.
   `begin` and batches reject the options. Axum, Cloudflare, and Spin reject
   them before sending (`edgezero:crates/edgezero-adapter-axum/src/outbound.rs:153-160`,
   `edgezero:crates/edgezero-adapter-spin/src/outbound.rs:1520-1525`), as
@@ -1048,18 +1111,28 @@ These rules now apply on all four adapters.
   branch. Today it keeps `Trailer` wherever chunked framing survives, and the
   test at `publisher.rs:26560-26575` asserts that. The test changes with it.
 - `validate_settings_for_deploy` (`crates/trusted-server-core/src/config.rs:258`)
-  rejects an operator `response_headers` entry named `trailer` or
-  `content-length`, so `ts config validate` and `ts config push` fail with the
-  header name. At runtime, `apply_response_headers_with_cache_privacy`
-  (`crates/trusted-server-core/src/response_privacy.rs:161-172`) skips such an
+  rejects an operator `response_headers` entry named `trailer`,
+  `content-length`, or any hop-by-hop field: `connection`, `keep-alive`, `te`,
+  `transfer-encoding`, `upgrade`, `proxy-connection`, `proxy-authenticate`, or
+  `proxy-authorization`. `ts config validate` and `ts config push` then fail
+  with the header name. At runtime, `apply_response_headers_with_cache_privacy`
+  (`crates/trusted-server-core/src/response_privacy.rs:161-188`) skips such an
   entry with a warning, so a live config that has one keeps loading.
 - Integration response headers already drop both names
   (`crates/trusted-server-core/src/integrations/registry.rs:450-462`).
 
 **Stripped fields.** Egress removes `Connection` and the fields it names,
 `Transfer-Encoding`, `Keep-Alive`, `TE`, `Upgrade`, `Proxy-Connection`,
-`Proxy-Authenticate`, and `Proxy-Authorization`, without error
-(`response_egress_framing.rs:320-345`).
+`Proxy-Authenticate`, and `Proxy-Authorization`
+(`response_egress_framing.rs:320-345`). A malformed `Connection` value, such as
+an empty token or a trailing comma, is not stripped. It is a framing error and a
+500 before commit (`response_egress_framing.rs:320-335`). Operator
+`response_headers` are Trusted Server's only source of such a value. Settings
+accept any valid `HeaderName` and `HeaderValue` (`settings.rs:3437-3449`), and
+the response-header helper applies the value unchanged
+(`response_privacy.rs:167-188`). So D10 rejects and skips every operator
+hop-by-hop entry. Egress strips the valid ones anyway, so skipping them changes
+nothing on the wire.
 
 **Write deadline (D7).** `Hooks::configure` installs
 `App::set_response_egress_policy` (`app.rs:553-560`), whose policy receives the
@@ -1396,12 +1469,12 @@ text or URLs (EZ-16).
 
 ## Adapter impact
 
-| Adapter    | Compile changes                                                                                         | Runtime changes                                                                                                                                                                                                                                   |
-| ---------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Fastly     | 38 sites, the lifecycle rewrite, deletion of the client, backends, and delivery code                    | [Fastly differences](#fastly-differences)                                                                                                                                                                                                         |
-| Axum       | 10 sites, the dev server `App` and `ingress` field, route and parity tests on `AxumTestServer`          | EdgeZero client in place of Trusted Server's. Ingress caps. Framing, head limits, and `configure` policies apply. Inbound 30 s read deadline. Startup failure exits the process                                                                   |
-| Cloudflare | 22 sites, deletion of the client, two compatibility flags, the deadline example                         | Multi-provider auctions load and fan out. Overlapped origin fetch. EdgeZero client in place of the encoding strip and manual redirect. Strict framing. Head limits. Inbound 30 s read deadline. Startup failure answers with the assembly error   |
-| Spin       | 34 sites, the `spin-sdk` fork, `SpinResponse`, deletion of the client and decoder, the deadline example | Multi-provider auctions load and fan out. Overlapped origin fetch. Streamed egress. Head limits. Inbound 30 s read deadline. Startup failure answers 503 with the assembly error. Config open failure at first read. Outbound-host manifest check |
+| Adapter    | Compile changes                                                                                         | Runtime changes                                                                                                                                                                                                                                                                         |
+| ---------- | ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fastly     | 38 sites, the lifecycle rewrite, deletion of the client, backends, and delivery code                    | [Fastly differences](#fastly-differences)                                                                                                                                                                                                                                               |
+| Axum       | 10 sites, the dev server `App` and `ingress` field, route and parity tests on `AxumTestServer`          | EdgeZero client in place of Trusted Server's. Ingress caps. Framing, head limits, and `configure` policies apply. Inbound 30 s read deadline. Raw publisher responses are collected under `publisher.max_buffered_body_bytes`, their first cap (2.5). Startup failure exits the process |
+| Cloudflare | 22 sites, deletion of the client, two compatibility flags, the deadline example                         | Multi-provider auctions load and fan out. EdgeZero client in place of the encoding strip and manual redirect. Raw publisher responses still collected under 10 MiB (2.5). Strict framing. Head limits. Inbound 30 s read deadline. Startup failure answers with the assembly error      |
+| Spin       | 34 sites, the `spin-sdk` fork, `SpinResponse`, deletion of the client and decoder, the deadline example | Multi-provider auctions load and fan out. Raw publisher responses still collected under 8 MiB (2.5). Streamed egress. Head limits. Inbound 30 s read deadline. Startup failure answers 503 with the assembly error. Config open failure at first read. Outbound-host manifest check     |
 
 Core carries 63 sites plus the outbound migration. The CLI library compiles
 against H unchanged, and its tests change only for the Axum harness.
@@ -1491,15 +1564,15 @@ headers, auction semantics, consent handling, EC cookies, upstream failures as
 
 **No new configuration keys.** Validation changes:
 
-| Setting                                                              | Today                                                                                                                                                                                      | After the cut                                                                                                                                                                                                                                |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `proxy.certificate_check = false`                                    | Disables origin TLS checks for the publisher, asset, redirect, and pull-sync backends (`crates/trusted-server-adapter-fastly/src/backend.rs:244-250`). Default `true` (`settings.rs:1937`) | `ts config validate` and `push` reject it. Runtime ignores it with a warning, which replaces `warn_if_certificate_check_disabled` (`crates/trusted-server-adapter-fastly/src/app.rs:241`). Only origins with invalid certificates then fail. |
-| `creative_opportunities.origin_readthrough_enabled = true`           | Shared-cache origin fetch with a surrogate key. Off by default (`crates/trusted-server-core/src/creative_opportunities.rs:424-425`)                                                        | Validate and push reject it. Runtime treats it as `false` with a warning.                                                                                                                                                                    |
-| `publisher.origin_host_header_override` on Spin                      | Ignored. Spin sends the URI authority (`crates/trusted-server-adapter-spin/src/platform.rs:449-456`)                                                                                       | Still ignored, now with a warning at settings load. Fastly, Axum, and Cloudflare send it through `host_authority_override`.                                                                                                                  |
-| `publisher.origin_url` with userinfo                                 | Accepted                                                                                                                                                                                   | Validate and push reject it. At runtime H rejects the request (2.11), so publisher requests answer 400.                                                                                                                                      |
-| `response_headers` naming `trailer` or `content-length`              | Applied                                                                                                                                                                                    | Validate and push reject the entry. Runtime skips it with a warning.                                                                                                                                                                         |
-| Multi-provider `auction.providers` on Cloudflare or Spin             | Startup fails (`crates/trusted-server-core/src/auction/plan.rs:417-466`)                                                                                                                   | Loads and fans out (2.4).                                                                                                                                                                                                                    |
-| Provider endpoint `http://127.0.0.1:<port>` or `http://[::1]:<port>` | Rejected. Endpoints must be HTTPS (`plan.rs:565-584`)                                                                                                                                      | Accepted (D18). Other `http` endpoints are still rejected.                                                                                                                                                                                   |
+| Setting                                                                                                                                                                                                          | Today                                                                                                                                                                                      | After the cut                                                                                                                                                                                                                                |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `proxy.certificate_check = false`                                                                                                                                                                                | Disables origin TLS checks for the publisher, asset, redirect, and pull-sync backends (`crates/trusted-server-adapter-fastly/src/backend.rs:244-250`). Default `true` (`settings.rs:1937`) | `ts config validate` and `push` reject it. Runtime ignores it with a warning, which replaces `warn_if_certificate_check_disabled` (`crates/trusted-server-adapter-fastly/src/app.rs:241`). Only origins with invalid certificates then fail. |
+| `creative_opportunities.origin_readthrough_enabled = true`                                                                                                                                                       | Shared-cache origin fetch with a surrogate key. Off by default (`crates/trusted-server-core/src/creative_opportunities.rs:424-425`)                                                        | Validate and push reject it. Runtime treats it as `false` with a warning.                                                                                                                                                                    |
+| `publisher.origin_host_header_override` on Spin                                                                                                                                                                  | Ignored. Spin sends the URI authority (`crates/trusted-server-adapter-spin/src/platform.rs:449-456`)                                                                                       | Still ignored, now with a warning at settings load. Fastly, Axum, and Cloudflare send it through `host_authority_override`.                                                                                                                  |
+| `publisher.origin_url` with userinfo                                                                                                                                                                             | Accepted                                                                                                                                                                                   | Validate and push reject it. At runtime H rejects the request (2.11), so publisher requests answer 400.                                                                                                                                      |
+| `response_headers` naming `trailer`, `content-length`, or a hop-by-hop field (`connection`, `keep-alive`, `te`, `transfer-encoding`, `upgrade`, `proxy-connection`, `proxy-authenticate`, `proxy-authorization`) | Applied                                                                                                                                                                                    | Validate and push reject the entry. Runtime skips it with a warning. A malformed `Connection` value would otherwise fail H's egress framing (section 5).                                                                                     |
+| Multi-provider `auction.providers` on Cloudflare or Spin                                                                                                                                                         | Startup fails (`crates/trusted-server-core/src/auction/plan.rs:417-466`)                                                                                                                   | Loads and fans out (2.4).                                                                                                                                                                                                                    |
+| Provider endpoint `http://127.0.0.1:<port>` or `http://[::1]:<port>`                                                                                                                                             | Rejected. Endpoints must be HTTPS (`plan.rs:565-584`)                                                                                                                                      | Accepted (D18). Other `http` endpoints are still rejected.                                                                                                                                                                                   |
 
 Validation rejects at deploy time and degrades at runtime. A live config that
 predates the cut keeps serving, and the pre-deploy check finds every entry to
@@ -1569,7 +1642,7 @@ links, secrets, and deploy flags are unchanged. No re-push is needed.
   details hold no provider text, URLs, or header values. Trusted Server never
   logs body bytes.
 - Telemetry rows have the same content, are sent later, and measure bidder time
-  from the batch start (2.4).
+  from the batch start to the recorded arrival, not to collection (2.4).
 
 ## Failure handling
 
@@ -1745,7 +1818,7 @@ records the repaired-versus-stock disposition under G4-FASTLY-POLICY
 | EZ-5  | Criterion 8 on Viceroy (test 7)                                                                                                                                     |                                                                                                                                                          |                                                  |
 | EZ-6  | End to end on Viceroy, Axum, workerd, and Spin (test 6)                                                                                                             |                                                                                                                                                          | Scenarios 1, 2, 6, 7, 8, and 11                  |
 | EZ-7  | Criterion 5 on Viceroy (test 3)                                                                                                                                     |                                                                                                                                                          |                                                  |
-| EZ-8  | Criterion 9, a profile readback unit test (test 3)                                                                                                                  | The Trusted Server criterion on the IO-entitled service                                                                                                  | Criterion 8 on the IO-entitled service           |
+| EZ-8  | Criterion 9, a profile readback unit test (test 3)                                                                                                                  | The Trusted Server criterion on the IO-entitled service, with a final HEAD's metadata compared with the GET's                                            | Criterion 8 on the IO-entitled service           |
 | EZ-9  | Criterion 20, unit and Axum (test 4)                                                                                                                                |                                                                                                                                                          |                                                  |
 | EZ-10 | Criterion 9: today's read-cap 413 tests unchanged, an oversized chunked `POST /auction` (test 1), and a batch-sync stream past its declared length and cap (test 8) | Criterion 4: an HTTP/2 POST with no `content-length` over the cap gets 413                                                                               |                                                  |
 | EZ-16 |                                                                                                                                                                     | Criterion 3, and criterion 8: a provider on a closed port logs one line with the provider and the refused cause, and the auction error body stays static |                                                  |
@@ -1886,8 +1959,9 @@ git grep -n transport_timeout_ms -- crates/trusted-server-core/src/auction \
    set it and absent when it set none, the decoding mode, the marker off
    through `effective_proxy_marker_enabled` (EZ-7), the response cap, the cache
    policy, and the Image Optimizer options read back from the request (EZ-8).
-   For bidders it asserts the consent and attested client-IP headers. A header
-   value that is not UTF-8 is dropped.
+   On the asset proxy the options read back on a final GET and on a final
+   HEAD, and never on the S3 preflight. For bidders it asserts the consent and
+   attested client-IP headers. A header value that is not UTF-8 is dropped.
 4. **Redirect policy (EZ-9 criterion 20).** The existing redirect, allowlist,
    and initial-target tests are ported to the scripted client and run again on
    the Axum binary against local origins. A redirect chain past its deadline
@@ -1905,12 +1979,22 @@ git grep -n transport_timeout_ms -- crates/trusted-server-core/src/auction \
    that outcome on a real runtime. It cannot force the event order behind open
    defect 3, so EdgeZero's fix carries the deterministic regression. The
    loopback bidders record the request framing they receive (section 8). An
-   abandoned auction cancels its pending bidder requests.
-6. **Overlapped origin (EZ-6).** On Viceroy, Axum, workerd, and Spin, with
-   loopback bidders, the origin request is dispatched before bid construction,
-   and bids are collected at the `</body>` hold. A batch cutoff built from
-   `ctx.monotonic_clock()` expires on time. A bid that arrives while the origin
-   body streams is observed before the cutoff.
+   abandoned auction cancels its pending bidder requests. A bid that answers in
+   time reports the same slot `elapsed` and telemetry `response_time_ms` when
+   collection is delayed after its arrival (2.4).
+6. **Publisher origin and bids (EZ-6).** On Viceroy, Axum, workerd, and Spin,
+   with loopback bidders and an origin whose head arrives at 700 ms, a
+   navigation with a 500 ms auction contains the bids that answered at 180 and
+   320 ms and not the one that answered at 600 ms, as EZ-6's Trusted Server
+   check states. A batch cutoff built from `ctx.monotonic_clock()` expires on
+   time. The two paths differ (2.5):
+   - On Viceroy, a navigation GET that preloads an EC snapshot takes the
+     overlapped path. The origin request is dispatched before bid
+     construction, bids are collected at the `</body>` hold, and a bid that
+     arrives while the origin body streams is observed before the cutoff.
+   - On Axum, workerd, and Spin, which have no KV graph, the plain path
+     dispatches the auction first and sends the origin request while the bids
+     are in flight.
 7. **Encoded passthrough (EZ-5 criterion 8).** On Viceroy, against origin
    fixtures:
    - A gzip HTML page reaches the client with `Content-Encoding: gzip` and
@@ -1983,7 +2067,11 @@ git grep -n transport_timeout_ms -- crates/trusted-server-core/src/auction \
 16. **Response egress.** A unit test feeds `make_response_bodiless` a HEAD and a
     304 response that carry `Trailer`, and the output has none. On all four
     adapters, a publisher `HEAD` and a conditional `GET` that returns 304 return
-    their real status. Validation rejects an operator `trailer` entry.
+    their real status. Validation rejects an operator `trailer` entry and an
+    operator `connection` entry. A live config whose operator
+    `connection: keep-alive,` or empty `connection` entry predates the cut loads,
+    the entry is skipped with a warning, and the response is served with its
+    real status instead of the framing 500 (section 5).
 17. **Write deadline.** A unit test calls the installed egress policy and gets a
     deadline 60 s after egress starts. Under Viceroy, a publisher page whose
     origin streams for 35 s reaches the client complete.
@@ -1996,6 +2084,19 @@ git grep -n transport_timeout_ms -- crates/trusted-server-core/src/auction \
     (section 8). A 9000-byte request target gets 414 from all three. A bodiless
     GET whose inbound body is an unread stream reaches a loopback origin with no
     request body.
+20. **Publisher ownership (2.5).** These run with the scripted client behind
+    H's real facade and head finishing, for `send` and for `begin` followed by
+    `collect`. Each raw `PublisherResponse` variant (`Buffered`, `PassThrough`,
+    and a 206 range response) attaches its owner once and keeps its bytes when
+    the origin call is constructed inside `owner.run`. A control that
+    constructs the call outside the scope gets "response body already owns an
+    outbound scope" from `attach`. This pins the construction rule, not just
+    the outcome.
+21. **Raw publisher collection (2.5).** On Axum, Cloudflare, and Spin,
+    `buffer_publisher_response_async` returns raw `Buffered` and `PassThrough`
+    responses with buffered bodies. A raw body at the adapter's cap passes. One
+    byte over it fails with 502 before egress, and so does a source error
+    mid-body. The processed HTML path keeps its `max_buffered_body_bytes` cap.
 
 Ported tests: every user of `StubHttpClient`, `NoopHttpClient`, and
 `StubBackend` moves to the scripted client (364 `StubHttpClient` lines in 20
@@ -2091,8 +2192,10 @@ route tests, the whole parity suite, and the CLI proxy test move to
    gate and `validate_for_target`, keep the Fastly backend bound, and add the
    loopback endpoint rule with the generator, fixture, browser-test, and
    `template-cache-local-test.sh` changes (D18).
-7. Port the publisher origin (O4, O5), with the scope owner, the readthrough
-   rule, the host override, the `origin_url` rule, and the Spin warning. Until
+7. Port the publisher origin (O4, O5), with the scope owner and both origin
+   calls constructed inside it, raw collection on Axum, Cloudflare, and Spin,
+   the readthrough rule, the host override, the `origin_url` rule, and the Spin
+   warning (tests 20 and 21). Until
    step 8, Trusted Server's Fastly delivery converts the response body with
    `into_stream()`, so the attached owner lives until the end of the body. Port
    the EOF fixture (O19), and run the HTML end-of-file checks in Runtime. The
@@ -2375,3 +2478,18 @@ old layer. That transient dual path exists only inside the pull request.
 
   Nits adopted throughout, including per-value filtering of the synthesized
   set.
+
+- **Round 7 (GitHub review 5810751514 on PR #1506, 2026-11-07, at
+  `854fe2e36`).** One blocking finding and five should-fix, all adopted.
+  - Blocking: the origin `send` and `begin` are now constructed inside
+    `owner.run`. Constructed outside it, head finishing gives a raw origin body
+    its own owner and the attach fails (2.5, test 20).
+  - Axum, Cloudflare, and Spin now collect every raw publisher variant before
+    egress, under today's caps (2.5, test 21).
+  - The overlap claim and test 6 are narrowed to where the overlap runs:
+    Fastly navigation GETs with an EC preload (2.5).
+  - D10 now covers operator hop-by-hop fields, because a malformed
+    `Connection` fails H's egress framing (section 5).
+  - The final client HEAD keeps its Image Optimizer options (2.7).
+  - The telemetry latency's changed stop point is stated, with a
+    delayed-collection test (2.4, test 5).
