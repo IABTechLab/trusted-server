@@ -4,7 +4,7 @@
 
 **Status:** Draft. Five agent review rounds, then a 2026-11-06 update against
 PR 275 head `9b31a697` and its review, and the 2026-11-07 fixes for GitHub
-review 5810751514. Awaiting maintainer answers to Q1 to Q7.
+reviews 5810751514 and 5815168335. Awaiting maintainer answers to Q1 to Q7.
 
 **EdgeZero target:** `IABTechLab/edgezero` PR 275 (branch
 `docs/outbound-http-spec`). Development and review use head
@@ -628,18 +628,41 @@ variants, which the function returns unchanged today (`publisher.rs:1868-1877`,
 `:2093-2095`), would stream, lose today's client caps, and fail during egress
 instead of before it.
 
-- The processed HTML output keeps its `publisher.max_buffered_body_bytes` cap
-  (`publisher.rs:1921`).
-- Raw bodies are collected with `Body::into_bytes_bounded(cap)`. `cap` is the
-  smaller of `publisher.max_buffered_body_bytes` and the adapter's current
-  client cap: 10 MiB on Cloudflare
-  (`crates/trusted-server-adapter-cloudflare/src/platform.rs:187`) and 8 MiB on
-  Spin (`crates/trusted-server-adapter-spin/src/platform.rs:33`). Axum's client
-  has no cap today (`crates/trusted-server-adapter-axum/src/platform.rs:364-366`),
-  so only the setting applies there. Each adapter passes its cap at the call
-  site, because the client modules that hold those constants are deleted.
-- Overflow and source errors map to `TrustedServerError::Proxy` (502) before
-  egress, as the client caps do today, not through the `PayloadTooLarge` rule
+Today's clients bound the origin input before the publisher classifies the
+response (`publisher.rs:5944-5964`, `:6046-6075`), so the bound covers HTML as
+well as raw responses. Cloudflare's client caps the declared length and the
+received bytes at 10 MiB
+(`crates/trusted-server-adapter-cloudflare/src/platform.rs:187`, `:385-395`,
+`:422-440`). Spin's client caps the received bytes at 8 MiB and separately
+bounds gzip and br expansion at 8 MiB
+(`crates/trusted-server-adapter-spin/src/platform.rs:29-33`, `:344-372`,
+`:541-543`). Axum's client has no cap
+(`crates/trusted-server-adapter-axum/src/platform.rs:364-366`). The cut keeps
+those input bounds for every publisher classification, raw and processed
+alike:
+
+- Each adapter has an origin input cap `cap`: the smaller of
+  `publisher.max_buffered_body_bytes` and its current client cap, so 10 MiB on
+  Cloudflare and 8 MiB on Spin by default. Axum has no client cap, so only the
+  setting applies there. Each adapter passes `cap` to
+  `handle_publisher_request` and `buffer_publisher_response_async`, because
+  the client modules that hold those constants are deleted.
+- The origin request sets `.max_encoded_response_bytes(cap)`, so H fails any
+  origin body over `cap` whatever its classification. These adapters collect
+  before egress, so that failure arrives before the response is committed.
+- Raw `Buffered` and `PassThrough` bodies are collected with
+  `Body::into_bytes_bounded(cap)`.
+- Processed HTML is decoded by Trusted Server's rewrite codec, because the
+  origin request uses `Original`. Its cumulative decoded bytes are bounded by
+  `cap`, as the old clients bound the bytes they returned. The streaming path
+  already applies a cumulative decoded bound, so this uses the same mechanism
+  with `cap` (`crates/trusted-server-core/src/settings.rs:70-75`).
+- The processed output keeps its separate `publisher.max_buffered_body_bytes`
+  cap (`publisher.rs:1921`). An input bound and an output bound are different
+  limits, and both apply.
+- Overflow and source errors fail before egress with the site's 502. That is
+  `TrustedServerError::Proxy`, or H's `ResponseTooLarge` through 2.11, as the
+  client caps fail today. None of these go through the `PayloadTooLarge` rule
   in 2.11.
 
 Test 21 covers this.
@@ -1131,8 +1154,19 @@ an empty token or a trailing comma, is not stripped. It is a framing error and a
 accept any valid `HeaderName` and `HeaderValue` (`settings.rs:3437-3449`), and
 the response-header helper applies the value unchanged
 (`response_privacy.rs:167-188`). So D10 rejects and skips every operator
-hop-by-hop entry. Egress strips the valid ones anyway, so skipping them changes
-nothing on the wire.
+hop-by-hop entry.
+
+Skipping is not wire-neutral for `Connection`. A valid `Connection` value names
+fields, and egress removes every field it names from the response, whatever set
+that field (`response_egress_framing.rs:320-333`). Skipping an operator
+`Connection` entry also drops that removal. A field it names, such as an
+operator `x-example`, then reaches the client, where H would have removed it.
+The ban accepts that loss of nomination semantics instead of re-implementing
+it. `ts config validate` and `push` reject every such config, so only a live
+config that predates the cut can carry one, and the pre-deploy check (Before
+deploy) finds it. Test 16 asserts the retained field. Skipping the other
+hop-by-hop names changes nothing on the wire, because egress strips them
+anyway.
 
 **Write deadline (D7).** `Hooks::configure` installs
 `App::set_response_egress_policy` (`app.rs:553-560`), whose policy receives the
@@ -1469,12 +1503,12 @@ text or URLs (EZ-16).
 
 ## Adapter impact
 
-| Adapter    | Compile changes                                                                                         | Runtime changes                                                                                                                                                                                                                                                                         |
-| ---------- | ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Fastly     | 38 sites, the lifecycle rewrite, deletion of the client, backends, and delivery code                    | [Fastly differences](#fastly-differences)                                                                                                                                                                                                                                               |
-| Axum       | 10 sites, the dev server `App` and `ingress` field, route and parity tests on `AxumTestServer`          | EdgeZero client in place of Trusted Server's. Ingress caps. Framing, head limits, and `configure` policies apply. Inbound 30 s read deadline. Raw publisher responses are collected under `publisher.max_buffered_body_bytes`, their first cap (2.5). Startup failure exits the process |
-| Cloudflare | 22 sites, deletion of the client, two compatibility flags, the deadline example                         | Multi-provider auctions load and fan out. EdgeZero client in place of the encoding strip and manual redirect. Raw publisher responses still collected under 10 MiB (2.5). Strict framing. Head limits. Inbound 30 s read deadline. Startup failure answers with the assembly error      |
-| Spin       | 34 sites, the `spin-sdk` fork, `SpinResponse`, deletion of the client and decoder, the deadline example | Multi-provider auctions load and fan out. Raw publisher responses still collected under 8 MiB (2.5). Streamed egress. Head limits. Inbound 30 s read deadline. Startup failure answers 503 with the assembly error. Config open failure at first read. Outbound-host manifest check     |
+| Adapter    | Compile changes                                                                                         | Runtime changes                                                                                                                                                                                                                                                                                                                                                     |
+| ---------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fastly     | 38 sites, the lifecycle rewrite, deletion of the client, backends, and delivery code                    | [Fastly differences](#fastly-differences)                                                                                                                                                                                                                                                                                                                           |
+| Axum       | 10 sites, the dev server `App` and `ingress` field, route and parity tests on `AxumTestServer`          | EdgeZero client in place of Trusted Server's. Ingress caps. Framing, head limits, and `configure` policies apply. Inbound 30 s read deadline. Publisher origin input is capped at `publisher.max_buffered_body_bytes` for every classification, its first input cap, and raw responses are collected before egress (2.5). Startup failure exits the process         |
+| Cloudflare | 22 sites, deletion of the client, two compatibility flags, the deadline example                         | Multi-provider auctions load and fan out. EdgeZero client in place of the encoding strip and manual redirect. Publisher origin input still capped at 10 MiB for every classification, and raw responses collected before egress (2.5). Strict framing. Head limits. Inbound 30 s read deadline. Startup failure answers with the assembly error                     |
+| Spin       | 34 sites, the `spin-sdk` fork, `SpinResponse`, deletion of the client and decoder, the deadline example | Multi-provider auctions load and fan out. Publisher origin input and HTML expansion still capped at 8 MiB for every classification, and raw responses collected before egress (2.5). Streamed egress. Head limits. Inbound 30 s read deadline. Startup failure answers 503 with the assembly error. Config open failure at first read. Outbound-host manifest check |
 
 Core carries 63 sites plus the outbound migration. The CLI library compiles
 against H unchanged, and its tests change only for the Axum harness.
@@ -2071,7 +2105,9 @@ git grep -n transport_timeout_ms -- crates/trusted-server-core/src/auction \
     operator `connection` entry. A live config whose operator
     `connection: keep-alive,` or empty `connection` entry predates the cut loads,
     the entry is skipped with a warning, and the response is served with its
-    real status instead of the framing 500 (section 5).
+    real status instead of the framing 500 (section 5). A live config with
+    `connection: x-example` and `x-example: example-value` serves `x-example`
+    after the skip, which records that the ban drops nomination semantics.
 17. **Write deadline.** A unit test calls the installed egress policy and gets a
     deadline 60 s after egress starts. Under Viceroy, a publisher page whose
     origin streams for 35 s reaches the client complete.
@@ -2092,11 +2128,18 @@ git grep -n transport_timeout_ms -- crates/trusted-server-core/src/auction \
     constructs the call outside the scope gets "response body already owns an
     outbound scope" from `attach`. This pins the construction rule, not just
     the outcome.
-21. **Raw publisher collection (2.5).** On Axum, Cloudflare, and Spin,
+21. **Publisher input caps (2.5).** On Axum, Cloudflare, and Spin,
     `buffer_publisher_response_async` returns raw `Buffered` and `PassThrough`
-    responses with buffered bodies. A raw body at the adapter's cap passes. One
-    byte over it fails with 502 before egress, and so does a source error
-    mid-body. The processed HTML path keeps its `max_buffered_body_bytes` cap.
+    responses with buffered bodies. With `max_buffered_body_bytes` at its 16 MiB
+    default, each adapter's `cap` holds for every classification:
+    - A raw body at `cap` passes. One byte over it fails with 502 before
+      egress, and so does a source error mid-body.
+    - Identity HTML that is processed passes at `cap` and fails with 502 before
+      egress one byte over it: 10 MiB on Cloudflare and 8 MiB on Spin.
+    - Gzip HTML whose encoded size is under `cap` but whose decoded size
+      exceeds it fails with 502 before egress.
+    - The processed output still fails at its own `max_buffered_body_bytes`
+      cap when a rewrite grows past it.
 
 Ported tests: every user of `StubHttpClient`, `NoopHttpClient`, and
 `StubBackend` moves to the scripted client (364 `StubHttpClient` lines in 20
@@ -2493,3 +2536,14 @@ old layer. That transient dual path exists only inside the pull request.
   - The final client HEAD keeps its Image Optimizer options (2.7).
   - The telemetry latency's changed stop point is stated, with a
     delayed-collection test (2.4, test 5).
+
+- **Round 8 (GitHub review 5815168335 on PR #1506, 2026-11-07, at
+  `5bd113408`).** Four round-7 fixes were accepted and resolved, and two were
+  partly fixed. Both remainders are adopted:
+  - The adapter input cap now covers every publisher classification, processed
+    HTML included, through H's encoded-byte cap and a cumulative decoded-byte
+    bound. The processed-output cap stays separate (2.5, test 21).
+  - The claim that skipping operator hop-by-hop entries is wire-neutral is
+    removed. Skipping `Connection` drops its nomination semantics, so a field
+    it names reaches the client. Validation finds such configs before deploy
+    (section 5, test 16).
