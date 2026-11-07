@@ -19,6 +19,7 @@ FASTLY_MANIFEST="$FASTLY_PROJECT/fastly.toml"
 EDGEZERO_MANIFEST="$FASTLY_PROJECT/edgezero.toml"
 ORIGIN_PORT=${FASTLY_SMOKE_ORIGIN_PORT:-18989}
 BASE_PORT=${FASTLY_SMOKE_PORT:-18980}
+POSITIVE_PORT=$((BASE_PORT + 4))
 ORIGIN_PID=""
 APP_PID=""
 
@@ -68,7 +69,7 @@ fi
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
 ORIGIN_PID=$SMOKE_ORIGIN_PID
 # The positive case uses the final listener in the case sequence.
-smoke_initialize_config "$FASTLY_PROJECT" "$WORKSPACE" "$ORIGIN_PORT" "$((BASE_PORT + 4))"
+smoke_initialize_config "$FASTLY_PROJECT" "$WORKSPACE" "$ORIGIN_PORT" "$POSITIVE_PORT"
 
 run_case() {
     local case_name="$1"
@@ -178,6 +179,6 @@ run_case missing-ec "$((BASE_PORT + 3))" 500 \
     "failed to resolve secret reference at \`ec.passphrase\`"
 
 cp "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST"
-run_case positive "$((BASE_PORT + 4))" 200
+run_case positive "$POSITIVE_PORT" 200
 
 echo "Fastly first-success smoke passed"

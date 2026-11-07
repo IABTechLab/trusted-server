@@ -1794,7 +1794,13 @@ pub async fn handle_first_party_proxy_sign(
     let mut base = target.clone();
     base.set_query(None);
     base.set_fragment(None);
-    let proxied = crate::creative::build_proxy_url_with_extras(settings, target.as_str(), &extras);
+    let public_origin = settings.publisher.effective_public_origin();
+    let proxied = crate::creative::build_proxy_url_with_extras(
+        settings,
+        target.as_str(),
+        &public_origin,
+        &extras,
+    );
 
     let resp = ProxySignResp {
         href: proxied,
@@ -2030,7 +2036,11 @@ pub async fn handle_first_party_proxy_rebuild(
         qs.append_pair(k, v);
     }
     qs.append_pair("tstoken", &token);
-    let href = first_party_url(settings, &format!("/first-party/click?{}", qs.finish()));
+    let public_origin = settings.publisher.effective_public_origin();
+    let href = first_party_url(
+        &public_origin,
+        &format!("/first-party/click?{}", qs.finish()),
+    );
 
     // Compute diagnostics: added and removed
     let mut added: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
@@ -3801,7 +3811,11 @@ mod tests {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js?c=3&b=2&a=1";
         // Simulate creative-generated first-party URL.
-        let first_party = creative::build_proxy_url(&settings, clear, "");
+        let first_party = creative::build_proxy_url(
+            &settings,
+            clear,
+            &settings.publisher.effective_public_origin(),
+        );
         let st = reconstruct_and_validate_signed_target(&settings, &first_party)
             .expect("reconstruct ok");
         assert_eq!(st.tsurl, "https://cdn.example/asset.js");
@@ -3813,7 +3827,11 @@ mod tests {
     fn reconstruct_valid_without_params() {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js";
-        let first_party = creative::build_proxy_url(&settings, clear, "");
+        let first_party = creative::build_proxy_url(
+            &settings,
+            clear,
+            &settings.publisher.effective_public_origin(),
+        );
         let st = reconstruct_and_validate_signed_target(&settings, &first_party)
             .expect("reconstruct ok");
         assert_eq!(st.tsurl, clear);
@@ -3827,7 +3845,11 @@ mod tests {
             let settings = create_test_settings();
             let clear = "ftp://cdn.example/file.gif";
             // Build a first-party proxy URL with a token for the unsupported scheme.
-            let first_party = creative::build_proxy_url(&settings, clear, "");
+            let first_party = creative::build_proxy_url(
+                &settings,
+                clear,
+                &settings.publisher.effective_public_origin(),
+            );
             let req = build_http_request(Method::GET, first_party);
             let err: Report<TrustedServerError> =
                 handle_first_party_proxy(&settings, &noop_services(), req)
@@ -3865,7 +3887,11 @@ mod tests {
         futures::executor::block_on(async {
             let settings = create_test_settings();
             let clear = "https://cdn.example/landing.html?x=1";
-            let first_party = creative::build_click_url(&settings, clear, "");
+            let first_party = creative::build_click_url(
+                &settings,
+                clear,
+                &settings.publisher.effective_public_origin(),
+            );
             let req = build_http_request(Method::GET, first_party);
             let resp = handle_first_party_click(&settings, &noop_services(), req)
                 .await

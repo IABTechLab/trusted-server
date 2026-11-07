@@ -436,7 +436,15 @@ This does not enable cross-origin credentials: runtime fetches still use
 `credentials: 'same-origin'`, so even an in-scope endpoint on a different origin
 does not receive cookies on those fetches. No CORS grants are added.
 
-**Format**: An `http` or `https` origin with a host and optional port, without userinfo, path, query, fragment, or a trailing slash. HTTPS is recommended for deployed publisher traffic; HTTP is supported for direct localhost development.
+**Format**: An `http` or `https` origin with a host and optional port, without userinfo, path, query, fragment, or a trailing slash. HTTPS is recommended for deployed publisher traffic; HTTP remains supported.
+
+App-config loading warns when an explicit origin is outside the EC cookie scope
+or uses HTTP on a non-loopback host. These are advisories, not validation errors;
+intentional local fixtures can still use `domain = "localhost"` with an origin
+such as `http://127.0.0.1:8080`. Loopback HTTP does not trigger the transport
+warning, but the differing host still triggers the cookie-scope advisory.
+Diagnostics run once per normalized app-config load or construction, not on
+repeated validation of the same object.
 
 After validation, the shared configuration loader normalizes accepted values to
 the URL parser's serialized origin for output and stored config. For example,
@@ -449,7 +457,8 @@ normalization, not silently discarded.
 Omission keeps old configuration files deserializable, not their previous URL
 authority behavior. Previously root-relative creative URLs followed the serving
 page's scheme, host, and port; the new default does not preserve those values.
-`ts config validate` and `ts config push` warn when this field is omitted.
+App-config loading, including `ts config validate`, `ts config push`, and
+`ts config diff`, warns when this field is omitted.
 Set this field to the actual browser-facing Trusted Server endpoint, including
 its port when needed, rather than the backend `origin_url`. For direct local
 development on port 8080, for example, use `http://localhost:8080`.

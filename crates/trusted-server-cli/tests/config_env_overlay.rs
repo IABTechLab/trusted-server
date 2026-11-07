@@ -174,6 +174,11 @@ fn public_origin_omission_warns_during_validate_but_explicit_origin_does_not() {
     let output = validate_with_overlay(&project, "true");
     assert!(output.status.success(), "should validate the legacy config");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("publisher.public_origin is unset").count(),
+        1,
+        "should warn once for one effective validation load: {stderr}"
+    );
     assert!(
         stderr.contains("publisher.public_origin is unset")
             && stderr.contains("https://{publisher.domain}")
@@ -196,6 +201,142 @@ fn public_origin_omission_warns_during_validate_but_explicit_origin_does_not() {
         !String::from_utf8_lossy(&output.stderr).contains("publisher.public_origin is unset"),
         "should not warn about a configured origin"
     );
+}
+
+#[test]
+fn public_origin_advisories_do_not_reject_validate() {
+    let project = migrated_project();
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read migrated config")
+        .parse::<DocumentMut>()
+        .expect("should parse migrated config");
+    document["publisher"]["domain"] = value("publisher.example");
+    document["publisher"]["cookie_domain"] = value(".foreign.example");
+    document["publisher"]["public_origin"] = value("HTTP://FOREIGN.EXAMPLE:8080");
+    fs::write(&project.config_path, document.to_string()).expect("should write explicit origin");
+    let output = validate_with_overlay(&project, "true");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "should retain successful validation: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("outside the EC cookie scope").count(),
+        1,
+        "should use publisher.domain, not cookie_domain: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("HTTP on a non-loopback host").count(),
+        1,
+        "should warn once about transport: {stderr}"
+    );
+    assert!(
+        !stderr.contains("foreign.example") && !stderr.contains("FOREIGN.EXAMPLE"),
+        "should not interpolate settings in diagnostics: {stderr}"
+    );
+}
+
+fn origin_diagnostic_command(project: &MigratedProject, operation: &str, no_env: bool) -> Output {
+    let mut process = Command::new(env!("CARGO_BIN_EXE_ts"));
+    process.arg("config");
+    if operation == "loader" {
+        process.args(["ad-templates", "lint"]);
+    } else {
+        process.arg(operation);
+    }
+    process
+        .arg("--manifest")
+        .arg(&project.manifest_path)
+        .arg("--app-config")
+        .arg(&project.config_path)
+        .current_dir(project.directory.path());
+    match operation {
+        "push" => {
+            process.args(["--adapter", "axum", "--local", "--yes", "--no-diff"]);
+        }
+        "diff" => {
+            process.args(["--adapter", "axum", "--local", "--exit-code"]);
+        }
+        _ => {}
+    }
+    if no_env {
+        process.arg("--no-env");
+    }
+    process
+        .env(PUBLIC_ORIGIN_ENV, "HTTP://FOREIGN.EXAMPLE:8080")
+        .output()
+        .expect("should run config diagnostic command")
+}
+
+fn assert_origin_diagnostics(output: &Output, omitted: usize, scope: usize, transport: usize) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "should preserve successful command exit: {stderr}"
+    );
+    for (message, expected) in [
+        ("publisher.public_origin is unset", omitted),
+        ("outside the EC cookie scope", scope),
+        ("HTTP on a non-loopback host", transport),
+    ] {
+        assert_eq!(
+            stderr.matches(message).count(),
+            expected,
+            "should emit each diagnostic once per effective load: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("FOREIGN.EXAMPLE") && !stderr.contains("foreign.example"),
+        "should not include configured origin values in diagnostics: {stderr}"
+    );
+}
+
+#[test]
+fn public_origin_diagnostics_cover_validate_push_diff_and_shared_audit_loader() {
+    for (origin, omitted, scope, transport) in [
+        (None, 1, 0, 0),
+        (Some("http://localhost:7676"), 0, 0, 0),
+        (Some("http://127.0.0.1:7676"), 0, 1, 0),
+        (Some("http://foreign.example:8080"), 0, 1, 1),
+    ] {
+        let project = migrated_project();
+        if let Some(origin) = origin {
+            let mut document = fs::read_to_string(&project.config_path)
+                .expect("should read config")
+                .parse::<DocumentMut>()
+                .expect("should parse config");
+            document["publisher"]["public_origin"] = value(origin);
+            fs::write(&project.config_path, document.to_string()).expect("should write config");
+        }
+        for operation in ["validate", "push", "diff", "loader"] {
+            let output = origin_diagnostic_command(&project, operation, true);
+            assert_origin_diagnostics(&output, omitted, scope, transport);
+            if operation == "diff" {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("no changes"),
+                    "should preserve matching serialized config hashes"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn public_origin_diagnostics_follow_effective_overlay_and_no_env() {
+    let project = migrated_project();
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read config")
+        .parse::<DocumentMut>()
+        .expect("should parse config");
+    document["publisher"]["public_origin"] = value("http://localhost:7676");
+    fs::write(&project.config_path, document.to_string()).expect("should write config");
+    for no_env in [false, true] {
+        let expected = usize::from(!no_env);
+        for operation in ["validate", "push", "diff", "loader"] {
+            let output = origin_diagnostic_command(&project, operation, no_env);
+            assert_origin_diagnostics(&output, 0, expected, expected);
+        }
+    }
 }
 
 #[test]

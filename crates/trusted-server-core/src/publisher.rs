@@ -10914,6 +10914,7 @@ mod tests {
                 })));
 
             let config = HtmlProcessorConfig {
+                public_origin: "https://publisher.example.com".to_string(),
                 csp_nonce_observed: None,
                 origin_host: "origin.example.com".to_string(),
                 request_host: "example.com".to_string(),

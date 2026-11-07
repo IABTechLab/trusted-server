@@ -45,6 +45,7 @@ function createPage({
   storedDebug = false,
   origin = 'https://publisher.example.com',
   scriptSrc,
+  publicOrigin,
   stampOrigin,
 } = {}) {
   dom = new JSDOM('<!doctype html><head></head><body><div id="slot1"></div></body>', {
@@ -76,6 +77,7 @@ function createPage({
   if (scriptSrc) {
     const script = window.document.createElement('script');
     script.src = scriptSrc;
+    if (publicOrigin !== undefined) script.setAttribute('data-ts-public-origin', publicOrigin);
     Object.defineProperty(window.document, 'currentScript', { configurable: true, value: script });
   }
   // Match bundle.rs: core first and independent IIFEs joined into one script.
@@ -110,6 +112,56 @@ function requestContext(window) {
 }
 
 describe('shared state across production IIFEs', () => {
+  it('recognizes the configured proxy origin across independent core and creative IIFEs without retargeting endpoints', async () => {
+    const scriptOrigin = 'https://www.publisher.example';
+    const proxyOrigin = 'https://ads.publisher.example:8443';
+    const { window } = createPage({
+      modules: ['core', 'creative'],
+      origin: scriptOrigin,
+      scriptSrc: `${scriptOrigin}/static/tsjs=tsjs-unified.min.js?v=hash`,
+      publicOrigin: proxyOrigin,
+    });
+    window.tscreative.setConfig({ renderGuard: true });
+    const script = window.document.currentScript;
+    script.setAttribute('data-ts-public-origin', 'https://changed.example');
+    Object.defineProperty(window.document, 'currentScript', { configurable: true, value: null });
+    const proxy = `${proxyOrigin}/first-party/proxy?tsurl=https%3A%2F%2Fresource.example%2Fasset&tstoken=signed`;
+    const image = new window.Image();
+    const iframe = window.document.createElement('iframe');
+    image.src = proxy;
+    iframe.src = proxy;
+    window.document.body.append(image, iframe);
+    const container = window.document.createElement('div');
+    container.innerHTML = `<img src="${proxy}"><iframe src="${proxy}"></iframe>`;
+    window.document.body.appendChild(container);
+    await new Promise((resolve) => window.setTimeout(resolve, 10));
+    for (const element of window.document.querySelectorAll('img, iframe')) {
+      expect(element.getAttribute('src')).toBe(proxy);
+      element.setAttribute('src', `${proxy}&version=2`);
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 10));
+    for (const element of window.document.querySelectorAll('img, iframe')) {
+      expect(element.getAttribute('src')).toBe(`${proxy}&version=2`);
+    }
+    expect(window.fetch).not.toHaveBeenCalled();
+
+    window.fetch.mockResolvedValue({ ok: true, json: async () => ({ href: proxy }) });
+    for (const external of [
+      `${proxyOrigin}/first-party/proxy-extra`,
+      'https://ads.publisher.example/first-party/proxy',
+      'https://foreign.example/first-party/proxy',
+      'https://changed.example/first-party/proxy',
+    ]) {
+      const externalImage = new window.Image();
+      externalImage.src = external;
+    }
+    await vi.waitFor(() => expect(window.fetch).toHaveBeenCalledTimes(4));
+    for (const [url, init] of window.fetch.mock.calls) {
+      expect(url).toBe(`${scriptOrigin}/first-party/sign`);
+      expect(init.credentials).toBe('same-origin');
+    }
+  });
+
   it('keeps the captured creative endpoint and repaired click authority across independent IIFEs', async () => {
     const endpoint = 'https://ads.example.com:8443';
     const original = `${endpoint}/first-party/click?tsurl=https%3A%2F%2Fexample.com%2Flanding&foo=1&tstoken=original`;
@@ -121,6 +173,7 @@ describe('shared state across production IIFEs', () => {
       modules: ['core', 'creative'],
       origin: 'https://foreign.example',
       scriptSrc: `${endpoint}/static/tsjs=tsjs-unified.min.js?v=hash`,
+      publicOrigin: 'https://configured.example:9443',
       stampOrigin: 'https://publisher.example',
     });
     Object.defineProperty(window.document, 'currentScript', { configurable: true, value: null });

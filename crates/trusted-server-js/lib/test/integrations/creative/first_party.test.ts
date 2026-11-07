@@ -4,9 +4,13 @@ const stampDescriptor = Object.getOwnPropertyDescriptor(window, '__tsCreativeOri
 const SCRIPT_ORIGIN = 'https://ads.example.com:8443';
 const STAMP_ORIGIN = 'https://publisher.example';
 
-function setCurrentScript(src?: string): void {
+function setCurrentScript(src?: string, publicOrigin?: string): HTMLScriptElement | null {
   const script = src ? Object.assign(document.createElement('script'), { src }) : null;
+  if (script && publicOrigin !== undefined) {
+    script.setAttribute('data-ts-public-origin', publicOrigin);
+  }
   Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+  return script;
 }
 
 function setStamp(origin: string): void {
@@ -30,6 +34,102 @@ afterEach(() => {
 });
 
 describe('creative/first_party.ts', () => {
+  it('does not proxy a server-rewritten resource when bundle and configured origins differ', async () => {
+    vi.stubGlobal('location', {
+      href: 'https://www.publisher.example/article',
+      origin: 'https://www.publisher.example',
+    });
+    setCurrentScript(
+      'https://www.publisher.example/static/runtime.js',
+      'https://ads.publisher.example:8443'
+    );
+    const { shouldProxyExternalUrl } =
+      await import('../../../src/integrations/creative/proxy_sign');
+
+    expect(
+      shouldProxyExternalUrl(
+        'https://ads.publisher.example:8443/first-party/proxy?tsurl=https%3A%2F%2Fimg.example%2Fpixel.gif&tstoken=signed'
+      )
+    ).toBe(false);
+  });
+
+  it.each([
+    [`${SCRIPT_ORIGIN}/first-party/proxy?token=1`, true],
+    ['https://configured.example:9443/first-party/proxy?token=1', true],
+    ['https://configured.example:9443/first-party/proxy-extra', false],
+    ['https://configured.example:9443/first-party/proxy/', false],
+    ['https://configured.example:9443/first-party/Proxy', false],
+    ['https://configured.example/first-party/proxy', false],
+    ['https://configured.example:8443/first-party/proxy', false],
+    ['http://configured.example:9443/first-party/proxy', false],
+    ['https://foreign.example/first-party/proxy', false],
+  ])('recognizes exact proxy paths on either captured origin: %s', async (value, expected) => {
+    setCurrentScript(`${SCRIPT_ORIGIN}/static/runtime.js`, 'https://configured.example:9443');
+    const { isFirstPartyProxyUrl, resolveFirstPartyPath } =
+      await import('../../../src/integrations/creative/first_party');
+
+    expect(isFirstPartyProxyUrl(value)).toBe(expected);
+    expect(resolveFirstPartyPath('/first-party/sign')).toBe(`${SCRIPT_ORIGIN}/first-party/sign`);
+    expect(resolveFirstPartyPath('/first-party/proxy-rebuild')).toBe(
+      `${SCRIPT_ORIGIN}/first-party/proxy-rebuild`
+    );
+  });
+
+  it.each([
+    undefined,
+    '',
+    'not an origin',
+    '/relative',
+    'null',
+    'data:text/plain,origin',
+    'ftp://configured.example',
+  ])('ignores missing or unusable configured metadata: %s', async (metadata) => {
+    setCurrentScript(`${SCRIPT_ORIGIN}/static/runtime.js`, metadata);
+    const { isFirstPartyProxyUrl, firstPartyOrigin } =
+      await import('../../../src/integrations/creative/first_party');
+    expect(firstPartyOrigin()).toBe(SCRIPT_ORIGIN);
+    expect(isFirstPartyProxyUrl(`${SCRIPT_ORIGIN}/first-party/proxy`)).toBe(true);
+    expect(isFirstPartyProxyUrl('https://configured.example/first-party/proxy')).toBe(false);
+  });
+
+  it.each([
+    ['https://CONFIGURED.example:443/', 'https://configured.example'],
+    ['http://CONFIGURED.example:80/', 'http://configured.example'],
+  ])('normalizes configured default ports: %s', async (metadata, origin) => {
+    setCurrentScript(`${SCRIPT_ORIGIN}/static/runtime.js`, metadata);
+    const { isFirstPartyProxyUrl } = await import('../../../src/integrations/creative/first_party');
+    expect(isFirstPartyProxyUrl(`${origin}/first-party/proxy`)).toBe(true);
+    expect(isFirstPartyProxyUrl(`${origin}:9443/first-party/proxy`)).toBe(false);
+  });
+
+  it('reads the executing script once and pins metadata against later mutation and replacement', async () => {
+    const script = setCurrentScript(
+      `${SCRIPT_ORIGIN}/static/runtime.js`,
+      'https://configured.example'
+    )!;
+    const getScript = vi.fn(() => script);
+    Object.defineProperty(document, 'currentScript', { configurable: true, get: getScript });
+    const { firstPartyOrigin, isFirstPartyProxyUrl } =
+      await import('../../../src/integrations/creative/first_party');
+    expect(getScript).toHaveBeenCalledTimes(1);
+
+    script.setAttribute('data-ts-public-origin', 'https://changed.example');
+    script.src = 'https://changed.example/runtime.js';
+    setCurrentScript('https://replacement.example/runtime.js', 'https://replacement.example');
+    expect(firstPartyOrigin()).toBe(SCRIPT_ORIGIN);
+    expect(isFirstPartyProxyUrl('https://configured.example/first-party/proxy')).toBe(true);
+    expect(isFirstPartyProxyUrl('https://changed.example/first-party/proxy')).toBe(false);
+    expect(isFirstPartyProxyUrl('https://replacement.example/first-party/proxy')).toBe(false);
+  });
+
+  it('captures spoofed configured metadata before startup, without authenticating it', async () => {
+    setCurrentScript(`${SCRIPT_ORIGIN}/static/runtime.js`, 'https://attacker.invalid');
+    const { isFirstPartyProxyUrl, firstPartyOrigin } =
+      await import('../../../src/integrations/creative/first_party');
+    expect(isFirstPartyProxyUrl('https://attacker.invalid/first-party/proxy')).toBe(true);
+    expect(firstPartyOrigin()).toBe(SCRIPT_ORIGIN);
+  });
+
   it('pins script origin ahead of a different document and parent stamp', async () => {
     setCurrentScript(`${SCRIPT_ORIGIN}/static/tsjs=tsjs-unified.min.js?v=hash`);
     setStamp(STAMP_ORIGIN);

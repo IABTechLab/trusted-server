@@ -47,6 +47,13 @@ The CLI environment overlay still replaces only scalar leaves already present
 in TOML. An environment variable cannot create an omitted `public_origin` key.
 No global overlay behavior changes.
 
+App-config construction and deserialization emit advisory diagnostics after
+normalization. Warn for an omitted origin, an explicit host outside the EC cookie
+scope derived from `publisher.domain`, and explicit non-loopback HTTP. Preserve
+successful validation for these cases. `Validate::validate` remains free of
+logging, so validating the same object repeatedly does not repeat diagnostics.
+Use static messages without interpolating configuration values.
+
 ## URL construction and rendering
 
 ```mermaid
@@ -57,11 +64,16 @@ flowchart TD
     Normalize --> Responses[Absolute sign and rebuild response URLs]
     Inline[Publisher inline renderer request origin] --> Override[Existing explicit proxy/click origin override]
     Script[Injected classic script origin] --> Endpoints[Runtime sign/rebuild endpoint origin]
+    Normalize --> Metadata[Runtime script data-ts-public-origin attribute]
+    Metadata --> Recognition[Exact already-proxied origin and path recognition]
+    Script --> Recognition
     Stamp[Existing trusted parent stamp] --> Legacy[Fallback resolution for legacy relative navigation]
 ```
 
-- Qualify the shared signed-URL builder's root-relative outputs. HTML attributes,
-  CSS, `srcset` and `/first-party/sign` then share one output rule.
+- Resolve the output origin at the rewrite boundary and pass it explicitly to
+  shared signed-URL builders. HTML attributes, CSS, `srcset` and
+  `/first-party/sign` share this rule without inferring origin choice from a
+  path's leading slash.
 - Qualify `/first-party/proxy-rebuild` JSON output and redirect `Location` with the
   same configured public origin.
 - Use one creative runtime-tag generator for both `<body>` insertion and the
@@ -89,9 +101,16 @@ remains pinned. This accepted script-first contract does not promise protection
 against that pre-load spoofing. Browser coverage must distinguish it from later
 mutations and from attempts to overwrite the stamp itself.
 
-Use the endpoint origin for sign/rebuild requests and exact-origin/exact-path
-proxy recognition. Do not mistake another host's `/first-party/proxy` for a
-Trusted Server proxy URL.
+Use the endpoint origin for sign/rebuild requests. Both publisher-page and
+creative-runtime script tags carry the configured effective public origin in
+`data-ts-public-origin`; capture it synchronously alongside the script origin.
+Recognize an existing proxy URL only when its exact `/first-party/proxy` path is
+on the endpoint origin or this configured origin. The additional recognition
+origin does not retarget sign/rebuild endpoints or replace the legacy stamp.
+Missing or unusable metadata retains legacy behavior. Later attribute mutations
+must not change the captured origins. As with the script source, earlier scripts
+can spoof the metadata before capture; it is not an authenticated identity.
+Do not mistake another host's `/first-party/proxy` for a Trusted Server proxy URL.
 
 Keep successful rebuilt signed click values absolute in both `href` and
 `data-tsclick`. A later unchanged click or second mutation must not drop the
@@ -155,6 +174,12 @@ source selection and bundle hashes should remain unchanged.
   expected output authority where those tests pin root-relative generated URLs.
 - Test HTML, CSS, `srcset`, click, runtime-tag, sign and rebuild outputs, original
   signatures, reserved fields, and absolute/legacy input compatibility.
+- Test a publisher bundle loaded from the document origin with a different
+  configured proxy origin. Enable image and iframe render guards and assert
+  generated proxy URLs remain unchanged with no extra signing requests. Cover
+  emitted independent IIFEs and a real browser using server-generated metadata.
+  Pin exact path, foreign host, ports, invalid/missing metadata, and post-capture
+  mutations while retaining script-origin-first endpoint selection.
 - Test distinct document/script/stamp origins, missing script, opaque srcdoc,
   repeated JSON repair/navigation, raw-resource fallback, GET fallback and
   long-URL form navigation. A mocked successful cross-origin POST test does not

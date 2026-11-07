@@ -6372,7 +6372,7 @@ mod tests {
                 let generated = crate::creative::build_proxy_url(
                     &settings,
                     "https://cdn.example.com/ad.png",
-                    "",
+                    &settings.publisher.effective_public_origin(),
                 );
                 let resolved = foreign
                     .join(&generated)

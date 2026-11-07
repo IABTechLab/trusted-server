@@ -20,7 +20,27 @@ pub fn tsjs_script_tag_with_attributes(
     module_ids: &[&str],
     attributes: &[(&'static str, &'static str)],
 ) -> String {
-    let attributes = attributes
+    script_tag_with_source(&tsjs_script_src(module_ids), attributes, None)
+}
+
+/// Runtime tag with the configured origin used to recognize existing proxy URLs.
+///
+/// Dynamic source and origin values are escaped independently of trusted static attributes.
+#[must_use]
+pub(crate) fn tsjs_script_tag_with_public_origin(
+    src: &str,
+    attributes: &[(&'static str, &'static str)],
+    public_origin: &str,
+) -> String {
+    script_tag_with_source(src, attributes, Some(public_origin))
+}
+
+fn script_tag_with_source(
+    src: &str,
+    attributes: &[(&'static str, &'static str)],
+    public_origin: Option<&str>,
+) -> String {
+    let mut attributes = attributes
         .iter()
         .map(|(name, value)| {
             debug_assert!(
@@ -40,10 +60,25 @@ pub fn tsjs_script_tag_with_attributes(
         })
         .collect::<String>();
 
+    if let Some(public_origin) = public_origin {
+        attributes.push_str(&format!(
+            " data-ts-public-origin=\"{}\"",
+            escape_attribute_value(public_origin)
+        ));
+    }
+
     format!(
         "<script src=\"{}\" id=\"trustedserver-js\"{attributes}></script>",
-        tsjs_script_src(module_ids),
+        escape_attribute_value(src),
     )
+}
+
+fn escape_attribute_value(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// `/static` URL for the unified bundle when exact module IDs are unavailable.
@@ -207,6 +242,46 @@ mod tests {
             tsjs_script_tag(&module_ids),
             format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
             "should keep the generic tag byte-for-byte unmarked"
+        );
+    }
+
+    #[test]
+    fn runtime_metadata_preserves_source_hash_and_static_attributes() {
+        let src = tsjs_script_src(&["gpt", "creative"]);
+        let origin = String::from("https://ads.publisher.example:8443");
+        assert_eq!(
+            tsjs_script_tag_with_public_origin(
+                &src,
+                &[("data-ts-gam-attribution", "true")],
+                &origin,
+            ),
+            format!(
+                "<script src=\"{src}\" id=\"trustedserver-js\" data-ts-gam-attribution=\"true\" data-ts-public-origin=\"{origin}\"></script>"
+            ),
+            "should add metadata without changing the source or static attributes"
+        );
+    }
+
+    #[test]
+    fn runtime_metadata_escapes_dynamic_values() {
+        assert_eq!(
+            tsjs_script_tag_with_public_origin(
+                "/static/test?v=a&b=\"<x>\"",
+                &[],
+                "https://example.com/\"<&>"
+            ),
+            "<script src=\"/static/test?v=a&amp;b=&quot;&lt;x&gt;&quot;\" id=\"trustedserver-js\" data-ts-public-origin=\"https://example.com/&quot;&lt;&amp;&gt;\"></script>",
+            "should escape dynamic source and origin without introducing attributes or markup"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn runtime_metadata_keeps_static_attribute_contract() {
+        let _ = tsjs_script_tag_with_public_origin(
+            "/static/test",
+            &[("data-static", "bad&value")],
+            "https://example.com",
         );
     }
 

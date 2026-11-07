@@ -34,6 +34,15 @@ including for GET rebuild navigation, even while the parent stamp remains
 unchanged. The pinned stamp still supplies legacy relative navigation and the
 endpoint fallback when no usable script origin exists.
 
+Both publisher-page and creative-runtime script tags also carry the configured
+origin in `data-ts-public-origin`. The runtime captures it once alongside the
+script origin to recognize already-proxied resources on either origin, requiring
+the exact `/first-party/proxy` path. This prevents a publisher-page render guard
+from proxying a server-generated resource again when the bundle and configured
+endpoint use different origins. The attribute does not change sign/rebuild
+endpoint selection or the legacy parent stamp. Like the script source, it is not
+authenticated against scripts that run before the runtime captures it.
+
 ## How It Works
 
 ```mermaid

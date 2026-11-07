@@ -17,6 +17,7 @@ smoke_require_spin_version
 WORKSPACE=$(smoke_make_workspace spin)
 ORIGIN_PORT=${SPIN_SMOKE_ORIGIN_PORT:-19189}
 BASE_PORT=${SPIN_SMOKE_PORT:-19180}
+POSITIVE_PORT=$((BASE_PORT + 4))
 ORIGIN_PID=""
 APP_PID=""
 CONFIG_PUSHED=false
@@ -43,7 +44,7 @@ fi
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
 ORIGIN_PID=$SMOKE_ORIGIN_PID
 # The positive case uses the final listener in the case sequence.
-smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT" "$((BASE_PORT + 4))"
+smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT" "$POSITIVE_PORT"
 
 SPIN_WORK="$WORKSPACE/spin"
 mkdir -p "$SPIN_WORK"
@@ -135,6 +136,6 @@ run_case missing-proxy "$((BASE_PORT + 2))" "$SPIN_PROXY_VAR" 503 \
     "resolved secret at \`publisher.proxy_secret\` must not be empty"
 run_case missing-ec "$((BASE_PORT + 3))" "$SPIN_EC_VAR" 503 \
     "resolved secret at \`ec.passphrase\` must not be empty"
-run_case positive "$((BASE_PORT + 4))" "" 200
+run_case positive "$POSITIVE_PORT" "" 200
 
 echo "Spin first-success smoke passed"

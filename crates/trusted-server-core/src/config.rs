@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
 use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use url::{Host, Url};
 use validator::{Validate, ValidationError, ValidationErrors};
 
 use crate::ec::registry::PartnerRegistry;
@@ -75,13 +76,20 @@ impl TrustedServerAppConfig {
     /// fails.
     pub fn new(mut settings: Settings) -> Result<Self, Report<TrustedServerError>> {
         settings.publisher.normalize()?;
-        let app_config = Self { settings };
+        let app_config = Self::from_normalized_settings(settings);
         edgezero_core::app_config::validate_excluding_secrets(&app_config).map_err(|errors| {
             Report::new(TrustedServerError::Configuration {
                 message: format!("Configuration validation failed: {errors}"),
             })
         })?;
         Ok(app_config)
+    }
+
+    fn from_normalized_settings(settings: Settings) -> Self {
+        for diagnostic in publisher_origin_diagnostics(&settings.publisher) {
+            log::warn!("{diagnostic}");
+        }
+        Self { settings }
     }
 
     /// Consumes the wrapper and returns the inner [`Settings`].
@@ -115,19 +123,58 @@ impl<'de> Deserialize<'de> for TrustedServerAppConfig {
         settings
             .normalize_deserialized()
             .map_err(serde::de::Error::custom)?;
-        Ok(Self { settings })
+        Ok(Self::from_normalized_settings(settings))
     }
+}
+
+fn publisher_origin_diagnostics(publisher: &crate::settings::Publisher) -> Vec<&'static str> {
+    let Some(origin) = publisher.public_origin.as_deref() else {
+        return vec![
+            "publisher.public_origin is unset; generated first-party URLs use https://{publisher.domain}, not the serving page's scheme, host or port. Verify this endpoint before deployment, or configure publisher.public_origin.",
+        ];
+    };
+    // Syntax errors belong to normalization and validation, not advisories.
+    let Ok(origin) = Url::parse(origin) else {
+        return Vec::new();
+    };
+    let Some(host) = origin.host() else {
+        return Vec::new();
+    };
+    let host_name = host.to_string().to_ascii_lowercase();
+    let domain = publisher.domain.to_ascii_lowercase();
+    let in_cookie_scope = host_name == domain
+        || host_name
+            .strip_suffix(&domain)
+            .is_some_and(|prefix| prefix.ends_with('.'));
+    let loopback = match host {
+        Host::Domain(name) => {
+            let name = name.trim_end_matches('.');
+            name == "localhost" || name.ends_with(".localhost")
+        }
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => {
+            address.is_loopback()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|address| address.is_loopback())
+        }
+    };
+    let mut diagnostics = Vec::new();
+    if !in_cookie_scope {
+        diagnostics.push(
+            "publisher.public_origin is outside the EC cookie scope derived from publisher.domain; EC cookies are not shared with this host. Verify this endpoint before deployment.",
+        );
+    }
+    if origin.scheme() == "http" && !loopback {
+        diagnostics.push(
+            "publisher.public_origin uses HTTP on a non-loopback host; first-party URLs do not use encrypted transport. Use HTTPS before deployment unless HTTP is intentional.",
+        );
+    }
+    diagnostics
 }
 
 impl Validate for TrustedServerAppConfig {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        // Deploy-time secret fields hold key names, whose runtime value errors
-        // EdgeZero prunes after this call. Do not gate the warning on them.
-        if self.settings.publisher.public_origin.is_none() {
-            log::warn!(
-                "publisher.public_origin is unset; generated first-party URLs use https://{{publisher.domain}}, not the serving page's scheme, host or port. Verify this endpoint before deployment, or configure publisher.public_origin."
-            );
-        }
         let mut errors = self.settings.validate().err().unwrap_or_default();
         if let Err(report) = validate_settings_for_deploy(&self.settings) {
             errors.add(
@@ -638,6 +685,134 @@ formats = [{ width = 300, height = 250 }]
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
         settings
+    }
+
+    #[test]
+    fn public_origin_diagnostics_use_ec_domain_and_dns_boundaries() {
+        let mut publisher = valid_settings().publisher;
+        publisher.domain = "PuBlIsHeR.ExAmPlE".to_owned();
+        publisher.cookie_domain = ".foreign.example".to_owned();
+        for (origin, outside_scope) in [
+            ("https://publisher.example", false),
+            ("https://ADS.PUBLISHER.EXAMPLE:8443", false),
+            ("https://nested.ads.publisher.example", false),
+            ("https://publisher.example.", true),
+            ("https://ads.publisher.example.", true),
+            ("https://notpublisher.example", true),
+            ("https://publisher.example.foreign.example", true),
+            ("https://foreign.example", true),
+        ] {
+            publisher.public_origin = Some(origin.to_owned());
+            let diagnostics = publisher_origin_diagnostics(&publisher);
+            assert_eq!(
+                diagnostics.len(),
+                usize::from(outside_scope),
+                "should classify {origin} against publisher.domain, not cookie_domain"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|message| message.contains("outside the EC cookie scope"))
+            );
+        }
+    }
+
+    #[test]
+    fn public_origin_transport_diagnostics_distinguish_loopback_hosts() {
+        let mut publisher = valid_settings().publisher;
+        publisher.domain = "localhost".to_owned();
+        for (scheme, host, transport_warning, scope_warning) in [
+            ("http", "localhost", false, false),
+            ("http", "LOCALHOST", false, false),
+            ("http", "localhost.", false, true),
+            ("http", "app.localhost", false, false),
+            ("http", "127.0.0.1", false, true),
+            ("http", "127.2.3.4", false, true),
+            ("http", "127.1", false, true),
+            ("http", "[::1]", false, true),
+            ("http", "[0:0:0:0:0:0:0:1]", false, true),
+            ("http", "[::ffff:127.0.0.1]", false, true),
+            ("http", "0.0.0.0", true, true),
+            ("http", "192.0.2.1", true, true),
+            ("http", "[::ffff:192.0.2.1]", true, true),
+            ("http", "[2001:db8::1]", true, true),
+            ("http", "notlocalhost", true, true),
+            ("http", "localhost.foreign.example", true, true),
+            ("https", "foreign.example", false, true),
+        ] {
+            let origin = format!("{scheme}://{host}:7676");
+            publisher.public_origin = Some(origin.clone());
+            let diagnostics = publisher_origin_diagnostics(&publisher);
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .any(|message| message.contains("HTTP on a non-loopback host")),
+                transport_warning,
+                "should classify transport for {origin}"
+            );
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .any(|message| message.contains("outside the EC cookie scope")),
+                scope_warning,
+                "should retain the localhost/IP scope mismatch for {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_origin_diagnostics_emit_once_per_boundary_and_validation_is_silent() {
+        let capture = crate::test_support::logging::WarningCapture::start();
+        for (origin, expected_warnings) in [
+            (None, 1),
+            (Some("HTTP://FOREIGN.EXAMPLE:8080"), 2),
+            (Some("HTTPS://ADS.PUBLISHER.EXAMPLE:443"), 0),
+            (Some("HTTPS://PUBLISHER.EXAMPLE.:443"), 1),
+        ] {
+            let mut settings = valid_settings();
+            settings.publisher.domain = "publisher.example".to_owned();
+            settings.publisher.public_origin = origin.map(str::to_owned);
+            let constructed = TrustedServerAppConfig::new(settings)
+                .expect("should construct config with advisory-only origin diagnostics");
+            let warnings = capture.take();
+            assert_eq!(warnings.len(), expected_warnings);
+            assert!(
+                warnings.iter().all(|warning| {
+                    warning.target == module_path!().trim_end_matches("::tests")
+                        && !warning.message.contains("FOREIGN")
+                        && !warning.message.contains("foreign.example")
+                }),
+                "should log only static diagnostic messages"
+            );
+            let data = serde_json::to_value(&constructed).expect("should serialize config");
+            let expected_hash =
+                BlobEnvelope::new(data.clone(), "2026-01-01T00:00:00Z".to_owned()).sha256;
+            let deserialized: TrustedServerAppConfig = serde_json::from_value(data.clone())
+                .expect("should deserialize config with advisory-only origin diagnostics");
+            assert_eq!(
+                capture.take().len(),
+                warnings.len(),
+                "should emit once on deserialization too"
+            );
+            for config in [&constructed, &deserialized] {
+                for _ in 0..3 {
+                    edgezero_core::app_config::validate_excluding_secrets(config)
+                        .expect("should retain successful push-safe validation");
+                    let _ = config.validate();
+                }
+                let serialized = serde_json::to_value(config).expect("should serialize config");
+                assert_eq!(serialized, data, "should not serialize diagnostic state");
+                assert_eq!(
+                    BlobEnvelope::new(serialized, "2026-01-01T00:00:00Z".to_owned()).sha256,
+                    expected_hash,
+                    "should preserve envelope hashes across validation"
+                );
+            }
+            assert!(
+                capture.take().is_empty(),
+                "should not log during repeated validation"
+            );
+        }
     }
 
     #[test]

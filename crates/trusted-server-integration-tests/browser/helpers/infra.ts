@@ -10,7 +10,10 @@ const ORIGIN_PORT = process.env.INTEGRATION_ORIGIN_PORT || "8888";
 
 /** Framework-specific container configuration. */
 const FRAMEWORK_CONFIG: Record<string, { image: string; port: number }> = {
-  nextjs: { image: "test-nextjs:latest", port: 3000 },
+  nextjs: {
+    image: process.env.NEXTJS_TEST_IMAGE || "test-nextjs:latest",
+    port: 3000,
+  },
   wordpress: { image: "test-wordpress:latest", port: 80 },
 };
 
@@ -93,9 +96,14 @@ export function stopContainer(containerId: string): void {
 export async function startViceroy(
   wasmPath: string,
   configPath: string,
+  options: { publicOriginHostname?: string } = {},
 ): Promise<{ process: ChildProcess; baseUrl: string }> {
   const port = await findAvailablePort();
   const baseUrl = `http://127.0.0.1:${port}`;
+  const publicOrigin = new URL(baseUrl);
+  if (options.publicOriginHostname) {
+    publicOrigin.hostname = options.publicOriginHostname;
+  }
   let generator = process.env.VICEROY_CONFIG_GENERATOR_PATH;
   if (!generator) {
     const host = execFileSync("rustc", ["-vV"], { encoding: "utf-8" }).match(
@@ -120,7 +128,7 @@ export async function startViceroy(
       "--output",
       runtimeConfig,
       "--public-origin",
-      baseUrl,
+      publicOrigin.origin,
     ]);
     const child = spawn(
       "viceroy",
