@@ -1,6 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::Aead as _, aead::KeyInit as _};
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::body::{Body as EdgeBody, BodyPayload};
+use edgezero_core::http::RequestParts;
 use edgezero_core::ingress::{InboundOrigin, RequestIngress};
 use error_stack::Report;
 use http::{Request, Response, StatusCode, header};
@@ -58,12 +59,25 @@ pub const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
 /// values before sanitation. Every adapter removes them so a shared configuration
 /// cannot expose an authentication secret to publisher or integration handling.
 pub fn sanitize_trusted_client_ip_headers(
-    req: &mut Request<EdgeBody>,
+    req: &mut RequestParts,
     config: Option<&TrustedClientIpConfig>,
 ) {
     if let Some(config) = config {
-        req.headers_mut().remove(config.ip_header.as_str());
-        req.headers_mut().remove(config.auth_header.as_str());
+        req.headers.remove(config.ip_header.as_str());
+        req.headers.remove(config.auth_header.as_str());
+    }
+}
+
+/// Split a body into buffered bytes or a stream without releasing a streamed body's scope.
+///
+/// A streaming body becomes a stream that keeps any outbound scope owner and
+/// closes it at end of stream, on error, or on drop. A buffered body releases
+/// its owner, because its bytes no longer depend on the scope. A streaming
+/// body is never returned as empty bytes.
+pub(crate) fn into_body_payload(body: EdgeBody) -> BodyPayload {
+    match body.into_stream() {
+        Ok(stream) => BodyPayload::Stream(stream),
+        Err(buffered) => buffered.into_parts().0,
     }
 }
 
@@ -193,7 +207,7 @@ impl RequestInfo {
         req: &Request<EdgeBody>,
         client_info: &ClientInfo,
     ) -> Result<Self, Report<TrustedServerError>> {
-        if let Some(origin) = public_origin(req) {
+        if let Some(origin) = public_origin(req.extensions()) {
             return Ok(Self {
                 host: origin.authority.clone(),
                 scheme: origin.scheme.clone(),
@@ -648,7 +662,9 @@ mod tests {
                 }),
                 edgezero_core::ingress::HeaderFidelity::default(),
             ));
-            crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+            crate::test_support::tests::with_request_parts(&mut request, |parts| {
+                crate::forwarder::prepare_trusted_forwarder(parts, &settings);
+            });
 
             let info = RequestInfo::from_request(&request, &default_client_info())
                 .expect("should accept trusted origin metadata");
@@ -986,7 +1002,9 @@ mod tests {
         );
         set_header(&mut req, "x-unrelated", "preserved");
 
-        sanitize_trusted_client_ip_headers(&mut req, Some(&config));
+        crate::test_support::tests::with_request_parts(&mut req, |parts| {
+            sanitize_trusted_client_ip_headers(parts, Some(&config));
+        });
 
         assert!(
             req.headers().get("x-reader-ip").is_none(),

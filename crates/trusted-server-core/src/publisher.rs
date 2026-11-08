@@ -31,7 +31,8 @@ use brotli::enc::BrotliEncoderParams;
 use brotli::enc::writer::CompressorWriter;
 use chrono::{DateTime, Utc};
 use cookie::CookieJar;
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::body::{Body as EdgeBody, BodyPayload};
+use edgezero_core::error::EdgeError;
 use error_stack::{Report, ResultExt};
 use flate2::read::ZlibDecoder;
 use flate2::write::{GzEncoder, ZlibEncoder};
@@ -75,7 +76,9 @@ use crate::error::TrustedServerError;
 use crate::html_processor::{
     BodyCloseInjection, HtmlProcessorConfig, create_html_processor_with_document_state,
 };
-use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
+use crate::http_util::{
+    RequestInfo, into_body_payload, is_navigation_request, serve_static_with_etag,
+};
 use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
 use crate::platform::{
     ClientInfo, GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices,
@@ -185,8 +188,16 @@ fn body_as_reader(
     Ok(std::io::Cursor::new(bytes))
 }
 
+/// Carries a publisher origin body read error inside a processing report.
+///
+/// [`publisher_stream_error`] takes the error back out, so a response stream
+/// ends with the origin's own [`EdgeError`] and keeps its status class.
+struct OriginBodyError(Option<EdgeError>);
+
 struct BodyChunkSource {
-    body: Option<EdgeBody>,
+    // Converted once from the origin body: buffered bytes, or a stream that
+    // keeps any outbound scope owner alive until it ends.
+    body: Option<BodyPayload>,
     chunk_size: usize,
     max_bytes: usize,
     bytes_seen: usize,
@@ -196,7 +207,7 @@ struct BodyChunkSource {
 impl BodyChunkSource {
     fn new(body: EdgeBody, chunk_size: usize) -> Self {
         Self {
-            body: Some(body),
+            body: Some(into_body_payload(body)),
             chunk_size,
             max_bytes: usize::MAX,
             bytes_seen: 0,
@@ -215,7 +226,7 @@ impl BodyChunkSource {
         // silently reporting end-of-stream on the next call.
         let pulled = match &mut self.body {
             None => Ok(None),
-            Some(EdgeBody::Once(bytes)) => {
+            Some(BodyPayload::Once(bytes)) => {
                 let end = (self.once_offset + self.chunk_size).min(bytes.len());
                 if self.once_offset >= end {
                     Ok(None)
@@ -225,11 +236,12 @@ impl BodyChunkSource {
                     Ok(Some(chunk))
                 }
             }
-            Some(EdgeBody::Stream(stream)) => match stream.next().await {
+            Some(BodyPayload::Stream(stream)) => match stream.next().await {
                 Some(Ok(chunk)) => Ok(Some(chunk)),
                 Some(Err(err)) => Err(Report::new(TrustedServerError::Proxy {
                     message: format!("Failed to read publisher origin body stream: {err}"),
-                })),
+                })
+                .attach_opaque(OriginBodyError(Some(err)))),
                 None => Ok(None),
             },
         };
@@ -287,10 +299,19 @@ fn process_and_encode_chunk<P: StreamProcessor>(
     Ok(Some(bytes::Bytes::from(encoded)))
 }
 
+/// Turn a publisher stream failure into the error that ends the response body.
+///
+/// An origin body read error passes through unchanged. Any other processing
+/// failure becomes an internal error that carries the report text.
 // By-value signature so `map_err(publisher_stream_error)` works directly.
-#[allow(clippy::needless_pass_by_value)]
-fn publisher_stream_error(err: Report<TrustedServerError>) -> std::io::Error {
-    std::io::Error::other(format!("{err:?}"))
+fn publisher_stream_error(mut err: Report<TrustedServerError>) -> EdgeError {
+    if let Some(origin) = err
+        .downcast_mut::<OriginBodyError>()
+        .and_then(|carried| carried.0.take())
+    {
+        return origin;
+    }
+    EdgeError::internal(std::io::Error::other(format!("{err:?}")))
 }
 
 fn not_found_response() -> Response<EdgeBody> {
@@ -2586,7 +2607,7 @@ pub async fn publisher_response_into_streaming_response(
             // eagerly instead measured ~100x worse TTFB than doing nothing.
             let stream = async_stream::try_stream! {
                 let (head, tail) = split_template_at_seam(&template)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    .map_err(|e| EdgeError::internal(std::io::Error::other(e.to_string())))?;
                 let mut encoder = BodyStreamEncoder::new(compression);
                 let encoded_head = encoder
                     .encode_chunk(head.to_vec())
@@ -2637,7 +2658,7 @@ pub async fn publisher_response_into_streaming_response(
                     yield bytes::Bytes::from(trailer);
                 }
             };
-            *response.body_mut() = EdgeBody::from_stream::<_, std::io::Error>(stream);
+            *response.body_mut() = EdgeBody::from_stream(stream);
             Ok(response)
         }
         PublisherResponse::PassThrough { mut response, body } => {
@@ -2730,7 +2751,7 @@ pub async fn publisher_response_into_streaming_response(
                         }
                     }
                 };
-                *response.body_mut() = EdgeBody::from_stream::<_, std::io::Error>(stream);
+                *response.body_mut() = EdgeBody::from_stream(stream);
                 return Ok(response);
             }
 
@@ -2904,7 +2925,7 @@ pub async fn publisher_response_into_streaming_response(
                     }
                 }
             };
-            *response.body_mut() = EdgeBody::from_stream::<_, std::io::Error>(stream);
+            *response.body_mut() = EdgeBody::from_stream(stream);
             Ok(response)
         }
     }
@@ -8151,7 +8172,9 @@ mod tests {
                 edgezero_core::ingress::HeaderFidelity::default(),
             );
             request.extensions_mut().insert(ingress);
-            crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+            crate::test_support::tests::with_request_parts(&mut request, |parts| {
+                crate::forwarder::prepare_trusted_forwarder(parts, &settings)
+            });
             let mut snapshot = request_head_snapshot(&request);
             assert!(
                 snapshot
@@ -8206,7 +8229,9 @@ mod tests {
             snapshot
                 .headers_mut()
                 .insert("x-forwarded-proto", http::HeaderValue::from_static("https"));
-            crate::forwarder::prepare_trusted_forwarder(&mut snapshot, &settings);
+            crate::test_support::tests::with_request_parts(&mut snapshot, |parts| {
+                crate::forwarder::prepare_trusted_forwarder(parts, &settings);
+            });
             let info = crate::http_util::RequestInfo::from_request(
                 &snapshot,
                 &crate::platform::ClientInfo::default(),
@@ -8373,7 +8398,7 @@ mod tests {
         assert_eq!(snapshot.uri(), request.uri());
         assert_eq!(snapshot.headers(), request.headers());
         assert!(
-            matches!(snapshot.body(), EdgeBody::Once(bytes) if bytes.is_empty()),
+            snapshot.body().as_bytes().is_some_and(<[u8]>::is_empty),
             "snapshot should never duplicate the request body"
         );
     }
@@ -10150,12 +10175,12 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr};
 
         use chrono::TimeZone as _;
-        use edgezero_core::router::PreDispatchHook as _;
         use futures::executor::block_on;
 
         use crate::platform::test_support::{
             StubHttpClient, build_services_with_http_client_and_client_ip,
         };
+        use crate::test_support::tests::run_pre_dispatch_hook;
         use crate::trace::{TracePreDispatchHook, TraceTerminalResponse};
 
         fn gate_and_decision(
@@ -10164,17 +10189,13 @@ mod tests {
             TraceCaptureGate,
             crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision,
         ) {
-            let mut request = request("", Some("__Host-ts-console=1"), "document");
+            let request = request("", Some("__Host-ts-console=1"), "document");
             let hook = TracePreDispatchHook::new(
                 Arc::new(settings.clone()),
                 Arc::new(|_| panic!("should not query setup metadata for a publisher document")),
             );
-            assert!(
-                block_on(hook.handle(&mut request))
-                    .expect("should freeze document gate")
-                    .is_none(),
-                "should continue publisher routing"
-            );
+            let mut request = block_on(run_pre_dispatch_hook(hook, request))
+                .expect("should continue publisher routing");
             let decision =
                 crate::integrations::gpt_diagnostics::prepare_request(settings, &mut request)
                     .expect("should prepare active navigation decision");
@@ -10246,7 +10267,7 @@ mod tests {
 
         fn render(
             settings: &Settings,
-            mut request: Request<EdgeBody>,
+            request: Request<EdgeBody>,
             content_type: &str,
         ) -> (Response<EdgeBody>, String) {
             let stub = Arc::new(StubHttpClient::new());
@@ -10262,12 +10283,8 @@ mod tests {
                     panic!("should not request setup metadata on ordinary publisher traffic")
                 }),
             );
-            assert!(
-                block_on(hook.handle(&mut request))
-                    .expect("should freeze ordinary request gate")
-                    .is_none(),
-                "should continue ordinary publisher routing"
-            );
+            let mut request = block_on(run_pre_dispatch_hook(hook, request))
+                .expect("should continue ordinary publisher routing");
             crate::integrations::gpt_diagnostics::prepare_request(settings, &mut request)
                 .expect("should prepare effective diagnostics decision");
             assert!(
@@ -10518,7 +10535,8 @@ mod tests {
                     Arc::new(settings),
                     Arc::new(|_| panic!("should not fetch setup metadata for a document")),
                 );
-                block_on(hook.handle(&mut request)).expect("should capture document gate");
+                let request = block_on(run_pre_dispatch_hook(hook, request))
+                    .expect("should capture document gate");
                 let gate = request
                     .extensions()
                     .get::<TraceCaptureGate>()
@@ -10612,18 +10630,15 @@ mod tests {
             let registry =
                 IntegrationRegistry::new(&settings).expect("should build publisher registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            let body = EdgeBody::Stream(
-                futures::stream::iter([
-                    Ok(bytes::Bytes::from_static(b"<html><hea")),
-                    Ok(bytes::Bytes::from_static(
-                        b"d><title>Example</title></head><head></head><bo",
-                    )),
-                    Ok(bytes::Bytes::from_static(
-                        b"dy>publisher ads remain</body></html>",
-                    )),
-                ])
-                .boxed_local(),
-            );
+            let body = EdgeBody::from_stream(futures::stream::iter([
+                Ok(bytes::Bytes::from_static(b"<html><hea")),
+                Ok(bytes::Bytes::from_static(
+                    b"d><title>Example</title></head><head></head><bo",
+                )),
+                Ok(bytes::Bytes::from_static(
+                    b"dy>publisher ads remain</body></html>",
+                )),
+            ]));
             let mut output = Vec::new();
             block_on(stream_publisher_body_async(
                 body,
@@ -12726,15 +12741,15 @@ mod tests {
         /// can be stored, and one it refused keeps streaming exactly like `inline`. A
         /// helper that assumed either would silently only ever test one of them.
         async fn body_of(response: Response<EdgeBody>) -> Vec<u8> {
-            match response.into_body() {
-                EdgeBody::Stream(mut stream) => {
+            match response.into_body().into_stream() {
+                Ok(mut stream) => {
                     let mut out = Vec::new();
                     while let Some(chunk) = stream.next().await {
                         out.extend_from_slice(&chunk.expect("stream chunk should read"));
                     }
                     out
                 }
-                other => other
+                Err(other) => other
                     .into_bytes()
                     .expect("a non-stream body has its bytes in hand")
                     .to_vec(),
@@ -13337,7 +13352,9 @@ mod tests {
                 request
                     .headers_mut()
                     .insert("x-forwarded-proto", HeaderValue::from_static("https"));
-                crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+                crate::test_support::tests::with_request_parts(&mut request, |parts| {
+                    crate::forwarder::prepare_trusted_forwarder(parts, &settings)
+                });
                 let response = run(&settings, &services, request).await;
                 let body = String::from_utf8(body_of(response).await).expect("should decode HTML");
                 assert!(
@@ -13546,9 +13563,11 @@ mod tests {
                 HeaderValue::from_static("Basic dXNlcjpwYXNz"),
             );
             assert!(
-                crate::auth::enforce_basic_auth(&settings, &mut request)
-                    .expect("should evaluate auth")
-                    .is_none(),
+                crate::test_support::tests::with_request_parts(&mut request, |parts| {
+                    crate::auth::enforce_basic_auth(&settings, parts)
+                })
+                .expect("should evaluate auth")
+                .is_none(),
                 "the original credential should pass edge auth"
             );
             request.headers_mut().insert(
@@ -16635,8 +16654,8 @@ mod tests {
             use super::*;
             use std::net::{IpAddr, Ipv4Addr};
 
+            use crate::test_support::tests::run_pre_dispatch_hook;
             use crate::trace::TracePreDispatchHook;
-            use edgezero_core::router::PreDispatchHook as _;
             use serde::Deserialize as _;
 
             fn decode_script_json(document: &str, prefix: &str) -> serde_json::Value {
@@ -16813,12 +16832,14 @@ mod tests {
                             Arc::new(MemoryTemplateCache::default()),
                             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99)),
                         );
-                        let mut request = navigation_request_with_cookie("__Host-ts-console=1");
-                        TracePreDispatchHook::new(
-                            Arc::clone(&settings),
-                            Arc::new(|_| panic!("should not load setup metadata")),
+                        let request = navigation_request_with_cookie("__Host-ts-console=1");
+                        let mut request = run_pre_dispatch_hook(
+                            TracePreDispatchHook::new(
+                                Arc::clone(&settings),
+                                Arc::new(|_| panic!("should not load setup metadata")),
+                            ),
+                            request,
                         )
-                        .handle(&mut request)
                         .await
                         .expect("should freeze document gate");
                         crate::integrations::gpt_diagnostics::prepare_request(
@@ -16946,19 +16967,15 @@ mod tests {
             async fn run_frozen(
                 settings: &Arc<Settings>,
                 services: &RuntimeServices,
-                mut request: Request<EdgeBody>,
+                request: Request<EdgeBody>,
             ) -> Response<EdgeBody> {
                 let hook = TracePreDispatchHook::new(
                     Arc::clone(settings),
                     Arc::new(|_| panic!("should never query setup metadata for publisher traffic")),
                 );
-                assert!(
-                    hook.handle(&mut request)
-                        .await
-                        .expect("should freeze incoming publisher cookie health")
-                        .is_none(),
-                    "should continue publisher routing"
-                );
+                let mut request = run_pre_dispatch_hook(hook, request)
+                    .await
+                    .expect("should continue publisher routing");
                 crate::integrations::gpt_diagnostics::prepare_request(settings, &mut request)
                     .expect(
                         "should freeze effective document diagnostics before publisher processing",
@@ -17182,11 +17199,13 @@ mod tests {
                                 .parse()
                                 .expect("should build unmatched path");
                         }
-                        TracePreDispatchHook::new(
-                            Arc::clone(&settings),
-                            Arc::new(|_| panic!("should not load setup metadata")),
+                        let mut request = run_pre_dispatch_hook(
+                            TracePreDispatchHook::new(
+                                Arc::clone(&settings),
+                                Arc::new(|_| panic!("should not load setup metadata")),
+                            ),
+                            request,
                         )
-                        .handle(&mut request)
                         .await
                         .expect("should freeze trace gate");
                         crate::integrations::gpt_diagnostics::prepare_request(
@@ -17675,7 +17694,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             // So pull exactly one chunk and prove the auction has not been collected
             // yet — `ad_bids_state` is only written by the collector. No timing
             // involved, so nothing to be flaky about.
-            let EdgeBody::Stream(mut stream) = warm.into_body() else {
+            let Ok(mut stream) = warm.into_body().into_stream() else {
                 panic!("a cache hit must stream, not buffer");
             };
             let first = stream
@@ -23183,7 +23202,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             trace_bootstrap: None,
             suppress_datadome_client_side_tag: false,
         };
-        let body = EdgeBody::from_stream(futures::stream::iter(vec![Ok::<_, io::Error>(
+        let body = EdgeBody::from_external_stream(futures::stream::iter(vec![Ok::<_, io::Error>(
             bytes::Bytes::from_static(b"<html><body>live</body></html>"),
         )]));
         let mut output = Vec::new();
@@ -23796,7 +23815,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     b"chunk",
                 ))))
             });
-            let body = EdgeBody::from_stream(stream);
+            let body = EdgeBody::from_external_stream(stream);
             let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE);
 
             {
@@ -24110,7 +24129,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         .expect("should build streaming response");
 
         assert!(
-            matches!(response.body(), EdgeBody::Stream(_)),
+            response.body().is_stream(),
             "streaming finalize should keep a lazy Body::Stream"
         );
 
@@ -24147,7 +24166,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
     /// the document head but not yet finished the response.
     fn origin_chunk_then_pending(chunk: bytes::Bytes) -> EdgeBody {
         let mut sent = false;
-        EdgeBody::from_stream(futures::stream::poll_fn(move |_cx| {
+        EdgeBody::from_external_stream(futures::stream::poll_fn(move |_cx| {
             if sent {
                 return std::task::Poll::Pending;
             }
@@ -24390,7 +24409,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                         noop_services(),
                     ))
                     .expect("should create lazy limited response");
-                let EdgeBody::Stream(mut stream) = response.into_body() else {
+                let Ok(mut stream) = response.into_body().into_stream() else {
                     panic!("should return lazy output")
                 };
                 let mut failed = false;
@@ -24458,7 +24477,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 noop_services(),
             ))
             .expect("should prepare lazy EOF output");
-            let EdgeBody::Stream(mut stream) = response.into_body() else {
+            let Ok(mut stream) = response.into_body().into_stream() else {
                 panic!("should return a lazy body");
             };
             let first = futures::executor::block_on(stream.next())
@@ -25682,11 +25701,12 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             ));
             let source = b"<html><head></head><body>Example</body></html>";
             let body = match failure {
-                "read" => {
-                    EdgeBody::from_stream(futures::stream::iter(vec![Err::<bytes::Bytes, _>(
-                        io::Error::other("example origin read failure"),
-                    )]))
-                }
+                "read" => EdgeBody::from_external_stream(futures::stream::iter(vec![Err::<
+                    bytes::Bytes,
+                    _,
+                >(
+                    io::Error::other("example origin read failure"),
+                )])),
                 "decode" => {
                     let mut encoded = gzip_encode(source);
                     encoded.truncate(encoded.len() / 2);
@@ -25917,7 +25937,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                                         Ok::<_, io::Error>(bytes::Bytes::copy_from_slice(chunk))
                                     })
                                     .collect();
-                                EdgeBody::from_stream(futures::stream::iter(chunks))
+                                EdgeBody::from_external_stream(futures::stream::iter(chunks))
                             } else {
                                 EdgeBody::from(encoded.clone())
                             };
@@ -26620,7 +26640,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .expect("should finalize buffered response");
 
             assert!(
-                !matches!(response.body(), EdgeBody::Stream(_)),
+                !response.body().is_stream(),
                 "bodiless {method} {status} must not carry a streaming body"
             );
             assert_bodiless_framing(
@@ -29254,7 +29274,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                         Arc::clone(&settings),
                         Arc::new(|_| panic!("should not load SPA setup metadata")),
                     );
-                    edgezero_core::router::PreDispatchHook::handle(&hook, &mut request)
+                    let request = crate::test_support::tests::run_pre_dispatch_hook(hook, request)
                         .await
                         .expect("should freeze SPA gate");
                     let mut ec_context = consent_allowing_ec_context();
@@ -29362,13 +29382,9 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     Arc::clone(&settings),
                     Arc::new(|_| panic!("should not load setup metadata on SPA capture")),
                 );
-                assert!(
-                    edgezero_core::router::PreDispatchHook::handle(&hook, &mut request)
-                        .await
-                        .expect("should freeze SPA cookies")
-                        .is_none(),
-                    "should keep ordinary SPA routing"
-                );
+                let request = crate::test_support::tests::run_pre_dispatch_hook(hook, request)
+                    .await
+                    .expect("should keep ordinary SPA routing");
 
                 let response = run_page_bids_response(&settings, &orchestrator, &[], request).await;
 
@@ -29543,7 +29559,9 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     .header("x-forwarded-proto", "https")
                     .body(EdgeBody::empty())
                     .expect("should construct SPA request");
-                crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+                crate::test_support::tests::with_request_parts(&mut request, |parts| {
+                    crate::forwarder::prepare_trusted_forwarder(parts, &settings)
+                });
                 let mut ec_context = EcContext::new_for_test(
                     None,
                     crate::consent::ConsentContext {

@@ -263,7 +263,7 @@ impl DataDomeIntegration {
     ) -> ProtectionPayload {
         let req = &*input.request;
         let client_info = input.services.client_info();
-        let public_info = crate::forwarder::public_origin(req)
+        let public_info = crate::forwarder::public_origin(req.extensions())
             .and_then(|_| RequestInfo::from_request(req, client_info).ok());
         let request_host = public_info
             .as_ref()
@@ -960,7 +960,9 @@ mod tests {
                     .headers_mut()
                     .remove(crate::forwarder::FORWARDER_AUTH_HEADER);
             }
-            crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+            crate::test_support::tests::with_request_parts(&mut request, |parts| {
+                crate::forwarder::prepare_trusted_forwarder(parts, &settings);
+            });
             let payload = integration.build_protection_payload(
                 &RequestFilterInput {
                     settings: &settings,

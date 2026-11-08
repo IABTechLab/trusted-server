@@ -1,7 +1,8 @@
 use crate::http_util::{
     RequestInfo, compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size,
+    into_body_payload,
 };
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::body::{Body as EdgeBody, BodyPayload};
 use edgezero_core::http::{Uri as EdgeUri, request_builder as edge_request_builder};
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
@@ -249,9 +250,9 @@ pub(crate) fn platform_response_to_fastly(
     platform_resp: PlatformResponse,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let (parts, body) = platform_resp.response.into_parts();
-    let body_bytes = match body {
-        EdgeBody::Once(bytes) => bytes.to_vec(),
-        EdgeBody::Stream(_) => {
+    let body_bytes = match into_body_payload(body) {
+        BodyPayload::Once(bytes) => bytes.to_vec(),
+        BodyPayload::Stream(_) => {
             return Err(Report::new(TrustedServerError::Proxy {
                 message: "streaming platform response body is not supported by Fastly response conversion"
                     .to_string(),
@@ -264,15 +265,11 @@ pub(crate) fn platform_response_to_fastly(
 fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetProxyResponse {
     let (parts, body) = platform_resp.response.into_parts();
 
-    match body {
-        EdgeBody::Once(bytes) => AssetProxyResponse::origin_controlled(Response::from_parts(
-            parts,
-            EdgeBody::from(bytes.to_vec()),
-        )),
-        stream_body @ EdgeBody::Stream(_) => {
-            let resp = Response::from_parts(parts, EdgeBody::empty());
-            AssetProxyResponse::origin_controlled_stream(resp, stream_body)
-        }
+    if body.is_stream() {
+        let resp = Response::from_parts(parts, EdgeBody::empty());
+        AssetProxyResponse::origin_controlled_stream(resp, body)
+    } else {
+        AssetProxyResponse::origin_controlled(Response::from_parts(parts, body))
     }
 }
 
@@ -289,15 +286,15 @@ pub async fn stream_asset_body<W: Write>(
     body: EdgeBody,
     output: &mut W,
 ) -> Result<(), Report<TrustedServerError>> {
-    match body {
-        EdgeBody::Once(bytes) => {
+    match into_body_payload(body) {
+        BodyPayload::Once(bytes) => {
             output
                 .write_all(bytes.as_ref())
                 .change_context(TrustedServerError::Proxy {
                     message: "failed to write buffered platform response body".to_string(),
                 })?;
         }
-        EdgeBody::Stream(mut stream) => {
+        BodyPayload::Stream(mut stream) => {
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|err| {
                     Report::new(TrustedServerError::Proxy {
@@ -1712,7 +1709,7 @@ pub async fn handle_first_party_proxy_sign(
     // adapter forwards verbatim — have no scheme of their own, so parsing would
     // hand back the placeholder base's `https` and make an HTTP dev server sign
     // an HTTPS target it then proxies over TLS against a plaintext service.
-    let request_scheme = match crate::forwarder::public_origin(&req)
+    let request_scheme = match crate::forwarder::public_origin(req.extensions())
         .map(|origin| origin.scheme.clone())
         .or_else(|| req.uri().scheme_str().map(str::to_ascii_lowercase))
     {
@@ -2989,7 +2986,9 @@ mod tests {
             );
             req.headers_mut()
                 .insert("x-forwarded-proto", HeaderValue::from_static("https"));
-            crate::forwarder::prepare_trusted_forwarder(&mut req, &settings);
+            crate::test_support::tests::with_request_parts(&mut req, |parts| {
+                crate::forwarder::prepare_trusted_forwarder(parts, &settings);
+            });
 
             let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
                 .await
@@ -6202,7 +6201,7 @@ mod tests {
     #[test]
     fn stream_asset_body_reports_mid_stream_origin_errors() {
         futures::executor::block_on(async {
-            let body = EdgeBody::from_stream(futures::stream::iter(vec![
+            let body = EdgeBody::from_external_stream(futures::stream::iter(vec![
                 Ok::<Bytes, io::Error>(Bytes::from_static(b"partial")),
                 Err(io::Error::other("origin stream failed")),
             ]));
@@ -6256,7 +6255,7 @@ mod tests {
         // the client renders nothing behind committed headers.
         let events = Rc::new(RefCell::new(Vec::new()));
         let source_events = Rc::clone(&events);
-        let body = EdgeBody::from_stream(async_stream::stream! {
+        let body = EdgeBody::from_external_stream(async_stream::stream! {
             for (index, segment) in ["<html><head>", "</head><body>"].into_iter().enumerate() {
                 source_events
                     .borrow_mut()

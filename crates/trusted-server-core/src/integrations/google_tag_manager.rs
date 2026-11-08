@@ -15,7 +15,7 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::body::{Body as EdgeBody, BodyPayload};
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
 use http::{Method, Request, Response, StatusCode, header};
@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
+use crate::http_util::into_body_payload;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, IntegrationScriptContext,
@@ -949,8 +950,8 @@ impl GoogleTagManagerIntegration {
         body: EdgeBody,
         max_size: usize,
     ) -> Result<Vec<u8>, PayloadSizeError> {
-        match body {
-            EdgeBody::Once(bytes) => {
+        match into_body_payload(body) {
+            BodyPayload::Once(bytes) => {
                 if bytes.len() > max_size {
                     log::warn!(
                         "POST body size {} exceeds max {} (rejected before proxy)",
@@ -964,7 +965,7 @@ impl GoogleTagManagerIntegration {
                 }
                 Ok(bytes.to_vec())
             }
-            EdgeBody::Stream(mut stream) => {
+            BodyPayload::Stream(mut stream) => {
                 let mut body_bytes = Vec::new();
                 while let Some(chunk_result) = stream.next().await {
                     let chunk = chunk_result.map_err(|error| {

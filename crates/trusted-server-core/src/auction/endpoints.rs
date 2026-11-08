@@ -708,11 +708,12 @@ mod tests {
         StubHttpClient, noop_services,
     };
     use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::test_support::tests::{
+        crate_test_settings_str, create_test_settings, run_pre_dispatch_hook,
+    };
     use crate::trace::TracePreDispatchHook;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use edgezero_core::router::PreDispatchHook as _;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -1225,7 +1226,7 @@ mod tests {
             .client_info(ClientInfo::default())
             .build();
         let body = json!({"adUnits":[{"code":"slot","mediaTypes":{"banner":{"sizes":[[300,250]]}},"ext":{"trusted_server":{"trace_slot_ref":SLOT_REF}}}]});
-        let mut request = Request::builder()
+        let request = Request::builder()
             .method("POST")
             .uri("https://publisher.example.com/auction")
             .header(header::COOKIE, "__Host-ts-console=1")
@@ -1233,11 +1234,13 @@ mod tests {
                 serde_json::to_vec(&body).expect("should encode source token"),
             ))
             .expect("should build request");
-        TracePreDispatchHook::new(
-            Arc::clone(&settings),
-            Arc::new(|_| panic!("should not load API setup metadata")),
+        let request = run_pre_dispatch_hook(
+            TracePreDispatchHook::new(
+                Arc::clone(&settings),
+                Arc::new(|_| panic!("should not load API setup metadata")),
+            ),
+            request,
         )
-        .handle(&mut request)
         .await
         .expect("should freeze trace gate");
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
@@ -1335,11 +1338,13 @@ mod tests {
                     "__Host-ts-console=1".parse().expect("should build cookie"),
                 );
             }
-            TracePreDispatchHook::new(
-                Arc::clone(&settings),
-                Arc::new(|_| panic!("should not load API setup metadata")),
+            let request = run_pre_dispatch_hook(
+                TracePreDispatchHook::new(
+                    Arc::clone(&settings),
+                    Arc::new(|_| panic!("should not load API setup metadata")),
+                ),
+                request,
             )
-            .handle(&mut request)
             .await
             .expect("should freeze cookie gate");
             let response = handle_auction(
@@ -1449,7 +1454,7 @@ mod tests {
                 "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
             }]
         });
-        let mut request = Request::builder()
+        let request = Request::builder()
             .method("POST")
             .header("cookie", "__Host-ts-console=1")
             .uri("https://test-publisher.example/auction")
@@ -1462,13 +1467,9 @@ mod tests {
             Arc::clone(&settings),
             Arc::new(|_| panic!("should not load setup metadata on API capture")),
         );
-        assert!(
-            hook.handle(&mut request)
-                .await
-                .expect("should freeze API cookies")
-                .is_none(),
-            "should retain ordinary API routing"
-        );
+        let request = run_pre_dispatch_hook(hook, request)
+            .await
+            .expect("should retain ordinary API routing");
 
         let response = handle_auction(
             &settings,

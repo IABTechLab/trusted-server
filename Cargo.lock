@@ -206,9 +206,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.42"
+version = "0.4.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e79b3f8a79cccc2898f31920fc69f304859b3bd567490f75ebf51ae1c792a9ac"
+checksum = "3976abdc8fe7d1133d43d304afd42abdf5bc3e1319d263d223bde07b5efc4be8"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -528,9 +528,9 @@ dependencies = [
 
 [[package]]
 name = "brotli-decompressor"
-version = "5.0.3"
+version = "5.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a32acac15fe1967bc3986b2a6347dffc965602354ea6f450ad07e8bfd253583"
+checksum = "5962523e1b92ce1b5e793d9169b9943eece10d39f62550bc04bb605d75b94924"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
@@ -576,9 +576,9 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
-version = "1.12.0"
+version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 dependencies = [
  "serde",
 ]
@@ -1530,9 +1530,10 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.11#87456c708ffe9edf86b3a0f8b06dfd15d60b07b5"
+source = "git+https://github.com/IABTechLab/edgezero?rev=dcbf622f16cb7c610e00cadf9edc1a50e9ad969c#dcbf622f16cb7c610e00cadf9edc1a50e9ad969c"
 dependencies = [
  "base16ct 1.0.0",
+ "edgezero-core",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -1543,9 +1544,10 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.11#87456c708ffe9edf86b3a0f8b06dfd15d60b07b5"
+source = "git+https://github.com/IABTechLab/edgezero?rev=dcbf622f16cb7c610e00cadf9edc1a50e9ad969c#dcbf622f16cb7c610e00cadf9edc1a50e9ad969c"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "bytes",
@@ -1555,9 +1557,14 @@ dependencies = [
  "futures",
  "futures-util",
  "http",
+ "http-body",
+ "hyper",
+ "hyper-util",
+ "libc",
  "log",
  "redb",
  "reqwest 0.13.4",
+ "serde",
  "serde_json",
  "simple_logger",
  "thiserror 2.0.18",
@@ -1571,9 +1578,10 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.11#87456c708ffe9edf86b3a0f8b06dfd15d60b07b5"
+source = "git+https://github.com/IABTechLab/edgezero?rev=dcbf622f16cb7c610e00cadf9edc1a50e9ad969c#dcbf622f16cb7c610e00cadf9edc1a50e9ad969c"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "brotli",
  "bytes",
@@ -1588,13 +1596,15 @@ dependencies = [
  "tempfile",
  "toml_edit 0.25.12+spec-1.1.0",
  "walkdir",
+ "wasm-streams",
+ "web-sys",
  "worker",
 ]
 
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.11#87456c708ffe9edf86b3a0f8b06dfd15d60b07b5"
+source = "git+https://github.com/IABTechLab/edgezero?rev=dcbf622f16cb7c610e00cadf9edc1a50e9ad969c#dcbf622f16cb7c610e00cadf9edc1a50e9ad969c"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1607,6 +1617,8 @@ dependencies = [
  "edgezero-adapter",
  "edgezero-core",
  "fastly",
+ "fastly-shared",
+ "fastly-sys",
  "fern",
  "flate2",
  "futures",
@@ -1624,16 +1636,15 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.11#87456c708ffe9edf86b3a0f8b06dfd15d60b07b5"
+source = "git+https://github.com/IABTechLab/edgezero?rev=dcbf622f16cb7c610e00cadf9edc1a50e9ad969c#dcbf622f16cb7c610e00cadf9edc1a50e9ad969c"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
- "brotli",
  "bytes",
  "ctor",
  "edgezero-adapter",
  "edgezero-core",
- "flate2",
  "futures",
  "futures-util",
  "log",
@@ -1651,7 +1662,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.11#87456c708ffe9edf86b3a0f8b06dfd15d60b07b5"
+source = "git+https://github.com/IABTechLab/edgezero?rev=dcbf622f16cb7c610e00cadf9edc1a50e9ad969c#dcbf622f16cb7c610e00cadf9edc1a50e9ad969c"
 dependencies = [
  "chrono",
  "clap",
@@ -1676,31 +1687,43 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.11#87456c708ffe9edf86b3a0f8b06dfd15d60b07b5"
+source = "git+https://github.com/IABTechLab/edgezero?rev=dcbf622f16cb7c610e00cadf9edc1a50e9ad969c#dcbf622f16cb7c610e00cadf9edc1a50e9ad969c"
 dependencies = [
+ "adler2",
+ "alloc-no-stdlib",
+ "alloc-stdlib",
  "anyhow",
  "async-compression",
  "async-stream",
  "async-trait",
  "base16ct 1.0.0",
+ "brotli",
+ "brotli-decompressor",
  "bytes",
+ "compression-codecs",
+ "compression-core",
+ "crc32fast",
  "edgezero-macros",
+ "flate2",
  "futures",
  "futures-util",
  "http",
  "http-body",
  "log",
  "matchit 0.9.2",
+ "miniz_oxide",
  "ryu",
  "serde",
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
  "sha2 0.11.1",
+ "simd-adler32",
  "thiserror 2.0.18",
  "toml",
  "tower-service",
  "tracing",
+ "url",
  "validator",
  "web-time",
 ]
@@ -1708,14 +1731,14 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.11#87456c708ffe9edf86b3a0f8b06dfd15d60b07b5"
+source = "git+https://github.com/IABTechLab/edgezero?rev=dcbf622f16cb7c610e00cadf9edc1a50e9ad969c#dcbf622f16cb7c610e00cadf9edc1a50e9ad969c"
 dependencies = [
  "log",
  "proc-macro2",
  "quote",
  "serde",
  "serde_json",
- "syn 3.0.4",
+ "syn 3.0.9",
  "toml",
  "validator",
 ]
@@ -3311,9 +3334,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.10.1"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498"
+checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3425,7 +3448,7 @@ dependencies = [
  "num-derive",
  "num-iter",
  "num-traits",
- "prettyplease",
+ "prettyplease 0.2.37",
  "proc-macro2",
  "quote",
  "strum_macros",
@@ -4715,6 +4738,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "prettyplease"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bfe0f4c752e450fc2faf62654f1c134747922825d5b04ca717b8874f41a40c0"
+dependencies = [
+ "proc-macro2",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "primeorder"
 version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4795,7 +4828,7 @@ dependencies = [
  "multimap",
  "once_cell",
  "petgraph",
- "prettyplease",
+ "prettyplease 0.2.37",
  "prost 0.13.5",
  "prost-types 0.13.5",
  "regex",
@@ -5897,8 +5930,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 [[package]]
 name = "spin-macro"
 version = "7.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac8a641da857d4e7cada31a853c40180eeb10485a0f2f0282d0a7e5a2a4105d4"
+source = "git+https://github.com/stackpop/spin-rust-sdk.git?rev=6c59ed5b4fcb377072763aee0b27a3abdd8edb72#6c59ed5b4fcb377072763aee0b27a3abdd8edb72"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5908,8 +5940,7 @@ dependencies = [
 [[package]]
 name = "spin-sdk"
 version = "7.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b7a3d9a6805ccdb4d404e91ccf7198ac5e486b6199dc9387aeebaa368272112"
+source = "git+https://github.com/stackpop/spin-rust-sdk.git?rev=6c59ed5b4fcb377072763aee0b27a3abdd8edb72#6c59ed5b4fcb377072763aee0b27a3abdd8edb72"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6049,9 +6080,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.4"
+version = "3.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
+checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7055,9 +7086,9 @@ dependencies = [
 
 [[package]]
 name = "want"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfa7760aed19e106de2c7c0b581b509f2f25d3dacaf737cb82ac61bc6d760b0e"
+checksum = "ec4cdd0dd910afe868b7ef477227d8d538b46b3075031afee8a9f2acb0a2ed0b"
 dependencies = [
  "try-lock",
 ]
@@ -7079,15 +7110,15 @@ dependencies = [
 
 [[package]]
 name = "wasip3"
-version = "0.7.1+wasi-0.3.0"
+version = "0.10.0+wasi-0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75e9ed91ee5a995b6fe16c89d4511a8c12eb76967be20b57557618e02e781bcc"
+checksum = "d1657e9f48c63d6c3f143f70d5c6e2be7d463371a7af1ed939a5b83d3ca080d0"
 dependencies = [
  "bytes",
  "http",
  "http-body",
  "thiserror 2.0.18",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.63.0",
 ]
 
 [[package]]
@@ -7147,9 +7178,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-encoder"
-version = "0.247.0"
+version = "0.262.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30b6733b8b91d010a6ac5b0fb237dc46a19650bc4c67db66857e2e787d437204"
+checksum = "4495a6f85dd94c411c749303efcbc5defade0b0cbdbc0541495241ab917a9b5a"
 dependencies = [
  "leb128fmt",
  "wasmparser",
@@ -7157,9 +7188,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-metadata"
-version = "0.247.0"
+version = "0.262.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "665fe59e56cc9b419ca6fcca56673e3421d1a5011e3b65caf6b726fd9e041d10"
+checksum = "c86ff6668190d9fb70372b306b4f9fe8930f0e2f57ce72e4922bf2f117900949"
 dependencies = [
  "anyhow",
  "indexmap 2.14.0",
@@ -7182,9 +7213,9 @@ dependencies = [
 
 [[package]]
 name = "wasmparser"
-version = "0.247.0"
+version = "0.262.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e6fb4c2bee46c5ea4d40f8cdb5c131725cd976718ec56f1c8e82fbde5fa2a80"
+checksum = "974d643b125b272607e2fff8012ea14a8328acd7621e4bafa7afb32500052b1b"
 dependencies = [
  "bitflags 2.13.0",
  "hashbrown 0.17.1",
@@ -7543,15 +7574,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 dependencies = [
  "bitflags 2.13.0",
+]
+
+[[package]]
+name = "wit-bindgen"
+version = "0.63.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b85a987ab61d365382d25c7d47e26edd48941b3bf6e3fbf76eff918bc71dab06"
+dependencies = [
+ "bitflags 2.13.0",
  "futures",
  "wit-bindgen-rust-macro",
 ]
 
 [[package]]
 name = "wit-bindgen-core"
-version = "0.57.1"
+version = "0.63.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02dee27a2dc20d1008016c742ec9fc6ea498492994ba3750be7454cbc97ff04c"
+checksum = "775e122e390603abfacd548027016cd0113a6e2bf2f8ce6bdd3658b013456ea8"
 dependencies = [
  "anyhow",
  "heck",
@@ -7560,15 +7600,15 @@ dependencies = [
 
 [[package]]
 name = "wit-bindgen-rust"
-version = "0.57.1"
+version = "0.63.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5007dae772945b7a5003d69d90a3a4a78929d41f19d004e980c4259a6af4484"
+checksum = "84e26e13b9d972026778d2ffb7985736de116026fdc8d9464f966e12df2eb240"
 dependencies = [
  "anyhow",
  "heck",
  "indexmap 2.14.0",
- "prettyplease",
- "syn 2.0.118",
+ "prettyplease 0.3.0",
+ "syn 3.0.9",
  "wasm-metadata",
  "wit-bindgen-core",
  "wit-component",
@@ -7576,24 +7616,24 @@ dependencies = [
 
 [[package]]
 name = "wit-bindgen-rust-macro"
-version = "0.57.1"
+version = "0.63.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af9237d678e3513ad24e96fe98beacdc0db6405284ba2a2400418cf0d42caa89"
+checksum = "16a008a0d6b4840677326beb4edbeb210a2f1b7d0183fb7cc33f466b90fd7fb6"
 dependencies = [
  "anyhow",
- "prettyplease",
+ "prettyplease 0.3.0",
  "proc-macro2",
  "quote",
- "syn 2.0.118",
+ "syn 3.0.9",
  "wit-bindgen-core",
  "wit-bindgen-rust",
 ]
 
 [[package]]
 name = "wit-component"
-version = "0.247.0"
+version = "0.262.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d567162a6b9843080e5e0053f696623ff694bae8ae017c9ec536d1873bbe3d8"
+checksum = "078def49fdb49cab405c3006e05793b3fdaf7069126ba6b9c97d01ec8c98fe4c"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -7610,9 +7650,9 @@ dependencies = [
 
 [[package]]
 name = "wit-parser"
-version = "0.247.0"
+version = "0.262.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ffe4064318cdf3c08cb99343b44c039fcefe61ccdf58aa9975285f13d74d1fc"
+checksum = "00f0dc051466ffe46787721fca3d088536f158ae400be044f1b1c386ba9397ad"
 dependencies = [
  "anyhow",
  "hashbrown 0.17.1",
@@ -7623,7 +7663,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
- "unicode-xid",
+ "unicode-ident",
  "wasmparser",
 ]
 

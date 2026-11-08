@@ -3,9 +3,81 @@ pub(crate) mod logging;
 
 #[cfg(test)]
 pub mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use edgezero_core::body::Body;
+    use edgezero_core::context::RequestContext;
+    use edgezero_core::error::EdgeError;
+    use edgezero_core::http::RequestParts;
+    use edgezero_core::router::{PreDispatchHook, RouterService};
+    use http::{Request, Response};
+
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource, TcfConsent};
     use crate::settings::Settings;
+
+    /// Run `edit` against the head of `request` and return its result.
+    ///
+    /// The body is left in place. This lets tests apply a head-only helper,
+    /// such as forwarder preparation or basic auth, to a whole request.
+    pub fn with_request_parts<T>(
+        request: &mut Request<Body>,
+        edit: impl FnOnce(&mut RequestParts) -> T,
+    ) -> T {
+        let (mut parts, body) = std::mem::take(request).into_parts();
+        let result = edit(&mut parts);
+        *request = Request::from_parts(parts, body);
+        result
+    }
+
+    /// Drive `hook` through a router and report the outcome.
+    ///
+    /// The route matches every path for the request's method.
+    ///
+    /// # Errors
+    ///
+    /// Returns the router's response when the hook answers instead of
+    /// continuing. `Ok` carries the request the route received, with the hook's
+    /// head and the buffered body bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the router cannot render its response.
+    pub async fn run_pre_dispatch_hook<H: PreDispatchHook>(
+        hook: H,
+        request: Request<Body>,
+    ) -> Result<Request<Body>, Response<Body>> {
+        let received: Arc<Mutex<Option<(RequestParts, Bytes)>>> = Arc::default();
+        let sink = Arc::clone(&received);
+        let record = move |context: RequestContext| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body = context.body_bytes(usize::MAX).await?;
+                let (parts, _) = context.into_request()?.into_parts();
+                *sink.lock().expect("should lock the recorded request") = Some((parts, body));
+                Ok::<_, EdgeError>(Response::new(Body::empty()))
+            }
+        };
+        let method = request.method().clone();
+        let router = RouterService::builder()
+            .pre_dispatch_hook(hook)
+            .route("/", method.clone(), record.clone())
+            .route("/{*rest}", method, record)
+            .build();
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("should render the router response");
+        let recorded = received
+            .lock()
+            .expect("should lock the recorded request")
+            .take();
+        match recorded {
+            Some((parts, body)) => Ok(Request::from_parts(parts, Body::from(body))),
+            None => Err(response),
+        }
+    }
 
     #[must_use]
     pub fn crate_test_settings_str() -> String {

@@ -2,12 +2,13 @@
 
 use std::time::Duration;
 
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::body::{Body as EdgeBody, BodyPayload};
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
 use url::Url;
 
 use crate::error::TrustedServerError;
+use crate::http_util::into_body_payload;
 use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
 use crate::settings::Settings;
 
@@ -186,8 +187,8 @@ pub(crate) async fn collect_body_bounded(
     max_bytes: usize,
     integration: &'static str,
 ) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    match body {
-        EdgeBody::Once(bytes) => {
+    match into_body_payload(body) {
+        BodyPayload::Once(bytes) => {
             if bytes.len() > max_bytes {
                 return Err(Report::new(TrustedServerError::RequestTooLarge {
                     message: format!(
@@ -198,7 +199,7 @@ pub(crate) async fn collect_body_bounded(
             }
             Ok(bytes.to_vec())
         }
-        EdgeBody::Stream(mut stream) => {
+        BodyPayload::Stream(mut stream) => {
             let mut body_bytes = Vec::new();
             while let Some(chunk_result) = stream.next().await {
                 let chunk = chunk_result.map_err(|error| {
@@ -246,8 +247,8 @@ pub(crate) async fn collect_response_bounded(
     max_bytes: usize,
     integration: &'static str,
 ) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    match body {
-        EdgeBody::Once(bytes) => {
+    match into_body_payload(body) {
+        BodyPayload::Once(bytes) => {
             if bytes.len() > max_bytes {
                 return Err(Report::new(TrustedServerError::Integration {
                     integration: integration.to_string(),
@@ -259,7 +260,7 @@ pub(crate) async fn collect_response_bounded(
             }
             Ok(bytes.to_vec())
         }
-        EdgeBody::Stream(mut stream) => {
+        BodyPayload::Stream(mut stream) => {
             let mut body_bytes = Vec::new();
             while let Some(chunk_result) = stream.next().await {
                 let chunk = chunk_result.map_err(|error| {

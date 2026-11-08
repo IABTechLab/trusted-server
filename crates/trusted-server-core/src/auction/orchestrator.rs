@@ -5334,7 +5334,9 @@ mod tests {
                 edgezero_core::ingress::HeaderFidelity::default(),
             );
             request.extensions_mut().insert(ingress);
-            crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+            crate::test_support::tests::with_request_parts(&mut request, |parts| {
+                crate::forwarder::prepare_trusted_forwarder(parts, &settings);
+            });
             let mut snapshot = super::snapshot_context_request(&request);
             assert!(
                 snapshot
@@ -5389,7 +5391,9 @@ mod tests {
             snapshot
                 .headers_mut()
                 .insert("x-forwarded-proto", http::HeaderValue::from_static("https"));
-            crate::forwarder::prepare_trusted_forwarder(&mut snapshot, &settings);
+            crate::test_support::tests::with_request_parts(&mut snapshot, |parts| {
+                crate::forwarder::prepare_trusted_forwarder(parts, &settings);
+            });
             let info = crate::http_util::RequestInfo::from_request(
                 &snapshot,
                 &crate::platform::ClientInfo::default(),
