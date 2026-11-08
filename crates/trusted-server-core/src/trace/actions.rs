@@ -63,7 +63,9 @@ fn failure(status: StatusCode) -> Response<EdgeBody> {
     let body: &'static [u8] = match status {
         StatusCode::FORBIDDEN => br#"{"error":"trace action rejected"}"#,
         StatusCode::PAYLOAD_TOO_LARGE => br#"{"error":"trace body must be empty"}"#,
-        StatusCode::BAD_REQUEST => br#"{"error":"trace body unavailable"}"#,
+        StatusCode::BAD_REQUEST | StatusCode::REQUEST_TIMEOUT => {
+            br#"{"error":"trace body unavailable"}"#
+        }
         _ => br#"{"error":"trace action unavailable"}"#,
     };
     let mut response = Response::new(EdgeBody::from(body));
@@ -187,13 +189,15 @@ fn accepts_empty_framing(headers: &HeaderMap) -> bool {
 
 /// Map a failed zero-byte body read to its bounded trace error status.
 ///
-/// Any body byte is 413. Every other read failure, including an expired read
-/// deadline, keeps the existing 400 for an unreadable body.
+/// Any body byte is 413, and an expired read is 408. On canonical dispatch an
+/// expired inbound read deadline is a fixed input outcome, so `EdgeZero`
+/// replaces this response with its own 408 after the hook returns. Every other
+/// read failure keeps the existing 400 for an unreadable body.
 fn body_rejection_status(error: &EdgeError) -> StatusCode {
-    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        StatusCode::PAYLOAD_TOO_LARGE
-    } else {
-        StatusCode::BAD_REQUEST
+    match error.status() {
+        StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
+        StatusCode::REQUEST_TIMEOUT => StatusCode::REQUEST_TIMEOUT,
+        _ => StatusCode::BAD_REQUEST,
     }
 }
 
@@ -208,6 +212,7 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
+    use edgezero_core::error::EdgeError;
     use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
         TargetUnavailable,
@@ -960,6 +965,28 @@ mod tests {
             2,
             "should require successful EOF and stop after error"
         );
+    }
+
+    #[test]
+    fn trace_actions_stream_read_timeout_is_bounded_request_timeout_without_later_polling() {
+        let polls = Rc::new(Cell::new(0));
+        let captured = Rc::clone(&polls);
+        let mut request = request("end");
+        *request.body_mut() = EdgeBody::from_stream(stream::poll_fn(
+            move |_| -> Poll<Option<Result<Bytes, EdgeError>>> {
+                captured.set(captured.get() + 1);
+                Poll::Ready(Some(match captured.get() {
+                    1 => Ok(Bytes::new()),
+                    2 => Err(EdgeError::request_timeout("fictional-secret-expired-read")),
+                    _ => panic!("should not poll after the read timeout"),
+                }))
+            },
+        ));
+        private_error(
+            respond(&settings(true, false), request),
+            StatusCode::REQUEST_TIMEOUT,
+        );
+        assert_eq!(polls.get(), 2, "should stop reading at the expired read");
     }
 
     #[test]
