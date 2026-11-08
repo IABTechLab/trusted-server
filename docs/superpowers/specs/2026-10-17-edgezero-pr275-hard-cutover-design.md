@@ -1,20 +1,24 @@
 # EdgeZero PR 275 Hard Cutover
 
-**Date:** 2026-10-17, rewritten 2026-11-05, updated 2026-11-06 and 2026-11-07
+**Date:** 2026-10-17, rewritten 2026-11-05, updated 2026-11-06, 2026-11-07 and
+2026-11-08
 
 **Status:** Draft. Five agent review rounds, then a 2026-11-06 update against
 PR 275 head `9b31a697` and its review, and the 2026-11-07 fixes for GitHub
-reviews 5810751514 and 5815168335. Awaiting maintainer answers to Q1 to Q7.
+reviews 5810751514 and 5815168335. The maintainer answered Q1 to Q7 on
+2026-11-08 ([Maintainer answers](#maintainer-answers)).
 
 **EdgeZero target:** `IABTechLab/edgezero` PR 275 (branch
-`docs/outbound-http-spec`). Development and review use head
+`docs/outbound-http-spec`). This spec was checked against head
 `9b31a69760255c279f163a3e56bc95a7eed228e3`, called **H** below. Earlier drafts
 used `8f82547b`. The commits since then change Cloudflare response egress,
 Cloudflare tests, documentation, and CI. They change no public API and no line
 an earlier draft cited. The Fastly guide's same-name paragraph, which Fastly
-differences item 12 cites, is new in `9b31a697`. `main` pins the frozen
-candidate that EdgeZero's qualification
-record names (see [Merge gate and pin](#merge-gate-and-pin)).
+differences item 12 cites, is new in `9b31a697`. The cut is stacked on PR 275
+and follows its head, and `main` pins the head the cut was last rebased onto
+(D5, [Merge gate and pin](#merge-gate-and-pin)). On 2026-11-08 the head is
+`5ea8d93c`. This revision rechecked at `5ea8d93c` only the facts the answers
+rely on. Every other citation is still at H.
 
 **Trusted Server base:** `main` at `51730bdaf`, which pins EdgeZero `v0.0.11`.
 
@@ -31,8 +35,8 @@ IABTechLab/auctioneer#8. This cut is its first scope item. #840 tracks the
 wider EdgeZero migration.
 
 Citations: `crates/...:<line>` is Trusted Server at `51730bdaf`.
-`edgezero:<path>:<line>` is EdgeZero at H. `edgezero@v0.0.11:` is the current
-pin.
+`edgezero:<path>:<line>` is EdgeZero at H. `edgezero@5ea8d93c:` is PR 275's
+head on 2026-11-08. `edgezero@v0.0.11:` is the current pin.
 
 ## Problem
 
@@ -96,8 +100,9 @@ until EdgeZero's follow-ups land.
   today, apart from the changes in [Fastly differences](#fastly-differences).
 - Read every inbound body through a bounded EdgeZero reader, with today's
   per-endpoint caps.
-- Produce Trusted Server's share of EdgeZero's qualification evidence (EZ-Q1),
-  and pin `main` only to a qualified candidate.
+- Produce Trusted Server's share of EdgeZero's qualification evidence (EZ-Q1).
+  The maintainer runs the hosted legs by hand. Neither the merge nor production
+  deploys wait for EdgeZero's EZ-Q1 record (D5).
 
 ## Non-goals
 
@@ -131,22 +136,22 @@ until EdgeZero's follow-ups land.
 | D2  | No Trusted Server transport plumbing. Every outbound request uses EdgeZero's `HttpClient`. Where H lacks a feature, Trusted Server takes the requirement's interim.                                                                                                                                                                                                                                                                                                                                          | Maintainer                                         |
 | D3  | Fastly calls `send_request_with_registries_and_hooks` inside the `run_custom` and `serve_custom` loop. Trusted Server logic moves into the callback around it and into `prepare` and `finalize`.                                                                                                                                                                                                                                                                                                             | Maintainer                                         |
 | D4  | Redirect following uses `HttpClient::follow` (EZ-9).                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Maintainer                                         |
-| D5  | `main` merges only after EdgeZero publishes the EZ-Q1 record for a frozen candidate, and pins that candidate.                                                                                                                                                                                                                                                                                                                                                                                                | Spec author, open as Q1                            |
+| D5  | The cut is stacked on PR 275. It pins PR 275's head and repins at each rebase. `main` merges it without waiting for EdgeZero's EZ-Q1 record and pins the head the cut was last rebased onto. Production deploys do not wait for qualification.                                                                                                                                                                                                                                                               | Maintainer (Q1, Q5)                                |
 | D6  | Requests use the adapter's default client with the proxy marker off. Fastly post-delivery work uses a fresh EdgeZero Fastly client.                                                                                                                                                                                                                                                                                                                                                                          | Spec author                                        |
-| D7  | Every request sets a constant 1 s connect timeout and a per-call `timeout` that never depends on a remaining budget. It is the site's configured timeout where the site map names one, 2 s for Tinybird, and otherwise 60 s streamed and 15 s buffered. Redirect chains get a 60 s deadline. The response write deadline is 60 s after egress starts.                                                                                                                                                        | Spec author, open as Q2                            |
+| D7  | Every request sets a constant 1 s connect timeout and a per-call `timeout` that never depends on a remaining budget. It is the site's configured timeout where the site map names one, 2 s for Tinybird, and otherwise 60 s streamed and 15 s buffered. Redirect chains get a 60 s deadline. The response write deadline is 60 s after egress starts. Each value is Trusted Server's to set, and EdgeZero exposes every knob for it.                                                                         | Spec author, confirmed by the maintainer (Q2)      |
 | D8  | Sites that relay bytes or run Trusted Server's own rewrite codec use `ResponseDecoding::Original`. Sites that parse a body Trusted Server does not decode itself use `Decode`.                                                                                                                                                                                                                                                                                                                               | Spec author                                        |
 | D9  | `ts config validate` and `push` reject `certificate_check = false` and `origin_readthrough_enabled = true`. At runtime both are ignored with a warning. Spin ignores `origin_host_header_override` with a warning, which deviates from the EZ-13 interim (Configuration explains why).                                                                                                                                                                                                                       | Spec author, from the interims, with one deviation |
 | D10 | Trusted Server never sends `Trailer`, and never sends `Content-Length` or a hop-by-hop field from operator config. Validate and push reject such operator entries. Runtime skips them with a warning.                                                                                                                                                                                                                                                                                                        | Spec author                                        |
 | D11 | Fastly auction telemetry is queued during the request and sent after delivery inside the serving callback (EZ-15 interim).                                                                                                                                                                                                                                                                                                                                                                                   | Spec author, from the EZ-15 interim                |
 | D12 | Tests use a scripted `OutboundHttpClient` in Trusted Server test code until EZ-24 lands.                                                                                                                                                                                                                                                                                                                                                                                                                     | Spec author, from the EZ-24 interim                |
-| D13 | EZ-2 measurements baseline on the `main` commit the cut branch is based on at candidate freeze, instead of `a9037770a` plus #1123. EdgeZero acknowledges the change before its hosted phase.                                                                                                                                                                                                                                                                                                                 | Spec author                                        |
+| D13 | EZ-2 measurements baseline on the `main` commit the cut branch is based on when the maintainer runs them, instead of `a9037770a` plus #1123. EdgeZero acknowledges the change before its hosted phase.                                                                                                                                                                                                                                                                                                       | Spec author                                        |
 | D14 | A Spin component that fails to instantiate blocks the cut. CI's Spin job proves it.                                                                                                                                                                                                                                                                                                                                                                                                                          | Spec author                                        |
 | D15 | Framework responses carry `x-ts-version` through EdgeZero's synthesized response headers (EZ-19), where EdgeZero applies them. On Fastly, `prepare` supplies a per-request set that adds the service version, environment, geo, and operator headers (EZ-19.2).                                                                                                                                                                                                                                              | Spec author                                        |
 | D16 | The Axum dev server reads `EDGEZERO__ADAPTER__INGRESS__*` from the environment.                                                                                                                                                                                                                                                                                                                                                                                                                              | Spec author                                        |
 | D17 | Upstream failures keep today's statuses. Only the statuses the cut introduces on purpose (413, 408, and the publisher-forward 400) change.                                                                                                                                                                                                                                                                                                                                                                   | Spec author                                        |
-| D18 | Provider endpoint validation also accepts plain `http` for the loopback IP literals `127.0.0.1` and `[::1]`, so test fixtures reach local bidder stubs.                                                                                                                                                                                                                                                                                                                                                      | Spec author, open as Q6                            |
+| D18 | Provider endpoint validation also accepts plain `http` for the loopback IP literals `127.0.0.1` and `[::1]`, so test fixtures reach local bidder stubs.                                                                                                                                                                                                                                                                                                                                                      | Maintainer (Q6)                                    |
 | D19 | Trusted Server confirms as present the follow-ups the cut uses: EZ-10, EZ-16, EZ-17, EZ-18, EZ-19, EZ-20, EZ-22, and EZ-23. The criteria of their present parts join the gate (EZ-Q1.6), and the record maps conditional legs (EZ-Q1.8). EZ-18.4's bodiless part follows D20. EZ-22.6's Cloudflare and Spin retention recipe is not adopted, so EZ-22 criterion 10 is deferred. EZ-13 and EZ-21 are not confirmed, so their criteria stay out of the gate. EZ-21's interim applies, and D9 replaces EZ-13's. | Spec author                                        |
-| D20 | Accept EdgeZero's strict suppression of bodiless Fastly responses (HEAD, 204, 205, 304) in place of SDK framing parity (EZ-18.4). EdgeZero records the decision in its contract.                                                                                                                                                                                                                                                                                                                             | Maintainer, open as Q7                             |
+| D20 | Accept EdgeZero's strict suppression of bodiless Fastly responses (HEAD, 204, 205, 304) in place of SDK framing parity. Trusted Server withdraws the bodiless part of EZ-18.4 and asks EdgeZero to amend EZ-18.4, EZ-18.6, and EZ-18 criteria 3 and 6 to match.                                                                                                                                                                                                                                              | Maintainer (Q7)                                    |
 
 D1 to D4 are settled and not open for review. The rationale for each other
 decision sits in the section that implements it.
@@ -157,8 +162,8 @@ decision sits in the section that implements it.
 
 **Pin.** The six EdgeZero crates move from `tag = "v0.0.11"` to a `rev` on the
 same `IABTechLab/edgezero` git source. Features and `default-features` stay as
-they are. During development the rev is H. At merge it is the qualified
-candidate (D5).
+they are. The rev is PR 275's head, and the cut repins it at each rebase. At
+merge, `main` pins the head the cut was last rebased onto (D5).
 
 **spin-sdk.** Trusted Server's `spin-sdk` must come from the same source as
 EdgeZero's: `version = "=7.0.0"` from the `stackpop/spin-rust-sdk` git fork at
@@ -1085,10 +1090,11 @@ new 8 MiB and 1 MiB default caps do not apply.
 
 EdgeZero's default admission sets the inbound read deadline to request start
 plus 30 s (`edgezero:crates/edgezero-core/src/ingress.rs:34`, `:730-736`), and
-reads after it fail with 408. Trusted Server keeps the default, and Q2 asks
-whether publisher uploads need more. If they do, `Hooks::configure` installs an
-admission policy that gives the publisher fallback routes a longer read
-deadline (`ingress.rs:743-763`). On Fastly the deadline is checked between
+reads after it fail with 408. Trusted Server keeps the default (Q2), which a
+16 MiB upload meets at about 4.5 Mbit/s. If uploads need more later,
+`Hooks::configure` installs an admission policy (`App::set_ingress_admission_policy`)
+that gives the publisher fallback routes a longer read deadline
+(`ingress.rs:743-763`). On Fastly the deadline is checked between
 blocking reads (`edgezero:crates/edgezero-adapter-fastly/src/request.rs:864-925`),
 so a read that blocks is bounded by the host, not by 30 s.
 
@@ -1711,27 +1717,44 @@ links, secrets, and deploy flags are unchanged. No re-push is needed.
 
 ### Merge gate and pin
 
-`main` merges the cut only after EdgeZero publishes the EZ-Q1 record for a
-frozen candidate C, and pins C or the immutable tag that the record is
-published on (D5). H is not frozen. PR 275 is open with change requests from
-two reviewers and the defects below. EdgeZero's qualification rule says a
-defect forces a new candidate and a full rerun
-(`edgezero:docs/superpowers/plans/2026-10-18-trusted-server-outbound-05-qualification.md:416-417`).
-A force-push to the PR branch can orphan H, and an orphaned commit breaks
-`--locked` builds once it is collected.
+`main` merges the cut without waiting for EdgeZero's EZ-Q1 record, and
+production deploys do not wait for qualification (D5, Q1). The maintainer
+qualifies Trusted Server's hosted legs by hand
+([EdgeZero qualification, Trusted Server's part](#edgezero-qualification-trusted-servers-part)).
 
-The cut develops on a branch pinned to H and rebases onto `main` regularly.
-Before merge it repins to C and reruns the compile probe's tools to re-diff the
-public API.
+The cut is stacked on PR 275, because its Axum changes need it (Q5). The cut
+pins PR 275's head, repins whenever that head moves, and rebases onto `main`
+regularly. At each repin it reruns the compile probe's tools to re-diff the
+public API, and reruns the dependents inventory (Static). `main` pins the head
+the cut was last rebased onto.
+
+This accepts two risks:
+
+- `main` and production can run a PR 275 head that EdgeZero has not
+  qualified. PR 275 is open with change requests from two reviewers.
+  EdgeZero's qualification rule says a defect forces a new candidate and a full
+  rerun
+  (`edgezero:docs/superpowers/plans/2026-10-18-trusted-server-outbound-05-qualification.md:416-417`).
+  Without the gate, Trusted Server gets such fixes at its next repin.
+- A force-push to the PR branch can orphan the pinned commit, and an orphaned
+  commit breaks `--locked` builds once it is collected. The pin then moves to
+  the new head.
+
+Once PR 275 merges, Trusted Server moves from the PR 275 commit to an EdgeZero
+release tag (Follow-ups).
 
 Auctioneer pins EdgeZero `775366fd`, an earlier PR 275 commit. #1505 needs both
-projects on one revision, so Auctioneer moves to C after the cut.
+projects on one revision, so Auctioneer moves to Trusted Server's PR 275 commit
+after the cut.
 
 ### Open EdgeZero defects at H
 
 Review 5798502238 on PR 275 (2026-11-06, at H) checked every requirement
-against EdgeZero's own copy of the contract. It found five blocking defects. C
-must fix them, and Trusted Server adds no workaround (D2).
+against EdgeZero's own copy of the contract. It found five blocking defects.
+Trusted Server adds no workaround (D2). Re-reviews verified EdgeZero's fixes
+for all five: review 5810546608 at `598f0a2a` for defects 1, 3, 4, and 5, and
+review 5815197468 at `6f0cc74c` for defect 2. Because the cut follows PR 275's
+head (D5), it picks those fixes up.
 
 1. **Fastly batch setup (EZ-6.7, EZ-6.8).** Setup stops at the first slot that
    completes synchronously, such as a slot whose deadline passed during another
@@ -1781,8 +1804,12 @@ At H no qualification record exists. EdgeZero's inventory lists 261 required
 results, all missing (217 local, 44 external). No release leg is accepted, and
 the approvals G4-FASTLY-POLICY, G4-OPTIMIZER-HORIZON, G4-APPLICABILITY, and
 G4-MEASUREMENTS are pending
-(`edgezero:docs/audits/2026-10-18-outbound-api-approval.md:30-41`). The
-requester decision behind D20 is not recorded there (Q7).
+(`edgezero:docs/audits/2026-10-18-outbound-api-approval.md:30-41`). Since
+`6f0cc74c`, its Strict Suppression And SDK Deviation Record (lines 795 to 809
+at `5ea8d93c`) records the requester's choice to keep strict suppression,
+without waiving EZ-18.4. D20 now withdraws EZ-18.4's bodiless part, and
+Trusted Server asked EdgeZero to amend the contract to match
+([PR 275 thread r4504573926](https://github.com/IABTechLab/edgezero/pull/275#discussion_r4504573926)).
 Trusted Server owns 24 of the 44 external legs: 15 local consumer legs, 4 hosted
 legs on its own build, and the 5 consumer reviews. It runs the other 20 on its
 staging service. The inventory assigns all 20 to EdgeZero's qualification
@@ -1797,35 +1824,41 @@ HTTP/1.1 and HTTP/2, all on Trusted Server staging. EZ-Q1.4 does not list them
 for EdgeZero's qualification build, so they fall to Trusted Server's build, and
 EdgeZero reconciles them with EZ-2's five.
 
-Trusted Server supplies these before EdgeZero's hosted phase can start:
+Trusted Server's inputs to the hosted legs:
 
-- a named operator
-- an authorized staging service, and an Image Optimizer entitlement on it
-- confirmed thresholds and sample counts for EZ-2's M1 to M7
-- the HTTP/3 decision (Q4)
-- the baseline commit for EZ-2 (D13). EZ-2's text and the runbook field
+- The maintainer is the operator and runs Trusted Server's hosted legs by hand
+  for now (Q3). For each run, the maintainer chooses the staging service, its
+  Image Optimizer entitlement, and the thresholds and sample counts for EZ-2's
+  M1 to M7, and the run's record states them.
+- HTTP/3 is qualified per adapter, not through Trusted Server's staging
+  service (Q4). Trusted Server asked EdgeZero to amend EZ-1 criterion 2 to
+  match
+  ([PR 275 thread r4504554519](https://github.com/IABTechLab/edgezero/pull/275#discussion_r4504554519)).
+  Until it does, the inventory's HTTP/3 leg stays conditional on
+  `hosted HTTP3 enabled`.
+- The baseline commit for EZ-2 (D13). EZ-2's text and the runbook field
   (`edgezero:crates/edgezero-test-harness/acceptance/ts-outbound-qualification-runbook.md:69`)
   change to match.
 
 The run:
 
-1. EdgeZero freezes C and publishes its qualification package and runbook.
-2. The cut branch repins to C and runs Trusted Server's local legs.
-3. Trusted Server deploys its own build of C to staging and runs its hosted
-   legs.
-4. Trusted Server deploys EdgeZero's qualification build to the same staging
-   service for EdgeZero's hosted legs. At H that build does not exist (open
-   defect 4).
-5. Trusted Server records its consumer review. HTTP/3 follows Q4. EZ-5.9 and
-   EZ-5.10 are not needed, because relays and the S3 preflight use `Original`.
-   EZ-11 and EZ-14 are not needed for the cut, because D9 and D7 cover them.
-   Trusted Server confirms the follow-ups in D19 as present, so their criteria
-   join the gate (EZ-Q1.6), with the Trusted Server legs in the table below.
-   Reuse mode is not adopted in production. EZ-22 criterion 9 still joins the
-   gate, because CI builds the `reusable-sandbox` feature.
-6. EdgeZero publishes the record as a release asset on an immutable tag.
-   Trusted Server pins that tag.
-7. Any defect yields a new C and a full rerun.
+1. At each repin, the cut branch runs Trusted Server's local legs.
+2. The maintainer deploys Trusted Server's build of the pinned head to staging
+   and runs its hosted legs by hand.
+3. When EdgeZero's qualification build exists for the pinned head, the
+   maintainer deploys it to the same staging service for EdgeZero's hosted
+   legs. At H that build does not exist (open defect 4). Review 5810546608
+   verified it at `598f0a2a`.
+4. Trusted Server records its consumer review. EZ-5.9 and EZ-5.10 are not
+   needed, because relays and the S3 preflight use `Original`. EZ-11 and EZ-14
+   are not needed for the cut, because D9 and D7 cover them. Trusted Server
+   confirms the follow-ups in D19 as present, so their criteria join the gate
+   (EZ-Q1.6), with the Trusted Server legs in the table below. Reuse mode is
+   not adopted in production. EZ-22 criterion 9 still joins the gate, because
+   CI builds the `reusable-sandbox` feature.
+5. None of these steps gates the merge or production deploys (D5). A failed
+   leg goes to EdgeZero on PR 275, and Trusted Server takes the fix at its next
+   repin.
 
 Trusted Server's working list of legs follows. EdgeZero's inventory
 (`edgezero:crates/edgezero-test-harness/acceptance/outbound-cutover-cases.json`)
@@ -1921,16 +1954,18 @@ it adds outbound sites or platform-type uses that need porting.
 Issue #1484 asks for multi-provider fan-out on Cloudflare and Spin. The cut
 closes it.
 
-The cut lands first, and later pull requests rebase onto it. Pull requests that
-merge before it are ported by the cut. Q5 asks whether new uses of the Trusted
-Server outbound layer stop once the cut's pull request opens.
+The cut lands first, and later pull requests rebase onto it. New uses of
+`PlatformHttpClient`, `PlatformBackend`, and `StubHttpClient` are not frozen
+while the cut is open (Q5). Pull requests that merge before the cut are ported
+by the cut at its next rebase onto `main`, and the dependents inventory
+(Static) finds their new uses.
 
 ## Verification
 
 ### Static
 
 Every CI gate in `AGENTS.md`, and `--locked` builds after the lockfile review
-in section 1 and the compile-probe re-diff at C. The Fastly and Axum adapters'
+in section 1 and the compile-probe re-diff at each repin. The Fastly and Axum adapters'
 dev-dependencies enable EdgeZero's `test-utils` features
 (`edgezero:crates/edgezero-adapter-fastly/Cargo.toml:23`,
 `edgezero:crates/edgezero-adapter-axum/src/lib.rs:35-36`).
@@ -2285,47 +2320,68 @@ old layer. That transient dual path exists only inside the pull request.
 - `PlatformTimer` and EdgeZero's clock as one time source.
 - An error renderer that brands framework errors.
 - Dependabot ignore rules for EdgeZero-pinned crates.
+- Moving the pin from the PR 275 commit to an EdgeZero release tag once PR 275
+  merges (D5).
 - Spin on `wasm32-wasip2`.
 - The rest of #1505: Auctioneer as an in-process auction provider.
 
-## Open questions
+## Maintainer answers
 
-- **Q1. Merge gate (D5).** Wait for EdgeZero's EZ-Q1 record and pin the
-  qualified candidate, which is recommended? Or merge pinned to H with
-  production deploys blocked, to stop rebasing against 50 conflicting pull
-  requests?
-- **Q2. Timeouts (D7).** Are 60 s for streamed calls and the write deadline,
-  15 s for buffered calls, and 60 s for redirect chains right? A longer
-  streamed budget delays stall detection until EZ-14 lands. Is the default
-  30 s inbound read deadline enough for publisher uploads up to 16 MiB, which
-  need about 4.5 Mbit/s?
-- **Q3. Hosted qualification.** Who is Trusted Server's operator, which staging
-  service is authorized, who provides the Image Optimizer entitlement, and what
-  are the M1 to M7 thresholds?
-- **Q4. HTTP/3.** Does the staging service serve HTTP/3? EZ-1's HTTP/3 leg
-  depends on it.
-- **Q5. In-flight pull requests.** Do new uses of `PlatformHttpClient`,
-  `PlatformBackend`, and `StubHttpClient` stop once the cut's pull request
-  opens?
-- **Q6. Loopback bidder endpoints (D18).** Is accepting `http` provider
-  endpoints on `127.0.0.1` and `[::1]` acceptable, which is recommended? The
-  other option is a test CA that the CI runner and each runtime trust, plus a
-  hosts entry for the fixture bidder host. Whether Viceroy, workerd, and Spin
-  honor a runner CA is unverified.
-- **Q7. Bodiless Fastly framing (D20).** EZ-18.4 asks Fastly to frame HEAD,
-  204, 205, and 304 responses exactly as the SDK's `send_to_client` does. H
-  suppresses their payload strictly instead. In EdgeZero's local SDK controls,
-  the SDK path fails on HTTP/2 for a HEAD, 204, or 304 with a body, and sends a
-  forbidden payload on 205. EdgeZero's plan records 9 of 18 controls failing
-  (`edgezero:docs/superpowers/plans/2026-10-18-trusted-server-outbound-04-followups.md:826-834`).
-  The plan and EdgeZero's guide both say the requester chose strict suppression
-  (`04-followups.md:828-830`, `edgezero:docs/guide/capabilities.md:251-252`),
-  but its approval log and its contract do not record it. Trusted Server
-  accepts strict suppression, because the hard cut does not ask EdgeZero to
-  reproduce SDK framing. Confirm that choice, so EdgeZero amends EZ-18.4 and
-  records the decision in its approval log? The response diff then expects
-  Fastly differences item 7, and the HEAD, 204, and 304 parts of EZ-18
-  criteria 3 and 6 record the approved deviation.
+The maintainer answered the open questions on 2026-11-08. The decisions they
+change are D5, D7, D13, D18, and D20.
+
+- **Q1. Merge gate (D5).** Do not wait for EdgeZero's EZ-Q1 record. `main`
+  merges the cut pinned to PR 275, and production deploys do not wait for
+  qualification ([Merge gate and pin](#merge-gate-and-pin)).
+- **Q2. Timeouts (D7).** Each app that uses EdgeZero sets its own limits.
+  EdgeZero already lets it set every one, so EdgeZero needs no change:
+  - the per-request `timeout`, `connect_timeout`, and `deadline`
+    (`edgezero@5ea8d93c:crates/edgezero-core/src/outbound.rs:1087`, `:1100`,
+    `:1495`). The deadline also bounds a redirect chain under `follow`
+    (`outbound.rs:615-623`).
+  - the redirect count (`OutboundRedirectLimit::new`,
+    `edgezero@5ea8d93c:crates/edgezero-core/src/outbound/redirect.rs:332`).
+  - the response write deadline (`App::set_response_egress_policy`,
+    `edgezero@5ea8d93c:crates/edgezero-core/src/app.rs:553`), 30 s by default
+    (`response_egress.rs:22`).
+  - the inbound read deadline, per request (`App::set_ingress_admission_policy`,
+    `app.rs:514`), 30 s by default (`ingress.rs:34`).
+  - the head limits (`App::set_ingress_head_limits`, `app.rs:523`).
+
+  D7's values stand: a 1 s connect timeout, 60 s for streamed calls, 15 s for
+  buffered calls, 60 s for redirect chains, a 60 s write deadline, and
+  EdgeZero's default 30 s inbound read deadline for publisher uploads.
+
+- **Q3. Hosted qualification.** The maintainer qualifies by hand for now, as
+  the operator. For each run the maintainer chooses the staging service, its
+  Image Optimizer entitlement, and EZ-2's M1 to M7 thresholds
+  ([EdgeZero qualification, Trusted Server's part](#edgezero-qualification-trusted-servers-part)).
+- **Q4. HTTP/3.** Qualified per adapter. Trusted Server asked EdgeZero to amend
+  EZ-1 criterion 2 so its HTTP/3 leg no longer depends on Trusted Server's
+  staging service
+  ([PR 275 thread r4504554519](https://github.com/IABTechLab/edgezero/pull/275#discussion_r4504554519)).
+- **Q5. In-flight pull requests.** The cut is stacked on PR 275, because its
+  Axum changes need it. New uses of `PlatformHttpClient`, `PlatformBackend`,
+  and `StubHttpClient` are not frozen. The cut ports them when it rebases
+  ([In-flight work](#in-flight-work)).
+- **Q6. Loopback bidder endpoints (D18).** Accepted. Provider endpoint
+  validation accepts `http` on `127.0.0.1` and `[::1]`.
+- **Q7. Bodiless Fastly framing (D20).** Strict suppression.
+  - HEAD, 204, and 304 responses never include content (RFC 9110 §6.4.1). On
+    HTTP/1.1 such a response ends at the blank line after its headers
+    (RFC 9112 §6.3). On HTTP/2 a body there makes it malformed, and clients
+    must not accept it (RFC 9113 §8.1.1). A server must not send content in a
+    205 (RFC 9110 §15.3.6).
+  - EdgeZero's local SDK controls show `send_to_client` breaking HTTP/2 clients
+    on HEAD, 204, and 304, and sending a 205 body on both HTTP/1.1 and HTTP/2
+    (`edgezero:docs/audits/evidence/2026-10-23-buffered-response-framing.json`,
+    the nine `sdk_parity.failed_cases`).
+  - Trusted Server withdraws EZ-18.4's bodiless part and asked EdgeZero to
+    amend EZ-18.4, EZ-18.6, and EZ-18 criteria 3 and 6 to match
+    ([PR 275 thread r4504573926](https://github.com/IABTechLab/edgezero/pull/275#discussion_r4504573926)).
+    The response diff expects Fastly differences item 7.
+  - Until EdgeZero amends them, the nine cases stay recorded failures and
+    EZ-18.4 stays unqualified. That no longer blocks the cut (D5).
 
 ## Expected files
 
@@ -2547,3 +2603,20 @@ old layer. That transient dual path exists only inside the pull request.
     removed. Skipping `Connection` drops its nomination semantics, so a field
     it names reaches the client. Validation finds such configs before deploy
     (section 5, test 16).
+
+- **Round 9 (GitHub review 5815676577 on PR #1506, 2026-11-08, at
+  `a83dc4d89`).** The reviewer accepted and resolved the two round-8 fixes and
+  found no new defect. Its verdict was BLOCKED on Q1 to Q7. The maintainer's
+  answers are recorded in [Maintainer answers](#maintainer-answers):
+  - The cut is stacked on PR 275 and follows its head. `main` merges without
+    waiting for EdgeZero's EZ-Q1 record, and production deploys do not wait
+    for qualification (D5, Merge gate and pin).
+  - Limits are app-owned. EdgeZero already exposes every one, and D7's values
+    stand.
+  - Hosted qualification is manual, and the maintainer is the operator.
+  - HTTP/3 is qualified per adapter, and EZ-18.4's bodiless part is withdrawn.
+    Both are asked of EdgeZero in PR 275 threads.
+  - New uses of the outbound layer are not frozen, and loopback `http`
+    endpoints are accepted.
+  - The five blocking defects found at H were verified fixed at later PR 275
+    heads (Open EdgeZero defects at H).
