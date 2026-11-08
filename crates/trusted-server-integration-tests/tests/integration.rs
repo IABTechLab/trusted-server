@@ -3,11 +3,18 @@ mod environments;
 mod frameworks;
 
 use common::ec::CookieVaryingOrigin;
-use common::runtime::{RuntimeEnvironment, TestError, origin_port, wasm_binary_path};
+use common::runtime::{
+    RuntimeEnvironment, RuntimeProcess, TestError, origin_port, wasm_binary_path,
+};
 use environments::{RUNTIME_ENVIRONMENTS, ReadyCheckOptions, wait_for_http_ready};
 use error_stack::ResultExt as _;
 use frameworks::scenarios::EcScenario;
 use frameworks::{FRAMEWORKS, FrontendFramework};
+use reqwest::header::CONTENT_TYPE;
+use std::io::{Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use testcontainers::runners::SyncRunner as _;
 
@@ -379,4 +386,522 @@ fn trace_browser_workflow_cloudflare() {
 fn trace_browser_workflow_spin() {
     init_logger();
     common::trace_boundary::exercise_browser(common::trace_boundary::TraceBrowserRuntime::Spin);
+}
+
+// ---------------------------------------------------------------------------
+// Runtime ingress baseline for the EdgeZero cut
+// ---------------------------------------------------------------------------
+//
+// These cases record how each runtime hands request bodies and methods to
+// Trusted Server today, so later changes can show exactly what moved. They
+// all bind the fixed origin port, so each one holds `ORIGIN_PORT_LOCK` while
+// it runs and stays correct without `--test-threads=1`.
+
+/// Largest `/auction` body the handler accepts.
+///
+/// Mirrors `MAX_AUCTION_BODY_SIZE` in `trusted-server-core`.
+const AUCTION_BODY_CAP: usize = 256 * 1024;
+
+/// Status the recording origin returns when a case compares statuses.
+///
+/// Neither Trusted Server nor `EdgeZero` synthesizes 203, so a 203 at the
+/// client can only have come from the origin.
+const ORIGIN_PASS_THROUGH_STATUS: u16 = 203;
+
+/// Publisher path the byte-for-byte POST case sends its body to.
+const INGRESS_FORM_PATH: &str = "/ingress-form";
+
+/// Serializes the ingress cases that bind the fixed origin port.
+static ORIGIN_PORT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Takes the origin-port lock for the rest of the calling case.
+fn lock_origin_port() -> MutexGuard<'static, ()> {
+    // A failed case poisons the lock but frees the port, so later cases can
+    // still run.
+    ORIGIN_PORT_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A runtime the ingress cases start against the fixed origin port.
+#[derive(Clone, Copy, Debug)]
+enum IngressRuntime {
+    Axum,
+    Cloudflare,
+    Fastly,
+}
+
+impl IngressRuntime {
+    /// Starts the runtime with the shared integration app config.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the runtime's artifact or CLI is missing or it never
+    /// becomes ready.
+    fn spawn(self) -> RuntimeProcess {
+        match self {
+            Self::Axum => environments::axum::AxumDevServer
+                .spawn(&wasm_binary_path())
+                .expect("should start the Axum dev server"),
+            Self::Cloudflare => {
+                let config_json = common::config::cloudflare_config_json(origin_port())
+                    .expect("should build the Cloudflare config binding");
+                environments::cloudflare::CloudflareWorkers
+                    .spawn_with_config_json(&config_json)
+                    .expect("should start the Cloudflare Worker")
+            }
+            Self::Fastly => environments::fastly::FastlyViceroy
+                .spawn(&wasm_binary_path())
+                .expect("should start Viceroy"),
+        }
+    }
+}
+
+/// One request as the recording origin received it.
+#[derive(Clone, Debug)]
+struct OriginRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+/// Loopback origin that records every request and answers with one status.
+///
+/// Unlike [`common::ec::MinimalOrigin`], it reads the whole request body and
+/// decodes chunked framing, so a case can compare what reached the origin
+/// with what the client sent.
+struct RecordingOrigin {
+    requests: Arc<Mutex<Vec<OriginRequest>>>,
+    shutdown_tx: mpsc::Sender<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RecordingOrigin {
+    /// Starts the origin on `127.0.0.1:{port}`, answering every request with
+    /// `status` and a small HTML page.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the port is already in use.
+    fn start(port: u16, status: u16) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", port)).expect("should bind origin port");
+        listener
+            .set_nonblocking(true)
+            .expect("should set listener nonblocking");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+
+        let handle = thread::spawn(move || {
+            while matches!(shutdown_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        let recorded = Arc::clone(&recorded);
+                        // One thread per connection, so an idle pooled
+                        // connection cannot hold up the next request.
+                        thread::spawn(move || serve_origin_connection(stream, status, &recorded));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            requests,
+            shutdown_tx,
+            handle: Some(handle),
+        }
+    }
+
+    /// Returns every request recorded so far, in arrival order.
+    fn requests(&self) -> Vec<OriginRequest> {
+        self.requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for RecordingOrigin {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Reads one request from `stream`, records it, and answers with `status`.
+fn serve_origin_connection(
+    mut stream: TcpStream,
+    status: u16,
+    recorded: &Mutex<Vec<OriginRequest>>,
+) {
+    // Some platforms hand out accepted sockets in the listener's nonblocking
+    // mode; the request read below must block, with a bound.
+    if stream.set_nonblocking(false).is_err()
+        || stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .is_err()
+    {
+        return;
+    }
+    let Some(request) = read_origin_request(&mut stream) else {
+        return;
+    };
+    let head_only = request.method == "HEAD";
+    recorded
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(request);
+
+    let body = b"<html><body><h1>Example origin</h1></body></html>";
+    let reason = http::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|code| code.canonical_reason())
+        .unwrap_or("Example");
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    if !head_only {
+        let _ = stream.write_all(body);
+    }
+    let _ = stream.flush();
+}
+
+/// Reads one HTTP/1.1 request, decoding a `Content-Length` or chunked body.
+///
+/// Returns `None` when the connection closes, times out, or sends a malformed
+/// head before the request is complete.
+fn read_origin_request(stream: &mut TcpStream) -> Option<OriginRequest> {
+    let mut received = Vec::new();
+    let head_end = loop {
+        if let Some(position) = find_subslice(&received, b"\r\n\r\n") {
+            break position;
+        }
+        read_more(stream, &mut received)?;
+    };
+    let head = std::str::from_utf8(&received[..head_end]).ok()?;
+    let mut lines = head.split("\r\n");
+    let mut request_line = lines.next()?.split(' ');
+    let method = request_line.next()?.to_owned();
+    let path = request_line.next()?.to_owned();
+    let mut content_length = 0;
+    let mut chunked = false;
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.parse().ok()?;
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = value.eq_ignore_ascii_case("chunked");
+        }
+    }
+
+    let mut body = received.split_off(head_end + 4);
+    let body = if chunked {
+        loop {
+            if let Some(decoded) = decode_chunked(&body) {
+                break decoded;
+            }
+            read_more(stream, &mut body)?;
+        }
+    } else {
+        while body.len() < content_length {
+            read_more(stream, &mut body)?;
+        }
+        body.truncate(content_length);
+        body
+    };
+
+    Some(OriginRequest { method, path, body })
+}
+
+/// Appends the next read from `stream` to `buffer`.
+///
+/// Returns `None` at end of stream or on a read error, including a timeout.
+fn read_more(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<()> {
+    let mut chunk = [0_u8; 8192];
+    let read = stream.read(&mut chunk).ok()?;
+    if read == 0 {
+        return None;
+    }
+    buffer.extend_from_slice(&chunk[..read]);
+    Some(())
+}
+
+/// Decodes a complete chunked body, or returns `None` while it is incomplete.
+fn decode_chunked(mut bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let line_end = find_subslice(bytes, b"\r\n")?;
+        let size_line = std::str::from_utf8(&bytes[..line_end]).ok()?;
+        let size = usize::from_str_radix(size_line.split(';').next()?.trim(), 16).ok()?;
+        bytes = &bytes[line_end + 2..];
+        if size == 0 {
+            // Trailer fields, if any, end at an empty line.
+            loop {
+                let field_end = find_subslice(bytes, b"\r\n")?;
+                if field_end == 0 {
+                    return Some(body);
+                }
+                bytes = &bytes[field_end + 2..];
+            }
+        }
+        let data_end = size.checked_add(2)?;
+        if bytes.get(size..data_end)? != b"\r\n" {
+            return None;
+        }
+        body.extend_from_slice(&bytes[..size]);
+        bytes = &bytes[data_end..];
+    }
+}
+
+/// Returns the offset of the first `needle` in `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Builds a valid auction request exactly one byte over [`AUCTION_BODY_CAP`].
+///
+/// The padding rides in `config`, which the handler accepts and filters. A
+/// runtime that skipped the cap would answer 200, and one that delivered an
+/// empty body would answer 400, so only an enforced cap answers 413.
+fn over_cap_auction_body() -> Vec<u8> {
+    let prefix = r#"{"adUnits":[{"code":"ingress-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}}}],"config":{"padding":""#;
+    let suffix = r#""}}"#;
+    let padding = "a".repeat(AUCTION_BODY_CAP + 1 - prefix.len() - suffix.len());
+    let body = format!("{prefix}{padding}{suffix}").into_bytes();
+    assert_eq!(
+        body.len(),
+        AUCTION_BODY_CAP + 1,
+        "should build a body one byte over the auction cap"
+    );
+    body
+}
+
+/// A `POST /auction` with a JSON body reaches the handler and gets an
+/// auction response, not the parse error an empty body would cause.
+fn post_auction_with_json_body_reaches_handler(runtime: IngressRuntime) {
+    init_logger();
+    let _port = lock_origin_port();
+    let _origin = RecordingOrigin::start(origin_port(), 200);
+    let process = runtime.spawn();
+    let request_body = serde_json::json!({
+        "adUnits": [{
+            "code": "ingress-slot",
+            "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+        }]
+    });
+
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{}/auction", process.base_url))
+        .json(&request_body)
+        .send()
+        .expect("should send the auction request");
+
+    let status = response.status().as_u16();
+    let body = response.text().expect("should read the auction response");
+    assert_eq!(
+        status, 200,
+        "{runtime:?} should hand the JSON body to the auction handler: {body}"
+    );
+    let auction_response: serde_json::Value =
+        serde_json::from_str(&body).expect("should return an OpenRTB JSON response");
+    assert!(
+        auction_response["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "{runtime:?} auction response should carry the auction id: {body}"
+    );
+}
+
+/// A publisher `POST` body reaches the origin unchanged, every byte value
+/// included.
+fn publisher_post_body_reaches_origin_byte_for_byte(runtime: IngressRuntime) {
+    init_logger();
+    let _port = lock_origin_port();
+    let origin = RecordingOrigin::start(origin_port(), 200);
+    let process = runtime.spawn();
+    let sent: Vec<u8> = (0..=u8::MAX).cycle().take(4096).collect();
+
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{}{INGRESS_FORM_PATH}", process.base_url))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(sent.clone())
+        .send()
+        .expect("should send the publisher POST");
+
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "{runtime:?} should return the origin's answer to the publisher POST"
+    );
+    let received = origin
+        .requests()
+        .into_iter()
+        .find(|request| request.method == "POST" && request.path == INGRESS_FORM_PATH)
+        .expect("should record the publisher POST at the origin");
+    let first_difference = received
+        .body
+        .iter()
+        .zip(&sent)
+        .position(|(received, sent)| received != sent);
+    assert!(
+        received.body == sent,
+        "{runtime:?} should forward all {} body bytes unchanged; the origin received {} bytes, first difference at {first_difference:?}",
+        sent.len(),
+        received.body.len()
+    );
+}
+
+/// A request for `/` returns the status the origin answered with.
+fn root_returns_origin_status(runtime: IngressRuntime, method: &reqwest::Method) {
+    init_logger();
+    let _port = lock_origin_port();
+    let _origin = RecordingOrigin::start(origin_port(), ORIGIN_PASS_THROUGH_STATUS);
+    let process = runtime.spawn();
+
+    let response = reqwest::blocking::Client::new()
+        .request(method.clone(), format!("{}/", process.base_url))
+        .send()
+        .expect("should send the root request");
+
+    assert_eq!(
+        response.status().as_u16(),
+        ORIGIN_PASS_THROUGH_STATUS,
+        "{runtime:?} {method} / should return the origin's status"
+    );
+}
+
+/// A chunked `POST /auction` one byte over the cap gets a `text/plain` 413.
+fn chunked_post_auction_over_cap_returns_413(runtime: IngressRuntime) {
+    init_logger();
+    let _port = lock_origin_port();
+    let _origin = RecordingOrigin::start(origin_port(), 200);
+    let process = runtime.spawn();
+
+    // A reader body has no known length, so reqwest frames it as chunked and
+    // sends no `Content-Length`. The declared-length check cannot reject it;
+    // only reading the body can.
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{}/auction", process.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(reqwest::blocking::Body::new(std::io::Cursor::new(
+            over_cap_auction_body(),
+        )))
+        .send()
+        .expect("should send the chunked auction request");
+
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let body = response.text().expect("should read the rejection body");
+    assert_eq!(
+        status, 413,
+        "{runtime:?} should reject a chunked auction body over the cap: {body}"
+    );
+    assert!(
+        content_type.starts_with("text/plain"),
+        "{runtime:?} should answer the over-cap body with text/plain, got `{content_type}`"
+    );
+    assert!(
+        !body.is_empty(),
+        "{runtime:?} should explain the over-cap rejection in the body"
+    );
+}
+
+#[test]
+#[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
+fn post_auction_with_json_body_reaches_handler_fastly() {
+    post_auction_with_json_body_reaches_handler(IngressRuntime::Fastly);
+}
+
+#[test]
+#[ignore = "requires the pre-built trusted-server-axum binary"]
+fn post_auction_with_json_body_reaches_handler_axum() {
+    post_auction_with_json_body_reaches_handler(IngressRuntime::Axum);
+}
+
+#[test]
+#[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
+fn publisher_post_body_reaches_origin_byte_for_byte_fastly() {
+    publisher_post_body_reaches_origin_byte_for_byte(IngressRuntime::Fastly);
+}
+
+#[test]
+#[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
+fn publisher_post_body_reaches_origin_byte_for_byte_cloudflare() {
+    publisher_post_body_reaches_origin_byte_for_byte(IngressRuntime::Cloudflare);
+}
+
+#[test]
+#[ignore = "requires the pre-built trusted-server-axum binary"]
+fn publisher_post_body_reaches_origin_byte_for_byte_axum() {
+    publisher_post_body_reaches_origin_byte_for_byte(IngressRuntime::Axum);
+}
+
+#[test]
+#[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
+fn head_root_returns_origin_status_fastly() {
+    root_returns_origin_status(IngressRuntime::Fastly, &reqwest::Method::HEAD);
+}
+
+#[test]
+#[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
+fn head_root_returns_origin_status_cloudflare() {
+    root_returns_origin_status(IngressRuntime::Cloudflare, &reqwest::Method::HEAD);
+}
+
+#[test]
+#[ignore = "requires the pre-built trusted-server-axum binary"]
+fn head_root_returns_origin_status_axum() {
+    root_returns_origin_status(IngressRuntime::Axum, &reqwest::Method::HEAD);
+}
+
+#[test]
+#[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
+fn options_root_returns_origin_status_fastly() {
+    root_returns_origin_status(IngressRuntime::Fastly, &reqwest::Method::OPTIONS);
+}
+
+#[test]
+#[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
+fn options_root_returns_origin_status_cloudflare() {
+    root_returns_origin_status(IngressRuntime::Cloudflare, &reqwest::Method::OPTIONS);
+}
+
+#[test]
+#[ignore = "requires the pre-built trusted-server-axum binary"]
+fn options_root_returns_origin_status_axum() {
+    root_returns_origin_status(IngressRuntime::Axum, &reqwest::Method::OPTIONS);
+}
+
+#[test]
+#[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
+fn chunked_post_auction_over_cap_returns_413_fastly() {
+    chunked_post_auction_over_cap_returns_413(IngressRuntime::Fastly);
+}
+
+#[test]
+#[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
+fn chunked_post_auction_over_cap_returns_413_cloudflare() {
+    chunked_post_auction_over_cap_returns_413(IngressRuntime::Cloudflare);
+}
+
+#[test]
+#[ignore = "requires the pre-built trusted-server-axum binary"]
+fn chunked_post_auction_over_cap_returns_413_axum() {
+    chunked_post_auction_over_cap_returns_413(IngressRuntime::Axum);
 }
