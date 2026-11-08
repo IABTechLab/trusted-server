@@ -6,8 +6,11 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use edgezero_adapter_axum::context::AxumRequestContext;
+use edgezero_core::body::BodyPayload;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
 use error_stack::{Report, ResultExt as _};
+use trusted_server_core::http_util::into_body_payload;
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
     PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
@@ -271,7 +274,7 @@ impl Future for AxumPendingHandle {
 
 /// reqwest-backed HTTP client for the Axum dev server.
 ///
-/// `send_async` buffers any `Body::Stream` in the calling context, then spawns
+/// `send_async` buffers any streamed body in the calling context, then spawns
 /// a `tokio` task for each outbound request so that multiple `send_async` calls
 /// run concurrently. `select` uses [`futures::future::select_all`] to wait for
 /// the first completing handle, preserving fan-out semantics.
@@ -303,16 +306,16 @@ impl AxumPlatformHttpClient {
 
     /// Drain `body` to a `Vec<u8>`.
     ///
-    /// For `Body::Stream` this awaits every chunk in the current async context
+    /// For a streamed body this awaits every chunk in the current async context
     /// (where `LocalBoxStream` is valid) before the bytes are moved into a
     /// `tokio::spawn` task that requires `Send`.
     async fn buffer_body(
         body: edgezero_core::body::Body,
     ) -> Result<Vec<u8>, Report<PlatformError>> {
-        match body {
-            edgezero_core::body::Body::Once(bytes) => Ok(bytes.to_vec()),
-            edgezero_core::body::Body::Stream(mut stream) => {
-                log::debug!("buffering Body::Stream into Vec<u8> for outbound request");
+        match into_body_payload(body) {
+            BodyPayload::Once(bytes) => Ok(bytes.to_vec()),
+            BodyPayload::Stream(mut stream) => {
+                log::debug!("buffering a streamed body into Vec<u8> for outbound request");
                 use futures::StreamExt as _;
                 let mut buf = Vec::new();
                 while let Some(chunk) = stream.next().await {
@@ -582,7 +585,9 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
     });
 
-    let client_ip = edgezero_adapter_axum::context::AxumRequestContext::get(ctx.request())
+    let client_ip = ctx
+        .extensions()
+        .get::<AxumRequestContext>()
         .and_then(|c| c.remote_addr)
         .map(|addr| addr.ip());
 

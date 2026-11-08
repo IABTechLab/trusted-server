@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
@@ -106,11 +107,14 @@ fn main() {
     match mode {
         ServeMode::Single => {
             // `run_custom` completes the callback's SDK result exactly once.
-            // The callback sends its own response and returns `()`, so there
-            // is no error for the SDK to turn into a second response.
+            // The callback sends its own response and always returns `Ok`, so
+            // there is no error for the SDK to turn into a second response.
             let Ok(()) = edgezero_adapter_fastly::lifecycle::run_custom(
                 FastlyRequest::from_client(),
-                |request, sandbox: &mut Sandbox| handle_request(request, sandbox, &mut startup),
+                |request, sandbox: &mut Sandbox| {
+                    handle_request(request, sandbox, &mut startup);
+                    Ok::<(), Infallible>(())
+                },
             );
         }
         ServeMode::Reuse(limits) => serve_loop(limits, startup),
@@ -139,6 +143,9 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
             counters.observe(sandbox, |sandbox| {
                 handle_request(request, sandbox, &mut startup);
             });
+            // The callback has already sent its response, so it never
+            // reports an error that would end serving.
+            Ok::<(), Infallible>(())
         },
     );
 
@@ -397,19 +404,20 @@ fn edgezero_main(
     // success, and returns the error unchanged. A failed build hands back its
     // error router as the error payload: that serves this request and is then
     // dropped, so a transient config-store failure cannot pin the sandbox into
-    // permanent error mode, and the next callback retries construction.
+    // permanent error mode, and the next callback retries construction. The
+    // error router is boxed because an `App` is too large for an `Err` payload.
     let failed_build = sandbox
         .initialize(|| {
             let (app, state) = TrustedServerApp::build_app_with_state(&runtime_stores);
             match state {
                 Some(state) => Ok(RetainedApp { app, state }),
-                None => Err(app),
+                None => Err(Box::new(app)),
             }
         })
         .err();
 
     let (app, app_state): (&edgezero_core::app::App, Option<Arc<AppState>>) =
-        match (failed_build.as_ref(), sandbox.state()) {
+        match (failed_build.as_deref(), sandbox.state()) {
             (Some(app), _) => (app, None),
             (None, Some(retained)) => (&retained.app, Some(Arc::clone(&retained.state))),
             (None, None) => {
@@ -739,36 +747,29 @@ fn send_response_to_client(mut response: HttpResponse, counters: Option<&Sandbox
 
     let (parts, body) = response.into_parts();
 
-    match body {
-        EdgeBody::Stream(_) => {
-            let skeleton = compat::to_fastly_response_skeleton(HttpResponse::from_parts(
-                parts,
-                EdgeBody::empty(),
-            ));
-            let mut streaming_body = skeleton.stream_to_client();
-            match futures::executor::block_on(stream_asset_body(body, &mut streaming_body)) {
-                Ok(()) => {
-                    if let Err(e) = streaming_body.finish() {
-                        // Also post-commitment: same attribution as the
-                        // streaming failure below.
-                        log::error!(
-                            "failed to finish EdgeZero streaming body{counter_context}: {e}"
-                        );
-                    }
-                }
-                Err(e) => {
-                    // After commitment: log and stop. Returning an error here
-                    // would let the SDK attempt a second response. Counters
-                    // already went out with the headers, so the failure is
-                    // tagged with the same identity for reconciliation.
-                    log::error!("EdgeZero streaming failed{counter_context}: {e:?}");
-                    drop(streaming_body);
+    if body.is_stream() {
+        let skeleton =
+            compat::to_fastly_response_skeleton(HttpResponse::from_parts(parts, EdgeBody::empty()));
+        let mut streaming_body = skeleton.stream_to_client();
+        match futures::executor::block_on(stream_asset_body(body, &mut streaming_body)) {
+            Ok(()) => {
+                if let Err(e) = streaming_body.finish() {
+                    // Also post-commitment: same attribution as the
+                    // streaming failure below.
+                    log::error!("failed to finish EdgeZero streaming body{counter_context}: {e}");
                 }
             }
+            Err(e) => {
+                // After commitment: log and stop. Returning an error here
+                // would let the SDK attempt a second response. Counters
+                // already went out with the headers, so the failure is
+                // tagged with the same identity for reconciliation.
+                log::error!("EdgeZero streaming failed{counter_context}: {e:?}");
+                drop(streaming_body);
+            }
         }
-        once => {
-            compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
-        }
+    } else {
+        compat::to_fastly_response(HttpResponse::from_parts(parts, body)).send_to_client();
     }
 }
 
@@ -903,14 +904,18 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use edgezero_core::body::Body as EdgeBody;
+    use edgezero_core::context::RequestContext;
     use edgezero_core::http::response_builder;
     use edgezero_core::http::{HeaderValue, Method, StatusCode};
     use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
         TargetUnavailable,
     };
+    use edgezero_core::router::RouterService;
     use fastly::mime;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use trusted_server_core::integrations::HeaderMutation;
+    use trusted_server_core::trace::TracePreDispatchHook;
 
     fn test_settings() -> Settings {
         Settings::from_toml(
@@ -950,7 +955,7 @@ mod tests {
             .expect("should configure trace");
         settings.handlers.insert(0,serde_json::from_value(serde_json::json!({"path":"^/_ts/trace","username":"example-user","password":"example-password"}))
             .expect("should configure trace protection"));
-        let mut request = edgezero_core::http::request_builder()
+        let (mut request, _body) = edgezero_core::http::request_builder()
             .uri("https://publisher.example.com/_ts/trace/assets/v1.js")
             .header(
                 "authorization",
@@ -961,7 +966,8 @@ mod tests {
                 ),
             )
             .body(EdgeBody::empty())
-            .expect("should build protected asset request");
+            .expect("should build protected asset request")
+            .into_parts();
         let trusted_server_core::trace::TracePreflight::Ready(dispatch) =
             trusted_server_core::trace::preflight(&settings, &mut request)
         else {
@@ -997,6 +1003,37 @@ mod tests {
         );
     }
 
+    /// Drives `request` through `hook` on a router whose routes record a continuation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the hook continues to a route instead of answering.
+    fn dispatch_through_hook(
+        hook: &Arc<TracePreDispatchHook>,
+        request: HttpRequest,
+    ) -> HttpResponse {
+        let continued = Arc::new(AtomicBool::new(false));
+        let route_continued = Arc::clone(&continued);
+        let route = move |_ctx: RequestContext| {
+            route_continued.store(true, Ordering::SeqCst);
+            async { Ok::<_, EdgeError>(HttpResponse::new(EdgeBody::empty())) }
+        };
+        let method = request.method().clone();
+        let hook = Arc::clone(hook);
+        let router = RouterService::builder()
+            .pre_dispatch_hook_arc(hook)
+            .route("/", method.clone(), route.clone())
+            .route("/{*rest}", method, route)
+            .build();
+        let response = futures::executor::block_on(router.oneshot(request))
+            .expect("should build local trace response");
+        assert!(
+            !continued.load(Ordering::SeqCst),
+            "should intercept reserved request"
+        );
+        response
+    }
+
     #[test]
     fn trace_dispatch_terminal_actions_errors_and_head_preserve_native_contract() {
         let mut settings = test_settings();
@@ -1009,10 +1046,10 @@ mod tests {
             .expect("should configure trace");
         settings.handlers.insert(0,serde_json::from_value(serde_json::json!({"path":"^/_ts/trace","username":"example-user","password":"example-password"}))
             .expect("should configure trace protection"));
-        let hook = trusted_server_core::trace::TracePreDispatchHook::new(
+        let hook = Arc::new(TracePreDispatchHook::new(
             Arc::new(settings.clone()),
             Arc::new(|_| panic!("should never query metadata for actions, errors or HEAD")),
-        );
+        ));
         let effects = RequestFilterEffects {
             request_headers: Vec::new(),
             response_headers: vec![
@@ -1103,11 +1140,7 @@ mod tests {
                     HeaderFidelity::default(),
                 ));
             }
-            let mut response = futures::executor::block_on(
-                edgezero_core::router::PreDispatchHook::handle(&hook, &mut request),
-            )
-            .expect("should build local trace response")
-            .expect("should intercept reserved request");
+            let mut response = dispatch_through_hook(&hook, request);
             assert_eq!(
                 response.status(),
                 expected,

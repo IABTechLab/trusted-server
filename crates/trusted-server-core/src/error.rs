@@ -6,6 +6,8 @@
 
 use core::error::Error;
 use derive_more::Display;
+use edgezero_core::error::EdgeError;
+use error_stack::Report;
 use http::StatusCode;
 
 /// The main error type for trusted server operations.
@@ -146,6 +148,46 @@ impl IntoHttpResponse for TrustedServerError {
             // Full details are already logged via log::error! in to_error_response.
             _ => "An internal error occurred".to_string(),
         }
+    }
+}
+
+/// Maps a failed application startup to the [`EdgeError`] that `EdgeZero` answers with.
+///
+/// The constructor follows the [`IntoHttpResponse::status_code`] of the report's
+/// current context, the same error the old startup routers answered with:
+///
+/// - 500 maps to [`EdgeError::internal`].
+/// - 503 maps to [`EdgeError::service_unavailable`].
+/// - 502 maps to [`EdgeError::bad_gateway`].
+/// - 400 maps to [`EdgeError::bad_request`].
+/// - Any other status maps to [`EdgeError::internal`].
+///
+/// The message is the error's [`IntoHttpResponse::user_message`], so no
+/// internal detail reaches the client. This function does not log. Callers log
+/// the full report at error level before returning the result.
+///
+/// # Examples
+///
+/// ```
+/// use edgezero_core::http::StatusCode;
+/// use error_stack::Report;
+/// use trusted_server_core::error::{TrustedServerError, startup_error};
+///
+/// let report = Report::new(TrustedServerError::KvStore {
+///     store_name: "example-store".to_owned(),
+///     message: "unavailable".to_owned(),
+/// });
+/// assert_eq!(startup_error(&report).status(), StatusCode::SERVICE_UNAVAILABLE);
+/// ```
+#[must_use]
+pub fn startup_error(report: &Report<TrustedServerError>) -> EdgeError {
+    let error = report.current_context();
+    let message = error.user_message();
+    match error.status_code() {
+        StatusCode::SERVICE_UNAVAILABLE => EdgeError::service_unavailable(message),
+        StatusCode::BAD_GATEWAY => EdgeError::bad_gateway(message),
+        StatusCode::BAD_REQUEST => EdgeError::bad_request(message),
+        _ => EdgeError::internal(std::io::Error::other(message)),
     }
 }
 
@@ -545,5 +587,122 @@ mod tests {
                 "should map {error:?} to expected HTTP status"
             );
         }
+    }
+
+    fn assert_startup_error(
+        error: TrustedServerError,
+        expected_kind: &str,
+        expected_status: StatusCode,
+    ) -> EdgeError {
+        let edge_error = startup_error(&Report::new(error));
+        assert_eq!(
+            edge_error.kind(),
+            expected_kind,
+            "should use the {expected_kind} constructor"
+        );
+        assert_eq!(
+            edge_error.status(),
+            expected_status,
+            "should keep the startup status"
+        );
+        edge_error
+    }
+
+    #[test]
+    fn startup_error_maps_internal_server_error_to_internal() {
+        let edge_error = assert_startup_error(
+            TrustedServerError::Configuration {
+                message: "fictional missing setting".to_string(),
+            },
+            "internal",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        assert!(
+            !edge_error.message().contains("fictional missing setting"),
+            "should keep the configuration detail out of the client message"
+        );
+    }
+
+    #[test]
+    fn startup_error_maps_service_unavailable_to_service_unavailable() {
+        let edge_error = assert_startup_error(
+            TrustedServerError::KvStore {
+                store_name: "example-store".to_string(),
+                message: "fictional store outage".to_string(),
+            },
+            "service_unavailable",
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+        assert_eq!(
+            edge_error.message(),
+            "An internal error occurred",
+            "should use the generic user message"
+        );
+    }
+
+    #[test]
+    fn startup_error_maps_bad_gateway_to_bad_gateway() {
+        let edge_error = assert_startup_error(
+            TrustedServerError::Proxy {
+                message: "fictional upstream failure".to_string(),
+            },
+            "bad_gateway",
+            StatusCode::BAD_GATEWAY,
+        );
+        assert_eq!(
+            edge_error.message(),
+            "An internal error occurred",
+            "should use the generic user message"
+        );
+    }
+
+    #[test]
+    fn startup_error_maps_bad_request_to_bad_request() {
+        let edge_error = assert_startup_error(
+            TrustedServerError::BadRequest {
+                message: "fictional startup input".to_string(),
+            },
+            "bad_request",
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            edge_error.message(),
+            "Bad request: fictional startup input",
+            "should keep the safe bad-request detail"
+        );
+    }
+
+    #[test]
+    fn startup_error_maps_other_statuses_to_internal() {
+        for error in [
+            TrustedServerError::Forbidden {
+                message: "fictional denial".to_string(),
+            },
+            TrustedServerError::PartnerNotFound {
+                partner_id: "example-partner".to_string(),
+            },
+            TrustedServerError::RequestTooLarge {
+                message: "fictional size".to_string(),
+            },
+        ] {
+            assert_startup_error(error, "internal", StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    #[test]
+    fn startup_error_follows_the_current_context() {
+        let report = Report::new(TrustedServerError::Configuration {
+            message: "fictional inner failure".to_string(),
+        })
+        .change_context(TrustedServerError::KvStore {
+            store_name: "example-store".to_string(),
+            message: "fictional outer failure".to_string(),
+        });
+
+        assert_eq!(
+            startup_error(&report).status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "should map the outermost context, as the startup routers did"
+        );
     }
 }

@@ -1,21 +1,24 @@
 //! Exercises the proxy against the production Axum listener and trace router.
 //!
-//! A child test process owns the real HTTP server. A TLS relay additionally
-//! exercises the proxy's encrypted upstream transport without inventing ingress
-//! metadata or replacing the server's trace authorization with an echo handler.
+//! `EdgeZero`'s `AxumTestServer` serves the real Trusted Server app over
+//! loopback TCP. A TLS relay additionally exercises the proxy's encrypted
+//! upstream transport without inventing ingress metadata or replacing the
+//! server's trace authorization with an echo handler.
 
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use std::convert::Infallible;
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use clap::Parser as _;
+use edgezero_adapter_axum::AXUM_PLATFORM;
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
+use edgezero_adapter_axum::test_utils::AxumTestServer;
+use edgezero_core::app::App;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt as _, Full};
 use hyper::client::conn::http1::SendRequest;
@@ -36,24 +39,14 @@ mod support;
 const PUBLIC_HOST: &str = "www.publisher.example.com";
 const PUBLIC_AUTHORITY: &str = "www.publisher.example.com:8443";
 const PUBLIC_ORIGIN: &str = "https://www.publisher.example.com:8443";
-const FIXTURE_ADDR: &str = "TS_TEST_AXUM_ADDR";
-const FIXTURE_ORIGIN: &str = "TS_TEST_AXUM_ORIGIN";
-const FIXTURE_TRUST: &str = "TS_TEST_AXUM_TRUST";
 
-/// Run only as a fixture child; the parent always kills and reaps this process.
-#[test]
-#[ignore = "server fixture invoked only by proxy integration tests"]
-fn trusted_server_fixture() {
-    // Direct ignored-test runs have no parent process to serve.
-    let Ok(addr) = std::env::var(FIXTURE_ADDR) else {
-        return;
-    };
+/// Serves the actual Trusted Server app on a loopback port.
+///
+/// The app reads no `EdgeZero` store: its settings are injected here, so no
+/// store is attached.
+async fn serve_trusted_server(origin: &str, trust: bool) -> AxumTestServer {
+    // The adapter's outbound client expects a process-level crypto provider.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let addr: SocketAddr = addr
-        .parse()
-        .expect("should parse the fixture listener address");
-    let origin = std::env::var(FIXTURE_ORIGIN).expect("should supply the publisher origin");
-    let trust = std::env::var(FIXTURE_TRUST).expect("should supply the forwarder policy");
     let mut value = json!({
         "handlers": [{
             "path": "^/_ts/admin",
@@ -72,7 +65,7 @@ fn trusted_server_fixture() {
             "gpt_diagnostics": {"enabled": true, "trace_page_enabled": true}
         }
     });
-    if trust == "enabled" {
+    if trust {
         value["trusted_forwarder"] = json!({
             "auth_header": "x-ts-forwarder-auth",
             "shared_secret": support::FORWARDER_TOKEN
@@ -81,20 +74,24 @@ fn trusted_server_fixture() {
     let settings = Settings::from_json_value(value).expect("should load fixture settings");
     let router = TrustedServerApp::routes_with_settings(settings)
         .expect("should build the actual Trusted Server router");
-    AxumDevServer::with_config(
-        router,
+    let app = App::from_router::<TrustedServerApp>(router, AXUM_PLATFORM)
+        .expect("should assemble the actual Trusted Server app");
+    AxumTestServer::start(AxumDevServer::with_config(
+        app,
         AxumDevServerConfig {
-            addr,
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             enable_ctrl_c: false,
+            ..AxumDevServerConfig::default()
         },
-    )
-    .run()
-    .expect("should run the actual Axum HTTP listener");
+    ))
+    .await
+    .expect("should start the actual Axum HTTP listener")
 }
 
 struct Fixture {
     addr: SocketAddr,
-    child: Child,
+    // Held for its lifetime: dropping it shuts the listener down.
+    _server: AxumTestServer,
     origin_headers: Arc<Mutex<Vec<HeaderMap>>>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -104,8 +101,6 @@ impl Drop for Fixture {
         for task in &self.tasks {
             task.abort();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -147,49 +142,14 @@ async fn start_fixture(trust: bool) -> Fixture {
             });
         }
     });
-    let reserved = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("should reserve the Axum fixture address");
-    let addr = reserved.local_addr().expect("should read the Axum address");
-    drop(reserved);
-    let child = Command::new(std::env::current_exe().expect("should locate the test executable"))
-        .args([
-            "--ignored",
-            "--exact",
-            "trusted_server_fixture",
-            "--nocapture",
-        ])
-        .env(FIXTURE_ADDR, addr.to_string())
-        .env(FIXTURE_ORIGIN, origin_url)
-        .env(FIXTURE_TRUST, if trust { "enabled" } else { "disabled" })
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("should spawn the real Axum fixture");
-    let mut fixture = Fixture {
-        addr,
-        child,
+    // `start` returns once the listener is bound, so no readiness poll is needed.
+    let server = serve_trusted_server(&origin_url, trust).await;
+    Fixture {
+        addr: server.address(),
+        _server: server,
         origin_headers: headers,
         tasks: vec![origin_task],
-    };
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if TcpStream::connect(addr).await.is_ok() {
-                return;
-            }
-            assert!(
-                fixture
-                    .child
-                    .try_wait()
-                    .expect("should inspect the child")
-                    .is_none(),
-                "should keep the Axum fixture running until ready"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("should start the actual Axum listener promptly");
-    fixture
+    }
 }
 
 async fn add_tls_relay(fixture: &mut Fixture) -> SocketAddr {

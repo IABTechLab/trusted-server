@@ -11,6 +11,8 @@ use std::io::Read as _;
 use std::net::IpAddr;
 
 use crate::backend::BackendConfig;
+use edgezero_core::body::BodyPayload;
+use trusted_server_core::http_util::into_body_payload;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
@@ -357,13 +359,13 @@ fn edge_request_to_fastly(
             fastly_req.append_header(name.as_str(), value.as_bytes());
         }
     }
-    match body {
-        edgezero_core::body::Body::Once(bytes) => {
+    match into_body_payload(body) {
+        BodyPayload::Once(bytes) => {
             if !bytes.is_empty() {
                 fastly_req.set_body(bytes.to_vec());
             }
         }
-        edgezero_core::body::Body::Stream(_) => {
+        BodyPayload::Stream(_) => {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("streaming request body is not supported by Fastly request conversion"));
         }
@@ -393,7 +395,8 @@ fn fastly_body_to_edge_stream(body: fastly::Body) -> edgezero_core::body::Body {
         }
     });
 
-    edgezero_core::body::Body::from_stream(stream)
+    // Body read failures surface as internal stream errors.
+    edgezero_core::body::Body::from_external_stream(stream)
 }
 
 /// Return whether a response is allowed to carry a body.
@@ -1487,7 +1490,7 @@ mod tests {
         let request = request_builder()
             .method("POST")
             .uri("https://example.com/")
-            .body(Body::from_stream(futures::stream::empty::<
+            .body(Body::from_external_stream(futures::stream::empty::<
                 Result<_, io::Error>,
             >()))
             .expect("should build streaming test request");
@@ -1562,7 +1565,7 @@ mod tests {
         let request = request_builder()
             .method("POST")
             .uri("https://example.com/")
-            .body(Body::from_stream(futures::stream::empty::<
+            .body(Body::from_external_stream(futures::stream::empty::<
                 Result<_, io::Error>,
             >()))
             .expect("should build streaming test request");

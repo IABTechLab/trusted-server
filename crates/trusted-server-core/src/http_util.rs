@@ -74,7 +74,8 @@ pub fn sanitize_trusted_client_ip_headers(
 /// closes it at end of stream, on error, or on drop. A buffered body releases
 /// its owner, because its bytes no longer depend on the scope. A streaming
 /// body is never returned as empty bytes.
-pub(crate) fn into_body_payload(body: EdgeBody) -> BodyPayload {
+#[must_use]
+pub fn into_body_payload(body: EdgeBody) -> BodyPayload {
     match body.into_stream() {
         Ok(stream) => BodyPayload::Stream(stream),
         Err(buffered) => buffered.into_parts().0,

@@ -2,11 +2,11 @@
 
 use std::net::IpAddr;
 
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::body::BodyPayload;
 use edgezero_core::http::Response as HttpResponse;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue};
 use trusted_server_core::forwarder::ForwarderPreparation;
-use trusted_server_core::http_util::SPOOFABLE_FORWARDED_HEADERS;
+use trusted_server_core::http_util::{SPOOFABLE_FORWARDED_HEADERS, into_body_payload};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings::TrustedClientIpConfig;
 
@@ -20,13 +20,13 @@ pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
         fastly_resp.append_header(name.as_str(), value.as_bytes());
     }
 
-    match body {
-        EdgeBody::Once(bytes) => {
+    match into_body_payload(body) {
+        BodyPayload::Once(bytes) => {
             if !bytes.is_empty() {
                 fastly_resp.set_body(bytes.to_vec());
             }
         }
-        EdgeBody::Stream(_) => {
+        BodyPayload::Stream(_) => {
             // Streaming bodies cannot cross the compat boundary. Both audited call sites
             // (legacy_main buffered arm and edgezero_main after EdgeZero collapses bodies
             // to Once) only pass Once bodies — a Stream here is a caller error.
@@ -134,6 +134,7 @@ pub(crate) fn capture_fastly_forwarder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::body::Body as EdgeBody;
     use trusted_server_core::forwarder::prepare_trusted_forwarder;
     use trusted_server_core::http_util::RequestInfo;
     use trusted_server_core::platform::ClientInfo;
@@ -165,13 +166,15 @@ mod tests {
                 "should remove native forwarding credential"
             );
             sanitize_fastly_forwarded_headers(&mut native, None);
-            let mut core = edgezero_core::http::request_builder()
+            let (mut parts, body) = edgezero_core::http::request_builder()
                 .uri("http://upstream.example.com/path")
                 .header("host", "upstream.example.com")
                 .body(EdgeBody::empty())
-                .expect("should construct converted request");
-            core.extensions_mut().insert(prepared);
-            prepare_trusted_forwarder(&mut core, &settings);
+                .expect("should construct converted request")
+                .into_parts();
+            parts.extensions.insert(prepared);
+            prepare_trusted_forwarder(&mut parts, &settings);
+            let core = edgezero_core::http::Request::from_parts(parts, body);
             let info = RequestInfo::from_request(&core, &ClientInfo::default())
                 .expect("should accept converted request metadata");
             assert_eq!(

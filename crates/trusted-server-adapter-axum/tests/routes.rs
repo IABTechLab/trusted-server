@@ -1,25 +1,37 @@
 //! Integration tests for the Axum dev server.
 //!
-//! Uses `EdgeZeroAxumService` directly (no live TCP server) so tests remain fast
-//! and self-contained. Each test builds the full `TrustedServerApp` router and
-//! drives it through the Tower `Service` interface.
+//! Each route test assembles the full `TrustedServerApp` from explicit test
+//! settings, serves it through `EdgeZero`'s `AxumTestServer` on a loopback port,
+//! and sends real HTTP/1 requests over TCP. The production listener therefore
+//! applies its ingress and egress handling to every request. The startup test
+//! runs the compiled `trusted-server-axum` binary.
 
-use axum::body::Body as AxumBody;
-use axum::http::Request;
-use edgezero_adapter_axum::service::EdgeZeroAxumService;
+use std::net::SocketAddr;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use tower::{Service as _, ServiceExt as _};
+use std::time::{Duration, Instant};
+
+use edgezero_adapter_axum::AXUM_PLATFORM;
+use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
+use edgezero_adapter_axum::test_utils::AxumTestServer;
+use edgezero_core::app::App;
+use edgezero_core::router::RouterService;
 use trusted_server_adapter_axum::app::TrustedServerApp;
 use trusted_server_core::test_support::nextjs_auction;
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
 
+/// Environment variable from which the Axum binary reads its app config.
+const AXUM_CONFIG_ENV: &str = "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG";
+
+/// How long the startup test waits for the binary to exit.
+const STARTUP_EXIT_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Build the full application router from explicit test settings.
 ///
 /// The settings baked into the binary contain placeholder secrets that
-/// `get_settings()` rejects by design, which would turn every route into a
-/// startup error page (and its route table into the fallback-only set).
+/// `get_settings()` rejects by design, which would fail application startup.
 fn test_settings() -> trusted_server_core::settings::Settings {
     trusted_server_core::settings::Settings::from_toml(
         r#"
@@ -41,13 +53,9 @@ fn test_settings() -> trusted_server_core::settings::Settings {
     .expect("should parse route test settings")
 }
 
-fn test_router() -> edgezero_core::router::RouterService {
+fn test_router() -> RouterService {
     TrustedServerApp::routes_with_settings(test_settings())
         .expect("should build router from test settings")
-}
-
-fn make_service() -> EdgeZeroAxumService {
-    EdgeZeroAxumService::new(test_router())
 }
 
 fn registered_routes() -> Vec<(String, String)> {
@@ -63,6 +71,142 @@ fn assert_route_registered(method: &str, path: &str) {
     assert!(
         routes.iter().any(|(m, p)| m == method && p == path),
         "{method} {path} must be explicitly registered; registered routes: {routes:?}"
+    );
+}
+
+/// A `TrustedServerApp` served over loopback TCP, with an HTTP client for it.
+///
+/// The app has no `EdgeZero` stores attached. The Axum adapter reads its
+/// config and secrets from environment-backed platform stores, and these tests
+/// inject settings directly, so no route needs one.
+struct TestServer {
+    server: AxumTestServer,
+    client: reqwest::Client,
+}
+
+impl TestServer {
+    /// Assembles `router` as the Trusted Server app and serves it on loopback port 0.
+    async fn start(router: RouterService) -> Self {
+        let app = App::from_router::<TrustedServerApp>(router, AXUM_PLATFORM)
+            .expect("should assemble the Trusted Server app");
+        let config = AxumDevServerConfig {
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            enable_ctrl_c: false,
+            ..AxumDevServerConfig::default()
+        };
+        let server = AxumTestServer::start(AxumDevServer::with_config(app, config))
+            .await
+            .expect("should start the Axum test server");
+        // No proxy, redirect following, or transparent decompression: the
+        // tests assert on exactly what the listener sends.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .no_gzip()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("should build the test HTTP client");
+        Self { server, client }
+    }
+
+    /// Serves the router built from the default test settings.
+    async fn with_test_settings() -> Self {
+        Self::start(test_router()).await
+    }
+
+    /// Starts a request for `path` on the served app.
+    fn request(&self, method: &str, path: &str) -> reqwest::RequestBuilder {
+        let method =
+            reqwest::Method::from_bytes(method.as_bytes()).expect("should parse the test method");
+        self.client
+            .request(method, format!("http://{}{path}", self.server.address()))
+    }
+}
+
+/// Sends `request` and returns the response, with a bound on the wait.
+async fn send(request: reqwest::RequestBuilder) -> reqwest::Response {
+    tokio::time::timeout(Duration::from_secs(10), request.send())
+        .await
+        .expect("should answer promptly")
+        .expect("should respond")
+}
+
+/// Returns a loopback port that is free at the time of the call.
+fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("should reserve a loopback port")
+        .local_addr()
+        .expect("should read the reserved port")
+        .port()
+}
+
+/// Waits up to `deadline` for `child` to exit, killing it if it does not.
+///
+/// Returns `None` when the child was still running at the deadline.
+fn wait_for_exit(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("should poll the Axum binary") {
+            return Some(status);
+        }
+        if started.elapsed() >= deadline {
+            child.kill().expect("should stop the Axum binary");
+            child.wait().expect("should reap the Axum binary");
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Reads everything left in a child's output pipe.
+fn read_pipe(pipe: Option<impl std::io::Read>) -> String {
+    let mut output = String::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_string(&mut output)
+            .expect("should read the Axum binary output");
+    }
+    output
+}
+
+#[test]
+fn axum_main_exits_non_zero_when_settings_fail() {
+    // A clean environment keeps developer store-name overrides out of the
+    // test. The config value is not a Trusted Server app-config envelope.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"))
+        .env_clear()
+        .env(AXUM_CONFIG_ENV, "not-a-trusted-server-config-envelope")
+        .env("PORT", free_loopback_port().to_string())
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("should spawn the Axum binary");
+
+    let status = wait_for_exit(&mut child, STARTUP_EXIT_DEADLINE);
+    let output = format!(
+        "{}{}",
+        read_pipe(child.stdout.take()),
+        read_pipe(child.stderr.take())
+    );
+
+    let status = status.unwrap_or_else(|| {
+        panic!("should exit instead of serving after a settings failure; output:\n{output}")
+    });
+    assert!(
+        !status.success(),
+        "should exit non-zero after a settings failure, got {status}; output:\n{output}"
+    );
+    assert!(
+        output.contains("failed to parse Trusted Server app-config blob envelope"),
+        "should log the settings failure report; output:\n{output}"
+    );
+    assert!(
+        output.contains("trusted-server-adapter-axum failed to start"),
+        "should log the startup failure before exiting; output:\n{output}"
+    );
+    assert!(
+        !output.contains("Listening on"),
+        "should not reach the listener; output:\n{output}"
     );
 }
 
@@ -85,20 +229,9 @@ async fn aps_profile_serves_renderer_through_adapter_fallback() {
     );
     let router = TrustedServerApp::routes_with_settings(settings)
         .expect("should build router with APS profile");
-    let mut service = EdgeZeroAxumService::new(router);
-    let request = Request::builder()
-        .method("GET")
-        .uri("/integrations/aps/renderer")
-        .body(AxumBody::empty())
-        .expect("should build APS renderer request");
+    let server = TestServer::start(router).await;
 
-    let response = service
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(request)
-        .await
-        .expect("should serve APS renderer");
+    let response = send(server.request("GET", "/integrations/aps/renderer")).await;
     assert_eq!(response.status().as_u16(), 200);
 }
 
@@ -174,21 +307,9 @@ fn legacy_admin_aliases_are_registered_to_local_deny() {
 async fn discovery_endpoint_is_routed() {
     // Verifies the route exists — 5xx from missing signing keys is acceptable;
     // 404 is not (that would mean the route was not registered).
-    let mut svc = make_service();
+    let server = TestServer::with_test_settings().await;
 
-    let req = Request::builder()
-        .method("GET")
-        .uri("/.well-known/trusted-server.json")
-        .body(AxumBody::empty())
-        .expect("should build request");
-
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let resp = send(server.request("GET", "/.well-known/trusted-server.json")).await;
 
     assert_ne!(
         resp.status().as_u16(),
@@ -199,22 +320,15 @@ async fn discovery_endpoint_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verify_signature_endpoint_is_routed() {
-    let mut svc = make_service();
+    let server = TestServer::with_test_settings().await;
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/verify-signature")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let resp = send(
+        server
+            .request("POST", "/verify-signature")
+            .header("content-type", "application/json")
+            .body("{}"),
+    )
+    .await;
 
     assert_ne!(
         resp.status().as_u16(),
@@ -225,24 +339,12 @@ async fn verify_signature_endpoint_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tsjs_route_prefix_is_handled_not_5xx() {
-    let mut svc = make_service();
+    let server = TestServer::with_test_settings().await;
 
     // /static/tsjs= is a GET /{*rest} catch-all path. The handler returns 404
     // for an unknown hash, which is correct application behaviour (not a routing 404).
     // This test verifies the handler is reached (no 5xx/panic) and that routing works.
-    let req = Request::builder()
-        .method("GET")
-        .uri("/static/tsjs=0000000000000000")
-        .body(AxumBody::empty())
-        .expect("should build request");
-
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let resp = send(server.request("GET", "/static/tsjs=0000000000000000")).await;
     let status = resp.status().as_u16();
 
     assert!(
@@ -253,21 +355,10 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
-    let mut svc = make_service();
+    let server = TestServer::with_test_settings().await;
     let src = trusted_server_core::tsjs::tsjs_script_src(&["creative"]);
-    let req = Request::builder()
-        .method("GET")
-        .uri(src)
-        .body(AxumBody::empty())
-        .expect("should build request");
 
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let resp = send(server.request("GET", &src)).await;
 
     assert_eq!(
         resp.status().as_u16(),
@@ -293,22 +384,15 @@ async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finalize_middleware_sets_geo_unavailable_header() {
-    let mut svc = make_service();
+    let server = TestServer::with_test_settings().await;
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/verify-signature")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let resp = send(
+        server
+            .request("POST", "/verify-signature")
+            .header("content-type", "application/json")
+            .body("{}"),
+    )
+    .await;
 
     assert_eq!(
         resp.headers()
@@ -325,20 +409,14 @@ async fn finalize_middleware_sets_geo_unavailable_header() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_route_without_credentials_returns_401() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/_ts/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(
+        server
+            .request("POST", "/_ts/admin/keys/rotate")
+            .header("content-type", "application/json")
+            .body("{}"),
+    )
+    .await;
     assert_eq!(
         resp.status().as_u16(),
         401,
@@ -356,20 +434,13 @@ async fn authenticated_admin_ec_routes_return_501() {
         "/_ts/admin/ec".to_owned(),
         format!("/_ts/admin/ec/{sample_ec_id}"),
     ] {
-        let mut svc = make_service();
-        let req = Request::builder()
-            .method("GET")
-            .uri(&path)
-            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
-            .body(AxumBody::empty())
-            .expect("should build request");
-        let resp = svc
-            .ready()
-            .await
-            .expect("should be ready")
-            .call(req)
-            .await
-            .expect("should respond");
+        let server = TestServer::with_test_settings().await;
+        let resp = send(
+            server
+                .request("GET", &path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw=="),
+        )
+        .await;
         assert_eq!(
             resp.status().as_u16(),
             501,
@@ -392,19 +463,8 @@ async fn authenticated_admin_ec_routes_return_501() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_ec_route_without_credentials_returns_401() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("GET")
-        .uri("/_ts/admin/ec")
-        .body(AxumBody::empty())
-        .expect("should build unauthenticated admin EC request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(server.request("GET", "/_ts/admin/ec")).await;
 
     assert_eq!(resp.status().as_u16(), 401);
     assert!(
@@ -417,20 +477,13 @@ async fn admin_ec_route_without_credentials_returns_401() {
 async fn authenticated_admin_eids_route_returns_200() {
     // The EIDs echo is pure request inspection (no KV), so the dev server
     // serves the real handler.
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("GET")
-        .uri("/_ts/admin/eids")
-        .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
-        .body(AxumBody::empty())
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(
+        server
+            .request("GET", "/_ts/admin/eids")
+            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw=="),
+    )
+    .await;
     assert_eq!(
         resp.status().as_u16(),
         200,
@@ -446,22 +499,17 @@ async fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
         format!("/_ts/admin/ec/{ec_id}"),
         "/_ts/admin/eids".to_owned(),
     ];
+    let server = TestServer::with_test_settings().await;
 
     for path in valid_paths {
         for method in ["POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
-            let request = Request::builder()
-                .method(method)
-                .uri(&path)
-                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
-                .body(AxumBody::from("sensitive-admin-body"))
-                .expect("should build authenticated admin request");
-            let response = make_service()
-                .ready()
-                .await
-                .expect("should be ready")
-                .call(request)
-                .await
-                .expect("should respond");
+            let response = send(
+                server
+                    .request(method, &path)
+                    .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .body("sensitive-admin-body"),
+            )
+            .await;
 
             assert_eq!(response.status().as_u16(), 405);
             assert_eq!(
@@ -507,19 +555,13 @@ async fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
         "/_ts%252Fadmin/ec".to_owned(),
     ] {
         for method in ["GET", "POST"] {
-            let request = Request::builder()
-                .method(method)
-                .uri(&path)
-                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
-                .body(AxumBody::from("sensitive-admin-body"))
-                .expect("should build malformed admin request");
-            let response = make_service()
-                .ready()
-                .await
-                .expect("should be ready")
-                .call(request)
-                .await
-                .expect("should respond");
+            let response = send(
+                server
+                    .request(method, &path)
+                    .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .body("sensitive-admin-body"),
+            )
+            .await;
 
             assert_eq!(response.status().as_u16(), 404);
             assert_eq!(
@@ -542,23 +584,17 @@ async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
     // origin (which would leak the admin credentials and key body). A
     // publisher-fallback proxy without a backend would surface as a 5xx, so 404
     // proves the local deny ran.
+    let server = TestServer::with_test_settings().await;
     for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
         for method in LEGACY_ADMIN_DENY_METHODS {
-            let mut svc = make_service();
-            let req = Request::builder()
-                .method(*method)
-                .uri(path)
-                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
-                .header("content-type", "application/json")
-                .body(AxumBody::from("{\"key_id\":\"leak-me\"}"))
-                .expect("should build authorized legacy-alias request");
-            let resp = svc
-                .ready()
-                .await
-                .expect("should be ready")
-                .call(req)
-                .await
-                .expect("should respond");
+            let resp = send(
+                server
+                    .request(method, path)
+                    .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .header("content-type", "application/json")
+                    .body("{\"key_id\":\"leak-me\"}"),
+            )
+            .await;
             assert_eq!(
                 resp.status().as_u16(),
                 404,
@@ -570,20 +606,14 @@ async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_route_without_credentials_includes_www_authenticate_header() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/_ts/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(
+        server
+            .request("POST", "/_ts/admin/keys/rotate")
+            .header("content-type", "application/json")
+            .body("{}"),
+    )
+    .await;
     assert_eq!(
         resp.status().as_u16(),
         401,
@@ -609,21 +639,15 @@ async fn admin_route_without_credentials_includes_www_authenticate_header() {
 async fn admin_route_with_wrong_credentials_returns_401() {
     use base64::Engine as _;
     let creds = base64::engine::general_purpose::STANDARD.encode("admin:wrong-password");
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/_ts/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .header("authorization", format!("Basic {creds}"))
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(
+        server
+            .request("POST", "/_ts/admin/keys/rotate")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Basic {creds}"))
+            .body("{}"),
+    )
+    .await;
     assert_eq!(
         resp.status().as_u16(),
         401,
@@ -633,19 +657,8 @@ async fn admin_route_with_wrong_credentials_returns_401() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_endpoint_does_not_require_auth() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("GET")
-        .uri("/.well-known/trusted-server.json")
-        .body(AxumBody::empty())
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(server.request("GET", "/.well-known/trusted-server.json")).await;
     assert_ne!(
         resp.status().as_u16(),
         401,
@@ -655,20 +668,14 @@ async fn discovery_endpoint_does_not_require_auth() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auction_endpoint_does_not_require_auth() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/auction")
-        .header("content-type", "application/json")
-        .body(AxumBody::from(r#"{"adUnits":[]}"#))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(
+        server
+            .request("POST", "/auction")
+            .header("content-type", "application/json")
+            .body(r#"{"adUnits":[]}"#),
+    )
+    .await;
     assert_ne!(
         resp.status().as_u16(),
         401,
@@ -678,22 +685,15 @@ async fn auction_endpoint_does_not_require_auth() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_route_returns_non_404_non_5xx() {
-    let mut svc = make_service();
+    let server = TestServer::with_test_settings().await;
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/_ts/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let resp = send(
+        server
+            .request("POST", "/_ts/admin/keys/rotate")
+            .header("content-type", "application/json")
+            .body("{}"),
+    )
+    .await;
     let status = resp.status().as_u16();
 
     assert_ne!(status, 404, "admin route must be routed");
@@ -710,20 +710,14 @@ async fn admin_route_returns_non_404_non_5xx() {
 // generic `admin_route_without_credentials_returns_401` above).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_rotate_key_auth_fail_returns_401() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/_ts/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .body(AxumBody::from(r#"{"keyId":"test-key"}"#))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(
+        server
+            .request("POST", "/_ts/admin/keys/rotate")
+            .header("content-type", "application/json")
+            .body(r#"{"keyId":"test-key"}"#),
+    )
+    .await;
     assert_eq!(
         resp.status().as_u16(),
         401,
@@ -733,20 +727,14 @@ async fn admin_rotate_key_auth_fail_returns_401() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_deactivate_key_auth_fail_returns_401() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/_ts/admin/keys/deactivate")
-        .header("content-type", "application/json")
-        .body(AxumBody::from(r#"{"keyId":"test-key"}"#))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(
+        server
+            .request("POST", "/_ts/admin/keys/deactivate")
+            .header("content-type", "application/json")
+            .body(r#"{"keyId":"test-key"}"#),
+    )
+    .await;
     assert_eq!(
         resp.status().as_u16(),
         401,
@@ -760,19 +748,8 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_proxy_is_routed() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("GET")
-        .uri("/first-party/proxy")
-        .body(AxumBody::empty())
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(server.request("GET", "/first-party/proxy")).await;
     assert_ne!(
         resp.status().as_u16(),
         404,
@@ -782,19 +759,8 @@ async fn first_party_proxy_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_click_is_routed() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("GET")
-        .uri("/first-party/click")
-        .body(AxumBody::empty())
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(server.request("GET", "/first-party/click")).await;
     assert_ne!(
         resp.status().as_u16(),
         404,
@@ -804,19 +770,8 @@ async fn first_party_click_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_sign_get_is_routed() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("GET")
-        .uri("/first-party/sign")
-        .body(AxumBody::empty())
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(server.request("GET", "/first-party/sign")).await;
     assert_ne!(
         resp.status().as_u16(),
         404,
@@ -826,20 +781,14 @@ async fn first_party_sign_get_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_sign_post_is_routed() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/first-party/sign")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(
+        server
+            .request("POST", "/first-party/sign")
+            .header("content-type", "application/json")
+            .body("{}"),
+    )
+    .await;
     assert_ne!(
         resp.status().as_u16(),
         404,
@@ -849,20 +798,14 @@ async fn first_party_sign_post_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_proxy_rebuild_is_routed() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/first-party/proxy-rebuild")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
+    let server = TestServer::with_test_settings().await;
+    let resp = send(
+        server
+            .request("POST", "/first-party/proxy-rebuild")
+            .header("content-type", "application/json")
+            .body("{}"),
+    )
+    .await;
     assert_ne!(
         resp.status().as_u16(),
         404,
@@ -886,22 +829,19 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
         nextjs_auction::services(Arc::clone(&client)),
     )
     .expect("should build router with fixture services");
+    let server = TestServer::start(router).await;
 
-    let request = edgezero_core::http::request_builder()
-        .method("GET")
-        .uri("https://test-publisher.example.com/article")
-        .header("host", "test-publisher.example.com")
-        .header("accept", "text/html")
-        .body(edgezero_core::body::Body::empty())
-        .expect("should build publisher navigation");
-    let response = router
-        .oneshot(request)
-        .await
-        .expect("should serve publisher navigation");
+    let response = send(
+        server
+            .request("GET", "/article")
+            .header("host", "test-publisher.example.com")
+            .header("accept", "text/html"),
+    )
+    .await;
     assert_eq!(response.status(), 200, "should serve fixture HTML");
     let body = response
-        .into_body()
-        .into_bytes()
+        .bytes()
+        .await
         .expect("should buffer adapter output");
     let html = String::from_utf8(body.to_vec()).expect("should emit UTF-8 HTML");
 
@@ -952,36 +892,26 @@ async fn nextjs_gtm_rejects_malformed_request_hosts() {
             nextjs_auction::services(origin),
         )
         .expect("should build script composition router");
-        let mut service = EdgeZeroAxumService::new(router);
+        let server = TestServer::start(router).await;
         let hostile_host = "example.com</script><script>alert(1)</script>";
         let value = if header == "forwarded" {
             format!("host=\"{hostile_host}\"")
         } else {
             hostile_host.to_owned()
         };
-        let mut request = Request::builder()
-            .uri("/script-composition")
-            .header("host", nextjs_auction::PUBLISHER_HOST)
-            .body(AxumBody::empty())
-            .expect("should build hostile host request");
-        request.headers_mut().insert(
-            header,
-            value.parse().expect("should encode hostile host header"),
-        );
-        let response = service
-            .ready()
-            .await
-            .expect("should be ready")
-            .call(request)
-            .await
-            .expect("should respond to hostile host request");
+        let mut request = server.request("GET", "/script-composition");
+        if header != "host" {
+            request = request.header("host", nextjs_auction::PUBLISHER_HOST);
+        }
+        let response = send(request.header(header, value)).await;
         let expected_status = if header == "host" { 400 } else { 200 };
         assert_eq!(
             response.status().as_u16(),
             expected_status,
             "should reject malformed Host and ignore unauthenticated {header}"
         );
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        let body = response
+            .bytes()
             .await
             .expect("should consume hostile host response");
         assert!(
@@ -1010,25 +940,20 @@ async fn nextjs_gtm_accepts_local_request_hosts_and_ports() {
             nextjs_auction::services(origin),
         )
         .expect("should build script composition router");
-        let mut service = EdgeZeroAxumService::new(router);
-        let request = Request::builder()
-            .uri("/script-composition")
-            .header("host", host)
-            .body(AxumBody::empty())
-            .expect("should build local host request");
-        let response = service
-            .ready()
-            .await
-            .expect("should be ready")
-            .call(request)
-            .await
-            .expect("should serve local host request");
+        let server = TestServer::start(router).await;
+        let response = send(
+            server
+                .request("GET", "/script-composition")
+                .header("host", host),
+        )
+        .await;
         assert_eq!(
             response.status().as_u16(),
             200,
             "should accept host: {host}"
         );
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        let body = response
+            .bytes()
             .await
             .expect("should consume local host response");
         let html = String::from_utf8(body.to_vec()).expect("should emit UTF-8 HTML");
@@ -1060,21 +985,14 @@ async fn nextjs_gtm_html_response_is_complete() {
             nextjs_auction::services(origin),
         )
         .expect("should build mixed integration router");
-        let mut service = EdgeZeroAxumService::new(router);
-        let request = Request::builder()
-            .method("GET")
-            .uri("/article")
-            .header("host", nextjs_auction::PUBLISHER_HOST)
-            .header("accept", "text/html")
-            .body(AxumBody::empty())
-            .expect("should build navigation");
-        let response = service
-            .ready()
-            .await
-            .expect("should be ready")
-            .call(request)
-            .await
-            .expect("should serve HTML");
+        let server = TestServer::start(router).await;
+        let response = send(
+            server
+                .request("GET", "/article")
+                .header("host", nextjs_auction::PUBLISHER_HOST)
+                .header("accept", "text/html"),
+        )
+        .await;
         assert_eq!(
             response.status().as_u16(),
             200,
@@ -1088,7 +1006,8 @@ async fn nextjs_gtm_html_response_is_complete() {
             gzip.then_some("gzip"),
             "should retain the requested response compression"
         );
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        let body = response
+            .bytes()
             .await
             .expect("should consume entire adapter body");
         nextjs_auction::assert_script_composition_response(&body, gzip);
@@ -1097,20 +1016,9 @@ async fn nextjs_gtm_html_response_is_complete() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_reports_git_version() {
-    let mut service = make_service();
-    let request = Request::builder()
-        .method("GET")
-        .uri("/health")
-        .body(AxumBody::empty())
-        .expect("should build health request");
+    let server = TestServer::with_test_settings().await;
 
-    let response = service
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(request)
-        .await
-        .expect("should serve health");
+    let response = send(server.request("GET", "/health")).await;
 
     assert_eq!(
         response.status().as_u16(),

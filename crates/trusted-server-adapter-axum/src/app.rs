@@ -6,7 +6,7 @@ use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
-    HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
+    HandlerFuture, HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
 };
 use edgezero_core::router::RouterService;
 use error_stack::Report;
@@ -20,7 +20,7 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError, startup_error};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
@@ -162,7 +162,7 @@ where
     Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
 {
     let services = state.services_for_request(&ctx);
-    let mut req = ctx.into_request();
+    let mut req = ctx.into_request()?;
     if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
         &state.settings,
         &mut req,
@@ -564,7 +564,7 @@ fn named_route_handler(
 }
 
 // ---------------------------------------------------------------------------
-// Startup error fallback
+// Publisher fallback methods
 // ---------------------------------------------------------------------------
 
 fn publisher_fallback_methods() -> [Method; 7] {
@@ -579,34 +579,6 @@ fn publisher_fallback_methods() -> [Method; 7] {
     ]
 }
 
-/// Returns a [`RouterService`] that responds to every route with the startup error.
-fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    let message = Arc::new(format!("{}\n", e.current_context().user_message()));
-    let status = e.current_context().status_code();
-
-    let make_handler = |msg: Arc<String>| {
-        move |_ctx: RequestContext| {
-            let body = edgezero_core::body::Body::from((*msg).clone());
-            let mut resp = Response::new(body);
-            *resp.status_mut() = status;
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            async move { Ok::<Response, EdgeError>(resp) }
-        }
-    };
-
-    let mut router = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
-        Arc::new(Settings::default()),
-    ));
-    for method in publisher_fallback_methods() {
-        router = router.route("/", method.clone(), make_handler(Arc::clone(&message)));
-        router = router.route("/{*rest}", method, make_handler(Arc::clone(&message)));
-    }
-    router.build()
-}
-
 // ---------------------------------------------------------------------------
 // TrustedServerApp
 // ---------------------------------------------------------------------------
@@ -619,16 +591,13 @@ impl Hooks for TrustedServerApp {
         "TrustedServer"
     }
 
-    fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
-        };
+    fn routes() -> Result<RouterService, EdgeError> {
+        let state = build_state().map_err(|report| {
+            log::error!("{report:?}");
+            startup_error(&report)
+        })?;
 
-        build_router(&state)
+        Ok(build_router(&state))
     }
 }
 
@@ -725,7 +694,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     router.build()
 }
 
-fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
+fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
     if let Some(services) = &state.services {
         let client_info = services.client_info().clone();
         let geo = client_info.client_ip.and_then(|client_ip| {
@@ -738,7 +707,9 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
     }
     TraceMetadata {
         client_info: ClientInfo {
-            client_ip: AxumRequestContext::get(request)
+            client_ip: request
+                .extensions
+                .get::<AxumRequestContext>()
                 .and_then(|context| context.remote_addr)
                 .map(|peer| peer.ip()),
             ..ClientInfo::default()

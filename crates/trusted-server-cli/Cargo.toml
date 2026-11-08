@@ -112,7 +112,7 @@ x509-parser = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 assert_cmd = { workspace = true }
-edgezero-adapter-axum = { workspace = true, features = ["axum"] }
+edgezero-adapter-axum = { workspace = true, features = ["axum", "test-utils"] }
 flate2 = { workspace = true }
 predicates = { workspace = true }
 temp-env = { workspace = true }

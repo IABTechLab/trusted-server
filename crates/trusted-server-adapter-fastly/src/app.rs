@@ -79,7 +79,10 @@
 //!
 //! # Startup error handling
 //!
-//! When [`build_state`] fails, [`startup_error_router`] returns a minimal router
+//! [`Hooks::routes`] returns the startup error as an [`EdgeError`] from
+//! [`startup_error`]. The entry point builds its app with
+//! `TrustedServerApp::build_app_with_state` instead. There, when [`build_state`]
+//! fails, [`startup_error_router`] returns a minimal router
 //! that responds to all routes with the startup error. This router does **not**
 //! attach middleware. Startup-error responses may still receive entry-point
 //! finalization (geo and TS headers) when settings can be reloaded via
@@ -94,7 +97,7 @@ use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
-    HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
+    HandlerFuture, HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
 };
 use edgezero_core::router::RouterService;
 use error_stack::Report;
@@ -116,7 +119,7 @@ use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError, startup_error};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
@@ -265,12 +268,14 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     // No cooperative timer is installed: Fastly host calls block. EOF consumers
     // must bound their own transport calls using the remaining finish budget.
     let client_info = ctx
-        .request()
         .extensions()
         .get::<ClientInfo>()
         .cloned()
         .unwrap_or_else(|| ClientInfo {
-            client_ip: FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip),
+            client_ip: ctx
+                .extensions()
+                .get::<FastlyRequestContext>()
+                .and_then(|c| c.client_ip),
             ..ClientInfo::default()
         });
 
@@ -548,7 +553,7 @@ async fn execute_named(
     handler: NamedRouteHandler,
 ) -> Result<Response, EdgeError> {
     let services = build_per_request_services(&state, &ctx);
-    let mut req = ctx.into_request();
+    let mut req = ctx.into_request()?;
 
     // S2S batch sync uses Bearer auth (not EC cookies), so it skips EC
     // context creation entirely — mirroring the dedicated early arm in the
@@ -769,7 +774,7 @@ async fn execute_fallback(
     ctx: RequestContext,
 ) -> Result<Response, EdgeError> {
     let services = build_per_request_services(&state, &ctx);
-    let req = ctx.into_request();
+    let req = ctx.into_request()?;
     Ok(dispatch_fallback(&state, &services, req).await)
 }
 
@@ -1282,7 +1287,10 @@ impl TrustedServerApp {
     ) -> (App, Option<Arc<AppState>>) {
         let (router, state) = Self::router_with_state(stores);
         let mut app = App::with_name(router, Self::name());
-        Self::configure(&mut app);
+        // The default `configure` makes no change and cannot fail.
+        if let Err(error) = Self::configure(&mut app) {
+            log::error!("failed to configure the application: {error:?}");
+        }
         (app, state)
     }
 
@@ -1343,13 +1351,16 @@ impl TrustedServerApp {
     }
 }
 
-fn trace_metadata(request: &Request) -> TraceMetadata {
+fn trace_metadata(request: &RequestParts) -> TraceMetadata {
     let client_info = request
-        .extensions()
+        .extensions
         .get::<ClientInfo>()
         .cloned()
         .unwrap_or_else(|| ClientInfo {
-            client_ip: FastlyRequestContext::get(request).and_then(|context| context.client_ip),
+            client_ip: request
+                .extensions
+                .get::<FastlyRequestContext>()
+                .and_then(|context| context.client_ip),
             ..ClientInfo::default()
         });
     let geo = client_info.client_ip.and_then(|client_ip| {
@@ -1368,9 +1379,13 @@ impl Hooks for TrustedServerApp {
         "TrustedServer"
     }
 
-    fn routes() -> RouterService {
+    fn routes() -> Result<RouterService, EdgeError> {
         let stores = RuntimeStoreConfig::logical();
-        Self::router_with_state(&stores).0
+        let state = build_state(&stores).map_err(|report| {
+            log::error!("{report:?}");
+            startup_error(&report)
+        })?;
+        Ok(Self::routes_for_state(&state))
     }
 
     fn stores() -> StoresMetadata {
@@ -3214,7 +3229,7 @@ mod tests {
                 let registry = Arc::clone(&registry);
                 let orchestrator = Arc::clone(&orchestrator);
                 Box::pin(async move {
-                    let request = ctx.into_request();
+                    let request = ctx.into_request()?;
                     let method = request.method().clone();
                     let mut ec_context =
                         match EcContext::read_from_request(&settings, &request, &services) {
@@ -3360,7 +3375,7 @@ mod tests {
             "should preserve the streaming origin status"
         );
         assert!(
-            matches!(response.body(), Body::Stream(_)),
+            response.body().is_stream(),
             "EdgeZero asset dispatch must stream the origin body, not buffer it"
         );
     }
@@ -3404,7 +3419,7 @@ mod tests {
                 gzip.then_some("gzip"),
                 "should retain the requested response compression"
             );
-            let Body::Stream(mut stream) = response.into_body() else {
+            let Ok(mut stream) = response.into_body().into_stream() else {
                 panic!("should retain lazy Fastly body");
             };
             let mut bytes = Vec::new();
@@ -3438,7 +3453,7 @@ mod tests {
             "publisher proxy should succeed against the streaming origin stub"
         );
         assert!(
-            matches!(response.body(), Body::Stream(_)),
+            response.body().is_stream(),
             "EdgeZero publisher dispatch must attach the lazy streaming body, not buffer it"
         );
         assert!(

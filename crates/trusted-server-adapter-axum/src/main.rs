@@ -1,5 +1,6 @@
+use edgezero_adapter_axum::AXUM_PLATFORM;
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
-use edgezero_core::app::Hooks as _;
+use edgezero_core::app::App;
 use log::LevelFilter;
 use trusted_server_adapter_axum::app::TrustedServerApp;
 
@@ -32,14 +33,24 @@ fn main() {
         Some(port) => AxumDevServerConfig {
             addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             enable_ctrl_c: true,
+            ..AxumDevServerConfig::default()
         },
         // Normal development path: read bind address from axum.toml.
         None => AxumDevServerConfig::default(),
     };
 
+    // A settings failure stops startup before the listener binds. `routes`
+    // has already logged the full report.
+    let app = match App::build::<TrustedServerApp>(AXUM_PLATFORM) {
+        Ok(app) => app,
+        Err(error) => {
+            log::error!("trusted-server-adapter-axum failed to start: {error}");
+            std::process::exit(1);
+        }
+    };
+
     log::info!("Listening on http://{}", config.addr);
-    let router = TrustedServerApp::routes();
-    if let Err(err) = AxumDevServer::with_config(router, config).run() {
+    if let Err(err) = AxumDevServer::with_config(app, config).run() {
         log::error!("trusted-server-adapter-axum failed: {err}");
         std::process::exit(1);
     }
