@@ -185,7 +185,7 @@ baseline results that Task 12 compares against.
       verification section. Expected: the diff is empty, or every changed item
       is listed.
 - [ ] **Step 3: Baseline suite.** Run every CI gate in `AGENTS.md` ("CI
-      Gates", 1 to 13) at the merged head and save each command's exit code
+      Gates", 1 to 15) at the merged head and save each command's exit code
       and summary line to `$SCRATCH/baseline.md`. Expected: every gate exits 0.
       Report any failure to the user before Task 1, together with a
       reproduction at `origin/main`.
@@ -1187,7 +1187,7 @@ except the four guide documents.
 **Files:** The PR #1506 body.
 
 - [ ] **Step 1: Run the full suite** at the head: every `AGENTS.md` CI gate
-      (1 to 13), the Spec "Runtime" list, the HTML EOF checks, the response
+      (1 to 15), the Spec "Runtime" list, the HTML EOF checks, the response
       diff against the Task 0 merge commit, and the four smoke scripts.
       Record each command, exit code, and summary line.
 - [ ] **Step 2: Update the PR body.** Add `PRfection phase: implementation`,
