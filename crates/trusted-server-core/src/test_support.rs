@@ -2,6 +2,8 @@
 pub(crate) mod body_read;
 #[cfg(test)]
 pub(crate) mod logging;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod scripted_client;
 
 #[cfg(test)]
 pub mod tests {
