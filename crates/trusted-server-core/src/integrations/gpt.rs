@@ -562,7 +562,13 @@ mod tests {
     use super::*;
     use crate::constants::HEADER_X_FORWARDED_FOR;
     use crate::integrations::IntegrationDocumentState;
+    use crate::outbound::{BUFFERED_TIMEOUT, DEFAULT_BUFFERED_RESPONSE_BYTES};
+    use crate::platform::test_support::build_services_with_outbound_client;
+    use crate::test_support::scripted_client::{
+        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
+    };
     use crate::test_support::tests::create_test_settings;
+    use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding, ResponseMode};
     use http::Method;
 
     fn test_config() -> GptConfig {
@@ -754,6 +760,73 @@ mod tests {
     }
 
     // -- GPT proxy configuration --
+
+    #[test]
+    fn gpt_script_request_readback() {
+        let clock = TestClock::new();
+        let upstream = ScriptedHttpClient::new(&clock);
+        upstream.respond_to(
+            Method::GET,
+            "https://ads.example.com/gpt.js",
+            ScriptedReply::status(http::StatusCode::OK)
+                .header("content-type", "application/javascript")
+                .header("content-encoding", "gzip")
+                .body("gzip-bytes"),
+        );
+        let services = build_services_with_outbound_client(&upstream, &clock);
+        let integration = GptIntegration::new(GptConfig {
+            script_url: "https://ads.example.com/gpt.js".to_owned(),
+            ..test_config()
+        });
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://edge.example.com/integrations/gpt/script")
+            .header(HEADER_ACCEPT, "application/javascript")
+            .header(HEADER_ACCEPT_LANGUAGE, "en-US")
+            .header(HEADER_ACCEPT_ENCODING, "gzip")
+            .header(header::COOKIE, "session=fictional")
+            .header(HEADER_X_FORWARDED_FOR, "198.51.100.10")
+            .body(EdgeBody::empty())
+            .expect("should build the GPT script request");
+
+        let response = futures::executor::block_on(integration.handle(
+            &create_test_settings(),
+            &services,
+            req,
+        ))
+        .expect("should serve the GPT script");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip"),
+            "should relay the script in the coding the upstream sent"
+        );
+        let requests = upstream.requests();
+        assert_eq!(requests.len(), 1, "should send one script request");
+        let sent = &requests[0];
+        assert_eq!(
+            (&sent.method, sent.uri.to_string()),
+            (&Method::GET, "https://ads.example.com/gpt.js".to_owned()),
+            "should fetch the configured script URL"
+        );
+        sent.assert_headers(&[
+            ("accept", "application/javascript"),
+            ("accept-language", "en-US"),
+            ("accept-encoding", "gzip"),
+            ("user-agent", "TrustedServer/1.0"),
+        ]);
+        sent.assert_transport(ExpectedTransport {
+            timeout: BUFFERED_TIMEOUT,
+            response_mode: ResponseMode::Buffered {
+                max_bytes: DEFAULT_BUFFERED_RESPONSE_BYTES,
+            },
+            response_decoding: ResponseDecoding::Original,
+            cache_policy: OutboundCachePolicy::PlatformDefault,
+        });
+    }
 
     #[test]
     fn build_proxy_config_uses_streaming_without_ec_forwarding_or_redirects() {

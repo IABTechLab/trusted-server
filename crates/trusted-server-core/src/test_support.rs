@@ -10,6 +10,16 @@ use edgezero_core::http::Request;
 
 #[cfg(any(test, feature = "test-utils"))]
 use crate::platform::HttpClient;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::{
+    error::TrustedServerError,
+    redacted::Redacted,
+    s3_sigv4::{self, S3Credentials},
+};
+#[cfg(any(test, feature = "test-utils"))]
+use error_stack::Report;
+#[cfg(any(test, feature = "test-utils"))]
+use http::{HeaderMap, HeaderValue, Method, header};
 
 /// Inserts `client` into `request`'s extensions, where `ctx.http_client()` reads it.
 ///
@@ -31,6 +41,57 @@ use crate::platform::HttpClient;
 #[cfg(any(test, feature = "test-utils"))]
 pub fn insert_outbound_client(request: &mut Request, client: HttpClient) {
     request.extensions_mut().insert(client);
+}
+
+/// Recomputes the S3 `SigV4` `Authorization` value for a request an origin received.
+///
+/// An origin stub passes the method, the `Host`, request target, and `x-amz-date` it
+/// received, and the route's region and credentials. The result equals the request's
+/// `Authorization` only when Trusted Server signed exactly that `Host`, path, and query.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Proxy`] when
+/// `amz_date` is not a `SigV4` timestamp or the received values cannot be signed.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn s3_sigv4_authorization(
+    method: &Method,
+    host: &str,
+    request_target: &str,
+    amz_date: &str,
+    region: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+) -> Result<String, Report<TrustedServerError>> {
+    let invalid = |message: String| Report::new(TrustedServerError::Proxy { message });
+    let signed_at = chrono::NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
+        .map_err(|_| invalid(format!("invalid x-amz-date `{amz_date}`")))?
+        .and_utc();
+    let url = url::Url::parse(&format!("https://{host}{request_target}"))
+        .map_err(|_| invalid(format!("invalid received target `{host}{request_target}`")))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::HOST,
+        HeaderValue::from_str(host)
+            .map_err(|_| invalid(format!("invalid received Host `{host}`")))?,
+    );
+    s3_sigv4::sign_headers(
+        method,
+        &url,
+        &mut headers,
+        region,
+        &S3Credentials {
+            access_key_id: access_key_id.to_owned(),
+            secret_access_key: Redacted::new(secret_access_key.to_owned()),
+            session_token: None,
+        },
+        std::time::SystemTime::from(signed_at),
+    )?;
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .ok_or_else(|| invalid("signer set no Authorization header".to_owned()))
 }
 
 #[cfg(test)]

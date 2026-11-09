@@ -343,8 +343,8 @@ impl CloudflareHttpClient {
 
         // Force manual redirect handling: the Workers runtime otherwise defaults
         // to `RequestRedirect::Follow` and transparently chases 3xx responses to
-        // any host inside `Fetch::send()`. Core's `proxy_with_redirects` does its
-        // own per-hop redirect handling and validates each next hop against
+        // any host inside `Fetch::send()`. Core follows redirects only through
+        // its redirect policy, which validates each next hop against
         // `allowed_domains`; auto-following here would bypass that allowlist
         // (SSRF). `Manual` surfaces the 3xx + Location back to core unfollowed,
         // matching the Axum adapter's `redirect::Policy::none()`.

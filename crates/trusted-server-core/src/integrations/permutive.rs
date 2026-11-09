@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::outbound::{OutboundRequest, ResponseDecoding};
+use edgezero_core::outbound::ResponseDecoding;
 use error_stack::{Report, ResultExt};
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, StatusCode};
@@ -132,7 +132,7 @@ impl PermutiveIntegration {
         // TODO: Check KV store cache first (future enhancement)
 
         // Fetch SDK from Permutive CDN
-        let permutive_req = OutboundRequest::get(&sdk_url)
+        let permutive_req = outbound_request(Method::GET, &sdk_url)
             .and_then(|request| request.header(header::USER_AGENT, "TrustedServer/1.0"))
             .and_then(|request| request.header(header::ACCEPT, "application/javascript, */*"))
             .map_err(|error| {

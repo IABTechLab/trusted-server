@@ -27,8 +27,7 @@ use crate::http_util::read_request_body;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, IntegrationScriptContext,
-    IntegrationScriptRewriter, ScriptRewriteAction, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
-    collect_response_bounded,
+    IntegrationScriptRewriter, ScriptRewriteAction,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{FIRST_PARTY_PASSTHROUGH_STRIP_HEADERS, ProxyRequestConfig, proxy_request};
@@ -786,20 +785,19 @@ impl GoogleTagManagerIntegration {
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError`] when the body cannot be read within the
-    /// response cap or the response cannot be built.
-    async fn rewritten_script_response(
+    /// Returns [`TrustedServerError`] when the body was not buffered or the
+    /// response cannot be built.
+    fn rewritten_script_response(
         &self,
         response: Response<EdgeBody>,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
         log::debug!("Rewriting GTM/gtag script content");
         let status = response.status();
-        let body_bytes = collect_response_bounded(
-            response.into_body(),
-            UPSTREAM_SDK_MAX_RESPONSE_BYTES as usize,
-            GTM_INTEGRATION_ID,
-        )
-        .await?;
+        // `proxy_request` buffers the script under its response cap.
+        let body_bytes = response
+            .into_body()
+            .into_bytes()
+            .ok_or_else(|| Report::new(Self::error("GTM script response was not buffered")))?;
         let body_str = String::from_utf8_lossy(&body_bytes);
         let rewritten_body = Self::rewrite_gtm_urls(&body_str);
 
@@ -985,7 +983,7 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
                 log::warn!("GTM upstream returned status {}", response.status());
                 return Ok(response);
             }
-            return self.rewritten_script_response(response).await;
+            return self.rewritten_script_response(response);
         }
 
         Ok(response)
@@ -1103,11 +1101,18 @@ mod tests {
         IntegrationDocumentState, IntegrationRegistry, IntegrationScriptContext,
         IntegrationScriptRewriter, ScriptRewriteAction,
     };
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::outbound::{
+        BUFFERED_TIMEOUT, DEFAULT_BUFFERED_RESPONSE_BYTES, REDIRECT_CHAIN_DEADLINE,
+    };
+    use crate::platform::test_support::build_services_with_outbound_client;
     use crate::settings::Settings;
     use crate::streaming_processor::StreamProcessor as _;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::scripted_client::{
+        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
+    };
+    use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding, ResponseMode};
 
     #[test]
     fn container_id_validation_matches_gtm_pattern() {
@@ -1728,31 +1733,112 @@ mod tests {
         });
     }
 
-    /// Drives `handle` against a stubbed upstream that returns `headers`.
+    /// A scripted upstream that answers the URL `integration` proxies `req` to with `reply`.
+    ///
+    /// A request that resolves to no proxied target scripts nothing, so any request it sends
+    /// fails.
+    fn scripted_gtm_upstream(
+        integration: &GoogleTagManagerIntegration,
+        req: &http::Request<EdgeBody>,
+        reply: ScriptedReply,
+    ) -> (TestClock, ScriptedHttpClient, RuntimeServices) {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        if let Some(GtmTarget::Proxy(target_url)) =
+            integration.build_target_url(req, req.uri().path())
+        {
+            client.respond_to(req.method().clone(), &target_url, reply);
+        }
+        let services = build_services_with_outbound_client(&client, &clock);
+        (clock, client, services)
+    }
+
+    /// Drives `handle` against a scripted upstream that returns `headers`.
     fn handle_with_upstream_headers(
         path_and_query: &str,
         status: u16,
         headers: Vec<(&'static str, &'static str)>,
     ) -> Response<EdgeBody> {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response_with_headers(status, b"upstream body".to_vec(), headers);
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
-            let req = build_http_request(
-                Method::GET,
-                &format!("https://edge.example.com{path_and_query}"),
-                EdgeBody::empty(),
-            );
+        let settings = create_test_settings();
+        let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
+        let req = build_http_request(
+            Method::GET,
+            &format!("https://edge.example.com{path_and_query}"),
+            EdgeBody::empty(),
+        );
+        let reply = headers.into_iter().fold(
+            ScriptedReply::status(StatusCode::from_u16(status).expect("should be a valid status"))
+                .body("upstream body"),
+            |reply, (name, value)| reply.header(name, value),
+        );
+        let (_clock, _client, services) = scripted_gtm_upstream(&integration, &req, reply);
 
+        futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should handle the GTM request")
+    }
+
+    #[test]
+    fn gtm_script_request_readback() {
+        let settings = create_test_settings();
+        let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://edge.example.com/integrations/google_tag_manager/gtm.js")
+            .header(header::USER_AGENT, "fictional-agent/1.0")
+            .header(header::ACCEPT, "*/*")
+            .header(header::ACCEPT_LANGUAGE, "en-US")
+            .header(header::REFERER, "https://publisher.example.com/article")
+            .header(crate::constants::HEADER_X_FORWARDED_FOR, "198.51.100.10")
+            .header(header::ACCEPT_ENCODING, "gzip, br")
+            .header(header::COOKIE, "_ga=fictional")
+            .body(EdgeBody::empty())
+            .expect("should build the GTM script request");
+        let target_url = into_proxy_url(
             integration
-                .handle(&settings, &services, req)
-                .await
-                .expect("should handle the GTM request")
-        })
+                .build_target_url(&req, req.uri().path())
+                .expect("should resolve a gtm.js target"),
+        );
+        let (clock, client, services) = scripted_gtm_upstream(
+            &integration,
+            &req,
+            ScriptedReply::status(StatusCode::OK)
+                .header("content-type", "application/javascript")
+                .body("var gtm = true;"),
+        );
+
+        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should serve the GTM script");
+
+        assert_eq!(response.status(), StatusCode::OK, "should serve the script");
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1, "should send one script request");
+        let sent = &requests[0];
+        assert_eq!(
+            (&sent.method, sent.uri.to_string()),
+            (&Method::GET, target_url),
+            "should fetch the configured container script"
+        );
+        sent.assert_headers(&[
+            ("user-agent", "fictional-agent/1.0"),
+            ("accept", "*/*"),
+            ("accept-language", "en-US"),
+            ("referer", "https://publisher.example.com/article"),
+            ("x-forwarded-for", ""),
+            ("accept-encoding", "identity"),
+        ]);
+        sent.assert_followed_transport(
+            ExpectedTransport {
+                timeout: BUFFERED_TIMEOUT,
+                response_mode: ResponseMode::Buffered {
+                    max_bytes: DEFAULT_BUFFERED_RESPONSE_BYTES,
+                },
+                response_decoding: ResponseDecoding::Original,
+                cache_policy: OutboundCachePolicy::PlatformDefault,
+            },
+            clock
+                .monotonic_clock()
+                .deadline_after(REDIRECT_CHAIN_DEADLINE),
+        );
     }
 
     #[test]
@@ -2096,32 +2182,27 @@ mod tests {
         );
     }
 
-    /// Drives `handle` with a stubbed upstream body and the given config.
+    /// Drives `handle` with a scripted upstream body and the given config.
     fn handle_with_upstream_body(
         config: GoogleTagManagerConfig,
         path_and_query: &str,
         status: u16,
         body: &[u8],
     ) -> Response<EdgeBody> {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(status, body.to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let integration = GoogleTagManagerIntegration::new(config);
-            let req = build_http_request(
-                Method::GET,
-                &format!("https://edge.example.com{path_and_query}"),
-                EdgeBody::empty(),
-            );
+        let settings = create_test_settings();
+        let integration = GoogleTagManagerIntegration::new(config);
+        let req = build_http_request(
+            Method::GET,
+            &format!("https://edge.example.com{path_and_query}"),
+            EdgeBody::empty(),
+        );
+        let reply =
+            ScriptedReply::status(StatusCode::from_u16(status).expect("should be a valid status"))
+                .body(body.to_vec());
+        let (_clock, _client, services) = scripted_gtm_upstream(&integration, &req, reply);
 
-            integration
-                .handle(&settings, &services, req)
-                .await
-                .expect("should handle the GTM request")
-        })
+        futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should handle the GTM request")
     }
 
     #[test]
@@ -2177,15 +2258,10 @@ mod tests {
             "should carry the configured cache lifetime"
         );
 
-        let body = futures::executor::block_on(async {
-            collect_response_bounded(
-                response.into_body(),
-                UPSTREAM_SDK_MAX_RESPONSE_BYTES as usize,
-                GTM_INTEGRATION_ID,
-            )
-            .await
-            .expect("should read the rewritten body")
-        });
+        let body = response
+            .into_body()
+            .into_bytes()
+            .expect("should buffer the rewritten body");
         assert_eq!(
             String::from_utf8_lossy(&body),
             r#"var beacon = "/integrations/google_tag_manager/g/collect";"#,
@@ -2921,11 +2997,6 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         futures::executor::block_on(async {
             // A malformed Content-Length no longer answers 400 before the read:
             // the bounded read governs, and a body under the cap is forwarded.
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(204, Vec::new());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
             let integration = GoogleTagManagerIntegration::new(tag_config("GTM-TEST1234", &[]));
             let payload = b"v=2&tid=G-TEST&cid=123".to_vec();
             let mut req = build_http_request(
@@ -2936,6 +3007,11 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             req.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
                 http::HeaderValue::from_static("not-a-number"),
+            );
+            let (_clock, upstream, services) = scripted_gtm_upstream(
+                &integration,
+                &req,
+                ScriptedReply::status(StatusCode::NO_CONTENT),
             );
 
             let response = integration
@@ -2949,7 +3025,11 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
                 "should return the upstream answer"
             );
             assert_eq!(
-                stub.recorded_request_bodies(),
+                upstream
+                    .requests()
+                    .iter()
+                    .map(|request| request.body.to_vec())
+                    .collect::<Vec<_>>(),
                 vec![payload],
                 "should forward the beacon body read under the cap"
             );
@@ -4287,10 +4367,8 @@ container_id = "GTM-DEFAULT"
         let settings = make_settings();
         let integration = GoogleTagManagerIntegration::new(tag_config("GTM-TEST1234", &[]));
         for case in body_read_failure_cases(default_max_beacon_body_size()) {
-            let stub = Arc::new(StubHttpClient::new());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
+            let upstream = ScriptedHttpClient::forbidding();
+            let services = build_services_with_outbound_client(&upstream, &TestClock::new());
             let (req, expectation) = case.into_request(
                 http::Request::builder()
                     .method(Method::POST)
@@ -4301,11 +4379,7 @@ container_id = "GTM-DEFAULT"
                 futures::executor::block_on(integration.handle(&settings, &services, req));
 
             expectation.assert_outcome("GTM beacon", &outcome);
-            assert!(
-                stub.recorded_request_uris().is_empty(),
-                "should not call upstream for the {} case",
-                expectation.name()
-            );
+            upstream.assert_no_requests();
         }
     }
 }

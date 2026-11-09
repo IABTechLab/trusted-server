@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::outbound::{OutboundRequest, ResponseDecoding};
+use edgezero_core::outbound::ResponseDecoding;
 use error_stack::{Report, ResultExt};
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, StatusCode};
@@ -126,7 +126,7 @@ impl LockrIntegration {
 
         // TODO: Check KV store cache first (future enhancement)
 
-        let lockr_req = OutboundRequest::get(sdk_url)
+        let lockr_req = outbound_request(Method::GET, sdk_url)
             .and_then(|request| request.header(header::USER_AGENT, "TrustedServer/1.0"))
             .and_then(|request| request.header(header::ACCEPT, "application/javascript, */*"))
             .map_err(|error| {
@@ -655,6 +655,41 @@ mod tests {
             sdk_url: "https://sdk.example.com/identity-lockr-trust-server.js".to_string(),
             ..test_config()
         }
+    }
+
+    #[test]
+    fn lockr_sdk_url_with_fragment_is_fetched_without_it() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::GET,
+            "https://sdk.example.com/identity-lockr-trust-server.js",
+            ScriptedReply::status(StatusCode::OK).body("window.lockr = {};"),
+        );
+        let services = build_services_with_outbound_client(&client, &clock);
+        let integration = LockrIntegration::new(LockrConfig {
+            sdk_url: "https://sdk.example.com/identity-lockr-trust-server.js#v2".to_string(),
+            ..readback_config()
+        });
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example.com/integrations/lockr/sdk")
+            .body(EdgeBody::empty())
+            .expect("should build SDK request");
+
+        let response = block_on(integration.handle(&create_test_settings(), &services, req))
+            .expect("should serve an SDK whose configured URL carries a fragment");
+
+        assert_eq!(response.status(), StatusCode::OK, "should serve the SDK");
+        assert_eq!(
+            client
+                .requests()
+                .iter()
+                .map(|request| request.uri.to_string())
+                .collect::<Vec<_>>(),
+            vec!["https://sdk.example.com/identity-lockr-trust-server.js"],
+            "should fetch the SDK URL without its fragment"
+        );
     }
 
     #[test]

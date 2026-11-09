@@ -15,7 +15,6 @@ use crate::http_util::read_request_body;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
-    UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{ProxyRequestConfig, proxy_request};
@@ -23,6 +22,9 @@ use crate::settings::{IntegrationConfig, Settings};
 use crate::tsjs;
 
 const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
+
+/// Cap on a Testlight upstream response, the 2 MiB limit for RTB responses.
+const TESTLIGHT_MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct TestlightConfig {
@@ -196,7 +198,8 @@ impl IntegrationProxy for TestlightIntegration {
 
         let payload_bytes = Self::rewrite_request_body(&payload_bytes, &ec_id)?;
 
-        let mut proxy_config = ProxyRequestConfig::new(&self.config.endpoint);
+        let mut proxy_config = ProxyRequestConfig::new(&self.config.endpoint)
+            .with_max_response_bytes(TESTLIGHT_MAX_RESPONSE_BYTES);
         proxy_config.forward_ec_id = false;
         proxy_config.body = Some(payload_bytes);
         proxy_config.stream_passthrough = true;
@@ -210,13 +213,15 @@ impl IntegrationProxy for TestlightIntegration {
             .change_context(Self::error("Failed to contact upstream integration"))?;
         let (parts, body) = response.into_parts();
 
+        // `proxy_request` buffers the answer under the Testlight response cap.
+        let response_body = body
+            .into_bytes()
+            .ok_or_else(|| {
+                Report::new(Self::error("Testlight upstream response was not buffered"))
+            })?
+            .to_vec();
+
         // Attempt to parse response into structured form for logging/future transforms.
-        let response_body = collect_response_bounded(
-            body,
-            UPSTREAM_RTB_MAX_RESPONSE_BYTES,
-            TESTLIGHT_INTEGRATION_ID,
-        )
-        .await?;
         match serde_json::from_slice::<TestlightResponseBody>(&response_body) {
             Ok(body) => {
                 let response_body = serde_json::to_vec(&body)
@@ -277,13 +282,17 @@ fn default_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::outbound::{BUFFERED_TIMEOUT, REDIRECT_CHAIN_DEADLINE};
+    use crate::platform::test_support::build_services_with_outbound_client;
     use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::scripted_client::{
+        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
+    };
     use crate::test_support::tests::{VALID_SYNTHETIC_ID, create_test_settings};
     use crate::tsjs;
+    use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding, ResponseMode};
     use http::Method;
     use serde_json::json;
-    use std::sync::Arc;
 
     #[test]
     fn build_requires_config() {
@@ -421,13 +430,18 @@ mod tests {
     }
 
     #[test]
-    fn handle_uses_platform_http_client_with_http_request() {
+    fn testlight_request_readback() {
         futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, br#"{"ok":true}"#.to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            let clock = TestClock::new();
+            let upstream = ScriptedHttpClient::new(&clock);
+            upstream.respond_to(
+                Method::POST,
+                "https://example.com/openrtb",
+                ScriptedReply::status(http::StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(r#"{"ok":true}"#),
             );
+            let services = build_services_with_outbound_client(&upstream, &clock);
             let settings = create_test_settings();
             let integration = TestlightIntegration::new(TestlightConfig {
                 enabled: true,
@@ -445,6 +459,10 @@ mod tests {
                 crate::constants::HEADER_X_TS_EC.clone(),
                 http::HeaderValue::from_static(VALID_SYNTHETIC_ID),
             );
+            req.headers_mut().insert(
+                header::USER_AGENT,
+                http::HeaderValue::from_static("fictional-agent/1.0"),
+            );
 
             let response = integration
                 .handle(&settings, &services, req)
@@ -454,12 +472,39 @@ mod tests {
             assert_eq!(
                 response.status(),
                 http::StatusCode::OK,
-                "should return stubbed upstream status"
+                "should return the upstream status"
             );
+            let requests = upstream.requests();
+            assert_eq!(requests.len(), 1, "should send one Testlight request");
+            let sent = &requests[0];
+            let sent_body: serde_json::Value =
+                serde_json::from_slice(&sent.body).expect("should send a JSON body");
             assert_eq!(
-                stub.recorded_backend_names(),
-                vec!["stub-backend".to_string()],
-                "should route outbound request through PlatformHttpClient"
+                (&sent.method, sent.uri.to_string(), &sent_body["user"]["id"]),
+                (
+                    &Method::POST,
+                    "https://example.com/openrtb".to_owned(),
+                    &json!(VALID_SYNTHETIC_ID)
+                ),
+                "should POST the rewritten payload to the configured endpoint"
+            );
+            sent.assert_headers(&[
+                ("user-agent", "fictional-agent/1.0"),
+                ("accept-encoding", "gzip, deflate, br"),
+                ("content-type", "application/json"),
+            ]);
+            sent.assert_followed_transport(
+                ExpectedTransport {
+                    timeout: BUFFERED_TIMEOUT,
+                    response_mode: ResponseMode::Buffered {
+                        max_bytes: 2 * 1024 * 1024,
+                    },
+                    response_decoding: ResponseDecoding::Original,
+                    cache_policy: OutboundCachePolicy::PlatformDefault,
+                },
+                clock
+                    .monotonic_clock()
+                    .deadline_after(REDIRECT_CHAIN_DEADLINE),
             );
             let response_json: serde_json::Value =
                 serde_json::from_slice(&response.into_body().into_bytes().unwrap_or_default())
@@ -482,10 +527,8 @@ mod tests {
             rewrite_scripts: true,
         });
         for case in body_read_failure_cases(INTEGRATION_MAX_BODY_BYTES) {
-            let stub = Arc::new(StubHttpClient::new());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
+            let upstream = ScriptedHttpClient::forbidding();
+            let services = build_services_with_outbound_client(&upstream, &TestClock::new());
             let (req, expectation) = case.into_request(
                 http::Request::builder()
                     .method(Method::POST)
@@ -497,11 +540,7 @@ mod tests {
                 futures::executor::block_on(integration.handle(&settings, &services, req));
 
             expectation.assert_outcome("Testlight auction", &outcome);
-            assert!(
-                stub.recorded_request_uris().is_empty(),
-                "should not call upstream for the {} case",
-                expectation.name()
-            );
+            upstream.assert_no_requests();
         }
     }
 }

@@ -50,7 +50,9 @@ futures = { workspace = true }
 http = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
+rcgen = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "cookies"] }
+rustls = { workspace = true }
 scraper = { workspace = true }
 testcontainers = { workspace = true }
 temp-env = { workspace = true }

@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use testcontainers::runners::SyncRunner as _;
+use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
 
 /// Initialize the logger once for the test binary.
 ///
@@ -904,4 +905,328 @@ fn chunked_post_auction_over_cap_returns_413_cloudflare() {
 #[ignore = "requires the pre-built trusted-server-axum binary"]
 fn chunked_post_auction_over_cap_returns_413_axum() {
     chunked_post_auction_over_cap_returns_413(IngressRuntime::Axum);
+}
+
+// ---------------------------------------------------------------------------
+// SigV4 asset host check for the EdgeZero cut
+// ---------------------------------------------------------------------------
+//
+// `EdgeZero` drops the `Host` header Trusted Server signs and sends the URI
+// authority instead, so these cases check that the authority, path, and query
+// an S3 origin receives are exactly what Trusted Server signed. S3 routes need
+// an `https` origin, so the origin is a loopback TLS server behind a test CA,
+// and `SSL_CERT_FILE` points Viceroy's native root store at that CA.
+
+/// Region the `SigV4` asset routes sign for.
+const SIGV4_REGION: &str = "us-east-1";
+
+/// Access key ID behind the routes' `integration_s3_access_key_id` secret.
+const SIGV4_ACCESS_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
+
+/// Secret access key behind the routes' `integration_s3_secret_access_key` secret.
+const SIGV4_SECRET_ACCESS_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+
+/// One request head as the TLS asset origin received it.
+#[derive(Clone, Debug)]
+struct SignedAssetRequest {
+    method: String,
+    target: String,
+    headers: Vec<(String, String)>,
+}
+
+impl SignedAssetRequest {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Loopback HTTPS origin, trusted through a test CA, that records every request
+/// head and answers each with a small image.
+struct TlsAssetOrigin {
+    port: u16,
+    ca_file: tempfile::NamedTempFile,
+    requests: Arc<Mutex<Vec<SignedAssetRequest>>>,
+    shutdown_tx: mpsc::Sender<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl TlsAssetOrigin {
+    /// Starts the origin on an ephemeral loopback port.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the test certificates or the listener cannot be set up.
+    fn start() -> Self {
+        let ca_key = rcgen::KeyPair::generate().expect("should generate the test CA key");
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("should create the test CA parameters");
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Example test CA");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let ca_cert = ca_params
+            .self_signed(&ca_key)
+            .expect("should self-sign the test CA");
+        let leaf_key = rcgen::KeyPair::generate().expect("should generate the origin key");
+        let leaf_cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()])
+            .expect("should create the origin certificate parameters")
+            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .expect("should sign the origin certificate");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let tls_config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("should select TLS versions")
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![leaf_cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der())
+                        .expect("should encode the origin key"),
+                )
+                .expect("should build the origin TLS configuration"),
+        );
+        let mut ca_file = tempfile::NamedTempFile::new().expect("should create the CA file");
+        ca_file
+            .write_all(ca_cert.pem().as_bytes())
+            .expect("should write the CA certificate");
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("should bind the TLS origin");
+        let port = listener
+            .local_addr()
+            .expect("should read the TLS origin address")
+            .port();
+        listener
+            .set_nonblocking(true)
+            .expect("should set listener nonblocking");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            while matches!(shutdown_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        let recorded = Arc::clone(&recorded);
+                        let tls_config = Arc::clone(&tls_config);
+                        thread::spawn(move || {
+                            serve_tls_asset_connection(stream, tls_config, &recorded);
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            port,
+            ca_file,
+            requests,
+            shutdown_tx,
+            handle: Some(handle),
+        }
+    }
+
+    /// Returns every request recorded so far, in arrival order.
+    fn requests(&self) -> Vec<SignedAssetRequest> {
+        self.requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for TlsAssetOrigin {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Completes the TLS handshake, records one request head, and answers it.
+fn serve_tls_asset_connection(
+    stream: TcpStream,
+    tls_config: Arc<rustls::ServerConfig>,
+    recorded: &Mutex<Vec<SignedAssetRequest>>,
+) {
+    if stream.set_nonblocking(false).is_err()
+        || stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .is_err()
+    {
+        return;
+    }
+    let Ok(connection) = rustls::ServerConnection::new(tls_config) else {
+        return;
+    };
+    let mut tls = rustls::StreamOwned::new(connection, stream);
+    let mut received = Vec::new();
+    let head_end = loop {
+        if let Some(position) = find_subslice(&received, b"\r\n\r\n") {
+            break position;
+        }
+        let mut chunk = [0_u8; 4096];
+        match tls.read(&mut chunk) {
+            Ok(read) if read > 0 => received.extend_from_slice(&chunk[..read]),
+            _ => return,
+        }
+    };
+    let Ok(head) = std::str::from_utf8(&received[..head_end]) else {
+        return;
+    };
+    let mut lines = head.split("\r\n");
+    let mut request_line = lines.next().unwrap_or_default().split(' ');
+    let (Some(method), Some(target)) = (request_line.next(), request_line.next()) else {
+        return;
+    };
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+        .collect();
+    let head_only = method == "HEAD";
+    recorded
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(SignedAssetRequest {
+            method: method.to_owned(),
+            target: target.to_owned(),
+            headers,
+        });
+
+    let body = b"example-image";
+    let response_head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = tls.write_all(response_head.as_bytes());
+    if !head_only {
+        let _ = tls.write_all(body);
+    }
+    tls.conn.send_close_notify();
+    let _ = tls.flush();
+}
+
+/// The Viceroy integration config with `envelope` as its app config.
+fn viceroy_config_with_app_config(envelope: &str) -> String {
+    include_str!("../fixtures/configs/viceroy-template.toml").replace(
+        "        # GENERATED_TRUSTED_SERVER_CONFIG_STORES",
+        &format!(
+            "        [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}]\n            format = \"inline-toml\"\n        [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}.contents]\n            {CONFIG_BLOB_KEY} = '''{envelope}'''"
+        ),
+    )
+}
+
+/// Asserts that `request` carries the `Host`, path, and query Trusted Server signed.
+///
+/// The recorded `Host` and request target must equal the expected values, and
+/// recomputing the signature from what the origin received must reproduce the
+/// request's `Authorization`, which holds only if those are the signed values.
+fn assert_sent_as_signed(request: &SignedAssetRequest, expected_host: &str, expected_target: &str) {
+    let host = request
+        .header("host")
+        .expect("should record the Host header");
+    assert_eq!(
+        (host, request.target.as_str()),
+        (expected_host, expected_target),
+        "should send the {} to the signed authority and target",
+        request.method
+    );
+    let authorization = request
+        .header("authorization")
+        .expect("should send a SigV4 Authorization header");
+    let amz_date = request
+        .header("x-amz-date")
+        .expect("should send the signing timestamp");
+    let method =
+        http::Method::from_bytes(request.method.as_bytes()).expect("should record a valid method");
+    let recomputed = trusted_server_core::test_support::s3_sigv4_authorization(
+        &method,
+        host,
+        &request.target,
+        amz_date,
+        SIGV4_REGION,
+        SIGV4_ACCESS_KEY_ID,
+        SIGV4_SECRET_ACCESS_KEY,
+    )
+    .expect("should recompute the signature from the received request");
+    assert_eq!(
+        authorization, recomputed,
+        "should sign exactly the Host, path, and query the {} reached the origin with",
+        request.method
+    );
+}
+
+#[test]
+#[ignore = "requires Viceroy and the release Fastly WASM"]
+fn sigv4_signed_asset_reaches_origin_with_signed_host_path_and_query() {
+    init_logger();
+    let origin = TlsAssetOrigin::start();
+    let expected_host = format!("127.0.0.1:{}", origin.port);
+    let envelope = common::config::sigv4_asset_app_config_envelope(
+        origin_port(),
+        &format!("https://{expected_host}"),
+    )
+    .expect("should build the SigV4 asset app config");
+    let config_dir = tempfile::tempdir().expect("should create the Viceroy config directory");
+    let config_path = config_dir.path().join("viceroy.toml");
+    std::fs::write(&config_path, viceroy_config_with_app_config(&envelope))
+        .expect("should write the Viceroy config");
+
+    let image_status = temp_env::with_vars(
+        [
+            ("SSL_CERT_FILE", Some(origin.ca_file.path().as_os_str())),
+            ("VICEROY_CONFIG_PATH", Some(config_path.as_os_str())),
+        ],
+        || {
+            let process = environments::fastly::FastlyViceroy
+                .spawn(&wasm_binary_path())
+                .expect("should start Viceroy");
+            let client = reqwest::blocking::Client::new();
+            let plain = client
+                .get(format!(
+                    "{}/.sigv4-assets/photos/cat%20one.jpg?version=2&name=a%2Fb",
+                    process.base_url
+                ))
+                .send()
+                .expect("should send the plain asset request");
+            assert_eq!(
+                plain.status().as_u16(),
+                200,
+                "should serve the signed asset from the origin"
+            );
+            // Viceroy cannot run Image Optimizer, so only the preflight before it is checked.
+            client
+                .get(format!(
+                    "{}/.sigv4-images/photos/dog.jpg?profile=default",
+                    process.base_url
+                ))
+                .send()
+                .expect("should send the optimized asset request")
+                .status()
+        },
+    );
+    log::info!("optimized SigV4 asset answered {image_status}");
+
+    let requests = origin.requests();
+    let plain = requests
+        .iter()
+        .find(|request| request.method == "GET" && request.target.starts_with("/.sigv4-assets/"))
+        .expect("should record the signed asset GET");
+    assert_sent_as_signed(
+        plain,
+        &expected_host,
+        "/.sigv4-assets/photos/cat%20one.jpg?version=2&name=a%2Fb",
+    );
+    let preflight = requests
+        .iter()
+        .find(|request| request.method == "HEAD" && request.target.starts_with("/.sigv4-images/"))
+        .expect("should record the signed S3 HEAD preflight");
+    assert_sent_as_signed(preflight, &expected_host, "/.sigv4-images/photos/dog.jpg");
 }

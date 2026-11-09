@@ -15,6 +15,7 @@ use subtle::ConstantTimeEq as _;
 use url::Url;
 use validator::{Validate, ValidationError};
 
+use crate::asset_image_optimizer::image_optimizer_region;
 use crate::auction_config_types::AuctionConfig;
 use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
@@ -24,7 +25,6 @@ use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
 use crate::integrations::datadome::HEADER_DATADOME_TEST_BYPASS;
-use crate::platform::PlatformImageOptimizerRegion;
 use crate::proxy::{is_host_allowed, is_host_permitted};
 use crate::redacted::Redacted;
 
@@ -1135,7 +1135,7 @@ impl AssetImageOptimizerConfig {
                         .to_string(),
             }));
         }
-        if PlatformImageOptimizerRegion::parse(&self.region).is_none() {
+        if image_optimizer_region(&self.region).is_none() {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "proxy.asset_routes image_optimizer region `{}` is not supported",

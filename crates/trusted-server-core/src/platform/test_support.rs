@@ -12,9 +12,8 @@ use web_time::Instant;
 use super::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformCacheIntent,
     PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
-    PlatformImageOptimizerOptions, PlatformImageOptimizerParams, PlatformPendingRequest,
-    PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
-    StoreName,
+    PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
+    RuntimeServices, StoreId, StoreName,
 };
 use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
@@ -256,7 +255,6 @@ pub(crate) struct StubHttpClient {
     // streaming response support.
     streaming_responses_supported: std::sync::atomic::AtomicBool,
     pending_streaming_responses_supported: std::sync::atomic::AtomicBool,
-    image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
     cache_intents: Mutex<Vec<PlatformCacheIntent>>,
     stream_response_flags: Mutex<Vec<bool>>,
     request_methods: Mutex<Vec<String>>,
@@ -269,7 +267,6 @@ struct StubHttpResponse {
     status: u16,
     body: Vec<u8>,
     headers: Vec<(String, String)>,
-    stream_body: bool,
 }
 
 impl StubHttpClient {
@@ -299,7 +296,6 @@ impl StubHttpClient {
             concurrent_fanout: std::sync::atomic::AtomicBool::new(true),
             streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             pending_streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
-            image_optimizer_options: Mutex::new(Vec::new()),
             cache_intents: Mutex::new(Vec::new()),
             stream_response_flags: Mutex::new(Vec::new()),
             request_methods: Mutex::new(Vec::new()),
@@ -349,20 +345,6 @@ impl StubHttpClient {
                 status,
                 body,
                 headers,
-                stream_body: false,
-            });
-    }
-
-    /// Queue a canned response whose body is returned as a lazy stream.
-    pub fn push_streaming_response(&self, status: u16, body: Vec<u8>) {
-        self.responses
-            .lock()
-            .expect("should lock responses")
-            .push_back(StubHttpResponse {
-                status,
-                body,
-                headers: Vec::new(),
-                stream_body: true,
             });
     }
 
@@ -446,14 +428,6 @@ impl StubHttpClient {
             .clone()
     }
 
-    /// Return Image Optimizer metadata captured per `send` call, in order.
-    pub fn recorded_image_optimizer_options(&self) -> Vec<Option<PlatformImageOptimizerOptions>> {
-        self.image_optimizer_options
-            .lock()
-            .expect("should lock image optimizer options")
-            .clone()
-    }
-
     /// Return the cache intent captured per `send` or `send_async` call, in order.
     pub(crate) fn recorded_cache_intents(&self) -> Vec<PlatformCacheIntent> {
         self.cache_intents
@@ -527,10 +501,6 @@ impl PlatformHttpClient for StubHttpClient {
             .expect("should lock calls")
             .push(request.backend_name.clone());
 
-        self.image_optimizer_options
-            .lock()
-            .expect("should lock image optimizer options")
-            .push(request.image_optimizer.clone());
         self.cache_intents
             .lock()
             .expect("should lock cache intents")
@@ -604,7 +574,7 @@ impl PlatformHttpClient for StubHttpClient {
                 body: response.body,
                 headers: response.headers,
             },
-            stream_response || response.stream_body,
+            stream_response,
             request_is_head,
         )?;
 
@@ -615,10 +585,6 @@ impl PlatformHttpClient for StubHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-        if request.image_optimizer.is_some() {
-            return Err(Report::new(PlatformError::HttpClient)
-                .attach("Image Optimizer is not supported with StubHttpClient send_async"));
-        }
         if request.stream_response && !self.supports_pending_streaming_responses() {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("streaming responses are not supported with StubHttpClient send_async"));
@@ -695,11 +661,6 @@ impl PlatformHttpClient for StubHttpClient {
             .expect("should lock responses")
             .pop_front()
             .ok_or_else(|| Report::new(PlatformError::HttpClient))?;
-
-        if response.stream_body {
-            return Err(Report::new(PlatformError::Unsupported)
-                .attach("streaming stub responses require StubHttpClient send"));
-        }
 
         let pending = StubPendingResponse {
             backend_name: backend_name.clone(),
@@ -1112,7 +1073,7 @@ pub(crate) fn noop_services_with_telemetry_sink(
 pub(crate) fn build_services_with_http_client(
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
-    build_services_with_secret_and_http_client(NoopSecretStore, http_client)
+    build_services_with_config_secret_and_http_client(NoopConfigStore, NoopSecretStore, http_client)
 }
 
 /// Build test services that dispatch HTTP requests with an attested client IP.
@@ -1226,14 +1187,6 @@ pub(crate) fn build_services_with_secret_http_client_and_client_ip(
             ..ClientInfo::default()
         })
         .build()
-}
-
-/// Build test services with a custom secret store and the standard test config store.
-pub(crate) fn build_services_with_secret_and_http_client(
-    secret_store: impl PlatformSecretStore + 'static,
-    http_client: Arc<dyn PlatformHttpClient>,
-) -> RuntimeServices {
-    build_services_with_config_secret_and_http_client(NoopConfigStore, secret_store, http_client)
 }
 
 #[cfg(test)]
@@ -1478,31 +1431,6 @@ mod tests {
             stub.recorded_cache_intents(),
             vec![PlatformCacheIntent::Default, PlatformCacheIntent::Bypass],
             "should record both send_async cache intents in order"
-        );
-    }
-
-    #[test]
-    fn stub_http_client_send_async_rejects_image_optimizer_metadata() {
-        let stub = StubHttpClient::new();
-        let req = PlatformHttpRequest::new(
-            request_builder()
-                .method("GET")
-                .uri("https://example.com/image.jpg")
-                .body(Body::empty())
-                .expect("should build request"),
-            "stub-backend",
-        )
-        .with_image_optimizer(PlatformImageOptimizerOptions::new(
-            "us_east",
-            PlatformImageOptimizerParams::default(),
-        ));
-
-        let err = futures::executor::block_on(stub.send_async(req))
-            .expect_err("should reject async Image Optimizer metadata");
-
-        assert!(
-            format!("{err:?}").contains("Image Optimizer"),
-            "should explain unsupported async IO path: {err:?}"
         );
     }
 

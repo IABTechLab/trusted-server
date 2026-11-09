@@ -24,6 +24,62 @@ pub fn integration_app_config_envelope_with_trace(
     app_config_envelope(origin_port, trace, |_| Ok(()))
 }
 
+/// Builds the integration app-config envelope with two S3 `SigV4` asset routes
+/// to `asset_origin`.
+///
+/// `/.sigv4-assets/` signs plain requests and keeps their query.
+/// `/.sigv4-images/` adds Image Optimizer, so each request first sends a signed
+/// S3 `HEAD` preflight. Both routes sign for `us-east-1` with the
+/// `integration_s3_*` secrets of the Viceroy template.
+///
+/// # Errors
+///
+/// Returns a fixture-generation error when configuration validation fails.
+pub fn sigv4_asset_app_config_envelope(origin_port: u16, asset_origin: &str) -> TestResult<String> {
+    let assets: toml::Table = toml::from_str(&format!(
+        r#"
+[[proxy.asset_routes]]
+prefix = "/.sigv4-assets/"
+origin_url = "{asset_origin}"
+
+[proxy.asset_routes.auth]
+type = "s3_sigv4"
+region = "us-east-1"
+access_key_id = "integration_s3_access_key_id"
+secret_access_key = "integration_s3_secret_access_key"
+
+[[proxy.asset_routes]]
+prefix = "/.sigv4-images/"
+origin_url = "{asset_origin}"
+
+[proxy.asset_routes.auth]
+type = "s3_sigv4"
+region = "us-east-1"
+access_key_id = "integration_s3_access_key_id"
+secret_access_key = "integration_s3_secret_access_key"
+
+[proxy.asset_routes.image_optimizer]
+enabled = true
+region = "us_east"
+profile_set = "sigv4_images"
+
+[image_optimizer.profile_sets.sigv4_images]
+default_profile = "default"
+
+[image_optimizer.profile_sets.sigv4_images.profiles]
+default = "width=640"
+"#
+    ))
+    .map_err(|error| {
+        Report::new(TestError::ConfigGeneration)
+            .attach(format!("invalid SigV4 asset route fixture: {error}"))
+    })?;
+    app_config_envelope(origin_port, false, |table| {
+        table.extend(assets);
+        Ok(())
+    })
+}
+
 /// Builds the integration app-config envelope after `customize` edits the
 /// parsed fixture.
 fn app_config_envelope(
@@ -117,6 +173,31 @@ fn cloudflare_binding_json(binding: &serde_json::Value) -> TestResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sigv4_asset_fixture_validates_both_signed_routes() {
+        let envelope: serde_json::Value = serde_json::from_str(
+            &sigv4_asset_app_config_envelope(8888, "https://127.0.0.1:8443")
+                .expect("should generate the SigV4 asset fixture"),
+        )
+        .expect("should parse the SigV4 asset envelope");
+        let routes = envelope["data"]["proxy"]["asset_routes"]
+            .as_array()
+            .expect("should carry the asset routes");
+
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| route["prefix"].as_str())
+                .collect::<Vec<_>>(),
+            vec![Some("/.sigv4-assets/"), Some("/.sigv4-images/")],
+            "should keep the plain and the Image Optimizer route"
+        );
+        assert_eq!(
+            routes[1]["image_optimizer"]["enabled"], true,
+            "should enable Image Optimizer on the preflight route"
+        );
+    }
 
     #[test]
     fn trace_browser_fixture_keeps_auctions_and_shared_assembly_disabled() {

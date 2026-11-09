@@ -201,7 +201,7 @@ pub struct DataDomeConfig {
     #[validate(url)]
     pub protection_api_origin: String,
 
-    /// First-byte timeout for Protection API calls, in milliseconds.
+    /// Total timeout for each Protection API call, in milliseconds.
     #[serde(default = "default_timeout_ms")]
     #[validate(range(min = 1, max = 10000))]
     pub timeout_ms: u32,

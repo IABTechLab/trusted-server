@@ -636,7 +636,7 @@ mod tests {
     }
 
     /// A Didomi upstream that answers one `method` request to `uri` with `reply`.
-    fn upstream(method: Method, uri: &str, reply: ScriptedReply) -> ScriptedHttpClient {
+    fn scripted_upstream(method: Method, uri: &str, reply: ScriptedReply) -> ScriptedHttpClient {
         let client = ScriptedHttpClient::new(&TestClock::new());
         client.respond_to(method, uri, reply);
         client
@@ -951,8 +951,11 @@ mod tests {
 
     #[test]
     fn enabled_geo_redirects_noncanonical_loader_without_upstream_call() {
-        let stub = ScriptedHttpClient::forbidding();
-        let services = services_with_geo(&stub, GeoResult::Value(Some(geo_info("us", Some("ca")))));
+        let upstream = ScriptedHttpClient::forbidding();
+        let services = services_with_geo(
+            &upstream,
+            GeoResult::Value(Some(geo_info("us", Some("ca")))),
+        );
         let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
         let request = http::Request::builder()
@@ -997,15 +1000,18 @@ mod tests {
             "should keep the redirect usable from cross-origin loader embeds"
         );
         assert!(
-            stub.requests().is_empty(),
+            upstream.requests().is_empty(),
             "should not contact Didomi before canonical redirect"
         );
     }
 
     #[test]
     fn enabled_geo_redirects_loader_under_custom_proxy_prefix() {
-        let stub = ScriptedHttpClient::forbidding();
-        let services = services_with_geo(&stub, GeoResult::Value(Some(geo_info("us", Some("ca")))));
+        let upstream = ScriptedHttpClient::forbidding();
+        let services = services_with_geo(
+            &upstream,
+            GeoResult::Value(Some(geo_info("us", Some("ca")))),
+        );
         let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(DidomiIntegrationConfig {
             proxy_path: Some("publisher/privacy".to_string()),
@@ -1031,20 +1037,22 @@ mod tests {
             "should preserve the custom proxy prefix in the canonical target"
         );
         assert!(
-            stub.requests().is_empty(),
+            upstream.requests().is_empty(),
             "should not contact Didomi before the custom-prefix redirect"
         );
     }
 
     #[test]
     fn enabled_geo_proxies_canonical_loader_with_authoritative_headers() {
-        let stub = upstream(
+        let upstream = scripted_upstream(
             Method::GET,
             "https://sdk.example.com/key/loader.js?target_type=notice&country=US&region=CA",
             ScriptedReply::status(StatusCode::OK).body("loader"),
         );
-        let services =
-            services_with_geo(&stub, GeoResult::Value(Some(geo_info("us", Some("us-ca")))));
+        let services = services_with_geo(
+            &upstream,
+            GeoResult::Value(Some(geo_info("us", Some("us-ca")))),
+        );
         let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
         let request = http::Request::builder()
@@ -1061,11 +1069,11 @@ mod tests {
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
-            sent_uris(&stub),
+            sent_uris(&upstream),
             vec!["https://sdk.example.com/key/loader.js?target_type=notice&country=US&region=CA"],
             "should send the canonical query to Didomi"
         );
-        let headers = sent_headers(&stub);
+        let headers = sent_headers(&upstream);
         for (name, expected) in [
             ("x-geo-country", "US"),
             ("x-geo-region", "CA"),
@@ -1081,12 +1089,15 @@ mod tests {
 
     #[test]
     fn disabled_geo_proxies_loader_without_geo_query() {
-        let stub = upstream(
+        let upstream = scripted_upstream(
             Method::GET,
             "https://sdk.example.com/key/loader.js?target_type=notice",
             ScriptedReply::status(StatusCode::OK).body("loader"),
         );
-        let services = services_with_geo(&stub, GeoResult::Value(Some(geo_info("US", Some("CA")))));
+        let services = services_with_geo(
+            &upstream,
+            GeoResult::Value(Some(geo_info("US", Some("CA")))),
+        );
         let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config(true)));
         let request = http::Request::builder()
@@ -1101,7 +1112,7 @@ mod tests {
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
-            sent_uris(&stub),
+            sent_uris(&upstream),
             vec!["https://sdk.example.com/key/loader.js?target_type=notice"],
             "should not add geo when the option is disabled"
         );
@@ -1109,12 +1120,12 @@ mod tests {
 
     #[test]
     fn enabled_geo_leaves_unrelated_sdk_assets_unchanged() {
-        let stub = upstream(
+        let upstream = scripted_upstream(
             Method::GET,
             "https://sdk.example.com/sdk/v1/core.js?v=1",
             ScriptedReply::status(StatusCode::OK).body("sdk"),
         );
-        let services = services_with_geo(&stub, GeoResult::Failure);
+        let services = services_with_geo(&upstream, GeoResult::Failure);
         let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
         let request = http::Request::builder()
@@ -1129,7 +1140,7 @@ mod tests {
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
-            sent_uris(&stub),
+            sent_uris(&upstream),
             vec!["https://sdk.example.com/sdk/v1/core.js?v=1"],
             "should not apply loader geo behavior to other SDK assets"
         );
@@ -1147,13 +1158,13 @@ mod tests {
     fn noncanonical_sdk_uses_trusted_geo_instead_of_caller_headers() {
         for (enabled, method, path) in NONCANONICAL_SDK_CASES {
             // Arrange conflicting caller geography and a normalized platform pair.
-            let stub = upstream(
+            let upstream = scripted_upstream(
                 method.clone(),
                 &format!("https://sdk.example.com{path}?v=1"),
                 ScriptedReply::status(StatusCode::OK).body("sdk"),
             );
             let services = services_with_geo(
-                &stub,
+                &upstream,
                 GeoResult::Value(Some(geo_info(" us ", Some(" us-ca ")))),
             );
             let settings = create_test_settings();
@@ -1186,11 +1197,11 @@ mod tests {
                 "should proxy without redirect"
             );
             assert_eq!(
-                sent_uris(&stub),
+                sent_uris(&upstream),
                 vec![format!("https://sdk.example.com{path}?v=1")],
                 "should preserve noncanonical SDK URL"
             );
-            let headers = sent_headers(&stub);
+            let headers = sent_headers(&upstream);
             for (name, expected) in [
                 ("x-geo-country", "US"),
                 ("x-geo-region", "CA"),
@@ -1222,12 +1233,12 @@ mod tests {
                 GeoResult::Value(Some(geo_info("XX", Some("CA")))),
                 GeoResult::Value(Some(geo_info("US", Some("GB-LND")))),
             ] {
-                let stub = upstream(
+                let upstream = scripted_upstream(
                     method.clone(),
                     &format!("https://sdk.example.com{path}"),
                     ScriptedReply::status(StatusCode::OK).body("sdk"),
                 );
-                let services = services_with_geo(&stub, geo_result);
+                let services = services_with_geo(&upstream, geo_result);
                 let settings = create_test_settings();
                 let integration = DidomiIntegration::new(Arc::new(DidomiIntegrationConfig {
                     geo_query_parameters: enabled,
@@ -1255,7 +1266,7 @@ mod tests {
                     http::StatusCode::OK,
                     "should tolerate unavailable geo outside enabled GET loaders"
                 );
-                let headers = sent_headers(&stub);
+                let headers = sent_headers(&upstream);
                 for name in [
                     "x-geo-country",
                     "x-geo-region",
@@ -1289,7 +1300,7 @@ mod tests {
                 GeoResult::Value(Some(geo_info("US", Some("CA")))),
                 GeoResult::Value(None),
             ] {
-                let stub = upstream(
+                let upstream = scripted_upstream(
                     method.clone(),
                     &format!("https://sdk.example.com{path}?country=GB&region=LND"),
                     reply_with_headers(
@@ -1307,7 +1318,7 @@ mod tests {
                         ],
                     ),
                 );
-                let services = services_with_geo(&stub, geo_result);
+                let services = services_with_geo(&upstream, geo_result);
                 let settings = create_test_settings();
                 let integration = DidomiIntegration::new(Arc::new(DidomiIntegrationConfig {
                     geo_query_parameters: enabled,
@@ -1326,7 +1337,7 @@ mod tests {
                         .expect("should proxy SDK request");
 
                 assert_eq!(
-                    sent_cache_policies(&stub),
+                    sent_cache_policies(&upstream),
                     vec![OutboundCachePolicy::Bypass],
                     "should bypass SDK cache without canonical geo identity for {path}, geo option {enabled}"
                 );
@@ -1368,7 +1379,7 @@ mod tests {
                         "should remove SDK cache metadata {name}"
                     );
                 }
-                let headers = sent_headers(&stub);
+                let headers = sent_headers(&upstream);
                 assert!(
                     !headers.contains_key(header::IF_NONE_MATCH)
                         && !headers.contains_key(header::IF_MODIFIED_SINCE),
@@ -1397,12 +1408,12 @@ mod tests {
                         ("Cloudflare-CDN-Cache-Control", "max-age=31536000"),
                         ("Fastly-Surrogate-Control", "max-age=31536000"),
                     ];
-                    let stub = upstream(
+                    let upstream = scripted_upstream(
                         Method::GET,
                         &format!("https://sdk.example.com{path}?v=1"),
                         reply_with_headers("sdk", &cache_headers),
                     );
-                    let services = services_with_geo(&stub, geo_result.clone());
+                    let services = services_with_geo(&upstream, geo_result.clone());
                     let settings = create_test_settings();
                     let integration = DidomiIntegration::new(Arc::new(DidomiIntegrationConfig {
                         geo_query_parameters: enabled,
@@ -1422,7 +1433,7 @@ mod tests {
                     .expect("should proxy SDK asset");
 
                     assert_eq!(
-                        sent_cache_policies(&stub),
+                        sent_cache_policies(&upstream),
                         vec![OutboundCachePolicy::PlatformDefault],
                         "should follow origin cache policy for {path}, geo option {enabled}"
                     );
@@ -1459,13 +1470,15 @@ mod tests {
     #[test]
     fn api_requests_do_not_forward_geo_headers() {
         for enabled in [false, true] {
-            let stub = upstream(
+            let upstream = scripted_upstream(
                 Method::GET,
                 "https://api.example.com/api/events",
                 ScriptedReply::status(StatusCode::OK).body("event"),
             );
-            let services =
-                services_with_geo(&stub, GeoResult::Value(Some(geo_info("US", Some("CA")))));
+            let services = services_with_geo(
+                &upstream,
+                GeoResult::Value(Some(geo_info("US", Some("CA")))),
+            );
             let settings = create_test_settings();
             let integration = DidomiIntegration::new(Arc::new(DidomiIntegrationConfig {
                 geo_query_parameters: enabled,
@@ -1484,7 +1497,7 @@ mod tests {
             futures::executor::block_on(integration.handle(&settings, &services, request))
                 .expect("should proxy API request");
 
-            let headers = sent_headers(&stub);
+            let headers = sent_headers(&upstream);
             for name in [
                 "x-geo-country",
                 "x-geo-region",
@@ -1508,8 +1521,8 @@ mod tests {
             GeoResult::Value(Some(geo_info("XX", Some("CA")))),
             GeoResult::Failure,
         ] {
-            let stub = ScriptedHttpClient::forbidding();
-            let services = services_with_geo(&stub, geo_result);
+            let upstream = ScriptedHttpClient::forbidding();
+            let services = services_with_geo(&upstream, geo_result);
             let settings = create_test_settings();
             let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
             let request = http::Request::builder()
@@ -1544,7 +1557,7 @@ mod tests {
                 "should keep geo failures usable from cross-origin loader embeds"
             );
             assert!(
-                stub.requests().is_empty(),
+                upstream.requests().is_empty(),
                 "should not contact Didomi on geo failure"
             );
         }
@@ -1552,7 +1565,7 @@ mod tests {
 
     #[test]
     fn api_requests_bypass_cache_and_strip_response_cache_metadata() {
-        let stub = upstream(
+        let upstream = scripted_upstream(
             Method::GET,
             "https://api.example.com/api/events?x=1",
             reply_with_headers(
@@ -1568,7 +1581,7 @@ mod tests {
                 ],
             ),
         );
-        let services = services_with_geo(&stub, GeoResult::Value(None));
+        let services = services_with_geo(&upstream, GeoResult::Value(None));
         let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config(true)));
         let request = http::Request::builder()
@@ -1582,7 +1595,7 @@ mod tests {
                 .expect("should proxy API request");
 
         assert_eq!(
-            sent_cache_policies(&stub),
+            sent_cache_policies(&upstream),
             vec![OutboundCachePolicy::Bypass],
             "should bypass the platform cache for API requests"
         );
@@ -1611,7 +1624,7 @@ mod tests {
 
     #[test]
     fn canonical_loader_responses_preserve_origin_cache_metadata() {
-        let stub = upstream(
+        let upstream = scripted_upstream(
             Method::GET,
             "https://sdk.example.com/key/loader.js?country=US&region=CA",
             reply_with_headers(
@@ -1626,7 +1639,10 @@ mod tests {
                 ],
             ),
         );
-        let services = services_with_geo(&stub, GeoResult::Value(Some(geo_info("US", Some("CA")))));
+        let services = services_with_geo(
+            &upstream,
+            GeoResult::Value(Some(geo_info("US", Some("CA")))),
+        );
         let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
         let request = http::Request::builder()
@@ -1640,7 +1656,7 @@ mod tests {
                 .expect("should proxy SDK request");
 
         assert_eq!(
-            sent_cache_policies(&stub),
+            sent_cache_policies(&upstream),
             vec![OutboundCachePolicy::PlatformDefault],
             "should retain normal platform caching for canonical SDK loaders"
         );
@@ -1930,8 +1946,8 @@ mod tests {
         let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config(true)));
         for case in body_read_failure_cases(INTEGRATION_MAX_BODY_BYTES) {
-            let stub = ScriptedHttpClient::forbidding();
-            let services = services_with_geo(&stub, GeoResult::Value(None));
+            let upstream = ScriptedHttpClient::forbidding();
+            let services = services_with_geo(&upstream, GeoResult::Value(None));
             let (req, expectation) = case.into_request(
                 http::Request::builder()
                     .method(http::Method::POST)
@@ -1943,7 +1959,7 @@ mod tests {
 
             expectation.assert_outcome("Didomi API", &outcome);
             assert!(
-                stub.requests().is_empty(),
+                upstream.requests().is_empty(),
                 "should not call upstream for the {} case",
                 expectation.name()
             );

@@ -324,14 +324,50 @@ pub struct ExpectedTransport {
 impl RecordedRequest {
     /// Asserts the transport settings every Trusted Server request carries.
     ///
-    /// Checks a one second connect timeout, no caller deadline, the proxy marker off, the URI
-    /// authority sent upstream with no override, and the timeout, response mode, decoding, and
-    /// cache policy in `expected`.
+    /// Checks a one second connect timeout, no caller deadline, no Image Optimizer options, the
+    /// proxy marker off, the URI authority sent upstream with no override, and the timeout,
+    /// response mode, decoding, and cache policy in `expected`.
     ///
     /// # Panics
     ///
     /// Panics when any of those settings differs.
     pub fn assert_transport(&self, expected: ExpectedTransport) {
+        self.assert_transport_settings(expected, None, None);
+    }
+
+    /// Asserts [`RecordedRequest::assert_transport`]'s settings for one hop of a followed chain.
+    ///
+    /// Every hop of a followed redirect chain carries the chain's `deadline`, so this checks that
+    /// deadline in place of the absent one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any of those settings differs.
+    pub fn assert_followed_transport(&self, expected: ExpectedTransport, deadline: Deadline) {
+        self.assert_transport_settings(expected, Some(deadline), None);
+    }
+
+    /// Asserts [`RecordedRequest::assert_transport`]'s settings for an Image Optimizer request.
+    ///
+    /// This checks that the request carries exactly `options` in place of no options.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any of those settings differs.
+    pub fn assert_image_optimizer_transport(
+        &self,
+        expected: ExpectedTransport,
+        options: &OutboundImageOptimizerOptions,
+    ) {
+        self.assert_transport_settings(expected, None, Some(options));
+    }
+
+    fn assert_transport_settings(
+        &self,
+        expected: ExpectedTransport,
+        deadline: Option<Deadline>,
+        image_optimizer: Option<&OutboundImageOptimizerOptions>,
+    ) {
         let request = format!("{} {}", self.method, self.uri);
         assert_eq!(
             self.connect_timeout,
@@ -343,9 +379,15 @@ impl RecordedRequest {
             Some(expected.timeout),
             "should give {request} its constant timeout"
         );
-        assert!(
-            self.deadline.is_none(),
-            "should not give {request} a deadline from a remaining budget"
+        assert_eq!(
+            self.deadline.map(|recorded| recorded.instant()),
+            deadline.map(|expected| expected.instant()),
+            "should give {request} only the chain deadline it expects, never one from a remaining budget"
+        );
+        assert_eq!(
+            self.image_optimizer.as_ref(),
+            image_optimizer,
+            "should give {request} exactly the Image Optimizer options it expects"
         );
         assert_eq!(
             (

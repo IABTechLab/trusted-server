@@ -1489,7 +1489,9 @@ mod tests {
         TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
-    use trusted_server_core::test_support::scripted_client::{ScriptedHttpClient, TestClock};
+    use trusted_server_core::test_support::scripted_client::{
+        ScriptedHttpClient, ScriptedReply, TestClock,
+    };
     use trusted_server_core::test_support::{insert_outbound_client, nextjs_auction};
 
     #[test]
@@ -3103,14 +3105,22 @@ mod tests {
     }
 
     fn streaming_runtime_services() -> RuntimeServices {
+        runtime_services_with_upstream(&ScriptedHttpClient::forbidding(), &TestClock::new())
+    }
+
+    /// Streaming runtime services whose `EdgeZero` outbound requests go to `upstream`.
+    fn runtime_services_with_upstream(
+        upstream: &ScriptedHttpClient,
+        clock: &TestClock,
+    ) -> RuntimeServices {
         RuntimeServices::builder()
             .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
             .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
             .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
             .backend(Arc::new(FixedBackend))
             .http_client(Arc::new(StreamingHttpClient))
-            .outbound_client(ScriptedHttpClient::forbidding().http_client())
-            .clock(TestClock::new().monotonic_clock())
+            .outbound_client(upstream.http_client())
+            .clock(clock.monotonic_clock())
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
             .build()
@@ -3421,9 +3431,9 @@ mod tests {
     fn dispatch_asset_fallback_streams_origin_body_without_buffering() {
         // Regression guard for the EdgeZero asset streaming cutover: a successful
         // asset proxy must hand `edgezero_main` a streaming body (`Body::Stream`)
-        // rather than draining the origin into a buffered `Body::Once`. Injecting a
-        // streaming HTTP client lets us assert the body type the entry point will
-        // pipe straight to the client via `stream_to_client`.
+        // rather than draining the origin into a buffered `Body::Once`. A scripted
+        // upstream with a chunked body lets us assert the body type the entry point
+        // will pipe straight to the client via `stream_to_client`.
         let settings = Settings::from_toml(
             r#"
             [[handlers]]
@@ -3455,7 +3465,16 @@ mod tests {
         .expect("should parse asset-route settings");
         let state = build_state_from_settings(settings).expect("should build state");
 
-        let services = streaming_runtime_services();
+        let clock = TestClock::new();
+        let upstream = ScriptedHttpClient::new(&clock);
+        upstream.respond_to(
+            Method::GET,
+            "https://assets.example.com/.images/logo.png",
+            ScriptedReply::status(StatusCode::OK)
+                .header("content-type", "image/png")
+                .chunks(vec![Bytes::from_static(b"streamed-asset")]),
+        );
+        let services = runtime_services_with_upstream(&upstream, &clock);
         let req = empty_request(Method::GET, "/.images/logo.png");
         let asset_route = state
             .settings

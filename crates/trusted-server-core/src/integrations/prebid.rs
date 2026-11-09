@@ -3752,6 +3752,10 @@ mod tests {
     use crate::integrations::{
         AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
     };
+    use crate::outbound::{
+        BUFFERED_TIMEOUT, DEFAULT_BUFFERED_RESPONSE_BYTES, REDIRECT_CHAIN_DEADLINE,
+    };
+    use crate::platform::test_support::build_services_with_outbound_client;
     use crate::platform::test_support::{
         HashMapConfigStore, HashMapSecretStore, NoopConfigStore, NoopGeo, NoopHttpClient,
         NoopSecretStore, StubHttpClient, build_services_with_config_secret_and_http_client,
@@ -3762,10 +3766,13 @@ mod tests {
     };
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
-    use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
+    use crate::test_support::scripted_client::{
+        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
+    };
     use crate::test_support::tests::create_test_settings;
     use base64::engine::general_purpose::STANDARD as TEST_BASE64_STANDARD;
     use bytes::Bytes;
+    use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding, ResponseMode};
     use http::Method;
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
@@ -5308,7 +5315,7 @@ external_bundle_sri = "sha384-AAAA"
         );
     }
     #[test]
-    fn external_bundle_handler_fetches_and_sanitizes_with_platform_client() {
+    fn external_bundle_handler_fetches_and_sanitizes_the_bundle() {
         futures::executor::block_on(async {
             let sha256 = "a".repeat(64);
             let mut config = base_config();
@@ -5317,20 +5324,19 @@ external_bundle_sri = "sha384-AAAA"
             let mut settings = make_settings();
             settings.proxy.allowed_domains = vec!["assets.example".to_string()];
 
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response_with_headers(
-                200,
-                b"console.log('bundle');".to_vec(),
-                vec![
-                    (header::CONTENT_TYPE.as_str(), "text/html"),
-                    (header::CACHE_CONTROL.as_str(), "private, max-age=0"),
-                    (header::SET_COOKIE.as_str(), "bad=1; Path=/"),
-                    ("x-upstream", "leak"),
-                ],
+            let clock = TestClock::new();
+            let upstream = ScriptedHttpClient::new(&clock);
+            upstream.respond_to(
+                Method::GET,
+                "https://assets.example/prebid/trusted-prebid.js",
+                ScriptedReply::status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE.as_str(), "text/html")
+                    .header(header::CACHE_CONTROL.as_str(), "private, max-age=0")
+                    .header(header::SET_COOKIE.as_str(), "bad=1; Path=/")
+                    .header("x-upstream", "leak")
+                    .body("console.log('bundle');"),
             );
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
+            let services = build_services_with_outbound_client(&upstream, &clock);
             let req = http::Request::builder()
                 .method(Method::GET)
                 .uri(format!(
@@ -5376,28 +5382,28 @@ external_bundle_sri = "sha384-AAAA"
                 "should preserve bundle bytes"
             );
 
+            let requests = upstream.requests();
+            assert_eq!(requests.len(), 1, "should make one upstream request");
+            let sent = &requests[0];
             assert_eq!(
-                stub.recorded_request_uris(),
-                vec!["https://assets.example/prebid/trusted-prebid.js".to_string()],
+                sent.uri.to_string(),
+                "https://assets.example/prebid/trusted-prebid.js",
                 "should fetch the configured external bundle URL without adding EC query params"
             );
-            let recorded_headers = stub.recorded_request_headers();
-            assert_eq!(
-                recorded_headers.len(),
-                1,
-                "should make one upstream request"
-            );
-            assert!(
-                !recorded_headers[0]
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case(header::COOKIE.as_str())),
-                "external bundle fetch should not forward client cookies"
-            );
-            assert!(
-                !recorded_headers[0]
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case(header::ACCEPT.as_str())),
-                "external bundle fetch should not forward client headers"
+            // Neither the client's cookies nor its other headers reach the bundle host.
+            sent.assert_headers(&[]);
+            sent.assert_followed_transport(
+                ExpectedTransport {
+                    timeout: BUFFERED_TIMEOUT,
+                    response_mode: ResponseMode::Buffered {
+                        max_bytes: DEFAULT_BUFFERED_RESPONSE_BYTES,
+                    },
+                    response_decoding: ResponseDecoding::Original,
+                    cache_policy: OutboundCachePolicy::PlatformDefault,
+                },
+                clock
+                    .monotonic_clock()
+                    .deadline_after(REDIRECT_CHAIN_DEADLINE),
             );
         });
     }
