@@ -32,7 +32,7 @@ use trusted_server_core::edge_app::install_edge_policies;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::{RuntimeRequestOrigin, sanitize_forwarded_headers};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
-use trusted_server_core::platform::{ClientInfo, RuntimeServices};
+use trusted_server_core::platform::{ClientInfo, HttpClient, RuntimeServices};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::platform::{PlatformConfigStore, StoreName};
 use trusted_server_core::proxy::{
@@ -516,7 +516,7 @@ impl Hooks for TrustedServerApp {
             EdgeError::service_unavailable("Service Unavailable")
         })?;
 
-        Ok(build_router(&state))
+        Ok(build_router(&state, None))
     }
 }
 
@@ -535,7 +535,34 @@ impl TrustedServerApp {
         settings: Settings,
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_settings(settings)?;
-        Ok(build_router(&state))
+        Ok(build_router(&state, None))
+    }
+
+    /// Build the full application router from explicit settings, with `client`
+    /// in router state.
+    ///
+    /// Testing seam: `EdgeZero` hands a client in router state to every
+    /// request in place of the adapter's own, so an app served from this
+    /// router on `EdgeZero`'s Axum test server starts no real transport.
+    /// Production installs no client in router state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or the integration
+    /// registry fail to initialise.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let client = HttpClient::with_client(ScriptedHttpClient::forbidding());
+    /// let router = TrustedServerApp::routes_with_settings_and_outbound_client(settings, client)?;
+    /// ```
+    pub fn routes_with_settings_and_outbound_client(
+        settings: Settings,
+        client: HttpClient,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_settings(settings)?;
+        Ok(build_router(&state, Some(client)))
     }
 
     /// Build the full router with explicit settings and runtime services.
@@ -559,11 +586,11 @@ impl TrustedServerApp {
         services: RuntimeServices,
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_services(settings, Some(services))?;
-        Ok(build_router(&state))
+        Ok(build_router(&state, None))
     }
 }
 
-fn build_router(state: &Arc<AppState>) -> RouterService {
+fn build_router(state: &Arc<AppState>, outbound_client: Option<HttpClient>) -> RouterService {
     {
         let state = Arc::clone(state);
 
@@ -944,6 +971,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         for method in publisher_fallback_methods() {
             builder = builder.route("/", method.clone(), fallback.clone());
             builder = builder.route("/{*rest}", method, fallback.clone());
+        }
+
+        // Only the testing seam passes a client. Router state replaces the
+        // adapter's per-request client, which production keeps.
+        if let Some(client) = outbound_client {
+            builder = builder.with_state(client);
         }
 
         builder.build()

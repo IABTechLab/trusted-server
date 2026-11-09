@@ -17,6 +17,7 @@ use trusted_server_adapter_spin::app::TrustedServerApp;
 use trusted_server_core::constants::TS_GIT_VERSION;
 use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::test_support::insert_outbound_client;
 use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
 
 /// Build the full application router from explicit test settings.
@@ -54,8 +55,10 @@ fn test_router() -> RouterService {
 async fn route(router: RouterService, mut req: Request) -> Response {
     // `oneshot` skips `EdgeZero`'s request conversion, which installs the
     // adapter's default client, so install one that fails every request.
-    req.extensions_mut()
-        .insert(HttpClient::with_client(ScriptedHttpClient::forbidding()));
+    insert_outbound_client(
+        &mut req,
+        HttpClient::with_client(ScriptedHttpClient::forbidding()),
+    );
     router.oneshot(req).await.expect("should route request")
 }
 

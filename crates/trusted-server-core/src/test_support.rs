@@ -5,6 +5,34 @@ pub(crate) mod logging;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod scripted_client;
 
+#[cfg(any(test, feature = "test-utils"))]
+use edgezero_core::http::Request;
+
+#[cfg(any(test, feature = "test-utils"))]
+use crate::platform::HttpClient;
+
+/// Inserts `client` into `request`'s extensions, where `ctx.http_client()` reads it.
+///
+/// [`RouterService::oneshot`](edgezero_core::router::RouterService::oneshot) skips the
+/// adapter's request conversion, which is what installs a default client, so a `oneshot`
+/// route test calls this before dispatch. Pass a client built with
+/// [`HttpClient::with_client`], which keeps the default proxy marker, so the adapter's own
+/// `.with_proxy_marker(false)` stays observable.
+///
+/// # Examples
+///
+/// ```ignore
+/// insert_outbound_client(
+///     &mut request,
+///     HttpClient::with_client(ScriptedHttpClient::forbidding()),
+/// );
+/// let response = router.oneshot(request).await?;
+/// ```
+#[cfg(any(test, feature = "test-utils"))]
+pub fn insert_outbound_client(request: &mut Request, client: HttpClient) {
+    request.extensions_mut().insert(client);
+}
+
 #[cfg(test)]
 pub mod tests {
     use std::sync::{Arc, Mutex};

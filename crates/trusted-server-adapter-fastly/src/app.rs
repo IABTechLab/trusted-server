@@ -1499,8 +1499,8 @@ mod tests {
         TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
-    use trusted_server_core::test_support::nextjs_auction;
     use trusted_server_core::test_support::scripted_client::{ScriptedHttpClient, TestClock};
+    use trusted_server_core::test_support::{insert_outbound_client, nextjs_auction};
 
     #[test]
     fn hooks_store_metadata_matches_edgezero_manifest() {
@@ -1572,9 +1572,10 @@ mod tests {
     fn route(router: &RouterService, mut request: edgezero_core::http::Request) -> Response {
         // `oneshot` skips `EdgeZero`'s request conversion, which installs the
         // adapter's default client, so install one that fails every request.
-        request
-            .extensions_mut()
-            .insert(HttpClient::with_client(ScriptedHttpClient::forbidding()));
+        insert_outbound_client(
+            &mut request,
+            HttpClient::with_client(ScriptedHttpClient::forbidding()),
+        );
         block_on(router.oneshot(request)).expect("should route request")
     }
 
