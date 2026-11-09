@@ -6,7 +6,8 @@
 //! applies its ingress and egress handling to every request. The startup test
 //! runs the compiled `trusted-server-axum` binary.
 
-use std::net::SocketAddr;
+use std::io::{Read as _, Write as _};
+use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1032,5 +1033,96 @@ async fn health_reports_git_version() {
             .and_then(|v| v.to_str().ok()),
         trusted_server_core::constants::TS_GIT_VERSION,
         "should report the compiled-in git version on /health"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Synthesized headers on EdgeZero's canonical responses
+// ---------------------------------------------------------------------------
+
+/// Sends `request` as raw bytes to `address` and returns the whole response.
+///
+/// For request targets the HTTP client cannot express, such as asterisk-form.
+/// The request must ask the server to close the connection.
+fn send_raw(address: SocketAddr, request: &'static str) -> String {
+    let mut stream = TcpStream::connect(address).expect("should connect to the Axum test server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("should set a read timeout");
+    stream
+        .write_all(request.as_bytes())
+        .expect("should send the raw request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("should read the raw response");
+    String::from_utf8(response).expect("should answer with a UTF-8 response head")
+}
+
+/// Returns the value of header `name` from a raw HTTP/1 response.
+fn raw_header<'response>(response: &'response str, name: &str) -> Option<&'response str> {
+    response
+        .split("\r\n\r\n")
+        .next()
+        .into_iter()
+        .flat_map(|head| head.split("\r\n").skip(1))
+        .filter_map(|line| line.split_once(':'))
+        .find(|(field, _)| field.trim().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_not_found_carries_x_ts_version() {
+    let server = TestServer::with_test_settings().await;
+    let address = server.server.address();
+
+    // The publisher fallback claims every origin-form path, so only an
+    // asterisk-form target has no route and gets EdgeZero's canonical 404.
+    let response = tokio::task::spawn_blocking(move || {
+        send_raw(
+            address,
+            "OPTIONS * HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+    })
+    .await
+    .expect("should finish the raw request");
+
+    assert!(
+        response.starts_with("HTTP/1.1 404 "),
+        "should answer an unrouted target with the canonical 404; response:\n{response}"
+    );
+    assert_eq!(
+        raw_header(&response, "x-ts-version"),
+        trusted_server_core::constants::TS_GIT_VERSION,
+        "should add the compiled-in git version to the canonical 404; response:\n{response}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_method_not_allowed_carries_allow_and_x_ts_version() {
+    let server = TestServer::with_test_settings().await;
+
+    let response = send(server.request("TRACE", "/auction")).await;
+
+    assert_eq!(
+        response.status().as_u16(),
+        405,
+        "should answer an unrouted method on a known path with the canonical 405"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("allow")
+            .and_then(|value| value.to_str().ok()),
+        Some("DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"),
+        "should list the path's methods in sorted order"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ts-version")
+            .and_then(|value| value.to_str().ok()),
+        trusted_server_core::constants::TS_GIT_VERSION,
+        "should add the compiled-in git version to the canonical 405"
     );
 }
