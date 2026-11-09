@@ -701,6 +701,7 @@ mod tests {
 
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
+    use crate::error::IntoHttpResponse as _;
 
     use crate::integrations::adserver_mock::{AdServerMockConfig, AdServerMockProvider};
     use crate::openrtb::Uid;
@@ -717,6 +718,8 @@ mod tests {
     use crate::trace::TracePreDispatchHook;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use edgezero_core::error::{BadGatewayReason, EdgeError};
+    use edgezero_core::{FastlyFailureCause, ProviderFailureDetail, ProviderFailurePhase};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -1030,6 +1033,95 @@ mod tests {
             "disabling publisher templates must not disable direct /auction"
         );
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn all_planned_launch_failures_return_bad_gateway_and_execution_failed_telemetry() {
+        // The plan accepts a backslash in the endpoint query, but `EdgeZero`
+        // builds no request for it. The other endpoint gets the error Fastly
+        // reports when it cannot register the bidder backend.
+        let unbuildable = r"https://failing.example/auction?x=\";
+        let unregistered = "https://failing.example/auction";
+        for endpoint in [unbuildable, unregistered] {
+            let settings_toml = format!(
+                "{}\n[auction]\nenabled = true\n\n[auction.providers.launch-fail]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = '{endpoint}'\nrouting = \"all_eligible\"\n",
+                crate_test_settings_str()
+            );
+            let settings =
+                Settings::from_toml(&settings_toml).expect("should parse launch-failure settings");
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the orchestrator");
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let clock = TestClock::new();
+            let bidders = ScriptedHttpClient::new(&clock);
+            bidders.respond_to(
+                http::Method::POST,
+                unregistered,
+                ScriptedReply::error(EdgeError::bad_gateway_with_detail(
+                    "Fastly failed to register a dynamic backend",
+                    BadGatewayReason::Unspecified,
+                    ProviderFailureDetail::Fastly {
+                        phase: ProviderFailurePhase::BackendRegistration,
+                        cause: FastlyFailureCause::BackendHostError { status: 1 },
+                    },
+                )),
+            );
+            let services = RuntimeServices {
+                outbound_client: bidders.http_client(),
+                clock: clock.monotonic_clock(),
+                ..services_with_telemetry(Arc::clone(&telemetry_sink))
+            };
+            let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+            let body = json!({
+                "adUnits": [{
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }]
+            });
+            let request = Request::builder()
+                .method("POST")
+                .uri("https://test-publisher.example/auction")
+                .body(EdgeBody::from(
+                    serde_json::to_vec(&body).expect("should serialize launch-failure body"),
+                ))
+                .expect("should build launch-failure request");
+
+            let error = handle_auction(
+                &settings,
+                &orchestrator,
+                None,
+                None,
+                &mut ec_context,
+                &services,
+                request,
+            )
+            .await
+            .expect_err("all planned launch failures should fail the auction endpoint");
+
+            assert_eq!(
+                error.current_context().status_code(),
+                StatusCode::BAD_GATEWAY,
+                "{endpoint} should answer 502"
+            );
+            let batches = telemetry_sink
+                .batches
+                .lock()
+                .expect("should lock telemetry batches");
+            assert_eq!(
+                batches.len(),
+                1,
+                "{endpoint} should emit one telemetry batch"
+            );
+            let rows = batches[0].rows();
+            assert_eq!(
+                rows.len(),
+                1,
+                "{endpoint} should emit one execution-failure summary"
+            );
+            assert_eq!(rows[0].event_kind, "summary");
+            assert_eq!(rows[0].terminal_status.as_deref(), Some("execution_failed"));
+            assert_eq!(rows[0].terminal_reason.as_deref(), Some("execution_failed"));
+        }
     }
 
     #[tokio::test]

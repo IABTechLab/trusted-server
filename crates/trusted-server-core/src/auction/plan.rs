@@ -540,7 +540,7 @@ fn canonicalize_endpoint(
 ) -> Result<CanonicalProviderEndpoint, Report<TrustedServerError>> {
     let mut endpoint = Url::parse(value).map_err(|error| {
         configuration_error(format!(
-            "provider `{provider_id}` endpoint must be an absolute HTTPS URL: {error}"
+            "provider `{provider_id}` endpoint must be absolute HTTPS, or plain HTTP to 127.0.0.1 or [::1]: {error}"
         ))
     })?;
     if !(endpoint.scheme() == "https" || is_loopback_http_endpoint(&endpoint))
@@ -1007,6 +1007,19 @@ mod tests {
                 "should reject plain HTTP to {endpoint}"
             );
         }
+    }
+
+    #[test]
+    fn unparsable_endpoint_error_states_the_loopback_rule() {
+        let Err(error) = compile_endpoint("not a URL") else {
+            panic!("should reject an unparsable endpoint");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("must be absolute HTTPS, or plain HTTP to 127.0.0.1 or [::1]"),
+            "should state the loopback-aware endpoint rule: {error}"
+        );
     }
 
     #[test]

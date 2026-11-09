@@ -1938,6 +1938,45 @@ mod tests {
         }
     }
 
+    /// [`test_settings`] with `count` standard providers in place of its own,
+    /// each on its own port, so each is a distinct Fastly backend tuple.
+    fn settings_with_provider_tuples(count: u16) -> Settings {
+        let mut settings = test_settings();
+        settings.auction.providers = (0..count)
+            .map(|index| {
+                (
+                    format!("provider-{index}")
+                        .parse()
+                        .expect("should parse provider ID"),
+                    trusted_server_core::auction::ProviderConfig {
+                        protocol: "openrtb-2.6".to_string(),
+                        profile: "standard".to_string(),
+                        endpoint: format!("https://bid.example:{}/openrtb", 9000 + index),
+                        timeout_ms: Some(1000),
+                        routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                        notifications: trusted_server_core::auction::NotificationConfig::default(),
+                        profile_config: serde_json::json!({}),
+                    },
+                )
+            })
+            .collect();
+        settings
+    }
+
+    #[test]
+    fn state_builder_enforces_the_fastly_backend_bound() {
+        build_state_from_settings(settings_with_provider_tuples(160))
+            .expect("should start with 160 distinct provider backend tuples");
+
+        let Err(error) = build_state_from_settings(settings_with_provider_tuples(161)) else {
+            panic!("should refuse to start with 161 distinct provider backend tuples");
+        };
+        assert!(
+            error.to_string().contains("161") && error.to_string().contains("160"),
+            "should name the tuple count and the bound: {error}"
+        );
+    }
+
     #[test]
     fn startup_registers_aps_renderer_route() {
         let mut settings = test_settings();

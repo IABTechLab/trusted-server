@@ -1,8 +1,9 @@
 //! Auction orchestrator for managing multi-provider auctions.
 
+use edgezero_core::ProviderFailurePhase;
 use edgezero_core::error::EdgeError;
 use edgezero_core::outbound::{
-    OutboundBatch, OutboundBatchNext, OutboundResponse, OutboundSlotResult,
+    OutboundBatch, OutboundBatchCheck, OutboundBatchNext, OutboundResponse, OutboundSlotResult,
 };
 use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
 use error_stack::Report;
@@ -39,8 +40,11 @@ use crate::trace::{
 pub struct DispatchedAuction {
     /// The bidder batch, absent when no bidder request was built.
     batch: Option<OutboundBatch>,
-    /// The bidder behind each batch slot, at the slot's index.
-    slot_providers: Vec<BidderSlot>,
+    /// The bidder behind each batch slot, at the slot's index, until the slot
+    /// is settled.
+    slot_providers: Vec<Option<BidderSlot>>,
+    /// How many providers the auction routed a bidder request to.
+    routed_bidder_count: usize,
     completed_responses: Vec<AuctionResponse>,
     clock: MonotonicClock,
     auction_start: MonotonicInstant,
@@ -112,7 +116,7 @@ impl DispatchedAuction {
         let undelivered = self.batch.map(OutboundBatch::cancel).unwrap_or_default();
         let abandoned = undelivered
             .into_iter()
-            .filter_map(|index| self.slot_providers.get(index))
+            .filter_map(|index| self.slot_providers.get(index).and_then(Option::as_ref))
             .map(|slot| {
                 AbandonedProviderCall::bidder(
                     slot.provider.provider_name(),
@@ -144,6 +148,7 @@ impl DispatchedAuction {
         Self {
             batch: None,
             slot_providers: Vec::new(),
+            routed_bidder_count: 0,
             completed_responses: Vec::new(),
             auction_deadline: clock.deadline_after(Duration::from_millis(u64::from(timeout_ms))),
             clock,
@@ -244,6 +249,35 @@ fn provider_skipped_response(provider_name: &str) -> AuctionResponse {
         "routing",
         serde_json::json!({"skipped_no_eligible_slots": true}),
     )
+}
+
+/// The error direct execution returns when no routed bidder request launched.
+fn all_launches_failed_error() -> Report<TrustedServerError> {
+    Report::new(TrustedServerError::Auction {
+        message: "All eligible planned provider requests failed to launch".to_string(),
+    })
+}
+
+/// Whether every routed bidder failed to launch, so no bid request left.
+fn all_bidders_failed_to_launch(responses: &[AuctionResponse], routed_bidder_count: usize) -> bool {
+    let launch_failed = serde_json::json!(ERROR_TYPE_LAUNCH_FAILED);
+    routed_bidder_count > 0
+        && responses
+            .iter()
+            .filter(|response| response.metadata.get("error_type") == Some(&launch_failed))
+            .count()
+            == routed_bidder_count
+}
+
+/// Whether `error` is a failed backend registration, which no request byte
+/// follows.
+///
+/// A registration that runs out of budget stays a timeout.
+fn failed_backend_registration(error: &EdgeError) -> bool {
+    !matches!(error, EdgeError::GatewayTimeout { .. })
+        && error
+            .provider_failure_detail()
+            .is_some_and(|detail| detail.phase() == ProviderFailurePhase::BackendRegistration)
 }
 
 /// Whole milliseconds in `duration`, saturating.
@@ -368,9 +402,16 @@ impl AuctionOrchestrator {
         let trace = context.request.extensions().get::<TraceAuctionCarry>();
         let _trace_guard = trace.map(TraceAuctionCarry::cancellation_guard);
         match self.dispatch_planned_auction(request, context).await {
-            DispatchAuctionOutcome::Dispatched(dispatched) => Ok(self
-                .collect_dispatched_auction(dispatched, context.services, context)
-                .await),
+            DispatchAuctionOutcome::Dispatched(dispatched) => {
+                let routed_bidder_count = dispatched.routed_bidder_count;
+                let result = self
+                    .collect_dispatched_auction(dispatched, context.services, context)
+                    .await;
+                if all_bidders_failed_to_launch(&result.provider_responses, routed_bidder_count) {
+                    return Err(all_launches_failed_error());
+                }
+                Ok(result)
+            }
             DispatchAuctionOutcome::DispatchFailed {
                 fatal_admission_error,
                 ..
@@ -383,9 +424,7 @@ impl AuctionOrchestrator {
                         message: "Planned auction admission failed".to_string(),
                     }));
                 }
-                Err(Report::new(TrustedServerError::Auction {
-                    message: "All eligible planned provider requests failed to launch".to_string(),
-                }))
+                Err(all_launches_failed_error())
             }
             DispatchAuctionOutcome::NotStarted => {
                 if self.planned_providers.is_empty() {
@@ -631,7 +670,6 @@ impl AuctionOrchestrator {
             .collect::<HashMap<_, _>>();
         let mut bidder_requests = Vec::new();
         let mut slot_providers = Vec::new();
-        let mut immediate_response_count = 0usize;
         let mut launch_failure_count = 0usize;
 
         for input in routed.inputs() {
@@ -668,17 +706,16 @@ impl AuctionOrchestrator {
                     parse_state,
                 }) => {
                     bidder_requests.push(bidder_request);
-                    slot_providers.push(BidderSlot {
+                    slot_providers.push(Some(BidderSlot {
                         provider,
                         parse_state,
                         trace_observation,
-                    });
+                    }));
                 }
                 Ok(ProviderRequestOutcome::Immediate(response)) => {
                     if let (Some(trace), Some(observation)) = (&trace, trace_observation) {
                         trace.observe_response(observation, &response);
                     }
-                    immediate_response_count += 1;
                     completed_responses.push(response);
                 }
                 Err(error) => {
@@ -698,48 +735,58 @@ impl AuctionOrchestrator {
             }
         }
 
-        if bidder_requests.is_empty() && immediate_response_count == 0 {
-            // A pre-launch timeout is a completed provider outcome. Only a set
-            // made entirely of launch failures crosses the fatal boundary.
-            if launch_failure_count > 0 && launch_failure_count == routed.inputs().len() {
-                for response in &mut completed_responses {
-                    if let Some(&count) =
-                        planned_unused_bidder_params.get(response.provider.as_str())
-                    {
-                        *response = materialize_planned_response(response.clone(), count);
-                    }
-                }
-                completed_responses.sort_by_key(|response| {
-                    planned_provider_order
-                        .get(response.provider.as_str())
-                        .copied()
-                        .unwrap_or(usize::MAX)
-                });
-                return DispatchAuctionOutcome::DispatchFailed {
-                    request: request.clone(),
-                    provider_responses: completed_responses,
-                    fatal_admission_error: None,
-                    metadata: routing_metadata(planned_unroutable_bidder_count),
-                    elapsed_ms: elapsed_ms(&clock, auction_start),
-                };
-            }
-            if routed.inputs().is_empty() && completed_responses.is_empty() {
-                return DispatchAuctionOutcome::NotStarted;
-            }
+        if routed.inputs().is_empty() && completed_responses.is_empty() {
+            return DispatchAuctionOutcome::NotStarted;
         }
 
         // Every bidder request leaves together, after all are built and
         // signed. An auction whose providers were all filtered out starts no
         // batch, so it completes without waiting for the deadline.
-        let batch = (!bidder_requests.is_empty()).then(|| {
-            context
+        let batch = if bidder_requests.is_empty() {
+            None
+        } else {
+            let mut batch = context
                 .services
                 .outbound_client()
-                .start_batch_until(bidder_requests, auction_deadline)
-        });
+                .start_batch_until(bidder_requests, auction_deadline);
+            // Fastly registers every bidder backend while it starts the batch,
+            // so a registration failure is already recorded here.
+            launch_failure_count += settle_recorded_slots(
+                &mut batch,
+                &mut slot_providers,
+                &mut completed_responses,
+                trace.as_ref(),
+            )
+            .await;
+            Some(batch)
+        };
+
+        // A pre-launch timeout is a completed provider outcome. Only a set
+        // made entirely of launch failures crosses the fatal boundary.
+        if launch_failure_count > 0 && launch_failure_count == routed.inputs().len() {
+            for response in &mut completed_responses {
+                if let Some(&count) = planned_unused_bidder_params.get(response.provider.as_str()) {
+                    *response = materialize_planned_response(response.clone(), count);
+                }
+            }
+            completed_responses.sort_by_key(|response| {
+                planned_provider_order
+                    .get(response.provider.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+            return DispatchAuctionOutcome::DispatchFailed {
+                request: request.clone(),
+                provider_responses: completed_responses,
+                fatal_admission_error: None,
+                metadata: routing_metadata(planned_unroutable_bidder_count),
+                elapsed_ms: elapsed_ms(&clock, auction_start),
+            };
+        }
         DispatchAuctionOutcome::Dispatched(DispatchedAuction {
             batch,
             slot_providers,
+            routed_bidder_count: routed.inputs().len(),
             completed_responses,
             clock,
             auction_start,
@@ -820,6 +867,7 @@ impl AuctionOrchestrator {
         let DispatchedAuction {
             batch,
             slot_providers,
+            routed_bidder_count,
             completed_responses,
             clock,
             auction_start,
@@ -835,12 +883,12 @@ impl AuctionOrchestrator {
 
         log::info!(
             "Collecting {} in-flight SSP responses ({}ms of the auction budget remaining)",
-            slot_providers.len(),
+            slot_providers.iter().flatten().count(),
             remaining_ms(&clock, auction_deadline),
         );
 
         let mut responses = completed_responses;
-        let mut unresolved = slot_providers.into_iter().map(Some).collect::<Vec<_>>();
+        let mut unresolved = slot_providers;
         if let Some(mut batch) = batch {
             let failed = loop {
                 match batch.next().await {
@@ -904,6 +952,21 @@ impl AuctionOrchestrator {
                 .copied()
                 .unwrap_or(usize::MAX)
         });
+        // A registration failure recorded after the batch started is a launch
+        // failure too. When every routed bidder failed to launch, the auction
+        // ends as a dispatch failure, without the mediator.
+        if all_bidders_failed_to_launch(&responses, routed_bidder_count) {
+            if let Some(trace) = &trace {
+                trace.finish_dispatch_failed(false);
+            }
+            return OrchestrationResult {
+                provider_responses: responses,
+                mediator_response: None,
+                winning_bids: HashMap::new(),
+                total_time_ms: elapsed_ms(&clock, auction_start),
+                metadata: routing_metadata(planned_unroutable_bidder_count),
+            };
+        }
 
         let mediated = match &self.mediator {
             Some(mediator) => {
@@ -1104,9 +1167,12 @@ async fn settle_bidder_slot(
         },
         Err(error) => {
             let timed_out = matches!(error, EdgeError::GatewayTimeout { .. });
+            let launch_failed = failed_backend_registration(&error);
             log_request_failure("Planned provider", provider_name, error);
             let response = if timed_out {
                 provider_timeout_response(provider_name, response_time_ms)
+            } else if launch_failed {
+                provider_launch_failed_response(provider_name, response_time_ms)
             } else {
                 provider_transport_failed_response(provider_name, response_time_ms)
             };
@@ -1121,6 +1187,52 @@ async fn settle_bidder_slot(
         }
     }
     response
+}
+
+/// Settles the bidder slots `batch` has already recorded, without waiting.
+///
+/// Returns how many of them failed backend registration. A failed batch fails
+/// every later observation too, so collection marks the slots it leaves.
+async fn settle_recorded_slots(
+    batch: &mut OutboundBatch,
+    slots: &mut [Option<BidderSlot>],
+    responses: &mut Vec<AuctionResponse>,
+    trace: Option<&TraceAuctionCarry>,
+) -> usize {
+    let mut registration_failures = 0;
+    loop {
+        match batch.check() {
+            Ok(OutboundBatchCheck::Item(item)) => {
+                let (index, result) = item.into_parts();
+                let Some(slot) = slots.get_mut(index).and_then(Option::take) else {
+                    log::warn!("Auction batch reported unknown slot {index}, ignoring");
+                    continue;
+                };
+                if result
+                    .outcome
+                    .as_ref()
+                    .is_err_and(failed_backend_registration)
+                {
+                    registration_failures += 1;
+                }
+                responses.push(settle_bidder_slot(slot, result, trace).await);
+            }
+            Ok(OutboundBatchCheck::Pending | OutboundBatchCheck::Finished(_)) => {
+                return registration_failures;
+            }
+            Err(error) => {
+                let report = outbound_error(
+                    error,
+                    TrustedServerError::Auction {
+                        message: "Auction bidder batch failed".to_string(),
+                    },
+                    OutboundRequestSource::Internal,
+                );
+                log::warn!("Auction bidder batch failed as it started: {report:?}");
+                return registration_failures;
+            }
+        }
+    }
 }
 
 /// Parses a mediator response, logging and dropping a parse failure.
@@ -1206,7 +1318,9 @@ mod tests {
     use std::time::Duration;
 
     use base64::Engine as _;
+    use edgezero_core::error::{BadGatewayReason, EdgeError};
     use edgezero_core::outbound::OutboundResponse;
+    use edgezero_core::{FastlyFailureCause, ProviderFailureDetail, ProviderFailurePhase};
     use http::{Method, StatusCode};
 
     use crate::auction::orchestrator::DispatchAuctionOutcome;
@@ -1239,8 +1353,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        AuctionOrchestrator, DispatchedAuction, ERROR_TYPE_TIMEOUT, ERROR_TYPE_TRANSPORT,
-        OrchestrationResult,
+        AuctionOrchestrator, DispatchedAuction, ERROR_TYPE_LAUNCH_FAILED, ERROR_TYPE_TIMEOUT,
+        ERROR_TYPE_TRANSPORT, OrchestrationResult,
     };
 
     /// Endpoint every [`planned_config`] provider shares.
@@ -1388,6 +1502,283 @@ mod tests {
         }
     }
 
+    /// Endpoint of the bidder that the launch-failure tests make fail.
+    const FAILING_BIDDER: &str = "https://failing.example.test/openrtb";
+
+    /// [`FAILING_BIDDER`] with a backslash in its query. The plan accepts it,
+    /// but `EdgeZero` builds no outbound request for a target with a backslash.
+    const UNBUILDABLE_BIDDER: &str = r"https://failing.example.test/openrtb?x=\";
+
+    /// Endpoint of the bidder that answers in the launch-failure tests.
+    const ANSWERING_BIDDER: &str = "https://answering.example.test/openrtb";
+
+    /// How a launch-failure test makes its bidder fail to launch.
+    #[derive(Clone, Copy, Debug)]
+    enum LaunchFailure {
+        /// Trusted Server cannot build the request, so it never joins the batch.
+        Construction,
+        /// Fastly cannot register the bidder backend as the batch starts.
+        Registration,
+    }
+
+    impl LaunchFailure {
+        const ALL: [Self; 2] = [Self::Construction, Self::Registration];
+
+        /// The endpoint a provider failing this way is configured with.
+        fn endpoint(self) -> &'static str {
+            match self {
+                Self::Construction => UNBUILDABLE_BIDDER,
+                Self::Registration => FAILING_BIDDER,
+            }
+        }
+
+        /// Scripts the failure for `auctions` auctions on `bidders`.
+        fn script(self, bidders: &ScriptedHttpClient, auctions: usize) {
+            if matches!(self, Self::Registration) {
+                for _ in 0..auctions {
+                    bidders.respond_to(
+                        Method::POST,
+                        FAILING_BIDDER,
+                        ScriptedReply::error(backend_registration_error()),
+                    );
+                }
+            }
+        }
+
+        /// How many bid requests reach `EdgeZero` in one auction.
+        fn requests_per_auction(self) -> usize {
+            match self {
+                Self::Construction => 0,
+                Self::Registration => 1,
+            }
+        }
+    }
+
+    /// The error Fastly reports when it cannot register a bidder's backend.
+    fn backend_registration_error() -> EdgeError {
+        EdgeError::bad_gateway_with_detail(
+            "Fastly failed to register a dynamic backend",
+            BadGatewayReason::Unspecified,
+            ProviderFailureDetail::Fastly {
+                phase: ProviderFailurePhase::BackendRegistration,
+                cause: FastlyFailureCause::BackendHostError { status: 1 },
+            },
+        )
+    }
+
+    /// Compiles one standard provider per `(id, endpoint)`.
+    fn launch_plan(providers: &[(&str, &str)]) -> Arc<AuctionPlan> {
+        let mut config = planned_config(
+            &providers
+                .iter()
+                .map(|(id, _)| (*id, RoutingMode::AllEligible))
+                .collect::<Vec<_>>(),
+            false,
+        );
+        for (id, endpoint) in providers {
+            config
+                .providers
+                .get_mut(&ProviderId::from_str(id).expect("should parse fictional provider ID"))
+                .expect("should configure the provider")
+                .endpoint = (*endpoint).to_string();
+        }
+        Arc::new(AuctionPlan::compile(config).expect("should compile the launch-failure plan"))
+    }
+
+    fn launch_context<'a>(
+        settings: &'a crate::settings::Settings,
+        inbound: &'a http::Request<edgezero_core::body::Body>,
+        services: &'a RuntimeServices,
+    ) -> AuctionContext<'a> {
+        AuctionContext {
+            settings,
+            request: inbound,
+            timeout_ms: 777,
+            provider_responses: None,
+            services,
+        }
+    }
+
+    /// Each provider with the `error_type` its response carries, if any.
+    fn error_types(result: &OrchestrationResult) -> Vec<(&str, Option<serde_json::Value>)> {
+        result
+            .provider_responses
+            .iter()
+            .map(|response| {
+                (
+                    response.provider.as_str(),
+                    response.metadata.get("error_type").cloned(),
+                )
+            })
+            .collect()
+    }
+
+    /// Bidders that fail to launch, through construction or backend registration.
+    mod launch_failure_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn all_planned_launch_failures_error_direct_and_surface_split_failure() {
+            for failure in LaunchFailure::ALL {
+                let clock = TestClock::new();
+                let bidders = ScriptedHttpClient::new(&clock);
+                failure.script(&bidders, 2);
+                let services = build_services_with_outbound_client(&bidders, &clock);
+                let orchestrator = AuctionOrchestrator::from_plan(
+                    launch_plan(&[("launch-fail", failure.endpoint())]),
+                    None,
+                );
+                let settings = create_test_settings();
+                let inbound = http::Request::new(edgezero_core::body::Body::empty());
+                let context = launch_context(&settings, &inbound, &services);
+                let request = planned_request();
+
+                let error = orchestrator
+                    .run_auction(&request, &context)
+                    .await
+                    .expect_err("all planned launch failures should fail direct execution");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("All eligible planned provider requests failed to launch"),
+                    "{failure:?} should distinguish launch failure from an ordinary no-bid: {error:?}"
+                );
+
+                let DispatchAuctionOutcome::DispatchFailed {
+                    provider_responses,
+                    fatal_admission_error,
+                    ..
+                } = orchestrator.dispatch_auction(&request, &context).await
+                else {
+                    panic!("{failure:?} should surface a split dispatch failure");
+                };
+                assert!(
+                    fatal_admission_error.is_none(),
+                    "{failure:?} should carry no fatal admission error"
+                );
+                assert_eq!(
+                    provider_responses
+                        .iter()
+                        .map(|response| (
+                            response.provider.as_str(),
+                            response.metadata["error_type"].clone()
+                        ))
+                        .collect::<Vec<_>>(),
+                    vec![("launch-fail", serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))],
+                    "{failure:?} should keep one launch failure for the failed provider"
+                );
+                assert_eq!(
+                    bidders.requests().len(),
+                    2 * failure.requests_per_auction(),
+                    "{failure:?} should send no bid request beyond the failed registrations"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn launch_failure_plus_answered_provider_remains_a_completed_auction() {
+            for failure in LaunchFailure::ALL {
+                let clock = TestClock::new();
+                let bidders = ScriptedHttpClient::new(&clock);
+                failure.script(&bidders, 1);
+                respond(&bidders, ANSWERING_BIDDER, 204, Vec::new());
+                let services = build_services_with_outbound_client(&bidders, &clock);
+                let orchestrator = AuctionOrchestrator::from_plan(
+                    launch_plan(&[
+                        ("launch-fail", failure.endpoint()),
+                        ("answers", ANSWERING_BIDDER),
+                    ]),
+                    None,
+                );
+                let settings = create_test_settings();
+                let inbound = http::Request::new(edgezero_core::body::Body::empty());
+                let context = launch_context(&settings, &inbound, &services);
+
+                let result = orchestrator
+                    .run_auction(&planned_request(), &context)
+                    .await
+                    .expect("one launched provider should complete the auction");
+
+                assert_eq!(
+                    error_types(&result),
+                    vec![
+                        ("answers", None),
+                        (
+                            "launch-fail",
+                            Some(serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
+                        ),
+                    ],
+                    "{failure:?} should keep the launch failure beside the completed provider"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn provider_launch_failures_error_when_no_requests_launch() {
+            let clock = TestClock::new();
+            let bidders = ScriptedHttpClient::new(&clock);
+            LaunchFailure::Registration.script(&bidders, 1);
+            let services = build_services_with_outbound_client(&bidders, &clock);
+            let orchestrator = AuctionOrchestrator::from_plan(
+                launch_plan(&[
+                    ("unbuildable", UNBUILDABLE_BIDDER),
+                    ("unregistered", FAILING_BIDDER),
+                ]),
+                None,
+            );
+            let settings = create_test_settings();
+            let inbound = http::Request::new(edgezero_core::body::Body::empty());
+            let context = launch_context(&settings, &inbound, &services);
+
+            let error = orchestrator
+                .run_auction(&planned_request(), &context)
+                .await
+                .expect_err("should fail when every provider launch fails");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("All eligible planned provider requests failed to launch"),
+                "should explain that no provider request launched: {error:?}"
+            );
+            assert_eq!(
+                recorded_uris(&bidders),
+                vec![FAILING_BIDDER.to_string()],
+                "should send only the request whose registration failed"
+            );
+        }
+
+        #[test]
+        fn registration_failure_recorded_after_dispatch_still_fails_direct_execution() {
+            let clock = TestClock::new();
+            let bidders = ScriptedHttpClient::new(&clock);
+            bidders.respond_to(
+                Method::POST,
+                FAILING_BIDDER,
+                ScriptedReply::error(backend_registration_error()).after(Duration::from_millis(10)),
+            );
+            let services = build_services_with_outbound_client(&bidders, &clock);
+            let orchestrator = AuctionOrchestrator::from_plan(
+                launch_plan(&[("launch-fail", FAILING_BIDDER)]),
+                None,
+            );
+            let settings = create_test_settings();
+            let inbound = http::Request::new(edgezero_core::body::Body::empty());
+            let context = launch_context(&settings, &inbound, &services);
+
+            let error = clock
+                .drive(orchestrator.run_auction(&planned_request(), &context))
+                .expect_err("a registration failure found in collection should still fail");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("All eligible planned provider requests failed to launch"),
+                "should report the launch failure, not an ordinary no-bid: {error:?}"
+            );
+        }
+    }
+
     fn planned_prebid_config(
         providers: &[(&str, serde_json::Value, NotificationConfig)],
     ) -> AuctionPlanConfig {
@@ -1495,7 +1886,6 @@ mod tests {
         use crate::auction::telemetry::{
             AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
         };
-        use crate::outbound::DEFAULT_BUFFERED_RESPONSE_BYTES;
         use crate::platform::test_support::{
             build_services_with_outbound_client, noop_services_with_client_ip,
         };
@@ -1834,10 +2224,10 @@ mod tests {
                     OutboundCachePolicy::Bypass,
                     ResponseDecoding::Decode,
                     ResponseMode::Buffered {
-                        max_bytes: DEFAULT_BUFFERED_RESPONSE_BYTES
+                        max_bytes: 2 * 1024 * 1024
                     }
                 ),
-                "should buffer the mediator response under 10 MiB, decoded, uncached"
+                "should buffer the mediator response under 2 MiB, decoded, uncached"
             );
             let mediated = result
                 .mediator_response
@@ -2344,6 +2734,52 @@ mod tests {
             )
             .expect("should serialize redacted facts")["evidence"]
                 .clone()
+        }
+
+        #[tokio::test]
+        async fn trace_auction_live_launch_failure_survives_the_ordinary_error() {
+            for failure in LaunchFailure::ALL {
+                let clock = TestClock::new();
+                let bidders = ScriptedHttpClient::new(&clock);
+                failure.script(&bidders, 1);
+                let services = build_services_with_outbound_client(&bidders, &clock);
+                let orchestrator = AuctionOrchestrator::from_plan(
+                    launch_plan(&[("launch-fail", failure.endpoint())]),
+                    None,
+                );
+                let settings = create_test_settings();
+                let request = planned_request();
+                let (inbound, carry) = captured_request(&request);
+                let context = launch_context(&settings, &inbound, &services);
+
+                let _error = orchestrator
+                    .run_auction(&request, &context)
+                    .await
+                    .expect_err("should preserve the ordinary launch failure");
+
+                let value = evidence(&carry);
+                assert_eq!(
+                    value["terminal_status"], "dispatch_failed",
+                    "{failure:?} should preserve the actual dispatch failure"
+                );
+                assert_eq!(
+                    value["terminal_reason"], "provider_execution_failed",
+                    "{failure:?} should use the directly observed launch failure"
+                );
+                assert_eq!(
+                    value["provider_calls"][0]["status"], "error",
+                    "{failure:?} should retain the failed actual invocation"
+                );
+                assert!(
+                    !value.to_string().contains("launch-fail"),
+                    "{failure:?} should exclude provider identities from public facts"
+                );
+                assert_eq!(
+                    bidders.requests().len(),
+                    failure.requests_per_auction(),
+                    "{failure:?} should send no bid request beyond the failed registration"
+                );
+            }
         }
 
         #[tokio::test]
