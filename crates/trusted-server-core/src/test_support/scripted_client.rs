@@ -41,13 +41,18 @@ const ADAPTER: &str = "scripted";
 
 /// Hand-advanced monotonic time for scripted outbound tests.
 ///
-/// Clones share one instant, which starts at the process clock's current instant and moves only
-/// through [`TestClock::advance`]. Advancing wakes every timer and scripted reply waiting on the
+/// Clones share one instant, which starts an hour after the process clock's current instant and
+/// moves only through [`TestClock::advance`]. A deadline taken from the process clock, such as one
+/// from `MonotonicClock::default()`, is therefore already expired on this clock, so code that
+/// mixes clocks fails its tests. Advancing wakes every timer and scripted reply waiting on the
 /// clock, as `EdgeZero` requires of a fake clock.
 #[derive(Clone)]
 pub struct TestClock {
     state: Arc<Mutex<ClockState>>,
 }
+
+/// How far a new [`TestClock`] starts ahead of the process clock.
+const PROCESS_CLOCK_OFFSET: Duration = Duration::from_hours(1);
 
 struct ClockState {
     now: MonotonicInstant,
@@ -56,11 +61,17 @@ struct ClockState {
 
 impl TestClock {
     /// Creates a clock that stands still until advanced.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process clock cannot be offset by an hour.
     #[must_use]
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(ClockState {
-                now: MonotonicInstant::now(),
+                now: MonotonicInstant::now()
+                    .checked_add(PROCESS_CLOCK_OFFSET)
+                    .expect("should offset the test clock from process time"),
                 waiters: Vec::new(),
             })),
         }
@@ -401,7 +412,9 @@ impl ScriptedHttpClient {
         } = Dispatched::new(request);
         // The facade hands begin and batch only buffered bodies. It rejects streamed uploads
         // there, and settlement drains a GET or HEAD stream before the provider sees it.
-        recorded.body = body.into_bytes().unwrap_or_default();
+        recorded.body = body
+            .into_bytes()
+            .expect("should receive a buffered body for begin or batch");
         let Scheduled { arrival, outcome } = self.schedule(recorded, context);
         Scheduled {
             arrival,
@@ -1334,6 +1347,26 @@ mod tests {
         assert!(
             matches!(at_deadline, Poll::Ready(Ok(()))),
             "should resolve once the clock reaches the deadline, got {at_deadline:?}"
+        );
+    }
+
+    #[test]
+    fn process_clock_deadline_is_already_expired_on_the_test_clock() {
+        let clock = TestClock::new();
+        let test_now = clock.monotonic_clock().now();
+
+        let process_deadline = MonotonicClock::default().deadline_after(Duration::from_secs(60));
+        let test_deadline = clock
+            .monotonic_clock()
+            .deadline_after(Duration::from_secs(60));
+
+        assert!(
+            process_deadline.is_expired_at(test_now),
+            "should expire a process-clock deadline on the test clock, so mixed clocks fail tests"
+        );
+        assert!(
+            !test_deadline.is_expired_at(test_now),
+            "should keep a test-clock deadline open on the test clock"
         );
     }
 }
