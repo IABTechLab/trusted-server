@@ -9,7 +9,6 @@
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use edgezero_adapter_axum::AXUM_PLATFORM;
@@ -21,7 +20,9 @@ use trusted_server_adapter_axum::app::TrustedServerApp;
 use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::nextjs_auction;
-use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
+use trusted_server_core::test_support::scripted_client::{
+    ScriptedHttpClient, ScriptedReply, TestClock,
+};
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
@@ -86,18 +87,28 @@ fn assert_route_registered(method: &str, path: &str) {
 struct TestServer {
     server: AxumTestServer,
     client: reqwest::Client,
+    /// The script in router state, when the test supplied one.
+    outbound: Option<ScriptedHttpClient>,
 }
 
 impl TestServer {
     /// Serves the app built from `settings`, with a script that fails every
     /// outbound request in router state, so no real `EdgeZero` transport starts.
     async fn start(settings: Settings) -> Self {
+        Self::with_origin(settings, ScriptedHttpClient::forbidding()).await
+    }
+
+    /// Serves the app built from `settings`, with `outbound` in router state.
+    async fn with_origin(settings: Settings, outbound: ScriptedHttpClient) -> Self {
         let router = TrustedServerApp::routes_with_settings_and_outbound_client(
             settings,
-            HttpClient::with_client(ScriptedHttpClient::forbidding()),
+            HttpClient::with_client(outbound.clone()),
         )
         .expect("should build router from test settings");
-        Self::serve(router).await
+        Self {
+            outbound: Some(outbound),
+            ..Self::serve(router).await
+        }
     }
 
     /// Assembles `router` as the Trusted Server app and serves it on loopback port 0.
@@ -120,7 +131,19 @@ impl TestServer {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("should build the test HTTP client");
-        Self { server, client }
+        Self {
+            server,
+            client,
+            outbound: None,
+        }
+    }
+
+    /// Fails the test if the app sent any outbound request through its router-state script.
+    fn assert_no_outbound_requests(&self) {
+        self.outbound
+            .as_ref()
+            .expect("should serve with a router-state script")
+            .assert_no_requests();
     }
 
     /// Serves the router built from the default test settings.
@@ -246,6 +269,7 @@ async fn aps_profile_serves_renderer_through_adapter_fallback() {
 
     let response = send(server.request("GET", "/integrations/aps/renderer")).await;
     assert_eq!(response.status().as_u16(), 200);
+    server.assert_no_outbound_requests();
 }
 
 /// Verify that every expected explicit route is registered in the route table.
@@ -329,6 +353,7 @@ async fn discovery_endpoint_is_routed() {
         404,
         "discovery endpoint must be routed"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -348,6 +373,7 @@ async fn verify_signature_endpoint_is_routed() {
         404,
         "verify-signature must be routed"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -364,6 +390,7 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
         status < 500,
         "tsjs catch-all handler must not return 5xx: got {status}"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -389,6 +416,7 @@ async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
         resp.headers().get("surrogate-control").is_none(),
         "s-maxage fallback must not emit Fastly Surrogate-Control"
     );
+    server.assert_no_outbound_requests();
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +442,7 @@ async fn finalize_middleware_sets_geo_unavailable_header() {
         Some("false"),
         "finalize middleware should set X-Geo-Info-Available: false on every response"
     );
+    server.assert_no_outbound_requests();
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +464,7 @@ async fn admin_route_without_credentials_returns_401() {
         401,
         "admin route must return 401 without credentials"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -484,6 +514,7 @@ async fn admin_ec_route_without_credentials_returns_401() {
         resp.headers().contains_key("www-authenticate"),
         "admin EC 401 should include the Basic authentication challenge"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -502,6 +533,7 @@ async fn authenticated_admin_eids_route_returns_200() {
         200,
         "/_ts/admin/eids should serve the real EIDs echo handler"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -586,6 +618,7 @@ async fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
             );
         }
     }
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -615,6 +648,7 @@ async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
             );
         }
     }
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -646,6 +680,7 @@ async fn admin_route_without_credentials_includes_www_authenticate_header() {
         www_auth.starts_with("Basic realm="),
         "WWW-Authenticate must be Basic scheme, got: {www_auth}"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -666,6 +701,7 @@ async fn admin_route_with_wrong_credentials_returns_401() {
         401,
         "admin route must reject wrong credentials with 401"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -677,6 +713,7 @@ async fn discovery_endpoint_does_not_require_auth() {
         401,
         "/.well-known/trusted-server.json must not require auth"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -694,6 +731,7 @@ async fn auction_endpoint_does_not_require_auth() {
         401,
         "/auction must not apply admin basic-auth gate"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -713,6 +751,7 @@ async fn admin_route_returns_non_404_non_5xx() {
     // The auth gate short-circuits with 401 before the handler; only an
     // unhandled 500 indicates a panic or missing handler.
     assert_ne!(status, 500, "admin route must not panic: got {status}");
+    server.assert_no_outbound_requests();
 }
 
 // ---------------------------------------------------------------------------
@@ -736,6 +775,7 @@ async fn admin_rotate_key_auth_fail_returns_401() {
         401,
         "admin/keys/rotate without credentials must return 401"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -753,6 +793,7 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
         401,
         "admin/keys/deactivate without credentials must return 401"
     );
+    server.assert_no_outbound_requests();
 }
 
 // ---------------------------------------------------------------------------
@@ -768,6 +809,7 @@ async fn first_party_proxy_is_routed() {
         404,
         "/first-party/proxy must be routed"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -779,6 +821,7 @@ async fn first_party_click_is_routed() {
         404,
         "/first-party/click must be routed"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -790,6 +833,7 @@ async fn first_party_sign_get_is_routed() {
         404,
         "GET /first-party/sign must be routed"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -807,6 +851,7 @@ async fn first_party_sign_post_is_routed() {
         404,
         "POST /first-party/sign must be routed"
     );
+    server.assert_no_outbound_requests();
 }
 
 /// The listener hands every POST body to the handler as a stream, so a signed
@@ -833,6 +878,7 @@ async fn first_party_sign_post_signs_the_url_in_its_body() {
         body.contains(r#""href":"/first-party/proxy?tsurl="#),
         "should return the first-party proxy URL: {body}"
     );
+    server.assert_no_outbound_requests();
 }
 
 /// A JSON auction body reaches the handler instead of being read as empty.
@@ -856,6 +902,7 @@ async fn auction_post_parses_its_json_body() {
         body.contains(r#""id":""#),
         "should return an OpenRTB response with an auction id: {body}"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -873,6 +920,7 @@ async fn first_party_proxy_rebuild_is_routed() {
         404,
         "/first-party/proxy-rebuild must be routed"
     );
+    server.assert_no_outbound_requests();
 }
 
 /// Regression test: a Next.js navigation with a pending auction must buffer to
@@ -885,10 +933,10 @@ async fn first_party_proxy_rebuild_is_routed() {
 /// Fastly adapter alone and not by this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nextjs_auction_output_holds_until_the_structural_body_close() {
-    let client = Arc::new(nextjs_auction::NextJsAuctionOrigin::default());
+    let client = nextjs_auction::NextJsAuctionOrigin::default();
     let router = TrustedServerApp::routes_with_settings_and_services(
         nextjs_auction::settings(),
-        nextjs_auction::services(Arc::clone(&client)),
+        nextjs_auction::services(&client),
     )
     .expect("should build router with fixture services");
     let server = TestServer::serve(router).await;
@@ -944,14 +992,14 @@ async fn nextjs_gtm_rejects_malformed_request_hosts() {
     // A hostile `Host` is rejected. Unauthenticated forwarded fields are
     // stripped before routing, so their hostile values never reach rewriting.
     for header in ["host", "x-forwarded-host", "forwarded"] {
-        let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+        let origin = nextjs_auction::NextJsAuctionOrigin::with_html_response(
             &nextjs_auction::script_composition_html(),
             false,
             true,
-        ));
+        );
         let router = TrustedServerApp::routes_with_settings_and_services(
             nextjs_auction::script_composition_settings(),
-            nextjs_auction::services(origin),
+            nextjs_auction::services(&origin),
         )
         .expect("should build script composition router");
         let server = TestServer::serve(router).await;
@@ -992,14 +1040,14 @@ async fn nextjs_gtm_accepts_local_request_hosts_and_ports() {
         "my_service:8080",
         "_service_.example.com:8443",
     ] {
-        let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+        let origin = nextjs_auction::NextJsAuctionOrigin::with_html_response(
             &nextjs_auction::script_composition_html(),
             false,
             true,
-        ));
+        );
         let router = TrustedServerApp::routes_with_settings_and_services(
             nextjs_auction::script_composition_settings(),
-            nextjs_auction::services(origin),
+            nextjs_auction::services(&origin),
         )
         .expect("should build script composition router");
         let server = TestServer::serve(router).await;
@@ -1037,14 +1085,14 @@ async fn nextjs_gtm_accepts_local_request_hosts_and_ports() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nextjs_gtm_html_response_is_complete() {
     for gzip in [false, true] {
-        let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+        let origin = nextjs_auction::NextJsAuctionOrigin::with_html_response(
             &nextjs_auction::script_composition_html(),
             gzip,
             false,
-        ));
+        );
         let router = TrustedServerApp::routes_with_settings_and_services(
             nextjs_auction::script_composition_settings(),
-            nextjs_auction::services(origin),
+            nextjs_auction::services(&origin),
         )
         .expect("should build mixed integration router");
         let server = TestServer::serve(router).await;
@@ -1095,6 +1143,7 @@ async fn health_reports_git_version() {
         trusted_server_core::constants::TS_GIT_VERSION,
         "should report the compiled-in git version on /health"
     );
+    server.assert_no_outbound_requests();
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,6 +1206,7 @@ async fn canonical_not_found_carries_x_ts_version() {
         trusted_server_core::constants::TS_GIT_VERSION,
         "should add the compiled-in git version to the canonical 404; response:\n{response}"
     );
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1185,5 +1235,38 @@ async fn canonical_method_not_allowed_carries_allow_and_x_ts_version() {
             .and_then(|value| value.to_str().ok()),
         trusted_server_core::constants::TS_GIT_VERSION,
         "should add the compiled-in git version to the canonical 405"
+    );
+    server.assert_no_outbound_requests();
+}
+
+/// Origin of [`test_settings`].
+const ORIGIN: &str = "https://origin.test-publisher.example.com";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_body_at_cap_passes_and_one_over_fails_502_axum() {
+    // Axum's cap is `max_buffered_body_bytes` alone, 16 MiB by default.
+    let cap = test_settings().publisher.max_buffered_body_bytes;
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+    for (path, len) in [("/at-cap.bin", cap), ("/over-cap.bin", cap + 1)] {
+        origin.respond_to(
+            edgezero_core::http::Method::GET,
+            &format!("{ORIGIN}{path}"),
+            ScriptedReply::status(edgezero_core::http::StatusCode::OK)
+                .header("content-type", "application/octet-stream")
+                .body(vec![b'x'; len]),
+        );
+    }
+    let server = TestServer::with_origin(test_settings(), origin).await;
+
+    let at_cap = send(server.request("GET", "/at-cap.bin")).await;
+    assert_eq!(at_cap.status(), 200, "should serve a raw body at the cap");
+    let body = at_cap.bytes().await.expect("should read the at-cap body");
+    assert_eq!(body.len(), cap, "should serve every byte at the cap");
+
+    let over_cap = send(server.request("GET", "/over-cap.bin")).await;
+    assert_eq!(
+        over_cap.status(),
+        502,
+        "should fail a raw body one byte over the cap with 502 before egress"
     );
 }

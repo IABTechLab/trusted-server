@@ -16,16 +16,12 @@
 
 // All three adapters define `TrustedServerApp`, so alias each to avoid name collisions.
 // reqwest and axum::http re-export the `http` crate, so HeaderMap types are identical.
-use error_stack::Report;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use trusted_server_core::platform::{
-    HttpClient, PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
-    PlatformResponse, PlatformSelectResult,
-};
+use trusted_server_core::platform::HttpClient;
 
 use axum::body::Body as AxumBody;
 use axum::http::Request as AxumRequest;
@@ -37,6 +33,7 @@ use edgezero_adapter_axum::test_utils::AxumTestServer;
 use edgezero_adapter_cloudflare::CLOUDFLARE_PLATFORM;
 use edgezero_adapter_spin::SPIN_PLATFORM;
 use edgezero_core::app::App;
+use edgezero_core::error::EdgeError;
 use edgezero_core::http::request_builder;
 use edgezero_core::router::RouterService;
 use http::HeaderMap;
@@ -46,7 +43,9 @@ use trusted_server_adapter_spin::app::TrustedServerApp as SpinApp;
 use trusted_server_core::constants::{HEADER_X_TS_VERSION, TS_GIT_VERSION};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::nextjs_auction;
-use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
+use trusted_server_core::test_support::scripted_client::{
+    ScriptedHttpClient, ScriptedReply, TestClock,
+};
 
 /// Shared test settings for all adapters.
 ///
@@ -1047,10 +1046,10 @@ async fn assert_bodiless_get_reaches_origin_without_body() {
     let origin = RecordingOrigin::start().await;
     let mut settings = test_settings();
     settings.publisher.origin_url = format!("http://{}", origin.address);
-    // EdgeZero's own Axum client goes in router state instead of a script. It
-    // is staged for Task 7: until then the publisher forward still runs
-    // through Trusted Server's own Axum client, so this test does not yet show
-    // that the router-state client carries the forward.
+    // EdgeZero's own Axum client goes in router state instead of a script, and
+    // the publisher forward runs through it.
+    // `bodiless_get_with_a_forbidding_router_client_never_reaches_the_origin`
+    // proves the router-state client is the one that carries the forward.
     let client = HttpClient::with_client(
         AxumOutboundClient::try_new().expect("should build EdgeZero's Axum outbound client"),
     );
@@ -1091,6 +1090,43 @@ async fn assert_bodiless_get_reaches_origin_without_body() {
         content_length.is_none_or(|value| value == "0"),
         "should forward no Content-Length or `Content-Length: 0`, got {content_length:?}"
     );
+    server
+        .shutdown()
+        .await
+        .expect("should stop the Axum test server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bodiless_get_with_a_forbidding_router_client_never_reaches_the_origin() {
+    let origin = RecordingOrigin::start().await;
+    let mut settings = test_settings();
+    settings.publisher.origin_url = format!("http://{}", origin.address);
+    let forbidding = ScriptedHttpClient::forbidding();
+    let server =
+        serve(Adapter::Axum.app(settings, HttpClient::with_client(forbidding.clone()))).await;
+
+    // The forbidding script fails the forward. Its test clock runs ahead of the
+    // listener's clock, so the inbound read deadline the forward carries has
+    // already passed when the facade settles the unread body, and the forward
+    // ends there with 408, before the script records it. Either way the
+    // request leaves only through the router-state client.
+
+    let response = send_raw(
+        server.address(),
+        "GET / HTTP/1.1\r\nHost: test-publisher.example.com\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n",
+    )
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 408"),
+        "should fail the forward inside the router-state client, got: {response}"
+    );
+    assert!(
+        origin.records().is_empty(),
+        "should never reach the loopback origin through another client"
+    );
+    forbidding.assert_no_requests();
     server
         .shutdown()
         .await
@@ -1192,9 +1228,9 @@ async fn send_raw(address: SocketAddr, request: &str) -> String {
 /// A known non-regulated location permits the fixture's server-side auction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adapter_buffers_nextjs_auction_output() {
-    let client = Arc::new(nextjs_auction::NextJsAuctionOrigin::default());
+    let client = nextjs_auction::NextJsAuctionOrigin::default();
     let settings = nextjs_auction::settings();
-    let services = nextjs_auction::services(Arc::clone(&client));
+    let services = nextjs_auction::services(&client);
     let routers = [
         (
             "Axum",
@@ -1320,74 +1356,72 @@ async fn adapter_buffers_nextjs_auction_output() {
     }
 }
 
-#[derive(Default)]
+/// Scripted publisher origin and EOF lookup for the HTML finalization parity case.
+///
+/// Every request queues its own answer as the script records it: the lookup
+/// approves or fails, and every other request gets the example document.
 struct TerminalFixtureOrigin {
-    lookup_calls: AtomicUsize,
-    saw_range: AtomicUsize,
-    fail_lookup: bool,
+    clock: TestClock,
+    client: ScriptedHttpClient,
+    lookup_calls: Arc<AtomicUsize>,
+    saw_range: Arc<AtomicUsize>,
 }
 
-#[async_trait::async_trait(?Send)]
-impl PlatformHttpClient for TerminalFixtureOrigin {
-    async fn send(
-        &self,
-        request: PlatformHttpRequest,
-    ) -> Result<PlatformResponse, Report<PlatformError>> {
-        let (content_type, body) = if request.request.uri().host() == Some("lookup.example.com") {
-            tokio::task::yield_now().await;
-            let payload = request
-                .request
-                .into_body()
-                .into_bytes()
-                .expect("should send a bounded fixture payload");
-            let payload: serde_json::Value = serde_json::from_slice(&payload)
-                .expect("should encode completed-document metadata");
-            assert_eq!(
-                payload["complete"], true,
-                "should observe the EOF sentinel before I/O"
-            );
-            assert_eq!(
-                payload["sha256"]
-                    .as_str()
-                    .expect("should hash transformed HTML")
-                    .len(),
-                64,
-                "should send a complete digest"
-            );
-            self.lookup_calls.fetch_add(1, Ordering::SeqCst);
-            if self.fail_lookup {
-                return Err(Report::new(PlatformError::HttpClient));
+impl TerminalFixtureOrigin {
+    fn new(fail_lookup: bool) -> Self {
+        let clock = TestClock::new();
+        let script = ScriptedHttpClient::new(&clock);
+        let rearm = script.clone();
+        let lookup_calls = Arc::new(AtomicUsize::new(0));
+        let saw_range = Arc::new(AtomicUsize::new(0));
+        let (lookups, ranges) = (Arc::clone(&lookup_calls), Arc::clone(&saw_range));
+        let client = script.with_request_observer(move |request| {
+            let uri = request.uri.to_string();
+            if request.uri.host() == Some("lookup.example.com") {
+                let payload: serde_json::Value = serde_json::from_slice(&request.body)
+                    .expect("should encode completed-document metadata");
+                assert_eq!(
+                    payload["complete"], true,
+                    "should observe the EOF sentinel before I/O"
+                );
+                assert_eq!(
+                    payload["sha256"]
+                        .as_str()
+                        .expect("should hash transformed HTML")
+                        .len(),
+                    64,
+                    "should send a complete digest"
+                );
+                lookups.fetch_add(1, Ordering::SeqCst);
+                let reply = if fail_lookup {
+                    ScriptedReply::error(EdgeError::bad_gateway("example lookup failure"))
+                } else {
+                    ScriptedReply::status(http::StatusCode::OK)
+                        .header("content-type", "text/plain")
+                        .header("cache-control", "public, max-age=60")
+                        .body("EXAMPLE_APPROVED")
+                };
+                rearm.respond_to(request.method.clone(), &uri, reply);
+            } else {
+                if request.headers.contains_key(http::header::RANGE) {
+                    ranges.fetch_add(1, Ordering::SeqCst);
+                }
+                rearm.respond_to(
+                    request.method.clone(),
+                    &uri,
+                    ScriptedReply::status(http::StatusCode::OK)
+                        .header("content-type", "text/html")
+                        .header("cache-control", "public, max-age=60")
+                        .body("<!doctype html><html><head></head><body><p>EXAMPLE_UNSIGNED</p></body></html><!--example-document-eof-->"),
+                );
             }
-            ("text/plain", "EXAMPLE_APPROVED")
-        } else {
-            if request.request.headers().contains_key(http::header::RANGE) {
-                self.saw_range.fetch_add(1, Ordering::SeqCst);
-            }
-            (
-                "text/html",
-                "<!doctype html><html><head></head><body><p>EXAMPLE_UNSIGNED</p></body></html><!--example-document-eof-->",
-            )
-        };
-        Ok(PlatformResponse::new(
-            http::Response::builder()
-                .status(200)
-                .header("content-type", content_type)
-                .header("cache-control", "public, max-age=60")
-                .body(edgezero_core::body::Body::from(body))
-                .expect("should build an example upstream response"),
-        ))
-    }
-    async fn send_async(
-        &self,
-        _: PlatformHttpRequest,
-    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
-    }
-    async fn select(
-        &self,
-        _: Vec<PlatformPendingRequest>,
-    ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        });
+        Self {
+            clock,
+            client,
+            lookup_calls,
+            saw_range,
+        }
     }
 }
 
@@ -1401,14 +1435,8 @@ async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
         settings.integrations.insert_config("html_finalization_fixture", &serde_json::json!({
         "enabled": enabled, "lookup_url": format!("https://lookup.example.com/{case}"), "transport_timeout_ms": 1000,
     })).expect("should enable the fictional terminal consumer");
-        let client = Arc::new(TerminalFixtureOrigin {
-            lookup_calls: AtomicUsize::new(0),
-            saw_range: AtomicUsize::new(0),
-            fail_lookup: case == "failed",
-        });
-        let services = nextjs_auction::services_with_http_client(
-            Arc::clone(&client) as Arc<dyn PlatformHttpClient>
-        );
+        let client = TerminalFixtureOrigin::new(case == "failed");
+        let services = nextjs_auction::services_with_outbound_client(&client.client, &client.clock);
         let routers = [
             (
                 "Axum",
@@ -1528,7 +1556,6 @@ async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
 #[cfg(test)]
 mod trace_parity {
     use std::net::IpAddr;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1545,15 +1572,11 @@ mod trace_parity {
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::platform::{
         BackendNamingPolicy, ClientInfo, GeoInfo, HttpClient, PlatformBackend, PlatformBackendSpec,
-        PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
-        PlatformKvStore, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
-        PlatformSelectResult, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
+        PlatformConfigStore, PlatformError, PlatformGeo, PlatformKvStore, PlatformSecretStore,
+        RuntimeServices, StoreId, StoreName, UnavailableHttpClient, UnavailableKvStore,
     };
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedForwarderConfig;
-    use trusted_server_core::test_support::scripted_client::{
-        ScriptedHttpClient, ScriptedReply, TestClock,
-    };
     use trusted_server_core::trace::TraceTerminalResponse;
 
     use super::*;
@@ -1663,27 +1686,6 @@ mod trace_parity {
         }
     }
     #[async_trait(?Send)]
-    impl PlatformHttpClient for ForbiddenLifecycle {
-        async fn send(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            panic!("should not contact trace origin");
-        }
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            panic!("should not launch trace auctions");
-        }
-        async fn select(
-            &self,
-            _requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            panic!("should not collect trace auctions");
-        }
-    }
-    #[async_trait(?Send)]
     impl AuctionTelemetrySink for ForbiddenLifecycle {
         fn is_enabled(&self) -> bool {
             panic!("should not inspect trace auction telemetry");
@@ -1767,7 +1769,7 @@ mod trace_parity {
             .secret_store(forbidden.clone())
             .kv_store(forbidden.clone())
             .backend(forbidden.clone())
-            .http_client(forbidden.clone())
+            .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(forbidden.outbound_client())
             .clock(TestClock::new().monotonic_clock())
             .auction_telemetry_sink(forbidden)
@@ -2141,7 +2143,7 @@ mod trace_parity {
             .secret_store(forbidden.clone())
             .kv_store(forbidden.clone())
             .backend(forbidden.clone())
-            .http_client(forbidden.clone())
+            .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(forbidden.outbound_client())
             .clock(TestClock::new().monotonic_clock())
             .auction_telemetry_sink(forbidden)
@@ -2427,81 +2429,37 @@ mod trace_parity {
         outbound.assert_no_requests();
     }
 
-    struct ForwarderOrigin {
-        base: RuntimeServices,
-        requests: Mutex<Vec<(String, HeaderMap)>>,
-    }
+    /// Geo lookup that knows no location.
+    struct NoGeo;
 
-    impl PlatformBackend for ForwarderOrigin {
-        fn naming_policy(&self) -> BackendNamingPolicy {
-            self.base.backend().naming_policy()
-        }
-
-        fn predict_name(
-            &self,
-            spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<PlatformError>> {
-            self.base.backend().predict_name(spec)
-        }
-
-        fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            self.base.backend().ensure(spec)
-        }
-    }
-
-    impl PlatformGeo for ForwarderOrigin {
-        fn lookup(&self, ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-            self.base.geo().lookup(ip)
-        }
-    }
-
-    #[async_trait(?Send)]
-    impl PlatformHttpClient for ForwarderOrigin {
-        async fn send(
-            &self,
-            request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            self.requests
-                .lock()
-                .expect("should lock recorded origin requests")
-                .push((
-                    request.request.uri().to_string(),
-                    request.request.headers().clone(),
-                ));
-            self.base.http_client().send(request).await
-        }
-
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            panic!("should not launch auctions from forwarder fixture");
-        }
-
-        async fn select(
-            &self,
-            _requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            panic!("should not collect auctions from forwarder fixture");
+    impl PlatformGeo for NoGeo {
+        fn lookup(&self, _ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+            Ok(None)
         }
     }
 
     #[tokio::test]
     async fn trusted_forwarder_parity_proxy_strips_credentials_and_retains_backend_targets() {
-        let origin = Arc::new(ForwarderOrigin {
-            base: nextjs_auction::services(
-                Arc::new(nextjs_auction::NextJsAuctionOrigin::default()),
-            ),
-            requests: Mutex::new(Vec::new()),
-        });
         let forbidden = Arc::new(ForbiddenLifecycle::new());
-        // The publisher origin still goes through the platform client above.
-        // Integrations send through EdgeZero's client, so the Lockr leg reaches
-        // this script, which answers it once per adapter.
+        // The publisher origin and the Lockr leg both reach this script. Every
+        // origin request queues the Next.js page for itself as it is recorded,
+        // and the vendor answers once per adapter.
         let clock = TestClock::new();
-        let vendor = ScriptedHttpClient::new(&clock);
+        let script = ScriptedHttpClient::new(&clock);
+        let rearm = script.clone();
+        let upstream = script.with_request_observer(move |request| {
+            if request.uri.host() == Some(nextjs_auction::ORIGIN_HOST) {
+                rearm.respond_to(
+                    request.method.clone(),
+                    &request.uri.to_string(),
+                    ScriptedReply::status(StatusCode::OK)
+                        .header("content-type", "text/html")
+                        .body(nextjs_auction::origin_html()),
+                );
+            }
+        });
         for _ in 0..3 {
-            vendor.respond_to(
+            upstream.respond_to(
                 Method::GET,
                 "https://vendor.example.com/example",
                 ScriptedReply::status(StatusCode::OK)
@@ -2509,15 +2467,29 @@ mod trace_parity {
                     .body(serde_json::json!({"example":true}).to_string()),
             );
         }
+        let origin_requests = || {
+            upstream
+                .requests()
+                .into_iter()
+                .filter(|request| request.uri.host() == Some(nextjs_auction::ORIGIN_HOST))
+                .collect::<Vec<_>>()
+        };
+        let vendor_requests = || {
+            upstream
+                .requests()
+                .into_iter()
+                .filter(|request| request.uri.host() == Some("vendor.example.com"))
+                .collect::<Vec<_>>()
+        };
         let services = RuntimeServices::builder()
             .config_store(forbidden.clone())
-            .secret_store(forbidden)
+            .secret_store(forbidden.clone())
             .kv_store(Arc::new(UnavailableKvStore))
-            .backend(origin.clone())
-            .http_client(origin.clone())
-            .outbound_client(vendor.http_client())
+            .backend(forbidden)
+            .http_client(Arc::new(UnavailableHttpClient))
+            .outbound_client(upstream.http_client())
             .clock(clock.monotonic_clock())
-            .geo(origin.clone())
+            .geo(Arc::new(NoGeo))
             .client_info(ClientInfo::default())
             .build();
         let mut settings = forwarder_settings();
@@ -2530,12 +2502,8 @@ mod trace_parity {
             .expect("should enable public URL rewriting");
         settings.integrations.insert_config("lockr", &serde_json::json!({"enabled":true,"app_id":"fictional-app","api_endpoint":"https://vendor.example.com","sdk_url":"https://vendor.example.com/sdk.js"})).expect("should configure fictional integration upstream");
         for (adapter, router) in routers_with_services(settings, services) {
-            origin
-                .requests
-                .lock()
-                .expect("should reset recorded origin requests")
-                .clear();
-            let vendor_sent = vendor.requests().len();
+            let origin_sent = origin_requests().len();
+            let vendor_sent = vendor_requests().len();
             for (method, path, target) in [
                 (
                     Method::GET,
@@ -2602,19 +2570,15 @@ mod trace_parity {
                     );
                 }
                 let (actual_target, headers) = if path.starts_with("/integrations/") {
-                    let request = vendor
-                        .requests()
+                    let request = vendor_requests()
                         .pop()
                         .expect("should reach the integration upstream");
                     (request.uri.to_string(), request.headers)
                 } else {
-                    origin
-                        .requests
-                        .lock()
-                        .expect("should inspect actual outbound request")
-                        .last()
-                        .cloned()
-                        .expect("should reach configured upstream")
+                    let request = origin_requests()
+                        .pop()
+                        .expect("should reach configured upstream");
+                    (request.uri.to_string(), request.headers)
                 };
                 assert_eq!(
                     actual_target, target,
@@ -2636,12 +2600,8 @@ mod trace_parity {
             }
             assert_eq!(
                 (
-                    origin
-                        .requests
-                        .lock()
-                        .expect("should count outbound requests")
-                        .len(),
-                    vendor.requests().len() - vendor_sent
+                    origin_requests().len() - origin_sent,
+                    vendor_requests().len() - vendor_sent
                 ),
                 (2, 1),
                 "{adapter} should dispatch exactly the two publisher and one integration requests"
@@ -2664,12 +2624,8 @@ mod trace_parity {
             }
             assert_eq!(
                 (
-                    origin
-                        .requests
-                        .lock()
-                        .expect("should count requests after early returns")
-                        .len(),
-                    vendor.requests().len() - vendor_sent
+                    origin_requests().len() - origin_sent,
+                    vendor_requests().len() - vendor_sent
                 ),
                 (2, 1),
                 "{adapter} should keep forwarding credentials away from all upstreams on trace early returns"

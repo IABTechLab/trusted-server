@@ -7,8 +7,11 @@ thread_local! {
     static WARNINGS: RefCell<Option<Vec<CapturedWarning>>> = const { RefCell::new(None) };
 }
 
-pub(crate) struct CapturedWarning {
+/// One warning a [`WarningCapture`] recorded.
+pub struct CapturedWarning {
+    /// Log target of the warning.
     pub target: String,
+    /// Rendered warning message.
     pub message: String,
 }
 
@@ -35,9 +38,20 @@ impl log::Log for TestLogger {
     fn flush(&self) {}
 }
 
-pub(crate) struct WarningCapture;
+/// Records the warnings logged on the current thread until it is dropped.
+///
+/// The first capture installs one process-wide logger that keeps only warnings, so a test
+/// binary that installs another logger cannot use it. Captures do not nest.
+pub struct WarningCapture;
 
 impl WarningCapture {
+    /// Starts capturing the warnings logged on this thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another logger is already installed or a capture is already active on this
+    /// thread.
+    #[must_use]
     pub fn start() -> Self {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
@@ -55,6 +69,12 @@ impl WarningCapture {
         Self
     }
 
+    /// Returns the warnings captured since the start or the last take.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the capture is no longer active on this thread.
+    #[must_use]
     pub fn take(&self) -> Vec<CapturedWarning> {
         WARNINGS.with(|warnings| {
             std::mem::take(

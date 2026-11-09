@@ -200,6 +200,17 @@ pub fn auction_app_config_envelope(
     bidders: &[AuctionBidderFixture],
     auction_timeout_ms: u32,
 ) -> TestResult<String> {
+    app_config_envelope(origin_port, false, |table| {
+        enable_auction(table, bidders, auction_timeout_ms)
+    })
+}
+
+/// Enables the auction in `table` over `bidders` alone, with `auction_timeout_ms`.
+fn enable_auction(
+    table: &mut toml::Table,
+    bidders: &[AuctionBidderFixture],
+    auction_timeout_ms: u32,
+) -> TestResult<()> {
     let mut providers = toml::Table::new();
     for bidder in bidders {
         let provider: toml::Table = toml::from_str(&format!(
@@ -212,15 +223,59 @@ pub fn auction_app_config_envelope(
         })?;
         providers.insert(bidder.id.clone(), toml::Value::Table(provider));
     }
+    let auction = table_mut(table, "auction")?;
+    auction.insert("enabled".to_string(), toml::Value::Boolean(true));
+    auction.insert(
+        "timeout_ms".to_string(),
+        toml::Value::Integer(i64::from(auction_timeout_ms)),
+    );
+    auction.insert("providers".to_string(), toml::Value::Table(providers));
+    auction.remove("bidders");
+    Ok(())
+}
+
+/// Builds [`auction_app_config_envelope`] with server-side ad templates on `path`.
+///
+/// Each slot is a 300x250 creative opportunity on `path`, and navigations to `path` run
+/// their auction with `auction_timeout_ms`.
+///
+/// # Errors
+///
+/// Returns a fixture-generation error when configuration validation fails.
+pub fn navigation_auction_app_config_envelope(
+    origin_port: u16,
+    bidders: &[AuctionBidderFixture],
+    auction_timeout_ms: u32,
+    path: &str,
+    slots: &[&str],
+) -> TestResult<String> {
+    let mut slot_tables = Vec::new();
+    for slot in slots {
+        let slot: toml::Table = toml::from_str(&format!(
+            "id = \"{slot}\"\npage_patterns = [\"{path}\"]\nformats = [{{ width = 300, height = 250 }}]\n"
+        ))
+        .map_err(|error| {
+            Report::new(TestError::ConfigGeneration)
+                .attach(format!("invalid creative opportunity slot fixture: {error}"))
+        })?;
+        slot_tables.push(toml::Value::Table(slot));
+    }
     app_config_envelope(origin_port, false, |table| {
-        let auction = table_mut(table, "auction")?;
-        auction.insert("enabled".to_string(), toml::Value::Boolean(true));
-        auction.insert(
-            "timeout_ms".to_string(),
+        enable_auction(table, bidders, auction_timeout_ms)?;
+        let mut creative_opportunities = toml::Table::new();
+        creative_opportunities.insert(
+            "gam_network_id".to_string(),
+            toml::Value::String("12345".to_owned()),
+        );
+        creative_opportunities.insert(
+            "auction_timeout_ms".to_string(),
             toml::Value::Integer(i64::from(auction_timeout_ms)),
         );
-        auction.insert("providers".to_string(), toml::Value::Table(providers));
-        auction.remove("bidders");
+        creative_opportunities.insert("slot".to_string(), toml::Value::Array(slot_tables));
+        table.insert(
+            "creative_opportunities".to_string(),
+            toml::Value::Table(creative_opportunities),
+        );
         Ok(())
     })
 }

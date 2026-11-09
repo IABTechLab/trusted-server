@@ -137,9 +137,9 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, handle_page_bids,
-    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
-    publisher_response_into_streaming_response,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherOriginOptions,
+    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    publisher_owner_error, publisher_response_into_streaming_response,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -905,17 +905,23 @@ async fn dispatch_fallback(
                     &mut ec.ec_context,
                     auction,
                     req,
-                    EdgeCacheHeader::SurrogateControl,
+                    PublisherOriginOptions {
+                        edge_header: EdgeCacheHeader::SurrogateControl,
+                        input_cap: None,
+                    },
                 )
                 .await
                 {
-                    Ok(pub_response) => {
+                    Ok((pub_response, owner)) => {
                         // Origin start succeeded on the sole publisher-page
                         // path. Authorize orphan recovery only for real-browser
                         // document navigations so named routes, integration
                         // proxies, and filter short circuits cannot rotate an
                         // identity.
                         ec.ec_context.set_recovery_eligible(is_publisher_navigation);
+                        // The owner keeps the auction batch and the origin body
+                        // alive until the client body ends: delivery converts
+                        // the attached body with `into_stream()`.
                         publisher_response_into_streaming_response(
                             pub_response,
                             &method,
@@ -925,6 +931,7 @@ async fn dispatch_fallback(
                             services.clone(),
                         )
                         .await
+                        .and_then(|response| owner.attach(response).map_err(publisher_owner_error))
                     }
                     Err(e) => Err(e),
                 }
@@ -1453,9 +1460,10 @@ mod tests {
 
     use super::{
         AppState, AuctionDispatch, EcContext, EdgeCacheHeader, EidSyncSource, HandlerFuture,
-        NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig,
-        TrustedServerApp, build_orchestrator_with_plan, build_per_request_services,
-        build_state_from_settings, compile_auction_plan, handle_publisher_request,
+        NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
+        PublisherOriginOptions, RuntimeStoreConfig, TrustedServerApp, build_orchestrator_with_plan,
+        build_per_request_services, build_state_from_settings, compile_auction_plan,
+        handle_publisher_request, publisher_owner_error,
         publisher_response_into_streaming_response, startup_error_router,
     };
     use base64::Engine as _;
@@ -1483,11 +1491,9 @@ mod tests {
     };
     use trusted_server_core::platform::{
         ClientInfo, HttpClient, PlatformBackend, PlatformBackendSpec, PlatformError,
-        PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
-        PlatformResponse, PlatformSelectResult, PlatformTemplateCache,
-        PlatformTemplateCacheReservation, RuntimeServices, TemplateCacheError, TemplateCacheKey,
-        TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation, TemplateEntry,
-        TemplateMetadata,
+        PlatformKvStore, PlatformTemplateCache, PlatformTemplateCacheReservation, RuntimeServices,
+        TemplateCacheError, TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss,
+        TemplateCacheReservation, TemplateEntry, TemplateMetadata, UnavailableHttpClient,
     };
     use trusted_server_core::settings::Settings;
     use trusted_server_core::test_support::scripted_client::{
@@ -3103,51 +3109,6 @@ mod tests {
         }
     }
 
-    struct StreamingHttpClient;
-
-    #[async_trait::async_trait(?Send)]
-    impl PlatformHttpClient for StreamingHttpClient {
-        fn supports_streaming_responses(&self) -> bool {
-            true
-        }
-
-        async fn send(
-            &self,
-            request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            assert!(
-                request.stream_response,
-                "streaming Fastly routes should request an origin response stream"
-            );
-            let response = edgezero_core::http::response_builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/html")
-                .body(Body::stream(futures::stream::iter(vec![
-                    Bytes::from_static(b"streamed-asset"),
-                ])))
-                .map_err(|_| Report::new(PlatformError::HttpClient))?;
-            Ok(PlatformResponse::new(response))
-        }
-
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        async fn select(
-            &self,
-            _pending_requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    fn streaming_runtime_services() -> RuntimeServices {
-        runtime_services_with_upstream(&ScriptedHttpClient::forbidding(), &TestClock::new())
-    }
-
     /// Streaming runtime services whose `EdgeZero` outbound requests go to `upstream`.
     fn runtime_services_with_upstream(
         upstream: &ScriptedHttpClient,
@@ -3158,7 +3119,7 @@ mod tests {
             .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
             .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
             .backend(Arc::new(FixedBackend))
-            .http_client(Arc::new(StreamingHttpClient))
+            .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(upstream.http_client())
             .clock(clock.monotonic_clock())
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
@@ -3267,44 +3228,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct DispatchOriginClient {
-        calls: AtomicUsize,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl PlatformHttpClient for DispatchOriginClient {
-        async fn send(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            let response = edgezero_core::http::response_builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                .header(header::CACHE_CONTROL, "public, max-age=300")
-                .body(Body::from(
-                    b"<html><head></head><body>origin</body></html>".as_ref(),
-                ))
-                .map_err(|_| Report::new(PlatformError::HttpClient))?;
-            Ok(PlatformResponse::new(response))
-        }
-
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        async fn select(
-            &self,
-            _pending_requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
     #[test]
     fn dispatch_edge_authenticated_esi_request_stores_then_hits_template() {
         let settings = Arc::new(
@@ -3346,7 +3269,19 @@ mod tests {
             .expect("should parse dispatch cache settings"),
         );
         let cache = Arc::new(DispatchTemplateCache::default());
-        let origin = Arc::new(DispatchOriginClient::default());
+        let clock = TestClock::new();
+        let origin = ScriptedHttpClient::new(&clock);
+        // Two replies: a warm dispatch that wrongly fetched the origin would take the second.
+        for _ in 0..2 {
+            origin.respond_to(
+                Method::GET,
+                &format!("{}/secure/article", settings.publisher.origin_url),
+                ScriptedReply::status(StatusCode::OK)
+                    .header("content-type", "text/html; charset=utf-8")
+                    .header("cache-control", "public, max-age=300")
+                    .body("<html><head></head><body>origin</body></html>"),
+            );
+        }
         let services = RuntimeServices::builder()
             .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
             .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
@@ -3354,9 +3289,9 @@ mod tests {
             .template_cache(Arc::clone(&cache) as Arc<dyn PlatformTemplateCache>)
             .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
             .backend(Arc::new(FixedBackend))
-            .http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>)
-            .outbound_client(ScriptedHttpClient::forbidding().http_client())
-            .clock(TestClock::new().monotonic_clock())
+            .http_client(Arc::new(UnavailableHttpClient))
+            .outbound_client(origin.http_client())
+            .clock(clock.monotonic_clock())
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
             .build();
@@ -3400,13 +3335,17 @@ mod tests {
                             registry: None,
                         },
                         request,
-                        EdgeCacheHeader::SurrogateControl,
+                        PublisherOriginOptions {
+                            edge_header: EdgeCacheHeader::SurrogateControl,
+                            input_cap: None,
+                        },
                     )
                     .await
                     {
                         Ok(response) => response,
                         Err(report) => return Ok(super::http_error(&report)),
                     };
+                    let (response, owner) = response;
                     match publisher_response_into_streaming_response(
                         response,
                         &method,
@@ -3416,6 +3355,7 @@ mod tests {
                         services,
                     )
                     .await
+                    .and_then(|response| owner.attach(response).map_err(publisher_owner_error))
                     {
                         Ok(response) => Ok(response),
                         Err(report) => Ok(super::http_error(&report)),
@@ -3461,7 +3401,7 @@ mod tests {
         block_on(warm.into_body().into_bytes_bounded(1024 * 1024))
             .expect("should drain warm response");
         assert_eq!(
-            origin.calls.load(Ordering::Relaxed),
+            origin.requests().len(),
             1,
             "the warm dispatch must not fetch the publisher origin"
         );
@@ -3546,12 +3486,12 @@ mod tests {
         for gzip in [false, true] {
             let state = build_state_from_settings(nextjs_auction::script_composition_settings())
                 .expect("should build mixed state");
-            let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+            let origin = nextjs_auction::NextJsAuctionOrigin::with_html_response(
                 &nextjs_auction::script_composition_html(),
                 gzip,
                 true,
-            ));
-            let services = nextjs_auction::services(origin);
+            );
+            let services = nextjs_auction::services(&origin);
             let request = request_builder()
                 .method(Method::GET)
                 .uri(format!(
@@ -3603,7 +3543,19 @@ mod tests {
         // guards the adapter wiring that could silently re-buffer.
         let settings = test_settings();
         let state = build_state_from_settings(settings).expect("should build state");
-        let services = streaming_runtime_services();
+        let clock = TestClock::new();
+        let origin = ScriptedHttpClient::new(&clock);
+        origin.respond_to(
+            Method::GET,
+            &format!("{}/article", state.settings.publisher.origin_url),
+            ScriptedReply::status(StatusCode::OK)
+                .header("content-type", "text/html")
+                .chunks(vec![
+                    Bytes::from_static(b"<html><body>"),
+                    Bytes::from_static(b"streamed</body></html>"),
+                ]),
+        );
+        let services = runtime_services_with_upstream(&origin, &clock);
         let req = empty_request(Method::GET, "/article");
 
         let response = block_on(super::dispatch_fallback(&state, &services, req));

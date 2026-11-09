@@ -29,7 +29,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use edgezero_core::body::{Body, BodyPayload};
+use edgezero_core::body::{Body, BodyPayload, BodyStream};
 use edgezero_core::error::{EdgeError, RequestBodyOverflowOrigin};
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use edgezero_core::outbound::{
@@ -41,6 +41,7 @@ use edgezero_core::outbound::{
     OutboundResponseContext, OutboundSendMode, OutboundTime, ResponseDecoding, ResponseMode,
 };
 use edgezero_core::time::{Deadline, DispatchBudget, MonotonicClock, MonotonicInstant};
+use futures::FutureExt as _;
 use futures::future::poll_fn;
 use futures::stream::{self, StreamExt as _};
 
@@ -204,6 +205,7 @@ pub struct ScriptedReply {
     delay: Duration,
     hold: Option<Hold>,
     body_polls: Option<Arc<AtomicUsize>>,
+    body_error: Option<EdgeError>,
     fails_batch: bool,
 }
 
@@ -260,6 +262,13 @@ impl ScriptedReply {
         self
     }
 
+    /// Ends the body with `error` after its chunks, as an upstream that fails mid-body.
+    #[must_use]
+    pub fn body_error(mut self, error: EdgeError) -> Self {
+        self.body_error = Some(error);
+        self
+    }
+
     /// Makes the reply arrive `delay` after its request enters dispatch, on the test clock.
     ///
     /// A batch slot's request enters dispatch at the batch start.
@@ -295,6 +304,7 @@ impl ScriptedReply {
             delay: Duration::ZERO,
             hold: None,
             body_polls: None,
+            body_error: None,
             fails_batch: false,
         }
     }
@@ -302,7 +312,12 @@ impl ScriptedReply {
     /// Builds the provider head `EdgeZero` finalizes, or returns the scripted error.
     fn into_head(self, context: OutboundResponseContext) -> Result<OutboundHead, EdgeError> {
         let status = self.outcome?;
-        let mut chunks = stream::iter(self.chunks.into_iter().map(Ok::<_, EdgeError>));
+        let mut chunks = stream::iter(
+            self.chunks
+                .into_iter()
+                .map(Ok::<_, EdgeError>)
+                .chain(self.body_error.map(Err)),
+        );
         let body = match self.body_polls {
             None => chunks.boxed_local(),
             Some(polls) => stream::poll_fn(move |context| {
@@ -359,8 +374,14 @@ pub struct RecordedRequest {
     pub uri: Uri,
     /// Normalized request headers.
     pub headers: HeaderMap,
-    /// Whole request body, collected when the request streamed it.
+    /// Whole request body.
+    ///
+    /// A streamed upload is recorded when its request enters dispatch, before its body is
+    /// collected, so this stays empty for an upload that fails or that the facade never let
+    /// finish.
     pub body: Bytes,
+    /// Cap on the request body the request may upload.
+    pub max_request_body_bytes: u64,
     /// Per-call timeout.
     pub timeout: Option<Duration>,
     /// Connect timeout.
@@ -645,10 +666,10 @@ impl ScriptedHttpClient {
         assert!(sent.is_empty(), "should not send {}", sent.join(", "));
     }
 
-    /// Records the request, takes its reply, and builds the head it arrives with.
+    /// Takes the reply for a recorded request and builds the head it arrives with.
     fn schedule(
         &self,
-        recorded: RecordedRequest,
+        recorded: &RecordedRequest,
         context: OutboundResponseContext,
     ) -> Scheduled<OutboundHead> {
         let reply = self.take_reply(recorded);
@@ -681,37 +702,47 @@ impl ScriptedHttpClient {
         recorded.body = body
             .into_bytes()
             .expect("should receive a buffered body for begin or batch");
-        let Scheduled { arrival, outcome } = self.schedule(recorded, context);
+        self.record(&recorded);
+        let Scheduled { arrival, outcome } = self.schedule(&recorded, context);
         Scheduled {
             arrival,
             outcome: outcome.and_then(finish_now),
         }
     }
 
-    fn take_reply(&self, recorded: RecordedRequest) -> ScriptedReply {
+    /// Records a request as it enters dispatch and returns its position in the record.
+    ///
+    /// The observer sees the request as recorded, so a streamed upload's body is still empty.
+    fn record(&self, recorded: &RecordedRequest) -> usize {
         let mut state = lock(&self.state);
-        let RecordedRequest { method, uri, .. } = &recorded;
-        let reply = if self.forbid {
-            ScriptedReply::error(internal(format!("should not send {method} {uri}")))
-        } else {
-            state
-                .replies
-                .get_mut(&(method.clone(), uri.to_string()))
-                .and_then(VecDeque::pop_front)
-                .unwrap_or_else(|| {
-                    ScriptedReply::error(internal(format!("unscripted request {method} {uri}")))
-                })
-        };
-        let observed = self
-            .observer
-            .as_ref()
-            .map(|observer| (observer, recorded.clone()));
-        state.requests.push(recorded);
+        state.requests.push(recorded.clone());
+        let position = state.requests.len() - 1;
         drop(state);
-        if let Some((observer, recorded)) = observed {
-            observer(&recorded);
+        if let Some(observer) = &self.observer {
+            observer(recorded);
         }
-        reply
+        position
+    }
+
+    /// Fills in the body of the request recorded at `position` once its upload is collected.
+    fn record_upload(&self, position: usize, body: &Bytes) {
+        if let Some(recorded) = lock(&self.state).requests.get_mut(position) {
+            recorded.body = body.clone();
+        }
+    }
+
+    fn take_reply(&self, recorded: &RecordedRequest) -> ScriptedReply {
+        let RecordedRequest { method, uri, .. } = recorded;
+        if self.forbid {
+            return ScriptedReply::error(internal(format!("should not send {method} {uri}")));
+        }
+        lock(&self.state)
+            .replies
+            .get_mut(&(method.clone(), uri.to_string()))
+            .and_then(VecDeque::pop_front)
+            .unwrap_or_else(|| {
+                ScriptedReply::error(internal(format!("unscripted request {method} {uri}")))
+            })
     }
 }
 
@@ -729,12 +760,30 @@ impl OutboundHttpClient for ScriptedHttpClient {
         let Dispatched {
             mut recorded,
             body,
-            max_request_body_bytes,
             context,
         } = Dispatched::new(request);
+        let (payload, _egress_owner) = body.into_parts();
+        let upload = match payload {
+            BodyPayload::Once(bytes) => {
+                recorded.body = bytes;
+                None
+            }
+            BodyPayload::Stream(source) => Some(source),
+        };
+        let position = self.record(&recorded);
         Box::pin(async move {
-            recorded.body = collect_upload(body, max_request_body_bytes).await?;
-            let scheduled = client.schedule(recorded, context);
+            if let Some(source) = upload {
+                let budget = context.budget();
+                recorded.body = collect_upload(
+                    source,
+                    recorded.max_request_body_bytes,
+                    budget,
+                    &client.clock,
+                )
+                .await?;
+                client.record_upload(position, &recorded.body);
+            }
+            let scheduled = client.schedule(&recorded, context);
             scheduled.wait(client.clock).await
         })
     }
@@ -783,7 +832,6 @@ impl OutboundHttpClient for ScriptedHttpClient {
 struct Dispatched {
     recorded: RecordedRequest,
     body: Body,
-    max_request_body_bytes: u64,
     context: OutboundResponseContext,
 }
 
@@ -818,6 +866,7 @@ impl Dispatched {
                 uri,
                 headers,
                 body: Bytes::new(),
+                max_request_body_bytes,
                 timeout,
                 connect_timeout,
                 deadline,
@@ -834,7 +883,6 @@ impl Dispatched {
                 budget,
             },
             body,
-            max_request_body_bytes,
             context,
         }
     }
@@ -1046,17 +1094,38 @@ fn finish_now(head: OutboundHead) -> Result<OutboundResponse, EdgeError> {
     ))
 }
 
-/// Collects a request body, enforcing the upload cap on a streamed body as providers do.
+/// Collects a streamed upload, enforcing its cap and its budget as providers do.
 ///
-/// The facade already checked a buffered body against the cap.
-async fn collect_upload(body: Body, max_request_body_bytes: u64) -> Result<Bytes, EdgeError> {
-    let (payload, _egress_owner) = body.into_parts();
-    let mut source = match payload {
-        BodyPayload::Once(bytes) => return Ok(bytes),
-        BodyPayload::Stream(source) => source,
-    };
+/// Each read races the budget deadline on the test clock, as Axum's provider does, so an upload
+/// that stalls past the deadline times out there. The facade already checked a buffered body
+/// against the cap.
+async fn collect_upload(
+    mut source: BodyStream,
+    max_request_body_bytes: u64,
+    budget: DispatchBudget,
+    clock: &TestClock,
+) -> Result<Bytes, EdgeError> {
     let mut collected = BytesMut::new();
-    while let Some(chunk) = source.next().await {
+    loop {
+        let mut next = source.next();
+        let read = poll_fn(|context| {
+            if let Poll::Ready(item) = next.poll_unpin(context) {
+                return Poll::Ready(Some(item));
+            }
+            clock
+                .poll_reached(budget.deadline.instant(), context.waker())
+                .map(|()| None)
+        })
+        .await;
+        let Some(item) = read else {
+            return Err(EdgeError::gateway_timeout_caused(
+                "scripted upload did not finish before its deadline",
+                budget.cause,
+            ));
+        };
+        let Some(chunk) = item else {
+            return Ok(collected.freeze());
+        };
         collected.extend_from_slice(&chunk?);
         if u64::try_from(collected.len()).unwrap_or(u64::MAX) > max_request_body_bytes {
             return Err(EdgeError::payload_too_large(
@@ -1064,7 +1133,6 @@ async fn collect_upload(body: Body, max_request_body_bytes: u64) -> Result<Bytes
             ));
         }
     }
-    Ok(collected.freeze())
 }
 
 /// Wraps `response` as the [`OutboundResponse`] a POST that `EdgeZero` sent would return.
@@ -1210,6 +1278,14 @@ mod tests {
                 &Bytes::from_static(b"{\"id\":1}")
             ),
             "should record the method, URI, headers, and body"
+        );
+        assert_eq!(
+            bid.max_request_body_bytes,
+            OutboundRequest::post(uri("/bid"))
+                .expect("should build a default POST request")
+                .into_parts()
+                .max_request_body_bytes,
+            "should record the default upload cap"
         );
         assert_eq!(
             (
@@ -1585,6 +1661,108 @@ mod tests {
             recorded[0].uri.to_string(),
             uri("/forbidden"),
             "should record its URI"
+        );
+    }
+
+    #[test]
+    fn forbidding_client_records_an_upload_that_fails_before_it_is_collected() {
+        let client = ScriptedHttpClient::forbidding();
+        let upload = Body::from_stream(stream::iter([
+            Ok(Bytes::from_static(b"partial")),
+            Err(EdgeError::bad_request("example upload source failed")),
+        ]));
+
+        let error = block_on(
+            client.http_client().send(
+                OutboundRequest::post(uri("/upload"))
+                    .expect("should build the POST request")
+                    .body(upload),
+            ),
+        )
+        .expect_err("should fail the upload");
+
+        assert!(
+            matches!(error, EdgeError::BadRequest { .. }),
+            "should fail with the upload source error, got {error:?}"
+        );
+        let recorded = client.requests();
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|request| (request.method.clone(), request.uri.to_string()))
+                .collect::<Vec<_>>(),
+            vec![(Method::POST, uri("/upload"))],
+            "should record the request whose upload failed"
+        );
+        assert!(
+            recorded[0].body.is_empty(),
+            "should leave the failed upload's body empty"
+        );
+    }
+
+    #[test]
+    fn streamed_upload_over_its_cap_is_recorded_with_the_cap_and_fails_413() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        let upload = Body::from_stream(stream::iter([
+            Ok(Bytes::from_static(b"1234")),
+            Ok(Bytes::from_static(b"5")),
+        ]));
+
+        let error = block_on(
+            client.http_client().send(
+                OutboundRequest::post(uri("/upload"))
+                    .expect("should build the POST request")
+                    .max_request_body_bytes(4)
+                    .body(upload),
+            ),
+        )
+        .expect_err("should fail the upload over its cap");
+
+        assert_eq!(
+            error.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should fail an upload past its cap with 413, got {error:?}"
+        );
+        let recorded = client.requests();
+        assert_eq!(recorded.len(), 1, "should record the over-cap upload");
+        assert_eq!(
+            recorded[0].max_request_body_bytes, 4,
+            "should record the upload cap"
+        );
+    }
+
+    #[test]
+    fn streamed_upload_that_stalls_past_its_deadline_times_out() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        let upload = Body::from_stream(stream::pending::<Result<Bytes, EdgeError>>());
+
+        let mut sent = client.http_client().send(
+            OutboundRequest::post(uri("/upload"))
+                .expect("should build the POST request")
+                .timeout(Duration::from_secs(1))
+                .body(upload),
+        );
+        let before = poll_once(&mut sent, Waker::noop());
+        clock.advance(Duration::from_secs(1));
+        let after = poll_once(&mut sent, Waker::noop());
+
+        assert!(before.is_pending(), "should wait for the upload");
+        assert!(
+            matches!(
+                after,
+                Poll::Ready(Err(EdgeError::GatewayTimeout {
+                    cause: BudgetSource::PerCallTimeout,
+                    ..
+                }))
+            ),
+            "should time out the stalled upload at its deadline, got {after:?}"
+        );
+        assert_eq!(
+            client.requests().len(),
+            1,
+            "should record the request before its upload stalls"
         );
     }
 

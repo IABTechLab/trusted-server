@@ -154,6 +154,19 @@ impl Publisher {
         "replace-with-random-proxy-secret",
     ];
 
+    /// Drops `origin_host_header_override` on Spin, with a warning.
+    ///
+    /// Spin sends the origin URI authority as `Host` and cannot override it, so
+    /// the Spin adapter calls this when it loads settings. A config that sets
+    /// the override keeps serving there, with the URI authority.
+    pub fn drop_origin_host_header_override_for_spin(&mut self) {
+        if self.origin_host_header_override.take().is_some() {
+            log::warn!(
+                "publisher.origin_host_header_override is ignored on Spin; the origin receives its URI authority as Host"
+            );
+        }
+    }
+
     /// Returns the EC cookie domain, computed as `.{domain}`.
     ///
     /// Per spec §5.2, EC cookies derive their domain from
@@ -3446,6 +3459,24 @@ impl Settings {
         }
 
         Ok(())
+    }
+
+    /// Warns that a live `creative_opportunities.origin_readthrough_enabled = true` is ignored.
+    ///
+    /// Origin readthrough is unavailable: the publisher origin is always fetched
+    /// with the ad-stack bypass or the platform default cache policy, as if the
+    /// setting were `false`. Validation rejects the setting, and a config that
+    /// predates the rejection keeps serving.
+    pub fn warn_ignored_origin_readthrough(&self) {
+        if self
+            .creative_opportunities
+            .as_ref()
+            .is_some_and(|config| config.origin_readthrough_enabled == Some(true))
+        {
+            log::warn!(
+                "creative_opportunities.origin_readthrough_enabled = true is ignored; origin readthrough is unavailable. Remove the setting before the next config push"
+            );
+        }
     }
 
     /// Returns compiled creative opportunity slots when template delivery is enabled.

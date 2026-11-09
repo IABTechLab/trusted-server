@@ -468,34 +468,11 @@ fn fastly_response_to_platform(
 
 /// Apply the caller's cache intent to a Fastly request.
 ///
-/// The two branches are mutually exclusive by construction, which is the point of
-/// [`PlatformCacheIntent`]: `set_surrogate_key` "overrides any previous
-/// `Request::set_pass` call" (`fastly-0.12.1/src/http/request.rs:2462`), so calling both
-/// would silently cancel the bypass.
-///
-/// Readthrough is enabled by *omitting* `set_pass`, never by adding a TTL. `set_ttl`
-/// carries the same override note and additionally overrides the origin's own
-/// `Cache-Control`, including `private` and `no-store` — it would turn the hazard this
-/// gate exists to avoid into an API.
+/// The default leaves Fastly's read-through caching alone. Nothing sets a TTL, which
+/// would override the origin's own `Cache-Control`, including `private` and `no-store`.
 fn apply_fastly_cache_intent(request: &mut fastly::Request, intent: &PlatformCacheIntent) {
     match intent {
         PlatformCacheIntent::Bypass => request.set_pass(true),
-        PlatformCacheIntent::Shared { surrogate_key } => {
-            match fastly::http::HeaderValue::from_str(surrogate_key) {
-                Ok(value) => request.set_surrogate_key(value),
-                Err(error) => {
-                    // Fail closed. Caching without the key would store an object no purge
-                    // can reach, which is worse than not caching it: the whole rollback
-                    // story for readthrough is "purge the key".
-                    log::error!(
-                        "Surrogate key {surrogate_key:?} is not a valid header value \
-                         ({error}); bypassing the cache rather than storing an \
-                         unpurgeable object"
-                    );
-                    request.set_pass(true);
-                }
-            }
-        }
         PlatformCacheIntent::Default => {}
     }
 }
@@ -523,8 +500,9 @@ fn apply_fastly_cache_intent(request: &mut fastly::Request, intent: &PlatformCac
 ///
 /// Deadline collection requires [`PlatformCacheIntent::Bypass`], which all
 /// auction requests use. This guarantees a direct SDK pending handle that can
-/// join body handles in one timed host wait. Shared-cache requests retain the
-/// SDK caching state machine through the unbounded send/select/wait APIs.
+/// join body handles in one timed host wait. Requests with the platform default
+/// cache policy retain the SDK caching state machine through the unbounded
+/// send/select/wait APIs.
 pub struct FastlyPlatformHttpClient;
 
 #[async_trait::async_trait(?Send)]
@@ -1263,46 +1241,6 @@ mod tests {
         assert!(
             format!("{request:?}").contains("cache_override: None"),
             "the default intent should preserve Fastly read-through caching"
-        );
-    }
-
-    #[test]
-    fn apply_fastly_cache_intent_never_passes_on_the_shared_branch() {
-        // Readthrough is enabled by *omitting* set_pass. If this branch ever set pass as
-        // well, the surrogate key would reverse it — and the resulting behavior would
-        // depend on call order rather than on what the code says.
-        let mut request = fastly::Request::get("https://example.com/");
-        apply_fastly_cache_intent(
-            &mut request,
-            &PlatformCacheIntent::Shared {
-                surrogate_key: "ts-origin".to_owned(),
-            },
-        );
-        let rendered = format!("{request:?}");
-        assert!(
-            !rendered.contains("cache_override: Pass"),
-            "the shared branch must not bypass, got: {rendered}"
-        );
-        assert!(
-            rendered.contains("ts-origin"),
-            "the shared branch must attach the surrogate key, got: {rendered}"
-        );
-    }
-
-    #[test]
-    fn a_surrogate_key_that_cannot_be_a_header_value_falls_back_to_bypass() {
-        // Fail closed: caching without the key would store an object no purge can reach,
-        // and "purge the key" is the entire rollback story for readthrough.
-        let mut request = fastly::Request::get("https://example.com/");
-        apply_fastly_cache_intent(
-            &mut request,
-            &PlatformCacheIntent::Shared {
-                surrogate_key: "bad\nkey".to_owned(),
-            },
-        );
-        assert!(
-            format!("{request:?}").contains("cache_override: Pass"),
-            "an unusable key must bypass rather than store something unpurgeable"
         );
     }
 

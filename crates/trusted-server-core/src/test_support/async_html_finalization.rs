@@ -4,21 +4,20 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use edgezero_core::body::Body;
-use edgezero_core::http::{Uri, request_builder};
+use edgezero_core::error::EdgeError;
+use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding};
 use error_stack::{Report, ResultExt as _};
 use futures::future::LocalBoxFuture;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
-use url::Url;
 use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
     IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory, IntegrationRegistration,
 };
-use crate::platform::{PlatformBackendSpec, PlatformHttpRequest};
+use crate::outbound::{buffered, outbound_request};
 use crate::settings::{IntegrationConfig, Settings};
 use crate::streaming_processor::StreamProcessor;
 use crate::streaming_processor::finish::{StreamFinish, StreamFinishError, StreamFinishInput};
@@ -27,6 +26,9 @@ pub(crate) const ID: &str = "html_finalization_fixture";
 const EOF_SENTINEL: &[u8] = b"<!--example-document-eof-->";
 const ORIGINAL: &[u8] = b"EXAMPLE_UNSIGNED";
 const REPLACEMENT: &[u8] = b"EXAMPLE_FINALIZED";
+
+/// Largest lookup reply the fixture reads.
+const MAX_LOOKUP_RESPONSE_BYTES: u64 = 64;
 
 #[derive(Clone, Deserialize, Validate)]
 pub(crate) struct FixtureConfig {
@@ -123,71 +125,57 @@ impl StreamProcessor for FixtureSession {
             if !self.saw_eof_sentinel || !self.synchronous_eof {
                 return Err(Report::new(StreamFinishError::Rejected));
             }
-            let url =
-                Url::parse(&self.config.lookup_url).change_context(StreamFinishError::Rejected)?;
-            // Fastly cannot interrupt a blocking host call. Bound its transport
-            // by the remaining chain budget; timer adapters deliberately test
-            // cancellation against a longer transport timeout.
-            let timeout = if input.deadline.has_cooperative_timer() {
-                Duration::from_millis(u64::from(self.config.transport_timeout_ms))
+            // Fastly cannot interrupt a blocking host call, so its request also
+            // carries the remaining chain budget as a deadline. The constant
+            // timeout keeps the backend identity stable; the reported timeout is
+            // the bound the request actually runs under.
+            let transport_timeout =
+                Duration::from_millis(u64::from(self.config.transport_timeout_ms));
+            let cooperative = input.deadline.has_cooperative_timer();
+            let reported_timeout = if cooperative {
+                transport_timeout
             } else {
-                input
-                    .deadline
-                    .remaining()
-                    .min(Duration::from_millis(u64::from(
-                        self.config.transport_timeout_ms,
-                    )))
+                input.deadline.remaining().min(transport_timeout)
             };
-            let backend = input
-                .services
-                .backend()
-                .ensure(&PlatformBackendSpec {
-                    scheme: url.scheme().to_string(),
-                    host: url
-                        .host_str()
-                        .ok_or_else(|| Report::new(StreamFinishError::Rejected))?
-                        .to_string(),
-                    port: url.port(),
-                    host_header_override: None,
-                    certificate_check: true,
-                    first_byte_timeout: timeout,
-                    between_bytes_timeout: timeout,
-                    discriminator: Some(ID.to_string()),
-                })
-                .change_context(StreamFinishError::Unavailable)?;
             let payload = serde_json::to_vec(&json!({
                 "complete": true,
                 "sha256": hex::encode(self.digest.clone().finalize()),
                 "bytes": self.bytes,
-                "transport_timeout_ms": timeout.as_millis(),
+                "transport_timeout_ms": reported_timeout.as_millis(),
             }))
             .change_context(StreamFinishError::Rejected)?;
-            let request = request_builder()
-                .method(http::Method::POST)
-                .uri(
-                    self.config
-                        .lookup_url
-                        .parse::<Uri>()
-                        .change_context(StreamFinishError::Rejected)?,
-                )
-                .header(http::header::CONTENT_TYPE, "application/json")
-                .body(Body::from(payload))
-                .change_context(StreamFinishError::Rejected)?;
+            let mut request = buffered(
+                outbound_request(http::Method::POST, &self.config.lookup_url)
+                    .map_err(|error| fixture_error(error, StreamFinishError::Rejected))?,
+                transport_timeout,
+                MAX_LOOKUP_RESPONSE_BYTES,
+                ResponseDecoding::Decode,
+            )
+            .cache_policy(OutboundCachePolicy::Bypass)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .map_err(|error| fixture_error(error, StreamFinishError::Rejected))?
+            .body(payload);
+            if !cooperative {
+                request = request.deadline(
+                    input
+                        .services
+                        .clock()
+                        .deadline_after(input.deadline.remaining()),
+                );
+            }
             let response = input
                 .services
-                .http_client()
-                .send(PlatformHttpRequest::new(request, backend).with_cache_bypass())
+                .outbound_client()
+                .send(request)
                 .await
-                .change_context(StreamFinishError::Unavailable)?;
-            if !response.response.status().is_success() {
+                .map_err(|error| fixture_error(error, StreamFinishError::Unavailable))?;
+            if !response.is_success() {
                 return Err(Report::new(StreamFinishError::Unavailable));
             }
             let reply = response
-                .response
-                .into_body()
-                .into_bytes_bounded(64)
+                .into_bytes_bounded(MAX_LOOKUP_RESPONSE_BYTES)
                 .await
-                .change_context(StreamFinishError::Rejected)?;
+                .map_err(|error| fixture_error(error, StreamFinishError::Rejected))?;
             if reply.as_ref() != b"EXAMPLE_APPROVED" {
                 return Err(Report::new(StreamFinishError::Rejected));
             }
@@ -211,6 +199,11 @@ impl StreamProcessor for FixtureSession {
             Ok(StreamFinish::Replace)
         }))
     }
+}
+
+/// Reports an outbound failure as `context`, carrying the `EdgeError` for diagnosis.
+fn fixture_error(error: EdgeError, context: StreamFinishError) -> Report<StreamFinishError> {
+    Report::new(context).attach_opaque(error)
 }
 
 #[cfg(test)]

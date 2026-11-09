@@ -16,7 +16,9 @@ use trusted_server_core::constants::TS_GIT_VERSION;
 use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::insert_outbound_client;
-use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
+use trusted_server_core::test_support::scripted_client::{
+    ScriptedHttpClient, ScriptedReply, TestClock,
+};
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
@@ -796,14 +798,12 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
 /// Fastly adapter alone and not by this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nextjs_auction_output_holds_until_the_structural_body_close() {
-    use std::sync::Arc;
-
     use trusted_server_core::test_support::nextjs_auction;
 
-    let client = Arc::new(nextjs_auction::NextJsAuctionOrigin::default());
+    let client = nextjs_auction::NextJsAuctionOrigin::default();
     let router = TrustedServerApp::routes_with_settings_and_services(
         nextjs_auction::settings(),
-        nextjs_auction::services(Arc::clone(&client)),
+        nextjs_auction::services(&client),
     )
     .expect("should build router with fixture services");
 
@@ -855,4 +855,93 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
         !html.contains("__ts_rsc_") && !html.contains("<!--ts-inline-body-close-"),
         "should not leak generated placeholders: {html}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Publisher origin through EdgeZero's client
+// ---------------------------------------------------------------------------
+
+/// Origin of the route test settings.
+const ORIGIN: &str = "https://origin.test-publisher.example.com";
+
+/// Cloudflare's origin input cap with the default 16 MiB `max_buffered_body_bytes`.
+const CLOUDFLARE_INPUT_CAP: usize = 10 * 1024 * 1024;
+
+/// Sends `req` through `router` with `origin` as the request's outbound client.
+async fn route_to_origin(
+    router: RouterService,
+    mut req: Request,
+    origin: &ScriptedHttpClient,
+) -> Response {
+    insert_outbound_client(&mut req, HttpClient::with_client(origin.clone()));
+    router.oneshot(req).await.expect("should route request")
+}
+
+/// A publisher GET for `path` on the test publisher host.
+fn publisher_get(path: &str) -> Request {
+    request_builder()
+        .method(Method::GET)
+        .uri(format!("https://test-publisher.example.com{path}"))
+        .header(header::HOST, "test-publisher.example.com")
+        .body(Body::empty())
+        .expect("should build publisher request")
+}
+
+/// An identity HTML document exactly `len` bytes long.
+fn html_document(len: usize) -> Vec<u8> {
+    let mut document = b"<html><body>".to_vec();
+    document.resize(len - b"</body></html>".len(), b'a');
+    document.extend_from_slice(b"</body></html>");
+    document
+}
+
+/// Asserts that an origin body of [`CLOUDFLARE_INPUT_CAP`] bytes is served and
+/// one byte more fails with 502 before egress.
+async fn assert_cloudflare_input_cap(content_type: &str, body: fn(usize) -> Vec<u8>) {
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+    for (path, len) in [
+        ("/at-cap", CLOUDFLARE_INPUT_CAP),
+        ("/over-cap", CLOUDFLARE_INPUT_CAP + 1),
+    ] {
+        origin.respond_to(
+            Method::GET,
+            &format!("{ORIGIN}{path}"),
+            ScriptedReply::status(StatusCode::OK)
+                .header("content-type", content_type)
+                .body(body(len)),
+        );
+    }
+
+    let at_cap = route_to_origin(test_router(), publisher_get("/at-cap"), &origin).await;
+    assert_eq!(
+        at_cap.status(),
+        StatusCode::OK,
+        "should serve a {content_type} body at the cap"
+    );
+    let served = at_cap
+        .into_body()
+        .into_bytes()
+        .expect("should buffer the at-cap body");
+    assert!(
+        served.len() >= CLOUDFLARE_INPUT_CAP,
+        "should serve the whole {content_type} body at the cap, got {} bytes",
+        served.len()
+    );
+
+    let over_cap = route_to_origin(test_router(), publisher_get("/over-cap"), &origin).await;
+    assert_eq!(
+        over_cap.status(),
+        StatusCode::BAD_GATEWAY,
+        "should fail a {content_type} body one byte over the cap with 502"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_body_at_cap_passes_and_one_over_fails_502_cloudflare() {
+    assert_cloudflare_input_cap("application/octet-stream", |len| vec![b'x'; len]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_html_at_cap_passes_and_one_over_fails_502_cloudflare() {
+    assert_cloudflare_input_cap("text/html", html_document).await;
 }

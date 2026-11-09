@@ -259,6 +259,8 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     validate_secret_key_references(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
     reject_disabled_certificate_check(settings)?;
+    reject_origin_readthrough(settings)?;
+    reject_origin_url_userinfo(settings)?;
     validate_js_asset_proxy_config(settings)?;
     validate_gpt_diagnostics_config(settings)?;
 
@@ -282,6 +284,7 @@ pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
     warn_ignored_certificate_check(settings);
+    settings.warn_ignored_origin_readthrough();
     settings.reject_placeholder_secrets()?;
     validate_js_asset_proxy_config(settings)?;
     validate_gpt_diagnostics_config(settings)?;
@@ -306,6 +309,47 @@ fn reject_disabled_certificate_check(
     Err(Report::new(TrustedServerError::Configuration {
         message: "proxy.certificate_check = false is not supported; origin TLS is always verified"
             .to_owned(),
+    }))
+}
+
+/// Rejects `creative_opportunities.origin_readthrough_enabled = true`, because origin
+/// readthrough is unavailable.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the setting is `true`.
+fn reject_origin_readthrough(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let enabled = settings
+        .creative_opportunities
+        .as_ref()
+        .is_some_and(|config| config.origin_readthrough_enabled == Some(true));
+    if !enabled {
+        return Ok(());
+    }
+    Err(Report::new(TrustedServerError::Configuration {
+        message: "creative_opportunities.origin_readthrough_enabled = true is not supported; origin readthrough is unavailable"
+            .to_owned(),
+    }))
+}
+
+/// Rejects a `publisher.origin_url` that carries userinfo.
+///
+/// The publisher forward refuses such a target, so every publisher request would
+/// answer 400. The error never echoes the URL, which holds the credentials.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the URL has a username or password.
+fn reject_origin_url_userinfo(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let has_userinfo = url::Url::parse(&settings.publisher.origin_url)
+        .is_ok_and(|url| !url.username().is_empty() || url.password().is_some());
+    if !has_userinfo {
+        return Ok(());
+    }
+    Err(Report::new(TrustedServerError::Configuration {
+        message:
+            "publisher.origin_url must not contain userinfo; put credentials in a header instead"
+                .to_owned(),
     }))
 }
 
@@ -1457,6 +1501,68 @@ password = "production-admin-password-32-bytes"
                     && warning.message.contains("ignored")
             }),
             "should warn that certificate_check = false is ignored"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_origin_url_with_userinfo() {
+        for origin_url in [
+            "https://example-user@origin.test-publisher.example.com",
+            "https://example-user:example-pass@origin.test-publisher.example.com",
+        ] {
+            let mut settings = valid_settings();
+            settings.publisher.origin_url = origin_url.to_owned();
+
+            let error = validate_settings_for_deploy(&settings)
+                .expect_err("should reject an origin URL with userinfo at deploy");
+            assert!(
+                format!("{error:?}").contains("publisher.origin_url"),
+                "should name the rejected setting: {error:?}"
+            );
+            assert!(
+                !format!("{error:?}").contains("example-pass"),
+                "should never echo the credentials: {error:?}"
+            );
+            let error = TrustedServerAppConfig::new(settings)
+                .expect_err("should reject an origin URL with userinfo on validate and push");
+            assert!(
+                error.to_string().contains("publisher.origin_url"),
+                "should name the rejected setting on validate and push: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_origin_readthrough_enabled() {
+        let mut settings = valid_settings();
+        let readthrough = |enabled: bool| {
+            serde_json::from_value::<crate::creative_opportunities::CreativeOpportunitiesConfig>(
+                serde_json::json!({
+                    "gam_network_id": "12345",
+                    "origin_readthrough_enabled": enabled,
+                }),
+            )
+            .expect("should build a creative opportunities config")
+        };
+        settings.creative_opportunities = Some(readthrough(false));
+        validate_settings_for_deploy(&settings)
+            .expect("should accept origin readthrough explicitly disabled");
+
+        settings.creative_opportunities = Some(readthrough(true));
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should reject origin readthrough at deploy");
+        assert!(
+            format!("{error:?}").contains("creative_opportunities.origin_readthrough_enabled"),
+            "should name the rejected setting: {error:?}"
+        );
+        let error = TrustedServerAppConfig::new(settings)
+            .expect_err("should reject origin readthrough on validate and push");
+        assert!(
+            error
+                .to_string()
+                .contains("creative_opportunities.origin_readthrough_enabled"),
+            "should name the rejected setting on validate and push: {error:?}"
         );
     }
 

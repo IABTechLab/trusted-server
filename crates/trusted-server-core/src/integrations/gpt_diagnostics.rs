@@ -411,6 +411,17 @@ fn console_cookie_state(request: &Request<EdgeBody>) -> ConsoleCookieState {
 }
 
 fn sanitize_console_cookie(request: &mut Request<EdgeBody>) {
+    // The rebuilt field keeps only UTF-8 values, so a non-UTF-8 field never reaches
+    // `EdgeZero`, which would drop it at dispatch with this warning. The value is
+    // never logged.
+    if request
+        .headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .any(|value| value.to_str().is_err())
+    {
+        log::warn!("dropping non-UTF-8 request header: cookie");
+    }
     let retained = request
         .headers()
         .get_all(header::COOKIE)

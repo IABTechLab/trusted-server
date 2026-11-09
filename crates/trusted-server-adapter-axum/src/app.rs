@@ -28,8 +28,9 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, buffer_publisher_response_async,
-    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherOriginOptions,
+    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_owner_error,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -253,27 +254,36 @@ async fn dispatch_fallback(
         slots: state.settings.creative_opportunity_slots(),
         registry: None,
     };
-    let publisher_response = handle_publisher_request(
+    // Axum has no runtime memory limit of its own, so the publisher setting
+    // alone bounds the origin body this adapter collects before egress.
+    let input_cap =
+        u64::try_from(state.settings.publisher.max_buffered_body_bytes).unwrap_or(u64::MAX);
+    let (publisher_response, owner) = handle_publisher_request(
         &state.settings,
         services,
         None,
         &mut ec_context,
         auction,
         req,
-        EdgeCacheHeader::SMaxageFallback,
+        PublisherOriginOptions {
+            edge_header: EdgeCacheHeader::SMaxageFallback,
+            input_cap: Some(input_cap),
+        },
     )
     .await?;
     // Async finalize so the dispatched auction is collected and its bids are
     // injected before `</body>` (the sync buffer path would drop them).
-    buffer_publisher_response_async(
+    let response = buffer_publisher_response_async(
         publisher_response,
         &method,
         &state.settings,
         &state.registry,
         &state.orchestrator,
         services,
+        Some(input_cap),
     )
-    .await
+    .await?;
+    owner.attach(response).map_err(publisher_owner_error)
 }
 
 fn fallback_handler(

@@ -469,6 +469,18 @@ struct OriginRequest {
     content_length: Option<String>,
     /// The `Transfer-Encoding` value the request was framed with, if any.
     transfer_encoding: Option<String>,
+    /// Every header field, names lowercased, in arrival order.
+    headers: Vec<(String, String)>,
+}
+
+impl OriginRequest {
+    /// Returns the value of the first `name` field, compared case-insensitively.
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(field, _)| field.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 /// Builds the complete HTTP response a [`RecordingOrigin`] sends for one request.
@@ -631,9 +643,11 @@ fn read_origin_request(stream: &mut TcpStream) -> Option<OriginRequest> {
     let mut chunked = false;
     let mut declared_length = None;
     let mut transfer_encoding = None;
+    let mut headers = Vec::new();
     for line in lines {
         let (name, value) = line.split_once(':')?;
         let value = value.trim();
+        headers.push((name.to_ascii_lowercase(), value.to_owned()));
         if name.eq_ignore_ascii_case("content-length") {
             content_length = value.parse().ok()?;
             declared_length = Some(value.to_owned());
@@ -665,6 +679,7 @@ fn read_origin_request(stream: &mut TcpStream) -> Option<OriginRequest> {
         body,
         content_length: declared_length,
         transfer_encoding,
+        headers,
     })
 }
 
@@ -1713,4 +1728,790 @@ fn spin_runtime_auction_reports_one_timeout_and_cutoff() {
             );
         },
     );
+}
+
+// ---------------------------------------------------------------------------
+// Publisher origin through EdgeZero's client (spec tests 1, 2, and 6)
+// ---------------------------------------------------------------------------
+
+/// A runtime the publisher-origin cases serve an isolated app config on.
+#[derive(Clone, Copy, Debug)]
+enum OriginRuntime {
+    Axum,
+    Cloudflare,
+    Fastly,
+    Spin,
+}
+
+impl OriginRuntime {
+    /// Serves `envelope` on this runtime and runs `check` against its base URL.
+    ///
+    /// Spin may reach any loopback port, so loopback origins and bidders work there.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the runtime's artifact or CLI is missing or it never becomes ready.
+    fn serve(self, envelope: &str, check: impl FnOnce(&str)) {
+        use common::trace_boundary::{TraceRuntime, with_trace_runtime};
+        match self {
+            Self::Axum => {
+                let process = environments::axum::AxumDevServer
+                    .spawn_with_app_config(envelope)
+                    .expect("should start the Axum dev server");
+                check(&process.base_url);
+            }
+            Self::Cloudflare => with_trace_runtime(TraceRuntime::Cloudflare, envelope, None, check),
+            Self::Fastly => with_trace_runtime(TraceRuntime::Fastly, envelope, None, check),
+            Self::Spin => with_trace_runtime(
+                TraceRuntime::Spin,
+                envelope,
+                Some("http://127.0.0.1:*"),
+                check,
+            ),
+        }
+    }
+}
+
+/// A `GET /` that carries body bytes returns 400 and never reaches the origin
+/// (EZ-1 criterion 13).
+fn get_root_with_body_returns_400(runtime: IngressRuntime) {
+    init_logger();
+    let _port = lock_origin_port();
+    let origin = RecordingOrigin::start(origin_port(), ORIGIN_PASS_THROUGH_STATUS);
+    let process = runtime.spawn();
+    // Readiness probes may already have fetched the root page from the origin.
+    let probes = origin.requests().len();
+
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/", process.base_url))
+        .header(CONTENT_TYPE, "text/plain")
+        .body("example GET body")
+        .send()
+        .expect("should send the GET with a body");
+
+    assert_eq!(
+        response.status().as_u16(),
+        400,
+        "{runtime:?} should refuse to forward a GET that carries a body"
+    );
+    let forwarded = origin.requests();
+    assert_eq!(
+        forwarded.len(),
+        probes,
+        "{runtime:?} should not forward the GET with a body to the origin: {:?}",
+        &forwarded[probes..]
+    );
+}
+
+#[test]
+#[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
+fn get_root_with_body_returns_400_fastly() {
+    get_root_with_body_returns_400(IngressRuntime::Fastly);
+}
+
+#[test]
+#[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
+fn get_root_with_body_returns_400_cloudflare() {
+    get_root_with_body_returns_400(IngressRuntime::Cloudflare);
+}
+
+#[test]
+#[ignore = "requires the pre-built trusted-server-axum binary"]
+fn get_root_with_body_returns_400_axum() {
+    get_root_with_body_returns_400(IngressRuntime::Axum);
+}
+
+/// Serves the shared integration app config on Spin, with the recording origin
+/// on the fixed origin port, and runs `check` against its base URL.
+fn with_spin_ingress(status: u16, check: impl FnOnce(&str, &RecordingOrigin)) {
+    init_logger();
+    let _port = lock_origin_port();
+    let origin = RecordingOrigin::start(origin_port(), status);
+    let envelope = common::config::integration_app_config_envelope(origin_port())
+        .expect("should build the integration app config");
+    OriginRuntime::Spin.serve(&envelope, |base_url| check(base_url, &origin));
+}
+
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn spin_runtime_post_auction_with_json_body() {
+    with_spin_ingress(200, |base_url, _origin| {
+        let response = reqwest::blocking::Client::new()
+            .post(format!("{base_url}/auction"))
+            .json(&serde_json::json!({
+                "adUnits": [{
+                    "code": "ingress-slot",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }]
+            }))
+            .send()
+            .expect("should send the auction request");
+        let status = response.status().as_u16();
+        let body = response.text().expect("should read the auction response");
+        assert_eq!(
+            status, 200,
+            "Spin should hand the JSON body to the auction handler: {body}"
+        );
+        let auction: serde_json::Value =
+            serde_json::from_str(&body).expect("should return an OpenRTB JSON response");
+        assert!(
+            auction["id"].as_str().is_some_and(|id| !id.is_empty()),
+            "Spin auction response should carry the auction id: {body}"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn spin_runtime_publisher_post_body_reaches_origin() {
+    with_spin_ingress(200, |base_url, origin| {
+        let sent: Vec<u8> = (0..=u8::MAX).cycle().take(4096).collect();
+        let response = reqwest::blocking::Client::new()
+            .post(format!("{base_url}{INGRESS_FORM_PATH}"))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(sent.clone())
+            .send()
+            .expect("should send the publisher POST");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "Spin should return the origin's answer to the publisher POST"
+        );
+        let received = origin
+            .requests()
+            .into_iter()
+            .find(|request| request.method == "POST" && request.path == INGRESS_FORM_PATH)
+            .expect("should record the publisher POST at the origin");
+        assert!(
+            received.body == sent,
+            "Spin should forward all {} body bytes unchanged; the origin received {} bytes",
+            sent.len(),
+            received.body.len()
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn spin_runtime_head_root() {
+    with_spin_ingress(ORIGIN_PASS_THROUGH_STATUS, |base_url, _origin| {
+        let response = reqwest::blocking::Client::new()
+            .head(format!("{base_url}/"))
+            .send()
+            .expect("should send the HEAD request");
+        assert_eq!(
+            response.status().as_u16(),
+            ORIGIN_PASS_THROUGH_STATUS,
+            "Spin HEAD / should return the origin's status"
+        );
+    });
+}
+
+/// Page the navigation bid cases load.
+const NAVIGATION_PATH: &str = "/article";
+
+/// When the navigation origin's head arrives.
+const NAVIGATION_ORIGIN_DELAY: Duration = Duration::from_millis(700);
+
+/// The navigation auction's deadline.
+const NAVIGATION_AUCTION_TIMEOUT_MS: u32 = 500;
+
+/// Pre-seeded EC row of the Viceroy template, so the Fastly navigation
+/// preloads an EC snapshot and takes the overlapped path.
+const NAVIGATION_EC_ID: &str =
+    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.test05";
+
+/// The creative a navigation bidder answering after `delay` delivers.
+fn navigation_creative(delay: Duration) -> String {
+    format!("example-creative-{}", delay.as_millis())
+}
+
+/// A loopback bidder that waits `delay` and bids on its own slot.
+fn start_navigation_bidder(delay: Duration) -> RecordingOrigin {
+    let slot = format!("slot-{}", delay.as_millis());
+    let body = serde_json::to_vec(&serde_json::json!({
+        "seatbid": [{"seat": format!("seat-{}", delay.as_millis()), "bid": [{
+            "id": format!("bid-{}", delay.as_millis()),
+            "impid": slot,
+            "price": 1.5,
+            "adm": navigation_creative(delay),
+            "w": 300,
+            "h": 250
+        }]}]
+    }))
+    .expect("should serialize the navigation bid");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("should bind a bidder port");
+    RecordingOrigin::serve(
+        listener,
+        Arc::new(move |_request| {
+            thread::sleep(delay);
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            response
+        }),
+    )
+}
+
+/// The publisher origin of the navigation cases: its head arrives after
+/// [`NAVIGATION_ORIGIN_DELAY`].
+fn start_slow_navigation_origin() -> RecordingOrigin {
+    let listener =
+        TcpListener::bind(("127.0.0.1", origin_port())).expect("should bind the origin port");
+    RecordingOrigin::serve(
+        listener,
+        Arc::new(|_request| {
+            thread::sleep(NAVIGATION_ORIGIN_DELAY);
+            let body = b"<html><head><title>Example</title></head><body><main>example article</main></body></html>";
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(body);
+            response
+        }),
+    )
+}
+
+/// Loads a navigation whose 500 ms auction races bidders at 180, 320, and 600 ms
+/// and an origin whose head arrives at 700 ms (EZ-6).
+fn navigation_bids_include_180_and_320_ms_and_exclude_600_ms(runtime: OriginRuntime) {
+    init_logger();
+    let _port = lock_origin_port();
+    let _origin = start_slow_navigation_origin();
+    let delays = [180, 320, 600].map(Duration::from_millis);
+    let bidders = delays.map(start_navigation_bidder);
+    let ids = delays.map(|delay| format!("bidder-{}", delay.as_millis()));
+    let fixtures = loopback_bidder_fixtures(
+        &ids.iter()
+            .zip(&bidders)
+            .map(|(id, bidder)| (id.as_str(), bidder, Duration::from_millis(1500)))
+            .collect::<Vec<_>>(),
+    );
+    let slots = delays.map(|delay| format!("slot-{}", delay.as_millis()));
+    let envelope = common::config::navigation_auction_app_config_envelope(
+        origin_port(),
+        &fixtures,
+        NAVIGATION_AUCTION_TIMEOUT_MS,
+        NAVIGATION_PATH,
+        &slots.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .expect("should build the navigation auction config");
+
+    runtime.serve(&envelope, |base_url| {
+        let response = reqwest::blocking::Client::new()
+            .get(format!("{base_url}{NAVIGATION_PATH}"))
+            .header(
+                "cookie",
+                format!("{}; ts-ec={NAVIGATION_EC_ID}", tcf_purpose_one_cookie()),
+            )
+            .header("cf-ipcountry", "US")
+            .header("accept", "text/html")
+            .header("sec-fetch-dest", "document")
+            .header("sec-fetch-mode", "navigate")
+            .timeout(Duration::from_secs(30))
+            .send()
+            .expect("should load the navigation");
+        let status = response.status().as_u16();
+        let html = response.text().expect("should read the navigation page");
+        assert_eq!(status, 200, "{runtime:?} should serve the page: {html}");
+        for delay in [180, 320].map(Duration::from_millis) {
+            assert!(
+                html.contains(&navigation_creative(delay)),
+                "{runtime:?} should inject the bid that answered at {} ms: {html}",
+                delay.as_millis()
+            );
+        }
+        assert!(
+            !html.contains(&navigation_creative(Duration::from_millis(600))),
+            "{runtime:?} should drop the bid that answered after the 500 ms cutoff: {html}"
+        );
+    });
+
+    assert_bidders_received(
+        &format!("{runtime:?}"),
+        &bidders.iter().collect::<Vec<_>>(),
+        1,
+    );
+}
+
+#[test]
+#[ignore = "requires Viceroy and the release Fastly WASM"]
+fn navigation_bids_include_180_and_320_ms_and_exclude_600_ms_fastly() {
+    navigation_bids_include_180_and_320_ms_and_exclude_600_ms(OriginRuntime::Fastly);
+}
+
+#[test]
+#[ignore = "requires the pre-built trusted-server-axum binary"]
+fn navigation_bids_include_180_and_320_ms_and_exclude_600_ms_axum() {
+    navigation_bids_include_180_and_320_ms_and_exclude_600_ms(OriginRuntime::Axum);
+}
+
+#[test]
+#[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
+fn navigation_bids_include_180_and_320_ms_and_exclude_600_ms_cloudflare() {
+    navigation_bids_include_180_and_320_ms_and_exclude_600_ms(OriginRuntime::Cloudflare);
+}
+
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn navigation_bids_include_180_and_320_ms_and_exclude_600_ms_spin() {
+    navigation_bids_include_180_and_320_ms_and_exclude_600_ms(OriginRuntime::Spin);
+}
+
+// ---------------------------------------------------------------------------
+// Encoded passthrough on Viceroy (spec test 7, EZ-5 criterion 8)
+// ---------------------------------------------------------------------------
+
+/// Passes every chunk through unchanged, so a pipeline only re-encodes.
+struct IdentityProcessor;
+
+impl trusted_server_core::streaming_processor::StreamProcessor for IdentityProcessor {
+    fn process_chunk(&mut self, chunk: &[u8], _is_last: bool) -> std::io::Result<Vec<u8>> {
+        Ok(chunk.to_vec())
+    }
+}
+
+/// Decodes `bytes` coded with `compression` through Trusted Server's own codec.
+fn decode(
+    bytes: &[u8],
+    compression: trusted_server_core::streaming_processor::Compression,
+) -> Vec<u8> {
+    use trusted_server_core::streaming_processor::{
+        Compression, PipelineConfig, StreamingPipeline,
+    };
+    let mut decoded = Vec::new();
+    StreamingPipeline::new(
+        PipelineConfig {
+            input_compression: compression,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        },
+        IdentityProcessor,
+    )
+    .process(bytes, &mut decoded)
+    .expect("should decode the body");
+    decoded
+}
+
+/// A complete HTTP/1.1 response with `status`, `headers`, and `body`.
+fn raw_response(status: u16, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
+    let reason = http::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|code| code.canonical_reason())
+        .unwrap_or("Example");
+    let mut response = format!("HTTP/1.1 {status} {reason}\r\n");
+    for (name, value) in headers {
+        response.push_str(&format!("{name}: {value}\r\n"));
+    }
+    response.push_str("Connection: close\r\n\r\n");
+    let mut response = response.into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+/// HTML the publisher origin serves for the encoded passthrough cases.
+const PASSTHROUGH_HTML: &[u8] =
+    b"<html><head><title>Example</title></head><body><a href=\"/next\">next</a></body></html>";
+
+/// [`PASSTHROUGH_HTML`] as `gzip -n -9` codes it.
+const PASSTHROUGH_HTML_GZIP: &[u8] = &[
+    31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 179, 201, 40, 201, 205, 177, 179, 201, 72, 77, 76, 177, 179,
+    41, 201, 44, 201, 73, 181, 115, 173, 72, 204, 45, 200, 73, 181, 209, 135, 112, 109, 244, 33,
+    146, 73, 249, 41, 149, 118, 54, 137, 10, 25, 69, 169, 105, 182, 74, 250, 121, 169, 21, 37, 74,
+    118, 32, 210, 70, 63, 17, 168, 8, 34, 173, 15, 54, 14, 0, 15, 183, 7, 35, 85, 0, 0, 0,
+];
+
+/// [`PASSTHROUGH_HTML`] as the `brotli` command line tool codes it.
+const PASSTHROUGH_HTML_BROTLI: &[u8] = &[
+    161, 160, 2, 0, 224, 56, 176, 99, 52, 211, 83, 219, 181, 121, 205, 227, 195, 214, 54, 195, 208,
+    232, 226, 197, 49, 14, 216, 239, 6, 154, 116, 31, 23, 222, 115, 88, 126, 55, 165, 56, 183, 208,
+    95, 189, 160, 80, 215, 28, 134, 101, 217, 51, 196, 199, 81, 240, 80, 58,
+];
+
+/// The SVG the publisher origin serves br-coded.
+const PASSTHROUGH_SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>";
+
+/// [`PASSTHROUGH_SVG`] as the `brotli` command line tool codes it.
+const PASSTHROUGH_SVG_BROTLI: &[u8] = &[
+    161, 64, 1, 192, 47, 122, 178, 212, 191, 206, 71, 69, 171, 214, 109, 14, 27, 112, 34, 148, 4,
+    22, 143, 114, 199, 160, 75, 55, 49, 249, 186, 223, 115, 79, 163, 115, 36, 153, 82, 40, 72, 58,
+    194, 7,
+];
+
+/// The bid response the gzip bidder serves.
+const GZIP_BID_JSON: &[u8] = br#"{"seatbid":[{"seat":"gzip-seat","bid":[{"id":"gzip-bid","impid":"auction-slot","price":2.25,"adm":"<div>gzip bid</div>","w":300,"h":250}]}]}"#;
+
+/// [`GZIP_BID_JSON`] as `gzip -n -9` codes it.
+const GZIP_BID_JSON_GZIP: &[u8] = &[
+    31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 171, 86, 42, 78, 77, 44, 73, 202, 76, 81, 178, 138, 174, 6,
+    179, 149, 172, 148, 210, 171, 50, 11, 116, 193, 108, 29, 37, 152, 20, 136, 130, 72, 128, 68,
+    116, 148, 50, 115, 11, 192, 66, 137, 165, 201, 37, 153, 249, 121, 186, 197, 57, 249, 32, 229,
+    5, 69, 153, 201, 169, 74, 86, 70, 122, 70, 166, 58, 74, 137, 41, 185, 64, 21, 54, 41, 153, 101,
+    118, 32, 157, 10, 64, 157, 54, 250, 32, 30, 80, 97, 185, 146, 149, 177, 129, 129, 142, 82, 6,
+    80, 177, 169, 65, 109, 44, 16, 2, 0, 181, 125, 165, 97, 140, 0, 0, 0,
+];
+
+/// Bytes of the gzip-stored asset the range case slices.
+const RANGE_BYTES: usize = 50;
+
+#[test]
+fn encoded_fixtures_decode_to_their_plain_bodies() {
+    use trusted_server_core::streaming_processor::Compression;
+    assert_eq!(
+        (
+            decode(PASSTHROUGH_HTML_GZIP, Compression::Gzip),
+            decode(PASSTHROUGH_HTML_BROTLI, Compression::Brotli),
+            decode(PASSTHROUGH_SVG_BROTLI, Compression::Brotli),
+            decode(GZIP_BID_JSON_GZIP, Compression::Gzip),
+        ),
+        (
+            PASSTHROUGH_HTML.to_vec(),
+            PASSTHROUGH_HTML.to_vec(),
+            PASSTHROUGH_SVG.to_vec(),
+            GZIP_BID_JSON.to_vec(),
+        ),
+        "should decode every precomputed fixture to its plain body"
+    );
+    assert!(
+        PASSTHROUGH_HTML_GZIP.len() > RANGE_BYTES,
+        "should keep the range inside the stored asset"
+    );
+}
+
+/// Answers the encoded passthrough paths of the publisher origin.
+fn encoded_passthrough_response(request: &OriginRequest) -> Vec<u8> {
+    match origin_request_path(request) {
+        "/gzip-page" => raw_response(
+            200,
+            &[
+                ("Content-Type", "text/html; charset=utf-8".to_owned()),
+                ("Content-Encoding", "gzip".to_owned()),
+                ("Content-Length", PASSTHROUGH_HTML_GZIP.len().to_string()),
+            ],
+            PASSTHROUGH_HTML_GZIP,
+        ),
+        "/image.svg" => raw_response(
+            200,
+            &[
+                ("Content-Type", "image/svg+xml".to_owned()),
+                ("Content-Encoding", "br".to_owned()),
+                ("Content-Length", PASSTHROUGH_SVG_BROTLI.len().to_string()),
+                ("ETag", "\"example-svg\"".to_owned()),
+            ],
+            PASSTHROUGH_SVG_BROTLI,
+        ),
+        "/asset.bin" => raw_response(
+            206,
+            &[
+                ("Content-Type", "application/octet-stream".to_owned()),
+                ("Content-Encoding", "gzip".to_owned()),
+                (
+                    "Content-Range",
+                    format!(
+                        "bytes 0-{}/{}",
+                        RANGE_BYTES - 1,
+                        PASSTHROUGH_HTML_GZIP.len()
+                    ),
+                ),
+                ("Content-Length", RANGE_BYTES.to_string()),
+            ],
+            &PASSTHROUGH_HTML_GZIP[..RANGE_BYTES],
+        ),
+        "/app.js" if request.header("if-none-match") == Some("\"example-js\"") => {
+            raw_response(304, &[("ETag", "\"example-js\"".to_owned())], b"")
+        }
+        "/creative.html" => raw_response(
+            200,
+            &[
+                ("Content-Type", "text/html; charset=utf-8".to_owned()),
+                ("Content-Encoding", "br".to_owned()),
+                ("Content-Length", PASSTHROUGH_HTML_BROTLI.len().to_string()),
+            ],
+            PASSTHROUGH_HTML_BROTLI,
+        ),
+        _ => html_response(200, request.method == "HEAD"),
+    }
+}
+
+/// Serves the shared integration app config on Viceroy, with the encoded
+/// passthrough origin on the fixed origin port.
+fn with_encoded_passthrough(check: impl FnOnce(&str, &RecordingOrigin)) {
+    init_logger();
+    let _port = lock_origin_port();
+    let listener =
+        TcpListener::bind(("127.0.0.1", origin_port())).expect("should bind the origin port");
+    let origin = RecordingOrigin::serve(listener, Arc::new(encoded_passthrough_response));
+    let process = IngressRuntime::Fastly.spawn();
+    check(&process.base_url, &origin);
+}
+
+/// A client that neither decodes responses nor follows redirects.
+fn raw_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .no_gzip()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("should build a raw client")
+}
+
+#[test]
+#[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
+fn gzip_html_page_keeps_gzip_and_carries_tsjs_fastly() {
+    with_encoded_passthrough(|base_url, _origin| {
+        let response = raw_client()
+            .get(format!("{base_url}/gzip-page"))
+            .header("accept-encoding", "gzip")
+            .send()
+            .expect("should load the gzip page");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "should serve the gzip page"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip"),
+            "should keep the gzip coding"
+        );
+        let html = String::from_utf8(decode(
+            &response.bytes().expect("should read the gzip page"),
+            trusted_server_core::streaming_processor::Compression::Gzip,
+        ))
+        .expect("should decode to UTF-8 HTML");
+        assert!(
+            html.contains("/static/tsjs="),
+            "should decode to the rewritten document with the TSJS tag: {html}"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
+fn br_svg_relays_byte_identical_with_length_and_etag_fastly() {
+    with_encoded_passthrough(|base_url, _origin| {
+        let response = raw_client()
+            .get(format!("{base_url}/image.svg"))
+            .header("accept-encoding", "br")
+            .send()
+            .expect("should load the SVG");
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        let head = (
+            response.status().as_u16(),
+            header("content-encoding"),
+            header("content-length"),
+            header("etag"),
+        );
+        assert_eq!(
+            response.bytes().expect("should read the SVG").as_ref(),
+            PASSTHROUGH_SVG_BROTLI,
+            "should relay the br SVG byte for byte"
+        );
+        assert_eq!(
+            head,
+            (
+                200,
+                Some("br".to_owned()),
+                Some(PASSTHROUGH_SVG_BROTLI.len().to_string()),
+                Some("\"example-svg\"".to_owned())
+            ),
+            "should relay the br SVG with its origin length and ETag"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
+fn gzip_asset_range_returns_206_with_origin_content_range_fastly() {
+    let range = format!("bytes=0-{}", RANGE_BYTES - 1);
+    with_encoded_passthrough(|base_url, origin| {
+        let response = raw_client()
+            .get(format!("{base_url}/asset.bin"))
+            .header("range", range.as_str())
+            .header("accept-encoding", "gzip")
+            .send()
+            .expect("should request the range");
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        let head = (
+            response.status().as_u16(),
+            header("content-range"),
+            header("content-length"),
+        );
+        assert_eq!(
+            response.bytes().expect("should read the range").as_ref(),
+            &PASSTHROUGH_HTML_GZIP[..RANGE_BYTES],
+            "should relay the encoded range unchanged"
+        );
+        assert!(
+            origin
+                .requests()
+                .iter()
+                .any(|request| request.header("range") == Some(range.as_str())),
+            "should forward the Range header to the origin"
+        );
+        assert_eq!(
+            head,
+            (
+                206,
+                Some(format!(
+                    "bytes 0-{}/{}",
+                    RANGE_BYTES - 1,
+                    PASSTHROUGH_HTML_GZIP.len()
+                )),
+                Some(RANGE_BYTES.to_string())
+            ),
+            "should return the origin range with its Content-Range"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
+fn js_asset_revalidation_returns_304_fastly() {
+    with_encoded_passthrough(|base_url, _origin| {
+        let response = raw_client()
+            .get(format!("{base_url}/app.js"))
+            .header("if-none-match", "\"example-js\"")
+            .send()
+            .expect("should revalidate the script");
+        assert_eq!(
+            response.status().as_u16(),
+            304,
+            "should return the origin's 304 for a matching validator"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires Viceroy and the release Fastly WASM"]
+fn first_party_proxy_html_creative_keeps_br_fastly() {
+    init_logger();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("should bind the creative origin");
+    let creative_origin = RecordingOrigin::serve(listener, Arc::new(encoded_passthrough_response));
+    let envelope =
+        common::config::proxy_allowlist_app_config_envelope(origin_port(), &["127.0.0.1"])
+            .expect("should build the proxy allowlist app config");
+    common::trace_boundary::with_trace_runtime(
+        common::trace_boundary::TraceRuntime::Fastly,
+        &envelope,
+        None,
+        |base_url| {
+            let client = raw_client();
+            let signed: serde_json::Value = client
+                .get(format!("{base_url}/first-party/sign"))
+                .query(&[(
+                    "url",
+                    format!("http://127.0.0.1:{}/creative.html", creative_origin.port),
+                )])
+                .send()
+                .expect("should send the sign request")
+                .error_for_status()
+                .expect("should sign the creative URL")
+                .json()
+                .expect("should return the signed proxy URL");
+            let href = signed["href"]
+                .as_str()
+                .expect("should return the first-party proxy href");
+            let response = client
+                .get(format!("{base_url}{href}"))
+                .header("accept-encoding", "br")
+                .send()
+                .expect("should fetch the proxied creative");
+            assert_eq!(
+                response.status().as_u16(),
+                200,
+                "should serve the proxied creative"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-encoding")
+                    .and_then(|value| value.to_str().ok()),
+                Some("br"),
+                "should keep the creative's br coding"
+            );
+        },
+    );
+}
+
+#[test]
+#[ignore = "requires Viceroy and the release Fastly WASM"]
+fn gzip_json_bid_response_is_decoded_fastly() {
+    init_logger();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("should bind the gzip bidder");
+    let bidder = RecordingOrigin::serve(
+        listener,
+        Arc::new(|_request| {
+            raw_response(
+                200,
+                &[
+                    ("Content-Type", "application/json".to_owned()),
+                    ("Content-Encoding", "gzip".to_owned()),
+                    ("Content-Length", GZIP_BID_JSON_GZIP.len().to_string()),
+                ],
+                GZIP_BID_JSON_GZIP,
+            )
+        }),
+    );
+    let envelope = common::config::auction_app_config_envelope(
+        origin_port(),
+        &loopback_bidder_fixtures(&[("gzip", &bidder, Duration::from_millis(1500))]),
+        2000,
+    )
+    .expect("should build the gzip bidder auction config");
+
+    common::trace_boundary::with_trace_runtime(
+        common::trace_boundary::TraceRuntime::Fastly,
+        &envelope,
+        None,
+        |base_url| {
+            let response = post_auction(base_url);
+            assert_eq!(
+                response["seatbid"][0]["bid"][0]["price"],
+                serde_json::json!(2.25),
+                "should decode the gzip bid response: {response}"
+            );
+        },
+    );
+}
+
+#[test]
+#[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
+fn origin_records_identity_accept_encoding_when_none_was_set_fastly() {
+    with_encoded_passthrough(|base_url, origin| {
+        let response = raw_client()
+            .get(format!("{base_url}/plain"))
+            .send()
+            .expect("should load the page without Accept-Encoding");
+        assert_eq!(response.status().as_u16(), 200, "should serve the page");
+        let forwarded = origin
+            .requests()
+            .into_iter()
+            .find(|request| origin_request_path(request) == "/plain")
+            .expect("should forward the page request");
+        assert_eq!(
+            forwarded.header("accept-encoding"),
+            Some("identity"),
+            "should send identity when Trusted Server set no Accept-Encoding"
+        );
+    });
 }

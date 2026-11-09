@@ -36,9 +36,9 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
-    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherOriginOptions,
+    PublisherResponse, buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_owner_error,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -295,12 +295,27 @@ where
 // Publisher response helper
 // ---------------------------------------------------------------------------
 
+/// Largest publisher origin body the Cloudflare adapter collects before egress.
+///
+/// It keeps the 10 MiB limit the adapter's own client applied before the
+/// publisher origin moved to `EdgeZero`'s client.
+const PUBLISHER_ORIGIN_INPUT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Returns the origin input cap: the smaller of the publisher buffer setting
+/// and [`PUBLISHER_ORIGIN_INPUT_BYTES`].
+fn publisher_input_cap(settings: &Settings) -> u64 {
+    u64::try_from(settings.publisher.max_buffered_body_bytes)
+        .unwrap_or(u64::MAX)
+        .min(PUBLISHER_ORIGIN_INPUT_BYTES)
+}
+
 /// Collapse a [`PublisherResponse`] into a plain [`Response`].
 ///
 /// Delegates to the shared [`buffer_publisher_response_async`], which collects
-/// the dispatched server-side auction and enforces
-/// `settings.publisher.max_buffered_body_bytes`, then removes any
-/// `Transfer-Encoding` header since the buffered body is no longer chunked.
+/// the dispatched server-side auction, collects raw origin bodies under
+/// `input_cap`, and enforces `settings.publisher.max_buffered_body_bytes` on
+/// processed output, then removes any `Transfer-Encoding` header since the
+/// buffered body is no longer chunked.
 async fn resolve_publisher_response(
     publisher_response: PublisherResponse,
     method: &Method,
@@ -308,6 +323,7 @@ async fn resolve_publisher_response(
     registry: &IntegrationRegistry,
     orchestrator: &AuctionOrchestrator,
     services: &RuntimeServices,
+    input_cap: u64,
 ) -> Result<Response, Report<TrustedServerError>> {
     let mut response = buffer_publisher_response_async(
         publisher_response,
@@ -316,6 +332,7 @@ async fn resolve_publisher_response(
         registry,
         orchestrator,
         services,
+        Some(input_cap),
     )
     .await?;
     response.headers_mut().remove(header::TRANSFER_ENCODING);
@@ -567,6 +584,7 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                     slots: state.settings.creative_opportunity_slots(),
                     registry: None,
                 };
+                let input_cap = publisher_input_cap(&state.settings);
                 match handle_publisher_request(
                     &state.settings,
                     &services,
@@ -574,21 +592,24 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                     &mut ec_context,
                     auction,
                     req,
-                    EdgeCacheHeader::CloudflareCdnCacheControl,
+                    PublisherOriginOptions {
+                        edge_header: EdgeCacheHeader::CloudflareCdnCacheControl,
+                        input_cap: Some(input_cap),
+                    },
                 )
                 .await
                 {
-                    Ok(pr) => {
-                        resolve_publisher_response(
-                            pr,
-                            &method,
-                            &state.settings,
-                            &state.registry,
-                            &state.orchestrator,
-                            &services,
-                        )
-                        .await
-                    }
+                    Ok((pr, owner)) => resolve_publisher_response(
+                        pr,
+                        &method,
+                        &state.settings,
+                        &state.registry,
+                        &state.orchestrator,
+                        &services,
+                        input_cap,
+                    )
+                    .await
+                    .and_then(|response| owner.attach(response).map_err(publisher_owner_error)),
                     Err(e) => Err(e),
                 }
             };

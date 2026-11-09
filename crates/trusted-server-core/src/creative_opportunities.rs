@@ -360,39 +360,17 @@ pub struct CreativeOpportunitiesConfig {
     ///
     /// Named bypass cookies always disqualify. On the template cache path, an origin's
     /// `Vary: Cookie` still refuses storage regardless of this assertion or the key.
-    /// Readthrough performs no response-side check: when
-    /// [`Self::origin_readthrough_enabled`] is also `true`, otherwise eligible requests
-    /// with unlisted cookies rely on this assertion alone. Configured key-cookie
-    /// dimensions disable readthrough because its key does not include their values.
-    /// Verify the cookie axis with `ts origin probe-shareability` before enabling both
-    /// flags; see the configuration guide's template-cache section.
+    /// Verify the cookie axis with `ts origin probe-shareability` before enabling it;
+    /// see the configuration guide's template-cache section.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_is_cookie_independent: Option<bool>,
-    /// Whether this origin's responses may be held in the platform's shared readthrough
+    /// Retired opt-in for holding origin responses in the platform's shared readthrough
     /// cache.
     ///
-    /// Unset or `false` preserves the existing policy: ad-serving requests bypass the
-    /// cache, while other publisher requests retain the platform default. Setting `true`
-    /// uses request shareability instead: eligible ad-serving requests may use the cache,
-    /// and ineligible non-ad requests bypass it.
-    ///
-    /// **This flag is the whole opt-in.** Unlike
-    /// [`Self::origin_is_cookie_independent`], which only ever applies to cookie-bearing
-    /// requests, readthrough admits *cookieless* requests — first-time visitors, which is
-    /// exactly when an origin issues a session cookie. There is no response-side guard on
-    /// this path: the decision is made before the origin replies, and no post-response
-    /// hook is reachable on the Fastly adapter. Safety therefore rests on the origin's own
-    /// `Cache-Control` plus an operator's verification, so enabling it must be a
-    /// deliberate act rather than a consequence of deploying.
-    ///
-    /// Configured [`Self::template_cache_key_cookies`] disable readthrough because
-    /// its key does not include their values; template variants remain eligible.
-    /// Verify with `ts origin probe-shareability` before setting this.
-    ///
-    /// Setting this back to `false` restores the existing ad-stack bypass policy, not
-    /// a global cache bypass. Purge already-stored tagged objects with `ts cache purge`
-    /// (`--all` or the exact reader-facing `--page` URL). Objects stored by versions
-    /// without readthrough tags must still expire on the origin's TTL.
+    /// Origin readthrough is unavailable. Validation rejects `true`, and a live config
+    /// that still sets it serves as if it were `false`: ad-serving requests bypass the
+    /// platform cache and other publisher requests keep the platform default. Runtime
+    /// loading warns through [`crate::settings::Settings::warn_ignored_origin_readthrough`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_readthrough_enabled: Option<bool>,
     /// Slot templates. An empty vec or `enabled = false` disables template delivery.
@@ -414,15 +392,6 @@ impl CreativeOpportunitiesConfig {
     #[must_use]
     pub fn origin_is_cookie_independent(&self) -> bool {
         self.origin_is_cookie_independent.unwrap_or(false)
-    }
-
-    /// Whether the origin's responses may enter the platform's shared readthrough cache.
-    ///
-    /// Defaults to `false`: the conservative reading, and the one that preserves today's
-    /// shipped behavior for every deployment that does not ask for the change.
-    #[must_use]
-    pub fn origin_readthrough_enabled(&self) -> bool {
-        self.origin_readthrough_enabled.unwrap_or(false)
     }
 
     /// Exact cookie names included as bounded shared-template key dimensions.
