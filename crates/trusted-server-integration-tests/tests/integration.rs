@@ -466,12 +466,16 @@ struct OriginRequest {
     body: Vec<u8>,
 }
 
-/// Loopback origin that records every request and answers with one status.
+/// Builds the complete HTTP response a [`RecordingOrigin`] sends for one request.
+type OriginResponder = Arc<dyn Fn(&OriginRequest) -> Vec<u8> + Send + Sync>;
+
+/// Loopback origin that records every request and answers it from a responder.
 ///
 /// Unlike [`common::ec::MinimalOrigin`], it reads the whole request body and
 /// decodes chunked framing, so a case can compare what reached the origin
 /// with what the client sent.
 struct RecordingOrigin {
+    port: u16,
     requests: Arc<Mutex<Vec<OriginRequest>>>,
     shutdown_tx: mpsc::Sender<()>,
     handle: Option<JoinHandle<()>>,
@@ -486,6 +490,22 @@ impl RecordingOrigin {
     /// Panics if the port is already in use.
     fn start(port: u16, status: u16) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", port)).expect("should bind origin port");
+        Self::serve(
+            listener,
+            Arc::new(move |request| html_response(status, request.method == "HEAD")),
+        )
+    }
+
+    /// Serves `listener`, answering each request with what `respond` builds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the listener cannot be configured.
+    fn serve(listener: TcpListener, respond: OriginResponder) -> Self {
+        let port = listener
+            .local_addr()
+            .expect("should read the origin address")
+            .port();
         listener
             .set_nonblocking(true)
             .expect("should set listener nonblocking");
@@ -498,9 +518,12 @@ impl RecordingOrigin {
                 match listener.accept() {
                     Ok((stream, _addr)) => {
                         let recorded = Arc::clone(&recorded);
+                        let respond = Arc::clone(&respond);
                         // One thread per connection, so an idle pooled
                         // connection cannot hold up the next request.
-                        thread::spawn(move || serve_origin_connection(stream, status, &recorded));
+                        thread::spawn(move || {
+                            serve_origin_connection(stream, respond.as_ref(), &recorded);
+                        });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -511,6 +534,7 @@ impl RecordingOrigin {
         });
 
         Self {
+            port,
             requests,
             shutdown_tx,
             handle: Some(handle),
@@ -535,10 +559,10 @@ impl Drop for RecordingOrigin {
     }
 }
 
-/// Reads one request from `stream`, records it, and answers with `status`.
+/// Reads one request from `stream`, records it, and answers with what `respond` builds.
 fn serve_origin_connection(
     mut stream: TcpStream,
-    status: u16,
+    respond: &(dyn Fn(&OriginRequest) -> Vec<u8> + Send + Sync),
     recorded: &Mutex<Vec<OriginRequest>>,
 ) {
     // Some platforms hand out accepted sockets in the listener's nonblocking
@@ -553,26 +577,32 @@ fn serve_origin_connection(
     let Some(request) = read_origin_request(&mut stream) else {
         return;
     };
-    let head_only = request.method == "HEAD";
+    let response = respond(&request);
     recorded
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push(request);
 
+    let _ = stream.write_all(&response);
+    let _ = stream.flush();
+}
+
+/// A `status` answer with a small HTML page, or only its head for `HEAD`.
+fn html_response(status: u16, head_only: bool) -> Vec<u8> {
     let body = b"<html><body><h1>Example origin</h1></body></html>";
     let reason = http::StatusCode::from_u16(status)
         .ok()
         .and_then(|code| code.canonical_reason())
         .unwrap_or("Example");
-    let head = format!(
+    let mut response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
-    );
-    let _ = stream.write_all(head.as_bytes());
+    )
+    .into_bytes();
     if !head_only {
-        let _ = stream.write_all(body);
+        response.extend_from_slice(body);
     }
-    let _ = stream.flush();
+    response
 }
 
 /// Reads one HTTP/1.1 request, decoding a `Content-Length` or chunked body.
@@ -905,6 +935,127 @@ fn chunked_post_auction_over_cap_returns_413_cloudflare() {
 #[ignore = "requires the pre-built trusted-server-axum binary"]
 fn chunked_post_auction_over_cap_returns_413_axum() {
     chunked_post_auction_over_cap_returns_413(IngressRuntime::Axum);
+}
+
+// ---------------------------------------------------------------------------
+// First-party proxy redirect policy on the Axum binary
+// ---------------------------------------------------------------------------
+//
+// The scripted redirect tests in `trusted-server-core` cover the policy on
+// every adapter's code path. This case runs it again on the real Axum binary,
+// whose `EdgeZero` client follows the chain against a loopback origin.
+
+/// Answers the paths of the first-party proxy redirect chain.
+///
+/// `/start` redirects to `/final` on the same origin, `/to-blocked-host` to the
+/// same origin under `localhost`, a host outside the proxy allowlist, and
+/// `/to-userinfo` to a `Location` that carries userinfo. A policy that let the
+/// blocked hop through would reach this origin at `/blocked`.
+fn redirect_chain_response(origin_port: u16, request: &OriginRequest) -> Vec<u8> {
+    let redirect = |location: &str| {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    };
+    match origin_request_path(request) {
+        "/start" => redirect("/final"),
+        "/to-blocked-host" => redirect(&format!("http://localhost:{origin_port}/blocked")),
+        "/to-userinfo" => redirect(&format!(
+            "http://fictional:secret@127.0.0.1:{origin_port}/userinfo"
+        )),
+        "/final" => b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nConnection: close\r\n\r\nfollowed-final".to_vec(),
+        _ => html_response(404, request.method == "HEAD"),
+    }
+}
+
+/// The path of `request`'s target, without its query.
+fn origin_request_path(request: &OriginRequest) -> &str {
+    request.path.split('?').next().unwrap_or_default()
+}
+
+/// Signs `target` through the binary's `/first-party/sign` route and fetches
+/// the first-party proxy URL it returns.
+fn fetch_signed_proxy_url(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    target: &str,
+) -> reqwest::blocking::Response {
+    let signed: serde_json::Value = client
+        .get(format!("{base_url}/first-party/sign"))
+        .query(&[("url", target)])
+        .send()
+        .expect("should send the sign request")
+        .error_for_status()
+        .expect("should sign the loopback target")
+        .json()
+        .expect("should return the signed proxy URL");
+    let href = signed["href"]
+        .as_str()
+        .expect("should return the first-party proxy href");
+    client
+        .get(format!("{base_url}{href}"))
+        .send()
+        .expect("should send the first-party proxy request")
+}
+
+#[test]
+#[ignore = "requires the pre-built trusted-server-axum binary"]
+fn first_party_proxy_redirect_policy_runs_on_axum_binary() {
+    init_logger();
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).expect("should bind the redirect chain origin");
+    let port = listener
+        .local_addr()
+        .expect("should read the redirect chain origin address")
+        .port();
+    let origin = RecordingOrigin::serve(
+        listener,
+        Arc::new(move |request| redirect_chain_response(port, request)),
+    );
+    let envelope =
+        common::config::proxy_allowlist_app_config_envelope(origin_port(), &["127.0.0.1"])
+            .expect("should build the proxy allowlist app config");
+    let process = environments::axum::AxumDevServer
+        .spawn_with_app_config(&envelope)
+        .expect("should start the Axum dev server");
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("should build a client that returns redirects");
+    let target = |path: &str| format!("http://127.0.0.1:{}{path}", origin.port);
+
+    let followed = fetch_signed_proxy_url(&client, &process.base_url, &target("/start"));
+    assert_eq!(
+        followed.status().as_u16(),
+        200,
+        "should follow a permitted hop to the final origin"
+    );
+    assert_eq!(
+        followed.text().expect("should read the followed body"),
+        "followed-final",
+        "should serve the final origin's body"
+    );
+    let blocked = fetch_signed_proxy_url(&client, &process.base_url, &target("/to-blocked-host"));
+    assert_eq!(
+        blocked.status().as_u16(),
+        403,
+        "should answer a hop outside proxy.allowed_domains with the allowlist violation"
+    );
+    let userinfo = fetch_signed_proxy_url(&client, &process.base_url, &target("/to-userinfo"));
+    assert_eq!(
+        userinfo.status().as_u16(),
+        502,
+        "should answer a Location with userinfo with the proxy's 502"
+    );
+
+    let requests = origin.requests();
+    let paths: Vec<&str> = requests.iter().map(origin_request_path).collect();
+    assert_eq!(
+        paths,
+        vec!["/start", "/final", "/to-blocked-host", "/to-userinfo"],
+        "should send only the permitted follow-up hop"
+    );
 }
 
 // ---------------------------------------------------------------------------

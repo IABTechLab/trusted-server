@@ -15,6 +15,7 @@ use crate::http_util::read_request_body;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    UPSTREAM_RTB_MAX_RESPONSE_BYTES,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{ProxyRequestConfig, proxy_request};
@@ -22,9 +23,6 @@ use crate::settings::{IntegrationConfig, Settings};
 use crate::tsjs;
 
 const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
-
-/// Cap on a Testlight upstream response, the 2 MiB limit for RTB responses.
-const TESTLIGHT_MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct TestlightConfig {
@@ -199,7 +197,10 @@ impl IntegrationProxy for TestlightIntegration {
         let payload_bytes = Self::rewrite_request_body(&payload_bytes, &ec_id)?;
 
         let mut proxy_config = ProxyRequestConfig::new(&self.config.endpoint)
-            .with_max_response_bytes(TESTLIGHT_MAX_RESPONSE_BYTES);
+            .with_max_response_bytes(
+                u64::try_from(UPSTREAM_RTB_MAX_RESPONSE_BYTES)
+                    .expect("should widen the RTB response cap to u64"),
+            );
         proxy_config.forward_ec_id = false;
         proxy_config.body = Some(payload_bytes);
         proxy_config.stream_passthrough = true;

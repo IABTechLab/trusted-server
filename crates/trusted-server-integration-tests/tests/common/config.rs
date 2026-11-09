@@ -24,6 +24,33 @@ pub fn integration_app_config_envelope_with_trace(
     app_config_envelope(origin_port, trace, |_| Ok(()))
 }
 
+/// Builds the integration app-config envelope with `proxy.allowed_domains` set.
+///
+/// The first-party proxy then checks its signed target and every redirect hop
+/// against `allowed_domains`.
+///
+/// # Errors
+///
+/// Returns a fixture-generation error when configuration validation fails.
+pub fn proxy_allowlist_app_config_envelope(
+    origin_port: u16,
+    allowed_domains: &[&str],
+) -> TestResult<String> {
+    app_config_envelope(origin_port, false, |table| {
+        let allowed_domains = allowed_domains
+            .iter()
+            .map(|domain| toml::Value::String((*domain).to_owned()))
+            .collect();
+        let mut proxy = toml::Table::new();
+        proxy.insert(
+            "allowed_domains".to_owned(),
+            toml::Value::Array(allowed_domains),
+        );
+        table.insert("proxy".to_owned(), toml::Value::Table(proxy));
+        Ok(())
+    })
+}
+
 /// Builds the integration app-config envelope with two S3 `SigV4` asset routes
 /// to `asset_origin`.
 ///

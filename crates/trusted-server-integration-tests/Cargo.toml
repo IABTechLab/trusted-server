@@ -52,7 +52,7 @@ libc = { workspace = true }
 log = { workspace = true }
 rcgen = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "cookies"] }
-rustls = { workspace = true }
+rustls = { workspace = true, features = ["ring"] }
 scraper = { workspace = true }
 testcontainers = { workspace = true }
 temp-env = { workspace = true }
