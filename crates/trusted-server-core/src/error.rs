@@ -51,6 +51,11 @@ pub enum TrustedServerError {
     #[display("Request payload too large: {message}")]
     RequestTooLarge { message: String },
 
+    /// The request body was not read before the inbound read deadline,
+    /// resulting in a 408 Request Timeout.
+    #[display("Request timeout: {message}")]
+    RequestTimeout { message: String },
+
     /// HTTP header value creation failed.
     #[display("Invalid HTTP header value: {message}")]
     InvalidHeaderValue { message: String },
@@ -129,6 +134,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
             Self::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::RequestTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
             Self::EdgeCookie { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -144,6 +150,8 @@ impl IntoHttpResponse for TrustedServerError {
             // Consent strings may contain user data; return category only.
             Self::GdprConsent { .. } => "GDPR consent error".to_string(),
             Self::InvalidHeaderValue { .. } => "Invalid header value".to_string(),
+            // The client sent the body too slowly; the detail stays in the logs.
+            Self::RequestTimeout { .. } => "Request timeout".to_string(),
             // Server/integration errors (5xx/502/503) — generic message only.
             // Full details are already logged via log::error! in to_error_response.
             _ => "An internal error occurred".to_string(),
@@ -241,6 +249,12 @@ mod tests {
                 StatusCode::PAYLOAD_TOO_LARGE,
             ),
             (
+                TrustedServerError::RequestTimeout {
+                    message: String::from("body read deadline passed"),
+                },
+                StatusCode::REQUEST_TIMEOUT,
+            ),
+            (
                 TrustedServerError::InvalidHeaderValue {
                     message: String::from("non-ascii header"),
                 },
@@ -326,6 +340,7 @@ mod tests {
                 TrustedServerError::GdprConsent { .. } => StatusCode::BAD_REQUEST,
                 TrustedServerError::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
                 TrustedServerError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+                TrustedServerError::RequestTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
                 TrustedServerError::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
                 TrustedServerError::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
                 TrustedServerError::Prebid { .. } => StatusCode::BAD_GATEWAY,
@@ -440,6 +455,15 @@ mod tests {
             message: "non-ascii".into(),
         };
         assert_eq!(error.user_message(), "Invalid header value");
+
+        let error = TrustedServerError::RequestTimeout {
+            message: "read deadline passed after 30s".into(),
+        };
+        assert_eq!(
+            error.user_message(),
+            "Request timeout",
+            "should keep the timeout detail out of the client message"
+        );
     }
 
     #[test]
@@ -464,6 +488,7 @@ mod tests {
             | TrustedServerError::EdgeCookie { .. }
             | TrustedServerError::PartnerNotFound { .. }
             | TrustedServerError::RequestTooLarge { .. }
+            | TrustedServerError::RequestTimeout { .. }
             | TrustedServerError::InsecureDefault { .. } => (),
         };
 
@@ -577,6 +602,12 @@ mod tests {
                     message: "body too large".to_string(),
                 },
                 StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                TrustedServerError::RequestTimeout {
+                    message: "body read deadline passed".to_string(),
+                },
+                StatusCode::REQUEST_TIMEOUT,
             ),
         ];
 

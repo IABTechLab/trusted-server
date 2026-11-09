@@ -33,11 +33,12 @@ use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
+use crate::http_util::read_request_body;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
-    collect_response_bounded, ensure_integration_backend,
+    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_response_bounded,
+    ensure_integration_backend,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -835,12 +836,8 @@ impl IntegrationProxy for SourcepointIntegration {
         let (req_parts, req_body) = req.into_parts();
 
         let request_body = if method == Method::POST {
-            let bytes = collect_body_bounded(
-                req_body,
-                INTEGRATION_MAX_BODY_BYTES,
-                SOURCEPOINT_INTEGRATION_ID,
-            )
-            .await?;
+            let bytes =
+                read_request_body(&req_parts.headers, req_body, INTEGRATION_MAX_BODY_BYTES).await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()
@@ -1151,6 +1148,7 @@ mod tests {
         PlatformError, PlatformHttpClient, PlatformPendingRequest, PlatformResponse,
         PlatformSelectResult,
     };
+    use crate::test_support::body_read::body_read_failure_cases;
     use crate::test_support::tests::create_test_settings;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3059,5 +3057,32 @@ mod tests {
             Some("/integrations/sourcepoint/cdn/consent/tcfv2/new-path"),
             "should rewrite relative redirect resolved against CDN base"
         );
+    }
+
+    #[test]
+    fn sourcepoint_cdn_body_read_failures_map_to_statuses() {
+        let settings = create_test_settings();
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        for case in body_read_failure_cases(INTEGRATION_MAX_BODY_BYTES) {
+            let stub = Arc::new(StubHttpClient::new());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let (req, expectation) = case.into_request(
+                http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("https://publisher.example.com/integrations/sourcepoint/cdn/asset"),
+            );
+
+            let outcome =
+                futures::executor::block_on(integration.handle(&settings, &services, req));
+
+            expectation.assert_outcome("Sourcepoint CDN", &outcome);
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "should not call upstream for the {} case",
+                expectation.name()
+            );
+        }
     }
 }

@@ -596,7 +596,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post(
                 "/verify-signature",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_verify_signature(&s.settings, &services, req)
+                    handle_verify_signature(&s.settings, &services, req).await
                 }),
             )
             // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`

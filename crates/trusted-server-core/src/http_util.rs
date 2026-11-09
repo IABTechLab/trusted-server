@@ -1,6 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::Bytes;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::Aead as _, aead::KeyInit as _};
 use edgezero_core::body::{Body as EdgeBody, BodyPayload};
+use edgezero_core::error::EdgeError;
 use edgezero_core::http::RequestParts;
 use edgezero_core::ingress::{InboundOrigin, RequestIngress};
 use error_stack::Report;
@@ -70,16 +72,152 @@ pub fn sanitize_trusted_client_ip_headers(
 
 /// Split a body into buffered bytes or a stream without releasing a streamed body's scope.
 ///
-/// A streaming body becomes a stream that keeps any outbound scope owner and
-/// closes it at end of stream, on error, or on drop. A buffered body releases
-/// its owner, because its bytes no longer depend on the scope. A streaming
-/// body is never returned as empty bytes.
+/// A streaming [`EdgeBody`] becomes a [`BodyPayload::Stream`] that keeps any
+/// outbound scope owner and closes it at end of stream, on error, or on drop.
+/// A buffered body becomes [`BodyPayload::Once`] and releases its owner,
+/// because its bytes no longer depend on the scope. A streaming body is never
+/// returned as empty bytes, unlike [`EdgeBody::into_bytes`].
+///
+/// # Examples
+///
+/// ```
+/// use edgezero_core::body::{Body, BodyPayload};
+/// use trusted_server_core::http_util::into_body_payload;
+///
+/// let BodyPayload::Once(bytes) = into_body_payload(Body::from("example")) else {
+///     panic!("should keep a buffered body buffered");
+/// };
+/// assert_eq!(bytes.as_ref(), b"example");
+///
+/// let streamed = Body::stream(futures::stream::iter([bytes::Bytes::from_static(b"example")]));
+/// assert!(
+///     matches!(into_body_payload(streamed), BodyPayload::Stream(_)),
+///     "should keep a streamed body streamed"
+/// );
+/// ```
 #[must_use]
 pub fn into_body_payload(body: EdgeBody) -> BodyPayload {
     match body.into_stream() {
         Ok(stream) => BodyPayload::Stream(stream),
         Err(buffered) => buffered.into_parts().0,
     }
+}
+
+/// Read an inbound request body into memory, accepting at most `max` bytes.
+///
+/// When `headers` carry exactly one `Content-Length` field whose value is a
+/// decimal number above `max`, the body is rejected without being polled.
+/// Otherwise the body is read with [`EdgeBody::into_bytes_bounded`], which
+/// stops at the first chunk that would cross `max`, so a duplicate or
+/// malformed `Content-Length` never decides the outcome on its own. The
+/// read also ends with an error once the inbound read deadline passes.
+///
+/// Rejections the client caused are logged at warn and host read failures at
+/// error. Body bytes are never logged.
+///
+/// # Errors
+///
+/// - [`TrustedServerError::RequestTooLarge`] (413) when the declared length or
+///   the bytes read exceed `max`.
+/// - [`TrustedServerError::RequestTimeout`] (408) when the read passes the
+///   inbound read deadline.
+/// - [`TrustedServerError::BadRequest`] (400) for any other client error the
+///   body stream reports.
+/// - [`TrustedServerError::Proxy`] (502) when the host fails to read the body.
+///
+/// # Examples
+///
+/// ```
+/// use edgezero_core::body::Body;
+/// use http::{HeaderMap, HeaderValue, header};
+/// use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+/// use trusted_server_core::http_util::read_request_body;
+///
+/// let bytes = futures::executor::block_on(read_request_body(
+///     &HeaderMap::new(),
+///     Body::from(r#"{"example":true}"#),
+///     64,
+/// ))
+/// .expect("should read a body under the cap");
+/// assert_eq!(bytes.as_ref(), br#"{"example":true}"#);
+///
+/// let mut headers = HeaderMap::new();
+/// headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("65"));
+/// let report = futures::executor::block_on(read_request_body(&headers, Body::empty(), 64))
+///     .expect_err("should reject a declared length over the cap");
+/// assert!(matches!(
+///     report.current_context(),
+///     TrustedServerError::RequestTooLarge { .. }
+/// ));
+/// assert_eq!(report.current_context().status_code().as_u16(), 413);
+/// ```
+pub async fn read_request_body(
+    headers: &HeaderMap,
+    body: EdgeBody,
+    max: usize,
+) -> Result<Bytes, Report<TrustedServerError>> {
+    if let Some(declared) = single_declared_content_length(headers)
+        && declared > u64::try_from(max).unwrap_or(u64::MAX)
+    {
+        log::warn!(
+            "Rejecting request body: declared Content-Length {declared} exceeds the {max} byte limit"
+        );
+        return Err(Report::new(TrustedServerError::RequestTooLarge {
+            message: format!("declared Content-Length {declared} exceeds the {max} byte limit"),
+        }));
+    }
+
+    body.into_bytes_bounded(max)
+        .await
+        .map_err(|error| request_body_read_error(&error, max))
+}
+
+/// Returns the `Content-Length` when `headers` carry exactly one field whose
+/// value is a decimal number that fits in a `u64`.
+fn single_declared_content_length(headers: &HeaderMap) -> Option<u64> {
+    let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let value = value.to_str().ok()?;
+    // `u64::from_str` also accepts a leading `+`, which `Content-Length` does not.
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// Maps a failed bounded body read onto the Trusted Server error for its status.
+fn request_body_read_error(error: &EdgeError, max: usize) -> Report<TrustedServerError> {
+    let status = error.status();
+    let context = match status {
+        StatusCode::PAYLOAD_TOO_LARGE => {
+            log::warn!("Rejecting request body: body exceeds the {max} byte limit");
+            TrustedServerError::RequestTooLarge {
+                message: format!("request body exceeds the {max} byte limit"),
+            }
+        }
+        StatusCode::REQUEST_TIMEOUT => {
+            log::warn!("Rejecting request body: read deadline passed: {error}");
+            TrustedServerError::RequestTimeout {
+                message: "request body was not read before the read deadline".to_string(),
+            }
+        }
+        status if status.is_client_error() => {
+            log::warn!("Rejecting request body: client read error ({status}): {error}");
+            TrustedServerError::BadRequest {
+                message: "request body could not be read".to_string(),
+            }
+        }
+        status => {
+            log::error!("Failed to read request body ({status}): {error}");
+            TrustedServerError::Proxy {
+                message: "failed to read request body".to_string(),
+            }
+        }
+    };
+    Report::new(context).attach(format!("body read failed with {status}: {error}"))
 }
 
 /// Strip forwarded headers that clients can spoof.
@@ -500,30 +638,10 @@ pub fn compute_encrypted_sha256_token(settings: &Settings, full_url: &str) -> St
     URL_SAFE_NO_PAD.encode(digest)
 }
 
-/// Return an error if `bytes` exceeds `limit`.
-///
-/// # Errors
-///
-/// Returns [`TrustedServerError::RequestTooLarge`] when `bytes.len() > limit`.
-pub fn enforce_max_body_size(
-    bytes: &[u8],
-    limit: usize,
-    what: &str,
-) -> Result<(), Report<TrustedServerError>> {
-    if bytes.len() > limit {
-        return Err(Report::new(TrustedServerError::RequestTooLarge {
-            message: format!(
-                "{what} payload {} exceeds limit of {limit} bytes",
-                bytes.len()
-            ),
-        }));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::IntoHttpResponse as _;
     use crate::platform::ClientInfo;
     use crate::redacted::Redacted;
     use crate::settings::TrustedClientIpConfig;
@@ -1339,5 +1457,197 @@ mod tests {
             is_navigation_request(&req),
             "should match text/html case-insensitively in fallback"
         );
+    }
+
+    /// Cap the `read_request_body` tests read against.
+    const READ_TEST_MAX: usize = 16;
+
+    /// Returns headers that carry each of `values` as a `Content-Length` field.
+    fn content_length_headers(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(value).expect("should build Content-Length value"),
+            );
+        }
+        headers
+    }
+
+    /// Returns a streamed body that yields `chunks` in order.
+    fn streamed_body(chunks: &[&'static [u8]]) -> EdgeBody {
+        let items: Vec<Result<bytes::Bytes, EdgeError>> = chunks
+            .iter()
+            .map(|chunk| Ok(bytes::Bytes::from_static(chunk)))
+            .collect();
+        EdgeBody::from_stream(futures::stream::iter(items))
+    }
+
+    /// Returns a streamed body whose first item is `error`.
+    fn failing_body(error: EdgeError) -> EdgeBody {
+        EdgeBody::from_stream(futures::stream::iter([Err::<bytes::Bytes, _>(error)]))
+    }
+
+    fn read_body(
+        headers: &HeaderMap,
+        body: EdgeBody,
+    ) -> Result<bytes::Bytes, Report<TrustedServerError>> {
+        futures::executor::block_on(read_request_body(headers, body, READ_TEST_MAX))
+    }
+
+    /// Asserts that `result` failed with the variant `is_expected` accepts and with `status`.
+    fn assert_read_error(
+        result: Result<bytes::Bytes, Report<TrustedServerError>>,
+        is_expected: fn(&TrustedServerError) -> bool,
+        status: StatusCode,
+    ) {
+        let report = result.expect_err("should reject the body");
+        let error = report.current_context();
+        assert!(
+            is_expected(error),
+            "should map to the expected variant, got {error:?}"
+        );
+        assert_eq!(
+            error.status_code(),
+            status,
+            "should answer {status} for {error:?}"
+        );
+    }
+
+    #[test]
+    fn declared_length_over_max_returns_413_without_polling() {
+        let polled = std::rc::Rc::new(std::cell::Cell::new(false));
+        let poll_flag = std::rc::Rc::clone(&polled);
+        let body = EdgeBody::from_stream(futures::stream::poll_fn(move |_| {
+            poll_flag.set(true);
+            std::task::Poll::Ready(None::<Result<bytes::Bytes, EdgeError>>)
+        }));
+        let headers = content_length_headers(&["17"]);
+
+        let result = read_body(&headers, body);
+
+        assert_read_error(
+            result,
+            |error| matches!(error, TrustedServerError::RequestTooLarge { .. }),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        );
+        assert!(
+            !polled.get(),
+            "should reject a declared overflow without polling the body"
+        );
+    }
+
+    #[test]
+    fn stream_crossing_max_returns_413() {
+        let body = streamed_body(&[b"0123456789", b"0123456789"]);
+
+        let result = read_body(&HeaderMap::new(), body);
+
+        assert_read_error(
+            result,
+            |error| matches!(error, TrustedServerError::RequestTooLarge { .. }),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        );
+    }
+
+    #[test]
+    fn read_after_deadline_returns_408() {
+        let body = failing_body(EdgeError::request_timeout("expired"));
+
+        let result = read_body(&HeaderMap::new(), body);
+
+        assert_read_error(
+            result,
+            |error| matches!(error, TrustedServerError::RequestTimeout { .. }),
+            StatusCode::REQUEST_TIMEOUT,
+        );
+    }
+
+    #[test]
+    fn client_caused_stream_error_returns_400() {
+        let body = failing_body(EdgeError::bad_request("malformed chunk framing"));
+
+        let result = read_body(&HeaderMap::new(), body);
+
+        assert_read_error(
+            result,
+            |error| matches!(error, TrustedServerError::BadRequest { .. }),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    #[test]
+    fn host_read_error_returns_502() {
+        let body = failing_body(EdgeError::bad_gateway("host read failed"));
+
+        let result = read_body(&HeaderMap::new(), body);
+
+        assert_read_error(
+            result,
+            |error| matches!(error, TrustedServerError::Proxy { .. }),
+            StatusCode::BAD_GATEWAY,
+        );
+    }
+
+    #[test]
+    fn duplicate_content_length_falls_through_to_bounded_read() {
+        // Both declarations exceed the cap, so a precheck that trusted either
+        // one would answer 413 instead of reading the body.
+        let headers = content_length_headers(&["999", "999"]);
+
+        let bytes = read_body(&headers, streamed_body(&[b"hello"]))
+            .expect("should read a body under the cap despite duplicate declarations");
+
+        assert_eq!(
+            bytes.as_ref(),
+            b"hello",
+            "should return the body the bounded read collected"
+        );
+    }
+
+    #[test]
+    fn non_numeric_content_length_falls_through_to_bounded_read() {
+        // `+999` parses as a Rust integer but is not a valid `Content-Length`.
+        for declared in ["not-a-number", "+999", "1e9", ""] {
+            let headers = content_length_headers(&[declared]);
+
+            let bytes = read_body(&headers, streamed_body(&[b"hello"])).unwrap_or_else(|error| {
+                panic!("should read the body when Content-Length is `{declared}`: {error:?}")
+            });
+
+            assert_eq!(
+                bytes.as_ref(),
+                b"hello",
+                "should return the body for Content-Length `{declared}`"
+            );
+        }
+    }
+
+    #[test]
+    fn body_under_max_returns_exact_bytes() {
+        let at_cap: &'static [u8] = b"0123456789abcdef";
+        let declared = at_cap.len().to_string();
+        let cases = [
+            ("buffered", HeaderMap::new(), EdgeBody::from(at_cap)),
+            (
+                "streamed",
+                content_length_headers(&[declared.as_str()]),
+                streamed_body(&[&at_cap[..7], &at_cap[7..]]),
+            ),
+            ("empty", HeaderMap::new(), EdgeBody::empty()),
+        ];
+
+        for (label, headers, body) in cases {
+            let expected: &[u8] = if label == "empty" { b"" } else { at_cap };
+
+            let bytes = read_body(&headers, body)
+                .unwrap_or_else(|error| panic!("should read the {label} body: {error:?}"));
+
+            assert_eq!(
+                bytes.as_ref(),
+                expected,
+                "should return the exact {label} body bytes"
+            );
+        }
     }
 }

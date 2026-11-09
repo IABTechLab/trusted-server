@@ -11,10 +11,11 @@ use validator::Validate;
 
 use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
+use crate::http_util::read_request_body;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
-    UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_body_bounded, collect_response_bounded,
+    UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{ProxyRequestConfig, proxy_request};
@@ -180,8 +181,7 @@ impl IntegrationProxy for TestlightIntegration {
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let (parts, body) = req.into_parts();
         let payload_bytes =
-            collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, TESTLIGHT_INTEGRATION_ID)
-                .await?;
+            read_request_body(&parts.headers, body, INTEGRATION_MAX_BODY_BYTES).await?;
         let req = http::Request::from_parts(parts, EdgeBody::empty());
 
         // Read EC ID from the ts-ec cookie forwarded by the client.
@@ -278,6 +278,7 @@ fn default_enabled() -> bool {
 mod tests {
     use super::*;
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::test_support::body_read::body_read_failure_cases;
     use crate::test_support::tests::{VALID_SYNTHETIC_ID, create_test_settings};
     use crate::tsjs;
     use http::Method;
@@ -468,5 +469,39 @@ mod tests {
                 "should preserve the upstream JSON response body"
             );
         });
+    }
+
+    #[test]
+    fn testlight_auction_body_read_failures_map_to_statuses() {
+        let settings = create_test_settings();
+        let integration = TestlightIntegration::new(TestlightConfig {
+            enabled: true,
+            endpoint: "https://example.com/openrtb".to_string(),
+            timeout_ms: 1000,
+            shim_src: tsjs::tsjs_unified_script_src(),
+            rewrite_scripts: true,
+        });
+        for case in body_read_failure_cases(INTEGRATION_MAX_BODY_BYTES) {
+            let stub = Arc::new(StubHttpClient::new());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let (req, expectation) = case.into_request(
+                http::Request::builder()
+                    .method(Method::POST)
+                    .uri("https://edge.example.com/integrations/testlight/auction")
+                    .header(crate::constants::HEADER_X_TS_EC.clone(), VALID_SYNTHETIC_ID),
+            );
+
+            let outcome =
+                futures::executor::block_on(integration.handle(&settings, &services, req));
+
+            expectation.assert_outcome("Testlight auction", &outcome);
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "should not call upstream for the {} case",
+                expectation.name()
+            );
+        }
     }
 }

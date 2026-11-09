@@ -23,7 +23,7 @@ use http::{Method, Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 
 use crate::error::TrustedServerError;
-use crate::http_util::enforce_max_body_size;
+use crate::http_util::read_request_body;
 use crate::platform::{RuntimeServices, reader_url_surrogate_key};
 
 /// Purge bodies name a scope and, for a URL purge, one URL. Nothing here is unbounded.
@@ -107,8 +107,9 @@ struct PurgeResponse {
 ///
 /// # Errors
 ///
-/// Returns an error when the body cannot be read, exceeds [`PURGE_MAX_BODY_BYTES`], is not
-/// valid JSON for a known scope, or when the platform's purge fails.
+/// Returns an error when the body cannot be read in time, exceeds [`PURGE_MAX_BODY_BYTES`] (see
+/// [`read_request_body`]), is not valid JSON for a known scope, or when the platform's purge
+/// fails.
 pub async fn handle_cache_purge(
     services: &RuntimeServices,
     req: Request<EdgeBody>,
@@ -132,14 +133,8 @@ pub async fn handle_cache_purge(
         ));
     }
 
-    let body = req.into_body();
-    if body.is_stream() {
-        return Err(Report::new(TrustedServerError::BadRequest {
-            message: "cache-purge request body must be buffered, not streamed".into(),
-        }));
-    }
-    let bytes = body.into_bytes().unwrap_or_default();
-    enforce_max_body_size(&bytes, PURGE_MAX_BODY_BYTES, "cache-purge")?;
+    let (parts, body) = req.into_parts();
+    let bytes = read_request_body(&parts.headers, body, PURGE_MAX_BODY_BYTES).await?;
 
     let request =
         PurgeRequest::parse(&bytes).map_err(|message| TrustedServerError::BadRequest {
@@ -239,6 +234,8 @@ fn json_response(status: StatusCode, body: &str) -> Response<EdgeBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::test_support::noop_services;
+    use crate::test_support::body_read::body_read_failure_cases;
 
     #[test]
     fn content_type_must_be_exactly_json() {
@@ -369,5 +366,47 @@ mod tests {
                 String::from_utf8_lossy(body)
             );
         }
+    }
+    /// Returns a JSON `POST` request builder for the purge route.
+    fn purge_builder() -> http::request::Builder {
+        Request::builder()
+            .method(Method::POST)
+            .uri("https://ts.example.com/_ts/admin/cache/purge")
+            .header(header::CONTENT_TYPE, "application/json")
+    }
+
+    #[test]
+    fn cache_purge_body_read_failures_map_to_statuses() {
+        let services = noop_services();
+
+        for case in body_read_failure_cases(PURGE_MAX_BODY_BYTES) {
+            let (req, expectation) = case.into_request(purge_builder());
+
+            let outcome = futures::executor::block_on(handle_cache_purge(&services, req, None));
+
+            expectation.assert_outcome("cache purge", &outcome);
+        }
+    }
+
+    #[test]
+    fn cache_purge_reads_a_streamed_body() {
+        let services = noop_services();
+        let req = purge_builder()
+            .body(EdgeBody::stream(futures::stream::iter([
+                bytes::Bytes::from_static(br#"{"scope":"#),
+                bytes::Bytes::from_static(br#""nope"}"#),
+            ])))
+            .expect("should build the streamed purge request");
+
+        let error = futures::executor::block_on(handle_cache_purge(&services, req, None))
+            .expect_err("should reject the unknown scope it read");
+
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::BadRequest { message } if message.contains("unknown scope")
+            ),
+            "should parse the streamed body rather than reject it unread, got {error:?}"
+        );
     }
 }

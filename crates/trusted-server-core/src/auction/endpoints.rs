@@ -20,6 +20,7 @@ use crate::ec::kv_types::MAX_UID_LENGTH;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
+use crate::http_util::read_request_body;
 use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
@@ -45,6 +46,23 @@ const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
 /// with EID arrays) while preventing an authenticated client from consuming
 /// arbitrary WASM linear memory.
 const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
+
+/// Builds the `text/plain` 413 answered for an auction body over [`MAX_AUCTION_BODY_SIZE`].
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Auction`] when the response cannot be built.
+fn auction_body_too_large_response() -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(EdgeBody::from(format!(
+            "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
+        )))
+        .change_context(TrustedServerError::Auction {
+            message: "Auction request body exceeded maximum size".to_string(),
+        })
+}
 
 /// Handle auction request from `POST /auction`.
 ///
@@ -115,6 +133,8 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// # Errors
 ///
 /// Returns an error if:
+/// - The request body cannot be read (see [`read_request_body`]); a body over
+///   256 KiB is answered with a `text/plain` 413 instead
 /// - The request body cannot be parsed
 /// - The auction request conversion fails (e.g., invalid ad units)
 /// - The auction execution fails
@@ -128,40 +148,22 @@ pub async fn handle_auction(
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    // Reject oversized bodies before core buffers/parses them. The Content-Length
-    // pre-check stops well-behaved clients early; the post-read check defends
-    // against clients that lie about (or omit) the header.
-    let content_length_exceeded = req
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok())
-        .is_some_and(|length| length > MAX_AUCTION_BODY_SIZE);
-    if content_length_exceeded {
-        return Response::builder()
-            .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(EdgeBody::from(format!(
-                "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
-            )))
-            .change_context(TrustedServerError::Auction {
-                message: "Auction request body exceeded maximum size".to_string(),
-            });
-    }
-
+    // The bounded read rejects a declared overflow before polling the body and
+    // stops a streamed body at the first chunk past the cap, so a client that
+    // omits or understates `Content-Length` is still held to it.
     let (parts, body) = req.into_parts();
-    let body_bytes = body.into_bytes().unwrap_or_default();
-    if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
-        return Response::builder()
-            .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(EdgeBody::from(format!(
-                "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
-            )))
-            .change_context(TrustedServerError::Auction {
-                message: "Auction request body exceeded maximum size".to_string(),
-            });
-    }
+    let body_bytes = match read_request_body(&parts.headers, body, MAX_AUCTION_BODY_SIZE).await {
+        Ok(bytes) => bytes,
+        Err(report)
+            if matches!(
+                report.current_context(),
+                TrustedServerError::RequestTooLarge { .. }
+            ) =>
+        {
+            return auction_body_too_large_response();
+        }
+        Err(report) => return Err(report),
+    };
     let body: AdRequest =
         serde_json::from_slice(&body_bytes).change_context(TrustedServerError::BadRequest {
             message: "Failed to parse auction request body".to_string(),
@@ -708,6 +710,7 @@ mod tests {
         StubHttpClient, noop_services,
     };
     use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
+    use crate::test_support::body_read::body_read_failure_cases;
     use crate::test_support::tests::{
         crate_test_settings_str, create_test_settings, run_pre_dispatch_hook,
     };
@@ -2200,50 +2203,99 @@ mod tests {
         });
     }
 
+    /// Returns an orchestrator with the auction disabled, so a parsed body gets a 200 no-bid.
+    fn disabled_orchestrator() -> AuctionOrchestrator {
+        AuctionOrchestrator::new(AuctionConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    }
+
     #[test]
-    fn auction_rejects_streaming_body_instead_of_treating_as_empty() {
+    fn auction_reads_a_streamed_body() {
         futures::executor::block_on(async {
-            use bytes::Bytes;
-            use edgezero_core::body::Body as EdgeBody;
-            use http::{Method, Request as HttpRequest};
-
-            use crate::auction::build_orchestrator;
-            use crate::consent::ConsentContext;
-            use crate::ec::EcContext;
-            use crate::error::TrustedServerError;
-            use crate::platform::test_support::noop_services;
-            use crate::test_support::tests::create_test_settings;
-
             let settings = create_test_settings();
-            let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
+            let orchestrator = disabled_orchestrator();
             let services = noop_services();
             let mut ec_context = EcContext::new_for_test(None, ConsentContext::default());
-            let stream = futures::stream::iter([Bytes::from_static(br#"{}"#)]);
-            let req = HttpRequest::builder()
-                .method(Method::POST)
-                .uri("https://test.com/auction")
-                .body(EdgeBody::stream(stream))
-                .expect("should build request");
+            let body = serde_json::to_vec(&json!({
+                "adUnits": [{
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }]
+            }))
+            .expect("should serialize the auction body");
+            let (head, tail) = body.split_at(body.len() / 2);
+            let chunks = [
+                bytes::Bytes::copy_from_slice(head),
+                bytes::Bytes::copy_from_slice(tail),
+            ];
+            let request = Request::builder()
+                .method("POST")
+                .uri("https://test-publisher.example/auction")
+                .body(EdgeBody::stream(futures::stream::iter(chunks)))
+                .expect("should build the streamed auction request");
 
-            let result = handle_auction(
+            let response = handle_auction(
                 &settings,
                 &orchestrator,
                 None,
                 None,
                 &mut ec_context,
                 &services,
-                req,
+                request,
             )
-            .await;
+            .await
+            .expect("should parse a streamed auction body");
 
-            let err = match result {
-                Ok(_) => panic!("streaming body should be rejected"),
-                Err(err) => err,
-            };
-            assert!(
-                matches!(err.current_context(), TrustedServerError::BadRequest { .. }),
-                "streaming request body should fail as bad request"
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "should answer a streamed body as it answers a buffered one"
             );
+        });
+    }
+
+    #[test]
+    fn auction_body_read_failures_map_to_statuses() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let orchestrator = disabled_orchestrator();
+            let services = noop_services();
+
+            for case in body_read_failure_cases(MAX_AUCTION_BODY_SIZE) {
+                let mut ec_context = EcContext::new_for_test(None, ConsentContext::default());
+                let (request, expectation) = case.into_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("https://test-publisher.example/auction"),
+                );
+
+                let outcome = handle_auction(
+                    &settings,
+                    &orchestrator,
+                    None,
+                    None,
+                    &mut ec_context,
+                    &services,
+                    request,
+                )
+                .await;
+
+                expectation.assert_outcome("/auction", &outcome);
+                if expectation.expected() == StatusCode::PAYLOAD_TOO_LARGE {
+                    let response = outcome.expect("should answer an overflow with a response");
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("text/plain"),
+                        "should keep the text/plain 413 body for the {} case",
+                        expectation.name()
+                    );
+                }
+            }
         });
     }
 }

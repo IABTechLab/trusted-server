@@ -563,7 +563,7 @@ async fn execute_named(
     // legacy route_request. Batch-sync also skips request filters, matching
     // legacy, which returns before the filter step for this route.
     if matches!(handler, NamedRouteHandler::BatchSync) {
-        return Ok(run_batch_sync(&state, &services, req));
+        return Ok(run_batch_sync(&state, &services, req).await);
     }
 
     // An operator cache purge is not a reader request: running the EC lifecycle would
@@ -648,10 +648,12 @@ async fn run_named_route(
             handle_trusted_server_discovery(&state.settings, services, req)
         }
         NamedRouteHandler::VerifySignature => {
-            handle_verify_signature(&state.settings, services, req)
+            handle_verify_signature(&state.settings, services, req).await
         }
-        NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req),
-        NamedRouteHandler::DeactivateKey => handle_deactivate_key(&state.settings, services, req),
+        NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req).await,
+        NamedRouteHandler::DeactivateKey => {
+            handle_deactivate_key(&state.settings, services, req).await
+        }
         NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup => {
             unreachable!("admin diagnostics should be handled before EC setup")
         }
@@ -746,17 +748,19 @@ async fn run_named_route(
 /// Handles `POST /_ts/api/v1/batch-sync`, mirroring the legacy arm: identity
 /// graph + partner registry + rate limiter, with a default EC context for
 /// response finalization.
-fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
+async fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
     let device_signals = device_signals_for(&req);
     let is_real_browser = device_signals.looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
-    let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
+    let result = async {
+        let kv = crate::require_identity_graph(&state.settings)?;
         let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-        handle_batch_sync(&kv, &partner_registry, &limiter, req)
-    });
+        handle_batch_sync(&kv, &partner_registry, &limiter, req).await
+    }
+    .await;
 
     let mut response = result.unwrap_or_else(|e| http_error(&e));
     // Legacy parity: batch-sync responses still pass through

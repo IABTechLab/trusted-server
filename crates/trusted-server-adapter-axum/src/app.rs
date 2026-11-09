@@ -460,7 +460,7 @@ fn named_route_handler(
                         handle_trusted_server_discovery(&state.settings, &services, req)
                     }
                     NamedRouteHandler::VerifySignature => {
-                        handle_verify_signature(&state.settings, &services, req)
+                        handle_verify_signature(&state.settings, &services, req).await
                     }
                     NamedRouteHandler::CachePurgeNotSupported => {
                         // The Axum dev server has no template cache to purge. 501 rather

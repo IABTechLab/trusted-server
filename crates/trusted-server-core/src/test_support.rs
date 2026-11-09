@@ -1,4 +1,6 @@
 #[cfg(test)]
+pub(crate) mod body_read;
+#[cfg(test)]
 pub(crate) mod logging;
 
 #[cfg(test)]

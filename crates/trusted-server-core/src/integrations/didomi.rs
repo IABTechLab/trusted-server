@@ -10,10 +10,10 @@ use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
+use crate::http_util::read_request_body;
 use crate::integrations::{
     INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
-    ensure_integration_backend,
+    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, ensure_integration_backend,
 };
 use crate::platform::{GeoInfo, PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -464,9 +464,7 @@ impl IntegrationProxy for DidomiIntegration {
             .change_context(Self::error("Failed to configure Didomi backend"))?;
 
         let request_body = if parts.method == Method::POST {
-            let bytes =
-                collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, DIDOMI_INTEGRATION_ID)
-                    .await?;
+            let bytes = read_request_body(&parts.headers, body, INTEGRATION_MAX_BODY_BYTES).await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()
@@ -557,6 +555,7 @@ mod tests {
         build_services_with_http_client,
     };
     use crate::platform::{ClientInfo, GeoInfo, PlatformError, PlatformGeo};
+    use crate::test_support::body_read::body_read_failure_cases;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use http::Method;
 
@@ -1784,5 +1783,30 @@ mod tests {
             inserts[0],
             r#"<script>window.__tsjs_didomi={"proxyPath":"/integrations/didomi/consent/"};</script>"#
         );
+    }
+
+    #[test]
+    fn didomi_api_body_read_failures_map_to_statuses() {
+        let settings = create_test_settings();
+        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        for case in body_read_failure_cases(INTEGRATION_MAX_BODY_BYTES) {
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_geo(Arc::clone(&stub), GeoResult::Value(None));
+            let (req, expectation) = case.into_request(
+                http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("https://publisher.example/integrations/didomi/consent/api/events"),
+            );
+
+            let outcome =
+                futures::executor::block_on(integration.handle(&settings, &services, req));
+
+            expectation.assert_outcome("Didomi API", &outcome);
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "should not call upstream for the {} case",
+                expectation.name()
+            );
+        }
     }
 }

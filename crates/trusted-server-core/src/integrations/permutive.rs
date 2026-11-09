@@ -15,12 +15,12 @@ use validator::Validate;
 
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
+use crate::http_util::read_request_body;
 use crate::integrations::sdk_url::parse_sdk_network_url;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
-    UPSTREAM_SDK_MAX_RESPONSE_BYTES, collect_body_bounded, collect_response_bounded,
-    ensure_integration_backend,
+    UPSTREAM_SDK_MAX_RESPONSE_BYTES, collect_response_bounded, ensure_integration_backend,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -222,9 +222,7 @@ impl PermutiveIntegration {
         log::info!("Forwarding {} to {}", route_name, target_url);
 
         let request_body = if method == Method::POST {
-            let bytes =
-                collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, PERMUTIVE_INTEGRATION_ID)
-                    .await?;
+            let bytes = read_request_body(&parts.headers, body, INTEGRATION_MAX_BODY_BYTES).await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()
@@ -487,6 +485,7 @@ mod tests {
         assert_sdk_html_attribute_rewrite, assert_sdk_url_rewrite, sdk_url_cases,
     };
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::test_support::body_read::body_read_failure_cases;
     use crate::test_support::tests::create_test_settings;
 
     #[test]
@@ -761,5 +760,41 @@ mod tests {
                 .any(|(name, value)| name == "user-agent" && value == "test-agent"),
             "should still forward required headers (user-agent)"
         );
+    }
+
+    #[test]
+    fn permutive_api_body_read_failures_map_to_statuses() {
+        let settings = create_test_settings();
+        let integration = PermutiveIntegration::new(PermutiveConfig {
+            enabled: true,
+            organization_id: "myorg".to_string(),
+            workspace_id: "workspace-123".to_string(),
+            project_id: String::new(),
+            api_endpoint: default_api_endpoint(),
+            secure_signals_endpoint: default_secure_signals_endpoint(),
+            cache_ttl_seconds: 3600,
+            rewrite_sdk: true,
+        });
+        for case in body_read_failure_cases(INTEGRATION_MAX_BODY_BYTES) {
+            let stub = Arc::new(StubHttpClient::new());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let (req, expectation) = case.into_request(
+                http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("https://publisher.example/integrations/permutive/api/v2.0/events"),
+            );
+
+            let outcome =
+                futures::executor::block_on(integration.handle(&settings, &services, req));
+
+            expectation.assert_outcome("Permutive API", &outcome);
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "should not call upstream for the {} case",
+                expectation.name()
+            );
+        }
     }
 }

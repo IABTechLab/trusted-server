@@ -1,6 +1,5 @@
 use crate::http_util::{
-    RequestInfo, compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size,
-    into_body_payload,
+    RequestInfo, compute_encrypted_sha256_token, ct_str_eq, into_body_payload, read_request_body,
 };
 use edgezero_core::body::{Body as EdgeBody, BodyPayload};
 use edgezero_core::http::{Uri as EdgeUri, request_builder as edge_request_builder};
@@ -43,19 +42,6 @@ const REBUILD_MAX_BODY_BYTES: usize = 65536;
 
 fn body_as_reader(body: EdgeBody) -> Cursor<bytes::Bytes> {
     Cursor::new(body.into_bytes().unwrap_or_default())
-}
-
-fn request_body_bytes(
-    body: EdgeBody,
-    endpoint: &str,
-) -> Result<bytes::Bytes, Report<TrustedServerError>> {
-    if body.is_stream() {
-        return Err(Report::new(TrustedServerError::BadRequest {
-            message: format!("{endpoint} request body must be buffered, not streamed"),
-        }));
-    }
-
-    Ok(body.into_bytes().unwrap_or_default())
 }
 
 /// Headers copied from the original client request to the upstream proxy request
@@ -1688,7 +1674,8 @@ pub async fn handle_first_party_click(
 ///
 /// # Errors
 ///
-/// Returns an error if JSON parsing fails, the URL cannot be parsed, the URL uses an
+/// Returns an error if a POST body cannot be read within 64 KiB (see
+/// [`read_request_body`]), JSON parsing fails, the URL cannot be parsed, the URL uses an
 /// unsupported scheme, the URL lacks a host, the host is declined by
 /// `rewrite.exclude_domains` or `rewrite.include_domains`, the host violates
 /// `proxy.allowed_domains`, or request metadata needed to determine the scheme
@@ -1718,8 +1705,8 @@ pub async fn handle_first_party_proxy_sign(
     };
 
     let payload = if method == Method::POST {
-        let body_bytes = request_body_bytes(req.into_body(), "first-party sign")?;
-        enforce_max_body_size(&body_bytes, SIGN_MAX_BODY_BYTES, "first-party sign")?;
+        let (parts, body) = req.into_parts();
+        let body_bytes = read_request_body(&parts.headers, body, SIGN_MAX_BODY_BYTES).await?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party sign request body should be valid UTF-8".to_string(),
@@ -1903,8 +1890,8 @@ pub async fn handle_first_party_proxy_rebuild(
     let redirect_response = method == Method::GET || is_form_post;
 
     let payload = if method == Method::POST {
-        let body_bytes = request_body_bytes(req.into_body(), "first-party rebuild")?;
-        enforce_max_body_size(&body_bytes, REBUILD_MAX_BODY_BYTES, "first-party rebuild")?;
+        let (parts, body) = req.into_parts();
+        let body_bytes = read_request_body(&parts.headers, body, REBUILD_MAX_BODY_BYTES).await?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party rebuild request body should be valid UTF-8".to_string(),
@@ -2235,11 +2222,11 @@ mod tests {
 
     use super::{
         AssetProxyCachePolicy, IMAGE_FALLBACK_CONTENT_TYPE, ProxyRequestConfig,
-        SUPPORTED_ENCODINGS, asset_origin_host_header, asset_path_skips_image_optimizer,
-        build_asset_proxy_target_url, handle_asset_proxy_request, handle_first_party_click,
-        handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
-        is_host_allowed, is_host_permitted, proxy_request, rebuild_response_with_body,
-        reconstruct_and_validate_signed_target, stream_asset_body,
+        REBUILD_MAX_BODY_BYTES, SIGN_MAX_BODY_BYTES, SUPPORTED_ENCODINGS, asset_origin_host_header,
+        asset_path_skips_image_optimizer, build_asset_proxy_target_url, handle_asset_proxy_request,
+        handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
+        handle_first_party_proxy_sign, is_host_allowed, is_host_permitted, proxy_request,
+        rebuild_response_with_body, reconstruct_and_validate_signed_target, stream_asset_body,
     };
     use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
@@ -2259,6 +2246,7 @@ mod tests {
         ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
         OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings, UnknownProfilePolicy,
     };
+    use crate::test_support::body_read::body_read_failure_cases;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
@@ -2330,8 +2318,13 @@ mod tests {
         build_http_post_json_request(uri, &serde_json::json!({ "url": target }))
     }
 
-    fn build_http_post_streaming_request(uri: impl AsRef<str>) -> HttpRequest<EdgeBody> {
-        let stream = futures::stream::iter(vec![Bytes::from_static(b"{}")]);
+    /// Builds a JSON `POST` whose `body` arrives as a stream of two chunks.
+    fn build_http_post_streaming_request(
+        uri: impl AsRef<str>,
+        body: &'static [u8],
+    ) -> HttpRequest<EdgeBody> {
+        let (head, tail) = body.split_at(body.len() / 2);
+        let stream = futures::stream::iter([Bytes::from_static(head), Bytes::from_static(tail)]);
         HttpRequest::builder()
             .method(Method::POST)
             .uri(uri.as_ref())
@@ -6612,27 +6605,65 @@ mod tests {
     }
 
     #[test]
-    fn sign_rejects_streaming_body() {
+    fn sign_reads_a_streamed_body() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
-            let req = build_http_post_streaming_request("https://edge.example/first-party/sign");
-            let err = handle_first_party_proxy_sign(&settings, &noop_services(), req)
-                .await
-                .expect_err("should reject streaming sign body");
-            assert_eq!(
-                err.current_context().status_code(),
-                StatusCode::BAD_REQUEST,
-                "should return 400 for streaming sign body"
+            let req = build_http_post_streaming_request(
+                "https://edge.example/first-party/sign",
+                br#"{"url":"https://cdn.example/asset.js"}"#,
             );
+            let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                .await
+                .expect("should sign the URL from a streamed body");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json = response_body_string(resp);
             assert!(
-                matches!(
-                    err.current_context(),
-                    TrustedServerError::BadRequest { message }
-                        if message == "first-party sign request body must be buffered, not streamed"
-                ),
-                "should explain that sign bodies must be buffered"
+                json.contains("\"base\":\"https://cdn.example/asset.js\""),
+                "should sign the streamed target: {json}"
             );
         });
+    }
+
+    #[test]
+    fn sign_body_read_failures_map_to_statuses() {
+        let settings = create_test_settings();
+        for case in body_read_failure_cases(SIGN_MAX_BODY_BYTES) {
+            let (req, expectation) = case.into_request(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("https://edge.example/first-party/sign")
+                    .header(header::CONTENT_TYPE, "application/json"),
+            );
+
+            let outcome = futures::executor::block_on(handle_first_party_proxy_sign(
+                &settings,
+                &noop_services(),
+                req,
+            ));
+
+            expectation.assert_outcome("first-party sign", &outcome);
+        }
+    }
+
+    #[test]
+    fn rebuild_body_read_failures_map_to_statuses() {
+        let settings = create_test_settings();
+        for case in body_read_failure_cases(REBUILD_MAX_BODY_BYTES) {
+            let (req, expectation) = case.into_request(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("https://edge.example/first-party/proxy-rebuild")
+                    .header(header::CONTENT_TYPE, "application/json"),
+            );
+
+            let outcome = futures::executor::block_on(handle_first_party_proxy_rebuild(
+                &settings,
+                &noop_services(),
+                req,
+            ));
+
+            expectation.assert_outcome("first-party rebuild", &outcome);
+        }
     }
 
     #[test]

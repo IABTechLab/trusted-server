@@ -797,6 +797,55 @@ async fn first_party_sign_post_is_routed() {
     );
 }
 
+/// The listener hands every POST body to the handler as a stream, so a signed
+/// URL in the answer proves the bounded reader collected it end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_party_sign_post_signs_the_url_in_its_body() {
+    let server = TestServer::with_test_settings().await;
+    let resp = send(
+        server
+            .request("POST", "/first-party/sign")
+            .header("content-type", "application/json")
+            .body(r#"{"url":"https://cdn.example.com/pixel.gif?a=1"}"#),
+    )
+    .await;
+
+    let status = resp.status().as_u16();
+    let body = resp.text().await.expect("should read the sign response");
+    assert_eq!(status, 200, "POST /first-party/sign should sign: {body}");
+    assert!(
+        body.contains(r#""base":"https://cdn.example.com/pixel.gif""#),
+        "should sign the URL from the request body: {body}"
+    );
+    assert!(
+        body.contains(r#""href":"/first-party/proxy?tsurl="#),
+        "should return the first-party proxy URL: {body}"
+    );
+}
+
+/// A JSON auction body reaches the handler instead of being read as empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auction_post_parses_its_json_body() {
+    let server = TestServer::with_test_settings().await;
+    let resp = send(
+        server
+            .request("POST", "/auction")
+            .header("content-type", "application/json")
+            .body(
+                r#"{"adUnits":[{"code":"slot-1","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}"#,
+            ),
+    )
+    .await;
+
+    let status = resp.status().as_u16();
+    let body = resp.text().await.expect("should read the auction response");
+    assert_eq!(status, 200, "POST /auction should parse its body: {body}");
+    assert!(
+        body.contains(r#""id":""#),
+        "should return an OpenRTB response with an auction id: {body}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_proxy_rebuild_is_routed() {
     let server = TestServer::with_test_settings().await;

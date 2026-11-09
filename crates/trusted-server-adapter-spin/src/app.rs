@@ -590,6 +590,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 let req = ctx.into_request()?;
                 Ok::<Response, EdgeError>(
                     handle_verify_signature(&s.settings, &services, req)
+                        .await
                         .unwrap_or_else(|e| http_error(&e)),
                 )
             }

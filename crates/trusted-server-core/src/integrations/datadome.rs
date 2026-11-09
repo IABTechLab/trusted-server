@@ -70,12 +70,13 @@ use validator::Validate;
 
 use crate::constants::ENV_FASTLY_IS_STAGING;
 use crate::error::TrustedServerError;
+use crate::http_util::read_request_body;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
     IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, IntegrationRequestFilter,
     RequestFilterDecision, RequestFilterInput, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
-    collect_body_bounded, collect_response_bounded, ensure_integration_backend,
+    collect_response_bounded, ensure_integration_backend,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::redacted::Redacted;
@@ -741,9 +742,7 @@ impl DataDomeIntegration {
             .change_context(Self::error("Invalid API URL"))?;
 
         let request_body = if parts.method == Method::POST || parts.method == Method::PUT {
-            let bytes =
-                collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, DATADOME_INTEGRATION_ID)
-                    .await?;
+            let bytes = read_request_body(&parts.headers, body, INTEGRATION_MAX_BODY_BYTES).await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()
@@ -758,7 +757,7 @@ impl DataDomeIntegration {
 
         // Copy relevant headers from the original client request.
         // CONTENT_LENGTH is intentionally omitted: the body is re-materialized
-        // via collect_body_bounded, so its length may differ from the original.
+        // via read_request_body, so its length may differ from the original.
         let headers_to_copy = [
             header::USER_AGENT,
             header::ACCEPT,
@@ -1014,6 +1013,7 @@ mod tests {
 
     use super::*;
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::test_support::body_read::body_read_failure_cases;
     use crate::test_support::tests::create_test_settings;
 
     fn test_config() -> DataDomeConfig {
@@ -1661,5 +1661,32 @@ mod tests {
             vec!["stub-backend".to_string()],
             "should route outbound request through PlatformHttpClient"
         );
+    }
+
+    #[test]
+    fn datadome_js_api_body_read_failures_map_to_statuses() {
+        let settings = create_test_settings();
+        let integration = DataDomeIntegration::new(test_config());
+        for case in body_read_failure_cases(INTEGRATION_MAX_BODY_BYTES) {
+            let stub = Arc::new(StubHttpClient::new());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let (req, expectation) = case.into_request(
+                http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("https://publisher.example/integrations/datadome/js/check"),
+            );
+
+            let outcome =
+                futures::executor::block_on(integration.handle(&settings, &services, req));
+
+            expectation.assert_outcome("DataDome /js/", &outcome);
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "should not call upstream for the {} case",
+                expectation.name()
+            );
+        }
     }
 }
