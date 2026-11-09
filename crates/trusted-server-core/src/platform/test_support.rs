@@ -1,7 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::SigningKey;
@@ -226,28 +225,16 @@ struct StubPendingResponse {
 /// sites.
 /// Upper bound on the request body bytes captured per `send` call.
 const MAX_RECORDED_BODY_BYTES: usize = 64 * 1024 * 1024;
-type RecordedHeaderBytes = Vec<Vec<(String, Vec<u8>)>>;
 
 pub(crate) struct StubHttpClient {
     calls: Mutex<Vec<String>>,
     responses: Mutex<VecDeque<StubHttpResponse>>,
     // Headers captured per send call, stored as (name, value) string pairs.
     request_headers: Mutex<Vec<Vec<(String, String)>>>,
-    // Raw header values, including invalid UTF-8 values that cannot be represented
-    // by `recorded_request_headers`.
-    request_header_bytes: Mutex<RecordedHeaderBytes>,
     // Queued select() outcomes; true makes that select return ready: Err.
     select_errors: Mutex<VecDeque<bool>>,
     // Queued direct wait() errors for pending-stream failure-path tests.
     wait_errors: Mutex<VecDeque<()>>,
-    // Test-only wall-clock delays applied before each direct wait result.
-    wait_delays: Mutex<VecDeque<Duration>>,
-    // Test-only overrides for backend metadata on returned pending handles.
-    pending_backend_name_overrides: Mutex<VecDeque<Option<String>>>,
-    // Test-only wall-clock delays applied before each select result is returned.
-    select_delays: Mutex<VecDeque<Duration>>,
-    select_count: std::sync::atomic::AtomicUsize,
-    wait_count: std::sync::atomic::AtomicUsize,
     // Reported by supports_concurrent_fanout(); set false to emulate
     // platforms whose collection contract permits only a single provider.
     concurrent_fanout: std::sync::atomic::AtomicBool,
@@ -257,7 +244,6 @@ pub(crate) struct StubHttpClient {
     pending_streaming_responses_supported: std::sync::atomic::AtomicBool,
     cache_intents: Mutex<Vec<PlatformCacheIntent>>,
     stream_response_flags: Mutex<Vec<bool>>,
-    request_methods: Mutex<Vec<String>>,
     request_uris: Mutex<Vec<String>>,
     // Outgoing request bodies captured per send call, collected to bytes.
     request_bodies: Mutex<Vec<Vec<u8>>>,
@@ -270,35 +256,18 @@ struct StubHttpResponse {
 }
 
 impl StubHttpClient {
-    /// Number of calls to the unbounded selection method.
-    pub(crate) fn recorded_select_count(&self) -> usize {
-        self.select_count.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Number of calls to the unbounded single-request wait method.
-    pub(crate) fn recorded_wait_count(&self) -> usize {
-        self.wait_count.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     pub fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::new()),
             request_headers: Mutex::new(Vec::new()),
-            request_header_bytes: Mutex::new(Vec::new()),
             select_errors: Mutex::new(VecDeque::new()),
             wait_errors: Mutex::new(VecDeque::new()),
-            wait_delays: Mutex::new(VecDeque::new()),
-            pending_backend_name_overrides: Mutex::new(VecDeque::new()),
-            select_delays: Mutex::new(VecDeque::new()),
-            select_count: std::sync::atomic::AtomicUsize::new(0),
-            wait_count: std::sync::atomic::AtomicUsize::new(0),
             concurrent_fanout: std::sync::atomic::AtomicBool::new(true),
             streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             pending_streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             cache_intents: Mutex::new(Vec::new()),
             stream_response_flags: Mutex::new(Vec::new()),
-            request_methods: Mutex::new(Vec::new()),
             request_uris: Mutex::new(Vec::new()),
             request_bodies: Mutex::new(Vec::new()),
         }
@@ -358,43 +327,6 @@ impl StubHttpClient {
             .push_back(true);
     }
 
-    /// Make the next `select()` complete successfully before a later queued error.
-    pub(crate) fn push_select_success(&self) {
-        self.select_errors
-            .lock()
-            .expect("should lock select_errors")
-            .push_back(false);
-    }
-
-    /// Override backend metadata on the next pending handle returned by
-    /// [`Self::send_async`]. `None` removes the metadata entirely.
-    pub(crate) fn push_pending_backend_name_override(&self, backend_name: Option<&str>) {
-        self.pending_backend_name_overrides
-            .lock()
-            .expect("should lock pending backend name overrides")
-            .push_back(backend_name.map(str::to_string));
-    }
-
-    /// Queue a wall-clock delay before the next [`Self::select`] result.
-    ///
-    /// This is test-only timing control for deadline behavior. It deliberately
-    /// uses a caller-selected, generous contrast with the tested budget rather
-    /// than relying on scheduler races.
-    pub(crate) fn push_select_delay(&self, delay: Duration) {
-        self.select_delays
-            .lock()
-            .expect("should lock select_delays")
-            .push_back(delay);
-    }
-
-    /// Queue a wall-clock delay before the next direct pending-request `wait()`.
-    pub(crate) fn push_wait_delay(&self, delay: Duration) {
-        self.wait_delays
-            .lock()
-            .expect("should lock wait_delays")
-            .push_back(delay);
-    }
-
     /// Inject an error for the next direct pending-request `wait()`.
     pub fn push_wait_error(&self) {
         self.wait_errors
@@ -418,16 +350,6 @@ impl StubHttpClient {
             .clone()
     }
 
-    /// Return raw request header values captured per request, in order.
-    ///
-    /// Unlike [`Self::recorded_request_headers`], this includes malformed bytes.
-    pub(crate) fn recorded_request_header_bytes(&self) -> Vec<Vec<(String, Vec<u8>)>> {
-        self.request_header_bytes
-            .lock()
-            .expect("should lock request_header_bytes")
-            .clone()
-    }
-
     /// Return the cache intent captured per `send` or `send_async` call, in order.
     pub(crate) fn recorded_cache_intents(&self) -> Vec<PlatformCacheIntent> {
         self.cache_intents
@@ -441,14 +363,6 @@ impl StubHttpClient {
         self.stream_response_flags
             .lock()
             .expect("should lock stream response flags")
-            .clone()
-    }
-
-    /// Return request methods captured per `send` call, in order.
-    pub fn recorded_request_methods(&self) -> Vec<String> {
-        self.request_methods
-            .lock()
-            .expect("should lock request methods")
             .clone()
     }
 
@@ -509,10 +423,6 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock stream response flags")
             .push(request.stream_response);
-        self.request_methods
-            .lock()
-            .expect("should lock request methods")
-            .push(request.request.method().to_string());
         self.request_uris
             .lock()
             .expect("should lock request URIs")
@@ -533,16 +443,6 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock request_headers")
             .push(headers);
-        let header_bytes = request
-            .request
-            .headers()
-            .iter()
-            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
-            .collect();
-        self.request_header_bytes
-            .lock()
-            .expect("should lock request_header_bytes")
-            .push(header_bytes);
 
         // Capture the outgoing request body so tests can assert it is forwarded.
         // Propagate collection failures instead of recording an empty body, so
@@ -605,10 +505,6 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock stream response flags")
             .push(stream_response);
-        self.request_methods
-            .lock()
-            .expect("should lock request methods")
-            .push(request_method.to_string());
         self.request_uris
             .lock()
             .expect("should lock request URIs")
@@ -629,16 +525,6 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock request_headers")
             .push(headers);
-        let header_bytes = request
-            .request
-            .headers()
-            .iter()
-            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
-            .collect();
-        self.request_header_bytes
-            .lock()
-            .expect("should lock request_header_bytes")
-            .push(header_bytes);
 
         // Capture the outgoing request body, mirroring `send()`, so tests
         // exercising the async fan-out path (`request_bids` providers) can
@@ -669,24 +555,15 @@ impl PlatformHttpClient for StubHttpClient {
             body: response.body,
             headers: response.headers,
         };
-        let override_name = self
-            .pending_backend_name_overrides
-            .lock()
-            .expect("should lock pending backend name overrides")
-            .pop_front();
-        let pending = PlatformPendingRequest::new(pending)
-            .with_response_handling(stream_response, request_method);
-        Ok(match override_name {
-            Some(Some(name)) => pending.with_backend_name(name),
-            Some(None) => pending,
-            None => pending.with_backend_name(backend_name),
-        })
+        Ok(PlatformPendingRequest::new(pending)
+            .with_response_handling(stream_response, request_method)
+            .with_backend_name(backend_name))
     }
 
     async fn select_until(
         &self,
-        mut pending_requests: Vec<PlatformPendingRequest>,
-        deadline: Instant,
+        pending_requests: Vec<PlatformPendingRequest>,
+        _deadline: Instant,
     ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
         // Match Fastly's per-provider rejection before waiting on network work.
         let mut unchecked = pending_requests.into_iter();
@@ -704,63 +581,16 @@ impl PlatformHttpClient for StubHttpClient {
                 }
             }
         }
-        pending_requests = checked;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let delay = self
-            .select_delays
-            .lock()
-            .expect("should lock select delays")
-            .front()
-            .copied()
-            .unwrap_or_default();
-        if delay.is_zero() {
-            return self.select(pending_requests).await.map(Some);
-        }
-        if remaining.is_zero() {
-            return Ok(None);
-        }
-        if delay >= remaining {
-            self.select_delays
-                .lock()
-                .expect("should lock select delays")
-                .pop_front();
-            std::thread::sleep(remaining);
-            return Ok(None);
-        }
-        let response = self.select(pending_requests).await?;
-        Ok((Instant::now() < deadline).then_some(response))
+        self.select(checked).await.map(Some)
     }
 
     async fn wait_until(
         &self,
         pending: PlatformPendingRequest,
-        deadline: Instant,
+        _deadline: Instant,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         let pending = validate_deadline_cache_bypass(pending).map_err(|(_, error)| error)?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let delay = self
-            .wait_delays
-            .lock()
-            .expect("should lock wait delays")
-            .front()
-            .copied()
-            .unwrap_or_default();
-        if delay.is_zero() {
-            return self.wait(pending).await;
-        }
-        if remaining.is_zero() || delay >= remaining {
-            self.wait_delays
-                .lock()
-                .expect("should lock wait delays")
-                .pop_front();
-            std::thread::sleep(remaining);
-            return Err(Report::new(PlatformError::DeadlineExceeded));
-        }
-        let response = self.wait(pending).await?;
-        if Instant::now() >= deadline {
-            return Err(Report::new(PlatformError::DeadlineExceeded));
-        }
-        Ok(response)
+        self.wait(pending).await
     }
 
     /// Always marks the first pending request in the input as ready (FIFO order).
@@ -773,8 +603,6 @@ impl PlatformHttpClient for StubHttpClient {
         &self,
         mut pending_requests: Vec<PlatformPendingRequest>,
     ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-        self.select_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if pending_requests.is_empty() {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("select called with empty pending_requests list"));
@@ -786,15 +614,6 @@ impl PlatformHttpClient for StubHttpClient {
         {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("stream-marked pending request requires direct wait"));
-        }
-
-        let delay = self
-            .select_delays
-            .lock()
-            .expect("should lock select_delays")
-            .pop_front();
-        if let Some(delay) = delay {
-            std::thread::sleep(delay);
         }
 
         let ready_platform = pending_requests.remove(0);
@@ -850,17 +669,6 @@ impl PlatformHttpClient for StubHttpClient {
         &self,
         pending: PlatformPendingRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        self.wait_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let delay = self
-            .wait_delays
-            .lock()
-            .expect("should lock wait_delays")
-            .pop_front();
-        if let Some(delay) = delay {
-            std::thread::sleep(delay);
-        }
-
         if self
             .wait_errors
             .lock()
@@ -1109,39 +917,6 @@ pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip: Some(ip),
-            ..ClientInfo::default()
-        })
-        .build()
-}
-
-/// Build a [`RuntimeServices`] with a caller-supplied [`PlatformBackend`] and
-/// HTTP client.
-///
-/// Lets auction tests inject a backend whose
-/// [`PlatformBackend::canonicalize_transport_timeout_ms`] returns a controlled
-/// value, so the orchestrator's transport-timeout wiring can be asserted
-/// deterministically without depending on wall-clock timing.
-#[allow(
-    dead_code,
-    reason = "retained for target-specific transport-timeout tests"
-)]
-pub(crate) fn build_services_with_backend_and_http_client(
-    backend: Arc<dyn PlatformBackend>,
-    http_client: Arc<dyn PlatformHttpClient>,
-) -> RuntimeServices {
-    RuntimeServices::builder()
-        .config_store(Arc::new(NoopConfigStore))
-        .secret_store(Arc::new(NoopSecretStore))
-        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-        .backend(backend)
-        .http_client(http_client)
-        .outbound_client(ScriptedHttpClient::forbidding().http_client())
-        .clock(TestClock::new().monotonic_clock())
-        .geo(Arc::new(NoopGeo))
-        .client_info(ClientInfo {
-            client_ip: None,
-            tls_protocol: None,
-            tls_cipher: None,
             ..ClientInfo::default()
         })
         .build()

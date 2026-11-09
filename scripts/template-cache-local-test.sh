@@ -79,10 +79,6 @@ command -v node >/dev/null || {
   echo "node not found. The harness executes the real GPT bundle to verify slot setup." >&2
   exit 1
 }
-command -v openssl >/dev/null || {
-  echo "openssl not found. The harness needs it for the local HTTPS bid endpoint." >&2
-  exit 1
-}
 
 # A port already in use means requests would go to something else entirely — most
 # likely a leftover run, whose warm cache and stale config would read as a result.
@@ -101,25 +97,9 @@ cargo build -p trusted-server-cli --target "$HOST_TRIPLE" >/dev/null
 WASM="$REPO_ROOT/target/wasm32-wasip1/debug/trusted-server-adapter-fastly.wasm"
 TS="$REPO_ROOT/target/$HOST_TRIPLE/debug/ts"
 
-info "Generating a local CA and HTTPS bid certificate"
-openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
-  -subj "/CN=Trusted Server local harness CA" \
-  -keyout "$WORK/ca-key.pem" -out "$WORK/ca-cert.pem" >/dev/null 2>&1
-openssl req -newkey rsa:2048 -sha256 -nodes -subj "/CN=localhost" \
-  -keyout "$WORK/server-key.pem" -out "$WORK/server.csr" >/dev/null 2>&1
-cat > "$WORK/server.ext" <<'EOF'
-basicConstraints=CA:FALSE
-keyUsage=digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth
-subjectAltName=DNS:localhost,IP:127.0.0.1
-EOF
-openssl x509 -req -sha256 -days 1 -in "$WORK/server.csr" \
-  -CA "$WORK/ca-cert.pem" -CAkey "$WORK/ca-key.pem" -CAcreateserial \
-  -extfile "$WORK/server.ext" -out "$WORK/server-cert.pem" >/dev/null 2>&1
-
-info "Starting stub origin on :$ORIGIN_PORT and HTTPS bidder on :$BID_PORT"
+info "Starting stub origin on :$ORIGIN_PORT and HTTP bidder on :$BID_PORT"
 cat > "$WORK/origin.py" <<PYEOF
-"""Stub publisher origin and deliberately slow HTTPS bid endpoint.
+"""Stub publisher origin and deliberately slow loopback HTTP bid endpoint.
 
 The page uses the real Fastly policy that exposed #1009's response-side bypass: no
 Set-Cookie, a public Cache-Control, Surrogate-Control with stale windows, and a Vary the
@@ -129,7 +109,7 @@ The bid endpoint returns a real winning bid. It used to return an empty seatbid,
 every assertion below measure a page with no ads on it. That is how a seam that silently
 discarded every non-empty bid map passed this harness for weeks.
 """
-import gzip, json, ssl, threading, time
+import gzip, json, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # The impid must be the configured slot id: that is what the auction request sends and
@@ -234,9 +214,6 @@ origin = ThreadingHTTPServer(("127.0.0.1", $ORIGIN_PORT), H)
 threading.Thread(target=origin.serve_forever, daemon=True).start()
 
 bidder = ThreadingHTTPServer(("127.0.0.1", $BID_PORT), BidH)
-tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-tls.load_cert_chain("$WORK/server-cert.pem", "$WORK/server-key.pem")
-bidder.socket = tls.wrap_socket(bidder.socket, server_side=True)
 bidder.serve_forever()
 PYEOF
 python3 "$WORK/origin.py" > "$WORK/origin.log" 2>&1 &
@@ -275,7 +252,7 @@ s = replace_once(
     'cookie_domain = ".local-harness.example"',
     "publisher cookie domain",
 )
-# A real auction points at the slow HTTPS stub so the timings mean something.
+# A real auction points at the slow loopback HTTP stub so the timings mean something.
 s = replace_once(
     s,
     '[integrations.prebid]\nenabled = false',
@@ -286,7 +263,7 @@ s = replace_once(
 s = replace_once(
     s,
     'endpoint = "https://prebid.example.com/openrtb2/auction"',
-    f'endpoint = "https://localhost:{bid_port}/bid"\ntimeout_ms = 5000',
+    f'endpoint = "http://127.0.0.1:{bid_port}/bid"\ntimeout_ms = 5000',
     "Prebid provider endpoint",
 )
 s = replace_once(
@@ -346,50 +323,6 @@ info "Seeding an isolated config store (tracked fastly.toml remains untouched)"
 # pointed at this checkout without copying the workspace.
 cp "$REPO_ROOT/edgezero.toml" "$WORK/edgezero.toml"
 cp "$REPO_ROOT/fastly.toml" "$WORK/fastly.toml"
-
-# The application registers provider backends dynamically. Pre-register the exact
-# deterministic name so Viceroy reuses a local backend that trusts the temporary CA.
-python3 - "$WORK/fastly.toml" "$WORK/ca-cert.pem" "$BID_PORT" <<'PYEOF'
-import hashlib
-import json
-import sys
-
-manifest, ca_certificate, port = sys.argv[1:4]
-provider_id = "pbs-main"
-timeout_ms = "5000"
-
-
-def field(value):
-    return f"{len(value)}:{value}"
-
-
-canonical = "".join([
-    field("https"),
-    field("localhost"),
-    field(port),
-    field("1"),
-    "n",
-    "s",
-    field(provider_id),
-    field(timeout_ms),
-    field(timeout_ms),
-])
-digest = hashlib.sha256(canonical.encode()).hexdigest()[:32]
-readable = f"https_localhost_{port}_p_{provider_id}_fb{timeout_ms}_bb{timeout_ms}"
-backend_name = f"backend_{readable}_{digest}"
-backend = f'''[local_server.backends.{backend_name}]
-url = "https://localhost:{port}"
-cert_host = "localhost"
-ca_certificate.file = {json.dumps(ca_certificate)}
-'''
-
-content = open(manifest).read()
-marker = "[local_server.backends]\n\n"
-if content.count(marker) != 1:
-    raise SystemExit("expected one local backend insertion target")
-content = content.replace(marker, f"{marker}{backend}\n", 1)
-open(manifest, "w").write(content)
-PYEOF
 
 python3 - "$WORK/fastly.toml" <<'PYEOF'
 import sys

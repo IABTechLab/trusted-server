@@ -103,6 +103,7 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::plan::validate_fastly_backend_bound;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
@@ -226,7 +227,7 @@ pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let plan = Arc::new(compile_auction_plan(&settings)?);
-    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
+    validate_fastly_backend_bound(&plan)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 

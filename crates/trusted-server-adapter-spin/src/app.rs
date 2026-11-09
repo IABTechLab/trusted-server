@@ -132,7 +132,6 @@ fn build_state_with_services(
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let plan = Arc::new(compile_auction_plan(&settings)?);
-    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
@@ -1103,14 +1102,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_rejects_multi_provider_auction_plan() {
-        let error = match build_state_with_settings(multi_provider_settings()) {
-            Ok(_) => panic!("Spin startup should reject multi-provider fanout"),
-            Err(error) => error,
-        };
-        assert!(
-            format!("{error:?}").contains("concurrent provider fanout"),
-            "should identify unsupported fanout: {error:?}"
+    fn cloudflare_and_spin_load_multi_provider_plan() {
+        let state = build_state_with_settings(multi_provider_settings())
+            .expect("should load a multi-provider auction plan on Spin");
+
+        assert_eq!(
+            state.orchestrator.provider_count(),
+            2,
+            "should fan out to both configured providers"
         );
     }
 

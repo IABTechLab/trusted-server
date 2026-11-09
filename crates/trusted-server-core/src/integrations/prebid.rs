@@ -13,8 +13,11 @@ use base64::{
     },
 };
 use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::outbound::OutboundResponse;
+#[cfg(test)]
+use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding};
 use error_stack::{Report, ResultExt};
-use http::header::HeaderValue;
+use http::header::{HeaderMap, HeaderValue};
 use http::{Method, StatusCode, header};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -48,18 +51,17 @@ use crate::integrations::{
     IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
 };
 #[cfg(test)]
-use crate::integrations::{
-    ensure_integration_backend_with_timeout, predict_integration_backend_name,
-};
-#[cfg(test)]
 use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt, ImpStoredRequest,
     OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
     TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
 #[cfg(test)]
-use crate::platform::PlatformHttpRequest;
-use crate::platform::{PlatformResponse, RuntimeServices};
+use crate::outbound::{
+    DEFAULT_BUFFERED_RESPONSE_BYTES, OutboundRequestSource, buffered, outbound_error,
+    outbound_request,
+};
+use crate::platform::RuntimeServices;
 use crate::proxy::{ProxyRequestConfig, is_host_allowed, proxy_request};
 #[cfg(test)]
 use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
@@ -2023,7 +2025,7 @@ fn non_empty_override_object(
 #[cfg(test)]
 fn copy_request_headers(
     from: &http::Request<EdgeBody>,
-    to: &mut http::Request<EdgeBody>,
+    to: &mut HeaderMap,
     consent_forwarding: ConsentForwardingMode,
     client_ip: Option<std::net::IpAddr>,
 ) {
@@ -2041,7 +2043,7 @@ fn copy_request_headers(
 /// Applies the common browser-header and consent-cookie policy for PBS.
 pub(crate) fn apply_prebid_transport_headers(
     from: &PrebidTransportHeaders,
-    to: &mut http::Request<EdgeBody>,
+    to: &mut HeaderMap,
     consent_forwarding: ConsentForwardingMode,
     client_ip: Option<std::net::IpAddr>,
 ) {
@@ -2065,7 +2067,7 @@ fn apply_prebid_header_values(
     user_agent: Option<&HeaderValue>,
     referer: Option<&HeaderValue>,
     accept_language: Option<&HeaderValue>,
-    to: &mut http::Request<EdgeBody>,
+    to: &mut HeaderMap,
     consent_forwarding: ConsentForwardingMode,
     client_ip: Option<std::net::IpAddr>,
 ) {
@@ -2075,24 +2077,23 @@ fn apply_prebid_header_values(
         (header::ACCEPT_LANGUAGE, accept_language),
     ] {
         if let Some(value) = value {
-            to.headers_mut().insert(name, value.clone());
+            to.insert(name, value.clone());
         }
     }
 
     if let Some(ip) = client_ip
         && let Ok(value) = HeaderValue::from_str(&ip.to_string())
     {
-        to.headers_mut()
-            .insert(header::HeaderName::from_static("x-forwarded-for"), value);
+        to.insert(header::HeaderName::from_static("x-forwarded-for"), value);
     }
 
     // Rebuild the destination header so no stale or arbitrary cookies survive.
-    to.headers_mut().remove(header::COOKIE);
+    to.remove(header::COOKIE);
     if consent_forwarding == ConsentForwardingMode::OpenrtbOnly {
         return;
     }
     if let Some(value) = consent_cookies.header() {
-        to.headers_mut().insert(header::COOKIE, value.clone());
+        to.insert(header::COOKIE, value.clone());
     }
 }
 
@@ -2281,11 +2282,10 @@ pub(crate) async fn parse_planned_prebid_response(
     provider_id: &str,
     profile: &PrebidProfilePlan,
     input: &ProviderAuctionInput,
-    response: PlatformResponse,
+    response: OutboundResponse,
     response_time_ms: u64,
     auction_id: &str,
 ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-    let response = response.response;
     let status = response.status();
     let content_type = response
         .headers()
@@ -3219,11 +3219,10 @@ impl PrebidAuctionProvider {
 
     async fn parse_response_inner(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
         auction_id: Option<&str>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        let response = response.response;
         let status = response.status();
         let content_type = response
             .headers()
@@ -3589,60 +3588,47 @@ impl AuctionProvider for PrebidAuctionProvider {
             }
         }
 
-        // Create HTTP request
-        let mut pbs_req = http::Request::builder()
-            .method(http::Method::POST)
-            .uri(self.auction_endpoint_url())
-            .body(EdgeBody::empty())
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to build Prebid request".to_string(),
-            })?;
-        copy_request_headers(
-            context.request,
-            &mut pbs_req,
-            self.config.consent_forwarding,
-            context.services.client_info().client_ip,
-        );
-
         let pbs_body = serde_json::to_vec(&openrtb).change_context(TrustedServerError::Prebid {
             message: "Failed to serialize Prebid request body".to_string(),
         })?;
+        let target = outbound_request(http::Method::POST, &self.auction_endpoint_url()).map_err(
+            |error| {
+                outbound_error(
+                    error,
+                    TrustedServerError::Prebid {
+                        message: "Failed to build Prebid request".to_string(),
+                    },
+                    OutboundRequestSource::Internal,
+                )
+            },
+        )?;
+        // Uses context.timeout_ms (auction-scoped) rather than the 15 s fixed
+        // timeout proxy endpoints use.
+        let mut pbs_req = buffered(
+            target,
+            Duration::from_millis(u64::from(context.timeout_ms)),
+            DEFAULT_BUFFERED_RESPONSE_BYTES,
+            ResponseDecoding::Decode,
+        )
+        .cache_policy(OutboundCachePolicy::Bypass)
+        .body(pbs_body);
+        copy_request_headers(
+            context.request,
+            pbs_req.headers_mut(),
+            self.config.consent_forwarding,
+            context.services.client_info().client_ip,
+        );
         pbs_req.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
-        *pbs_req.body_mut() = EdgeBody::from(pbs_body);
 
-        // Uses context.timeout_ms (auction-scoped) rather than the 15 s fixed
-        // timeout proxy endpoints use.
-        // Send request asynchronously with auction-scoped timeout
-        let backend_name = ensure_integration_backend_with_timeout(
-            context.services,
-            &self.config.server_url,
-            "prebid",
-            Duration::from_millis(u64::from(context.timeout_ms)),
-        )
-        .change_context(TrustedServerError::Auction {
-            message: format!(
-                "Failed to resolve backend for Prebid Server endpoint: {}",
-                self.config.server_url
-            ),
-        })?;
-        let pending = context
-            .services
-            .http_client()
-            .send_async(PlatformHttpRequest::new(pbs_req, backend_name).with_cache_bypass())
-            .await
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to send async request to Prebid Server".to_string(),
-            })?;
-
-        Ok(ProviderRequestOutcome::pending(pending))
+        Ok(ProviderRequestOutcome::ready(pbs_req))
     }
 
     async fn parse_response(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         self.parse_response_inner(response, response_time_ms, None)
@@ -3651,7 +3637,7 @@ impl AuctionProvider for PrebidAuctionProvider {
 
     async fn parse_response_with_context(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
         request: &AuctionRequest,
         _context: &AuctionContext<'_>,
@@ -3670,22 +3656,6 @@ impl AuctionProvider for PrebidAuctionProvider {
 
     fn is_enabled(&self) -> bool {
         self.config.enabled
-    }
-
-    fn backend_name(&self, services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
-        predict_integration_backend_name(
-            services,
-            &self.config.server_url,
-            PREBID_INTEGRATION_ID,
-            Duration::from_millis(u64::from(timeout_ms)),
-        )
-        .inspect_err(|e| {
-            log::error!(
-                "Failed to predict backend name for Prebid server URL '{}': {e:?}",
-                self.config.server_url
-            );
-        })
-        .ok()
     }
 }
 
@@ -3757,22 +3727,21 @@ mod tests {
     };
     use crate::platform::test_support::build_services_with_outbound_client;
     use crate::platform::test_support::{
-        HashMapConfigStore, HashMapSecretStore, NoopConfigStore, NoopGeo, NoopHttpClient,
-        NoopSecretStore, StubHttpClient, build_services_with_config_secret_and_http_client,
-        build_services_with_http_client, build_services_with_http_client_and_client_ip,
+        HashMapConfigStore, HashMapSecretStore, NoopHttpClient,
+        build_services_with_config_secret_and_http_client,
     };
-    use crate::platform::{
-        ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, RuntimeServices,
-    };
+
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::scripted_client::{
-        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
+        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock, outbound_response,
     };
     use crate::test_support::tests::create_test_settings;
     use base64::engine::general_purpose::STANDARD as TEST_BASE64_STANDARD;
     use bytes::Bytes;
-    use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding, ResponseMode};
+    use edgezero_core::outbound::{
+        OutboundCachePolicy, OutboundRequest, ResponseDecoding, ResponseMode,
+    };
     use http::Method;
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
@@ -3874,65 +3843,6 @@ mod tests {
         }
     }
 
-    struct PredictOnlyBackend;
-
-    impl PlatformBackend for PredictOnlyBackend {
-        fn naming_policy(&self) -> crate::platform::BackendNamingPolicy {
-            crate::platform::BackendNamingPolicy::Axum
-        }
-
-        fn predict_name(
-            &self,
-            spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<PlatformError>> {
-            Ok(format!(
-                "predicted_{}_{}_{}_{}",
-                spec.scheme,
-                spec.host,
-                spec.first_byte_timeout.as_millis(),
-                spec.between_bytes_timeout.as_millis()
-            ))
-        }
-
-        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            Ok("unused".to_string())
-        }
-    }
-
-    fn services_with_backend(backend: impl PlatformBackend + 'static) -> RuntimeServices {
-        RuntimeServices::builder()
-            .config_store(Arc::new(NoopConfigStore))
-            .secret_store(Arc::new(NoopSecretStore))
-            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(backend))
-            .http_client(Arc::new(NoopHttpClient))
-            .outbound_client(ScriptedHttpClient::forbidding().http_client())
-            .clock(TestClock::new().monotonic_clock())
-            .geo(Arc::new(NoopGeo))
-            .client_info(ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-                ..ClientInfo::default()
-            })
-            .build()
-    }
-
-    #[test]
-    fn prebid_backend_name_delegates_to_platform_backend_prediction() {
-        let provider = PrebidAuctionProvider::new(base_config());
-        let services = services_with_backend(PredictOnlyBackend);
-
-        let backend_name = provider
-            .backend_name(&services, 123)
-            .expect("should predict backend name through platform backend");
-
-        assert_eq!(
-            backend_name, "predicted_https_prebid.example_123_123",
-            "should cap both first-byte and between-bytes timeouts to the auction budget"
-        );
-    }
-
     fn test_sri(algorithm: &str, digest: &[u8]) -> String {
         format!("{algorithm}-{}", TEST_BASE64_STANDARD.encode(digest))
     }
@@ -3971,7 +3881,7 @@ mod tests {
         status: StatusCode,
         content_type: Option<&str>,
         body: impl Into<Vec<u8>>,
-    ) -> PlatformResponse {
+    ) -> OutboundResponse {
         prebid_platform_response_with_body(status, content_type, EdgeBody::from(body.into()))
     }
 
@@ -3979,13 +3889,13 @@ mod tests {
         status: StatusCode,
         content_type: Option<&str>,
         body: EdgeBody,
-    ) -> PlatformResponse {
+    ) -> OutboundResponse {
         let mut builder = http::Response::builder().status(status);
         if let Some(content_type) = content_type {
             builder = builder.header(header::CONTENT_TYPE, content_type);
         }
 
-        PlatformResponse::new(
+        outbound_response(
             builder
                 .body(body)
                 .expect("should build Prebid platform response"),
@@ -4030,12 +3940,8 @@ mod tests {
     }
 
     #[test]
-    fn prebid_provider_uses_platform_http_client_for_bid_request() {
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, br#"{"seatbid":[]}"#.to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
+    fn prebid_provider_returns_an_unsent_bid_request() {
+        let services = crate::platform::test_support::noop_services();
         let settings = make_settings();
         let provider = PrebidAuctionProvider::new(base_config());
         let auction_request = create_test_auction_request();
@@ -4048,7 +3954,6 @@ mod tests {
             settings: &settings,
             request: &http_req,
             timeout_ms: 500,
-            transport_timeout_ms: 500,
             provider_responses: None,
             services: &services,
         };
@@ -4056,28 +3961,25 @@ mod tests {
         let outcome =
             futures::executor::block_on(provider.request_bids(&auction_request, &context))
                 .expect("should start request");
-        let ProviderRequestOutcome::Pending { request, .. } = outcome else {
-            panic!("should return a pending Prebid request");
+        let ProviderRequestOutcome::Ready { request, .. } = outcome else {
+            panic!("should return an unsent Prebid request");
         };
 
-        assert!(
-            request.backend_name().is_some(),
-            "should preserve backend correlation"
+        assert_eq!(
+            (request.method(), request.uri().to_string()),
+            (&http::Method::POST, provider.auction_endpoint_url()),
+            "should build one POST to the auction endpoint"
         );
         assert_eq!(
-            stub.recorded_backend_names().len(),
-            1,
-            "should launch one upstream request through PlatformHttpClient"
+            request.into_parts().cache_policy,
+            OutboundCachePolicy::Bypass,
+            "should bypass caches for personalized bid traffic"
         );
     }
 
     #[test]
     fn request_bids_sets_trusted_server_request_host_to_publisher_domain_not_edge_host() {
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, br#"{"seatbid":[]}"#.to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
+        let services = crate::platform::test_support::noop_services();
         let settings = make_settings();
         let provider = PrebidAuctionProvider::new(base_config());
         let auction_request = create_test_auction_request();
@@ -4095,18 +3997,13 @@ mod tests {
             settings: &settings,
             request: &http_req,
             timeout_ms: 500,
-            transport_timeout_ms: 500,
             provider_responses: None,
             services: &services,
         };
 
-        futures::executor::block_on(provider.request_bids(&auction_request, &context))
-            .expect("should start request");
-
-        let bodies = stub.recorded_request_bodies();
-        assert_eq!(bodies.len(), 1, "should send one upstream PBS request");
-        let sent: Json =
-            serde_json::from_slice(&bodies[0]).expect("should parse sent OpenRTB request body");
+        let request = unsent_bid_request(&provider, &auction_request, &context);
+        let sent: Json = serde_json::from_slice(&request_body(request))
+            .expect("should parse sent OpenRTB request body");
         let request_host = sent["ext"]["trusted_server"]["request_host"]
             .as_str()
             .expect("should set ext.trusted_server.request_host");
@@ -4114,6 +4011,29 @@ mod tests {
             request_host, auction_request.publisher.domain,
             "request_host should be the publisher domain, not the edge Host header"
         );
+    }
+
+    /// Runs the provider's `request_bids` and returns the request it built, unsent.
+    fn unsent_bid_request(
+        provider: &PrebidAuctionProvider,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+    ) -> OutboundRequest {
+        let outcome = futures::executor::block_on(provider.request_bids(request, context))
+            .expect("should build the PBS request");
+        let ProviderRequestOutcome::Ready { request, .. } = outcome else {
+            panic!("should return an unsent PBS request");
+        };
+        request
+    }
+
+    /// The buffered body of an unsent request.
+    fn request_body(request: OutboundRequest) -> Bytes {
+        request
+            .into_parts()
+            .body
+            .into_bytes()
+            .expect("should buffer the PBS request body")
     }
 
     fn create_test_auction_context<'a>(
@@ -7599,7 +7519,6 @@ external_bundle_sri = "sha384-AAAA"
             settings: &settings,
             request: &http_req,
             timeout_ms: 1000,
-            transport_timeout_ms: 1000,
             provider_responses: None,
             services: &services,
         };
@@ -9590,7 +9509,7 @@ set = { networkId = 42 }
                 ])),
             ),
         ] {
-            let expected_status = response.response.status().as_u16();
+            let expected_status = response.status().as_u16();
             let parsed = futures::executor::block_on(parse_planned_prebid_response(
                 "pbs-instance",
                 &profile,
@@ -9927,7 +9846,7 @@ set = { networkId = 42 }
 
         apply_prebid_transport_headers(
             routed.prebid_transport_headers(),
-            &mut outbound,
+            outbound.headers_mut(),
             ConsentForwardingMode::OpenrtbOnly,
             routed.attested_client_ip(),
         );
@@ -10010,7 +9929,7 @@ set = { networkId = 42 }
                     .headers_mut()
                     .append(header::COOKIE, HeaderValue::from_static("another=secret"));
 
-                copy_request_headers(&inbound, &mut outbound, mode, None);
+                copy_request_headers(&inbound, outbound.headers_mut(), mode, None);
 
                 let expected = if mode == ConsentForwardingMode::OpenrtbOnly {
                     None
@@ -10042,7 +9961,7 @@ set = { networkId = 42 }
                 );
                 let mut outbound = http::Request::new(EdgeBody::empty());
 
-                copy_request_headers(&inbound, &mut outbound, mode, None);
+                copy_request_headers(&inbound, outbound.headers_mut(), mode, None);
 
                 assert!(
                     !outbound.headers().contains_key(header::COOKIE),
@@ -10160,7 +10079,7 @@ set = { networkId = 42 }
 
         copy_request_headers(
             &from,
-            &mut to,
+            to.headers_mut(),
             ConsentForwardingMode::Both,
             Some(std::net::IpAddr::from([203, 0, 113, 7])),
         );
@@ -10193,7 +10112,7 @@ set = { networkId = 42 }
             .body(EdgeBody::empty())
             .expect("should build outbound request");
 
-        copy_request_headers(&from, &mut to, ConsentForwardingMode::Both, None);
+        copy_request_headers(&from, to.headers_mut(), ConsentForwardingMode::Both, None);
 
         assert!(
             !to.headers().contains_key("x-forwarded-for"),
@@ -10238,10 +10157,7 @@ set = { networkId = 42 }
                 None,
             ),
         ] {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(204, Vec::new());
-            let services = build_services_with_http_client_and_client_ip(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            let services = crate::platform::test_support::noop_services_with_client_ip(
                 std::net::IpAddr::from([203, 0, 113, 9]),
             );
             let settings = make_settings();
@@ -10265,17 +10181,17 @@ set = { networkId = 42 }
                 settings: &settings,
                 request: &inbound,
                 timeout_ms: 321,
-                transport_timeout_ms: 321,
                 provider_responses: None,
                 services: &services,
             };
 
-            futures::executor::block_on(provider.request_bids(&auction_request, &context))
-                .expect("should dispatch PBS request");
-
-            let headers = stub.recorded_request_header_bytes();
-            assert_eq!(headers.len(), 1, "should dispatch one request");
-            let headers = &headers[0];
+            let request = unsent_bid_request(&provider, &auction_request, &context);
+            let headers = request
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+                .collect::<Vec<_>>();
+            let headers = &headers;
             assert_eq!(
                 header_value(headers, "referer"),
                 Some(b"https://referrer.example/story?fictional=1".as_slice())
@@ -10295,12 +10211,8 @@ set = { networkId = 42 }
             );
             assert_eq!(header_value(headers, "cookie"), expected_cookie);
 
-            let body = stub
-                .recorded_request_bodies()
-                .into_iter()
-                .next()
-                .expect("should capture PBS request body");
-            let body: Json = serde_json::from_slice(&body).expect("should parse PBS request body");
+            let body: Json = serde_json::from_slice(&request_body(request))
+                .expect("should parse PBS request body");
             assert_eq!(
                 body["site"]["ref"], "https://referrer.example/story?fictional=1",
                 "should place the raw Referer in PBS site.ref as well as forwarding it"
@@ -10327,7 +10239,6 @@ set = { networkId = 42 }
             settings: &settings,
             request: &inbound,
             timeout_ms: 321,
-            transport_timeout_ms: 321,
             provider_responses: None,
             services: &services,
         };

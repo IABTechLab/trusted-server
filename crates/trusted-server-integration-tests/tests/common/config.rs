@@ -178,6 +178,53 @@ pub fn cloudflare_auction_config_json(origin_port: u16) -> TestResult<String> {
     cloudflare_binding_json(&serde_json::json!({ CONFIG_BLOB_KEY: envelope }))
 }
 
+/// One standard `OpenRTB` provider an auction fixture routes every eligible slot to.
+pub struct AuctionBidderFixture {
+    /// Provider ID.
+    pub id: String,
+    /// Provider endpoint, such as a loopback bidder's `http://127.0.0.1:<port>/bid`.
+    pub endpoint: String,
+    /// Configured provider timeout.
+    pub timeout_ms: u32,
+}
+
+/// Builds the integration app-config envelope with the auction enabled over `bidders`.
+///
+/// The fixture's own providers and bidder routes are replaced, so only `bidders` take part.
+///
+/// # Errors
+///
+/// Returns a fixture-generation error when configuration validation fails.
+pub fn auction_app_config_envelope(
+    origin_port: u16,
+    bidders: &[AuctionBidderFixture],
+    auction_timeout_ms: u32,
+) -> TestResult<String> {
+    let mut providers = toml::Table::new();
+    for bidder in bidders {
+        let provider: toml::Table = toml::from_str(&format!(
+            "protocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"{}\"\ntimeout_ms = {}\nrouting = \"all_eligible\"\n",
+            bidder.endpoint, bidder.timeout_ms
+        ))
+        .map_err(|error| {
+            Report::new(TestError::ConfigGeneration)
+                .attach(format!("invalid auction bidder fixture: {error}"))
+        })?;
+        providers.insert(bidder.id.clone(), toml::Value::Table(provider));
+    }
+    app_config_envelope(origin_port, false, |table| {
+        let auction = table_mut(table, "auction")?;
+        auction.insert("enabled".to_string(), toml::Value::Boolean(true));
+        auction.insert(
+            "timeout_ms".to_string(),
+            toml::Value::Integer(i64::from(auction_timeout_ms)),
+        );
+        auction.insert("providers".to_string(), toml::Value::Table(providers));
+        auction.remove("bidders");
+        Ok(())
+    })
+}
+
 fn table_mut<'a>(table: &'a mut toml::Table, key: &str) -> TestResult<&'a mut toml::Table> {
     table
         .get_mut(key)

@@ -9,11 +9,19 @@
 //! batch is the batch start. A reply that has not arrived by its request's deadline times out at
 //! that deadline. A batch drops a slot that ends at or after its cutoff, and the slot is
 //! `Unresolved`, as `EdgeZero`'s batch ledger does. A test that waits on a future reply advances
-//! the clock between polls, or from a future it polls alongside the waiting one.
+//! the clock between polls, or lets [`TestClock::drive`] advance it to each instant something
+//! waits on.
+//!
+//! The double's [`OutboundBatch::check`](edgezero_core::outbound::OutboundBatch::check) reports a
+//! reply as soon as the test clock reaches its
+//! arrival, which is more eager than Fastly's, where a check reports only what an earlier
+//! `EdgeZero` poll recorded.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io;
 use std::mem;
+use std::pin::pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -25,9 +33,9 @@ use edgezero_core::body::{Body, BodyPayload};
 use edgezero_core::error::{EdgeError, RequestBodyOverflowOrigin};
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use edgezero_core::outbound::{
-    HttpClient, IndependentOutboundProgress, OutboundBatch, OutboundBatchDriverEvent,
-    OutboundCachePolicy, OutboundDispatchRequest, OutboundExchangeOwner, OutboundFuture,
-    OutboundHead, OutboundHeaderFidelity, OutboundHeaderInput, OutboundHttpClient,
+    ContentTypeProvenance, HttpClient, IndependentOutboundProgress, OutboundBatch,
+    OutboundBatchDriverEvent, OutboundCachePolicy, OutboundDispatchRequest, OutboundExchangeOwner,
+    OutboundFuture, OutboundHead, OutboundHeaderFidelity, OutboundHeaderInput, OutboundHttpClient,
     OutboundImageOptimizerOptions, OutboundPending, OutboundPreparedBatch, OutboundProgressRuntime,
     OutboundProxyMarker, OutboundRequest, OutboundRequestParts, OutboundResponse,
     OutboundResponseContext, OutboundSendMode, OutboundTime, ResponseDecoding, ResponseMode,
@@ -56,7 +64,8 @@ const PROCESS_CLOCK_OFFSET: Duration = Duration::from_hours(1);
 
 struct ClockState {
     now: MonotonicInstant,
-    waiters: Vec<Waker>,
+    /// Wakers waiting for the clock, each with the instant it waits for.
+    waiters: Vec<(MonotonicInstant, Waker)>,
 }
 
 impl TestClock {
@@ -114,11 +123,51 @@ impl TestClock {
                 .expect("should advance the test clock within the platform clock range");
             mem::take(&mut state.waiters)
         };
-        waiters.into_iter().for_each(Waker::wake);
+        waiters
+            .into_iter()
+            .for_each(|(_instant, waker)| waker.wake());
+    }
+
+    /// Polls `future` to completion, advancing the clock whenever it can make no progress.
+    ///
+    /// Each time `future` is pending and has not woken itself, the clock moves to the earliest
+    /// instant a timer or scripted reply waits on. Time therefore moves only as far as the code
+    /// under test waits, and no test sleeps.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `future` is pending while nothing waits on the clock, such as a future that only
+    /// waits on a held reply, because no amount of time would finish it.
+    pub fn drive<F: Future>(&self, future: F) -> F::Output {
+        let woken = Arc::new(WakeFlag(AtomicBool::new(true)));
+        let waker = Waker::from(Arc::clone(&woken));
+        let mut context = Context::from_waker(&waker);
+        let mut future = pin!(future);
+        loop {
+            if woken.0.swap(false, Ordering::SeqCst) {
+                if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                    return output;
+                }
+                continue;
+            }
+            let next = self
+                .next_waited_instant()
+                .expect("should only drive a future that waits on the test clock");
+            self.advance(next.saturating_duration_since(self.now()));
+        }
     }
 
     fn now(&self) -> MonotonicInstant {
         lock(&self.state).now
+    }
+
+    /// Returns the earliest instant a registered waker waits for.
+    fn next_waited_instant(&self) -> Option<MonotonicInstant> {
+        lock(&self.state)
+            .waiters
+            .iter()
+            .map(|(instant, _waker)| *instant)
+            .min()
     }
 
     /// Reports whether the clock has reached `instant`, or arranges a wakeup when it does.
@@ -127,7 +176,13 @@ impl TestClock {
         if state.now >= instant {
             return Poll::Ready(());
         }
-        register(&mut state.waiters, waker);
+        if !state
+            .waiters
+            .iter()
+            .any(|(waited, waiter)| *waited == instant && waiter.will_wake(waker))
+        {
+            state.waiters.push((instant, waker.clone()));
+        }
         Poll::Pending
     }
 }
@@ -149,6 +204,7 @@ pub struct ScriptedReply {
     delay: Duration,
     hold: Option<Hold>,
     body_polls: Option<Arc<AtomicUsize>>,
+    fails_batch: bool,
 }
 
 impl ScriptedReply {
@@ -162,6 +218,19 @@ impl ScriptedReply {
     #[must_use]
     pub fn error(error: EdgeError) -> Self {
         Self::with_outcome(Err(error))
+    }
+
+    /// A failure of the whole batch driver, at this slot's arrival.
+    ///
+    /// In a batch, the driver reports `error` when this reply would arrive and observes nothing
+    /// after it, as a provider whose batch driver breaks. Outside a batch the request fails with
+    /// `error`, as [`ScriptedReply::error`] does.
+    #[must_use]
+    pub fn failing_batch(error: EdgeError) -> Self {
+        Self {
+            fails_batch: true,
+            ..Self::with_outcome(Err(error))
+        }
     }
 
     /// Appends one response header.
@@ -226,6 +295,7 @@ impl ScriptedReply {
             delay: Duration::ZERO,
             hold: None,
             body_polls: None,
+            fails_batch: false,
         }
     }
 
@@ -265,6 +335,15 @@ impl ReplyRelease {
     /// Lets the held reply arrive now, or at its [`ScriptedReply::after`] delay if that is later.
     pub fn release(self) {
         self.hold.release();
+    }
+
+    /// Reports whether the held reply is still queued or still awaited by a scheduled exchange.
+    ///
+    /// It turns false once the request was dispatched and its exchange dropped, as when the
+    /// code under test cancels the request.
+    #[must_use]
+    pub fn is_awaited(&self) -> bool {
+        Arc::strong_count(&self.hold.0) > 1
     }
 }
 
@@ -306,6 +385,10 @@ pub struct RecordedRequest {
     pub host_authority: String,
     /// Whether the request overrides its URI authority upstream.
     pub has_host_authority_override: bool,
+    /// The facade operation that dispatched the request.
+    pub mode: OutboundSendMode,
+    /// The effective budget the facade selected, a batch cutoff included.
+    pub budget: DispatchBudget,
 }
 
 /// Transport settings a readback test expects one recorded request to carry.
@@ -461,7 +544,11 @@ pub struct ScriptedHttpClient {
     clock: TestClock,
     forbid: bool,
     state: Arc<Mutex<ScriptState>>,
+    observer: Option<RequestObserver>,
 }
+
+/// A test callback that sees each request as the scripted client records it.
+type RequestObserver = Arc<dyn Fn(&RecordedRequest) + Send + Sync>;
 
 #[derive(Default)]
 struct ScriptState {
@@ -477,7 +564,22 @@ impl ScriptedHttpClient {
             clock: clock.clone(),
             forbid: false,
             state: Arc::default(),
+            observer: None,
         }
+    }
+
+    /// Calls `observer` with each request as the client records it.
+    ///
+    /// A test uses it to see what else had happened when a request left, such as the calls
+    /// another double had received by then. The observer runs outside the client's lock, so it
+    /// may read this client.
+    #[must_use]
+    pub fn with_request_observer(
+        mut self,
+        observer: impl Fn(&RecordedRequest) + Send + Sync + 'static,
+    ) -> Self {
+        self.observer = Some(Arc::new(observer));
+        self
     }
 
     /// Creates a client that fails every request it receives.
@@ -558,6 +660,7 @@ impl ScriptedHttpClient {
                 .unwrap_or_else(|| budget.deadline.instant()),
             budget,
             hold: reply.hold.clone(),
+            fails_batch: reply.fails_batch,
         };
         Scheduled {
             arrival,
@@ -599,7 +702,15 @@ impl ScriptedHttpClient {
                     ScriptedReply::error(internal(format!("unscripted request {method} {uri}")))
                 })
         };
+        let observed = self
+            .observer
+            .as_ref()
+            .map(|observer| (observer, recorded.clone()));
         state.requests.push(recorded);
+        drop(state);
+        if let Some((observer, recorded)) = observed {
+            observer(&recorded);
+        }
         reply
     }
 }
@@ -681,6 +792,8 @@ impl Dispatched {
         let host_authority = request.request().host_authority().to_owned();
         let has_host_authority_override = request.request().has_host_authority_override();
         let (parts, context) = request.into_parts();
+        let mode = context.mode();
+        let budget = context.budget();
         let OutboundRequestParts {
             body,
             cache_policy,
@@ -717,6 +830,8 @@ impl Dispatched {
                 proxy_marker,
                 host_authority,
                 has_host_authority_override,
+                mode,
+                budget,
             },
             body,
             max_request_body_bytes,
@@ -754,6 +869,8 @@ struct Arrival {
     at: MonotonicInstant,
     budget: DispatchBudget,
     hold: Option<Hold>,
+    /// Whether the reply's arrival fails the batch driver instead of resolving its slot.
+    fails_batch: bool,
 }
 
 /// The first event that ends a scripted exchange, at its test-clock instant.
@@ -827,6 +944,13 @@ impl BatchDriver {
         };
         let (index, slot) = self.slots.remove(position);
         let completed_at = terminal.instant();
+        if slot.arrival.fails_batch && matches!(terminal, Terminal::Arrived(_)) {
+            self.slots.clear();
+            let error = slot
+                .settle(terminal)
+                .expect_err("should script a batch failure as an error");
+            return Poll::Ready(Some(OutboundBatchDriverEvent::Failed(error)));
+        }
         self.late |= self.cutoff.is_expired_at(completed_at)
             && !slot
                 .arrival
@@ -943,6 +1067,23 @@ async fn collect_upload(body: Body, max_request_body_bytes: u64) -> Result<Bytes
     Ok(collected.freeze())
 }
 
+/// Wraps `response` as the [`OutboundResponse`] a POST that `EdgeZero` sent would return.
+///
+/// Parser tests use it to hand a provider a response without dispatching a request. The status,
+/// headers, and body are kept as given, and the response's clock is a fresh [`TestClock`].
+#[must_use]
+pub fn outbound_response(response: edgezero_core::http::Response) -> OutboundResponse {
+    let (parts, body) = response.into_parts();
+    OutboundResponse::new(
+        Method::POST,
+        parts.status,
+        parts.headers,
+        body,
+        TestClock::new().monotonic_clock(),
+        ContentTypeProvenance::Unknown,
+    )
+}
+
 fn internal(message: String) -> EdgeError {
     EdgeError::internal(io::Error::other(message))
 }
@@ -966,8 +1107,8 @@ mod tests {
 
     use edgezero_core::error::BudgetSource;
     use edgezero_core::outbound::{
-        OutboundBatchCheck, OutboundBatchTermination, OutboundCollectedSlot, OutboundImageFormat,
-        OutboundImageOptimizerRegion,
+        OutboundBatchCheck, OutboundBatchNext, OutboundBatchTermination, OutboundCollectedSlot,
+        OutboundImageFormat, OutboundImageOptimizerRegion,
     };
     use futures::executor::block_on;
 
@@ -1510,6 +1651,261 @@ mod tests {
         assert!(
             matches!(at_deadline, Poll::Ready(Ok(()))),
             "should resolve once the clock reaches the deadline, got {at_deadline:?}"
+        );
+    }
+
+    #[test]
+    fn per_call_timeout_before_cutoff_stays_a_gateway_timeout_in_a_completed_batch() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::GET,
+            &uri("/slow"),
+            ScriptedReply::status(StatusCode::OK).after(Duration::from_millis(300)),
+        );
+        let cutoff = clock
+            .monotonic_clock()
+            .deadline_after(Duration::from_millis(500));
+
+        let batch = client.http_client().start_batch_until(
+            vec![get("/slow").timeout(Duration::from_millis(100))],
+            cutoff,
+        );
+        let (slots, termination) = clock
+            .drive(batch.collect())
+            .expect("should collect the batch")
+            .into_parts();
+
+        assert_eq!(
+            termination,
+            OutboundBatchTermination::Completed,
+            "should complete when the only slot ends on its own timeout before the cutoff"
+        );
+        let [OutboundCollectedSlot::Resolved(slow)] = &slots[..] else {
+            panic!("should resolve the timed-out slot: {slots:?}");
+        };
+        assert!(
+            matches!(
+                slow.outcome,
+                Err(EdgeError::GatewayTimeout {
+                    cause: BudgetSource::PerCallTimeout,
+                    ..
+                })
+            ),
+            "should keep the per-call timeout as the slot's outcome, got {:?}",
+            slow.outcome
+        );
+        assert_eq!(
+            slow.elapsed,
+            Duration::from_millis(100),
+            "should time the slot to its own deadline"
+        );
+    }
+
+    #[test]
+    fn check_reports_a_fast_arrival_then_pending_before_the_cutoff() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client
+            .respond_to(
+                Method::GET,
+                &uri("/fast"),
+                ScriptedReply::status(StatusCode::OK).after(Duration::from_millis(100)),
+            )
+            .respond_to(
+                Method::GET,
+                &uri("/slow"),
+                ScriptedReply::status(StatusCode::OK).after(Duration::from_millis(600)),
+            );
+        let cutoff = clock
+            .monotonic_clock()
+            .deadline_after(Duration::from_millis(500));
+
+        let mut batch = client
+            .http_client()
+            .start_batch_until(vec![get("/fast"), get("/slow")], cutoff);
+        clock.advance(Duration::from_millis(100));
+        let first = batch.check().expect("should check the batch");
+        let second = batch.check().expect("should check the batch again");
+
+        let OutboundBatchCheck::Item(item) = first else {
+            panic!("should report the fast arrival first, got {first:?}");
+        };
+        assert_eq!(item.index(), 0, "should report the fast slot");
+        assert!(
+            matches!(second, OutboundBatchCheck::Pending),
+            "should report pending while the slow slot is still in flight, got {second:?}"
+        );
+    }
+
+    #[test]
+    fn held_slot_released_before_the_cutoff_resolves() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        let (reply, release) = ScriptedReply::status(StatusCode::OK).body("bid").held();
+        client.respond_to(Method::GET, &uri("/held"), reply);
+        let cutoff = clock
+            .monotonic_clock()
+            .deadline_after(Duration::from_millis(500));
+
+        let mut batch = client
+            .http_client()
+            .start_batch_until(vec![get("/held")], cutoff);
+        clock.advance(Duration::from_millis(200));
+        let while_held = batch.check().expect("should check the held batch");
+        release.release();
+        let next = clock
+            .drive(batch.next())
+            .expect("should observe the released slot");
+        let finished = clock.drive(batch.next()).expect("should finish the batch");
+
+        assert!(
+            matches!(while_held, OutboundBatchCheck::Pending),
+            "should keep the held slot pending, got {while_held:?}"
+        );
+        let OutboundBatchNext::Item(item) = next else {
+            panic!("should resolve the released slot, got {next:?}");
+        };
+        let (index, result) = item.into_parts();
+        assert_eq!(
+            (index, result.elapsed),
+            (0, Duration::from_millis(200)),
+            "should time the released slot to its release"
+        );
+        assert_eq!(
+            body_of(&result.outcome.expect("should answer the released slot")),
+            b"bid",
+            "should deliver the released body"
+        );
+        assert!(
+            matches!(
+                finished,
+                OutboundBatchNext::Finished(OutboundBatchTermination::Completed)
+            ),
+            "should complete once the released slot resolves, got {finished:?}"
+        );
+    }
+
+    #[test]
+    fn held_reply_is_no_longer_awaited_once_its_batch_is_cancelled() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        let (reply, release) = ScriptedReply::status(StatusCode::OK).held();
+        client.respond_to(Method::GET, &uri("/held"), reply);
+        let cutoff = clock
+            .monotonic_clock()
+            .deadline_after(Duration::from_secs(1));
+
+        let batch = client
+            .http_client()
+            .start_batch_until(vec![get("/held")], cutoff);
+        let awaited_in_flight = release.is_awaited();
+        let undelivered = batch.cancel();
+
+        assert!(
+            awaited_in_flight,
+            "should await the held reply while its slot is in flight"
+        );
+        assert_eq!(undelivered, vec![0], "should report the undelivered slot");
+        assert!(
+            !release.is_awaited(),
+            "should drop the exchange that awaited the held reply"
+        );
+    }
+
+    #[test]
+    fn batch_requests_record_batch_mode_and_cutoff_capped_budget() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::GET,
+            &uri("/bid"),
+            ScriptedReply::status(StatusCode::OK),
+        );
+        let cutoff = clock
+            .monotonic_clock()
+            .deadline_after(Duration::from_millis(500));
+
+        let batch = client
+            .http_client()
+            .start_batch_until(vec![get("/bid").timeout(Duration::from_secs(2))], cutoff);
+        drop(
+            clock
+                .drive(batch.collect())
+                .expect("should collect the batch"),
+        );
+
+        let recorded = client.requests();
+        assert_eq!(recorded.len(), 1, "should record the batch request");
+        assert_eq!(
+            (
+                recorded[0].mode,
+                recorded[0].budget.cause,
+                recorded[0].budget.deadline.instant()
+            ),
+            (
+                OutboundSendMode::Batch,
+                BudgetSource::BatchCutoff,
+                cutoff.instant()
+            ),
+            "should record the batch mode and the cutoff that caps the longer timeout"
+        );
+    }
+
+    #[test]
+    fn request_observer_sees_each_request_as_it_is_recorded() {
+        let clock = TestClock::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = {
+            let seen = Arc::clone(&seen);
+            ScriptedHttpClient::new(&clock).with_request_observer(move |request| {
+                lock(&seen).push(request.uri.to_string());
+            })
+        };
+        client.respond_to(
+            Method::GET,
+            &uri("/observed"),
+            ScriptedReply::status(StatusCode::OK),
+        );
+
+        block_on(client.http_client().send(get("/observed")))
+            .expect("should answer the observed request");
+
+        assert_eq!(
+            *lock(&seen),
+            vec![uri("/observed")],
+            "should call the observer once with the recorded request"
+        );
+    }
+
+    #[test]
+    fn drive_advances_the_clock_only_as_far_as_the_future_waits() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::GET,
+            &uri("/delayed"),
+            ScriptedReply::status(StatusCode::OK).after(Duration::from_secs(2)),
+        );
+        let started = clock.now();
+
+        let response = clock
+            .drive(
+                client
+                    .http_client()
+                    .send(get("/delayed").timeout(Duration::from_secs(5))),
+            )
+            .expect("should answer once the reply arrives");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should deliver the reply"
+        );
+        assert_eq!(
+            clock.now().saturating_duration_since(started),
+            Duration::from_secs(2),
+            "should advance exactly to the reply's arrival"
         );
     }
 

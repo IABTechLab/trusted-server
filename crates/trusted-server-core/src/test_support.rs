@@ -275,25 +275,27 @@ pub mod nextjs_auction {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
+    use edgezero_core::time::MonotonicClock;
     use error_stack::Report;
     use flate2::{read::GzDecoder, write::GzEncoder};
+    use http::{Method, StatusCode};
 
     use crate::geo::GeoInfo;
     use crate::platform::{
-        BackendNamingPolicy, ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-        PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
+        BackendNamingPolicy, ClientInfo, HttpClient, PlatformBackend, PlatformBackendSpec,
+        PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
         PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
         RuntimeServices, StoreId, StoreName, UnavailableKvStore,
     };
     use crate::settings::Settings;
-    use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
+    use crate::test_support::scripted_client::{ScriptedHttpClient, ScriptedReply, TestClock};
 
     /// Publisher host the fixture settings serve.
     pub const PUBLISHER_HOST: &str = "test-publisher.example.com";
     /// Upstream host the fixture origin answers for.
     pub const ORIGIN_HOST: &str = "origin.test-publisher.example.com";
-    /// Auction endpoint host the fixture bidder answers for.
-    pub const AUCTION_HOST: &str = "auction.example.com";
+    /// Bid endpoint of the fixture auction provider, where its scripted bidder answers.
+    pub const AUCTION_ENDPOINT: &str = "https://auction.example.com/bid";
 
     /// Settings that enable the Next.js integration and a single auction provider.
     ///
@@ -335,7 +337,7 @@ pub mod nextjs_auction {
         settings.auction.providers = serde_json::from_value(serde_json::json!({
             "fixture": {
                 "protocol": "openrtb-2.6",
-                "endpoint": "https://auction.example.com/bid",
+                "endpoint": AUCTION_ENDPOINT,
                 "routing": "all_eligible",
                 "timeout_ms": 5000
             }
@@ -520,13 +522,64 @@ pub mod nextjs_auction {
         );
     }
 
-    /// Upstream that serves [`origin_html`] and one deterministic bid.
-    #[derive(Default)]
+    /// Publisher origin that serves [`origin_html`], with a scripted bidder that
+    /// answers every bid request at [`AUCTION_ENDPOINT`] with one deterministic bid.
+    ///
+    /// [`services`] sends the auction through the bidder and reads time from the
+    /// clock its replies arrive on.
     pub struct NextJsAuctionOrigin {
-        auction_requests: AtomicUsize,
+        clock: TestClock,
+        bidder: ScriptedHttpClient,
+        auction_requests: Arc<AtomicUsize>,
         html_response: Option<Vec<u8>>,
         gzip: bool,
         streaming: bool,
+    }
+
+    impl Default for NextJsAuctionOrigin {
+        fn default() -> Self {
+            let clock = TestClock::new();
+            let auction_requests = Arc::new(AtomicUsize::new(0));
+            let script = ScriptedHttpClient::new(&clock);
+            let rearm = script.clone();
+            let counted = Arc::clone(&auction_requests);
+            // The scripted client spends each reply on one request, so every bid
+            // request queues the reply the next auction takes.
+            let bidder = script.with_request_observer(move |request| {
+                if request.method == Method::POST && request.uri == AUCTION_ENDPOINT {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    queue_fixture_bid(&rearm);
+                }
+            });
+            queue_fixture_bid(&bidder);
+            Self {
+                clock,
+                bidder,
+                auction_requests,
+                html_response: None,
+                gzip: false,
+                streaming: false,
+            }
+        }
+    }
+
+    /// Queues the fixture bid for the next bid request `bidder` receives.
+    fn queue_fixture_bid(bidder: &ScriptedHttpClient) {
+        let bid = serde_json::json!({
+            "id": "fixture-auction",
+            "seatbid": [{"seat": "example", "bid": [{
+                "id": "fixture-bid", "impid": "fixture-slot", "price": 1.25,
+                "adm": "<div>fixture-creative</div>", "w": 300, "h": 250,
+                "crid": "example-creative", "adomain": ["advertiser.example.com"]
+            }]}]
+        });
+        bidder.respond_to(
+            Method::POST,
+            AUCTION_ENDPOINT,
+            ScriptedReply::status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(bid.to_string()),
+        );
     }
 
     impl NextJsAuctionOrigin {
@@ -555,13 +608,13 @@ pub mod nextjs_auction {
             }
         }
 
-        /// Number of auction requests this fixture has answered.
+        /// Number of bid requests the fixture bidder has received.
         #[must_use]
         pub fn auction_requests(&self) -> usize {
             self.auction_requests.load(Ordering::SeqCst)
         }
 
-        /// Forget the recorded auction requests.
+        /// Forget the recorded bid requests.
         pub fn reset_auction_requests(&self) {
             self.auction_requests.store(0, Ordering::SeqCst);
         }
@@ -577,42 +630,19 @@ pub mod nextjs_auction {
             &self,
             request: PlatformHttpRequest,
         ) -> Result<PlatformResponse, Report<PlatformError>> {
-            let (content_type, body) = match request.request.uri().host() {
-                Some(ORIGIN_HOST) => ("text/html", origin_html()),
-                Some(AUCTION_HOST) => {
-                    self.auction_requests.fetch_add(1, Ordering::SeqCst);
-                    (
-                        "application/json",
-                        serde_json::json!({
-                            "id": "fixture-auction",
-                            "seatbid": [{"seat": "example", "bid": [{
-                                "id": "fixture-bid", "impid": "fixture-slot", "price": 1.25,
-                                "adm": "<div>fixture-creative</div>", "w": 300, "h": 250,
-                                "crid": "example-creative", "adomain": ["advertiser.example.com"]
-                            }]}]
-                        })
-                        .to_string(),
-                    )
-                }
-                host => {
-                    return Err(Report::new(PlatformError::HttpClient)
-                        .attach(format!("unexpected fixture upstream: {host:?}")));
-                }
-            };
-            let canned_origin =
-                request.request.uri().host() == Some(ORIGIN_HOST) && self.html_response.is_some();
-            let bytes = if canned_origin {
-                self.html_response
-                    .as_ref()
-                    .expect("should have canned response")
-                    .clone()
-            } else {
-                body.into_bytes()
-            };
+            let host = request.request.uri().host();
+            if host != Some(ORIGIN_HOST) {
+                return Err(Report::new(PlatformError::HttpClient)
+                    .attach(format!("unexpected fixture upstream: {host:?}")));
+            }
+            let bytes = self
+                .html_response
+                .clone()
+                .unwrap_or_else(|| origin_html().into_bytes());
             let mut response = http::Response::builder()
                 .status(200)
-                .header("content-type", content_type);
-            if canned_origin && self.gzip {
+                .header("content-type", "text/html");
+            if self.html_response.is_some() && self.gzip {
                 response = response.header("content-encoding", "gzip");
             }
             let body = if request.stream_response && self.streaming {
@@ -631,34 +661,18 @@ pub mod nextjs_auction {
 
         async fn send_async(
             &self,
-            request: PlatformHttpRequest,
+            _request: PlatformHttpRequest,
         ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            let backend = request.backend_name.clone();
-            Ok(PlatformPendingRequest::new(request).with_backend_name(backend))
-        }
-
-        async fn select_until(
-            &self,
-            pending_requests: Vec<PlatformPendingRequest>,
-            _deadline: web_time::Instant,
-        ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
-            // All fixture responses are deterministic and already available.
-            self.select(pending_requests).await.map(Some)
+            Err(Report::new(PlatformError::Unsupported)
+                .attach("the fixture origin serves no pending requests"))
         }
 
         async fn select(
             &self,
-            mut pending_requests: Vec<PlatformPendingRequest>,
+            _pending_requests: Vec<PlatformPendingRequest>,
         ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            let request = pending_requests
-                .remove(0)
-                .downcast::<PlatformHttpRequest>()
-                .expect("should recover fixture pending request");
-            Ok(PlatformSelectResult {
-                ready: self.send(request).await,
-                remaining: pending_requests,
-                failed_backend_name: None,
-            })
+            Err(Report::new(PlatformError::Unsupported)
+                .attach("the fixture origin serves no pending requests"))
         }
     }
 
@@ -747,24 +761,40 @@ pub mod nextjs_auction {
         }
     }
 
-    /// Runtime services wired to `client`, with every other platform capability
-    /// stubbed out.
+    /// Runtime services wired to `client`, with its scripted bidder as the outbound
+    /// client and every other platform capability stubbed out.
     #[must_use]
     pub fn services(client: Arc<NextJsAuctionOrigin>) -> RuntimeServices {
-        services_with_http_client(client)
+        let outbound_client = client.bidder.http_client();
+        let clock = client.clock.monotonic_clock();
+        fixture_services(client, outbound_client, clock)
     }
 
     /// Build fixture runtime services with a custom asynchronous upstream.
+    ///
+    /// The outbound client fails every request it receives.
     #[must_use]
     pub fn services_with_http_client(client: Arc<dyn PlatformHttpClient>) -> RuntimeServices {
+        fixture_services(
+            client,
+            ScriptedHttpClient::forbidding().http_client(),
+            TestClock::new().monotonic_clock(),
+        )
+    }
+
+    fn fixture_services(
+        client: Arc<dyn PlatformHttpClient>,
+        outbound_client: HttpClient,
+        clock: MonotonicClock,
+    ) -> RuntimeServices {
         RuntimeServices::builder()
             .config_store(Arc::new(FixtureStore))
             .secret_store(Arc::new(FixtureStore))
             .kv_store(Arc::new(UnavailableKvStore))
             .backend(Arc::new(FixtureStore))
             .http_client(client)
-            .outbound_client(ScriptedHttpClient::forbidding().http_client())
-            .clock(TestClock::new().monotonic_clock())
+            .outbound_client(outbound_client)
+            .clock(clock)
             .geo(Arc::new(FixtureGeo))
             .client_info(ClientInfo::default())
             .build()

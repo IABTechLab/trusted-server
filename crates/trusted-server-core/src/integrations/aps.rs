@@ -8,6 +8,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::outbound::OutboundResponse;
+#[cfg(test)]
+use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding};
 use error_stack::{Report, ResultExt};
 use http::header::HeaderName;
 use http::{HeaderMap, Method, StatusCode, header};
@@ -36,10 +39,6 @@ use crate::integrations::{
     IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
 };
 #[cfg(test)]
-use crate::integrations::{
-    ensure_integration_backend_with_timeout, predict_integration_backend_name,
-};
-#[cfg(test)]
 use crate::openrtb::ToExt;
 #[cfg(test)]
 use crate::openrtb::{
@@ -47,8 +46,11 @@ use crate::openrtb::{
     UserExt, to_openrtb_i32,
 };
 #[cfg(test)]
-use crate::platform::PlatformHttpRequest;
-use crate::platform::{PlatformResponse, RuntimeServices};
+use crate::outbound::{
+    DEFAULT_BUFFERED_RESPONSE_BYTES, OutboundRequestSource, buffered, outbound_error,
+    outbound_request,
+};
+use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 
 const APS_INTEGRATION_ID: &str = "aps";
@@ -881,7 +883,7 @@ pub(crate) async fn parse_planned_aps_response(
     profile: &ApsProfilePlan,
     endpoint: &str,
     input: &ProviderAuctionInput,
-    response: PlatformResponse,
+    response: OutboundResponse,
     response_time_ms: u64,
     debug_request: Option<ApsDebugRequest>,
 ) -> Result<AuctionResponse, Report<TrustedServerError>> {
@@ -893,7 +895,6 @@ pub(crate) async fn parse_planned_aps_response(
         allow_script_creatives: profile.allow_script_creatives,
         publisher_domain: &input.common_request().publisher.domain,
     };
-    let response = response.response;
     let status = response.status();
     let response_headers = if policy.debug {
         aps_debug_headers(response.headers())
@@ -1561,13 +1562,12 @@ impl ApsAuctionProvider {
 
     async fn parse_response_inner(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
         request: Option<&AuctionRequest>,
         debug_request: Option<ApsDebugRequest>,
         debug_enabled: bool,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        let response = response.response;
         let status = response.status();
         let response_headers = if debug_enabled {
             Self::debug_headers(response.headers())
@@ -1696,46 +1696,42 @@ impl AuctionProvider for ApsAuctionProvider {
             .config
             .debug
             .then(|| String::from_utf8_lossy(&body).into_owned());
-        let outbound_request = http::Request::builder()
-            .method(Method::POST)
-            .uri(&self.config.endpoint)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(EdgeBody::from(body))
-            .change_context(TrustedServerError::Auction {
-                message: "Failed to build APS request".to_string(),
-            })?;
+        let target = outbound_request(Method::POST, &self.config.endpoint).map_err(|error| {
+            outbound_error(
+                error,
+                TrustedServerError::Auction {
+                    message: "Failed to build APS request".to_string(),
+                },
+                OutboundRequestSource::Internal,
+            )
+        })?;
+        let mut aps_request = buffered(
+            target,
+            Duration::from_millis(u64::from(context.timeout_ms)),
+            DEFAULT_BUFFERED_RESPONSE_BYTES,
+            ResponseDecoding::Decode,
+        )
+        .cache_policy(OutboundCachePolicy::Bypass)
+        .body(body);
+        aps_request.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
         let debug_request = debug_body.map(|body| ApsDebugRequest {
             body,
-            headers: Self::debug_headers(outbound_request.headers()),
+            headers: Self::debug_headers(aps_request.headers()),
         });
-        let backend = ensure_integration_backend_with_timeout(
-            context.services,
-            &self.config.endpoint,
-            APS_INTEGRATION_ID,
-            Duration::from_millis(u64::from(context.timeout_ms)),
-        )
-        .change_context(TrustedServerError::Auction {
-            message: "Failed to resolve APS backend".to_string(),
-        })?;
-        let pending = context
-            .services
-            .http_client()
-            .send_async(PlatformHttpRequest::new(outbound_request, backend).with_cache_bypass())
-            .await
-            .change_context(TrustedServerError::Auction {
-                message: "Failed to send APS request".to_string(),
-            })?;
         Ok(match debug_request {
             Some(debug_request) => {
-                ProviderRequestOutcome::pending_with_state(pending, Box::new(debug_request))
+                ProviderRequestOutcome::ready_with_state(aps_request, Box::new(debug_request))
             }
-            None => ProviderRequestOutcome::pending(pending),
+            None => ProviderRequestOutcome::ready(aps_request),
         })
     }
 
     async fn parse_response(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         self.parse_response_inner(response, response_time_ms, None, None, self.config.debug)
@@ -1744,7 +1740,7 @@ impl AuctionProvider for ApsAuctionProvider {
 
     async fn parse_response_with_context(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
@@ -1762,7 +1758,7 @@ impl AuctionProvider for ApsAuctionProvider {
 
     async fn parse_response_with_context_and_state(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
@@ -1799,17 +1795,6 @@ impl AuctionProvider for ApsAuctionProvider {
 
     fn is_enabled(&self) -> bool {
         self.config.enabled
-    }
-
-    fn backend_name(&self, services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
-        predict_integration_backend_name(
-            services,
-            &self.config.endpoint,
-            APS_INTEGRATION_ID,
-            Duration::from_millis(u64::from(timeout_ms)),
-        )
-        .inspect_err(|error| log::error!("Failed to predict APS backend name: {error:?}"))
-        .ok()
     }
 }
 
@@ -1986,8 +1971,9 @@ mod tests {
         AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, PublisherInfo, UserInfo,
     };
     use crate::integrations::IntegrationDocumentState;
-    use crate::platform::test_support::{
-        StubHttpClient, build_services_with_http_client, noop_services,
+    use crate::platform::test_support::{build_services_with_outbound_client, noop_services};
+    use crate::test_support::scripted_client::{
+        ScriptedHttpClient, ScriptedReply, TestClock, outbound_response,
     };
     use crate::test_support::tests::create_test_settings;
     use serde_json::json;
@@ -2056,7 +2042,7 @@ mod tests {
 
     fn parse_with_context(
         provider: &ApsAuctionProvider,
-        response: PlatformResponse,
+        response: OutboundResponse,
     ) -> AuctionResponse {
         let settings = create_test_settings();
         let services = noop_services();
@@ -2068,7 +2054,6 @@ mod tests {
             settings: &settings,
             request: &downstream,
             timeout_ms: 321,
-            transport_timeout_ms: 321,
             provider_responses: None,
             services: &services,
         };
@@ -2290,7 +2275,6 @@ mod tests {
             settings: &settings,
             request: &downstream,
             timeout_ms: 321,
-            transport_timeout_ms: 321,
             provider_responses: None,
             services: &services,
         };
@@ -2334,7 +2318,6 @@ mod tests {
             settings: &settings,
             request: &downstream,
             timeout_ms: 321,
-            transport_timeout_ms: 321,
             provider_responses: None,
             services: &services,
         };
@@ -2432,7 +2415,6 @@ mod tests {
                 settings: &settings,
                 request: &downstream,
                 timeout_ms: 321,
-                transport_timeout_ms: 321,
                 provider_responses: None,
                 services: &services,
             };
@@ -2556,7 +2538,7 @@ mod tests {
             "seatbid": [{"bid": [bid("fictional-debug-bid", 1.23, "iframe")]}]
         }))
         .expect("should serialize APS response fixture");
-        let platform_response = PlatformResponse::new(
+        let platform_response = outbound_response(
             edgezero_core::http::response_builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -2600,11 +2582,9 @@ mod tests {
 
     #[test]
     fn debug_request_metadata_matches_the_dispatched_request() {
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, br#"{"seatbid":[]}"#.to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        let services = build_services_with_outbound_client(&client, &clock);
         let settings = create_test_settings();
         let downstream = http::Request::builder()
             .uri("https://publisher.example/auction")
@@ -2614,27 +2594,32 @@ mod tests {
             settings: &settings,
             request: &downstream,
             timeout_ms: 321,
-            transport_timeout_ms: 321,
             provider_responses: None,
             services: &services,
         };
         let mut provider_config = config();
         provider_config.debug = true;
+        client.respond_to(
+            Method::POST,
+            &provider_config.endpoint,
+            ScriptedReply::status(StatusCode::OK).body(br#"{"seatbid":[]}"#.to_vec()),
+        );
         let provider = ApsAuctionProvider::new(provider_config);
         let auction_request = request();
 
         let outcome =
             futures::executor::block_on(provider.request_bids(&auction_request, &context))
                 .expect("should dispatch APS request");
-        let ProviderRequestOutcome::Pending {
-            request: pending,
+        let ProviderRequestOutcome::Ready {
+            request: aps_request,
             parse_state,
         } = outcome
         else {
-            panic!("should return a pending APS request");
+            panic!("should return an unsent APS request");
         };
-        let platform_response = futures::executor::block_on(services.http_client().wait(pending))
-            .expect("should collect APS response");
+        let platform_response =
+            futures::executor::block_on(services.outbound_client().send(aps_request))
+                .expect("should collect APS response");
         let response = futures::executor::block_on(provider.parse_response_with_context_and_state(
             platform_response,
             12,
@@ -2644,20 +2629,16 @@ mod tests {
         ))
         .expect("should parse APS response");
 
-        let sent_body = stub
-            .recorded_request_bodies()
+        let sent = client
+            .requests()
             .into_iter()
             .next()
-            .expect("should capture outbound APS body");
-        let sent_headers = stub
-            .recorded_request_headers()
-            .into_iter()
-            .next()
-            .expect("should capture outbound APS headers");
-        let sent_content_type = sent_headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(header::CONTENT_TYPE.as_str()))
-            .map(|(_, value)| value.as_str());
+            .expect("should capture the outbound APS request");
+        let sent_body = sent.body.to_vec();
+        let sent_content_type = sent
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
         let call = &response.metadata["debug"]["httpcalls"]["aps"][0];
         assert_eq!(
             call["requestbody"],
@@ -2674,7 +2655,7 @@ mod tests {
     #[test]
     fn disabled_debug_omits_httpcall_metadata() {
         let provider = ApsAuctionProvider::new(config());
-        let platform_response = PlatformResponse::new(
+        let platform_response = outbound_response(
             edgezero_core::http::response_builder()
                 .status(StatusCode::OK)
                 .body(EdgeBody::from(
@@ -2695,20 +2676,20 @@ mod tests {
         let mut provider_config = config();
         provider_config.debug = true;
         let provider = ApsAuctionProvider::new(provider_config);
-        let malformed = PlatformResponse::new(
+        let malformed = outbound_response(
             edgezero_core::http::response_builder()
                 .status(StatusCode::OK)
                 .body(EdgeBody::from(b"{not-json".to_vec()))
                 .expect("should build malformed APS response"),
         );
-        let unavailable = PlatformResponse::new(
+        let unavailable = outbound_response(
             edgezero_core::http::response_builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header("retry-after", "5")
                 .body(EdgeBody::from(b"temporarily unavailable".to_vec()))
                 .expect("should build unavailable APS response"),
         );
-        let preview_limited = PlatformResponse::new(
+        let preview_limited = outbound_response(
             edgezero_core::http::response_builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(EdgeBody::from(vec![
@@ -2717,7 +2698,7 @@ mod tests {
                 ]))
                 .expect("should build preview-limited APS response"),
         );
-        let oversized = PlatformResponse::new(
+        let oversized = outbound_response(
             edgezero_core::http::response_builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(EdgeBody::from(vec![
@@ -2777,7 +2758,7 @@ mod tests {
         let mut provider_config = config();
         provider_config.debug = true;
         let provider = ApsAuctionProvider::new(provider_config);
-        let platform_response = PlatformResponse::new(
+        let platform_response = outbound_response(
             edgezero_core::http::response_builder()
                 .status(StatusCode::NO_CONTENT)
                 .body(EdgeBody::empty())
@@ -2795,7 +2776,7 @@ mod tests {
     #[test]
     fn malformed_json_is_a_safe_shape_error() {
         let provider = ApsAuctionProvider::new(config());
-        let platform_response = PlatformResponse::new(
+        let platform_response = outbound_response(
             edgezero_core::http::response_builder()
                 .status(StatusCode::OK)
                 .body(EdgeBody::from(b"{not-json".to_vec()))
@@ -2823,7 +2804,7 @@ mod tests {
         let mut provider_config = config();
         provider_config.debug = true;
         let provider = ApsAuctionProvider::new(provider_config);
-        let platform_response = PlatformResponse::new(
+        let platform_response = outbound_response(
             edgezero_core::http::response_builder()
                 .status(StatusCode::OK)
                 .body(EdgeBody::from(
@@ -2856,7 +2837,7 @@ mod tests {
     #[test]
     fn no_content_and_empty_responses_are_no_bids() {
         let provider = ApsAuctionProvider::new(config());
-        let platform_response = PlatformResponse::new(
+        let platform_response = outbound_response(
             edgezero_core::http::response_builder()
                 .status(StatusCode::NO_CONTENT)
                 .body(EdgeBody::empty())

@@ -750,16 +750,6 @@ mod tests {
     }
 
     #[test]
-    fn auction_http_capabilities_are_explicit() {
-        let client = AxumPlatformHttpClient::new();
-        let capabilities = trusted_server_core::platform::AuctionTargetId::Axum
-            .descriptor()
-            .capabilities();
-        assert!(client.supports_concurrent_fanout());
-        assert!(capabilities.supports_concurrent_provider_fanout());
-    }
-
-    #[test]
     fn config_env_var_normalizes_store_and_key() {
         assert_eq!(
             config_env_var("my-store.name", "my key"),

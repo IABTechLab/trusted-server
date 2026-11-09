@@ -938,14 +938,6 @@ mod tests {
         let init = outbound_request_init(worker::Method::Get, worker::Headers::new());
         assert!(matches!(init.redirect, worker::RequestRedirect::Manual));
     }
-
-    #[test]
-    fn auction_http_capabilities_are_explicit() {
-        let capabilities = trusted_server_core::platform::AuctionTargetId::Cloudflare
-            .descriptor()
-            .capabilities();
-        assert!(!capabilities.supports_concurrent_provider_fanout());
-    }
     use edgezero_core::http::{HeaderValue, request_builder};
     use edgezero_core::params::PathParams;
     use trusted_server_core::platform::HttpClient;

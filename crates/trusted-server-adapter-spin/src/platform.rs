@@ -853,21 +853,15 @@ mod tests {
     use edgezero_core::config_store::{
         BoundedStoreRead, ConfigStore, ConfigStoreError, ConfigValue, finish_bounded_config_read,
     };
-    use edgezero_core::time::{Deadline, MonotonicClock};
-    use trusted_server_core::platform::{AuctionTargetId, HttpClient};
-    use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
-
-    #[test]
-    fn auction_http_capabilities_are_explicit() {
-        let capabilities = AuctionTargetId::Spin.descriptor().capabilities();
-        assert!(!capabilities.supports_concurrent_provider_fanout());
-    }
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::request_builder;
     use edgezero_core::params::PathParams;
+    use edgezero_core::time::{Deadline, MonotonicClock};
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Write as _;
+    use trusted_server_core::platform::HttpClient;
+    use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
 
     struct InMemoryConfigStore(std::collections::BTreeMap<String, String>);
 

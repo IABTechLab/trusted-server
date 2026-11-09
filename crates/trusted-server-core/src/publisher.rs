@@ -3539,7 +3539,6 @@ fn make_collect_context<'a>(
         settings,
         request: placeholder,
         timeout_ms: 0,
-        transport_timeout_ms: 0,
         provider_responses: None,
         services,
     }
@@ -5481,7 +5480,6 @@ pub async fn handle_publisher_request(
                 settings,
                 request: &auction_client_request,
                 timeout_ms: auction_timeout_ms,
-                transport_timeout_ms: auction_timeout_ms,
                 provider_responses: None,
                 services,
             };
@@ -7904,7 +7902,6 @@ pub async fn handle_page_bids(
                 settings,
                 request: &req,
                 timeout_ms,
-                transport_timeout_ms: timeout_ms,
                 provider_responses: None,
                 services,
             };
@@ -8082,11 +8079,11 @@ mod tests {
 
     use super::*;
     use crate::auction::orchestrator::OrchestrationResult;
-    use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
     use crate::auction::types::AuctionResponse;
     use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
     use crate::platform::PlatformCacheIntent;
-    use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
+    use crate::platform::test_support::build_services_with_outbound_client;
+    use crate::test_support::scripted_client::{ScriptedHttpClient, ScriptedReply, TestClock};
 
     /// Every shared condition passing, as the base for single-condition negations.
     fn all_shareable() -> SharedRequestInputs {
@@ -8490,72 +8487,14 @@ mod tests {
 
     const SCHEDULING_PROVIDER: &str = "scheduling-capture";
 
-    #[derive(Debug)]
-    struct CapturedSchedulingAuction {
-        request: AuctionRequest,
-        client_uri: String,
-        client_host: Option<String>,
-        client_fastly_ssl: Option<String>,
-        client_user_agent: Option<String>,
-        http_calls_at_dispatch: usize,
-        lookups_at_dispatch: usize,
-    }
+    /// Endpoint of the [`SCHEDULING_PROVIDER`] that `legacy_provider_map` configures.
+    const SCHEDULING_ENDPOINT: &str = "https://scheduling-capture.example/openrtb2/auction";
 
-    struct SchedulingCaptureProvider {
-        captured: Arc<Mutex<Option<CapturedSchedulingAuction>>>,
-        http: Arc<StubHttpClient>,
-        lookups: Arc<AtomicUsize>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for SchedulingCaptureProvider {
-        fn provider_name(&self) -> &'static str {
-            SCHEDULING_PROVIDER
-        }
-
-        async fn request_bids(
-            &self,
-            request: &AuctionRequest,
-            context: &AuctionContext<'_>,
-        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            let header_value = |name: &str| {
-                context
-                    .request
-                    .headers()
-                    .get(name)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned)
-            };
-            *self.captured.lock().expect("should lock captured auction") =
-                Some(CapturedSchedulingAuction {
-                    request: request.clone(),
-                    client_uri: context.request.uri().to_string(),
-                    client_host: header_value(header::HOST.as_str()),
-                    client_fastly_ssl: header_value("fastly-ssl"),
-                    client_user_agent: header_value(header::USER_AGENT.as_str()),
-                    http_calls_at_dispatch: self.http.recorded_backend_names().len(),
-                    lookups_at_dispatch: self.lookups.load(Ordering::SeqCst),
-                });
-            Err(Report::new(TrustedServerError::Auction {
-                message: "scheduling capture only".to_owned(),
-            }))
-        }
-
-        async fn parse_response(
-            &self,
-            _response: crate::platform::PlatformResponse,
-            _response_time_ms: u64,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            panic!("parse_response must not run when scheduling capture fails")
-        }
-
-        fn timeout_ms(&self) -> u32 {
-            100
-        }
-
-        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
-            Some("scheduling-capture-backend".to_owned())
-        }
+    /// What had happened when the scheduling provider's bid request left.
+    struct BidderDispatch {
+        body: bytes::Bytes,
+        origin_calls: usize,
+        lookups: usize,
     }
 
     struct SchedulingProbeOutcome {
@@ -8701,9 +8640,34 @@ mod tests {
             http_calls_at_lookup: Arc::clone(&http_calls_at_lookup),
             lookups: Arc::clone(&lookups),
         });
-        let services = build_services_with_http_client(
-            Arc::clone(&http) as Arc<dyn crate::platform::PlatformHttpClient>
+        let clock = TestClock::new();
+        let bidder_dispatch = Arc::new(Mutex::new(None));
+        let bidders = {
+            let http = Arc::clone(&http);
+            let lookups = Arc::clone(&lookups);
+            let bidder_dispatch = Arc::clone(&bidder_dispatch);
+            ScriptedHttpClient::new(&clock).with_request_observer(move |request| {
+                *bidder_dispatch
+                    .lock()
+                    .expect("should lock the bidder dispatch") = Some(BidderDispatch {
+                    body: request.body.clone(),
+                    origin_calls: http.recorded_backend_names().len(),
+                    lookups: lookups.load(Ordering::SeqCst),
+                });
+            })
+        };
+        bidders.respond_to(
+            Method::POST,
+            SCHEDULING_ENDPOINT,
+            ScriptedReply::status(StatusCode::NO_CONTENT),
         );
+        let services = RuntimeServices {
+            outbound_client: bidders.http_client(),
+            clock: clock.monotonic_clock(),
+            ..build_services_with_http_client(
+                Arc::clone(&http) as Arc<dyn crate::platform::PlatformHttpClient>
+            )
+        };
         let ec_id = format!("{}.CkId01", "b".repeat(64));
         let mut ec_context = EcContext::new_for_test_with_ip(
             Some(ec_id),
@@ -8714,14 +8678,8 @@ mod tests {
             ec_context.ec_allowed() && ec_context.ec_value().is_some(),
             "test precondition: an active, consent-allowed EC must exist"
         );
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-        let captured_auction = Arc::new(Mutex::new(None));
-        let mut orchestrator = orchestrator;
-        orchestrator.register_provider(Arc::new(SchedulingCaptureProvider {
-            captured: Arc::clone(&captured_auction),
-            http: Arc::clone(&http),
-            lookups: Arc::clone(&lookups),
-        }));
+        let orchestrator = crate::auction::build_orchestrator(&settings)
+            .expect("should build the auction orchestrator");
         let slots = [scheduling_slot()];
 
         let result = handle_publisher_request(
@@ -8775,25 +8733,20 @@ mod tests {
                     && header_value(header::RANGE.as_str()).is_none()
             });
 
-        let captured_auction = captured_auction
+        let bidder_dispatch = bidder_dispatch
             .lock()
-            .expect("should lock captured auction")
+            .expect("should lock the bidder dispatch")
             .take();
-        let auction_preserved_client_snapshot = captured_auction.as_ref().is_some_and(|captured| {
-            captured.client_uri == "https://publisher.example/article"
-                && captured.client_host.as_deref() == Some("publisher.example")
-                && captured.client_fastly_ssl.as_deref() == Some("1")
-                && captured.client_user_agent.as_deref() == Some("scheduling-browser")
-                && captured
-                    .request
-                    .device
-                    .as_ref()
-                    .and_then(|device| device.user_agent.as_deref())
-                    == Some("scheduling-browser")
+        let article_page = format!("https://{}/article", settings.publisher.domain);
+        let auction_preserved_client_snapshot = bidder_dispatch.as_ref().is_some_and(|dispatch| {
+            let auction: serde_json::Value =
+                serde_json::from_slice(&dispatch.body).expect("should send a JSON bid request");
+            auction["device"]["ua"] == "scheduling-browser"
+                && auction["site"]["page"] == article_page
         });
-        let origin_kv_auction_order = captured_auction.as_ref().is_some_and(|captured| {
-            captured.http_calls_at_dispatch == 1 && captured.lookups_at_dispatch == 1
-        });
+        let origin_kv_auction_order = bidder_dispatch
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.origin_calls == 1 && dispatch.lookups == 1);
         let datadome_tag_suppressed = if let Ok(response) = result {
             let registry = IntegrationRegistry::new(&settings)
                 .expect("should create integration registry with DataDome");
@@ -8923,7 +8876,8 @@ mod tests {
         ec_context.set_pull_sync_marker_for_test(
             crate::ec::pull_sync_marker::PullSyncMarkerState::from_cookie(Some(marker)),
         );
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = crate::auction::build_orchestrator(&settings)
+            .expect("should build the auction orchestrator");
         let slots = has_matched_auction_slot
             .then(scheduling_slot)
             .into_iter()
@@ -10299,7 +10253,8 @@ mod tests {
                 "should exercise sanitized cookies rather than re-reading the original session"
             );
             let publisher = block_on(run_publisher_proxy(settings, &services, request));
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(settings)
+                .expect("should build the auction orchestrator");
             let registry =
                 IntegrationRegistry::new(settings).expect("should build publisher registry");
             let response = block_on(buffer_publisher_response_async(
@@ -10630,7 +10585,8 @@ mod tests {
             params.trace_bootstrap = Some(bootstrap);
             let registry =
                 IntegrationRegistry::new(&settings).expect("should build publisher registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let body = EdgeBody::from_stream(futures::stream::iter([
                 Ok(bytes::Bytes::from_static(b"<html><hea")),
                 Ok(bytes::Bytes::from_static(
@@ -10853,7 +10809,8 @@ mod tests {
         services: &RuntimeServices,
         req: Request<EdgeBody>,
     ) -> PublisherResponse {
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = crate::auction::build_orchestrator(settings)
+            .expect("should build the auction orchestrator");
         let mut ec_context =
             EcContext::read_from_request(settings, &req, services).expect("should read EC context");
         handle_publisher_request(
@@ -12001,92 +11958,6 @@ mod tests {
         /// string that cannot appear in the fixture page by accident.
         const STUB_BID_CPM: f64 = 3.5;
 
-        /// An auction provider that returns one genuine winning bid.
-        ///
-        /// Every other fixture in this file leaves the orchestrator with no providers, so
-        /// every auction resolves to an empty bid map. That is exactly why a defect that
-        /// discarded *non-empty* maps survived: no test ever produced one.
-        struct WinningBidProvider {
-            price: f64,
-        }
-
-        #[async_trait::async_trait(?Send)]
-        impl crate::auction::provider::AuctionProvider for WinningBidProvider {
-            fn provider_name(&self) -> &'static str {
-                STUB_BIDDER
-            }
-
-            async fn request_bids(
-                &self,
-                _request: &AuctionRequest,
-                context: &crate::auction::types::AuctionContext<'_>,
-            ) -> Result<crate::auction::provider::ProviderRequestOutcome, Report<TrustedServerError>>
-            {
-                let request = PlatformHttpRequest::new(
-                    HttpRequest::builder()
-                        .method(Method::POST)
-                        .uri("https://bidder.example.com/openrtb2/auction")
-                        .body(EdgeBody::empty())
-                        .expect("should build stub bid request"),
-                    "stub-bidder-backend",
-                );
-                context
-                    .services
-                    .http_client()
-                    .send_async(request.with_cache_bypass())
-                    .await
-                    .change_context(TrustedServerError::Auction {
-                        message: "stub bid launch failed".to_string(),
-                    })
-                    .map(crate::auction::provider::ProviderRequestOutcome::pending)
-            }
-
-            async fn parse_response(
-                &self,
-                _response: crate::platform::PlatformResponse,
-                response_time_ms: u64,
-            ) -> Result<crate::auction::types::AuctionResponse, Report<TrustedServerError>>
-            {
-                Ok(crate::auction::types::AuctionResponse::success(
-                    STUB_BIDDER,
-                    vec![Bid {
-                        slot_id: "test-slot".to_string(),
-                        price: Some(self.price),
-                        currency: "USD".to_string(),
-                        creative: None,
-                        adomain: None,
-                        bidder: STUB_BIDDER.to_string(),
-                        returned_seat: None,
-                        width: 728,
-                        height: 90,
-                        nurl: None,
-                        burl: None,
-                        bid_id: None,
-                        creative_id: None,
-                        renderer: None,
-                        ad_id: Some("stub-creative-1".to_string()),
-                        cache_id: None,
-                        cache_host: None,
-                        cache_path: None,
-                        metadata: Default::default(),
-                    }],
-                    response_time_ms,
-                ))
-            }
-
-            fn timeout_ms(&self) -> u32 {
-                2000
-            }
-
-            fn backend_name(
-                &self,
-                _services: &RuntimeServices,
-                _timeout_ms: u32,
-            ) -> Option<String> {
-                Some("stub-bidder-backend".to_string())
-            }
-        }
-
         /// [`settings_with_mode`], with an auction provider that actually bids.
         fn settings_with_bidder(mode: &str) -> Settings {
             let mut settings = settings_with_mode(mode);
@@ -12095,12 +11966,45 @@ mod tests {
             settings
         }
 
-        /// Queue the bidder's canned response.
+        /// Endpoint of the stub bidder that `legacy_provider_map` configures.
+        const STUB_BIDDER_ENDPOINT: &str = "https://stub-bidder.example/openrtb2/auction";
+
+        /// `services`, with bidder requests sent to a scripted stub bidder, returned with it.
+        fn with_stub_bidder(services: &RuntimeServices) -> (RuntimeServices, ScriptedHttpClient) {
+            let clock = TestClock::new();
+            let bidders = ScriptedHttpClient::new(&clock);
+            let services = RuntimeServices {
+                outbound_client: bidders.http_client(),
+                clock: clock.monotonic_clock(),
+                ..services.clone()
+            };
+            (services, bidders)
+        }
+
+        /// Queues one genuine winning bid at `price` for the stub bidder's next request.
         ///
-        /// Must be pushed **before** the origin HTML: the stub client serves one shared
-        /// FIFO queue, and the auction is dispatched before the origin fetch.
-        fn queue_bid_response(stub: &StubHttpClient) {
-            stub.push_response(200, b"{}".to_vec());
+        ///
+        /// Every other fixture in this file leaves the auction without bids, so every
+        /// auction resolves to an empty bid map. That is exactly why a defect that
+        /// discarded *non-empty* maps survived: no test ever produced one.
+        fn queue_winning_bid(bidders: &ScriptedHttpClient, price: f64) {
+            bidders.respond_to(
+                Method::POST,
+                STUB_BIDDER_ENDPOINT,
+                ScriptedReply::status(StatusCode::OK).body(
+                    serde_json::to_vec(&serde_json::json!({
+                        "seatbid": [{"seat": STUB_BIDDER, "bid": [{
+                            "impid": "test-slot",
+                            "price": price,
+                            "adid": "stub-creative-1",
+                            "adm": "<div>stub creative</div>",
+                            "w": 728,
+                            "h": 90
+                        }]}]
+                    }))
+                    .expect("should serialize the stub bid"),
+                ),
+            );
         }
 
         /// Which finalizer a request is driven through.
@@ -12130,7 +12034,8 @@ mod tests {
                 settings,
                 services,
                 request,
-                AuctionOrchestrator::new(settings.auction.clone()),
+                crate::auction::build_orchestrator(settings)
+                    .expect("should build the auction orchestrator"),
                 Finalizer::Streaming,
             )
             .await
@@ -12147,36 +12052,9 @@ mod tests {
                 settings,
                 services,
                 request,
-                AuctionOrchestrator::new(settings.auction.clone()),
+                crate::auction::build_orchestrator(settings)
+                    .expect("should build the auction orchestrator"),
                 finalizer,
-            )
-            .await
-        }
-
-        /// [`run`], with a provider registered so the auction returns a real bid.
-        async fn run_bidding(
-            settings: &Arc<Settings>,
-            services: &RuntimeServices,
-            request: Request<EdgeBody>,
-        ) -> Response<EdgeBody> {
-            run_bidding_at_price(settings, services, request, STUB_BID_CPM).await
-        }
-
-        /// [`run_bidding`], with a distinct winning CPM for this request.
-        async fn run_bidding_at_price(
-            settings: &Arc<Settings>,
-            services: &RuntimeServices,
-            request: Request<EdgeBody>,
-            price: f64,
-        ) -> Response<EdgeBody> {
-            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(WinningBidProvider { price }));
-            run_with_orchestrator(
-                settings,
-                services,
-                request,
-                orchestrator,
-                Finalizer::Streaming,
             )
             .await
         }
@@ -12192,12 +12070,11 @@ mod tests {
             let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                 super::TerminalTestFactory,
             )]);
-            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(WinningBidProvider {
-                price: STUB_BID_CPM,
-            }));
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
+            let (services, bidders) = with_stub_bidder(&services);
+            queue_winning_bid(&bidders, STUB_BID_CPM);
             let orchestrator = Arc::new(orchestrator);
-            queue_bid_response(&stub);
             queue_shareable_html(&stub);
             let consent = crate::consent::ConsentContext {
                 jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
@@ -12285,13 +12162,10 @@ mod tests {
                         IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                             super::CountingTerminalFactory(Arc::clone(&calls)),
                         )]);
-                    let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-                    orchestrator.register_provider(Arc::new(WinningBidProvider {
-                        price: STUB_BID_CPM,
-                    }));
-                    if live {
-                        queue_bid_response(&stub);
-                    }
+                    let orchestrator = crate::auction::build_orchestrator(&settings)
+                        .expect("should build the auction orchestrator");
+                    let (services, bidders) = with_stub_bidder(&services);
+                    queue_winning_bid(&bidders, STUB_BID_CPM);
                     let raw = b"<p>Example partial article</p>";
                     let mut headers = vec![
                         ("content-type", "text/html"),
@@ -12485,7 +12359,10 @@ mod tests {
             let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                 super::TerminalTestFactory,
             )]);
-            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let orchestrator = Arc::new(
+                crate::auction::build_orchestrator(&settings)
+                    .expect("should build the auction orchestrator"),
+            );
             for _ in 0..2 {
                 let response = handle_publisher_request(
                     &settings,
@@ -12586,7 +12463,10 @@ mod tests {
             let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                 super::TerminalTestFactory,
             )]);
-            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let orchestrator = Arc::new(
+                crate::auction::build_orchestrator(&settings)
+                    .expect("should build the auction orchestrator"),
+            );
             for path in ["/article", "/article-cold"] {
                 queue_shareable_html(&stub);
                 let mut request = navigation_request();
@@ -12794,7 +12674,10 @@ mod tests {
             services: &RuntimeServices,
             request: Request<EdgeBody>,
         ) {
-            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let orchestrator = Arc::new(
+                crate::auction::build_orchestrator(settings)
+                    .expect("should build the auction orchestrator"),
+            );
             let kv = crate::ec::kv::KvIdentityGraph::in_memory("test-store");
             let consent = crate::consent::ConsentContext {
                 jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
@@ -13671,7 +13554,10 @@ mod tests {
             });
             let registry =
                 IntegrationRegistry::new(&settings).expect("should create integration registry");
-            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let orchestrator = Arc::new(
+                crate::auction::build_orchestrator(&settings)
+                    .expect("should build the auction orchestrator"),
+            );
             // Only the cold request has an origin response available.
             queue_shareable_html(&stub);
 
@@ -14681,15 +14567,13 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let settings = Arc::new(settings_with_bidder("esi"));
-            let services = services(Arc::clone(&stub), Arc::clone(&cache));
-
-            // Bid first, page second: one FIFO queue, and the auction is dispatched
-            // before the origin fetch.
-            queue_bid_response(&stub);
+            let (services, bidders) =
+                with_stub_bidder(&services(Arc::clone(&stub), Arc::clone(&cache)));
             queue_shareable_html(&stub);
+            queue_winning_bid(&bidders, STUB_BID_CPM);
 
             let cold = String::from_utf8(
-                body_of(run_bidding(&settings, &services, navigation_request()).await).await,
+                body_of(run(&settings, &services, navigation_request()).await).await,
             )
             .expect("cold document should be UTF-8");
             let cold_bids = seam_bids(&cold);
@@ -14713,9 +14597,9 @@ mod tests {
 
             // The warm request needs only the bid response: a hit skips the origin
             // entirely, so an unused page fixture here would mask a fetch.
-            queue_bid_response(&stub);
+            queue_winning_bid(&bidders, STUB_BID_CPM);
             let warm = String::from_utf8(
-                body_of(run_bidding(&settings, &services, navigation_request()).await).await,
+                body_of(run(&settings, &services, navigation_request()).await).await,
             )
             .expect("warm document should be UTF-8");
             assert_eq!(
@@ -14747,11 +14631,12 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let settings = Arc::new(settings_with_bidder("esi"));
-            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            let (services, bidders) =
+                with_stub_bidder(&services(Arc::clone(&stub), Arc::clone(&cache)));
 
-            queue_bid_response(&stub);
             queue_shareable_html(&stub);
-            let cold = run_bidding(&settings, &services, navigation_request()).await;
+            queue_winning_bid(&bidders, STUB_BID_CPM);
+            let cold = run(&settings, &services, navigation_request()).await;
             assert_eq!(
                 cold.headers()
                     .get(HEADER_X_TS_TEMPLATE_CACHE)
@@ -14763,13 +14648,13 @@ mod tests {
             // Keep an origin response available so the old bypass behavior completes
             // normally and fails on the observable cache state rather than a fixture
             // underflow. A correct warm reload leaves this response untouched.
-            queue_bid_response(&stub);
             queue_shareable_html(&stub);
             let mut reload = navigation_request();
             reload
                 .headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("max-age=0"));
-            let warm = run_bidding(&settings, &services, reload).await;
+            queue_winning_bid(&bidders, STUB_BID_CPM);
+            let warm = run(&settings, &services, reload).await;
             assert_eq!(
                 warm.headers()
                     .get(HEADER_X_TS_TEMPLATE_CACHE)
@@ -14798,10 +14683,7 @@ mod tests {
                 "the reload must reuse the warm article template"
             );
             assert_eq!(
-                stub.recorded_backend_names()
-                    .iter()
-                    .filter(|backend| backend.as_str() == "stub-bidder-backend")
-                    .count(),
+                bidders.requests().len(),
                 2,
                 "each navigation must dispatch its own auction even when template cache hits"
             );
@@ -14988,7 +14870,10 @@ mod tests {
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
 
-            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let orchestrator = Arc::new(
+                crate::auction::build_orchestrator(&settings)
+                    .expect("should build the auction orchestrator"),
+            );
             let registry =
                 IntegrationRegistry::new(&settings).expect("should create integration registry");
             let consent = crate::consent::ConsentContext {
@@ -15159,7 +15044,10 @@ mod tests {
                 .build();
             queue_shareable_html(&stub);
 
-            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let orchestrator = Arc::new(
+                crate::auction::build_orchestrator(&settings)
+                    .expect("should build the auction orchestrator"),
+            );
             let registry =
                 IntegrationRegistry::new(&settings).expect("should create integration registry");
             let consent = crate::consent::ConsentContext {
@@ -15987,7 +15875,8 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let mut ec_context =
                 EcContext::new_for_test(None, crate::consent::ConsentContext::default());
             let error = handle_publisher_request(
@@ -16236,7 +16125,8 @@ mod tests {
             let settings = Arc::new(raw);
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
-            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            let (services, bidders) =
+                with_stub_bidder(&services(Arc::clone(&stub), Arc::clone(&cache)));
             for (index, field) in [
                 b"ab_bucket=A; ts-ec=reader1".as_slice(),
                 b"ab_bucket=A; ts-ec=reader2".as_slice(),
@@ -16244,17 +16134,11 @@ mod tests {
             .iter()
             .enumerate()
             {
-                queue_bid_response(&stub);
                 if index == 0 {
                     queue_shareable_html(&stub);
                 }
-                let response = run_bidding_at_price(
-                    &settings,
-                    &services,
-                    cookie_policy_request(&[field]),
-                    if index == 0 { 3.5 } else { 7.5 },
-                )
-                .await;
+                queue_winning_bid(&bidders, if index == 0 { 3.5 } else { 7.5 });
+                let response = run(&settings, &services, cookie_policy_request(&[field])).await;
                 assert_eq!(
                     response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
                     if index == 0 { "miss-stored" } else { "hit" },
@@ -16288,8 +16172,8 @@ mod tests {
                 "should fetch one shared origin template"
             );
             assert_eq!(
-                requests.len(),
-                3,
+                bidders.requests().len(),
+                2,
                 "should run a fresh auction on each reader request"
             );
             let entries = cache.entries.lock().expect("should lock templates");
@@ -16383,14 +16267,22 @@ mod tests {
                         !withdrawn,
                         "should apply reader consent"
                     );
-                    let captured = Arc::new(Mutex::new(None));
-                    let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-                    orchestrator.register_provider(Arc::new(SchedulingCaptureProvider {
-                        captured: Arc::clone(&captured),
-                        http: Arc::clone(&stub),
-                        lookups: Arc::new(AtomicUsize::new(0)),
-                    }));
-                    let orchestrator = Arc::new(orchestrator);
+                    let clock = TestClock::new();
+                    let bidders = ScriptedHttpClient::new(&clock);
+                    bidders.respond_to(
+                        Method::POST,
+                        SCHEDULING_ENDPOINT,
+                        ScriptedReply::status(StatusCode::NO_CONTENT),
+                    );
+                    let services = RuntimeServices {
+                        outbound_client: bidders.http_client(),
+                        clock: clock.monotonic_clock(),
+                        ..services.clone()
+                    };
+                    let orchestrator = Arc::new(
+                        crate::auction::build_orchestrator(&settings)
+                            .expect("should build the auction orchestrator"),
+                    );
                     let cookies = format!("ab_bucket=A; ts-ec={identity}");
                     let response = handle_publisher_request(
                         &settings,
@@ -16460,10 +16352,16 @@ mod tests {
                     );
                     let body = body_of(response).await;
                     assert!(!body.is_empty(), "should render a complete reader response");
-                    let captured = captured.lock().expect("should lock captured auction");
-                    let auction = captured.as_ref().expect("should dispatch a reader auction");
+                    let requests = bidders.requests();
+                    let auction: serde_json::Value = serde_json::from_slice(
+                        &requests
+                            .first()
+                            .expect("should dispatch a reader auction")
+                            .body,
+                    )
+                    .expect("should send a JSON bid request");
                     assert_eq!(
-                        auction.request.user.id.as_deref(),
+                        auction["user"]["id"].as_str(),
                         if withdrawn {
                             None
                         } else {
@@ -16471,26 +16369,21 @@ mod tests {
                         },
                         "should use this reader's identity and suppress it after withdrawal"
                     );
+                    let eids = &auction["user"]["ext"]["eids"];
                     if withdrawn {
-                        assert!(
-                            auction.request.user.eids.is_none(),
-                            "should suppress withdrawn EIDs"
-                        );
+                        assert!(eids.is_null(), "should suppress withdrawn EIDs");
                     } else {
-                        let eids = auction
-                            .request
-                            .user
-                            .eids
-                            .as_ref()
+                        let eids = eids
+                            .as_array()
                             .expect("should include consenting reader EIDs");
                         assert_eq!(eids.len(), 1, "should expose only the configured partner");
                         assert_eq!(
-                            eids[0].source, "example.com",
+                            eids[0]["source"], "example.com",
                             "should use the registered source"
                         );
                         assert_eq!(
-                            eids[0].uids[0].id,
-                            format!("partner-reader-{index}"),
+                            eids[0]["uids"][0]["id"].as_str(),
+                            Some(format!("partner-reader-{index}").as_str()),
                             "should use this reader's partner identity on cold and warm requests"
                         );
                     }
@@ -16830,16 +16723,21 @@ mod tests {
                             None,
                         ));
                         let stub = Arc::new(StubHttpClient::new());
-                        if winning {
-                            stub.push_response(200, serde_json::to_vec(&serde_json::json!({"seatbid":[{"seat":"bidder","bid":[{"id":"bid","impid":"test-slot","price":1.5,"w":728,"h":90,"adm":"<div>Example creative</div>"}]}]})).expect("should encode winning provider response"));
-                        } else {
-                            stub.push_response(204, Vec::new());
-                        }
                         queue_shareable_html(&stub);
-                        let services = services_for_ip(
+                        let (services, bidders) = with_stub_bidder(&services_for_ip(
                             Arc::clone(&stub),
                             Arc::new(MemoryTemplateCache::default()),
                             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99)),
+                        ));
+                        let reply = if winning {
+                            ScriptedReply::status(StatusCode::OK).body(serde_json::to_vec(&serde_json::json!({"seatbid":[{"seat":"bidder","bid":[{"id":"bid","impid":"test-slot","price":1.5,"w":728,"h":90,"adm":"<div>Example creative</div>"}]}]})).expect("should encode winning provider response"))
+                        } else {
+                            ScriptedReply::status(StatusCode::NO_CONTENT)
+                        };
+                        bidders.respond_to(
+                            Method::POST,
+                            "https://bidder.example.com/auction",
+                            reply,
                         );
                         let request = navigation_request_with_cookie("__Host-ts-console=1");
                         let mut request = run_pre_dispatch_hook(
@@ -16945,9 +16843,12 @@ mod tests {
                             "should deliver one request transport"
                         );
                         assert_eq!(
-                            stub.recorded_request_bodies().len(),
-                            2,
-                            "should execute bidder and origin HTTP calls"
+                            (
+                                stub.recorded_request_bodies().len(),
+                                bidders.requests().len()
+                            ),
+                            (1, 1),
+                            "should execute the origin and the bidder HTTP calls"
                         );
                     }
                 }
@@ -17235,8 +17136,10 @@ mod tests {
                                 ..Default::default()
                             },
                         );
-                        let orchestrator =
-                            Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+                        let orchestrator = Arc::new(
+                            crate::auction::build_orchestrator(&settings)
+                                .expect("should build the auction orchestrator"),
+                        );
                         let registry = IntegrationRegistry::new(&settings)
                             .expect("should register integrations");
                         let response = handle_publisher_request(
@@ -18247,7 +18150,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 "the cold request should have populated the cache"
             );
 
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let consent = crate::consent::ConsentContext {
                 jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
                 ..Default::default()
@@ -19715,7 +19619,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
     mod ssat_cache_policy_tests {
         use super::*;
-        use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
+
         use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
         use crate::platform::test_support::{
@@ -19730,9 +19634,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         const ORIGIN_ETAG: &str = "\"origin-tag\"";
         const ORIGIN_LAST_MODIFIED: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
         const UNEXPECTED_304_PROVIDER: &str = "example-navigation-bidder";
-        const UNEXPECTED_304_BACKEND: &str = "example-navigation-bidder-backend";
-
-        struct DispatchingTestProvider;
 
         struct RangeAwareHttpClient {
             stub: StubHttpClient,
@@ -19783,57 +19684,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 pending_requests: Vec<PlatformPendingRequest>,
             ) -> Result<PlatformSelectResult, Report<PlatformError>> {
                 self.stub.select(pending_requests).await
-            }
-        }
-
-        #[async_trait::async_trait(?Send)]
-        impl AuctionProvider for DispatchingTestProvider {
-            fn provider_name(&self) -> &str {
-                UNEXPECTED_304_PROVIDER
-            }
-
-            async fn request_bids(
-                &self,
-                _request: &AuctionRequest,
-                context: &AuctionContext<'_>,
-            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-                let request = PlatformHttpRequest::new(
-                    HttpRequest::builder()
-                        .method(Method::POST)
-                        .uri("https://bidder.example.com/navigation-bids")
-                        .body(EdgeBody::empty())
-                        .expect("should build test provider request"),
-                    UNEXPECTED_304_BACKEND,
-                );
-                context
-                    .services
-                    .http_client()
-                    .send_async(request.with_cache_bypass())
-                    .await
-                    .change_context(TrustedServerError::Auction {
-                        message: "test provider launch failed".to_string(),
-                    })
-                    .map(ProviderRequestOutcome::pending)
-            }
-
-            async fn parse_response(
-                &self,
-                _response: PlatformResponse,
-                _response_time_ms: u64,
-            ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-                panic!("parse_response must not run for an unexpected origin 304");
-            }
-
-            fn timeout_ms(&self) -> u32 {
-                100
-            }
-
-            fn backend_name(
-                &self,
-                _services: &RuntimeServices,
-                _timeout_ms: u32,
-            ) -> Option<String> {
-                Some(UNEXPECTED_304_BACKEND.to_string())
             }
         }
 
@@ -20002,7 +19852,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             req: Request<EdgeBody>,
             consent: crate::consent::ConsentContext,
         ) -> PublisherResponse {
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(settings)
+                .expect("should build the auction orchestrator");
             run_with_orchestrator_and_consent(
                 settings,
                 services,
@@ -20087,14 +19938,13 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         #[tokio::test]
         async fn pending_origin_wait_failure_abandons_dispatched_auction_once() {
             let settings = settings_with_dispatching_provider();
-            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(DispatchingTestProvider));
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
             let stub = Arc::new(StubHttpClient::new());
             stub.set_streaming_responses_supported(true);
             stub.set_pending_streaming_responses_supported(true);
             queue_html_response_with_cache_control(&stub, "public, max-age=300");
-            stub.push_response(200, b"unused provider response".to_vec());
             stub.push_wait_error();
             let services = services_with_telemetry(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
@@ -20156,8 +20006,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         #[tokio::test]
         async fn pending_origin_start_failure_skips_kv_auction_and_telemetry() {
             let settings = settings_with_dispatching_provider();
-            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(DispatchingTestProvider));
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
             let stub = Arc::new(StubHttpClient::new());
             stub.set_streaming_responses_supported(true);
@@ -20450,7 +20300,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .await;
             let registry =
                 IntegrationRegistry::new(&settings).expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let response = buffer_publisher_response_async(
                 response,
                 &Method::GET,
@@ -20834,14 +20685,13 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             for content_type in [None, Some("text/html; charset=utf-8")] {
                 // Arrange
                 let settings = settings_with_dispatching_provider();
-                let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-                orchestrator.register_provider(Arc::new(DispatchingTestProvider));
+                let orchestrator = crate::auction::build_orchestrator(&settings)
+                    .expect("should build the auction orchestrator");
                 let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
                 let stub = Arc::new(StubHttpClient::new());
 
                 // `send_async` consumes the first response before the publisher
                 // origin request consumes the second response.
-                stub.push_response(200, b"unused provider response".to_vec());
                 let mut origin_headers = vec![
                     ("cache-control", "public, max-age=300"),
                     ("etag", ORIGIN_ETAG),
@@ -21324,7 +21174,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             "test precondition: consent must allow EC creation"
         );
 
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = crate::auction::build_orchestrator(&settings)
+            .expect("should build the auction orchestrator");
         let req = HttpRequest::builder()
             .method(Method::GET)
             .uri("https://publisher.example/article")
@@ -21413,7 +21264,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             &Method::GET,
             &settings,
             &registry,
-            &AuctionOrchestrator::new(settings.auction.clone()),
+            &crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator"),
             &services,
         )
         .await
@@ -21789,7 +21641,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
     async fn parser_seam_loop_collects_before_writing_post_body_chunks() {
         let settings = create_test_settings();
         let services = noop_services();
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = crate::auction::build_orchestrator(&settings)
+            .expect("should build the auction orchestrator");
         let dispatched = DispatchedAuction::empty_for_test(test_auction_request(), 500);
         let read_count = Arc::new(AtomicUsize::new(0));
         let body_close_processed_at = Arc::new(AtomicUsize::new(0));
@@ -21873,7 +21726,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         let settings = create_test_settings();
         let sink = Arc::new(RecordingTelemetrySink::default());
         let services = noop_services_with_telemetry_sink(Arc::clone(&sink) as _);
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = crate::auction::build_orchestrator(&settings)
+            .expect("should build the auction orchestrator");
         let ad_bids_state = AdBidsState::default();
         let ec_context = EcContext::new_for_test(None, ConsentContext::default());
         let ctx = AuctionCollectCtx {
@@ -21953,7 +21807,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 let settings = create_test_settings();
                 let sink = Arc::new(RecordingTelemetrySink::default());
                 let services = noop_services_with_telemetry_sink(Arc::clone(&sink) as _);
-                let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+                let orchestrator = crate::auction::build_orchestrator(&settings)
+                    .expect("should build the auction orchestrator");
                 let ad_bids_state = AdBidsState::default();
                 let ec_context = EcContext::new_for_test(None, ConsentContext::default());
                 let ctx = AuctionCollectCtx {
@@ -22049,7 +21904,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         // remains pending.
         let settings = create_test_settings();
         let services = noop_services();
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = crate::auction::build_orchestrator(&settings)
+            .expect("should build the auction orchestrator");
         let ad_bids_state = AdBidsState::default();
         let token = b"<!--ts-inline-body-close-test-->";
         let mut state = AuctionHoldState::new(
@@ -22997,7 +22853,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     &Method::GET,
                     &settings,
                     &registry,
-                    &AuctionOrchestrator::new(settings.auction.clone()),
+                    &crate::auction::build_orchestrator(&settings)
+                        .expect("should build the auction orchestrator"),
                     &services,
                 )
                 .await
@@ -23321,7 +23178,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 response_status: StatusCode::OK,
@@ -23388,7 +23246,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 response_status: StatusCode::OK,
@@ -23458,7 +23317,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 response_status: StatusCode::OK,
@@ -23528,7 +23388,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 response_status: StatusCode::OK,
@@ -23598,7 +23459,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 response_status: StatusCode::OK,
@@ -23689,7 +23551,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let services = noop_services();
             let mut params = non_html_stream_params("gzip");
             let compressed =
@@ -23732,7 +23595,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let services = noop_services();
             let mut params = non_html_stream_params("deflate");
             let compressed =
@@ -23780,7 +23644,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let services = noop_services();
             let mut params = non_html_stream_params("gzip");
             let compressed = gzip_encode(&vec![b'a'; 64 * 1024]);
@@ -23869,7 +23734,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
@@ -23947,7 +23813,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
@@ -24028,7 +23895,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 ),
             )
             .expect("should create integration registry");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 response_status: StatusCode::OK,
@@ -24097,7 +23965,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             )
             .expect("should create integration registry"),
         );
-        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let orchestrator = Arc::new(
+            crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator"),
+        );
         let services = noop_services();
         let response = Response::builder()
             .status(StatusCode::OK)
@@ -24290,7 +24161,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             &mut params,
             &settings,
             &registry,
-            &AuctionOrchestrator::new(settings.auction.clone()),
+            &crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator"),
             &noop_services(),
         ))
         .expect_err("should reject inconsistent EOF declarations before input effects");
@@ -24343,7 +24215,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             bytes: Arc::clone(&bytes),
             flushed: Arc::clone(&flushed),
         };
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = crate::auction::build_orchestrator(&settings)
+            .expect("should build the auction orchestrator");
         let mut params = html_stream_params("", None);
         let services = noop_services();
         let mut work = Box::pin(stream_publisher_body_async(
@@ -24420,7 +24293,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                         &Method::GET,
                         Arc::clone(&settings),
                         &registry,
-                        Arc::new(AuctionOrchestrator::new(settings.auction.clone())),
+                        Arc::new(
+                            crate::auction::build_orchestrator(&settings)
+                                .expect("should build the auction orchestrator"),
+                        ),
                         noop_services(),
                     ))
                     .expect("should create lazy limited response");
@@ -24488,7 +24364,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 &Method::GET,
                 Arc::clone(&settings),
                 &registry,
-                Arc::new(AuctionOrchestrator::new(settings.auction.clone())),
+                Arc::new(
+                    crate::auction::build_orchestrator(&settings)
+                        .expect("should build the auction orchestrator"),
+                ),
                 noop_services(),
             ))
             .expect("should prepare lazy EOF output");
@@ -24544,7 +24423,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         let services = build_services_with_http_client(
             Arc::clone(&http) as Arc<dyn crate::platform::PlatformHttpClient>
         );
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = crate::auction::build_orchestrator(&settings)
+            .expect("should build the auction orchestrator");
         let request = Request::builder()
             .method(Method::GET)
             .uri("https://proxy.example.com/article")
@@ -24627,7 +24507,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             &mut params,
             &settings,
             &registry,
-            &AuctionOrchestrator::new(settings.auction.clone()),
+            &crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator"),
             &noop_services(),
         ))
         .expect("should finish the document");
@@ -24758,8 +24639,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                                 body,
                                 params: Box::new(params),
                             };
-                            let orchestrator =
-                                Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+                            let orchestrator = Arc::new(
+                                crate::auction::build_orchestrator(&settings)
+                                    .expect("should build the auction orchestrator"),
+                            );
                             let response = if buffered {
                                 futures::executor::block_on(buffer_publisher_response_async(
                                     publisher,
@@ -24855,7 +24738,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 }
                 http.push_response_with_headers(status, raw.to_vec(), headers);
                 let services = build_services_with_http_client(http.clone());
-                let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+                let orchestrator = Arc::new(
+                    crate::auction::build_orchestrator(&settings)
+                        .expect("should build the auction orchestrator"),
+                );
                 let request = Request::builder()
                     .method(Method::GET)
                     .uri("https://proxy.example.com/article")
@@ -24940,7 +24826,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 StatusCode::PARTIAL_CONTENT
             };
             params.range_associated = streamed;
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let mut output = Vec::new();
             futures::executor::block_on(stream_publisher_body_async(
                 body,
@@ -25003,7 +24890,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         let mut source = b"<html><head></head><body><p>".to_vec();
         source.extend(vec![b'x'; 5 * STREAM_CHUNK_SIZE]);
         source.extend_from_slice(b"</p></body></html>");
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = crate::auction::build_orchestrator(&settings)
+            .expect("should build the auction orchestrator");
         let mut output = FlushCounter {
             bytes: Vec::new(),
             flushes: 0,
@@ -25067,15 +24955,14 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 crate::auction::AuctionConfig::legacy_provider_map(&["seam-test"]);
             settings.auction.timeout_ms = 60_000;
             settings.auction.mediator = None;
-            let client = Arc::new(GatedAuctionHttpClient {
-                inner: StubHttpClient::new(),
-                released: AtomicBool::new(false),
-                collections: AtomicUsize::new(0),
-            });
-            client.inner.push_response(200, Vec::new());
-            let services = build_services_with_http_client(client.clone());
-            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(GatedAuctionProvider));
+            let clock = TestClock::new();
+            let bidders = ScriptedHttpClient::new(&clock);
+            // The held bid keeps the auction unresolved until the test releases it.
+            let (bid, release) = ScriptedReply::status(StatusCode::NO_CONTENT).held();
+            bidders.respond_to(Method::POST, SEAM_TEST_BIDDER, bid);
+            let services = build_services_with_outbound_client(&bidders, &clock);
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let request = Request::new(EdgeBody::empty());
             let dispatched = futures::executor::block_on(orchestrator.dispatch_auction(
                 &test_auction_request(),
@@ -25083,7 +24970,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     settings: &settings,
                     request: &request,
                     timeout_ms: 60_000,
-                    transport_timeout_ms: 60_000,
                     provider_responses: None,
                     services: &services,
                 },
@@ -25145,12 +25031,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 1,
                 "should use one pre-auction flush barrier"
             );
-            assert_eq!(
-                client.collections.load(Ordering::SeqCst),
-                1,
-                "should poll the pending auction once"
-            );
-            client.released.store(true, Ordering::SeqCst);
+            release.release();
             futures::executor::block_on(work)
                 .expect("should complete once the auction is released");
             assert_eq!(
@@ -25230,7 +25111,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     vec![("content-type", "text/html")],
                 );
                 let services = build_services_with_http_client(http);
-                let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+                let orchestrator = Arc::new(
+                    crate::auction::build_orchestrator(&settings)
+                        .expect("should build the auction orchestrator"),
+                );
                 let request = Request::builder()
                     .uri("https://proxy.example.com/article")
                     .header(header::HOST, "proxy.example.com")
@@ -25330,7 +25214,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 ],
             );
             let services = build_services_with_http_client(http);
-            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let orchestrator = Arc::new(
+                crate::auction::build_orchestrator(&settings)
+                    .expect("should build the auction orchestrator"),
+            );
             let request = Request::builder()
                 .method(method.clone())
                 .uri("https://proxy.example.com/article")
@@ -25401,7 +25288,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             )),
             params: Box::new(html_stream_params("", None)),
         };
-        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let orchestrator = Arc::new(
+            crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator"),
+        );
         let response = futures::executor::block_on(publisher_response_into_streaming_response(
             response,
             &Method::GET,
@@ -25498,7 +25388,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     body,
                     params: Box::new(html_stream_params(encoding, None)),
                 };
-                let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+                let orchestrator = Arc::new(
+                    crate::auction::build_orchestrator(&settings)
+                        .expect("should build the auction orchestrator"),
+                );
                 let response =
                     futures::executor::block_on(publisher_response_into_streaming_response(
                         response,
@@ -25612,7 +25505,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 )),
             )),
         };
-        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let orchestrator = Arc::new(
+            crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator"),
+        );
         let response = futures::executor::block_on(publisher_response_into_streaming_response(
             response,
             &Method::GET,
@@ -25697,7 +25593,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             )]);
             let sink = Arc::new(RecordingTelemetrySink::default());
             let services = noop_services_with_telemetry_sink(Arc::clone(&sink) as _);
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let encoding = if failure == "decode" { "gzip" } else { "" };
             let mut params = html_stream_params(
                 encoding,
@@ -25777,7 +25674,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         )]);
         let sink = Arc::new(RecordingTelemetrySink::default());
         let services = noop_services_with_telemetry_sink(Arc::clone(&sink) as _);
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = crate::auction::build_orchestrator(&settings)
+            .expect("should build the auction orchestrator");
         let mut params = html_stream_params(
             "",
             Some(DispatchedAuction::empty_for_test(
@@ -25943,8 +25841,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                                 IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                                     TerminalTestFactory,
                                 )]);
-                            let orchestrator =
-                                Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+                            let orchestrator = Arc::new(
+                                crate::auction::build_orchestrator(&settings)
+                                    .expect("should build the auction orchestrator"),
+                            );
                             let body = if streamed {
                                 let chunks: Vec<_> = encoded
                                     .chunks(7)
@@ -26041,7 +25941,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             )
             .expect("should create integration registry"),
         );
-        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let orchestrator = Arc::new(
+            crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator"),
+        );
         let services = noop_services();
         let response = Response::builder()
             .status(StatusCode::OK)
@@ -26262,126 +26165,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         );
     }
 
-    // Manually polled fixture for publisher injection order, not timer scheduling.
-    // Adapter runtime tests cover autonomous deadline wakeups and cancellation.
-    struct GatedAuctionHttpClient {
-        inner: StubHttpClient,
-        released: std::sync::atomic::AtomicBool,
-        collections: AtomicUsize,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl crate::platform::PlatformHttpClient for GatedAuctionHttpClient {
-        async fn send(
-            &self,
-            request: crate::platform::PlatformHttpRequest,
-        ) -> Result<crate::platform::PlatformResponse, Report<crate::platform::PlatformError>>
-        {
-            self.inner.send(request).await
-        }
-
-        async fn send_async(
-            &self,
-            request: crate::platform::PlatformHttpRequest,
-        ) -> Result<crate::platform::PlatformPendingRequest, Report<crate::platform::PlatformError>>
-        {
-            self.inner.send_async(request).await
-        }
-
-        async fn select_until(
-            &self,
-            pending: Vec<crate::platform::PlatformPendingRequest>,
-            deadline: web_time::Instant,
-        ) -> Result<
-            Option<crate::platform::PlatformSelectResult>,
-            Report<crate::platform::PlatformError>,
-        > {
-            self.collections.fetch_add(1, Ordering::SeqCst);
-            let ready = futures::future::poll_fn(|_| {
-                // The gate models completion, so probe it before checking expiry.
-                if self.released.load(Ordering::SeqCst) {
-                    std::task::Poll::Ready(true)
-                } else if web_time::Instant::now() >= deadline {
-                    std::task::Poll::Ready(false)
-                } else {
-                    std::task::Poll::Pending
-                }
-            })
-            .await;
-            if ready {
-                self.inner.select_until(pending, deadline).await
-            } else {
-                Ok(None)
-            }
-        }
-
-        async fn select(
-            &self,
-            pending: Vec<crate::platform::PlatformPendingRequest>,
-        ) -> Result<crate::platform::PlatformSelectResult, Report<crate::platform::PlatformError>>
-        {
-            self.collections.fetch_add(1, Ordering::SeqCst);
-            futures::future::poll_fn(|_| {
-                if self.released.load(Ordering::SeqCst) {
-                    std::task::Poll::Ready(())
-                } else {
-                    std::task::Poll::Pending
-                }
-            })
-            .await;
-            self.inner.select(pending).await
-        }
-    }
-
-    struct GatedAuctionProvider;
-
-    #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for GatedAuctionProvider {
-        fn provider_name(&self) -> &'static str {
-            "seam-test"
-        }
-
-        async fn request_bids(
-            &self,
-            _request: &AuctionRequest,
-            context: &AuctionContext<'_>,
-        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            context
-                .services
-                .http_client()
-                .send_async(
-                    crate::platform::PlatformHttpRequest::new(
-                        Request::builder()
-                            .uri("https://bidder.example.com/bid")
-                            .body(EdgeBody::empty())
-                            .expect("should build test bid request"),
-                        "seam-test",
-                    )
-                    .with_cache_bypass(),
-                )
-                .await
-                .change_context(TrustedServerError::Auction {
-                    message: "Failed to dispatch test auction".to_string(),
-                })
-                .map(ProviderRequestOutcome::pending)
-        }
-
-        async fn parse_response(
-            &self,
-            _response: crate::platform::PlatformResponse,
-            response_time_ms: u64,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            Ok(AuctionResponse::success(
-                "seam-test",
-                Vec::new(),
-                response_time_ms,
-            ))
-        }
-
-        fn timeout_ms(&self) -> u32 {
-            60_000
-        }
-    }
+    /// Endpoint of the `seam-test` bidder that `legacy_provider_map` configures.
+    const SEAM_TEST_BIDDER: &str = "https://seam-test.example/openrtb2/auction";
 
     #[test]
     fn parser_confirmed_auction_seam_streams_nextjs_for_every_encoding() {
@@ -26402,15 +26187,14 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     }),
                 )
                 .expect("should enable Next.js");
-            let client = Arc::new(GatedAuctionHttpClient {
-                inner: StubHttpClient::new(),
-                released: std::sync::atomic::AtomicBool::new(false),
-                collections: AtomicUsize::new(0),
-            });
-            client.inner.push_response(200, Vec::new());
-            let services = build_services_with_http_client(Arc::clone(&client) as _);
-            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(GatedAuctionProvider));
+            let clock = TestClock::new();
+            let bidders = ScriptedHttpClient::new(&clock);
+            // The held bid keeps the auction unresolved until the test releases it.
+            let (bid, release) = ScriptedReply::status(StatusCode::NO_CONTENT).held();
+            bidders.respond_to(Method::POST, SEAM_TEST_BIDDER, bid);
+            let services = build_services_with_outbound_client(&bidders, &clock);
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let request = Request::new(EdgeBody::empty());
             let dispatched = futures::executor::block_on(orchestrator.dispatch_auction(
                 &test_auction_request(),
@@ -26418,7 +26202,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     settings: &settings,
                     request: &request,
                     timeout_ms: 60_000,
-                    transport_timeout_ms: 60_000,
                     provider_responses: None,
                     services: &services,
                 },
@@ -26505,11 +26288,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 !prefix.contains("var b=JSON.parse("),
                 "should hold bids until auction completes"
             );
-            assert_eq!(
-                client.collections.load(Ordering::SeqCst),
-                1,
-                "should begin collection at the real seam"
-            );
             assert!(
                 state
                     .script_cell()
@@ -26518,7 +26296,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     .is_none(),
                 "should keep auction unresolved at seam"
             );
-            client.released.store(true, Ordering::SeqCst);
+            release.release();
             futures::executor::block_on(async {
                 while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
                     output.extend_from_slice(&chunk.expect("should stream completed auction"));
@@ -26549,11 +26327,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             assert!(
                 !html.contains("ts-inline-body-close-") && !html.contains("__ts_rsc_"),
                 "should remove internal markers for {encoding}: {html}"
-            );
-            assert_eq!(
-                client.collections.load(Ordering::SeqCst),
-                1,
-                "should collect once"
             );
         }
     }
@@ -26629,7 +26402,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             )
             .expect("should create integration registry"),
         );
-        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let orchestrator = Arc::new(
+            crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator"),
+        );
 
         for (method, status, expected_length, expected_transfer_encoding) in BODILESS_FRAMING_CASES
         {
@@ -26694,7 +26470,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             ),
         )
         .expect("should create integration registry");
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let orchestrator = crate::auction::build_orchestrator(&settings)
+            .expect("should build the auction orchestrator");
         let services = noop_services();
 
         for (method, status, expected_length, expected_transfer_encoding) in BODILESS_FRAMING_CASES
@@ -26780,7 +26557,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             ),
         )
         .expect("should create integration registry");
-        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let orchestrator = Arc::new(
+            crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator"),
+        );
 
         let make_params = || {
             let ec_context =
@@ -26964,7 +26744,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             )
             .expect("should create integration registry"),
         );
-        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let orchestrator = Arc::new(
+            crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator"),
+        );
         let services = noop_services();
         let response = Response::builder()
             .status(StatusCode::OK)
@@ -29021,109 +28804,59 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
     mod page_bids_no_match_tests {
         use super::super::*;
-        use super::build_services_with_http_client;
         use crate::auction::AuctionOrchestrator;
-        use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
-        use crate::auction::types::{AuctionRequest, AuctionResponse, Bid};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
-        use crate::platform::test_support::{StubHttpClient, noop_services};
-        use crate::platform::{PlatformHttpRequest, PlatformResponse};
+        use crate::platform::test_support::{build_services_with_outbound_client, noop_services};
+        use crate::test_support::scripted_client::{ScriptedHttpClient, ScriptedReply, TestClock};
         use crate::test_support::tests::crate_test_settings_str;
-        use error_stack::{Report, ResultExt};
+
         use http::Method;
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
 
-        const AUCTION_ID_TEST_PROVIDER: &str = "auction_id_test_provider";
-        const AUCTION_ID_TEST_BACKEND: &str = "auction-id-test-backend";
+        const AUCTION_ID_TEST_PROVIDER: &str = "auction-id-test";
+        /// Endpoint of the [`AUCTION_ID_TEST_PROVIDER`] that `legacy_provider_map` configures.
+        const AUCTION_ID_TEST_ENDPOINT: &str = "https://auction-id-test.example/openrtb2/auction";
 
-        struct AuctionIdTestProvider {
-            captured_request: Arc<Mutex<Option<AuctionRequest>>>,
+        /// The plan-backed orchestrator for `settings`, with services whose test bidder
+        /// answers one winning `atf` bid, or no bid.
+        fn auction_id_test_auction(
+            settings: &Settings,
             winning_bid: bool,
-            creative: Option<String>,
+            creative: &str,
+        ) -> (AuctionOrchestrator, RuntimeServices, ScriptedHttpClient) {
+            let clock = TestClock::new();
+            let bidder = ScriptedHttpClient::new(&clock);
+            let reply = if winning_bid {
+                ScriptedReply::status(StatusCode::OK).body(
+                    serde_json::to_vec(&serde_json::json!({
+                        "seatbid": [{"seat": AUCTION_ID_TEST_PROVIDER, "bid": [{
+                            "impid": "atf",
+                            "price": 1.50,
+                            "adid": "winner-123",
+                            "adm": creative,
+                            "w": 300,
+                            "h": 250
+                        }]}]
+                    }))
+                    .expect("should serialize the winning bid"),
+                )
+            } else {
+                ScriptedReply::status(StatusCode::NO_CONTENT)
+            };
+            bidder.respond_to(Method::POST, AUCTION_ID_TEST_ENDPOINT, reply);
+            let services = build_services_with_outbound_client(&bidder, &clock);
+            let orchestrator = crate::auction::build_orchestrator(settings)
+                .expect("should build the auction orchestrator");
+            (orchestrator, services, bidder)
         }
 
-        #[async_trait::async_trait(?Send)]
-        impl AuctionProvider for AuctionIdTestProvider {
-            fn provider_name(&self) -> &str {
-                AUCTION_ID_TEST_PROVIDER
-            }
-
-            async fn request_bids(
-                &self,
-                request: &AuctionRequest,
-                context: &AuctionContext<'_>,
-            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-                *self
-                    .captured_request
-                    .lock()
-                    .expect("should lock captured auction request") = Some(request.clone());
-                let request = PlatformHttpRequest::new(
-                    Request::builder()
-                        .method(Method::POST)
-                        .uri("https://bidder.example.test/bids")
-                        .body(EdgeBody::empty())
-                        .expect("should build test bidder request"),
-                    AUCTION_ID_TEST_BACKEND,
-                );
-                context
-                    .services
-                    .http_client()
-                    .send_async(request.with_cache_bypass())
-                    .await
-                    .change_context(TrustedServerError::Auction {
-                        message: "test bidder launch failed".to_string(),
-                    })
-                    .map(ProviderRequestOutcome::pending)
-            }
-
-            async fn parse_response(
-                &self,
-                _response: PlatformResponse,
-                response_time_ms: u64,
-            ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-                let bids = if self.winning_bid {
-                    vec![Bid {
-                        slot_id: "atf".to_string(),
-                        price: Some(1.50),
-                        currency: "USD".to_string(),
-                        creative: self.creative.clone(),
-                        adomain: None,
-                        bidder: AUCTION_ID_TEST_PROVIDER.to_string(),
-                        returned_seat: None,
-                        width: 300,
-                        height: 250,
-                        nurl: None,
-                        burl: None,
-                        bid_id: None,
-                        creative_id: None,
-                        renderer: None,
-                        ad_id: Some("winner-123".to_string()),
-                        cache_id: None,
-                        cache_host: None,
-                        cache_path: None,
-                        metadata: Default::default(),
-                    }]
-                } else {
-                    Vec::new()
-                };
-                Ok(AuctionResponse::success(
-                    AUCTION_ID_TEST_PROVIDER,
-                    bids,
-                    response_time_ms,
-                ))
-            }
-
-            fn timeout_ms(&self) -> u32 {
-                100
-            }
-
-            fn backend_name(
-                &self,
-                _services: &RuntimeServices,
-                _timeout_ms: u32,
-            ) -> Option<String> {
-                Some(AUCTION_ID_TEST_BACKEND.to_string())
-            }
+        /// The `OpenRTB` request the test bidder received.
+        fn sent_auction(bidder: &ScriptedHttpClient) -> serde_json::Value {
+            let requests = bidder.requests();
+            let request = requests
+                .first()
+                .expect("should dispatch the auction request");
+            serde_json::from_slice(&request.body).expect("should send a JSON bid request")
         }
 
         fn settings_with_co() -> Settings {
@@ -29224,7 +28957,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         #[tokio::test]
         async fn page_bids_format_absent_or_json_returns_json() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             for path_and_format in ["/2024/article", "/2024/article&format=json"] {
                 let response = run_page_bids_response(
                     &settings,
@@ -29276,13 +29010,18 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                             .expect("should compile actual provider plan"),
                     );
                     let orchestrator = AuctionOrchestrator::from_plan(plan, None);
-                    let http = Arc::new(StubHttpClient::new());
-                    if winning_bid {
-                        http.push_response(200, serde_json::to_vec(&serde_json::json!({"seatbid":[{"seat":"bidder","bid":[{"id":"bid","impid":"atf","price":1.5,"w":300,"h":250,"adm":"<div>Example creative</div>"}]}]})).expect("should encode actual winning response"));
+                    let clock = TestClock::new();
+                    let bidder = ScriptedHttpClient::new(&clock);
+                    let reply = if winning_bid {
+                        ScriptedReply::status(StatusCode::OK).body(
+                            serde_json::to_vec(&serde_json::json!({"seatbid":[{"seat":"bidder","bid":[{"id":"bid","impid":"atf","price":1.5,"w":300,"h":250,"adm":"<div>Example creative</div>"}]}]}))
+                                .expect("should encode actual winning response"),
+                        )
                     } else {
-                        http.push_response(204, Vec::new());
-                    }
-                    let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
+                        ScriptedReply::status(StatusCode::NO_CONTENT)
+                    };
+                    bidder.respond_to(Method::POST, "https://bidder.example.com/auction", reply);
+                    let services = build_services_with_outbound_client(&bidder, &clock);
                     let mut request = make_page_bids_request_on(endpoint, "/2024/article");
                     set_test_header(&mut request, "cookie", "__Host-ts-console=1");
                     let hook = crate::trace::TracePreDispatchHook::new(
@@ -29361,12 +29100,9 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                             "should share opportunity and evidence token"
                         );
                     }
-                    assert_eq!(
-                        http.recorded_request_bodies().len(),
-                        1,
-                        "should execute one real provider launch"
-                    );
-                    let source = String::from_utf8(http.recorded_request_bodies()[0].clone())
+                    let sent = bidder.requests();
+                    assert_eq!(sent.len(), 1, "should execute one real provider launch");
+                    let source = String::from_utf8(sent[0].body.to_vec())
                         .expect("should serialize ordinary provider JSON");
                     assert!(
                         !source.contains("trace_slot_ref") && !source.contains(&token),
@@ -29388,7 +29124,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     )
                     .expect("should enable request-local trace evidence");
                 let settings = Arc::new(settings);
-                let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+                let orchestrator = crate::auction::build_orchestrator(&settings)
+                    .expect("should build the auction orchestrator");
                 let mut request = make_page_bids_request("/2024/article");
                 if active {
                     set_test_header(&mut request, "cookie", "__Host-ts-console=1");
@@ -29445,7 +29182,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         #[tokio::test]
         async fn page_bids_format_rejects_removed_unknown_and_empty_values() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             for format in ["fragment", "scrpit", ""] {
                 let response = run_page_bids_response(
                     &settings,
@@ -29520,20 +29258,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .expect("should return ok response")
         }
 
-        fn auction_id_test_orchestrator(
-            settings: &Settings,
-            captured_request: Arc<Mutex<Option<AuctionRequest>>>,
-            winning_bid: bool,
-        ) -> AuctionOrchestrator {
-            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(AuctionIdTestProvider {
-                captured_request,
-                winning_bid,
-                creative: None,
-            }));
-            orchestrator
-        }
-
         #[tokio::test]
         async fn public_origin_spa_creatives_use_public_port_and_preserve_publisher_identity() {
             let mut settings = settings_with_co();
@@ -29549,16 +29273,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 ),
             });
             for endpoint in [PAGE_BIDS_PATH, PAGE_BIDS_LEGACY_PATH] {
-                let captured = Arc::new(Mutex::new(None));
-                let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-                orchestrator.register_provider(Arc::new(AuctionIdTestProvider {
-                    captured_request: Arc::clone(&captured), winning_bid: true,
-                    creative: Some("<a href=\"https://ads.example.com/click\"><img src=\"https://ads.example.com/banner.png\"></a>".to_owned()),
-                }));
-                let stub = Arc::new(StubHttpClient::new());
-                stub.push_response(200, b"winner".to_vec());
-                let services = build_services_with_http_client(
-                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                let (orchestrator, services, bidder) = auction_id_test_auction(
+                    &settings,
+                    true,
+                    "<a href=\"https://ads.example.com/click\"><img src=\"https://ads.example.com/banner.png\"></a>",
                 );
                 let mut request = Request::builder()
                     .uri(format!(
@@ -29623,17 +29341,13 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     !creative.contains("internal.example.com"),
                     "should not leak transport authority into SPA creative"
                 );
-                let auction = captured
-                    .lock()
-                    .expect("should lock captured request")
-                    .clone()
-                    .expect("should dispatch SPA auction");
+                let auction = sent_auction(&bidder);
                 assert_eq!(
-                    auction.publisher.domain, "publisher.example.com",
+                    auction["site"]["publisher"]["domain"], "publisher.example.com",
                     "should retain configured publisher identity"
                 );
                 assert_eq!(
-                    auction.publisher.page_url.as_deref(),
+                    auction["site"]["page"].as_str(),
                     Some("https://publisher.example.com/2024/article"),
                     "should use public scheme with configured publisher page identity"
                 );
@@ -29650,14 +29364,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
                 .expect("should enable diagnostics");
             let slots = article_slot();
-            let winning_stub = Arc::new(StubHttpClient::new());
-            winning_stub.push_response(200, b"winner".to_vec());
-            let winning_services = build_services_with_http_client(
-                Arc::clone(&winning_stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let winning_request = Arc::new(Mutex::new(None));
-            let winning_orchestrator =
-                auction_id_test_orchestrator(&settings, Arc::clone(&winning_request), true);
+            let (winning_orchestrator, winning_services, winning_bidder) =
+                auction_id_test_auction(&settings, true, "<div>winner</div>");
             let mut ec_context = EcContext::new_for_test(
                 Some("page-auction-example-123".to_string()),
                 crate::consent::ConsentContext {
@@ -29688,14 +29396,13 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     .expect("should read winning page-bids response body"),
             )
             .expect("should serialize winning page-bids response as JSON");
-            let auction_request = winning_request
-                .lock()
-                .expect("should lock captured winning request")
-                .clone()
-                .expect("should dispatch a winning auction request");
+            let auction_request = sent_auction(&winning_bidder);
+            let auction_request_id = auction_request["id"]
+                .as_str()
+                .expect("should send the auction request ID");
 
             assert_eq!(
-                auction_request.id, "ts-page-auction-example-123",
+                auction_request_id, "ts-page-auction-example-123",
                 "test EC ID should produce a deterministic auction request ID"
             );
             let winning_auction_id = winning_body["bids"]["atf"]["hb_auction_id"]
@@ -29707,7 +29414,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 "page-bids should expose a freshly minted diagnostics token, got `{winning_auction_id}`"
             );
             assert_ne!(
-                winning_auction_id, auction_request.id,
+                winning_auction_id, auction_request_id,
                 "browser-visible auction ID must not be the EC-derived request ID"
             );
             assert!(
@@ -29715,13 +29422,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 "browser-visible auction ID must not embed the EC ID"
             );
 
-            let no_winner_stub = Arc::new(StubHttpClient::new());
-            no_winner_stub.push_response(200, b"no-bid".to_vec());
-            let no_winner_services = build_services_with_http_client(
-                Arc::clone(&no_winner_stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let no_winner_orchestrator =
-                auction_id_test_orchestrator(&settings, Arc::new(Mutex::new(None)), false);
+            let (no_winner_orchestrator, no_winner_services, _no_winner_bidder) =
+                auction_id_test_auction(&settings, false, "<div>winner</div>");
             let no_winner_response = handle_page_bids(
                 &settings,
                 &no_winner_services,
@@ -29761,13 +29463,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         async fn page_bids_auction_id_is_per_auction_and_gated_on_diagnostics() {
             async fn winning_auction_id(settings: &Settings) -> Option<String> {
                 let slots = article_slot();
-                let stub = Arc::new(StubHttpClient::new());
-                stub.push_response(200, b"winner".to_vec());
-                let services = build_services_with_http_client(
-                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-                );
-                let orchestrator =
-                    auction_id_test_orchestrator(settings, Arc::new(Mutex::new(None)), true);
+                let (orchestrator, services, _bidder) =
+                    auction_id_test_auction(settings, true, "<div>winner</div>");
                 let mut ec_context = EcContext::new_for_test(
                     Some("page-auction-example-123".to_string()),
                     crate::consent::ConsentContext {
@@ -29843,7 +29540,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         #[tokio::test]
         async fn deprecated_alias_response_matches_canonical_path() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
 
             let canonical = run_page_bids_response(
                 &settings,
@@ -29880,7 +29578,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         #[tokio::test]
         async fn deprecated_alias_response_is_marked_deprecated() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
 
             let canonical = run_page_bids_response(
                 &settings,
@@ -29924,7 +29623,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 settings.creative_opportunities.is_none(),
                 "test settings should have no creative opportunities configured"
             );
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
 
             let response = run_page_bids_response(
                 &settings,
@@ -29951,7 +29651,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         #[tokio::test]
         async fn cross_site_request_is_denied_before_configuration_is_revealed() {
             let settings = settings_without_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let mut req = Request::builder()
                 .method(Method::GET)
                 .uri(format!("https://test-publisher.com{PAGE_BIDS_PATH}?path=/"))
@@ -29971,7 +29672,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         #[tokio::test]
         async fn cross_site_fetch_metadata_is_rejected() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let mut req = make_page_bids_request("/2024/01/my-article/");
             set_test_header(&mut req, "sec-fetch-site", "cross-site");
 
@@ -29988,7 +29690,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         #[tokio::test]
         async fn missing_fetch_metadata_without_tsjs_header_is_rejected() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let mut req = make_page_bids_request("/2024/01/my-article/");
             req.headers_mut().remove("sec-fetch-site");
 
@@ -30005,7 +29708,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         #[tokio::test]
         async fn missing_fetch_metadata_with_tsjs_header_is_allowed() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let mut req = make_page_bids_request("/2024/01/my-article/");
             req.headers_mut().remove("sec-fetch-site");
             set_test_header(&mut req, "x-tsjs-page-bids", "1");
@@ -30023,7 +29727,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         #[tokio::test]
         async fn same_site_fetch_metadata_is_rejected() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let mut req = make_page_bids_request("/2024/01/my-article/");
             // `same-site` admits sibling origins under the same registrable
             // domain — not trusted to spend SSP quota.
@@ -30044,7 +29749,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             // Spec §8 kill-switch: creative-opportunities.toml with zero slots disables
             // all server-side auction activity and injection.
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let req = make_page_bids_request("/2024/01/my-article/");
 
             let body = run_page_bids(&settings, &orchestrator, &[], req).await;
@@ -30073,7 +29779,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             // but the server must not burn SSP request quota running a real auction
             // for them. Same gate the publisher path applies.
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let slots = article_slot();
             let mut req = make_page_bids_request("/2024/01/my-article/");
             set_test_header(
@@ -30107,7 +29814,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             // Navigations triggered by Sec-Purpose=prefetch should not fire real
             // SSP auctions — the user has not yet visited the page.
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let slots = article_slot();
             let mut req = make_page_bids_request("/2024/01/my-article/");
             set_test_header(&mut req, "sec-purpose", "prefetch");
@@ -30135,7 +29843,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         #[tokio::test]
         async fn page_bids_omits_only_over_limit_dynamic_slot() {
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let mut over_limit = article_slot()
                 .into_iter()
                 .next()
@@ -30176,7 +29885,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         async fn url_not_matching_any_pattern_returns_empty_response() {
             // Slots exist but request path does not match — no auction, no injection.
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let slots = article_slot(); // slot matches /20** only
             let req = make_page_bids_request("/about"); // does not match
 
@@ -30238,7 +29948,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             // the auction is off. Consent is allowed here so the test isolates
             // the kill switch.
             let settings = settings_with_co_auction_disabled();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let slots = article_slot();
             let req = make_page_bids_request("/2024/01/my-article/");
 
@@ -30267,7 +29978,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             // The dedicated template switch must suppress publisher/page-bids
             // delivery without using the global auction switch.
             let settings = settings_with_co_templates_disabled();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let slots = article_slot();
             let req = make_page_bids_request("/2024/01/my-article/");
 
@@ -30298,7 +30010,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             // hook does not create GPT slots client-side — matching the publisher
             // navigation path's shared `evaluate_ad_stack_gate` gate.
             let settings = settings_with_co();
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let slots = article_slot();
             let req = make_page_bids_request("/2024/01/my-article/");
 
@@ -30370,15 +30083,14 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
     /// the handler emitted.
     mod navigation_publisher_domain_tests {
         use super::*;
-        use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
+
         use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
-        use crate::auction::types::AuctionRequest;
-        use crate::auction::{AuctionContext, AuctionOrchestrator};
+
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
+        use crate::platform::ClientInfo;
         use crate::platform::test_support::{
             NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
         };
-        use crate::platform::{ClientInfo, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
         use std::sync::Mutex;
 
@@ -30391,49 +30103,16 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
         const CAPTURING_PROVIDER: &str = "request-capturing-provider";
 
-        /// Records the [`AuctionRequest`] the orchestrator dispatched, then
-        /// fails its launch so no real transport handle is needed.
-        struct RequestCapturingProvider {
-            captured: Arc<Mutex<Option<AuctionRequest>>>,
-        }
+        /// Endpoint of the [`CAPTURING_PROVIDER`] in [`settings_with_capturing_provider`].
+        const CAPTURING_ENDPOINT: &str = "https://capture.example/openrtb2/auction";
 
-        #[async_trait::async_trait(?Send)]
-        impl AuctionProvider for RequestCapturingProvider {
-            fn provider_name(&self) -> &str {
-                CAPTURING_PROVIDER
-            }
-
-            async fn request_bids(
-                &self,
-                request: &AuctionRequest,
-                _context: &AuctionContext<'_>,
-            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-                *self.captured.lock().expect("should lock captured request") =
-                    Some(request.clone());
-                Err(Report::new(TrustedServerError::Auction {
-                    message: "capture only".to_string(),
-                }))
-            }
-
-            async fn parse_response(
-                &self,
-                _response: PlatformResponse,
-                _response_time_ms: u64,
-            ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-                panic!("parse_response must not run when the launch fails");
-            }
-
-            fn timeout_ms(&self) -> u32 {
-                100
-            }
-
-            fn backend_name(
-                &self,
-                _services: &RuntimeServices,
-                _timeout_ms: u32,
-            ) -> Option<String> {
-                Some("capture-backend".to_string())
-            }
+        /// The `OpenRTB` request the capturing provider's bidder received.
+        fn sent_auction(bidder: &ScriptedHttpClient) -> serde_json::Value {
+            let requests = bidder.requests();
+            let request = requests
+                .first()
+                .expect("should dispatch an auction request");
+            serde_json::from_slice(&request.body).expect("should send a JSON bid request")
         }
 
         #[derive(Default)]
@@ -30504,15 +30183,14 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             vec![over_limit, valid_static]
         }
 
-        fn assert_only_renderable_slot_was_auctioned(
-            captured: &Arc<Mutex<Option<AuctionRequest>>>,
-        ) {
-            let request = captured
-                .lock()
-                .expect("should lock captured request")
-                .clone()
-                .expect("should dispatch an auction request");
-            let slot_ids: Vec<_> = request.slots.iter().map(|slot| slot.id.as_str()).collect();
+        fn assert_only_renderable_slot_was_auctioned(bidder: &ScriptedHttpClient) {
+            let request = sent_auction(bidder);
+            let slot_ids: Vec<_> = request["imp"]
+                .as_array()
+                .expect("should send impressions")
+                .iter()
+                .filter_map(|imp| imp["id"].as_str())
+                .collect();
             assert_eq!(slot_ids, vec!["valid_static_sibling"]);
         }
 
@@ -30525,65 +30203,56 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             EcContext::new_for_test(None, consent)
         }
 
+        /// Services whose capturing bidder answers no bid, returned with that bidder.
         fn services_with(
             http_client: Arc<dyn crate::platform::PlatformHttpClient>,
             telemetry_sink: Arc<RecordingTelemetrySink>,
-        ) -> RuntimeServices {
+        ) -> (RuntimeServices, ScriptedHttpClient) {
             let telemetry_sink: Arc<dyn AuctionTelemetrySink> = telemetry_sink;
-            RuntimeServices::builder()
+            let clock = TestClock::new();
+            let bidder = ScriptedHttpClient::new(&clock);
+            bidder.respond_to(
+                Method::POST,
+                CAPTURING_ENDPOINT,
+                ScriptedReply::status(StatusCode::NO_CONTENT),
+            );
+            let services = RuntimeServices::builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::new(StubBackend))
                 .http_client(http_client)
-                .outbound_client(ScriptedHttpClient::forbidding().http_client())
-                .clock(TestClock::new().monotonic_clock())
+                .outbound_client(bidder.http_client())
+                .clock(clock.monotonic_clock())
                 .geo(Arc::new(NoopGeo))
                 .auction_telemetry_sink(telemetry_sink)
                 .client_info(ClientInfo::default())
-                .build()
-        }
-
-        fn orchestrator_capturing_request(
-            settings: &Settings,
-            captured: &Arc<Mutex<Option<AuctionRequest>>>,
-        ) -> AuctionOrchestrator {
-            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(RequestCapturingProvider {
-                captured: Arc::clone(captured),
-            }));
-            orchestrator
+                .build();
+            (services, bidder)
         }
 
         /// Assert the dispatched request and every emitted telemetry row carry
         /// the configured publisher domain rather than the edge host.
         fn assert_configured_domain(
-            captured: &Arc<Mutex<Option<AuctionRequest>>>,
+            bidder: &ScriptedHttpClient,
             telemetry_sink: &RecordingTelemetrySink,
         ) {
-            let request = captured
-                .lock()
-                .expect("should lock captured request")
-                .clone()
-                .expect("should dispatch an auction request");
+            let request = sent_auction(bidder);
             assert_eq!(
-                request.publisher.domain, CONFIGURED_DOMAIN,
+                request["site"]["publisher"]["domain"], CONFIGURED_DOMAIN,
                 "publisher.domain should be the configured publisher domain, not the edge host"
             );
-            let site = request.site.expect("should populate site metadata");
             assert_eq!(
-                site.domain, CONFIGURED_DOMAIN,
+                request["site"]["domain"], CONFIGURED_DOMAIN,
                 "site.domain should be the configured publisher domain, not the edge host"
             );
             // Only the host is asserted: the two `AuctionRequest` builders still
             // disagree on where the scheme comes from (edge-detected here,
             // canonical `https` in `convert_tsjs_to_auction_request`), which is
             // tracked separately.
-            let page_url = request
-                .publisher
-                .page_url
-                .as_deref()
-                .expect("should populate page_url");
+            let page_url = request["site"]["page"]
+                .as_str()
+                .expect("should populate site.page");
             let page_url_host = url::Url::parse(page_url)
                 .expect("should build a parseable page_url")
                 .host_str()
@@ -30592,10 +30261,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             assert_eq!(
                 page_url_host, CONFIGURED_DOMAIN,
                 "page_url host should be the configured publisher domain, not the edge host"
-            );
-            assert_eq!(
-                site.page, page_url,
-                "site.page should mirror page_url, so it carries the configured publisher domain too"
             );
 
             let batches = telemetry_sink
@@ -30615,12 +30280,12 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         #[tokio::test]
         async fn initial_navigation_advertises_configured_publisher_domain() {
             let settings = settings_with_capturing_provider();
-            let captured = Arc::new(Mutex::new(None));
-            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, b"<html><head></head><body>ok</body></html>".to_vec());
-            let services = services_with(
+            let (services, bidder) = services_with(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
                 Arc::clone(&telemetry_sink),
             );
@@ -30650,16 +30315,16 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .await
             .expect("should proxy publisher request");
 
-            assert_configured_domain(&captured, &telemetry_sink);
+            assert_configured_domain(&bidder, &telemetry_sink);
         }
 
         #[tokio::test]
         async fn page_bids_advertises_configured_publisher_domain() {
             let settings = settings_with_capturing_provider();
-            let captured = Arc::new(Mutex::new(None));
-            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
-            let services = services_with(
+            let (services, bidder) = services_with(
                 Arc::new(crate::platform::test_support::NoopHttpClient),
                 Arc::clone(&telemetry_sink),
             );
@@ -30693,18 +30358,18 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .await
             .expect("should return ok response");
 
-            assert_configured_domain(&captured, &telemetry_sink);
+            assert_configured_domain(&bidder, &telemetry_sink);
         }
 
         #[tokio::test]
         async fn initial_navigation_auctions_only_renderable_slots() {
             let settings = settings_with_capturing_provider();
-            let captured = Arc::new(Mutex::new(None));
-            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, b"<html><head></head><body>ok</body></html>".to_vec());
-            let services = services_with(
+            let (services, bidder) = services_with(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
                 telemetry_sink,
             );
@@ -30736,16 +30401,16 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .await
             .expect("should proxy publisher request");
 
-            assert_only_renderable_slot_was_auctioned(&captured);
+            assert_only_renderable_slot_was_auctioned(&bidder);
         }
 
         #[tokio::test]
         async fn page_bids_auctions_only_renderable_slots() {
             let settings = settings_with_capturing_provider();
-            let captured = Arc::new(Mutex::new(None));
-            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
             let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
-            let services = services_with(
+            let (services, bidder) = services_with(
                 Arc::new(crate::platform::test_support::NoopHttpClient),
                 telemetry_sink,
             );
@@ -30781,7 +30446,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .await
             .expect("should return ok response");
 
-            assert_only_renderable_slot_was_auctioned(&captured);
+            assert_only_renderable_slot_was_auctioned(&bidder);
         }
     }
 }

@@ -2,6 +2,7 @@ mod common;
 mod environments;
 mod frameworks;
 
+use base64::Engine as _;
 use common::ec::CookieVaryingOrigin;
 use common::runtime::{
     RuntimeEnvironment, RuntimeProcess, TestError, origin_port, wasm_binary_path,
@@ -464,6 +465,10 @@ struct OriginRequest {
     method: String,
     path: String,
     body: Vec<u8>,
+    /// The `Content-Length` value the request was framed with, if any.
+    content_length: Option<String>,
+    /// The `Transfer-Encoding` value the request was framed with, if any.
+    transfer_encoding: Option<String>,
 }
 
 /// Builds the complete HTTP response a [`RecordingOrigin`] sends for one request.
@@ -624,13 +629,17 @@ fn read_origin_request(stream: &mut TcpStream) -> Option<OriginRequest> {
     let path = request_line.next()?.to_owned();
     let mut content_length = 0;
     let mut chunked = false;
+    let mut declared_length = None;
+    let mut transfer_encoding = None;
     for line in lines {
         let (name, value) = line.split_once(':')?;
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
             content_length = value.parse().ok()?;
+            declared_length = Some(value.to_owned());
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             chunked = value.eq_ignore_ascii_case("chunked");
+            transfer_encoding = Some(value.to_owned());
         }
     }
 
@@ -650,7 +659,13 @@ fn read_origin_request(stream: &mut TcpStream) -> Option<OriginRequest> {
         body
     };
 
-    Some(OriginRequest { method, path, body })
+    Some(OriginRequest {
+        method,
+        path,
+        body,
+        content_length: declared_length,
+        transfer_encoding,
+    })
 }
 
 /// Appends the next read from `stream` to `buffer`.
@@ -1380,4 +1395,322 @@ fn sigv4_signed_asset_reaches_origin_with_signed_host_path_and_query() {
         .find(|request| request.method == "HEAD" && request.target.starts_with("/.sigv4-images/"))
         .expect("should record the signed S3 HEAD preflight");
     assert_sent_as_signed(preflight, &expected_host, "/.sigv4-images/photos/dog.jpg");
+}
+
+// ---------------------------------------------------------------------------
+// Auction fan-out against loopback bidders (spec test 5)
+// ---------------------------------------------------------------------------
+
+/// Impression the runtime auction cases request.
+const AUCTION_SLOT: &str = "auction-slot";
+
+/// A TCF v2 `euconsent-v2` cookie that grants Purpose 1.
+///
+/// Runtimes without a geo source treat the jurisdiction as unknown, where the
+/// server-side auction needs Purpose 1. The construction matches the HTML
+/// end-of-file harness's consent cookie, which lives in another test binary.
+fn tcf_purpose_one_cookie() -> String {
+    let mut bits = [0_u8; 29];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("should have a current fixture clock")
+        .as_millis()
+        / 100;
+    for (offset, width, value) in [
+        (0, 6, 2),
+        (6, 36, now),
+        (42, 36, now),
+        (108, 6, 4),
+        (114, 6, 13),
+        (152, 1, 1),
+    ] {
+        for index in 0..width {
+            if value & (1 << (width - index - 1)) != 0 {
+                bits[(offset + index) / 8] |= 1 << (7 - (offset + index) % 8);
+            }
+        }
+    }
+    format!(
+        "euconsent-v2={}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bits)
+    )
+}
+
+/// A loopback bidder on its own port that answers each bid request with one bid.
+///
+/// It waits `delay` before answering and records every request it receives,
+/// framing included.
+fn start_loopback_bidder(seat: &str, price: f64, delay: Duration) -> RecordingOrigin {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "seatbid": [{"seat": seat, "bid": [{
+            "id": format!("{seat}-bid"),
+            "impid": AUCTION_SLOT,
+            "price": price,
+            "adm": "<div>loopback bid</div>",
+            "w": 300,
+            "h": 250
+        }]}]
+    }))
+    .expect("should serialize the loopback bid");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("should bind a loopback bidder port");
+    RecordingOrigin::serve(
+        listener,
+        Arc::new(move |_request| {
+            thread::sleep(delay);
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            response
+        }),
+    )
+}
+
+/// Configures one standard provider per loopback bidder, at `/bid` on its port.
+fn loopback_bidder_fixtures(
+    bidders: &[(&str, &RecordingOrigin, Duration)],
+) -> Vec<common::config::AuctionBidderFixture> {
+    bidders
+        .iter()
+        .map(
+            |(id, bidder, timeout)| common::config::AuctionBidderFixture {
+                id: (*id).to_owned(),
+                endpoint: format!("http://127.0.0.1:{}/bid", bidder.port),
+                timeout_ms: u32::try_from(timeout.as_millis())
+                    .expect("should fit the provider timeout in u32"),
+            },
+        )
+        .collect()
+}
+
+/// Sends one `/auction` request for [`AUCTION_SLOT`] and returns its `OpenRTB` response.
+fn post_auction(base_url: &str) -> serde_json::Value {
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{base_url}/auction"))
+        .header("cookie", tcf_purpose_one_cookie())
+        .header("cf-ipcountry", "US")
+        .json(&serde_json::json!({
+            "adUnits": [{
+                "code": AUCTION_SLOT,
+                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+            }]
+        }))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .expect("should send the auction request");
+    let status = response.status().as_u16();
+    let body = response.text().expect("should read the auction response");
+    assert_eq!(status, 200, "should complete the auction: {body}");
+    serde_json::from_str(&body).expect("should return an OpenRTB JSON response")
+}
+
+/// The provider summary the auction response carries for `provider`.
+fn provider_detail<'a>(response: &'a serde_json::Value, provider: &str) -> &'a serde_json::Value {
+    let detail = response["ext"]["orchestrator"]["provider_details"]
+        .as_array()
+        .expect("should list provider details")
+        .iter()
+        .find(|detail| detail["name"] == provider);
+    assert!(
+        detail.is_some(),
+        "should report provider {provider}: {response}"
+    );
+    detail.expect("should have found the provider detail")
+}
+
+/// Asserts every bidder received `auctions` requests with a JSON bid request body,
+/// and logs the framing each request arrived with.
+fn assert_bidders_received(runtime: &str, bidders: &[&RecordingOrigin], auctions: usize) {
+    for bidder in bidders {
+        let requests = bidder.requests();
+        assert_eq!(
+            requests.len(),
+            auctions,
+            "{runtime} should send one bid request per auction to port {}",
+            bidder.port
+        );
+        for request in &requests {
+            log::info!(
+                "{runtime} bid request framing: content-length {:?}, transfer-encoding {:?}",
+                request.content_length,
+                request.transfer_encoding
+            );
+            assert_eq!(
+                (request.method.as_str(), request.path.as_str()),
+                ("POST", "/bid"),
+                "{runtime} should POST the bid request to the provider path"
+            );
+            let bid_request = serde_json::from_slice::<serde_json::Value>(&request.body);
+            assert!(
+                bid_request.is_ok(),
+                "{runtime} should deliver the whole JSON bid request body: {bid_request:?}"
+            );
+        }
+    }
+}
+
+/// Runs a two-provider auction on `runtime` and asserts both bids arrive.
+fn multi_provider_auction_runs(runtime: common::trace_boundary::TraceRuntime, name: &str) {
+    init_logger();
+    let first = start_loopback_bidder("first-seat", 1.25, Duration::ZERO);
+    let second = start_loopback_bidder("second-seat", 2.5, Duration::ZERO);
+    let envelope = common::config::auction_app_config_envelope(
+        origin_port(),
+        &loopback_bidder_fixtures(&[
+            ("first", &first, Duration::from_millis(1500)),
+            ("second", &second, Duration::from_millis(1500)),
+        ]),
+        2000,
+    )
+    .expect("should build the multi-provider auction config");
+
+    common::trace_boundary::with_trace_runtime(
+        runtime,
+        &envelope,
+        Some("http://127.0.0.1:*"),
+        |base_url| {
+            let response = post_auction(base_url);
+            assert_eq!(
+                (
+                    &response["ext"]["orchestrator"]["providers"],
+                    &response["ext"]["orchestrator"]["total_bids"]
+                ),
+                (&serde_json::json!(2), &serde_json::json!(2)),
+                "{name} should fan out to both providers and collect both bids: {response}"
+            );
+            assert_eq!(
+                response["seatbid"][0]["bid"][0]["price"],
+                serde_json::json!(2.5),
+                "{name} should deliver the higher bid: {response}"
+            );
+        },
+    );
+
+    assert_bidders_received(name, &[&first, &second], 1);
+}
+
+#[test]
+#[ignore = "requires Viceroy and the release Fastly WASM"]
+fn twelve_bidder_auction_registers_twelve_backends_fastly() {
+    init_logger();
+    let bidders: Vec<RecordingOrigin> = (1..=12)
+        .map(|index| {
+            start_loopback_bidder(
+                &format!("seat-{index:02}"),
+                f64::from(index),
+                Duration::from_millis(20),
+            )
+        })
+        .collect();
+    let ids: Vec<String> = (1..=12).map(|index| format!("bidder-{index:02}")).collect();
+    let fixtures = loopback_bidder_fixtures(
+        &ids.iter()
+            .zip(&bidders)
+            .map(|(id, bidder)| (id.as_str(), bidder, Duration::from_millis(1500)))
+            .collect::<Vec<_>>(),
+    );
+    let envelope = common::config::auction_app_config_envelope(origin_port(), &fixtures, 2000)
+        .expect("should build the twelve-bidder auction config");
+
+    common::trace_boundary::with_trace_runtime(
+        common::trace_boundary::TraceRuntime::Fastly,
+        &envelope,
+        None,
+        |base_url| {
+            // Each bidder listens on its own port, so each needs its own backend.
+            // Two auctions show the backends serve every later auction too.
+            for auction in 1..=2 {
+                let response = post_auction(base_url);
+                assert_eq!(
+                    (
+                        &response["ext"]["orchestrator"]["providers"],
+                        &response["ext"]["orchestrator"]["total_bids"]
+                    ),
+                    (&serde_json::json!(12), &serde_json::json!(12)),
+                    "auction {auction} should collect one bid from each of the twelve bidders: {response}"
+                );
+                for id in &ids {
+                    assert_eq!(
+                        provider_detail(&response, id)["bid_count"],
+                        serde_json::json!(1),
+                        "auction {auction} should parse the bid from {id}"
+                    );
+                }
+                assert_eq!(
+                    response["seatbid"][0]["bid"][0]["price"],
+                    serde_json::json!(12.0),
+                    "auction {auction} should deliver the highest of the twelve bids"
+                );
+            }
+        },
+    );
+
+    assert_bidders_received("Fastly", &bidders.iter().collect::<Vec<_>>(), 2);
+}
+
+#[test]
+#[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
+fn multi_provider_auction_runs_cloudflare() {
+    multi_provider_auction_runs(
+        common::trace_boundary::TraceRuntime::Cloudflare,
+        "Cloudflare",
+    );
+}
+
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn multi_provider_auction_runs_spin() {
+    multi_provider_auction_runs(common::trace_boundary::TraceRuntime::Spin, "Spin");
+}
+
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn spin_runtime_auction_reports_one_timeout_and_cutoff() {
+    init_logger();
+    // The first bidder's own 200 ms timeout ends before the 1000 ms auction
+    // cutoff. The second bidder has time left but answers after the cutoff.
+    let early_timeout = start_loopback_bidder("early-seat", 1.0, Duration::from_millis(600));
+    let after_cutoff = start_loopback_bidder("late-seat", 2.0, Duration::from_millis(1600));
+    let envelope = common::config::auction_app_config_envelope(
+        origin_port(),
+        &loopback_bidder_fixtures(&[
+            ("early-timeout", &early_timeout, Duration::from_millis(200)),
+            ("after-cutoff", &after_cutoff, Duration::from_secs(2)),
+        ]),
+        1000,
+    )
+    .expect("should build the timeout and cutoff auction config");
+
+    common::trace_boundary::with_trace_runtime(
+        common::trace_boundary::TraceRuntime::Spin,
+        &envelope,
+        Some("http://127.0.0.1:*"),
+        |base_url| {
+            let response = post_auction(base_url);
+            let early = provider_detail(&response, "early-timeout");
+            let late = provider_detail(&response, "after-cutoff");
+            assert_eq!(
+                (
+                    &early["metadata"]["error_type"],
+                    &late["metadata"]["error_type"]
+                ),
+                (&serde_json::json!("timeout"), &serde_json::json!("timeout")),
+                "should report the provider timeout and the cutoff as timeouts, not a failed batch: {response}"
+            );
+            let early_ms = early["time_ms"]
+                .as_u64()
+                .expect("should time the early timeout");
+            let late_ms = late["time_ms"].as_u64().expect("should time the cutoff");
+            assert!(
+                early_ms < 1000 && late_ms >= 1000,
+                "should end the first bidder at its own timeout and the second at the cutoff, got {early_ms} ms and {late_ms} ms: {response}"
+            );
+            assert!(
+                response["seatbid"].as_array().is_none_or(Vec::is_empty),
+                "should deliver no bid: {response}"
+            );
+        },
+    );
 }

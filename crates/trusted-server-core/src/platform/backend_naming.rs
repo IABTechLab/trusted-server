@@ -1,4 +1,4 @@
-//! Pure adapter backend naming and auction-target capability policies.
+//! Pure adapter backend naming policies.
 //!
 //! These policies contain no platform SDK calls. Startup validation, CLI
 //! validation, and runtime adapters can therefore predict the same backend
@@ -15,13 +15,6 @@ use crate::host_header::validate_host_header_override_value;
 const MAX_FASTLY_BACKEND_NAME_LEN: usize = 255;
 const MAX_FASTLY_READABLE_PREFIX_LEN: usize = 200;
 const FASTLY_SPEC_DIGEST_HEX_LEN: usize = 32;
-const FASTLY_TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
-const FASTLY_TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS: u32 = 2000;
-const FASTLY_SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
-const FASTLY_TRANSPORT_TIMEOUT_COARSE_LADDER_MS: [u32; 8] =
-    [2000, 3000, 5000, 10000, 20000, 30000, 45000, 60000];
-const FASTLY_DYNAMIC_BACKEND_LIMIT: usize = 200;
-const FASTLY_NON_AUCTION_BACKEND_RESERVE: usize = 40;
 
 /// A pure backend-name and transport-timeout policy for one adapter.
 ///
@@ -86,175 +79,6 @@ impl BackendNamingPolicy {
             Self::Cloudflare => Ok(predict_cloudflare(spec)),
             Self::Spin => Ok(predict_spin(spec)),
         }
-    }
-
-    /// Canonicalize a transport timer without changing the logical budget.
-    ///
-    /// The result configures adapter transport timers and backend-name
-    /// stability only. It is not an auction-wide deadline. Fastly bounds the
-    /// cardinality of budget-derived timers because timers are encoded in
-    /// dynamic backend names; other adapters preserve the exact bounded value.
-    #[must_use]
-    pub fn canonicalize_transport_timeout_ms(self, remaining_ms: u32, configured_ms: u32) -> u32 {
-        match self {
-            Self::Fastly => canonicalize_fastly_transport_timeout_ms(remaining_ms, configured_ms),
-            Self::Axum | Self::Cloudflare | Self::Spin => remaining_ms.min(configured_ms),
-        }
-    }
-
-    /// Return the target-specific backend-name budget available to auction providers.
-    #[must_use]
-    pub(crate) fn auction_dynamic_backend_budget(self) -> Option<usize> {
-        matches!(self, Self::Fastly).then_some(
-            FASTLY_DYNAMIC_BACKEND_LIMIT.saturating_sub(FASTLY_NON_AUCTION_BACKEND_RESERVE),
-        )
-    }
-
-    /// Count every transport-timeout bucket one provider can reach.
-    #[must_use]
-    pub(crate) fn transport_timeout_bucket_count(self, configured_ms: u32) -> usize {
-        if !matches!(self, Self::Fastly) || configured_ms == 0 {
-            return 1;
-        }
-        let mut buckets = std::collections::BTreeSet::new();
-        buckets.insert(configured_ms);
-        for remaining_ms in FASTLY_SUB_QUANTUM_LADDER_MS {
-            let timeout = self.canonicalize_transport_timeout_ms(remaining_ms, configured_ms);
-            if timeout > 0 {
-                buckets.insert(timeout);
-            }
-        }
-        for remaining_ms in (FASTLY_TRANSPORT_TIMEOUT_QUANTUM_MS
-            ..FASTLY_TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS)
-            .step_by(FASTLY_TRANSPORT_TIMEOUT_QUANTUM_MS as usize)
-        {
-            let timeout = self.canonicalize_transport_timeout_ms(remaining_ms, configured_ms);
-            if timeout > 0 {
-                buckets.insert(timeout);
-            }
-        }
-        for remaining_ms in FASTLY_TRANSPORT_TIMEOUT_COARSE_LADDER_MS {
-            let timeout = self.canonicalize_transport_timeout_ms(remaining_ms, configured_ms);
-            if timeout > 0 {
-                buckets.insert(timeout);
-            }
-        }
-        buckets.len()
-    }
-}
-
-/// Canonical adapter target identifier accepted by Trusted Server tooling.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum AuctionTargetId {
-    /// Fastly Compute.
-    Fastly,
-    /// Native Axum development server.
-    Axum,
-    /// Cloudflare Workers.
-    Cloudflare,
-    /// Fermyon Spin.
-    Spin,
-}
-
-impl AuctionTargetId {
-    /// Map a canonical `EdgeZero` adapter registry ID to an auction target.
-    #[must_use]
-    pub fn from_adapter_id(adapter_id: &str) -> Option<Self> {
-        match adapter_id {
-            "fastly" => Some(Self::Fastly),
-            "axum" => Some(Self::Axum),
-            "cloudflare" => Some(Self::Cloudflare),
-            "spin" => Some(Self::Spin),
-            _ => None,
-        }
-    }
-
-    /// Return the canonical `EdgeZero` adapter registry ID.
-    #[must_use]
-    pub const fn adapter_id(self) -> &'static str {
-        match self {
-            Self::Fastly => "fastly",
-            Self::Axum => "axum",
-            Self::Cloudflare => "cloudflare",
-            Self::Spin => "spin",
-        }
-    }
-
-    /// Return the shared naming and capability descriptor for this target.
-    #[must_use]
-    pub const fn descriptor(self) -> AuctionTargetDescriptor {
-        match self {
-            Self::Fastly => AuctionTargetDescriptor {
-                id: self,
-                naming_policy: BackendNamingPolicy::Fastly,
-                capabilities: AuctionTargetCapabilities {
-                    concurrent_provider_fanout: true,
-                },
-            },
-            Self::Axum => AuctionTargetDescriptor {
-                id: self,
-                naming_policy: BackendNamingPolicy::Axum,
-                capabilities: AuctionTargetCapabilities {
-                    concurrent_provider_fanout: true,
-                },
-            },
-            Self::Cloudflare => AuctionTargetDescriptor {
-                id: self,
-                naming_policy: BackendNamingPolicy::Cloudflare,
-                capabilities: AuctionTargetCapabilities {
-                    concurrent_provider_fanout: false,
-                },
-            },
-            Self::Spin => AuctionTargetDescriptor {
-                id: self,
-                naming_policy: BackendNamingPolicy::Spin,
-                capabilities: AuctionTargetCapabilities {
-                    concurrent_provider_fanout: false,
-                },
-            },
-        }
-    }
-}
-
-/// Adapter capabilities relevant to auction dispatch validation.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct AuctionTargetCapabilities {
-    concurrent_provider_fanout: bool,
-}
-
-impl AuctionTargetCapabilities {
-    /// Return whether multiple provider requests can be in flight concurrently.
-    #[must_use]
-    pub const fn supports_concurrent_provider_fanout(self) -> bool {
-        self.concurrent_provider_fanout
-    }
-}
-
-/// Shared target descriptor used by plan validation.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct AuctionTargetDescriptor {
-    id: AuctionTargetId,
-    naming_policy: BackendNamingPolicy,
-    capabilities: AuctionTargetCapabilities,
-}
-
-impl AuctionTargetDescriptor {
-    /// Return the canonical target identity.
-    #[must_use]
-    pub const fn id(self) -> AuctionTargetId {
-        self.id
-    }
-
-    /// Return the pure backend naming and transport timer policy.
-    #[must_use]
-    pub const fn naming_policy(self) -> BackendNamingPolicy {
-        self.naming_policy
-    }
-
-    /// Return this target's auction dispatch capabilities.
-    #[must_use]
-    pub const fn capabilities(self) -> AuctionTargetCapabilities {
-        self.capabilities
     }
 }
 
@@ -465,28 +289,6 @@ fn predict_spin(spec: &PlatformBackendSpec) -> PredictedBackend {
     predict_no_registration(spec)
 }
 
-fn canonicalize_fastly_transport_timeout_ms(remaining_ms: u32, configured_ms: u32) -> u32 {
-    if remaining_ms >= configured_ms {
-        return configured_ms;
-    }
-    if remaining_ms >= FASTLY_TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS {
-        return FASTLY_TRANSPORT_TIMEOUT_COARSE_LADDER_MS
-            .into_iter()
-            .rev()
-            .find(|&rung| rung <= remaining_ms)
-            .unwrap_or(FASTLY_TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS);
-    }
-    let floored =
-        (remaining_ms / FASTLY_TRANSPORT_TIMEOUT_QUANTUM_MS) * FASTLY_TRANSPORT_TIMEOUT_QUANTUM_MS;
-    if floored > 0 {
-        return floored;
-    }
-    FASTLY_SUB_QUANTUM_LADDER_MS
-        .into_iter()
-        .find(|&rung| rung <= remaining_ms)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -578,55 +380,5 @@ mod tests {
         );
         assert_eq!(canonical_fastly_host("192.0.2.1"), "192.0.2.1");
         assert_eq!(canonical_fastly_host("[not-ipv6]"), "[not-ipv6]");
-    }
-
-    #[test]
-    fn target_descriptors_pin_all_capabilities_and_policies() {
-        let cases = [
-            (AuctionTargetId::Fastly, true, BackendNamingPolicy::Fastly),
-            (AuctionTargetId::Axum, true, BackendNamingPolicy::Axum),
-            (
-                AuctionTargetId::Cloudflare,
-                false,
-                BackendNamingPolicy::Cloudflare,
-            ),
-            (AuctionTargetId::Spin, false, BackendNamingPolicy::Spin),
-        ];
-        for (id, fanout, naming_policy) in cases {
-            let descriptor = id.descriptor();
-            assert_eq!(descriptor.id(), id);
-            assert_eq!(descriptor.naming_policy(), naming_policy);
-            assert_eq!(
-                descriptor
-                    .capabilities()
-                    .supports_concurrent_provider_fanout(),
-                fanout,
-                "should declare fanout accurately for {}",
-                id.adapter_id()
-            );
-            assert_eq!(AuctionTargetId::from_adapter_id(id.adapter_id()), Some(id));
-        }
-        assert_eq!(AuctionTargetId::from_adapter_id("FASTLY"), None);
-        assert_eq!(AuctionTargetId::from_adapter_id("unknown"), None);
-    }
-
-    #[test]
-    fn timeout_policies_preserve_logical_transport_distinction() {
-        assert_eq!(
-            BackendNamingPolicy::Fastly.canonicalize_transport_timeout_ms(999, 2000),
-            750
-        );
-        assert_eq!(
-            BackendNamingPolicy::Fastly.canonicalize_transport_timeout_ms(2000, 100),
-            100
-        );
-        for policy in [
-            BackendNamingPolicy::Axum,
-            BackendNamingPolicy::Cloudflare,
-            BackendNamingPolicy::Spin,
-        ] {
-            assert_eq!(policy.canonicalize_transport_timeout_ms(999, 2000), 999);
-            assert_eq!(policy.canonicalize_transport_timeout_ms(2000, 100), 100);
-        }
     }
 }

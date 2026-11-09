@@ -157,7 +157,16 @@ fn exercise_case(runtime: TraceRuntime, enabled: bool, auth_pattern: Option<&str
     with_trace_runtime(runtime, &envelope, None, check);
 }
 
-fn with_trace_runtime(
+/// Runs `check` against `runtime` serving the app config `envelope` in an isolated fixture.
+///
+/// On Spin, `publisher_origin` is the only outbound host the component may reach, and it
+/// may carry a port wildcard such as `http://127.0.0.1:*`.
+///
+/// # Panics
+///
+/// Panics when the runtime's artifact or CLI is missing or the runtime never loads the
+/// configuration.
+pub(crate) fn with_trace_runtime(
     runtime: TraceRuntime,
     envelope: &str,
     publisher_origin: Option<&str>,

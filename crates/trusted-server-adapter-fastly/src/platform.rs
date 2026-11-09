@@ -164,11 +164,6 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
 /// timeout → unique name).
 pub struct FastlyPlatformBackend;
 
-#[cfg(test)]
-const TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
-#[cfg(test)]
-const SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
-
 fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
     BackendConfig::new(&spec.scheme, &spec.host)
         .port(spec.port)
@@ -1233,16 +1228,6 @@ mod tests {
     // --- FastlyPlatformHttpClient -------------------------------------------
 
     #[test]
-    fn auction_http_capabilities_are_explicit() {
-        let client = FastlyPlatformHttpClient;
-        let capabilities = trusted_server_core::platform::AuctionTargetId::Fastly
-            .descriptor()
-            .capabilities();
-        assert!(client.supports_concurrent_fanout());
-        assert!(capabilities.supports_concurrent_provider_fanout());
-    }
-
-    #[test]
     fn response_conversion_preserves_original_redirect_at_single_send_boundary() {
         let mut response = fastly::Response::from_status(fastly::http::StatusCode::FOUND);
         response.set_header("location", "https://redirect.example/next");
@@ -1583,154 +1568,6 @@ mod tests {
         assert!(
             format!("{err:?}").contains("streaming request body"),
             "should describe the unsupported streaming body: {err:?}"
-        );
-    }
-
-    // --- FastlyPlatformBackend::canonicalize_transport_timeout_ms -----------
-
-    #[test]
-    fn canonicalize_prefers_configured_timeout_when_budget_allows() {
-        let backend = FastlyPlatformBackend;
-        assert_eq!(
-            backend.canonicalize_transport_timeout_ms(2000, 1000),
-            1000,
-            "should use the configured timeout verbatim when the budget allows"
-        );
-        assert_eq!(
-            backend.canonicalize_transport_timeout_ms(2000, 100),
-            100,
-            "should preserve a sub-quantum configured constant — it is name-stable on its own"
-        );
-    }
-
-    #[test]
-    fn canonicalize_floors_budget_bound_value_to_quantum() {
-        let backend = FastlyPlatformBackend;
-        assert_eq!(
-            backend.canonicalize_transport_timeout_ms(999, 2000),
-            750,
-            "should floor a 999ms budget to the 750ms quantum bucket"
-        );
-        assert_eq!(
-            backend.canonicalize_transport_timeout_ms(300, 2000),
-            250,
-            "should floor a tight budget down to one quantum"
-        );
-        assert_eq!(
-            backend.canonicalize_transport_timeout_ms(250, 2000),
-            250,
-            "should keep an exact quantum multiple"
-        );
-    }
-
-    #[test]
-    fn canonicalize_snaps_sub_quantum_budget_to_bounded_ladder() {
-        let backend = FastlyPlatformBackend;
-        // Exact wall-clock values in 1..250 must NOT pass through — that is the
-        // unbounded-cardinality regression this ladder closes.
-        assert_eq!(
-            backend.canonicalize_transport_timeout_ms(249, 2000),
-            200,
-            "should snap a sub-quantum budget down to the greatest ladder rung, not pass 249 through"
-        );
-        assert_eq!(backend.canonicalize_transport_timeout_ms(200, 2000), 200);
-        assert_eq!(backend.canonicalize_transport_timeout_ms(150, 2000), 150);
-        assert_eq!(backend.canonicalize_transport_timeout_ms(100, 2000), 100);
-        assert_eq!(backend.canonicalize_transport_timeout_ms(50, 2000), 50);
-        assert_eq!(
-            backend.canonicalize_transport_timeout_ms(49, 2000),
-            0,
-            "a budget below the smallest rung rounds to zero (launch skipped)"
-        );
-        assert_eq!(
-            backend.canonicalize_transport_timeout_ms(0, 1000),
-            0,
-            "an exhausted budget canonicalizes to zero"
-        );
-        assert_eq!(
-            backend.canonicalize_transport_timeout_ms(100, 0),
-            0,
-            "a zero configured timeout canonicalizes to zero"
-        );
-    }
-
-    #[test]
-    fn canonicalize_budget_derived_names_stay_within_a_safe_cardinality() {
-        // Enumerate every reachable remaining budget for a normal 2000ms
-        // ceiling and confirm the number of distinct backend-name-bearing
-        // transport values an origin can mint stays far below Fastly's
-        // per-service dynamic backend limit (documented default 200).
-        let backend = FastlyPlatformBackend;
-        let configured = 2000;
-        let mut distinct = std::collections::BTreeSet::new();
-        for remaining in 0..=configured {
-            let value = backend.canonicalize_transport_timeout_ms(remaining, configured);
-            if value > 0 {
-                distinct.insert(value);
-            }
-            // No arbitrary clock-derived value may leak: every canonical value
-            // is either a quantum multiple or one of the bounded ladder rungs.
-            assert!(
-                value == 0
-                    || value % TRANSPORT_TIMEOUT_QUANTUM_MS == 0
-                    || SUB_QUANTUM_LADDER_MS.contains(&value),
-                "canonical value {value}ms (from remaining {remaining}ms) is neither a quantum \
-                 multiple nor a ladder rung"
-            );
-            // The mediator </body> hold bound relies on canonicalization never
-            // extending a transport cap past the wall-clock budget.
-            assert!(
-                value <= remaining,
-                "canonical value {value}ms must not extend past the remaining {remaining}ms budget"
-            );
-        }
-        assert!(
-            distinct.len() <= 16,
-            "budget-derived transport values should stay well under the dynamic backend limit, \
-             got {} distinct values: {distinct:?}",
-            distinct.len()
-        );
-    }
-
-    #[test]
-    fn canonicalize_budget_derived_names_stay_bounded_for_large_ceiling() {
-        // A large configured ceiling (e.g. a 60s mediator budget) must not let
-        // the budget-derived buckets grow with the ceiling. Without the coarse
-        // ladder a 60,000ms ceiling would mint ~240 distinct 250ms buckets and
-        // blow past Fastly's documented per-service dynamic backend limit (200).
-        let backend = FastlyPlatformBackend;
-        let configured = 60_000;
-        let mut distinct = std::collections::BTreeSet::new();
-        for remaining in 0..=configured {
-            let value = backend.canonicalize_transport_timeout_ms(remaining, configured);
-            if value > 0 {
-                distinct.insert(value);
-            }
-            assert!(
-                value == 0
-                    || value % TRANSPORT_TIMEOUT_QUANTUM_MS == 0
-                    || SUB_QUANTUM_LADDER_MS.contains(&value),
-                "canonical value {value}ms (from remaining {remaining}ms) is neither a quantum \
-                 multiple nor a ladder rung"
-            );
-            // The mediator </body> hold bound relies on canonicalization never
-            // extending a transport cap past the wall-clock budget.
-            assert!(
-                value <= remaining,
-                "canonical value {value}ms must not extend past the remaining {remaining}ms budget"
-            );
-        }
-        // A budget above the top coarse rung must clamp to it, not open a new
-        // bucket per 250ms step.
-        assert_eq!(
-            backend.canonicalize_transport_timeout_ms(120_000, 240_000),
-            60_000,
-            "a budget above the top coarse rung clamps to it"
-        );
-        assert!(
-            distinct.len() <= 20,
-            "large-ceiling budget-derived values must stay bounded, got {} distinct values: {distinct:?}",
-            distinct.len()
         );
     }
 
