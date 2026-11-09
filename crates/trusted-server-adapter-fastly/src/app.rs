@@ -225,8 +225,6 @@ pub(crate) fn load_settings_from_config_store(
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    warn_if_certificate_check_disabled(&settings);
-
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
@@ -242,14 +240,6 @@ pub(crate) fn build_state_from_settings(
         default_kv_store,
         auction_telemetry_sink,
     }))
-}
-
-fn warn_if_certificate_check_disabled(settings: &Settings) {
-    if !settings.proxy.certificate_check {
-        log::warn!(
-            "INSECURE: proxy.certificate_check is disabled; HTTPS origin certificate verification is disabled"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------

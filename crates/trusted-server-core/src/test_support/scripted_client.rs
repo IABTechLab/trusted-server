@@ -15,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::mem;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
@@ -148,6 +148,7 @@ pub struct ScriptedReply {
     chunks: Vec<Bytes>,
     delay: Duration,
     hold: Option<Hold>,
+    body_polls: Option<Arc<AtomicUsize>>,
 }
 
 impl ScriptedReply {
@@ -208,6 +209,15 @@ impl ScriptedReply {
         (self, ReplyRelease { hold })
     }
 
+    /// Counts in `polls` each poll of the body stream, the poll that ends it included.
+    ///
+    /// A test reads the count to prove how much of the body the code under test read.
+    #[must_use]
+    pub fn counting_body_polls(mut self, polls: &Arc<AtomicUsize>) -> Self {
+        self.body_polls = Some(Arc::clone(polls));
+        self
+    }
+
     fn with_outcome(outcome: Result<StatusCode, EdgeError>) -> Self {
         Self {
             outcome,
@@ -215,13 +225,22 @@ impl ScriptedReply {
             chunks: Vec::new(),
             delay: Duration::ZERO,
             hold: None,
+            body_polls: None,
         }
     }
 
     /// Builds the provider head `EdgeZero` finalizes, or returns the scripted error.
     fn into_head(self, context: OutboundResponseContext) -> Result<OutboundHead, EdgeError> {
         let status = self.outcome?;
-        let body = stream::iter(self.chunks.into_iter().map(Ok::<_, EdgeError>)).boxed_local();
+        let mut chunks = stream::iter(self.chunks.into_iter().map(Ok::<_, EdgeError>));
+        let body = match self.body_polls {
+            None => chunks.boxed_local(),
+            Some(polls) => stream::poll_fn(move |context| {
+                polls.fetch_add(1, Ordering::SeqCst);
+                chunks.poll_next_unpin(context)
+            })
+            .boxed_local(),
+        };
         OutboundHead::new(
             status,
             OutboundHeaderInput::new(
@@ -287,6 +306,108 @@ pub struct RecordedRequest {
     pub host_authority: String,
     /// Whether the request overrides its URI authority upstream.
     pub has_host_authority_override: bool,
+}
+
+/// Transport settings a readback test expects one recorded request to carry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpectedTransport {
+    /// Per-call timeout.
+    pub timeout: Duration,
+    /// Buffered under its cap, or streamed.
+    pub response_mode: ResponseMode,
+    /// Whether response content codings are decoded.
+    pub response_decoding: ResponseDecoding,
+    /// Intermediary cache policy.
+    pub cache_policy: OutboundCachePolicy,
+}
+
+impl RecordedRequest {
+    /// Asserts the transport settings every Trusted Server request carries.
+    ///
+    /// Checks a one second connect timeout, no caller deadline, the proxy marker off, the URI
+    /// authority sent upstream with no override, and the timeout, response mode, decoding, and
+    /// cache policy in `expected`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any of those settings differs.
+    pub fn assert_transport(&self, expected: ExpectedTransport) {
+        let request = format!("{} {}", self.method, self.uri);
+        assert_eq!(
+            self.connect_timeout,
+            Some(Duration::from_secs(1)),
+            "should bound the connect of {request} at one second"
+        );
+        assert_eq!(
+            self.timeout,
+            Some(expected.timeout),
+            "should give {request} its constant timeout"
+        );
+        assert!(
+            self.deadline.is_none(),
+            "should not give {request} a deadline from a remaining budget"
+        );
+        assert_eq!(
+            (
+                self.response_mode,
+                self.response_decoding,
+                self.cache_policy
+            ),
+            (
+                expected.response_mode,
+                expected.response_decoding,
+                expected.cache_policy
+            ),
+            "should give {request} its response mode, decoding, and cache policy"
+        );
+        assert_eq!(
+            self.proxy_marker,
+            OutboundProxyMarker::Off,
+            "should send {request} with the proxy marker off"
+        );
+        assert_eq!(
+            (
+                Some(self.host_authority.as_str()),
+                self.has_host_authority_override
+            ),
+            (
+                self.uri.authority().map(http::uri::Authority::as_str),
+                false
+            ),
+            "should send {request} to its URI authority with no override"
+        );
+    }
+
+    /// Asserts the recorded headers are exactly `expected`, in any order.
+    ///
+    /// Names compare case-insensitively. `Host`, `Content-Length`, and hop-by-hop fields never
+    /// appear here, because `EdgeZero` strips them before dispatch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a header is missing, extra, or carries another value, or when a recorded
+    /// value is not UTF-8.
+    pub fn assert_headers(&self, expected: &[(&str, &str)]) {
+        let mut actual: Vec<(String, String)> = self
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                let value = value.to_str().expect("should record UTF-8 header values");
+                (name.as_str().to_owned(), value.to_owned())
+            })
+            .collect();
+        let mut expected: Vec<(String, String)> = expected
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), (*value).to_owned()))
+            .collect();
+        actual.sort();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "should send {} {} with exactly the expected headers",
+            self.method, self.uri
+        );
+    }
 }
 
 /// A scripted `EdgeZero` outbound client that records requests and answers them from a script.

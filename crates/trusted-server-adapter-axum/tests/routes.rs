@@ -32,12 +32,12 @@ const AXUM_CONFIG_ENV: &str = "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUST
 /// How long the startup test waits for the binary to exit.
 const STARTUP_EXIT_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Build the full application router from explicit test settings.
+/// Settings the route tests build the application from.
 ///
 /// The settings baked into the binary contain placeholder secrets that
 /// `get_settings()` rejects by design, which would fail application startup.
-fn test_settings() -> trusted_server_core::settings::Settings {
-    trusted_server_core::settings::Settings::from_toml(
+fn test_settings() -> Settings {
+    Settings::from_toml(
         r#"
             [[handlers]]
             path = "^/_ts/admin"

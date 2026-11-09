@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::outbound::{OutboundRequest, ResponseDecoding};
 use error_stack::{Report, ResultExt};
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, StatusCode};
@@ -20,9 +21,13 @@ use crate::integrations::sdk_url::parse_sdk_network_url;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
-    UPSTREAM_SDK_MAX_RESPONSE_BYTES, collect_response_bounded, ensure_integration_backend,
+    UPSTREAM_SDK_MAX_RESPONSE_BYTES,
 };
-use crate::platform::{PlatformHttpRequest, RuntimeServices};
+use crate::outbound::{
+    BUFFERED_TIMEOUT, DEFAULT_BUFFERED_RESPONSE_BYTES, OutboundRequestSource, buffered,
+    outbound_error, outbound_request,
+};
+use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 
 const PERMUTIVE_INTEGRATION_ID: &str = "permutive";
@@ -127,28 +132,32 @@ impl PermutiveIntegration {
         // TODO: Check KV store cache first (future enhancement)
 
         // Fetch SDK from Permutive CDN
-        let permutive_req = http::Request::builder()
-            .method(Method::GET)
-            .uri(&sdk_url)
-            .header(header::USER_AGENT, "TrustedServer/1.0")
-            .header(header::ACCEPT, "application/javascript, */*")
-            .body(EdgeBody::empty())
-            .change_context(Self::error("Failed to build Permutive SDK request"))?;
-
-        let backend_name = Self::backend_name_for_url(services, &sdk_url)
-            .change_context(Self::error("Failed to determine backend for SDK fetch"))?;
+        let permutive_req = OutboundRequest::get(&sdk_url)
+            .and_then(|request| request.header(header::USER_AGENT, "TrustedServer/1.0"))
+            .and_then(|request| request.header(header::ACCEPT, "application/javascript, */*"))
+            .map_err(|error| {
+                outbound_error(
+                    error,
+                    Self::error("Failed to build Permutive SDK request"),
+                    OutboundRequestSource::Internal,
+                )
+            })?;
+        let fetch_failed = || Self::error(format!("Failed to fetch Permutive SDK from {sdk_url}"));
 
         let permutive_response = services
-            .http_client()
-            .send(PlatformHttpRequest::new(permutive_req, backend_name))
+            .outbound_client()
+            .send(buffered(
+                permutive_req,
+                BUFFERED_TIMEOUT,
+                UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+                ResponseDecoding::Decode,
+            ))
             .await
-            .change_context(Self::error(format!(
-                "Failed to fetch Permutive SDK from {}",
-                sdk_url
-            )))?
-            .response;
+            .map_err(|error| {
+                outbound_error(error, fetch_failed(), OutboundRequestSource::Internal)
+            })?;
 
-        if !permutive_response.status().is_success() {
+        if !permutive_response.is_success() {
             log::error!(
                 "Permutive SDK fetch failed with status: {}",
                 permutive_response.status()
@@ -159,13 +168,12 @@ impl PermutiveIntegration {
             ))));
         }
 
-        let sdk_body = collect_response_bounded(
-            permutive_response.into_body(),
-            UPSTREAM_SDK_MAX_RESPONSE_BYTES,
-            PERMUTIVE_INTEGRATION_ID,
-        )
-        .await
-        .change_context(Self::error("Failed to read Permutive SDK response body"))?;
+        let sdk_body = permutive_response
+            .into_bytes_bounded(UPSTREAM_SDK_MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|error| {
+                outbound_error(error, fetch_failed(), OutboundRequestSource::Internal)
+            })?;
         log::info!(
             "Successfully fetched Permutive SDK: {} bytes",
             sdk_body.len()
@@ -228,30 +236,30 @@ impl PermutiveIntegration {
             EdgeBody::empty()
         };
 
-        let mut target_req = http::Request::builder()
-            .method(method)
-            .uri(&target_url)
-            .body(request_body)
-            .change_context(Self::error(format!(
-                "Failed to build {} proxy request",
-                route_name
-            )))?;
+        let forward_failed = || Self::error(format!("Failed to forward request to {target_url}"));
+        let mut target_req = outbound_request(method, &target_url)
+            .map_err(|error| {
+                outbound_error(
+                    error,
+                    Self::error(format!("Failed to build {} proxy request", route_name)),
+                    OutboundRequestSource::Internal,
+                )
+            })?
+            .body(request_body);
         self.copy_request_headers(&parts.headers, target_req.headers_mut());
 
-        let backend_name =
-            Self::backend_name_for_url(services, upstream_base).change_context(Self::error(
-                format!("Failed to determine backend for {} proxy", route_name),
-            ))?;
-
         let response = services
-            .http_client()
-            .send(PlatformHttpRequest::new(target_req, backend_name))
+            .outbound_client()
+            .send(buffered(
+                target_req,
+                BUFFERED_TIMEOUT,
+                DEFAULT_BUFFERED_RESPONSE_BYTES,
+                ResponseDecoding::Original,
+            ))
             .await
-            .change_context(Self::error(format!(
-                "Failed to forward request to {}",
-                target_url
-            )))?
-            .response;
+            .map_err(|error| {
+                outbound_error(error, forward_failed(), OutboundRequestSource::Internal)
+            })?;
 
         log::info!(
             "{} responded with status: {}",
@@ -259,7 +267,9 @@ impl PermutiveIntegration {
             response.status()
         );
 
-        Ok(response)
+        response.into_response().map_err(|error| {
+            outbound_error(error, forward_failed(), OutboundRequestSource::Internal)
+        })
     }
 
     /// Copy relevant request headers for proxying.
@@ -289,13 +299,6 @@ impl PermutiveIntegration {
                 to.append(name.clone(), value.clone());
             }
         }
-    }
-
-    fn backend_name_for_url(
-        services: &RuntimeServices,
-        target_url: &str,
-    ) -> Result<String, Report<TrustedServerError>> {
-        ensure_integration_backend(services, target_url, PERMUTIVE_INTEGRATION_ID, None)
     }
 }
 
@@ -478,14 +481,19 @@ fn default_rewrite_sdk() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding, ResponseMode};
+    use futures::executor::block_on;
 
     use super::*;
     use crate::integrations::sdk_url_test_support::{
         assert_sdk_html_attribute_rewrite, assert_sdk_url_rewrite, sdk_url_cases,
     };
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::outbound::{BUFFERED_TIMEOUT, DEFAULT_BUFFERED_RESPONSE_BYTES};
+    use crate::platform::test_support::build_services_with_outbound_client;
     use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::scripted_client::{
+        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
+    };
     use crate::test_support::tests::create_test_settings;
 
     #[test]
@@ -672,129 +680,160 @@ mod tests {
         );
     }
 
-    #[test]
-    fn permutive_proxy_uses_platform_http_client() {
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"ok".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
-        let settings = create_test_settings();
-        let integration = PermutiveIntegration::new(PermutiveConfig {
+    fn readback_config() -> PermutiveConfig {
+        PermutiveConfig {
             enabled: true,
             organization_id: "myorg".to_string(),
             workspace_id: "workspace-123".to_string(),
             project_id: String::new(),
-            api_endpoint: default_api_endpoint(),
-            secure_signals_endpoint: default_secure_signals_endpoint(),
+            api_endpoint: "https://api.example.com".to_string(),
+            secure_signals_endpoint: "https://signals.example.com".to_string(),
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
-        });
-        let req = http::Request::builder()
-            .method(http::Method::GET)
-            .uri("https://publisher.example/integrations/permutive/api/v2.0/events")
-            .body(EdgeBody::empty())
-            .expect("should build request");
-
-        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
-            .expect("should proxy request");
-
-        assert_eq!(
-            response.status(),
-            http::StatusCode::OK,
-            "should return stubbed response"
-        );
-        assert_eq!(
-            stub.recorded_backend_names(),
-            vec!["stub-backend".to_string()],
-            "should route outbound request through PlatformHttpClient"
-        );
+        }
     }
 
     #[test]
-    fn permutive_proxy_strips_authorization() {
-        // Security regression guard: the publisher's Authorization header must
-        // not be forwarded to the Permutive upstream (credential leak).
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"ok".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+    fn permutive_sdk_request_readback() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        let integration = PermutiveIntegration::new(readback_config());
+        let sdk_url = integration.sdk_url();
+        client.respond_to(
+            Method::GET,
+            &sdk_url,
+            ScriptedReply::status(StatusCode::OK).body("window.permutive = {};"),
         );
-        let settings = create_test_settings();
-        let integration = PermutiveIntegration::new(PermutiveConfig {
-            enabled: true,
-            organization_id: "myorg".to_string(),
-            workspace_id: "workspace-123".to_string(),
-            project_id: String::new(),
-            api_endpoint: default_api_endpoint(),
-            secure_signals_endpoint: default_secure_signals_endpoint(),
-            cache_ttl_seconds: 3600,
-            rewrite_sdk: true,
-        });
+        let services = build_services_with_outbound_client(&client, &clock);
         let req = http::Request::builder()
-            .method(http::Method::GET)
-            .uri("https://publisher.example/integrations/permutive/api/v2.0/events")
+            .method(Method::GET)
+            .uri("https://publisher.example.com/integrations/permutive/sdk")
+            .header(header::ACCEPT_ENCODING, "gzip")
             .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
-            .header(header::USER_AGENT, "test-agent")
             .body(EdgeBody::empty())
-            .expect("should build request");
+            .expect("should build SDK request");
 
-        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
-            .expect("should proxy request");
+        let response = block_on(integration.handle(&create_test_settings(), &services, req))
+            .expect("should serve the Permutive SDK");
+
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("should buffer the SDK body")
+                .as_ref(),
+            b"window.permutive = {};",
+            "should serve the fetched SDK bytes"
+        );
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1, "should send one SDK request");
+        let sdk = &requests[0];
+        assert_eq!(
+            (&sdk.method, sdk.uri.to_string()),
+            (&Method::GET, sdk_url),
+            "should fetch the workspace SDK URL"
+        );
+        sdk.assert_headers(&[
+            ("user-agent", "TrustedServer/1.0"),
+            ("accept", "application/javascript, */*"),
+        ]);
+        sdk.assert_transport(ExpectedTransport {
+            timeout: BUFFERED_TIMEOUT,
+            response_mode: ResponseMode::Buffered {
+                max_bytes: 16 * 1024 * 1024,
+            },
+            response_decoding: ResponseDecoding::Decode,
+            cache_policy: OutboundCachePolicy::PlatformDefault,
+        });
+    }
+
+    #[test]
+    fn permutive_proxy_request_readback() {
+        // The publisher's `Authorization` header must not reach Permutive: it
+        // carries the publisher's own credential and would leak it.
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        let target = "https://api.example.com/v2.0/events?k=example";
+        client.respond_to(
+            Method::POST,
+            target,
+            ScriptedReply::status(StatusCode::ACCEPTED).body("accepted"),
+        );
+        let services = build_services_with_outbound_client(&client, &clock);
+        let integration = PermutiveIntegration::new(readback_config());
+        let payload = br#"{"event":"Pageview"}"#;
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri("https://publisher.example.com/integrations/permutive/api/v2.0/events?k=example")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, payload.len().to_string())
+            .header(header::ACCEPT, "application/json")
+            .header(header::USER_AGENT, "test-agent")
+            .header(header::ACCEPT_LANGUAGE, "en")
+            .header(header::ACCEPT_ENCODING, "br")
+            .header("x-example-trace", "trace-1")
+            .header("x-ts-ec", "internal-ec")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .header(header::COOKIE, "session_id=secret")
+            .body(EdgeBody::from(payload.to_vec()))
+            .expect("should build proxy request");
+
+        let response = block_on(integration.handle(&create_test_settings(), &services, req))
+            .expect("should proxy the Permutive request");
+
         assert_eq!(
             response.status(),
-            http::StatusCode::OK,
-            "should return stubbed response"
+            StatusCode::ACCEPTED,
+            "should relay the status"
         );
-
-        let headers = stub.recorded_request_headers();
-        assert!(
-            !headers[0]
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("authorization")),
-            "should NOT forward the publisher's Authorization header to Permutive"
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1, "should send one proxy request");
+        let proxied = &requests[0];
+        assert_eq!(
+            (
+                &proxied.method,
+                proxied.uri.to_string(),
+                proxied.body.as_ref()
+            ),
+            (&Method::POST, target.to_owned(), payload.as_slice()),
+            "should forward the method, path, query, and body"
         );
-        assert!(
-            headers[0]
-                .iter()
-                .any(|(name, value)| name == "user-agent" && value == "test-agent"),
-            "should still forward required headers (user-agent)"
-        );
+        proxied.assert_headers(&[
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+            ("user-agent", "test-agent"),
+            ("accept-language", "en"),
+            ("accept-encoding", "br"),
+            ("x-example-trace", "trace-1"),
+        ]);
+        proxied.assert_transport(ExpectedTransport {
+            timeout: BUFFERED_TIMEOUT,
+            response_mode: ResponseMode::Buffered {
+                max_bytes: DEFAULT_BUFFERED_RESPONSE_BYTES,
+            },
+            response_decoding: ResponseDecoding::Original,
+            cache_policy: OutboundCachePolicy::PlatformDefault,
+        });
     }
 
     #[test]
     fn permutive_api_body_read_failures_map_to_statuses() {
         let settings = create_test_settings();
-        let integration = PermutiveIntegration::new(PermutiveConfig {
-            enabled: true,
-            organization_id: "myorg".to_string(),
-            workspace_id: "workspace-123".to_string(),
-            project_id: String::new(),
-            api_endpoint: default_api_endpoint(),
-            secure_signals_endpoint: default_secure_signals_endpoint(),
-            cache_ttl_seconds: 3600,
-            rewrite_sdk: true,
-        });
+        let integration = PermutiveIntegration::new(readback_config());
         for case in body_read_failure_cases(INTEGRATION_MAX_BODY_BYTES) {
-            let stub = Arc::new(StubHttpClient::new());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
+            let clock = TestClock::new();
+            let client = ScriptedHttpClient::forbidding();
+            let services = build_services_with_outbound_client(&client, &clock);
             let (req, expectation) = case.into_request(
                 http::Request::builder()
                     .method(http::Method::POST)
                     .uri("https://publisher.example/integrations/permutive/api/v2.0/events"),
             );
 
-            let outcome =
-                futures::executor::block_on(integration.handle(&settings, &services, req));
+            let outcome = block_on(integration.handle(&settings, &services, req));
 
             expectation.assert_outcome("Permutive API", &outcome);
-            assert!(
-                stub.recorded_request_uris().is_empty(),
-                "should not call upstream for the {} case",
-                expectation.name()
-            );
+            client.assert_no_requests();
         }
     }
 }

@@ -496,8 +496,8 @@ impl AuctionProvider for AdServerMockProvider {
         }
 
         // Uses the auction-scoped canonical transport timeout rather than the
-        // 15 s fixed timeout in ensure_integration_backend, which is for proxy
-        // endpoints. The exact logical budget remains in context.timeout_ms.
+        // 15 s fixed timeout proxy endpoints use. The exact logical budget
+        // remains in context.timeout_ms.
         let backend_name = ensure_integration_backend_with_timeout(
             context.services,
             &self.config.endpoint,

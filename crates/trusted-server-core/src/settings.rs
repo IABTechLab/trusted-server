@@ -1911,9 +1911,7 @@ impl ProxyAssetRoute {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
-    /// Enable TLS certificate verification when proxying to HTTPS origins.
-    /// Defaults to true for secure production use.
-    /// Set to false for local development with self-signed certificates.
+    /// Must be true. Origin TLS is always verified.
     #[serde(default = "default_certificate_check")]
     pub certificate_check: bool,
     /// Permitted signing, initial fetch, and redirect target domains for the

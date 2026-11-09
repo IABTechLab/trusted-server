@@ -258,6 +258,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
     validate_secret_key_references(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
+    reject_disabled_certificate_check(settings)?;
     validate_js_asset_proxy_config(settings)?;
     validate_gpt_diagnostics_config(settings)?;
 
@@ -280,6 +281,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
 pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
+    warn_ignored_certificate_check(settings);
     settings.reject_placeholder_secrets()?;
     validate_js_asset_proxy_config(settings)?;
     validate_gpt_diagnostics_config(settings)?;
@@ -288,6 +290,34 @@ pub fn validate_settings_for_runtime(
     validate_enabled_integrations(settings, &plan, true)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
+}
+
+/// Rejects `proxy.certificate_check = false`, because origin TLS is always verified.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the setting is `false`.
+fn reject_disabled_certificate_check(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
+    if settings.proxy.certificate_check {
+        return Ok(());
+    }
+    Err(Report::new(TrustedServerError::Configuration {
+        message: "proxy.certificate_check = false is not supported; origin TLS is always verified"
+            .to_owned(),
+    }))
+}
+
+/// Warns that a live `proxy.certificate_check = false` is ignored.
+///
+/// A config that predates the rejection keeps serving, and origin TLS stays verified.
+fn warn_ignored_certificate_check(settings: &Settings) {
+    if !settings.proxy.certificate_check {
+        log::warn!(
+            "proxy.certificate_check = false is ignored; origin TLS is always verified. Remove the setting before the next config push"
+        );
+    }
 }
 
 fn validate_gpt_diagnostics_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
@@ -565,6 +595,7 @@ mod tests {
     use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
     use crate::redacted::Redacted;
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
+    use crate::test_support::logging::WarningCapture;
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
     use edgezero_core::blob_envelope::BlobEnvelope;
@@ -1379,6 +1410,53 @@ password = "production-admin-password-32-bytes"
         assert!(
             err.to_string().contains("Insecure default"),
             "error should mention insecure default"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_certificate_check_false() {
+        let mut settings = valid_settings();
+        settings.proxy.certificate_check = false;
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should reject certificate_check = false at deploy");
+        assert!(
+            format!("{error:?}").contains("proxy.certificate_check"),
+            "should name the rejected setting: {error:?}"
+        );
+        let error = TrustedServerAppConfig::new(settings)
+            .expect_err("should reject certificate_check = false on validate and push");
+        assert!(
+            error.to_string().contains("proxy.certificate_check"),
+            "should name the rejected setting on validate and push: {error:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_ignores_certificate_check_false_with_warning() {
+        let mut settings = valid_settings();
+        let capture = WarningCapture::start();
+        validate_settings_for_runtime(&settings)
+            .expect("should accept the default certificate check at runtime");
+        assert!(
+            !capture
+                .take()
+                .iter()
+                .any(|warning| warning.message.contains("proxy.certificate_check")),
+            "should not warn when certificate_check keeps its default"
+        );
+
+        settings.proxy.certificate_check = false;
+        validate_settings_for_runtime(&settings)
+            .expect("should keep serving a config that sets certificate_check = false");
+
+        let warnings = capture.take();
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.message.contains("proxy.certificate_check")
+                    && warning.message.contains("ignored")
+            }),
+            "should warn that certificate_check = false is ignored"
         );
     }
 

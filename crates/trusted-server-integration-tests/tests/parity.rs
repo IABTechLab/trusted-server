@@ -1551,7 +1551,9 @@ mod trace_parity {
     };
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedForwarderConfig;
-    use trusted_server_core::test_support::scripted_client::{ScriptedHttpClient, TestClock};
+    use trusted_server_core::test_support::scripted_client::{
+        ScriptedHttpClient, ScriptedReply, TestClock,
+    };
     use trusted_server_core::trace::TraceTerminalResponse;
 
     use super::*;
@@ -2466,16 +2468,6 @@ mod trace_parity {
                     request.request.uri().to_string(),
                     request.request.headers().clone(),
                 ));
-            if request.request.uri().host() == Some("vendor.example.com") {
-                return Ok(PlatformResponse::new(
-                    http::Response::builder()
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(edgezero_core::body::Body::from(
-                            serde_json::json!({"example":true}).to_string(),
-                        ))
-                        .expect("should answer fictional vendor request"),
-                ));
-            }
             self.base.http_client().send(request).await
         }
 
@@ -2503,16 +2495,28 @@ mod trace_parity {
             requests: Mutex::new(Vec::new()),
         });
         let forbidden = Arc::new(ForbiddenLifecycle::new());
-        let outbound = forbidden.script();
-        let outbound_client = forbidden.outbound_client();
+        // The publisher origin still goes through the platform client above.
+        // Integrations send through EdgeZero's client, so the Lockr leg reaches
+        // this script, which answers it once per adapter.
+        let clock = TestClock::new();
+        let vendor = ScriptedHttpClient::new(&clock);
+        for _ in 0..3 {
+            vendor.respond_to(
+                Method::GET,
+                "https://vendor.example.com/example",
+                ScriptedReply::status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(serde_json::json!({"example":true}).to_string()),
+            );
+        }
         let services = RuntimeServices::builder()
             .config_store(forbidden.clone())
             .secret_store(forbidden)
             .kv_store(Arc::new(UnavailableKvStore))
             .backend(origin.clone())
             .http_client(origin.clone())
-            .outbound_client(outbound_client)
-            .clock(TestClock::new().monotonic_clock())
+            .outbound_client(vendor.http_client())
+            .clock(clock.monotonic_clock())
             .geo(origin.clone())
             .client_info(ClientInfo::default())
             .build();
@@ -2531,6 +2535,7 @@ mod trace_parity {
                 .lock()
                 .expect("should reset recorded origin requests")
                 .clear();
+            let vendor_sent = vendor.requests().len();
             for (method, path, target) in [
                 (
                     Method::GET,
@@ -2596,12 +2601,21 @@ mod trace_parity {
                         "{adapter} should not generate internal transport URLs"
                     );
                 }
-                let requests = origin
-                    .requests
-                    .lock()
-                    .expect("should inspect actual outbound request");
-                let (actual_target, headers) =
-                    requests.last().expect("should reach configured upstream");
+                let (actual_target, headers) = if path.starts_with("/integrations/") {
+                    let request = vendor
+                        .requests()
+                        .pop()
+                        .expect("should reach the integration upstream");
+                    (request.uri.to_string(), request.headers)
+                } else {
+                    origin
+                        .requests
+                        .lock()
+                        .expect("should inspect actual outbound request")
+                        .last()
+                        .cloned()
+                        .expect("should reach configured upstream")
+                };
                 assert_eq!(
                     actual_target, target,
                     "{adapter} should keep configured backend target for {method} {path}"
@@ -2621,13 +2635,16 @@ mod trace_parity {
                 );
             }
             assert_eq!(
-                origin
-                    .requests
-                    .lock()
-                    .expect("should count outbound requests")
-                    .len(),
-                3,
-                "{adapter} should dispatch exactly the three intended upstream requests"
+                (
+                    origin
+                        .requests
+                        .lock()
+                        .expect("should count outbound requests")
+                        .len(),
+                    vendor.requests().len() - vendor_sent
+                ),
+                (2, 1),
+                "{adapter} should dispatch exactly the two publisher and one integration requests"
             );
             for method in [Method::GET, Method::PUT, Method::DELETE, Method::OPTIONS] {
                 let mut request = forwarded_request("/_ts/trace/enable");
@@ -2646,16 +2663,18 @@ mod trace_parity {
                 );
             }
             assert_eq!(
-                origin
-                    .requests
-                    .lock()
-                    .expect("should count requests after early returns")
-                    .len(),
-                3,
+                (
+                    origin
+                        .requests
+                        .lock()
+                        .expect("should count requests after early returns")
+                        .len(),
+                    vendor.requests().len() - vendor_sent
+                ),
+                (2, 1),
                 "{adapter} should keep forwarding credentials away from all upstreams on trace early returns"
             );
         }
-        outbound.assert_no_requests();
     }
 
     fn futures_trace_empty_stream() -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {

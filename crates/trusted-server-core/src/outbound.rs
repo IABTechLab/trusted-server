@@ -13,7 +13,7 @@ use edgezero_core::error::{BudgetSource, EdgeError};
 use edgezero_core::error_detail::ProviderFailureDetail;
 use edgezero_core::outbound::{OutboundRequest, ResponseDecoding};
 use error_stack::Report;
-use http::StatusCode;
+use http::{Method, StatusCode, Uri};
 
 use crate::error::TrustedServerError;
 
@@ -37,6 +37,22 @@ pub const DEFAULT_BUFFERED_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Cap on a publisher request body forwarded to the origin.
 pub const PUBLISHER_UPLOAD_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Builds a `method` request to `target`, a URL Trusted Server assembled.
+///
+/// The target is parsed as an [`http::Uri`] first, so any method works, not
+/// only the GET and POST that the raw-string constructors cover.
+///
+/// # Errors
+///
+/// Returns [`EdgeError::BadRequest`] when `target` is not an absolute HTTP or
+/// HTTPS URI.
+pub(crate) fn outbound_request(method: Method, target: &str) -> Result<OutboundRequest, EdgeError> {
+    let uri = target
+        .parse::<Uri>()
+        .map_err(|_| EdgeError::bad_request("outbound target is not a valid URI"))?;
+    OutboundRequest::new(method, uri)
+}
 
 /// Applies the buffered-response settings every buffered site carries.
 ///
@@ -143,10 +159,11 @@ struct OutboundFailureDetail(ProviderFailureDetail);
 /// - Every other failure keeps `context`, the site's own error, which is a
 ///   502 for every outbound site.
 ///
-/// The report carries `error`, the budget source of a timeout, and the
-/// error's provider failure detail. The detail is logged at warn with
-/// `{:?}`. The log never carries the error's message, which can hold provider
-/// text or a URL.
+/// The report carries `error` as an opaque attachment, the budget source of a
+/// timeout, and the error's provider failure detail. The detail is logged at
+/// warn with `{:?}`. Neither that log nor the report's `{:?}` rendering carries
+/// the error's message, which can hold provider text or a URL. Callers that
+/// need the error downcast the report to [`EdgeError`].
 ///
 /// # Examples
 ///
@@ -166,6 +183,7 @@ struct OutboundFailureDetail(ProviderFailureDetail);
 /// assert_eq!(report.current_context().status_code().as_u16(), 502);
 /// assert!(report.downcast_ref::<EdgeError>().is_some());
 /// ```
+#[track_caller]
 pub fn outbound_error(
     error: EdgeError,
     context: TrustedServerError,
@@ -202,7 +220,7 @@ pub fn outbound_error(
         Some(mapped) => Report::new(mapped).attach(format!("in place of: {context}")),
         None => Report::new(context),
     };
-    let mut report = report.attach(error);
+    let mut report = report.attach_opaque(error);
     if let Some(budget_source) = budget_source {
         report = report.attach(OutboundBudgetSource(budget_source));
     }
@@ -470,6 +488,48 @@ mod tests {
             !message.contains("provider said no") && !message.contains("example.com"),
             "should never log provider text or URLs, got `{message}`"
         );
+    }
+
+    #[test]
+    fn outbound_error_keeps_edge_error_text_out_of_report_debug() {
+        let report = outbound_error(
+            EdgeError::internal(io::Error::other(
+                "provider failed for https://example.com/secret-path",
+            )),
+            site_error(),
+            OutboundRequestSource::Internal,
+        );
+
+        let rendered = format!("{report:?}");
+        assert!(
+            !rendered.contains("provider failed") && !rendered.contains("example.com"),
+            "should keep the EdgeError text out of the logged report, got `{rendered}`"
+        );
+        assert!(
+            report.downcast_ref::<EdgeError>().is_some(),
+            "should still attach the EdgeError for downcasts"
+        );
+    }
+
+    #[test]
+    fn outbound_request_builds_any_method_and_rejects_invalid_targets() {
+        let request = outbound_request(Method::OPTIONS, "https://example.com/a/../b?x=1")
+            .expect("should build an OPTIONS request");
+        assert_eq!(
+            (request.method(), request.uri().to_string()),
+            (&Method::OPTIONS, "https://example.com/b?x=1".to_owned()),
+            "should keep the method and canonicalize the target"
+        );
+
+        for target in ["not a url", "/relative/path", "ftp://example.com/file"] {
+            let error = outbound_request(Method::GET, target)
+                .expect_err("should reject a target that is not an absolute HTTP URI");
+            assert_eq!(
+                error.status(),
+                StatusCode::BAD_REQUEST,
+                "should reject `{target}` as a bad request"
+            );
+        }
     }
 
     #[test]

@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::error::TrustedServerError;
 use crate::http_util::into_body_payload;
-use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
+use crate::platform::{PlatformBackendSpec, RuntimeServices};
 use crate::settings::Settings;
 
 pub mod adserver_mock;
@@ -42,36 +42,6 @@ pub use registry::{
     ProxyDispatchInput, RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
     RequestFilterRegistryInput, RequestFilterRegistryOutcome, ScriptRewriteAction,
 };
-
-/// Registers or retrieves a platform backend for the given URL.
-///
-/// Parses `url`, builds a [`PlatformBackendSpec`] with TLS enabled and a
-/// 15-second first-byte timeout, and delegates to
-/// [`crate::platform::PlatformBackend::ensure`].
-///
-/// # Errors
-///
-/// Returns an error when `url` cannot be parsed, is missing a host, or the
-/// backend registration fails.
-pub(crate) fn ensure_integration_backend(
-    services: &RuntimeServices,
-    url: &str,
-    integration: &'static str,
-    first_byte_timeout: Option<Duration>,
-) -> Result<String, Report<TrustedServerError>> {
-    services
-        .backend()
-        .ensure(&integration_backend_spec(
-            url,
-            integration,
-            true,
-            first_byte_timeout.unwrap_or(DEFAULT_FIRST_BYTE_TIMEOUT),
-        )?)
-        .change_context(TrustedServerError::Integration {
-            integration: integration.to_string(),
-            message: "Failed to register backend".to_string(),
-        })
-}
 
 /// Registers or retrieves a platform backend for the given URL with a custom
 /// first-byte timeout.
@@ -172,7 +142,7 @@ pub(crate) const INTEGRATION_MAX_BODY_BYTES: usize = 256 * 1024;
 /// Maximum response body size from RTB providers (prebid, aps, mediator).
 pub(crate) const UPSTREAM_RTB_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum response body size from SDK/proxy integrations.
-pub(crate) const UPSTREAM_SDK_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const UPSTREAM_SDK_MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Drains an upstream [`EdgeBody`] response into a byte vector, rejecting
 /// bodies larger than `max_bytes` with [`TrustedServerError::Integration`].

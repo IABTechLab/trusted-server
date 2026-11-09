@@ -3614,7 +3614,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         *pbs_req.body_mut() = EdgeBody::from(pbs_body);
 
         // Uses context.timeout_ms (auction-scoped) rather than the 15 s fixed
-        // timeout in ensure_integration_backend, which is for proxy endpoints.
+        // timeout proxy endpoints use.
         // Send request asynchronously with auction-scoped timeout
         let backend_name = ensure_integration_backend_with_timeout(
             context.services,

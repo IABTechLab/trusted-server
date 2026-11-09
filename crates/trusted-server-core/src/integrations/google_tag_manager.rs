@@ -796,7 +796,7 @@ impl GoogleTagManagerIntegration {
         let status = response.status();
         let body_bytes = collect_response_bounded(
             response.into_body(),
-            UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+            UPSTREAM_SDK_MAX_RESPONSE_BYTES as usize,
             GTM_INTEGRATION_ID,
         )
         .await?;
@@ -2180,7 +2180,7 @@ mod tests {
         let body = futures::executor::block_on(async {
             collect_response_bounded(
                 response.into_body(),
-                UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+                UPSTREAM_SDK_MAX_RESPONSE_BYTES as usize,
                 GTM_INTEGRATION_ID,
             )
             .await

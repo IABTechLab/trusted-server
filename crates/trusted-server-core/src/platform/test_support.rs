@@ -1066,6 +1066,22 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
+/// Build test services whose `EdgeZero` outbound requests go to `client`.
+///
+/// The services clock reads `clock`, so a test that scripts time shares one
+/// clock between the scripted replies and the code under test. Every other
+/// service is a no-op, so a request through the old platform client fails.
+pub(crate) fn build_services_with_outbound_client(
+    client: &ScriptedHttpClient,
+    clock: &TestClock,
+) -> RuntimeServices {
+    RuntimeServices {
+        outbound_client: client.http_client(),
+        clock: clock.monotonic_clock(),
+        ..noop_services()
+    }
+}
+
 /// Build a [`RuntimeServices`] whose auction telemetry sink is the supplied
 /// recording (or otherwise custom) sink, so tests can assert which terminal
 /// auction events were emitted.

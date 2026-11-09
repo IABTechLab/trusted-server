@@ -570,6 +570,8 @@ impl TrustedServerApp {
     /// Each request receives a clone of the supplied services, allowing callers
     /// to exercise production routes with deterministic platform dependencies.
     /// The supplied client metadata applies to every request to this router.
+    /// The services' outbound client also goes into router state, so an app
+    /// served from this router starts no real `EdgeZero` transport.
     ///
     /// # Errors
     ///
@@ -585,8 +587,9 @@ impl TrustedServerApp {
         settings: Settings,
         services: RuntimeServices,
     ) -> Result<RouterService, Report<TrustedServerError>> {
+        let client = services.outbound_client().clone();
         let state = build_state_with_services(settings, Some(services))?;
-        Ok(router_builder(&state).build())
+        Ok(router_builder(&state).with_state(client).build())
     }
 }
 

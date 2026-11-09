@@ -202,8 +202,7 @@ proxy = "enabled"
 
 # Proxy behavior and first-party asset routing. Kept active with defaults.
 [proxy]
-# Verify TLS certs when proxying to HTTPS origins (default true; false only for
-# local self-signed dev).
+# Must be true. Origin TLS is always verified, and validation rejects false.
 # certificate_check = true
 # Allowlist for first-party proxy signing, initial fetch targets, and redirect
 # targets. Supports exact ("example.com") and wildcard ("*.example.com", also
