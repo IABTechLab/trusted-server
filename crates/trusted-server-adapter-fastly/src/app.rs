@@ -108,7 +108,9 @@ use trusted_server_core::auction::{
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
-use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
+use trusted_server_core::constants::{
+    COOKIE_SHAREDID, COOKIE_TS_EIDS, ENV_FASTLY_SERVICE_VERSION, HEADER_X_TS_FASTLY_VERSION,
+};
 use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
@@ -119,6 +121,7 @@ use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
+use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError, startup_error};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
@@ -146,7 +149,7 @@ use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_f
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
+use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, fastly_version_header_value};
 use crate::platform::{
     FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
     FastlyPlatformSecretStore, UnavailableKvStore,
@@ -1287,7 +1290,8 @@ impl TrustedServerApp {
     ) -> (App, Option<Arc<AppState>>) {
         let (router, state) = Self::router_with_state(stores);
         let mut app = App::with_name(router, Self::name());
-        // The default `configure` makes no change and cannot fail.
+        // A `configure` error is logged, not fatal: the app serves without the
+        // policy that failed to install.
         if let Err(error) = Self::configure(&mut app) {
             log::error!("failed to configure the application: {error:?}");
         }
@@ -1375,6 +1379,25 @@ fn trace_metadata(request: &RequestParts) -> TraceMetadata {
 }
 
 impl Hooks for TrustedServerApp {
+    /// Installs the edge policies, adding `x-ts-fastly-version` to the
+    /// synthesized set when `FASTLY_SERVICE_VERSION` holds a valid value.
+    ///
+    /// The service version is read as the finalize middleware reads it. It is
+    /// fixed for the life of the sandbox, so reading it once here matches the
+    /// per-response value.
+    fn configure(app: &mut App) -> Result<(), EdgeError> {
+        install_edge_policies(app)?;
+        let Some(service_version) =
+            fastly_version_header_value(std::env::var(ENV_FASTLY_SERVICE_VERSION).ok().as_deref())
+        else {
+            return Ok(());
+        };
+        let mut fields = synthesized_response_headers();
+        fields.insert(HEADER_X_TS_FASTLY_VERSION, service_version);
+        app.set_synthesized_response_headers(fields)
+            .map_err(EdgeError::internal)
+    }
+
     fn name() -> &'static str {
         "TrustedServer"
     }

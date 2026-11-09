@@ -4,7 +4,7 @@ use edgezero_core::body::{Body as EdgeBody, BodyPayload};
 use edgezero_core::http::RequestParts;
 use edgezero_core::ingress::{InboundOrigin, RequestIngress};
 use error_stack::Report;
-use http::{Request, Response, StatusCode, header};
+use http::{HeaderMap, Request, Response, StatusCode, header};
 use sha2::{Digest as _, Sha256};
 use std::net::Ipv6Addr;
 use std::time::Duration;
@@ -87,11 +87,10 @@ pub fn into_body_payload(body: EdgeBody) -> BodyPayload {
 /// Call this at the edge entry point (before routing) to prevent
 /// `X-Forwarded-Host: evil.com` from hijacking all URL rewriting.
 /// See <https://github.com/IABTechLab/trusted-server/issues/409>.
-pub fn sanitize_forwarded_headers(req: &mut Request<EdgeBody>) {
+pub fn sanitize_forwarded_headers(headers: &mut HeaderMap) {
     for header in SPOOFABLE_FORWARDED_HEADERS {
-        if req.headers().contains_key(*header) {
+        if headers.remove(*header).is_some() {
             log::debug!("Stripped spoofable header: {header}");
-            req.headers_mut().remove(*header);
         }
     }
 }
@@ -1033,7 +1032,7 @@ mod tests {
         set_header(&mut req, "x-forwarded-proto", "https");
         set_header(&mut req, "fastly-ssl", "1");
 
-        sanitize_forwarded_headers(&mut req);
+        sanitize_forwarded_headers(req.headers_mut());
 
         assert!(
             req.headers().get("forwarded").is_none(),
@@ -1069,7 +1068,7 @@ mod tests {
         set_header(&mut req, "x-forwarded-host", "evil.com");
         set_header(&mut req, "x-forwarded-proto", "http");
 
-        sanitize_forwarded_headers(&mut req);
+        sanitize_forwarded_headers(req.headers_mut());
         let info = RequestInfo::from_request(&req, &default_client_info())
             .expect("should accept sanitized Host header");
 

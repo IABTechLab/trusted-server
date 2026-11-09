@@ -18,6 +18,10 @@ use trusted_server_core::platform::{
 use trusted_server_core::platform::UnavailableHttpClient;
 
 #[cfg(target_arch = "wasm32")]
+use edgezero_core::body::BodyPayload;
+#[cfg(target_arch = "wasm32")]
+use trusted_server_core::http_util::into_body_payload;
+#[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformPendingResponse, PlatformResponse,
     PlatformSelectResult,
@@ -101,6 +105,7 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
                 Report::new(PlatformError::ConfigStore)
                     .attach(format!("config store lookup failed: {e}"))
             })?
+            .map(|value| String::from(value.as_str()))
             .ok_or_else(|| {
                 Report::new(PlatformError::ConfigStore).attach(format!("key not found: {key}"))
             })
@@ -327,9 +332,9 @@ impl CloudflareHttpClient {
         }
 
         let (_, body) = request.request.into_parts();
-        let body_bytes = match body {
-            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            edgezero_core::body::Body::Stream(_) => {
+        let body_bytes = match into_body_payload(body) {
+            BodyPayload::Once(bytes) => bytes.to_vec(),
+            BodyPayload::Stream(_) => {
                 return Err(Report::new(PlatformError::HttpClient)
                     .attach("streaming request bodies are not supported on Cloudflare Workers"));
             }
@@ -646,14 +651,15 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
 
     // Secrets: still requires wasm32-specific env.secret() (async/sync mismatch).
     #[cfg(target_arch = "wasm32")]
-    let secret_store: Arc<dyn PlatformSecretStore> =
-        edgezero_adapter_cloudflare::context::CloudflareRequestContext::get(ctx.request())
-            .map(|cf_ctx| {
-                Arc::new(CloudflareSecretStoreAdapter {
-                    env: cf_ctx.env().clone(),
-                }) as Arc<dyn PlatformSecretStore>
-            })
-            .unwrap_or_else(|| Arc::new(NoopSecretStore));
+    let secret_store: Arc<dyn PlatformSecretStore> = ctx
+        .extensions()
+        .get::<edgezero_adapter_cloudflare::context::CloudflareRequestContext>()
+        .map(|cf_ctx| {
+            Arc::new(CloudflareSecretStoreAdapter {
+                env: cf_ctx.env().clone(),
+            }) as Arc<dyn PlatformSecretStore>
+        })
+        .unwrap_or_else(|| Arc::new(NoopSecretStore));
     #[cfg(not(target_arch = "wasm32"))]
     let secret_store: Arc<dyn PlatformSecretStore> = Arc::new(NoopSecretStore);
 
@@ -719,7 +725,7 @@ impl PlatformGeo for CloudflareGeo {
 }
 
 fn build_geo(ctx: &edgezero_core::context::RequestContext) -> CloudflareGeo {
-    let headers = ctx.request().headers();
+    let headers = ctx.headers();
     let country = headers
         .get("cf-ipcountry")
         .and_then(|v| v.to_str().ok())
@@ -756,8 +762,7 @@ fn build_geo(ctx: &edgezero_core::context::RequestContext) -> CloudflareGeo {
 }
 
 fn extract_client_ip(ctx: &edgezero_core::context::RequestContext) -> Option<IpAddr> {
-    ctx.request()
-        .headers()
+    ctx.headers()
         .get("cf-connecting-ip")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok())

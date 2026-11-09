@@ -254,22 +254,29 @@ pub(crate) use trusted_server_core::response_privacy::{
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Converts `service_version` to the `X-TS-Fastly-Version` value.
+///
+/// `None` when the version is unset, or when it is not a valid header value,
+/// which is logged.
+pub(crate) fn fastly_version_header_value(service_version: Option<&str>) -> Option<HeaderValue> {
+    match HeaderValue::from_str(service_version?) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
+            None
+        }
+    }
+}
+
 /// Sets `X-TS-Fastly-Version` to `service_version`, or removes an inherited
 /// value when the version is unset or invalid, so it is never reported as ours.
 fn apply_fastly_version_header(service_version: Option<&str>, response: &mut Response) {
-    match service_version.map(HeaderValue::from_str) {
-        Some(Ok(value)) => {
-            response
-                .headers_mut()
-                .insert(HEADER_X_TS_FASTLY_VERSION, value);
-        }
-        Some(Err(_)) => {
-            log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
-            response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
-        }
-        None => {
-            response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
-        }
+    if let Some(value) = fastly_version_header_value(service_version) {
+        response
+            .headers_mut()
+            .insert(HEADER_X_TS_FASTLY_VERSION, value);
+    } else {
+        response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
     }
 }
 

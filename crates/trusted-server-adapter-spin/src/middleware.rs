@@ -39,7 +39,7 @@ impl SanitizeRequestMiddleware {
 impl Middleware for SanitizeRequestMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         sanitize_trusted_client_ip_headers(
-            ctx.request_mut(),
+            ctx.parts_mut(),
             self.settings.trusted_client_ip.as_ref(),
         );
         next.run(ctx).await
@@ -106,7 +106,7 @@ impl AuthMiddleware {
 #[async_trait(?Send)]
 impl Middleware for AuthMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        match enforce_basic_auth(&self.settings, ctx.request_mut()) {
+        match enforce_basic_auth(&self.settings, ctx.parts_mut()) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
             Err(report) => {
@@ -149,7 +149,7 @@ impl NormalizeMiddleware {
 #[async_trait(?Send)]
 impl Middleware for NormalizeMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        crate::app::normalize_spin_request(ctx.request_mut());
+        crate::app::normalize_spin_request(ctx.parts_mut());
         next.run(ctx).await
     }
 }
@@ -333,8 +333,8 @@ mod tests {
             let handler_observed = Arc::clone(&handler_observed);
             async move {
                 *handler_observed.lock().expect("should lock observation") = Some((
-                    ctx.request().headers().contains_key("x-reader-ip"),
-                    ctx.request().headers().contains_key("x-reader-ip-auth"),
+                    ctx.headers().contains_key("x-reader-ip"),
+                    ctx.headers().contains_key("x-reader-ip-auth"),
                 ));
                 Ok::<Response, EdgeError>(empty_response())
             }

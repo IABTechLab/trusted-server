@@ -2,7 +2,7 @@ use core::future::Future;
 use std::sync::Arc;
 
 use edgezero_adapter_axum::context::AxumRequestContext;
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{App, Hooks};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
@@ -20,6 +20,7 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::edge_app::install_edge_policies;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError, startup_error};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::proxy::{
@@ -587,6 +588,10 @@ fn publisher_fallback_methods() -> [Method; 7] {
 pub struct TrustedServerApp;
 
 impl Hooks for TrustedServerApp {
+    fn configure(app: &mut App) -> Result<(), EdgeError> {
+        install_edge_policies(app)
+    }
+
     fn name() -> &'static str {
         "TrustedServer"
     }

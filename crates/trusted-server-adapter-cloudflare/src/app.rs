@@ -2,10 +2,12 @@ use core::future::Future;
 use core::pin::Pin;
 use std::sync::Arc;
 
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{App, Hooks};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use edgezero_core::http::{
+    HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
+};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -23,7 +25,8 @@ use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::edge_app::install_edge_policies;
+use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError, startup_error};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::StoreName;
@@ -277,7 +280,7 @@ where
         let f = f.clone();
         Box::pin(async move {
             let services = s.services_for_request(&ctx);
-            let mut req = ctx.into_request();
+            let mut req = ctx.into_request()?;
             if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                 &s.settings,
                 &mut req,
@@ -389,7 +392,7 @@ fn legacy_admin_alias_denied() -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Startup error fallback
+// Publisher fallback methods
 // ---------------------------------------------------------------------------
 
 /// HTTP methods the publisher fallback proxies, mirroring the Axum/Fastly
@@ -407,34 +410,6 @@ fn publisher_fallback_methods() -> [Method; 7] {
     ]
 }
 
-/// Returns a [`RouterService`] that responds to every route with the startup error.
-fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    let message = Arc::new(format!("{}\n", e.current_context().user_message()));
-    let status = e.current_context().status_code();
-
-    let make = move |msg: Arc<String>| {
-        move |_ctx: RequestContext| {
-            let body = edgezero_core::body::Body::from((*msg).clone());
-            let mut resp = Response::new(body);
-            *resp.status_mut() = status;
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            async move { Ok::<Response, EdgeError>(resp) }
-        }
-    };
-
-    let mut router = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
-        Arc::new(Settings::default()),
-    ));
-    for method in publisher_fallback_methods() {
-        router = router.route("/", method.clone(), make(Arc::clone(&message)));
-        router = router.route("/{*rest}", method, make(Arc::clone(&message)));
-    }
-    router.build()
-}
-
 // ---------------------------------------------------------------------------
 // TrustedServerApp
 // ---------------------------------------------------------------------------
@@ -443,20 +418,21 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 pub struct TrustedServerApp;
 
 impl Hooks for TrustedServerApp {
+    fn configure(app: &mut App) -> Result<(), EdgeError> {
+        install_edge_policies(app)
+    }
+
     fn name() -> &'static str {
         "TrustedServer"
     }
 
-    fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
-        };
+    fn routes() -> Result<RouterService, EdgeError> {
+        let state = build_state().map_err(|report| {
+            log::error!("{report:?}");
+            startup_error(&report)
+        })?;
 
-        build_router(&state)
+        Ok(build_router(&state))
     }
 }
 
@@ -513,7 +489,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
             let services = state.services_for_request(&ctx);
-            let mut req = ctx.into_request();
+            let mut req = ctx.into_request()?;
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
@@ -781,7 +757,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     }
 }
 
-fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
+fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
     if let Some(services) = &state.services {
         let client_info = services.client_info().clone();
         let geo = client_info.client_ip.and_then(|client_ip| {
@@ -793,12 +769,12 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
         return TraceMetadata { client_info, geo };
     }
     let client_ip = request
-        .headers()
+        .headers
         .get("cf-connecting-ip")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok());
     let geo = request
-        .headers()
+        .headers
         .get("cf-ipcountry")
         .and_then(|value| value.to_str().ok())
         .filter(|country| *country != "XX")

@@ -6,10 +6,15 @@
 //! that depends on external stores assert routing only; deterministic auth and
 //! method gates assert exact status codes.
 
-use edgezero_core::app::Hooks as _;
-use edgezero_core::http::{Request, Response, request_builder};
+use edgezero_adapter_spin::SPIN_PLATFORM;
+use edgezero_core::app::{App, Hooks as _};
+use edgezero_core::body::Body;
+use edgezero_core::http::{Method, Request, Response, StatusCode, header, request_builder};
+use edgezero_core::ingress::{IngressDispatchOutcome, IngressFraming, IngressHeadAccounting};
+use edgezero_core::response_egress_framing::ResponseEgressFramingMode;
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_spin::app::TrustedServerApp;
+use trusted_server_core::constants::TS_GIT_VERSION;
 use trusted_server_core::settings::Settings;
 
 /// Build the full application router from explicit test settings.
@@ -50,9 +55,98 @@ async fn route(router: RouterService, req: Request) -> Response {
 
 #[test]
 fn routes_build_without_panic() {
-    // build_state() may fail (no real settings in CI) — startup_error_router
-    // is the fallback. Either way, routes() must not panic.
+    // Host targets have no production config store, so `routes()` returns
+    // the startup error instead of panicking.
     let _router = TrustedServerApp::routes();
+}
+
+// ---------------------------------------------------------------------------
+// Synthesized headers on EdgeZero's canonical responses
+// ---------------------------------------------------------------------------
+
+/// Dispatches one request through the app `run_app` assembles, so the
+/// policies `TrustedServerApp::configure` installs apply, and returns the
+/// response head as egress would write it.
+async fn dispatch_through_app(method: Method, target: &str) -> Response {
+    let app = App::from_router::<TrustedServerApp>(test_router(), SPIN_PLATFORM)
+        .expect("should assemble the app with its edge policies");
+    let request = request_builder()
+        .method(method)
+        .uri(target)
+        .body(Body::empty())
+        .expect("should build request");
+    let outcome = app
+        .dispatch_ingress(
+            request,
+            app.monotonic_now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        )
+        .await
+        .expect("should admit the request");
+    let envelope = match outcome {
+        IngressDispatchOutcome::Response(envelope) => Some(envelope),
+        _ => None,
+    }
+    .expect("should answer with a response");
+    let (prepared, _policy, mut attempt, clock) = envelope
+        .begin(ResponseEgressFramingMode::ExplicitBufferedLength)
+        .map_err(|_failure| "response egress failed before conversion")
+        .expect("should begin response egress");
+    assert!(attempt.begin_writing(), "should start writing the response");
+    assert!(
+        attempt.complete(clock.now()),
+        "should complete the response"
+    );
+    prepared.into_response()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_not_found_carries_x_ts_version() {
+    // The publisher fallback claims every origin-form path, so only an
+    // asterisk-form target has no route and gets EdgeZero's canonical 404.
+    let response = dispatch_through_app(Method::OPTIONS, "*").await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "should answer an unrouted target with the canonical 404"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ts-version")
+            .and_then(|value| value.to_str().ok()),
+        TS_GIT_VERSION,
+        "should add the compiled-in git version to the canonical 404"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_method_not_allowed_carries_allow_and_x_ts_version() {
+    let response = dispatch_through_app(Method::TRACE, "/auction").await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "should answer an unrouted method on a known path with the canonical 405"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::ALLOW)
+            .and_then(|value| value.to_str().ok()),
+        Some("DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"),
+        "should list the path's methods in sorted order"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ts-version")
+            .and_then(|value| value.to_str().ok()),
+        TS_GIT_VERSION,
+        "should add the compiled-in git version to the canonical 405"
+    );
 }
 
 #[test]

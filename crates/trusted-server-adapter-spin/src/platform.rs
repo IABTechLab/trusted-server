@@ -17,8 +17,12 @@ use trusted_server_core::platform::{
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
 use trusted_server_core::platform::UnavailableHttpClient;
 
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use edgezero_core::body::BodyPayload;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 use std::io::Read as _;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use trusted_server_core::http_util::into_body_payload;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 use trusted_server_core::platform::PlatformHttpRequest;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -144,6 +148,7 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
                     "config store lookup failed for key `{key}`: {error}"
                 ))
             })?
+            .map(|value| String::from(value.as_str()))
             .ok_or_else(|| {
                 Report::new(PlatformError::ConfigStore)
                     .attach(format!("key `{key}` not found in Spin config store"))
@@ -509,9 +514,9 @@ impl SpinPlatformHttpClient {
         }
 
         let (_, body) = request.request.into_parts();
-        let body_bytes = match body {
-            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            edgezero_core::body::Body::Stream(_) => {
+        let body_bytes = match into_body_payload(body) {
+            BodyPayload::Once(bytes) => bytes.to_vec(),
+            BodyPayload::Stream(_) => {
                 // TODO: streaming request bodies unsupported; large proxy POBs (e.g.
                 // /first-party/proxy-rebuild) will fail until Spin WASI HTTP buffering
                 // is added to this client.
@@ -575,8 +580,11 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
         let backend_name = request.backend_name.clone();
-        let pending =
-            PlatformPendingResponse::start(Self::execute(request), spin_sdk::wasip3::spawn);
+        // Dropping the join handle detaches the task, as the deprecated
+        // `spin_sdk::wasip3::spawn` did.
+        let pending = PlatformPendingResponse::start(Self::execute(request), |operation| {
+            drop(spin_sdk::wasip3::spawn_local(operation));
+        });
         Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
     }
 
@@ -802,7 +810,8 @@ impl PlatformGeo for NullGeo {
 /// Cloudflare adapters receive. Deployments fronting Spin with such a hop must
 /// account for this.
 fn extract_client_ip(ctx: &edgezero_core::context::RequestContext) -> Option<IpAddr> {
-    edgezero_adapter_spin::context::SpinRequestContext::get(ctx.request())
+    ctx.extensions()
+        .get::<edgezero_adapter_spin::context::SpinRequestContext>()
         .and_then(|c| c.client_addr)
 }
 
@@ -823,7 +832,10 @@ mod tests {
     use super::*;
 
     use edgezero_core::body::Body;
-    use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
+    use edgezero_core::config_store::{
+        BoundedStoreRead, ConfigStore, ConfigStoreError, ConfigValue, finish_bounded_config_read,
+    };
+    use edgezero_core::time::{Deadline, MonotonicClock};
     use trusted_server_core::platform::AuctionTargetId;
 
     #[test]
@@ -842,8 +854,28 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl ConfigStore for InMemoryConfigStore {
-        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-            Ok(self.0.get(key).cloned())
+        async fn get(&self, key: &str) -> Result<Option<ConfigValue>, ConfigStoreError> {
+            Ok(self
+                .0
+                .get(key)
+                .map(|value| ConfigValue::from(value.as_str())))
+        }
+
+        async fn get_bounded(
+            &self,
+            key: &str,
+            clock: &MonotonicClock,
+            deadline: Deadline,
+            max_backend_bytes: u64,
+            max_value_bytes: u64,
+        ) -> Result<BoundedStoreRead<ConfigValue>, ConfigStoreError> {
+            finish_bounded_config_read(
+                self.get(key).await,
+                clock,
+                deadline,
+                max_backend_bytes,
+                max_value_bytes,
+            )
         }
     }
 
