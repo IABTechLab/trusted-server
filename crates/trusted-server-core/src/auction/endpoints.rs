@@ -1096,7 +1096,7 @@ mod tests {
                 request,
             )
             .await
-            .expect_err("all planned launch failures should fail the auction endpoint");
+            .expect_err("should fail the auction endpoint when every planned launch fails");
 
             assert_eq!(
                 error.current_context().status_code(),
