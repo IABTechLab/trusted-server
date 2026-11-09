@@ -711,6 +711,7 @@ mod tests {
     };
     use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
     use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
     use crate::test_support::tests::{
         crate_test_settings_str, create_test_settings, run_pre_dispatch_hook,
     };
@@ -748,6 +749,8 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::new(NoopBackend))
             .http_client(Arc::new(NoopHttpClient))
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(NoopGeo))
             .auction_telemetry_sink(telemetry_sink)
             .client_info(ClientInfo::default())
@@ -1088,6 +1091,8 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::new(NoopBackend))
             .http_client(Arc::clone(&stub) as Arc<dyn PlatformHttpClient>)
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(NoopGeo))
             .client_info(ClientInfo::default())
             .build();
@@ -1225,6 +1230,8 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::new(StubBackend))
             .http_client(Arc::clone(&http) as Arc<_>)
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(NoopGeo))
             .client_info(ClientInfo::default())
             .build();

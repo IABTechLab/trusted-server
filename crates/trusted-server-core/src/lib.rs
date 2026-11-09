@@ -12,6 +12,7 @@
 //! - [`consent`]: Consent signal extraction and logging
 //! - [`geo`]: Geographic location utilities and DMA code extraction
 //! - [`models`]: Data models for ad serving and callbacks
+//! - [`outbound`]: Outbound request settings and failure mapping
 //! - [`integrations::prebid`]: Prebid integration and real-time bidding support
 //! - [`settings`]: Configuration management and validation
 //! - [`streaming_replacer`]: Streaming URL replacement for large responses
@@ -59,6 +60,7 @@ pub mod http_util;
 pub mod integrations;
 pub mod models;
 pub mod openrtb;
+pub mod outbound;
 pub mod platform;
 pub mod price_bucket;
 pub mod proxy;

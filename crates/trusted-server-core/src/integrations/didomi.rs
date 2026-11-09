@@ -556,6 +556,7 @@ mod tests {
     };
     use crate::platform::{ClientInfo, GeoInfo, PlatformError, PlatformGeo};
     use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use http::Method;
 
@@ -619,6 +620,8 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::new(StubBackend))
             .http_client(http_client)
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(StubGeo(geo_result)))
             .client_info(ClientInfo {
                 client_ip: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),

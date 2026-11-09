@@ -8086,6 +8086,7 @@ mod tests {
     use crate::auction::types::AuctionResponse;
     use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
     use crate::platform::PlatformCacheIntent;
+    use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
 
     /// Every shared condition passing, as the base for single-condition negations.
     fn all_shareable() -> SharedRequestInputs {
@@ -11851,6 +11852,8 @@ mod tests {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::new(StubBackend))
                 .http_client(http_client)
+                .outbound_client(ScriptedHttpClient::forbidding().http_client())
+                .clock(TestClock::new().monotonic_clock())
                 .geo(Arc::new(NoopGeo))
                 .client_info(ClientInfo::default())
                 .template_cache(cache)
@@ -11883,6 +11886,8 @@ mod tests {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::new(StubBackend))
                 .http_client(http_client)
+                .outbound_client(ScriptedHttpClient::forbidding().http_client())
+                .clock(TestClock::new().monotonic_clock())
                 .geo(Arc::new(NoopGeo))
                 .client_info(ClientInfo::default())
                 .template_cache(cache)
@@ -12471,6 +12476,8 @@ mod tests {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::new(StubBackend))
                 .http_client(client.clone())
+                .outbound_client(ScriptedHttpClient::forbidding().http_client())
+                .clock(TestClock::new().monotonic_clock())
                 .geo(Arc::new(NoopGeo))
                 .client_info(ClientInfo::default())
                 .template_cache(template_cache.clone())
@@ -15142,6 +15149,8 @@ mod tests {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::new(StubBackend))
                 .http_client(Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>)
+                .outbound_client(ScriptedHttpClient::forbidding().http_client())
+                .clock(TestClock::new().monotonic_clock())
                 .geo(Arc::new(StubGeo(user.geo_marker)))
                 .client_info(ClientInfo::default())
                 .template_cache(
@@ -16955,6 +16964,8 @@ mod tests {
                     .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                     .backend(Arc::new(StubBackend))
                     .http_client(stub)
+                    .outbound_client(ScriptedHttpClient::forbidding().http_client())
+                    .clock(TestClock::new().monotonic_clock())
                     .geo(Arc::new(NoopGeo))
                     .client_info(ClientInfo {
                         client_ip: Some(ip),
@@ -19900,6 +19911,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::new(StubBackend))
                 .http_client(http_client)
+                .outbound_client(ScriptedHttpClient::forbidding().http_client())
+                .clock(TestClock::new().monotonic_clock())
                 .geo(Arc::new(NoopGeo))
                 .auction_telemetry_sink(telemetry_sink)
                 .client_info(ClientInfo::default())
@@ -22946,6 +22959,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                     .backend(Arc::new(crate::platform::test_support::StubBackend))
                     .http_client(Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>)
+                    .outbound_client(ScriptedHttpClient::forbidding().http_client())
+                    .clock(TestClock::new().monotonic_clock())
                     .geo(Arc::new(crate::platform::test_support::NoopGeo))
                     .client_info(ClientInfo {
                         tls_protocol: Some("TLSv1.3".to_owned()),
@@ -30521,6 +30536,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::new(StubBackend))
                 .http_client(http_client)
+                .outbound_client(ScriptedHttpClient::forbidding().http_client())
+                .clock(TestClock::new().monotonic_clock())
                 .geo(Arc::new(NoopGeo))
                 .auction_telemetry_sink(telemetry_sink)
                 .client_info(ClientInfo::default())

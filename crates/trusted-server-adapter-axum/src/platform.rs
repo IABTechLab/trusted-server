@@ -8,6 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use edgezero_adapter_axum::context::AxumRequestContext;
 use edgezero_core::body::BodyPayload;
+use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::http_util::into_body_payload;
@@ -579,7 +580,17 @@ fn recover_pending_handles(
 /// The generic runtime KV slot uses
 /// [`trusted_server_core::platform::UnavailableKvStore`]. A `warn` log is
 /// emitted once per process.
-pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
+///
+/// The outbound client is the one the request context carries, with the proxy
+/// marker turned off, and the clock is the context's monotonic clock.
+///
+/// # Errors
+///
+/// Returns an internal [`EdgeError`] when the request carries no outbound
+/// client.
+pub fn build_runtime_services(
+    ctx: &edgezero_core::context::RequestContext,
+) -> Result<RuntimeServices, EdgeError> {
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
         log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
@@ -608,7 +619,14 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     static TIMER: std::sync::OnceLock<Arc<dyn trusted_server_core::platform::PlatformTimer>> =
         std::sync::OnceLock::new();
 
-    RuntimeServices::builder()
+    let outbound_client = ctx
+        .http_client()
+        .ok_or_else(|| {
+            EdgeError::internal(std::io::Error::other("request has no outbound client"))
+        })?
+        .with_proxy_marker(false);
+
+    Ok(RuntimeServices::builder()
         .timer(Arc::clone(TIMER.get_or_init(|| Arc::new(AxumTimer))))
         .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
             Arc::new(AxumPlatformConfigStore) as Arc<dyn PlatformConfigStore>
@@ -627,6 +645,8 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         // API-route integration flow by reusing a poisoned connection after a
         // truncated POST. Revisit pooling if profiling shows allocation cost.
         .http_client(Arc::new(AxumPlatformHttpClient::new()))
+        .outbound_client(outbound_client)
+        .clock(ctx.monotonic_clock())
         .geo(Arc::clone(GEO.get_or_init(|| {
             Arc::new(AxumPlatformGeo) as Arc<dyn PlatformGeo>
         })))
@@ -636,7 +656,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
             tls_cipher: None,
             ..ClientInfo::default()
         })
-        .build()
+        .build())
 }
 
 struct AxumTimer;
@@ -659,15 +679,63 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use trusted_server_core::platform::HttpClient;
+    use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
+
+    /// Builds a context whose request carries `client`, as `EdgeZero`'s Axum
+    /// request conversion installs its default client.
+    fn context_with_client(client: Option<HttpClient>) -> edgezero_core::context::RequestContext {
+        let mut request = edgezero_core::http::request_builder()
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build a request");
+        if let Some(client) = client {
+            request.extensions_mut().insert(client);
+        }
+        edgezero_core::context::RequestContext::new(request, Default::default())
+    }
+
+    #[test]
+    fn runtime_services_carry_the_context_client_with_the_proxy_marker_off() {
+        let client = HttpClient::with_client(ScriptedHttpClient::forbidding());
+        assert!(
+            client.proxy_marker_enabled(),
+            "should start from a client whose marker is on"
+        );
+        let context = context_with_client(Some(client));
+
+        let services = build_runtime_services(&context).expect("should build runtime services");
+
+        assert!(
+            !services.outbound_client().proxy_marker_enabled(),
+            "should turn the proxy marker off on the context client"
+        );
+    }
+
+    #[test]
+    fn runtime_services_reject_a_request_without_an_outbound_client() {
+        let context = context_with_client(None);
+
+        let error = build_runtime_services(&context)
+            .expect_err("should reject a request with no outbound client");
+
+        assert_eq!(
+            error.status(),
+            edgezero_core::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer a missing client with an internal error"
+        );
+        assert_eq!(
+            error.to_string(),
+            "internal error: request has no outbound client",
+            "should name the missing client"
+        );
+    }
 
     #[test]
     fn html_finalization_timer_is_shared_without_an_executor() {
-        let request = edgezero_core::http::request_builder()
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build a request");
-        let context = edgezero_core::context::RequestContext::new(request, Default::default());
-        let services = build_runtime_services(&context);
-        let next_services = build_runtime_services(&context);
+        let context = context_with_client(Some(ScriptedHttpClient::forbidding().http_client()));
+        let services = build_runtime_services(&context).expect("should build runtime services");
+        let next_services =
+            build_runtime_services(&context).expect("should build runtime services again");
         assert!(
             std::ptr::eq(
                 services

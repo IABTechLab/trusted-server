@@ -13,7 +13,9 @@ use edgezero_core::response_egress_framing::ResponseEgressFramingMode;
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp;
 use trusted_server_core::constants::TS_GIT_VERSION;
+use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
@@ -59,7 +61,11 @@ fn registered_routes() -> Vec<(String, String)> {
         .collect()
 }
 
-async fn route(router: RouterService, req: Request) -> Response {
+async fn route(router: RouterService, mut req: Request) -> Response {
+    // `oneshot` skips `EdgeZero`'s request conversion, which installs the
+    // adapter's default client, so install one that fails every request.
+    req.extensions_mut()
+        .insert(HttpClient::with_client(ScriptedHttpClient::forbidding()));
     router.oneshot(req).await.expect("should route request")
 }
 

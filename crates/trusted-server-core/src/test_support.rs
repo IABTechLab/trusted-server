@@ -197,6 +197,7 @@ pub mod nextjs_auction {
         RuntimeServices, StoreId, StoreName, UnavailableKvStore,
     };
     use crate::settings::Settings;
+    use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
 
     /// Publisher host the fixture settings serve.
     pub const PUBLISHER_HOST: &str = "test-publisher.example.com";
@@ -673,6 +674,8 @@ pub mod nextjs_auction {
             .kv_store(Arc::new(UnavailableKvStore))
             .backend(Arc::new(FixtureStore))
             .http_client(client)
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(FixtureGeo))
             .client_info(ClientInfo::default())
             .build()

@@ -1350,18 +1350,46 @@ mod trace_parity {
     use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::platform::{
-        BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
+        BackendNamingPolicy, ClientInfo, GeoInfo, HttpClient, PlatformBackend, PlatformBackendSpec,
         PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
         PlatformKvStore, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
         PlatformSelectResult, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
     };
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedForwarderConfig;
+    use trusted_server_core::test_support::scripted_client::{ScriptedHttpClient, TestClock};
     use trusted_server_core::trace::TraceTerminalResponse;
 
     use super::*;
 
-    struct ForbiddenLifecycle;
+    /// Platform services that fail the test when a trace or forwarder request reaches them.
+    ///
+    /// Its outbound client is a forbid-mode script, which fails each request instead of
+    /// panicking, so the drop check fails the test if any outbound request was sent.
+    struct ForbiddenLifecycle {
+        outbound: ScriptedHttpClient,
+    }
+
+    impl ForbiddenLifecycle {
+        fn new() -> Self {
+            Self {
+                outbound: ScriptedHttpClient::forbidding(),
+            }
+        }
+
+        fn outbound_client(&self) -> HttpClient {
+            self.outbound.http_client()
+        }
+    }
+
+    impl Drop for ForbiddenLifecycle {
+        fn drop(&mut self) {
+            // Every router and response holding these services drops before its test returns.
+            if !std::thread::panicking() {
+                self.outbound.assert_no_requests();
+            }
+        }
+    }
 
     impl PlatformConfigStore for ForbiddenLifecycle {
         fn get(&self, _store: &StoreName, _key: &str) -> Result<String, Report<PlatformError>> {
@@ -1535,13 +1563,15 @@ mod trace_parity {
         if let Some(pattern) = auth_pattern {
             settings.handlers.insert(0,serde_json::from_value(serde_json::json!({"path":pattern,"username":"example-user","password":"example-password"})).expect("should insert trace auth rule"));
         }
-        let forbidden = Arc::new(ForbiddenLifecycle);
+        let forbidden = Arc::new(ForbiddenLifecycle::new());
         let services = RuntimeServices::builder()
             .config_store(forbidden.clone())
             .secret_store(forbidden.clone())
             .kv_store(forbidden.clone())
             .backend(forbidden.clone())
             .http_client(forbidden.clone())
+            .outbound_client(forbidden.outbound_client())
+            .clock(TestClock::new().monotonic_clock())
             .auction_telemetry_sink(forbidden)
             .geo(Arc::new(CountingGeo(calls)))
             .client_info(ClientInfo {
@@ -1898,13 +1928,15 @@ mod trace_parity {
     }
 
     fn forwarder_trace_routers(settings: Settings) -> Vec<(&'static str, RouterService)> {
-        let forbidden = Arc::new(ForbiddenLifecycle);
+        let forbidden = Arc::new(ForbiddenLifecycle::new());
         let services = RuntimeServices::builder()
             .config_store(forbidden.clone())
             .secret_store(forbidden.clone())
             .kv_store(forbidden.clone())
             .backend(forbidden.clone())
             .http_client(forbidden.clone())
+            .outbound_client(forbidden.outbound_client())
+            .clock(TestClock::new().monotonic_clock())
             .auction_telemetry_sink(forbidden)
             .geo(Arc::new(CountingGeo(Arc::new(AtomicUsize::new(0)))))
             .client_info(ClientInfo::default())
@@ -2252,13 +2284,16 @@ mod trace_parity {
             ),
             requests: Mutex::new(Vec::new()),
         });
-        let forbidden = Arc::new(ForbiddenLifecycle);
+        let forbidden = Arc::new(ForbiddenLifecycle::new());
+        let outbound_client = forbidden.outbound_client();
         let services = RuntimeServices::builder()
             .config_store(forbidden.clone())
             .secret_store(forbidden)
             .kv_store(Arc::new(UnavailableKvStore))
             .backend(origin.clone())
             .http_client(origin.clone())
+            .outbound_client(outbound_client)
+            .clock(TestClock::new().monotonic_clock())
             .geo(origin.clone())
             .client_info(ClientInfo::default())
             .build();

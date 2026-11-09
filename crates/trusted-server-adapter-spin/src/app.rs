@@ -145,10 +145,10 @@ fn build_state_with_services(
 }
 
 impl AppState {
-    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+    fn services_for_request(&self, ctx: &RequestContext) -> Result<RuntimeServices, EdgeError> {
         self.services
             .clone()
-            .unwrap_or_else(|| build_runtime_services(ctx))
+            .map_or_else(|| build_runtime_services(ctx), Ok)
     }
 }
 
@@ -572,7 +572,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let discovery_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
+                let services = s.services_for_request(&ctx)?;
                 let req = ctx.into_request()?;
                 Ok::<Response, EdgeError>(
                     handle_trusted_server_discovery(&s.settings, &services, req)
@@ -586,7 +586,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let verify_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
+                let services = s.services_for_request(&ctx)?;
                 let req = ctx.into_request()?;
                 Ok::<Response, EdgeError>(
                     handle_verify_signature(&s.settings, &services, req)
@@ -625,7 +625,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let auction_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
+                let services = s.services_for_request(&ctx)?;
                 // Request normalization (forwarded-header stripping, trusted
                 // Host/scheme/client-IP derivation) is applied centrally by
                 // `NormalizeMiddleware` before this handler runs, so the signed
@@ -665,7 +665,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let page_bids_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
+                let services = s.services_for_request(&ctx)?;
                 let mut req = ctx.into_request()?;
                 if let Err(error) =
                     trusted_server_core::integrations::gpt_diagnostics::prepare_request(
@@ -701,7 +701,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_proxy_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
+                let services = s.services_for_request(&ctx)?;
                 let req = ctx.into_request()?;
                 Ok::<Response, EdgeError>(
                     handle_first_party_proxy(&s.settings, &services, req)
@@ -716,7 +716,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_click_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
+                let services = s.services_for_request(&ctx)?;
                 let req = ctx.into_request()?;
                 Ok::<Response, EdgeError>(
                     handle_first_party_click(&s.settings, &services, req)
@@ -731,7 +731,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_sign_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
+                let services = s.services_for_request(&ctx)?;
                 let req = ctx.into_request()?;
                 Ok::<Response, EdgeError>(
                     handle_first_party_proxy_sign(&s.settings, &services, req)
@@ -750,7 +750,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_rebuild_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
+                let services = s.services_for_request(&ctx)?;
                 let req = ctx.into_request()?;
                 Ok::<Response, EdgeError>(
                     handle_first_party_proxy_rebuild(&s.settings, &services, req)
@@ -766,7 +766,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             state: Arc<AppState>,
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
-            let services = state.services_for_request(&ctx);
+            let services = state.services_for_request(&ctx)?;
             let mut req = ctx.into_request()?;
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);

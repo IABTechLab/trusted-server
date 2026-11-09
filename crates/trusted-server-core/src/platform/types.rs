@@ -3,6 +3,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use edgezero_core::outbound::HttpClient;
+use edgezero_core::time::MonotonicClock;
+
 use crate::auction::telemetry::{AuctionTelemetrySink, NoopAuctionTelemetrySink};
 
 use super::{
@@ -182,6 +185,13 @@ pub struct RuntimeServices {
     pub(crate) backend: Arc<dyn PlatformBackend>,
     /// Outbound HTTP client abstraction.
     pub(crate) http_client: Arc<dyn PlatformHttpClient>,
+    /// `EdgeZero` outbound HTTP client for this request, with the proxy marker off.
+    pub(crate) outbound_client: HttpClient,
+    /// Monotonic clock paired with this request's admitted ingress lifetime.
+    ///
+    /// Outbound deadlines and post-delivery budgets read this clock, so they
+    /// share one clock domain with the outbound client.
+    pub(crate) clock: MonotonicClock,
     /// Geographic information lookup.
     pub(crate) geo: Arc<dyn PlatformGeo>,
     /// Auction telemetry sink.
@@ -208,6 +218,8 @@ impl RuntimeServices {
     ///     .kv_store(kv_store)
     ///     .backend(Arc::new(MyBackend))
     ///     .http_client(Arc::new(MyHttpClient))
+    ///     .outbound_client(outbound_client.with_proxy_marker(false))
+    ///     .clock(ctx.monotonic_clock())
     ///     .geo(Arc::new(MyGeo))
     ///     .client_info(client_info)
     ///     .build();
@@ -263,6 +275,18 @@ impl RuntimeServices {
     #[must_use]
     pub fn http_client(&self) -> &dyn PlatformHttpClient {
         &*self.http_client
+    }
+
+    /// Returns the request's `EdgeZero` outbound HTTP client.
+    #[must_use]
+    pub fn outbound_client(&self) -> &HttpClient {
+        &self.outbound_client
+    }
+
+    /// Returns the monotonic clock paired with this request.
+    #[must_use]
+    pub fn clock(&self) -> &MonotonicClock {
+        &self.clock
     }
 
     /// Returns the platform geo lookup service.
@@ -345,6 +369,8 @@ pub struct RuntimeServicesBuilder {
     template_assembler: Option<Arc<dyn super::PlatformTemplateAssembler>>,
     backend: Option<Arc<dyn PlatformBackend>>,
     http_client: Option<Arc<dyn PlatformHttpClient>>,
+    outbound_client: Option<HttpClient>,
+    clock: Option<MonotonicClock>,
     geo: Option<Arc<dyn PlatformGeo>>,
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
@@ -361,6 +387,8 @@ impl RuntimeServicesBuilder {
             template_assembler: None,
             backend: None,
             http_client: None,
+            outbound_client: None,
+            clock: None,
             geo: None,
             auction_telemetry_sink: None,
             client_info: None,
@@ -427,6 +455,23 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the request's `EdgeZero` outbound HTTP client.
+    ///
+    /// Adapters pass the client from the request context with the proxy
+    /// marker off.
+    #[must_use]
+    pub fn outbound_client(mut self, outbound_client: HttpClient) -> Self {
+        self.outbound_client = Some(outbound_client);
+        self
+    }
+
+    /// Set the monotonic clock paired with the request.
+    #[must_use]
+    pub fn clock(mut self, clock: MonotonicClock) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
     /// Set the geo lookup implementation.
     #[must_use]
     pub fn geo(mut self, geo: Arc<dyn PlatformGeo>) -> Self {
@@ -483,6 +528,12 @@ impl RuntimeServicesBuilder {
             http_client: self
                 .http_client
                 .expect("should set http_client before building RuntimeServices"),
+            outbound_client: self
+                .outbound_client
+                .expect("should set outbound_client before building RuntimeServices"),
+            clock: self
+                .clock
+                .expect("should set clock before building RuntimeServices"),
             geo: self
                 .geo
                 .expect("should set geo before building RuntimeServices"),

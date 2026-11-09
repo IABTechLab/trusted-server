@@ -17,6 +17,7 @@ use super::{
     StoreName,
 };
 use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
+use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
 
 pub(crate) struct NoopConfigStore;
 
@@ -997,6 +998,8 @@ pub(crate) fn build_services_with_config_and_secret(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
+        .outbound_client(ScriptedHttpClient::forbidding().http_client())
+        .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo::default())
         .build()
@@ -1013,6 +1016,8 @@ pub(crate) fn build_services_with_config_and_secret_and_client_ip(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
+        .outbound_client(ScriptedHttpClient::forbidding().http_client())
+        .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip: Some(client_ip),
@@ -1050,6 +1055,8 @@ pub(crate) fn build_services_with_config(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
+        .outbound_client(ScriptedHttpClient::forbidding().http_client())
+        .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo::default())
         .build()
@@ -1071,6 +1078,8 @@ pub(crate) fn noop_services_with_telemetry_sink(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
+        .outbound_client(ScriptedHttpClient::forbidding().http_client())
+        .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
         .auction_telemetry_sink(auction_telemetry_sink)
         .client_info(ClientInfo::default())
@@ -1101,6 +1110,8 @@ pub(crate) fn build_services_with_http_client_and_client_ip(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(StubBackend))
         .http_client(http_client)
+        .outbound_client(ScriptedHttpClient::forbidding().http_client())
+        .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip: Some(client_ip),
@@ -1116,6 +1127,8 @@ pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
+        .outbound_client(ScriptedHttpClient::forbidding().http_client())
+        .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip: Some(ip),
@@ -1145,6 +1158,8 @@ pub(crate) fn build_services_with_backend_and_http_client(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(backend)
         .http_client(http_client)
+        .outbound_client(ScriptedHttpClient::forbidding().http_client())
+        .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip: None,
@@ -1167,6 +1182,8 @@ pub(crate) fn build_services_with_config_secret_and_http_client(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(StubBackend))
         .http_client(http_client)
+        .outbound_client(ScriptedHttpClient::forbidding().http_client())
+        .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo::default())
         .build()
@@ -1183,6 +1200,8 @@ pub(crate) fn build_services_with_secret_http_client_and_client_ip(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(StubBackend))
         .http_client(http_client)
+        .outbound_client(ScriptedHttpClient::forbidding().http_client())
+        .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip,

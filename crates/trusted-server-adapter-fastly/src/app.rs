@@ -267,7 +267,19 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 /// absent (e.g. tests that dispatch without the entry point). Scheme detection
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
-fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
+///
+/// The outbound client is the one `EdgeZero`'s Fastly request conversion
+/// installs in the request context, with the proxy marker turned off. The
+/// clock is the context's monotonic clock.
+///
+/// # Errors
+///
+/// Returns an internal [`EdgeError`] when the request carries no outbound
+/// client.
+fn build_per_request_services(
+    state: &AppState,
+    ctx: &RequestContext,
+) -> Result<RuntimeServices, EdgeError> {
     // No cooperative timer is installed: Fastly host calls block. EOF consumers
     // must bound their own transport calls using the remaining finish budget.
     let client_info = ctx
@@ -281,8 +293,14 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
                 .and_then(|c| c.client_ip),
             ..ClientInfo::default()
         });
+    let outbound_client = ctx
+        .http_client()
+        .ok_or_else(|| {
+            EdgeError::internal(std::io::Error::other("request has no outbound client"))
+        })?
+        .with_proxy_marker(false);
 
-    RuntimeServices::builder()
+    Ok(RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(Arc::clone(&state.default_kv_store))
@@ -293,10 +311,12 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
+        .outbound_client(outbound_client)
+        .clock(ctx.monotonic_clock())
         .geo(Arc::new(FastlyPlatformGeo))
         .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
-        .build()
+        .build())
 }
 
 fn publisher_fallback_methods() -> [Method; 7] {
@@ -555,7 +575,7 @@ async fn execute_named(
     ctx: RequestContext,
     handler: NamedRouteHandler,
 ) -> Result<Response, EdgeError> {
-    let services = build_per_request_services(&state, &ctx);
+    let services = build_per_request_services(&state, &ctx)?;
     let mut req = ctx.into_request()?;
 
     // S2S batch sync uses Bearer auth (not EC cookies), so it skips EC
@@ -780,7 +800,7 @@ async fn execute_fallback(
     state: Arc<AppState>,
     ctx: RequestContext,
 ) -> Result<Response, EdgeError> {
-    let services = build_per_request_services(&state, &ctx);
+    let services = build_per_request_services(&state, &ctx)?;
     let req = ctx.into_request()?;
     Ok(dispatch_fallback(&state, &services, req).await)
 }
@@ -1471,14 +1491,16 @@ mod tests {
         RequestFilterEffects, RequestFilterInput,
     };
     use trusted_server_core::platform::{
-        ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpClient,
-        PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult, PlatformTemplateCache, PlatformTemplateCacheReservation,
-        RuntimeServices, TemplateCacheError, TemplateCacheKey, TemplateCacheLookup,
-        TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
+        ClientInfo, HttpClient, PlatformBackend, PlatformBackendSpec, PlatformError,
+        PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
+        PlatformResponse, PlatformSelectResult, PlatformTemplateCache,
+        PlatformTemplateCacheReservation, RuntimeServices, TemplateCacheError, TemplateCacheKey,
+        TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation, TemplateEntry,
+        TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
     use trusted_server_core::test_support::nextjs_auction;
+    use trusted_server_core::test_support::scripted_client::{ScriptedHttpClient, TestClock};
 
     #[test]
     fn hooks_store_metadata_matches_edgezero_manifest() {
@@ -1547,7 +1569,12 @@ mod tests {
             .expect("should build request")
     }
 
-    fn route(router: &RouterService, request: edgezero_core::http::Request) -> Response {
+    fn route(router: &RouterService, mut request: edgezero_core::http::Request) -> Response {
+        // `oneshot` skips `EdgeZero`'s request conversion, which installs the
+        // adapter's default client, so install one that fails every request.
+        request
+            .extensions_mut()
+            .insert(HttpClient::with_client(ScriptedHttpClient::forbidding()));
         block_on(router.oneshot(request)).expect("should route request")
     }
 
@@ -1602,15 +1629,68 @@ mod tests {
         TrustedServerApp::routes_for_state(&state)
     }
 
+    /// Wraps `request` in a context that carries `client`, as `EdgeZero`'s Fastly
+    /// request conversion installs its default client.
+    fn context_with_client(
+        mut request: edgezero_core::http::Request,
+        client: HttpClient,
+    ) -> RequestContext {
+        request.extensions_mut().insert(client);
+        RequestContext::new(request, PathParams::default())
+    }
+
     #[test]
-    fn per_request_services_register_the_fastly_template_assembler() {
+    fn per_request_services_carry_the_context_client_with_the_proxy_marker_off() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let client = HttpClient::with_client(ScriptedHttpClient::forbidding());
+        assert!(
+            client.proxy_marker_enabled(),
+            "should start from a client whose marker is on"
+        );
+        let context = context_with_client(empty_request(Method::GET, "/article"), client);
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+
+        assert!(
+            !services.outbound_client().proxy_marker_enabled(),
+            "should turn the proxy marker off on the context client"
+        );
+    }
+
+    #[test]
+    fn per_request_services_reject_a_request_without_an_outbound_client() {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         let context = RequestContext::new(
             empty_request(Method::GET, "/article"),
             PathParams::default(),
         );
 
-        let services = build_per_request_services(&state, &context);
+        let error = build_per_request_services(&state, &context)
+            .expect_err("should reject a request with no outbound client");
+
+        assert_eq!(
+            error.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer a missing client with an internal error"
+        );
+        assert_eq!(
+            error.to_string(),
+            "internal error: request has no outbound client",
+            "should name the missing client"
+        );
+    }
+
+    #[test]
+    fn per_request_services_register_the_fastly_template_assembler() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            ScriptedHttpClient::forbidding().http_client(),
+        );
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
         let template = format!(
             "<html><body>article{}</body></html>",
             trusted_server_core::publisher::AD_ASSEMBLY_SEAM
@@ -3038,6 +3118,8 @@ mod tests {
             .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
             .backend(Arc::new(FixedBackend))
             .http_client(Arc::new(StreamingHttpClient))
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
             .build()
@@ -3232,6 +3314,8 @@ mod tests {
             .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
             .backend(Arc::new(FixedBackend))
             .http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>)
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
             .build();

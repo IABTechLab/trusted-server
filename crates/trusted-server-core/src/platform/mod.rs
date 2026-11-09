@@ -53,6 +53,8 @@ pub use backend_naming::{
     BackendNamingPolicy, PredictedBackend,
 };
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
+pub use edgezero_core::outbound::HttpClient;
+pub use edgezero_core::time::MonotonicClock;
 pub use error::PlatformError;
 pub use http::{
     PlatformCacheIntent, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,

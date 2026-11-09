@@ -214,6 +214,7 @@ mod tests {
         PlatformHttpClient, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
         PlatformSelectResult, RuntimeServices, StoreId, StoreName,
     };
+    use trusted_server_core::test_support::scripted_client::{ScriptedHttpClient, TestClock};
 
     use super::*;
 
@@ -423,6 +424,8 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(backend)
             .http_client(http_client)
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(NoopGeo))
             .client_info(ClientInfo::default())
             .build()

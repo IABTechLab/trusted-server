@@ -106,10 +106,10 @@ fn build_state_with_services(
 }
 
 impl AppState {
-    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+    fn services_for_request(&self, ctx: &RequestContext) -> Result<RuntimeServices, EdgeError> {
         self.services
             .clone()
-            .unwrap_or_else(|| build_runtime_services(ctx))
+            .map_or_else(|| build_runtime_services(ctx), Ok)
     }
 }
 
@@ -162,7 +162,7 @@ where
     F: FnOnce(Arc<AppState>, RuntimeServices, Request) -> Fut,
     Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
 {
-    let services = state.services_for_request(&ctx);
+    let services = state.services_for_request(&ctx)?;
     let mut req = ctx.into_request()?;
     if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
         &state.settings,

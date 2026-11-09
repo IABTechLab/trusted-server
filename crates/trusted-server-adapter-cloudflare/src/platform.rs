@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::error::EdgeError;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
@@ -629,8 +630,24 @@ impl PlatformSecretStore for CloudflareSecretStoreAdapter {
 /// Geo information is read from Cloudflare's injected request headers
 /// (`cf-ipcountry`, etc.) which are present on all plans; headers absent on
 /// the native host target simply produce empty/zero defaults.
-pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
+///
+/// The outbound client is the one the request context carries, with the proxy
+/// marker turned off, and the clock is the context's monotonic clock.
+///
+/// # Errors
+///
+/// Returns an internal [`EdgeError`] when the request carries no outbound
+/// client.
+pub fn build_runtime_services(
+    ctx: &edgezero_core::context::RequestContext,
+) -> Result<RuntimeServices, EdgeError> {
     let client_ip = extract_client_ip(ctx);
+    let outbound_client = ctx
+        .http_client()
+        .ok_or_else(|| {
+            EdgeError::internal(std::io::Error::other("request has no outbound client"))
+        })?
+        .with_proxy_marker(false);
 
     #[cfg(target_arch = "wasm32")]
     let http_client: Arc<dyn PlatformHttpClient> = Arc::new(CloudflareHttpClient);
@@ -673,6 +690,8 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .kv_store(kv_store)
         .backend(Arc::new(NoopBackend))
         .http_client(http_client)
+        .outbound_client(outbound_client)
+        .clock(ctx.monotonic_clock())
         .geo(Arc::new(geo))
         .client_info(ClientInfo {
             client_ip,
@@ -685,7 +704,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         std::sync::OnceLock::new();
     #[cfg(target_arch = "wasm32")]
     let builder = builder.timer(Arc::clone(TIMER.get_or_init(|| Arc::new(CloudflareTimer))));
-    builder.build()
+    Ok(builder.build())
 }
 
 // ---------------------------------------------------------------------------
@@ -929,6 +948,8 @@ mod tests {
     }
     use edgezero_core::http::{HeaderValue, request_builder};
     use edgezero_core::params::PathParams;
+    use trusted_server_core::platform::HttpClient;
+    use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
 
     fn make_ctx_with_header(name: &str, value: &str) -> RequestContext {
         let req = request_builder()
@@ -950,6 +971,54 @@ mod tests {
             .body(edgezero_core::body::Body::empty())
             .expect("should build test request");
         RequestContext::new(req, PathParams::default())
+    }
+
+    /// Builds a context whose request carries `client`, as `EdgeZero`'s
+    /// Cloudflare request conversion installs its default client.
+    fn make_ctx_with_outbound_client(client: HttpClient) -> RequestContext {
+        let mut req = request_builder()
+            .method("GET")
+            .uri("https://example.com/")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build test request");
+        req.extensions_mut().insert(client);
+        RequestContext::new(req, PathParams::default())
+    }
+
+    #[test]
+    fn build_runtime_services_carries_the_context_client_with_the_proxy_marker_off() {
+        let client = HttpClient::with_client(ScriptedHttpClient::forbidding());
+        assert!(
+            client.proxy_marker_enabled(),
+            "should start from a client whose marker is on"
+        );
+        let ctx = make_ctx_with_outbound_client(client);
+
+        let services = build_runtime_services(&ctx).expect("should build runtime services");
+
+        assert!(
+            !services.outbound_client().proxy_marker_enabled(),
+            "should turn the proxy marker off on the context client"
+        );
+    }
+
+    #[test]
+    fn build_runtime_services_rejects_a_request_without_an_outbound_client() {
+        let ctx = make_ctx_without_header();
+
+        let error = build_runtime_services(&ctx)
+            .expect_err("should reject a request with no outbound client");
+
+        assert_eq!(
+            error.status(),
+            edgezero_core::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer a missing client with an internal error"
+        );
+        assert_eq!(
+            error.to_string(),
+            "internal error: request has no outbound client",
+            "should name the missing client"
+        );
     }
 
     #[test]

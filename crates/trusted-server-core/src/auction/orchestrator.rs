@@ -2815,6 +2815,7 @@ mod tests {
         PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
         StoreName,
     };
+    use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
     use crate::test_support::tests::crate_test_settings_str;
     use error_stack::{Report, ResultExt};
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -9160,6 +9161,8 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::clone(&backend) as Arc<_>)
             .http_client(Arc::clone(&http) as Arc<_>)
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(crate::platform::test_support::NoopGeo))
             .auction_telemetry_sink(Arc::new(
                 crate::auction::telemetry::NoopAuctionTelemetrySink,
@@ -9226,6 +9229,8 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::clone(&backend) as Arc<_>)
             .http_client(Arc::clone(&http) as Arc<_>)
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(crate::platform::test_support::NoopGeo))
             .auction_telemetry_sink(Arc::new(
                 crate::auction::telemetry::NoopAuctionTelemetrySink,
@@ -9286,6 +9291,8 @@ mod tests {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::clone(&backend) as Arc<_>)
                 .http_client(Arc::clone(&http) as Arc<_>)
+                .outbound_client(ScriptedHttpClient::forbidding().http_client())
+                .clock(TestClock::new().monotonic_clock())
                 .geo(Arc::new(crate::platform::test_support::NoopGeo))
                 .auction_telemetry_sink(Arc::new(
                     crate::auction::telemetry::NoopAuctionTelemetrySink,
@@ -9374,6 +9381,8 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::clone(&backend) as Arc<_>)
             .http_client(Arc::clone(&http) as Arc<_>)
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(crate::platform::test_support::NoopGeo))
             .auction_telemetry_sink(Arc::new(
                 crate::auction::telemetry::NoopAuctionTelemetrySink,
@@ -9429,6 +9438,8 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::clone(&backend) as Arc<_>)
             .http_client(Arc::clone(&http) as Arc<_>)
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(crate::platform::test_support::NoopGeo))
             .auction_telemetry_sink(Arc::new(
                 crate::auction::telemetry::NoopAuctionTelemetrySink,

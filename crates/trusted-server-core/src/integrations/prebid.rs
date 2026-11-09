@@ -3762,6 +3762,7 @@ mod tests {
     };
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+    use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
     use crate::test_support::tests::create_test_settings;
     use base64::engine::general_purpose::STANDARD as TEST_BASE64_STANDARD;
     use bytes::Bytes;
@@ -3898,6 +3899,8 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::new(backend))
             .http_client(Arc::new(NoopHttpClient))
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(NoopGeo))
             .client_info(ClientInfo {
                 client_ip: None,

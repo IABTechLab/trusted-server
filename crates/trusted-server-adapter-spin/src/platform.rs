@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::error::EdgeError;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::{Report, ResultExt as _};
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
@@ -734,9 +735,24 @@ impl PlatformSecretStore for SpinSecretStoreAdapter {
 /// Config and KV are sourced from the `EdgeZero` handles that `run_app` injects
 /// before routing. Secrets are read synchronously from Spin component
 /// variables because Trusted Server's platform secret trait is sync.
-#[must_use]
-pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
+///
+/// The outbound client is the one the request context carries, with the proxy
+/// marker turned off, and the clock is the context's monotonic clock.
+///
+/// # Errors
+///
+/// Returns an internal [`EdgeError`] when the request carries no outbound
+/// client.
+pub fn build_runtime_services(
+    ctx: &edgezero_core::context::RequestContext,
+) -> Result<RuntimeServices, EdgeError> {
     let client_ip = extract_client_ip(ctx);
+    let outbound_client = ctx
+        .http_client()
+        .ok_or_else(|| {
+            EdgeError::internal(std::io::Error::other("request has no outbound client"))
+        })?
+        .with_proxy_marker(false);
 
     #[cfg(all(feature = "spin", target_arch = "wasm32"))]
     let http_client: Arc<dyn PlatformHttpClient> = Arc::new(SpinPlatformHttpClient);
@@ -764,6 +780,8 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .kv_store(kv_store)
         .backend(Arc::new(NoopBackend))
         .http_client(http_client)
+        .outbound_client(outbound_client)
+        .clock(ctx.monotonic_clock())
         .geo(Arc::new(NullGeo))
         .client_info(ClientInfo {
             client_ip,
@@ -781,7 +799,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         std::sync::OnceLock::new();
     #[cfg(all(feature = "spin", target_arch = "wasm32"))]
     let builder = builder.timer(Arc::clone(TIMER.get_or_init(|| Arc::new(SpinTimer))));
-    builder.build()
+    Ok(builder.build())
 }
 
 // ---------------------------------------------------------------------------
@@ -836,7 +854,8 @@ mod tests {
         BoundedStoreRead, ConfigStore, ConfigStoreError, ConfigValue, finish_bounded_config_read,
     };
     use edgezero_core::time::{Deadline, MonotonicClock};
-    use trusted_server_core::platform::AuctionTargetId;
+    use trusted_server_core::platform::{AuctionTargetId, HttpClient};
+    use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
 
     #[test]
     fn auction_http_capabilities_are_explicit() {
@@ -1105,10 +1124,59 @@ mod tests {
         );
     }
 
+    /// Builds a context without a Spin request context whose request carries
+    /// `client`, as `EdgeZero`'s Spin request conversion installs its default
+    /// client.
+    fn make_ctx_with_outbound_client(client: HttpClient) -> RequestContext {
+        let mut req = request_builder()
+            .method("GET")
+            .uri("https://example.com/")
+            .body(Body::empty())
+            .expect("should build request");
+        req.extensions_mut().insert(client);
+        RequestContext::new(req, PathParams::default())
+    }
+
+    #[test]
+    fn build_runtime_services_carries_the_context_client_with_the_proxy_marker_off() {
+        let client = HttpClient::with_client(ScriptedHttpClient::forbidding());
+        assert!(
+            client.proxy_marker_enabled(),
+            "should start from a client whose marker is on"
+        );
+        let ctx = make_ctx_with_outbound_client(client);
+
+        let services = build_runtime_services(&ctx).expect("should build runtime services");
+
+        assert!(
+            !services.outbound_client().proxy_marker_enabled(),
+            "should turn the proxy marker off on the context client"
+        );
+    }
+
+    #[test]
+    fn build_runtime_services_rejects_a_request_without_an_outbound_client() {
+        let ctx = make_ctx_without_spin_context();
+
+        let error = build_runtime_services(&ctx)
+            .expect_err("should reject a request with no outbound client");
+
+        assert_eq!(
+            error.status(),
+            edgezero_core::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer a missing client with an internal error"
+        );
+        assert_eq!(
+            error.to_string(),
+            "internal error: request has no outbound client",
+            "should name the missing client"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn build_runtime_services_uses_noop_native_stores_without_handles() {
-        let ctx = make_ctx_without_spin_context();
-        let services = build_runtime_services(&ctx);
+        let ctx = make_ctx_with_outbound_client(ScriptedHttpClient::forbidding().http_client());
+        let services = build_runtime_services(&ctx).expect("should build runtime services");
 
         assert!(
             services.client_info().client_ip.is_none(),
