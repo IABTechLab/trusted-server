@@ -18,7 +18,10 @@ use edgezero_adapter_axum::test_utils::AxumTestServer;
 use edgezero_core::app::App;
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_core::platform::HttpClient;
+use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::nextjs_auction;
+use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
@@ -86,8 +89,19 @@ struct TestServer {
 }
 
 impl TestServer {
+    /// Serves the app built from `settings`, with a script that fails every
+    /// outbound request in router state, so no real `EdgeZero` transport starts.
+    async fn start(settings: Settings) -> Self {
+        let router = TrustedServerApp::routes_with_settings_and_outbound_client(
+            settings,
+            HttpClient::with_client(ScriptedHttpClient::forbidding()),
+        )
+        .expect("should build router from test settings");
+        Self::serve(router).await
+    }
+
     /// Assembles `router` as the Trusted Server app and serves it on loopback port 0.
-    async fn start(router: RouterService) -> Self {
+    async fn serve(router: RouterService) -> Self {
         let app = App::from_router::<TrustedServerApp>(router, AXUM_PLATFORM)
             .expect("should assemble the Trusted Server app");
         let config = AxumDevServerConfig {
@@ -111,7 +125,7 @@ impl TestServer {
 
     /// Serves the router built from the default test settings.
     async fn with_test_settings() -> Self {
-        Self::start(test_router()).await
+        Self::start(test_settings()).await
     }
 
     /// Starts a request for `path` on the served app.
@@ -228,9 +242,7 @@ async fn aps_profile_serves_renderer_through_adapter_fallback() {
                 .expect("should parse APS profile config"),
         },
     );
-    let router = TrustedServerApp::routes_with_settings(settings)
-        .expect("should build router with APS profile");
-    let server = TestServer::start(router).await;
+    let server = TestServer::start(settings).await;
 
     let response = send(server.request("GET", "/integrations/aps/renderer")).await;
     assert_eq!(response.status().as_u16(), 200);
@@ -879,7 +891,7 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
         nextjs_auction::services(Arc::clone(&client)),
     )
     .expect("should build router with fixture services");
-    let server = TestServer::start(router).await;
+    let server = TestServer::serve(router).await;
 
     let response = send(
         server
@@ -942,7 +954,7 @@ async fn nextjs_gtm_rejects_malformed_request_hosts() {
             nextjs_auction::services(origin),
         )
         .expect("should build script composition router");
-        let server = TestServer::start(router).await;
+        let server = TestServer::serve(router).await;
         let hostile_host = "example.com</script><script>alert(1)</script>";
         let value = if header == "forwarded" {
             format!("host=\"{hostile_host}\"")
@@ -990,7 +1002,7 @@ async fn nextjs_gtm_accepts_local_request_hosts_and_ports() {
             nextjs_auction::services(origin),
         )
         .expect("should build script composition router");
-        let server = TestServer::start(router).await;
+        let server = TestServer::serve(router).await;
         let response = send(
             server
                 .request("GET", "/script-composition")
@@ -1035,7 +1047,7 @@ async fn nextjs_gtm_html_response_is_complete() {
             nextjs_auction::services(origin),
         )
         .expect("should build mixed integration router");
-        let server = TestServer::start(router).await;
+        let server = TestServer::serve(router).await;
         let response = send(
             server
                 .request("GET", "/article")

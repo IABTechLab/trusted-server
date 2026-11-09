@@ -13,7 +13,7 @@ use edgezero_core::http::{
     HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
 };
 use edgezero_core::ingress::{InboundOrigin, OriginSource};
-use edgezero_core::router::RouterService;
+use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
@@ -516,7 +516,7 @@ impl Hooks for TrustedServerApp {
             EdgeError::service_unavailable("Service Unavailable")
         })?;
 
-        Ok(build_router(&state, None))
+        Ok(router_builder(&state).build())
     }
 }
 
@@ -535,7 +535,7 @@ impl TrustedServerApp {
         settings: Settings,
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_settings(settings)?;
-        Ok(build_router(&state, None))
+        Ok(router_builder(&state).build())
     }
 
     /// Build the full application router from explicit settings, with `client`
@@ -562,7 +562,7 @@ impl TrustedServerApp {
         client: HttpClient,
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_settings(settings)?;
-        Ok(build_router(&state, Some(client)))
+        Ok(router_builder(&state).with_state(client).build())
     }
 
     /// Build the full router with explicit settings and runtime services.
@@ -586,11 +586,12 @@ impl TrustedServerApp {
         services: RuntimeServices,
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_services(settings, Some(services))?;
-        Ok(build_router(&state, None))
+        Ok(router_builder(&state).build())
     }
 }
 
-fn build_router(state: &Arc<AppState>, outbound_client: Option<HttpClient>) -> RouterService {
+/// Registers every route, middleware, and hook for `state` on a router builder.
+fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
     {
         let state = Arc::clone(state);
 
@@ -973,13 +974,7 @@ fn build_router(state: &Arc<AppState>, outbound_client: Option<HttpClient>) -> R
             builder = builder.route("/{*rest}", method, fallback.clone());
         }
 
-        // Only the testing seam passes a client. Router state replaces the
-        // adapter's per-request client, which production keeps.
-        if let Some(client) = outbound_client {
-            builder = builder.with_state(client);
-        }
-
-        builder.build()
+        builder
     }
 }
 

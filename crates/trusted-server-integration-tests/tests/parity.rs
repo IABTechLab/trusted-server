@@ -51,8 +51,11 @@ use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
 /// Shared test settings for all adapters.
 ///
 /// The settings baked into the binaries contain placeholder secrets that
-/// `get_settings()` rejects by design, so all routers are built through
-/// their `routes_with_settings` testing seams from this known-good config.
+/// `get_settings()` rejects by design, so every app and router here is built
+/// from this known-good config through an adapter testing seam:
+/// `routes_with_settings_and_outbound_client` for served apps,
+/// `routes_with_settings` for route-table checks, and
+/// `routes_with_settings_and_services` for fixed-service fixtures.
 /// The handler regex is the production-shaped `^/_ts/admin`, matching
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
@@ -1044,8 +1047,10 @@ async fn assert_bodiless_get_reaches_origin_without_body() {
     let origin = RecordingOrigin::start().await;
     let mut settings = test_settings();
     settings.publisher.origin_url = format!("http://{}", origin.address);
-    // EdgeZero's own Axum client goes in router state instead of a script, so
-    // the forward can reach the loopback origin.
+    // EdgeZero's own Axum client goes in router state instead of a script. It
+    // is staged for Task 7: until then the publisher forward still runs
+    // through Trusted Server's own Axum client, so this test does not yet show
+    // that the router-state client carries the forward.
     let client = HttpClient::with_client(
         AxumOutboundClient::try_new().expect("should build EdgeZero's Axum outbound client"),
     );
@@ -1074,6 +1079,18 @@ async fn assert_bodiless_get_reaches_origin_without_body() {
         "should forward no request body, got {} bytes",
         record.body.len()
     );
+    assert!(
+        !record.headers.contains_key(http::header::TRANSFER_ENCODING),
+        "should forward no Transfer-Encoding, got {:?}",
+        record.headers.get(http::header::TRANSFER_ENCODING)
+    );
+    // EZ-1 allows a bodiless forward to carry `Content-Length: 0`, though it
+    // should not, so the header must be absent or zero.
+    let content_length = record.headers.get(http::header::CONTENT_LENGTH);
+    assert!(
+        content_length.is_none_or(|value| value == "0"),
+        "should forward no Content-Length or `Content-Length: 0`, got {content_length:?}"
+    );
     server
         .shutdown()
         .await
@@ -1084,6 +1101,7 @@ async fn assert_bodiless_get_reaches_origin_without_body() {
 #[derive(Clone)]
 struct OriginRecord {
     method: http::Method,
+    headers: HeaderMap,
     body: bytes::Bytes,
 }
 
@@ -1111,6 +1129,7 @@ impl RecordingOrigin {
                     .expect("should lock the origin records")
                     .push(OriginRecord {
                         method: parts.method,
+                        headers: parts.headers,
                         body,
                     });
                 (
@@ -1540,8 +1559,8 @@ mod trace_parity {
     /// Platform services that fail the test when a trace or forwarder request reaches them.
     ///
     /// Its outbound client is a forbid-mode script, which fails each request instead of
-    /// panicking. Each test checks [`ForbiddenLifecycle::script`] at its end, and the drop
-    /// check backs that up, so the test fails if any outbound request was sent.
+    /// panicking. Each test checks [`ForbiddenLifecycle::script`] at its end, so the test
+    /// fails if any outbound request was sent.
     struct ForbiddenLifecycle {
         outbound: ScriptedHttpClient,
     }
@@ -1560,15 +1579,6 @@ mod trace_parity {
         /// Returns a handle on the script that records every outbound request.
         fn script(&self) -> ScriptedHttpClient {
             self.outbound.clone()
-        }
-    }
-
-    impl Drop for ForbiddenLifecycle {
-        fn drop(&mut self) {
-            // Every router and response holding these services drops before its test returns.
-            if !std::thread::panicking() {
-                self.outbound.assert_no_requests();
-            }
         }
     }
 
