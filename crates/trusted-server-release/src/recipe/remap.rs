@@ -61,7 +61,7 @@ pub(crate) const REMAPPED_CHECKOUT: &str = "/trusted-server";
 /// Fixed prefix of the vendored dependency directory.
 pub(super) const REMAPPED_VENDOR: &str = "/cargo-vendor";
 /// Fixed prefix of the private Cargo home.
-pub(super) const REMAPPED_CARGO_HOME: &str = "/cargo-home";
+pub(crate) const REMAPPED_CARGO_HOME: &str = "/cargo-home";
 /// Fixed prefix of the Rust tool root, which is the compiler sysroot.
 pub(super) const REMAPPED_TOOLS: &str = "/rust-tools";
 /// Fixed prefix of the Cargo target directory, which holds every `OUT_DIR`.

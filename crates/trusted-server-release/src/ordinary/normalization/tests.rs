@@ -7,7 +7,7 @@ use serde_json::json;
 use super::{plan, validate_configuration};
 
 #[test]
-fn both_roles_have_identical_four_map_arguments_and_retained_canonical_bytes() {
+fn both_roles_have_identical_six_map_arguments_and_retained_canonical_bytes() {
     let a = plan(
         Path::new("/example/workspace/ordinary-canonical-source"),
         Path::new("/example/temp/ordinary-fastly-canonical-target"),
@@ -35,8 +35,8 @@ fn both_roles_have_identical_four_map_arguments_and_retained_canonical_bytes() {
             .as_array()
             .expect("should list the closed remaps")
             .len(),
-        4,
-        "should include both source and both target mappings"
+        6,
+        "should include both source, target and Cargo home mappings"
     );
     assert_eq!(
         a.bytes,
@@ -56,6 +56,38 @@ fn both_roles_have_identical_four_map_arguments_and_retained_canonical_bytes() {
         a.arguments[1].contains("=/cargo-target"),
         "should reuse the reviewed target prefix"
     );
+    for role in ["canonical", "reproduction"] {
+        assert!(
+            a.arguments[1].contains(&format!(
+                "/example/temp/ordinary-{role}-cargo-home=/cargo-home"
+            )),
+            "should remap the {role} private Cargo home"
+        );
+    }
+}
+
+#[test]
+fn scan_rejects_a_raw_private_cargo_home() {
+    let flags = plan(
+        Path::new("/example/workspace/ordinary-canonical-source"),
+        Path::new("/example/temp/ordinary-fastly-canonical-target"),
+        "canonical",
+    )
+    .expect("should plan the closed canonical layout");
+    for home in [
+        "/example/temp/ordinary-canonical-cargo-home",
+        "/example/temp/ordinary-reproduction-cargo-home",
+    ] {
+        let mut bytes = crate::ordinary::normalization::TEST_WASM.to_vec();
+        let path = format!("{home}/registry/src/example/lib.rs");
+        bytes.extend_from_slice(&[0, u8::try_from(path.len() + 4).expect("should fit"), 3]);
+        bytes.extend_from_slice(b"raw");
+        bytes.extend_from_slice(path.as_bytes());
+        assert!(
+            super::scan(&bytes, &flags).is_err(),
+            "should reject an unremapped Cargo home {home}"
+        );
+    }
 }
 
 #[test]
@@ -267,12 +299,40 @@ fn preparation_requires_canonical_owned_roots_and_a_fresh_target() {
     fs::create_dir_all(&target).expect("should create fresh target");
     fs::write(source.join(".cargo/config.toml"), b"[alias]\n")
         .expect("should retain valid source configuration");
-    super::prepare(&source, &target, "canonical", &[])
+    let home = parent.join("temp/ordinary-canonical-cargo-home");
+    let inherited = [(OsString::from("CARGO_HOME"), OsString::from(&home))];
+    assert!(
+        super::prepare(&source, &target, "canonical", &inherited).is_err(),
+        "should refuse a missing private Cargo home"
+    );
+    fs::create_dir(&home).expect("should create the private Cargo home");
+    for wrong in [
+        Vec::new(),
+        vec![(
+            OsString::from("CARGO_HOME"),
+            OsString::from(parent.join("home/.cargo")),
+        )],
+        vec![(
+            OsString::from("CARGO_HOME"),
+            OsString::from(parent.join("temp/ordinary-reproduction-cargo-home")),
+        )],
+    ] {
+        assert!(
+            super::prepare(&source, &target, "canonical", &wrong).is_err(),
+            "should refuse a build without its role's private Cargo home"
+        );
+    }
+    super::prepare(&source, &target, "canonical", &inherited)
         .expect("should accept fresh canonical layout");
     let output = parent.join("arguments");
-    let argument =
-        crate::ordinary::commands::prepare_rustflags(&source, &target, "canonical", &output, &[])
-            .expect("should seal arguments before the build");
+    let argument = crate::ordinary::commands::prepare_rustflags(
+        &source,
+        &target,
+        "canonical",
+        &output,
+        &inherited,
+    )
+    .expect("should seal arguments before the build");
     let expected =
         plan(&source, &target, "canonical").expect("should derive fixed expected arguments");
     assert_eq!(
@@ -285,20 +345,26 @@ fn preparation_requires_canonical_owned_roots_and_a_fresh_target() {
         "should seal canonical argument bytes before Cargo runs"
     );
     assert!(
-        crate::ordinary::commands::prepare_rustflags(&source, &target, "canonical", &output, &[])
-            .is_err(),
+        crate::ordinary::commands::prepare_rustflags(
+            &source,
+            &target,
+            "canonical",
+            &output,
+            &inherited
+        )
+        .is_err(),
         "should refuse to reuse argument output"
     );
     fs::write(target.join("stale"), b"stale").expect("should contaminate target");
     assert!(
-        super::prepare(&source, &target, "canonical", &[]).is_err(),
+        super::prepare(&source, &target, "canonical", &inherited).is_err(),
         "should refuse reused target roots"
     );
     fs::remove_file(target.join("stale")).expect("should restore empty target");
     let peer = parent.join("workspace/ordinary-reproduction-source");
     std::os::unix::fs::symlink(&source, peer).expect("should create forbidden peer alias");
     assert!(
-        super::prepare(&source, &target, "canonical", &[]).is_err(),
+        super::prepare(&source, &target, "canonical", &inherited).is_err(),
         "should refuse an existing aliased peer mapping"
     );
 }

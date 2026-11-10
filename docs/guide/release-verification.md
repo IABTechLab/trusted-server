@@ -130,18 +130,17 @@ prevents all signing and publication. Debug information and custom sections are
 retained. The CLI binaries have no A/B release gate; native reproduction remains
 later measured coverage.
 
-The builds vary physical source/target directories, job count, umask and start
-time. Both receive the identical four-map target-scoped Cargo argument pair:
-their checkout roots map to `/trusted-server`, and their target roots map to
-`/cargo-target`. Normalized compiler source-path identity is intentionally
-shared. The retained argument bytes are checked against both observations, and
-the complete binaries are scanned for those four physical roots. Dependency
-sources under the runner's `CARGO_HOME` (`/home/runner/.cargo/registry/src`
-and `/home/runner/.cargo/git/checkouts`) are not remapped and remain in the
-debug sections; both jobs run as the same runner user with the same `HOME` and
-`CARGO_HOME`, so equality also depends on that shared path. The observations
-and companion record this as the `cargo-home-unvaried` gap. This is ordinary
-equality between two jobs on the same hosted image, not an independently
+The builds vary physical source/target directories, Cargo home, job count,
+umask and start time. Each role fetches its dependency sources into its own
+fresh Cargo home under `RUNNER_TEMP`. Both receive the identical six-map
+target-scoped Cargo argument pair: their checkout roots map to
+`/trusted-server`, their target roots map to `/cargo-target`, and their Cargo
+homes map to `/cargo-home`. Normalized compiler source-path identity is
+intentionally shared. The retained argument bytes are checked against both
+observations, each observation proves that every resolved package came from the
+checkout or that role's Cargo home, and the complete binaries are scanned for
+all six physical roots. Both jobs still run as the same runner user on the same
+hosted image. This is ordinary equality between two jobs, not an independently
 reproducible build recipe, with `release_qualification:false`; controlled
 material/tool/boundary closure and an alternate user remain unqualified.
 

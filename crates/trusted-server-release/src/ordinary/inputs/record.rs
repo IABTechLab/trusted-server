@@ -153,7 +153,7 @@ struct RootIdentity {
 
 struct Captured {
     request: Request,
-    roots: [RootIdentity; 2],
+    roots: [RootIdentity; 3],
 }
 
 fn execution_uid() -> u32 {
@@ -161,7 +161,7 @@ fn execution_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn root_identities(request: &Request) -> Result<[RootIdentity; 2], Report<ReleaseError>> {
+fn root_identities(request: &Request) -> Result<[RootIdentity; 3], Report<ReleaseError>> {
     let identity = |path: &str| -> Result<RootIdentity, Report<ReleaseError>> {
         let metadata = fs::symlink_metadata(path).map_err(|_| rejected())?;
         require(
@@ -177,6 +177,7 @@ fn root_identities(request: &Request) -> Result<[RootIdentity; 2], Report<Releas
     Ok([
         identity(&request.environment.checkout_root)?,
         identity(&request.environment.target_root)?,
+        identity(&request.environment.cargo_home)?,
     ])
 }
 
@@ -184,8 +185,14 @@ fn validate(request: &Request) -> Result<(), Report<ReleaseError>> {
     let env = &request.environment;
     let checkout = Path::new(&env.checkout_root);
     let target = Path::new(&env.target_root);
+    let cargo_home = Path::new(&env.cargo_home);
     real_root(checkout)?;
     real_root(target)?;
+    real_root(cargo_home)?;
+    require(
+        normalization::cargo_home(target, &request.role).is_some_and(|home| home == cargo_home),
+        "ordinary capture Cargo home is not the role's private home",
+    )?;
     require(
         digest(&request.source_commit, 40)
             && env.started_at_seconds > 0
@@ -203,9 +210,11 @@ fn validate(request: &Request) -> Result<(), Report<ReleaseError>> {
     )?;
     let checkout_metadata = fs::metadata(checkout).map_err(|_| rejected())?;
     let target_metadata = fs::metadata(target).map_err(|_| rejected())?;
+    let home_metadata = fs::metadata(cargo_home).map_err(|_| rejected())?;
     require(
         checkout_metadata.uid() == env.uid
             && target_metadata.uid() == env.uid
+            && home_metadata.uid() == env.uid
             && (checkout_metadata.dev(), checkout_metadata.ino())
                 != (target_metadata.dev(), target_metadata.ino()),
         "ordinary source/target ownership or filesystem identity is invalid",
@@ -230,6 +239,27 @@ fn validate(request: &Request) -> Result<(), Report<ReleaseError>> {
         )?;
     }
     Ok(())
+}
+
+/// Requires every resolved package source to come from the checkout or the
+/// role's private Cargo home, proving Cargo used the remapped home.
+fn dependency_sources(
+    checkout: &Path,
+    cargo_home: &Path,
+    metadata: &[u8],
+) -> Result<(), Report<ReleaseError>> {
+    let metadata =
+        documents::parse_json(metadata, Role::CargoObservation).map_err(|_| rejected())?;
+    let packages = metadata["packages"].as_array().ok_or_else(rejected)?;
+    require(
+        packages.iter().all(|package| {
+            package["manifest_path"].as_str().is_some_and(|path| {
+                let path = Path::new(path);
+                path.starts_with(checkout) || path.starts_with(cargo_home)
+            })
+        }),
+        "ordinary package source is outside the checkout and private Cargo home",
+    )
 }
 
 fn capture(bytes: &[u8]) -> Result<Captured, Report<ReleaseError>> {
@@ -306,6 +336,11 @@ fn finish(
     let metadata = documents::read_bounded(&request.cargo_metadata, Role::CargoObservation)?;
     let messages = documents::read_bounded(&request.cargo_messages, Role::CargoObservation)?;
     let js = javascript_identity(checkout, target, &metadata.bytes, &messages.bytes)?;
+    dependency_sources(
+        checkout,
+        Path::new(&request.environment.cargo_home),
+        &metadata.bytes,
+    )?;
     let binary = checkout.join("release-assets").join(ASSET);
     require(
         fs::canonicalize(&binary).is_ok_and(|resolved| resolved == binary),
@@ -316,7 +351,7 @@ fn finish(
     let retained = documents::read_bounded(&request.rustflags, Role::Metadata)?;
     require(
         retained.bytes == flags.bytes && retained.sha256 == flags.sha256,
-        "ordinary captured Cargo arguments differ from the source-owned four-map plan",
+        "ordinary captured Cargo arguments differ from the source-owned six-map plan",
     )?;
     normalization::scan(&binary.bytes, &flags)?;
     let source = source_identity(checkout, &request.source_commit)?;

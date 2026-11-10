@@ -110,7 +110,7 @@ The first difference is at offset 10,264,685. Read-only section analysis found i
 
 ### Build-side experiment for approval
 
-Preserve `debug = 1`, all Wasm sections, target/profile/default features, `--locked`, jobs/umask variation and fresh roots. Restrict the experiment to Fastly's Rust target compilation. Both jobs receive the same ordered four-map vector:
+Preserve `debug = 1`, all Wasm sections, target/profile/default features, `--locked`, jobs/umask variation and fresh roots. Restrict the experiment to Fastly's Rust target compilation. Both jobs receive the same ordered four-map vector (extended to six maps by the [review amendment](binary-attestations-phase2-fastly-integration.md#approved-phase-2-rebuild-check-compatibility), which adds each role's private Cargo home mapped to `/cargo-home`):
 
 | Physical prefix               | Logical prefix    |
 | ----------------------------- | ----------------- |

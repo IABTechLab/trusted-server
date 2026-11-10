@@ -29,6 +29,7 @@ pub(super) fn fixture() -> Value {
         "environment": {
             "checkout_root": "/example/workspace/ordinary-canonical-source",
             "target_root": "/example/temp/ordinary-fastly-canonical-target",
+            "cargo_home": "/example/temp/ordinary-canonical-cargo-home",
             "started_at_seconds": 1700000000,
             "umask": 18,
             "jobs": 4,
@@ -40,7 +41,6 @@ pub(super) fn fixture() -> Value {
         "gaps": [
             "alternate-user-unqualified",
             "boundary-unqualified",
-            "cargo-home-unvaried",
             "materials-unqualified",
             "tools-unqualified"
         ]
@@ -59,6 +59,7 @@ pub(super) fn reproduction() -> Value {
         json!("/example/workspace/ordinary-reproduction-source");
     value["environment"]["target_root"] =
         json!("/example/temp/ordinary-fastly-reproduction-target");
+    value["environment"]["cargo_home"] = json!("/example/temp/ordinary-reproduction-cargo-home");
     value["environment"]["started_at_seconds"] = json!(1700000900);
     value["environment"]["umask"] = json!(23);
     value["environment"]["jobs"] = json!(2);
@@ -397,5 +398,25 @@ fn typed_failure_stages_distinguish_identity_size_digest_and_complete_bytes() {
                 "should retain actual first difference"
             );
         }
+    }
+}
+
+#[test]
+fn rejects_a_cargo_home_other_than_the_role_private_home() {
+    for home in [
+        "/example/temp/ordinary-reproduction-cargo-home",
+        "/home/example/.cargo",
+        "/example/other/ordinary-canonical-cargo-home",
+    ] {
+        let mut value = fixture();
+        value["environment"]["cargo_home"] = json!(home);
+        let Err(error) = observation(&serde_json::to_vec(&value).expect("should encode fixture"))
+        else {
+            panic!("should reject a shared or foreign Cargo home: {home}");
+        };
+        assert!(
+            format!("{error:?}").contains("Cargo home is not the role's private home"),
+            "should reach the private Cargo home rule for {home}"
+        );
     }
 }

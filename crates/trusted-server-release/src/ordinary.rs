@@ -28,13 +28,9 @@ pub(crate) use commands::{compare_transfers, measure_build, prepare_rustflags, t
 
 const PROFILE: &str = "ordinary-release-fastly-byte-equality-v1";
 const ASSET: &str = "trusted-server-fastly.wasm";
-/// Unsupported assurances every observation must name. `cargo-home-unvaried`
-/// records that both builds share the runner's unremapped Cargo home, whose
-/// dependency source paths remain in the final bytes.
-const GAPS: [&str; 5] = [
+const GAPS: [&str; 4] = [
     "alternate-user-unqualified",
     "boundary-unqualified",
-    "cargo-home-unvaried",
     "materials-unqualified",
     "tools-unqualified",
 ];
@@ -180,10 +176,12 @@ pub(crate) fn pair(
     for left in [
         &canonical_environment.checkout_root,
         &canonical_environment.target_root,
+        &canonical_environment.cargo_home,
     ] {
         for right in [
             &reproduction_environment.checkout_root,
             &reproduction_environment.target_root,
+            &reproduction_environment.cargo_home,
         ] {
             require(
                 !Path::new(left).starts_with(right) && !Path::new(right).starts_with(left),
@@ -254,6 +252,7 @@ struct Tools {
 struct Environment {
     checkout_root: String,
     target_root: String,
+    cargo_home: String,
     started_at_seconds: u64,
     umask: u32,
     jobs: u32,
@@ -363,6 +362,11 @@ pub(crate) fn observation(bytes: &[u8]) -> Result<Observation, Report<ReleaseErr
             && environment.timezone == "UTC"
             && environment.uid > 0,
         "ordinary environment observations rejected",
+    )?;
+    require(
+        normalization::cargo_home(Path::new(&environment.target_root), &facts.role)
+            .is_some_and(|home| home == Path::new(&environment.cargo_home)),
+        "ordinary Cargo home is not the role's private home",
     )?;
     require(
         facts.artifact.size > 0 && facts.artifact.size <= Role::Executable.limit(),

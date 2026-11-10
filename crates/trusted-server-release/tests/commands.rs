@@ -622,8 +622,10 @@ fn ordinary_measurement_with(
 ) -> Output {
     let checkout = root.join("workspace/ordinary-canonical-source");
     let target = root.join("temp/ordinary-fastly-canonical-target");
+    let cargo_home = root.join("temp/ordinary-canonical-cargo-home");
     fs::create_dir_all(&checkout).expect("should create ordinary source root");
     fs::create_dir_all(&target).expect("should create ordinary target root");
+    fs::create_dir_all(&cargo_home).expect("should create the private Cargo home");
     for name in [
         "scripts/release/phase1-build.sh",
         ".cargo/config.toml",
@@ -637,6 +639,7 @@ fn ordinary_measurement_with(
     let arguments = Command::new(RELEASE_BIN)
         .env_clear()
         .current_dir(root)
+        .env("CARGO_HOME", &cargo_home)
         .arg("ordinary-rustflags")
         .arg("--checkout")
         .arg(&checkout)
@@ -723,7 +726,7 @@ fn ordinary_measurement_with(
     let mut request = json!({
         "role":"canonical","source_commit":"a".repeat(40),
         "environment":{
-            "checkout_root":checkout,"target_root":target,"started_at_seconds":1700000000_u64,
+            "checkout_root":checkout,"target_root":target,"cargo_home":cargo_home,"started_at_seconds":1700000000_u64,
             "umask":18,"jobs":4,"locale":"C","timezone":"UTC",
             "uid":fs::metadata(&checkout).expect("should inspect actual fixture owner").uid()
         },
@@ -1043,6 +1046,8 @@ fn ordinary_compare_mismatch_writes_no_companion() {
         json!(root.join("workspace/ordinary-reproduction-source"));
     reproduction["environment"]["target_root"] =
         json!(root.join("temp/ordinary-fastly-reproduction-target"));
+    reproduction["environment"]["cargo_home"] =
+        json!(root.join("temp/ordinary-reproduction-cargo-home"));
     reproduction["environment"]["started_at_seconds"] = json!(1_700_000_900_u64);
     reproduction["environment"]["jobs"] = json!(2);
     reproduction["environment"]["umask"] = json!(23);

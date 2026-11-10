@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::MetadataExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use error_stack::Report;
 use serde_json::{Value, json};
@@ -16,7 +16,7 @@ use crate::documents::{self, Role};
 use crate::error::ReleaseError;
 use crate::recipe;
 
-/// Closed four-map argument plan; it constructs no qualified recipe.
+/// Closed six-map argument plan; it constructs no qualified recipe.
 pub(super) struct Flags {
     /// The exact pair passed to Cargo.
     pub(super) arguments: Vec<String>,
@@ -24,7 +24,7 @@ pub(super) struct Flags {
     pub(super) bytes: Vec<u8>,
     /// Digest of those retained bytes.
     pub(super) sha256: String,
-    roots: [String; 4],
+    roots: [String; 6],
 }
 
 fn rejected() -> Report<ReleaseError> {
@@ -47,6 +47,11 @@ fn text(path: &Path) -> Result<String, Report<ReleaseError>> {
         })
         .map(str::to_owned)
         .ok_or_else(rejected)
+}
+
+/// The private Cargo home a role must build with, beside its target root.
+pub(super) fn cargo_home(target: &Path, role: &str) -> Option<PathBuf> {
+    Some(target.parent()?.join(format!("ordinary-{role}-cargo-home")))
 }
 
 /// Derives identical source-owned maps from either role's physical roots.
@@ -81,6 +86,8 @@ pub(super) fn plan(
         text(&workspace.join("ordinary-reproduction-source"))?,
         text(&temporary.join("ordinary-fastly-canonical-target"))?,
         text(&temporary.join("ordinary-fastly-reproduction-target"))?,
+        text(&temporary.join("ordinary-canonical-cargo-home"))?,
+        text(&temporary.join("ordinary-reproduction-cargo-home"))?,
     ];
     for (index, left) in roots.iter().enumerate() {
         for right in roots.iter().skip(index + 1) {
@@ -95,6 +102,8 @@ pub(super) fn plan(
         recipe::REMAPPED_CHECKOUT,
         recipe::REMAPPED_TARGET,
         recipe::REMAPPED_TARGET,
+        recipe::REMAPPED_CARGO_HOME,
+        recipe::REMAPPED_CARGO_HOME,
     ];
     let flags: Vec<_> = roots
         .iter()
@@ -124,6 +133,13 @@ pub(super) fn prepare(
     inherited: &[(OsString, OsString)],
 ) -> Result<Flags, Report<ReleaseError>> {
     let flags = plan(checkout, target, role)?;
+    let home = cargo_home(target, role).ok_or_else(rejected)?;
+    require(
+        inherited
+            .iter()
+            .any(|(name, value)| name == "CARGO_HOME" && Path::new(value) == home),
+        "ordinary build must use its role's private Cargo home",
+    )?;
     // SAFETY: geteuid only reads the process identity and has no memory preconditions.
     let owner = unsafe { libc::geteuid() };
     for path in &flags.roots {
@@ -137,7 +153,8 @@ pub(super) fn prepare(
             Err(error)
                 if error.kind() == std::io::ErrorKind::NotFound
                     && Path::new(path) != checkout
-                    && Path::new(path) != target => {}
+                    && Path::new(path) != target
+                    && Path::new(path) != home => {}
             _ => return Err(rejected()),
         }
     }

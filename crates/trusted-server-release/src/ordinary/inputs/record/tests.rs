@@ -132,6 +132,12 @@ impl CaptureFixture {
             })
             .collect();
         fs::write(&cargo_messages, bytes).expect("should retain Cargo messages");
+        let cargo_home = files
+            .target
+            .parent()
+            .expect("should have a temporary parent")
+            .join("ordinary-canonical-cargo-home");
+        fs::create_dir(&cargo_home).expect("should create the private Cargo home");
         let rustflags = files.target.join("rustflags.json");
         let flags =
             crate::ordinary::normalization::plan(&files.checkout, &files.target, "canonical")
@@ -153,6 +159,10 @@ impl CaptureFixture {
                     .target
                     .to_str()
                     .expect("should encode target root")
+                    .to_owned(),
+                cargo_home: cargo_home
+                    .to_str()
+                    .expect("should encode Cargo home")
                     .to_owned(),
                 started_at_seconds: 1_700_000_000,
                 umask: 0o022,
@@ -226,7 +236,7 @@ fn assembles_only_whitelisted_ordinary_facts_from_retained_inputs() {
             .as_array()
             .expect("should record gaps")
             .len(),
-        5,
+        4,
         "should preserve every unsupported assurance"
     );
     assert_eq!(
@@ -234,7 +244,7 @@ fn assembles_only_whitelisted_ordinary_facts_from_retained_inputs() {
             .as_object()
             .expect("should record explicit environment")
             .len(),
-        8,
+        9,
         "should serialize only the explicit capture allowlist"
     );
     assert_eq!(
@@ -413,4 +423,36 @@ fn malformed_capture_errors_never_echo_untrusted_keys() {
         diagnostic.len() < 512 && !format!("{error:?}").contains("example-key"),
         "should retain a bounded fixed diagnostic for malformed captures"
     );
+}
+
+#[test]
+fn dependency_sources_must_come_from_the_checkout_or_private_cargo_home() {
+    let checkout = Path::new("/example/workspace/ordinary-canonical-source");
+    let home = Path::new("/example/temp/ordinary-canonical-cargo-home");
+    let metadata = |paths: &[&str]| {
+        serde_json::to_vec(&json!({
+            "packages": paths.iter().map(|path| json!({"manifest_path": path})).collect::<Vec<_>>()
+        }))
+        .expect("should encode metadata")
+    };
+    super::dependency_sources(
+        checkout,
+        home,
+        &metadata(&[
+            "/example/workspace/ordinary-canonical-source/crates/example/Cargo.toml",
+            "/example/temp/ordinary-canonical-cargo-home/registry/src/index/example-1.0.0/Cargo.toml",
+        ]),
+    )
+    .expect("should accept checkout and private Cargo home sources");
+    for outside in [
+        "/home/example/.cargo/registry/src/index/example-1.0.0/Cargo.toml",
+        "/example/temp/ordinary-reproduction-cargo-home/git/checkouts/example/Cargo.toml",
+    ] {
+        let error = super::dependency_sources(checkout, home, &metadata(&[outside]))
+            .expect_err("should reject a source from another Cargo home");
+        assert!(
+            format!("{error:?}").contains("outside the checkout and private Cargo home"),
+            "should reach the dependency source rule for {outside}"
+        );
+    }
 }

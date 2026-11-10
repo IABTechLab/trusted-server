@@ -30,6 +30,11 @@ if [[ "$build_target" == wasm32-wasip1 ]]; then
   [[ -x "$ORDINARY_RELEASE_PRODUCER" ]] || { echo "Ordinary release producer is not executable" >&2; exit 1; }
   [[ "$(pwd -P)" == "$PWD" ]] || { echo "Checkout path must not contain symlinks" >&2; exit 1; }
   export LC_ALL=C TZ=UTC CARGO_BUILD_JOBS="$ordinary_jobs"
+  # Each role fetches its dependency sources into its own fresh Cargo home,
+  # which the compiler remaps to /cargo-home.
+  export CARGO_HOME="$RUNNER_TEMP/ordinary-$ordinary_role-cargo-home"
+  [[ ! -e "$CARGO_HOME" ]] || { echo "Refusing existing $CARGO_HOME" >&2; exit 1; }
+  mkdir "$CARGO_HOME"
   ordinary_started_at=$(date +%s)
   ordinary_umask=$(umask)
   ordinary_rustc=$(rustup which rustc)
@@ -195,6 +200,7 @@ const capture = {
   environment: {
     checkout_root: fs.realpathSync(process.cwd()),
     target_root: fs.realpathSync(env.CARGO_TARGET_DIR),
+    cargo_home: fs.realpathSync(env.CARGO_HOME),
     started_at_seconds: Number(env.ORDINARY_STARTED_AT),
     umask: parseInt(env.ORDINARY_UMASK, 8),
     jobs: Number(env.CARGO_BUILD_JOBS),
@@ -204,8 +210,11 @@ const capture = {
   cargo_messages: env.ORDINARY_MESSAGES, cargo_metadata: env.ORDINARY_METADATA,
   rustflags: env.ORDINARY_RUSTFLAGS,
 }
-if (capture.environment.target_root !== env.CARGO_TARGET_DIR)
-  throw Error('Compiler-visible ordinary target root must be canonical')
+if (
+  capture.environment.target_root !== env.CARGO_TARGET_DIR ||
+  capture.environment.cargo_home !== env.CARGO_HOME
+)
+  throw Error('Compiler-visible ordinary roots must be canonical')
 fs.writeFileSync(process.argv[2], JSON.stringify(capture) + '\n', { flag: 'wx', mode: 0o600 })
 JAVASCRIPT
   "$ORDINARY_RELEASE_PRODUCER" ordinary-measure \
