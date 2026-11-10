@@ -8,21 +8,6 @@ pub fn tsjs_script_src(module_ids: &[&str]) -> String {
     format!("/static/tsjs=tsjs-unified.min.js?v={hash}")
 }
 
-/// `<script>` tag for injecting the tsjs bundle.
-#[must_use]
-pub fn tsjs_script_tag(module_ids: &[&str]) -> String {
-    tsjs_script_tag_with_attributes(module_ids, &[])
-}
-
-/// Publisher `<script>` tag for the tsjs bundle with trusted static attributes.
-#[must_use]
-pub fn tsjs_script_tag_with_attributes(
-    module_ids: &[&str],
-    attributes: &[(&'static str, &'static str)],
-) -> String {
-    script_tag_with_source(&tsjs_script_src(module_ids), attributes, None)
-}
-
 /// Runtime tag with the configured origin used to recognize existing proxy URLs.
 ///
 /// Dynamic source and origin values are escaped independently of trusted static attributes.
@@ -31,14 +16,6 @@ pub(crate) fn tsjs_script_tag_with_public_origin(
     src: &str,
     attributes: &[(&'static str, &'static str)],
     public_origin: &str,
-) -> String {
-    script_tag_with_source(src, attributes, Some(public_origin))
-}
-
-fn script_tag_with_source(
-    src: &str,
-    attributes: &[(&'static str, &'static str)],
-    public_origin: Option<&str>,
 ) -> String {
     let mut attributes = attributes
         .iter()
@@ -60,12 +37,10 @@ fn script_tag_with_source(
         })
         .collect::<String>();
 
-    if let Some(public_origin) = public_origin {
-        attributes.push_str(&format!(
-            " data-ts-public-origin=\"{}\"",
-            escape_attribute_value(public_origin)
-        ));
-    }
+    attributes.push_str(&format!(
+        " data-ts-public-origin=\"{}\"",
+        escape_attribute_value(public_origin)
+    ));
 
     format!(
         "<script src=\"{}\" id=\"trustedserver-js\"{attributes}></script>",
@@ -215,33 +190,34 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_script_tag_wraps_source_in_single_trustedserver_tag() {
-        let module_ids = ["creative"];
-        let src = tsjs_script_src(&module_ids);
+    fn runtime_metadata_wraps_source_in_single_trustedserver_tag() {
+        let src = tsjs_script_src(&["creative"]);
+        let origin = "https://ads.publisher.example";
 
         assert_eq!(
-            tsjs_script_tag(&module_ids),
-            format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
-            "should generate exactly one trusted server script tag"
+            tsjs_script_tag_with_public_origin(&src, &[], origin),
+            format!(
+                "<script src=\"{src}\" id=\"trustedserver-js\" data-ts-public-origin=\"{origin}\"></script>"
+            ),
+            "should generate exactly one trusted server script tag with origin metadata"
         );
     }
 
     #[test]
     fn publisher_tsjs_script_tag_renders_static_attributes() {
-        let module_ids = ["gpt"];
-        let src = tsjs_script_src(&module_ids);
+        let src = tsjs_script_src(&["gpt"]);
+        let origin = "https://ads.publisher.example";
 
         assert_eq!(
-            tsjs_script_tag_with_attributes(&module_ids, &[("data-ts-gam-attribution", "true")]),
-            format!(
-                "<script src=\"{src}\" id=\"trustedserver-js\" data-ts-gam-attribution=\"true\"></script>"
+            tsjs_script_tag_with_public_origin(
+                &src,
+                &[("data-ts-gam-attribution", "true")],
+                origin,
             ),
-            "should render trusted static attributes on the publisher bundle tag"
-        );
-        assert_eq!(
-            tsjs_script_tag(&module_ids),
-            format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
-            "should keep the generic tag byte-for-byte unmarked"
+            format!(
+                "<script src=\"{src}\" id=\"trustedserver-js\" data-ts-gam-attribution=\"true\" data-ts-public-origin=\"{origin}\"></script>"
+            ),
+            "should render trusted static attributes and origin metadata on the publisher bundle tag"
         );
     }
 
@@ -276,11 +252,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
-    fn runtime_metadata_keeps_static_attribute_contract() {
+    #[should_panic(
+        expected = "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+    )]
+    fn publisher_tsjs_script_tag_rejects_invalid_attribute_name() {
         let _ = tsjs_script_tag_with_public_origin(
             "/static/test",
-            &[("data-static", "bad&value")],
+            &[("data-bad_name", "true")],
             "https://example.com",
         );
     }
@@ -289,40 +267,52 @@ mod tests {
     #[should_panic(
         expected = "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
     )]
-    fn publisher_tsjs_script_tag_rejects_invalid_attribute_name() {
-        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-bad_name", "true")]);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
-    )]
     fn publisher_tsjs_script_tag_rejects_empty_attribute_name() {
-        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("", "true")]);
+        let _ = tsjs_script_tag_with_public_origin(
+            "/static/test",
+            &[("", "true")],
+            "https://example.com",
+        );
     }
 
     #[test]
     #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
     fn publisher_tsjs_script_tag_rejects_double_quote_in_attribute_value() {
-        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad\"value")]);
+        let _ = tsjs_script_tag_with_public_origin(
+            "/static/test",
+            &[("data-safe-name", "bad\"value")],
+            "https://example.com",
+        );
     }
 
     #[test]
     #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
     fn publisher_tsjs_script_tag_rejects_ampersand_in_attribute_value() {
-        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad&value")]);
+        let _ = tsjs_script_tag_with_public_origin(
+            "/static/test",
+            &[("data-safe-name", "bad&value")],
+            "https://example.com",
+        );
     }
 
     #[test]
     #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
     fn publisher_tsjs_script_tag_rejects_less_than_in_attribute_value() {
-        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad<value")]);
+        let _ = tsjs_script_tag_with_public_origin(
+            "/static/test",
+            &[("data-safe-name", "bad<value")],
+            "https://example.com",
+        );
     }
 
     #[test]
     #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
     fn publisher_tsjs_script_tag_rejects_greater_than_in_attribute_value() {
-        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad>value")]);
+        let _ = tsjs_script_tag_with_public_origin(
+            "/static/test",
+            &[("data-safe-name", "bad>value")],
+            "https://example.com",
+        );
     }
 
     #[test]
