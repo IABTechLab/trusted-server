@@ -2,16 +2,12 @@ name: Documentation proposal
 
 # Proposes documentation edits with Copilot CLI for the code changes since a
 # chosen commit and opens one reviewable pull request. Run it manually from the
-# Actions tab. See
+# Actions tab; "Use workflow from" picks the branch to propose documentation
+# for and to open the pull request against. See
 # docs/superpowers/specs/2026-10-01-docs-proposal-automation-design.md.
 on:
   workflow_dispatch:
     inputs:
-      branch:
-        description: Branch to propose documentation for and open the pull request against
-        required: true
-        default: main
-        type: string
       since:
         description: >-
           Commit on the branch to propose documentation since (exclusive); the run
@@ -27,8 +23,8 @@ on:
 
 permissions: {}
 
-# Sequential merges are proposed one at a time, in order. The default queue
-# keeps only one pending run and cancels older ones, so keep them all. Every
+# Runs are proposed one at a time, in order. The default queue keeps only one
+# pending run and cancels older ones, so keep them all. Every
 # job has a timeout so a hung run cannot hold the queue for hours.
 concurrency:
   group: docs-proposal
@@ -36,21 +32,21 @@ concurrency:
   queue: max
 
 # Each job runs the proposal scripts from the workflow's own revision in
-# `tools/` against a checkout of the merge commit in `source/`, so retrying a
-# merge that predates this tooling, or a later fix to it, still works. Copilot
-# inspects `since`..`sha`.
-# The propose job resolves the commit once so later jobs use the same SHA even
-# if the branch moves during the run.
+# `tools/` against a checkout of the chosen commit in `source/`, so a range
+# that predates this tooling, or a later fix to it, still works. Copilot
+# inspects `since`..`sha`. The propose job resolves `sha` once, so later jobs
+# use the same commit even if the branch moves during the run.
 env:
-  DOCS_PROPOSAL_BRANCH: ${{ inputs.branch }}
+  DOCS_PROPOSAL_BRANCH: ${{ github.ref_name }}
   BASE_SHA: ${{ inputs.since }}
 
 jobs:
   # Copilot runs here with a read-only token; it cannot push or open PRs.
   # Copilot can write files that later steps execute, so treat this job as
   # untrusted: it uses no dependency cache that later runs would restore.
-  # Because untrusted code runs on the main ref, it can still write other
-  # main-scoped caches, so privileged workflows must never restore caches.
+  # Because untrusted code runs on the dispatched branch's ref, it can still
+  # write caches scoped to that branch, so privileged workflows must never
+  # restore caches.
   propose:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -60,6 +56,13 @@ jobs:
     outputs:
       merge_sha: ${{ steps.resolve.outputs.merge_sha }}
     steps:
+      - name: Require a branch
+        run: |
+          if [ "$GITHUB_REF_TYPE" != branch ]; then
+            printf '::error::Run the workflow from a branch, not %s %s.\n' "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
       - name: Checkout tools
         uses: actions/checkout@v4
         with:
@@ -70,7 +73,7 @@ jobs:
       - name: Checkout merge commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.sha || inputs.branch }}
+          ref: ${{ inputs.sha || github.sha }}
           path: source
           fetch-depth: 0
           persist-credentials: false

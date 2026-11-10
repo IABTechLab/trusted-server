@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Asks Copilot CLI to propose documentation edits for one merged commit.
+# Asks Copilot CLI to propose documentation edits for a range of commits.
 #
 # Usage: scripts/docs-proposal/propose.sh <merge-sha> <work-dir> [<base-sha>]
 # Run from a checkout of <merge-sha>; this script may live in a separate
@@ -69,7 +69,7 @@ run_copilot() {
 
 {
   render_prompt "$here/prompt.md"
-  printf '\n## Merged change\n\n- Commit: %s\n- Base: %s\n- Subject: %s\n\n' "$sha" "$base" "$(git log -1 --format=%s "$sha")"
+  printf '\n## Merged change\n\n- Branch: %s\n- Commit: %s\n- Base: %s\n- Subject: %s\n\n' "$DOCS_PROPOSAL_BRANCH" "$sha" "$base" "$(git log -1 --format=%s "$sha")"
   printf '## Sources of truth\n\n'
   awk '/^## Sources of truth/ { found = 1; next } /^## / { found = 0 } found' "$spec"
 } > "$work_dir/prompt.md"

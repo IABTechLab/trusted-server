@@ -35,10 +35,10 @@ if [ -n "$existing" ] && [ "$pr_state" != "OPEN" ]; then
   exit 0
 fi
 
-# A retry that inspected a different range, such as a manual dispatch without
-# the base of a multi-commit push, must not narrow or close the proposal.
+# A retry that inspected a different range, such as one with another `since`,
+# must not narrow or close the proposal.
 if [ -n "$existing" ] && [ "$pr_base" != "$base" ]; then
-  printf '::error::Proposal #%s for %s covers %s..%s, but this run inspected %s..%s. Rerun the workflow with base %s.\n' \
+  printf '::error::Proposal #%s for %s covers %s..%s, but this run inspected %s..%s. Rerun the workflow with since %s.\n' \
     "$pr_number" "$sha" "${pr_base:-an unrecorded base}" "$sha" "$base" "$sha" "${pr_base:-<original base>}" >&2
   exit 1
 fi
@@ -98,8 +98,16 @@ else
   git push --quiet --force-with-lease="refs/heads/$branch:$remote_head" origin "HEAD:refs/heads/$branch"
 fi
 
+# A range of several commits is named after its size and latest commit; only
+# a single commit is linked to its originating pull request.
 subject="$(git log -1 --format=%s "$sha")"
-origin_pr="$(gh api "repos/{owner}/{repo}/commits/$sha/pulls" --jq '.[0].number // empty' || true)"
+commits="$(git rev-list --count "$base..$sha" 2> /dev/null || echo 1)"
+origin_pr=""
+if [ "$commits" -eq 1 ]; then
+  origin_pr="$(gh api "repos/{owner}/{repo}/commits/$sha/pulls" --jq '.[0].number // empty' || true)"
+else
+  subject="$commits commits on $DOCS_PROPOSAL_BRANCH, latest: $subject"
+fi
 title="$(printf 'Update documentation for %s' "$subject" | cut -c1-200)"
 docs_proposal_pr_body "$sha" "$base" "$subject" "$origin_pr" "$work_dir/rationale.md" > "$work_dir/pr-body.md"
 if [ -n "$existing" ]; then
