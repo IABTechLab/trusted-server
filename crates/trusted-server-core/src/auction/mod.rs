@@ -130,6 +130,21 @@ mod plan_sharing_tests {
     use crate::integrations::IntegrationRegistry;
     use crate::test_support::tests::create_test_settings;
 
+    fn aps_provider_map() -> std::collections::BTreeMap<ProviderId, ProviderConfig> {
+        std::collections::BTreeMap::from([(
+            "aps-main".parse().expect("should parse APS provider ID"),
+            ProviderConfig {
+                protocol: "openrtb-2.6".to_string(),
+                profile: "aps".to_string(),
+                endpoint: "https://aps.example/e/pb/bid".to_string(),
+                timeout_ms: None,
+                routing: RoutingMode::AllEligible,
+                notifications: NotificationConfig::default(),
+                profile_config: serde_json::json!({"account_id":"example-account"}),
+            },
+        )])
+    }
+
     #[test]
     fn orchestrator_and_registry_share_the_compiled_plan_allocation() {
         let settings = create_test_settings();
@@ -212,18 +227,7 @@ mod plan_sharing_tests {
     #[test]
     fn aps_profile_registers_renderer_without_browser_aps_config() {
         let mut settings = create_test_settings();
-        settings.auction.providers = std::collections::BTreeMap::from([(
-            "aps-main".parse().expect("should parse APS provider ID"),
-            ProviderConfig {
-                protocol: "openrtb-2.6".to_string(),
-                profile: "aps".to_string(),
-                endpoint: "https://aps.example/e/pb/bid".to_string(),
-                timeout_ms: None,
-                routing: RoutingMode::AllEligible,
-                notifications: NotificationConfig::default(),
-                profile_config: serde_json::json!({"account_id":"example-account"}),
-            },
-        )]);
+        settings.auction.providers = aps_provider_map();
         let plan = Arc::new(compile_auction_plan(&settings).expect("should compile APS plan"));
         let registry = IntegrationRegistry::with_plan(&settings, plan)
             .expect("should build APS renderer registry");
@@ -236,18 +240,7 @@ mod plan_sharing_tests {
         // `create_test_settings` enables Prebid; add an APS profile, GPT and
         // `js_asset_proxy` so plan registrations precede the builder table.
         let mut settings = create_test_settings();
-        settings.auction.providers = std::collections::BTreeMap::from([(
-            "aps-main".parse().expect("should parse APS provider ID"),
-            ProviderConfig {
-                protocol: "openrtb-2.6".to_string(),
-                profile: "aps".to_string(),
-                endpoint: "https://aps.example/e/pb/bid".to_string(),
-                timeout_ms: None,
-                routing: RoutingMode::AllEligible,
-                notifications: NotificationConfig::default(),
-                profile_config: serde_json::json!({"account_id":"example-account"}),
-            },
-        )]);
+        settings.auction.providers = aps_provider_map();
         settings
             .integrations
             .insert_config("gpt", &serde_json::json!({ "enabled": true }))

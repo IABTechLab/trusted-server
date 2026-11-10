@@ -587,7 +587,7 @@ impl Default for PrebidIntegrationConfig {
 }
 
 impl PrebidIntegrationConfig {
-    /// Reports whether Prebid's script interception removes a `<script src>` URL.
+    /// Reports whether Prebid's interception removes an element with this `src` or `href` value.
     ///
     /// The query and fragment are ignored, and the URL path is matched against
     /// [`Self::script_patterns`] case-insensitively.
