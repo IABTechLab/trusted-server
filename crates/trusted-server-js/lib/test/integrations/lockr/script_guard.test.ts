@@ -67,6 +67,20 @@ describe('Lockr SDK Script Interception Guard', () => {
   });
 
   describe('appendChild interception', () => {
+    it.each([
+      'https://notaim.loc.kr/identity-lockr.js', // allow-domain: notaim.loc.kr
+      'https://notidentity.loc.kr/identity-lockr.js', // allow-domain: notidentity.loc.kr
+    ])('should require an exact Lockr hostname for %s', (url) => {
+      installLockrGuard();
+
+      const script = document.createElement('script');
+      script.setAttribute('src', url);
+      document.head.appendChild(script);
+
+      expect(script.getAttribute('src')).toBe(url);
+      script.remove();
+    });
+
     it('should rewrite Lockr SDK URL from aim.loc.kr', () => {
       installLockrGuard();
 
