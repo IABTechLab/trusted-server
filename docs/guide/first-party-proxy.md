@@ -12,13 +12,24 @@ The First-Party Proxy system rewrites third-party URLs in ad creatives to route 
 - **Click Tracking** - First-party click redirects
 - **Content Security** - Validated, signed URLs prevent tampering
 
+## Generated URL authority
+
+Routes remain path-based, but URLs emitted into rewritten creatives and
+`/first-party/sign` or `/first-party/proxy-rebuild` responses are absolute on
+`[publisher].public_origin`, for example
+`https://ads.publisher.example/first-party/proxy?...`. Existing root-relative
+signed proxy and click inputs remain accepted. The publisher SSAT/page-bids
+path retains its explicit request-origin override. See
+[public origin configuration](/guide/configuration#public_origin) for the default
+authority, EC cookie scope, and coordinated upgrade/rollback warning.
+
 ## How It Works
 
 ```mermaid
 flowchart TD
-  original["`Creative (Original) &lt;img src='tracker.com/pixel.gif' /&gt;`"]
-  rewritten["Creative (Rewritten)<br/>&lt;img src='/first-party/proxy?<br/>tsurl=https://tracker.com/<br/>pixel.gif&amp;tstoken=abc123...' /&gt;"]
-  server["Trusted Server<br/>1. Validate tstoken<br/>2. Append ts-ec<br/>3. Proxy to tracker.com<br/>4. Return response"]
+  original["`Creative (Original) &lt;img src='tracker.example.com/pixel.gif' /&gt;`"]
+  rewritten["Creative (Rewritten)<br/>&lt;img src='https://ads.publisher.example/first-party/proxy?<br/>tsurl=https://tracker.example.com/<br/>pixel.gif&amp;tstoken=abc123...' /&gt;"]
+  server["Trusted Server<br/>1. Validate tstoken<br/>2. Append ts-ec<br/>3. Proxy to tracker.example.com<br/>4. Return response"]
 
   original -->|Rewrite| rewritten -->|Browser Request| server
 ```
@@ -67,14 +78,14 @@ GET /first-party/proxy?tsurl=https://example.com/ad.html&tstoken=signature
 Original URL:
 
 ```
-https://tracker.com/pixel.gif?campaign=123&uid=abc
+https://tracker.example.com/pixel.gif?campaign=123&uid=abc
 ```
 
 Signed proxy URL:
 
 ```
-/first-party/proxy?
-  tsurl=https://tracker.com/pixel.gif&
+https://ads.publisher.example/first-party/proxy?
+  tsurl=https://tracker.example.com/pixel.gif&
   campaign=123&
   uid=abc&
   tstoken=HmacSha256Signature
@@ -83,7 +94,7 @@ Signed proxy URL:
 Final proxied request:
 
 ```
-https://tracker.com/pixel.gif?campaign=123&uid=abc&ts-ec=xyz
+https://tracker.example.com/pixel.gif?campaign=123&uid=abc&ts-ec=xyz
 ```
 
 ### `/first-party/click` - Click Redirects
@@ -93,7 +104,7 @@ Handles click tracking with first-party redirects.
 **Request**:
 
 ```
-GET /first-party/click?tsurl=https://advertiser.com/landing&tstoken=signature
+GET /first-party/click?tsurl=https://advertiser.example.com/landing&tstoken=signature
 ```
 
 **Query Parameters**: Same as `/first-party/proxy`
@@ -116,8 +127,8 @@ Click URL in creative:
 
 ```html
 <a
-  href="/first-party/click?
-  tsurl=https://advertiser.com/buy&
+  href="https://ads.publisher.example/first-party/click?
+  tsurl=https://advertiser.example.com/buy&
   product=widget&
   tstoken=signature"
 >
@@ -129,7 +140,7 @@ User clicks → Server responds:
 
 ```
 HTTP/1.1 302 Found
-Location: https://advertiser.com/buy?product=widget&ts-ec=xyz
+Location: https://advertiser.example.com/buy?product=widget&ts-ec=xyz
 ```
 
 ::: tip Click vs Proxy
@@ -159,7 +170,7 @@ POST /first-party/sign
 
 ```json
 {
-  "href": "/first-party/proxy?tsurl=https://example.com/resource.jpg&param=value&tstoken=signature&tsexp=1234567890",
+  "href": "https://ads.publisher.example/first-party/proxy?tsurl=https://example.com/resource.jpg&param=value&tstoken=signature&tsexp=1234567890",
   "base": "https://example.com/resource.jpg"
 }
 ```
@@ -199,7 +210,8 @@ Re-signs an existing signed click URL after creative script adds or removes
 query parameters. The original `tstoken` is validated before any change is
 applied, and `tsurl`, `tstoken`, and `tsexp` may never be added or deleted.
 
-Two request forms are supported, differing only in transport and response.
+JSON POST, GET navigation, and form-encoded POST navigation are supported,
+differing only in transport and response.
 
 **POST (JSON) — used by the click guard on a same-origin page**:
 
@@ -224,7 +236,7 @@ Responds `200` with the rebuilt URL and diagnostics:
 
 ```json
 {
-  "href": "/first-party/click?tsurl=https%3A%2F%2Fexample.com&variant=red&tstoken=sig2",
+  "href": "https://ads.publisher.example/first-party/click?tsurl=https%3A%2F%2Fexample.com&variant=red&tstoken=sig2",
   "base": "https://example.com",
   "added": { "variant": "red" },
   "removed": ["product"]
@@ -243,8 +255,9 @@ GET /first-party/proxy-rebuild?tsclick=<url-encoded click>&add=<JSON object>&del
 | `add`     | No       | URL-encoded JSON object, e.g. `{"variant":"red"}` |
 | `del`     | No       | URL-encoded JSON array, e.g. `["product"]`        |
 
-Responds `302` with the rebuilt click in `Location` (plus
-`Cache-Control: no-store, private`), so the browser continues to
+Responds `302` with the absolute rebuilt click URL in `Location`, on
+`publisher.public_origin` or its `https://{publisher.domain}` fallback, with
+`Cache-Control: no-store, private`. The browser continues to
 `/first-party/click`, which then redirects to the advertiser.
 
 **Form-encoded POST (navigation, no URL length limit)**: a `POST` carrying
@@ -302,12 +315,12 @@ For the detailed signing algorithm, validation steps, and security notes, see [P
 ```css
 /* Original */
 .banner {
-  background: url(https://cdn.com/bg.jpg);
+  background: url(https://cdn.example.com/bg.jpg);
 }
 
 /* Rewritten */
 .banner {
-  background: url(/first-party/proxy?tsurl=https://cdn.com/bg.jpg&tstoken=sig);
+  background: url(https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/bg.jpg&tstoken=sig);
 }
 ```
 
@@ -330,7 +343,7 @@ For the detailed signing algorithm, validation steps, and security notes, see [P
 **Logging**:
 
 ```
-proxy: likely pixel detected size=43 url=https://tracker.com/p.gif
+proxy: likely pixel detected size=43 url=https://tracker.example.com/p.gif
 ```
 
 ### Passthrough (Other Types)
@@ -368,7 +381,7 @@ The proxy automatically follows HTTP redirects:
 
 ```
 Request: /first-party/proxy?tsurl=https://short.link&tstoken=sig
-  → 302 to https://cdn.com/ad.html
+  → 302 to https://cdn.example.com/ad.html
   → 200 with HTML content
   → Rewrite HTML and return
 ```
@@ -388,11 +401,11 @@ When proxying, Trusted Server automatically appends the `ts-ec` parameter:
 
 ```
 Original request to proxy:
-  /first-party/proxy?tsurl=https://tracker.com/pixel.gif&tstoken=sig
+  /first-party/proxy?tsurl=https://tracker.example.com/pixel.gif&tstoken=sig
   Cookie: ts-ec=user123
 
 Proxied backend request:
-  https://tracker.com/pixel.gif?ts-ec=user123
+  https://tracker.example.com/pixel.gif?ts-ec=user123
 ```
 
 ### Redirect Propagation
@@ -416,14 +429,16 @@ This ensures downstream endpoints receive consistent IDs even through redirect c
 Click redirects also forward EC IDs:
 
 ```html
-<a href="/first-party/click?tsurl=https://advertiser.com&tstoken=sig"></a>
+<a
+  href="https://ads.publisher.example/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example.com%2F&tstoken=sig"
+></a>
 ```
 
 User clicks → redirect includes ID:
 
 ```
 302 Found
-Location: https://advertiser.com?ts-ec=user123
+Location: https://advertiser.example.com?ts-ec=user123
 ```
 
 ::: tip Forwarding Conditions
@@ -718,8 +733,8 @@ Proxy requests emit detailed logs:
 
 ```
 proxy: origin response status=200 ct=text/html cl=1234 accept=text/html url=https://...
-proxy: likely pixel detected size=43 url=https://tracker.com/p.gif
-click: tsurl=https://advertiser.com had_params=true target=... referer=... ua=... tsid=...
+proxy: likely pixel detected size=43 url=https://tracker.example.com/p.gif
+click: tsurl=https://advertiser.example.com had_params=true target=... referer=... ua=... tsid=...
 ```
 
 ### Diagnostic Headers
