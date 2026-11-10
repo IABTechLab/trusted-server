@@ -260,7 +260,7 @@ mod tests {
     #[test]
     #[ignore = "requires explicitly supplied current-lock original archives; no acquisition qualification"]
     fn actual_current_lock_npm_originals() {
-        let inputs = std::env::var_os("TS_RELEASE_NPM_ORIGINALS")
+        let inputs = std::env::var_os("TRUSTED_SERVER__RELEASE_NPM_ORIGINALS")
             .map(PathBuf::from)
             .expect("should explicitly supply current locked compressed originals");
         let bytes = include_bytes!("../../../trusted-server-js/lib/package-lock.json");

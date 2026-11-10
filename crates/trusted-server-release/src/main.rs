@@ -1,34 +1,77 @@
-// consumed by Task 7 preparation and Task 9 recipes
-#[allow(dead_code)]
+// Closed producer stages have no production caller yet. `expect` in the binary
+// build reports a module once it becomes live; tests exercise these modules
+// directly, so the test build only allows them.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by Task 7 preparation and Task 9 recipes"
+    )
+)]
+#[cfg_attr(test, allow(dead_code))]
 mod boundary;
-#[allow(dead_code, reason = "Task 10 composition capture is being integrated")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Task 10 composition capture is being integrated")
+)]
+#[cfg_attr(test, allow(dead_code))]
 mod composition;
-// Atomic output and schema helpers are consumed by later producer stages.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "atomic output and schema helpers are consumed by later producer stages"
+    )
+)]
+#[cfg_attr(test, allow(dead_code))]
 mod documents;
 mod error;
 mod git_objects;
-#[allow(dead_code, reason = "consumed by Task 9 recipes")]
+#[cfg_attr(not(test), expect(dead_code, reason = "consumed by Task 9 recipes"))]
+#[cfg_attr(test, allow(dead_code))]
 mod inspect;
-#[allow(dead_code, reason = "production JS tool qualification remains closed")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "production JS tool qualification remains closed")
+)]
+#[cfg_attr(test, allow(dead_code))]
 mod javascript;
-#[allow(dead_code, reason = "consumed by Task 7 material preparation")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by Task 7 material preparation")
+)]
+#[cfg_attr(test, allow(dead_code))]
 mod materials;
 mod ordinary;
 mod package;
 mod policy;
 mod preflight;
-#[allow(dead_code, reason = "production JS tool qualification remains closed")]
-mod preparation;
-#[allow(
-    dead_code,
-    reason = "Task 9 slice 1 recipe layer has no production caller yet"
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "production JS tool qualification remains closed")
 )]
-mod recipe;
-// `expect` would be unfulfilled in the test build, where the tests use it.
-#[allow(dead_code, reason = "consumed by Task 7 boundary and preparation")]
+#[cfg_attr(test, allow(dead_code))]
+mod preparation;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by Task 7 boundary and preparation")
+)]
+#[cfg_attr(test, allow(dead_code))]
 mod process;
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Task 9 slice 1 recipe layer has no production caller yet"
+    )
+)]
+#[cfg_attr(test, allow(dead_code))]
+mod recipe;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "only preflight uses source identity today")
+)]
+#[cfg_attr(test, allow(dead_code))]
 mod source;
 mod tool_tree;
 

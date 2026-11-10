@@ -627,3 +627,22 @@ fn backend_switch_exception_accepts_only_zero() {
         );
     }
 }
+
+#[test]
+fn helper_working_directory_must_stay_inside_the_private_mount() {
+    for (path, expected) in [
+        ("/boundary/writable", true),
+        ("/boundary/writable/tmp", true),
+        ("/boundary/writable/../../tmp", false),
+        ("/boundary/writable/tmp/..", false),
+        ("boundary/writable", false),
+        ("/boundary/writable-sibling", false),
+        ("/tmp", false),
+    ] {
+        assert_eq!(
+            is_private_working_dir(Path::new(path)),
+            expected,
+            "should classify helper TMPDIR {path}"
+        );
+    }
+}

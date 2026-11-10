@@ -352,12 +352,7 @@ export function installLifecycleObserver({
       if (/^path$/i.test(key))
         spawn.env[key] =
           `${path.dirname(nodePath)}${path.delimiter}${spawn.env[key]}`
-      if (
-        /^(?:NODE_OPTIONS|NODE_PATH|TS_RELEASE_OBSERVER|TS_RELEASE_KEY)/.test(
-          key
-        )
-      )
-        delete spawn.env[key]
+      if (/^(?:NODE_OPTIONS|NODE_PATH)/.test(key)) delete spawn.env[key]
     }
     // Both reviewed commands start with bare node; resolve that word independently of PATH.
     result[0] = `'${nodePath.replaceAll("'", "'\\''")}'${active.command.slice(4)}`

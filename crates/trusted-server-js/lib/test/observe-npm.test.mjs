@@ -141,6 +141,7 @@ function executeFreshCi({ optional, failHook }) {
     PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`,
     HOME: value.root,
     TMPDIR: value.root,
+    npm_config_update_notifier: 'false',
   };
   const seeded = spawnSync(
     process.execPath,

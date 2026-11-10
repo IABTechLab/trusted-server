@@ -27,9 +27,9 @@ const DENIAL_EPOCH: u64 = 1_700_000_000;
 /// Members that attempt a connection while Cargo builds them.
 pub(super) const ATTEMPTS: [&str; 3] = ["build-direct", "build-grandchild", "macro-attempt"];
 
-/// Reads the ordinary CI Cargo fixture named by `TS_RELEASE_CARGO_FIXTURE_ROOT`.
+/// Reads the ordinary CI Cargo fixture named by `TRUSTED_SERVER__RELEASE_CARGO_FIXTURE_ROOT`.
 pub(super) fn cargo_fixture() -> CargoFixture {
-    let root = std::env::var_os("TS_RELEASE_CARGO_FIXTURE_ROOT")
+    let root = std::env::var_os("TRUSTED_SERVER__RELEASE_CARGO_FIXTURE_ROOT")
         .map(PathBuf::from)
         .expect("should explicitly supply the ordinary CI Cargo fixture root");
     let root = fs::canonicalize(root).expect("should resolve the Cargo fixture root");

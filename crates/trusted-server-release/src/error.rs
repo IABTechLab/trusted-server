@@ -1,13 +1,14 @@
 /// Reports a closed release execution gate or invalid release input.
 #[derive(Debug, derive_more::Display)]
 pub(crate) enum ReleaseError {
-    #[display(
-        "Invalid release invocation; Rust release execution remains disabled pending \
-         authenticated bootstrap and preflight"
-    )]
+    #[display("Invalid release tool invocation")]
     Usage,
     #[display("Invalid release document")]
     Document,
+    #[display("Ordinary Fastly rebuild bytes differ")]
+    RebuildMismatch,
+    #[display("Ordinary build evidence does not join the current run")]
+    RebuildIdentity,
     #[display("Release input policy rejects the candidate inputs")]
     Policy,
     #[display("Inherited release environment is rejected")]

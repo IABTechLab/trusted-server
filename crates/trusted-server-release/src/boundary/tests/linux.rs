@@ -2,7 +2,7 @@
 //!
 //! On Linux these REQUIRE a reachable Docker daemon at the fixed socket and
 //! fail otherwise; they never skip. The image comes from
-//! `TS_RELEASE_TEST_IMAGE` (default `ubuntu:24.04`, whose glibc matches the
+//! `TRUSTED_SERVER__RELEASE_TEST_IMAGE` (default `ubuntu:24.04`, whose glibc matches the
 //! `ubuntu-24.04` runner that builds this test binary). A missing image is
 //! pulled once under a bounded deadline; a failed pull fails the test.
 //!
@@ -26,7 +26,7 @@ use crate::process::{ProcessOutcome, ProcessResult};
 
 /// The fixed Docker client on GitHub-hosted Ubuntu runners.
 const DOCKER_CLIENT: &str = "/usr/bin/docker";
-const TEST_IMAGE_VARIABLE: &str = "TS_RELEASE_TEST_IMAGE";
+const TEST_IMAGE_VARIABLE: &str = "TRUSTED_SERVER__RELEASE_TEST_IMAGE";
 const DEFAULT_TEST_IMAGE: &str = "ubuntu:24.04";
 /// `EROFS`: a write into a read-only bind mount.
 const READ_ONLY_FILESYSTEM: &str = "denied errno=30";

@@ -7,7 +7,7 @@
 //! qualifies a release. The canonical build is gated (ELF policy, debug
 //! info, remap scan, planted operator values, clean startup); the
 //! reproduction build is a recorded measurement only, and runs only when
-//! `TS_RELEASE_NATIVE_REPRODUCTION=measure` (otherwise the measurement
+//! `TRUSTED_SERVER__RELEASE_NATIVE_REPRODUCTION=measure` (otherwise the measurement
 //! records it as deferred to the scheduled run).
 
 use std::ffi::OsString;
@@ -40,9 +40,9 @@ use crate::preflight::AuditedEnvironment;
 use crate::preparation::tests::full::{JsFixtureRun, run_two_fresh_js_builds};
 use crate::process::{Cancellation, ProcessLimits};
 
-/// Reads the ordinary CI CLI fixture named by `TS_RELEASE_CLI_FIXTURE_ROOT`.
+/// Reads the ordinary CI CLI fixture named by `TRUSTED_SERVER__RELEASE_CLI_FIXTURE_ROOT`.
 fn cli_fixture() -> (PathBuf, CliFixture) {
-    let root = std::env::var_os("TS_RELEASE_CLI_FIXTURE_ROOT")
+    let root = std::env::var_os("TRUSTED_SERVER__RELEASE_CLI_FIXTURE_ROOT")
         .map(PathBuf::from)
         .expect("should explicitly supply the ordinary CI CLI fixture root");
     let root = fs::canonicalize(root).expect("should resolve the CLI fixture root");
@@ -241,7 +241,7 @@ fn start_everywhere(completed: &RecipeCompleted, cli: &CliFixture) -> NativeStar
 }
 
 #[test]
-#[ignore = "requires explicit JS, Cargo and CLI ordinary CI fixtures and Linux Docker; run separately in producer CI"]
+#[ignore = "requires explicit JS, Cargo and CLI ordinary CI fixtures and Linux Docker; frozen #1262 producer test, no workflow runs it"]
 fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
     // Read before any build so a missing selection fails in seconds.
     let native_reproduction = native_reproduction_from_env();

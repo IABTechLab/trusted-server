@@ -49,8 +49,59 @@ export function unavailableOrdinaryDiagnostic(directory) {
   })
 }
 
+/** Waits before retrying an idempotent ordinary read. */
+const ordinaryRetryDelays = [1_000, 3_000]
+
+/** Marks a transport error or transient HTTP status as safe to retry. */
+class OrdinaryRetryable extends Error {}
+
+function ordinaryWait(milliseconds, deadline) {
+  return new Promise((resolve, reject) => {
+    if (deadline?.aborted)
+      return reject(Error('Ordinary transfer deadline exhausted'))
+    const timer = setTimeout(resolve, milliseconds)
+    deadline?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer)
+        reject(Error('Ordinary transfer deadline exhausted'))
+      },
+      { once: true }
+    )
+  })
+}
+
+/**
+ * Retries an idempotent GET at most twice after a network error, 5xx or 429,
+ * inside the shared transfer deadline. Other failures are never retried.
+ */
+async function ordinaryRetry(operation, deadline, wait) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await operation()
+    } catch (error) {
+      if (
+        !(error instanceof OrdinaryRetryable) ||
+        attempt >= ordinaryRetryDelays.length
+      )
+        throw error
+      await wait(ordinaryRetryDelays[attempt], deadline)
+    }
+  }
+}
+
+function transientStatus(status) {
+  return status === 429 || (status >= 500 && status <= 599)
+}
+
 /** Fetches only fixed read-only current-run metadata, retaining strict-parser bytes. */
-export async function ordinaryApi(path, token, fetcher = fetch, deadline) {
+export async function ordinaryApi(
+  path,
+  token,
+  fetcher = fetch,
+  deadline,
+  wait = ordinaryWait
+) {
   if (
     !/^\/repos\/[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*\/actions\/runs\/[1-9][0-9]*(?:\/attempts\/[1-9][0-9]*\/jobs|\/artifacts)\?per_page=100$/.test(
       path
@@ -58,23 +109,35 @@ export async function ordinaryApi(path, token, fetcher = fetch, deadline) {
     !token
   )
     throw Error('Invalid ordinary metadata request')
-  const response = await ordinaryFetch(
-    // Fixed GitHub Actions metadata service, not an integration destination.
-    `https://api.github.com${path}`, // allow-domain: api.github.com
-    {
-      method: 'GET',
-      redirect: 'manual',
-      signal: AbortSignal.any([
-        AbortSignal.timeout(10_000),
-        ...(deadline ? [deadline] : []),
-      ]),
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-      },
+  const response = await ordinaryRetry(
+    async () => {
+      const response = await ordinaryFetch(
+        // Fixed GitHub Actions metadata service, not an integration destination.
+        `https://api.github.com${path}`, // allow-domain: api.github.com
+        {
+          method: 'GET',
+          redirect: 'manual',
+          signal: AbortSignal.any([
+            AbortSignal.timeout(10_000),
+            ...(deadline ? [deadline] : []),
+          ]),
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+          },
+        },
+        fetcher,
+        deadline
+      )
+      if (transientStatus(response.status)) {
+        discardOrdinaryBody(response)
+        throw new OrdinaryRetryable(`Ordinary metadata HTTP ${response.status}`)
+      }
+      return response
     },
-    fetcher
+    deadline,
+    wait
   )
   if (response.status !== 200) {
     discardOrdinaryBody(response)
@@ -88,7 +151,11 @@ export async function ordinaryApi(path, token, fetcher = fetch, deadline) {
 }
 
 /** Downloads one already-bound archive by exact ID, without forwarding credentials. */
-export async function ordinaryDownload(request, fetcher = fetch) {
+export async function ordinaryDownload(
+  request,
+  fetcher = fetch,
+  wait = ordinaryWait
+) {
   const { repository, archive, token, directory, deadline } = request
   const limits = {
     'canonical.zip': 768 * 1024 * 1024,
@@ -116,47 +183,62 @@ export async function ordinaryDownload(request, fetcher = fetch) {
   let descriptor
   try {
     descriptor = openSync(join(directory, archive.file), 'wx', 0o600)
-    const signal = AbortSignal.any([
-      AbortSignal.timeout(60_000),
-      ...(deadline ? [deadline] : []),
-    ])
-    const response = await ordinaryFetch(
-      // Fixed artifact API returns the authenticated download redirect.
-      `https://api.github.com/repos/${repository}/actions/artifacts/${archive.id}/zip`, // allow-domain: api.github.com
-      {
-        method: 'GET',
-        redirect: 'manual',
-        signal,
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: 'application/vnd.github+json',
-          'X-GitHub-Api-Version': '2022-11-28',
-        },
+    // Each retry requests a fresh redirect: the signed blob URL is short-lived.
+    // Only the requests are retried; a failed body stream is not.
+    const blob = await ordinaryRetry(
+      async () => {
+        const signal = AbortSignal.any([
+          AbortSignal.timeout(60_000),
+          ...(deadline ? [deadline] : []),
+        ])
+        const response = await ordinaryFetch(
+          // Fixed artifact API returns the authenticated download redirect.
+          `https://api.github.com/repos/${repository}/actions/artifacts/${archive.id}/zip`, // allow-domain: api.github.com
+          {
+            method: 'GET',
+            redirect: 'manual',
+            signal,
+            headers: {
+              Authorization: `Bearer ${token}`,
+              Accept: 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+            },
+          },
+          fetcher,
+          deadline
+        )
+        const location = response.headers.get('location')
+        discardOrdinaryBody(response)
+        if (transientStatus(response.status))
+          throw new OrdinaryRetryable('Ordinary archive API is unavailable')
+        if (response.status !== 302)
+          throw Error('Ordinary archive API did not return its single redirect')
+        const url = new URL(location)
+        if (
+          url.protocol !== 'https:' ||
+          url.username ||
+          url.password ||
+          url.port ||
+          url.hash
+        )
+          throw Error('Ordinary archive redirect rejected')
+        const blob = await ordinaryFetch(
+          url.href,
+          { method: 'GET', redirect: 'error', signal },
+          fetcher,
+          deadline
+        )
+        if (blob.status !== 200) {
+          discardOrdinaryBody(blob)
+          if (transientStatus(blob.status))
+            throw new OrdinaryRetryable('Ordinary archive blob is unavailable')
+          throw Error('Ordinary archive blob response rejected')
+        }
+        return blob
       },
-      fetcher
+      deadline,
+      wait
     )
-    const location = response.headers.get('location')
-    discardOrdinaryBody(response)
-    if (response.status !== 302)
-      throw Error('Ordinary archive API did not return its single redirect')
-    const url = new URL(location)
-    if (
-      url.protocol !== 'https:' ||
-      url.username ||
-      url.password ||
-      url.port ||
-      url.hash
-    )
-      throw Error('Ordinary archive redirect rejected')
-    const blob = await ordinaryFetch(
-      url.href,
-      { method: 'GET', redirect: 'error', signal },
-      fetcher
-    )
-    if (blob.status !== 200) {
-      discardOrdinaryBody(blob)
-      throw Error('Ordinary archive blob response rejected')
-    }
     const hash = createHash('sha256')
     const size = await ordinaryBody(blob, archive.size, (chunk) => {
       hash.update(chunk)
@@ -247,12 +329,14 @@ function ordinaryPlan(producer, input) {
   }
 }
 
-async function ordinaryFetch(url, options, fetcher) {
+async function ordinaryFetch(url, options, fetcher, deadline) {
   try {
     options.signal.throwIfAborted()
     return await fetcher(url, options)
   } catch {
-    throw Error('Ordinary read-only transport failed')
+    // A request timeout or network error is retryable; the shared deadline is not.
+    if (deadline?.aborted) throw Error('Ordinary read-only transport failed')
+    throw new OrdinaryRetryable('Ordinary read-only transport failed')
   }
 }
 

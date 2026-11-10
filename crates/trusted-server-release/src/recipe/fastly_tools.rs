@@ -16,7 +16,7 @@ use crate::documents::{Role, canonical_json, hash_bounded_with_check, lower_hex,
 use crate::error::ReleaseError;
 use crate::process::{BoundedCommand, ProcessLimits};
 
-const MODE: &str = "TRUSTED_SERVER_FASTLY_TOOL_MEASUREMENT";
+pub(super) const MODE: &str = "TRUSTED_SERVER__RELEASE_FASTLY_TOOL_MEASUREMENT";
 const PROFILE: &str = "fastly-linux-host-selected-files-v1";
 const HOST: &str = "x86_64-unknown-linux-gnu";
 const ROLES: [&str; 4] = [
@@ -171,11 +171,7 @@ pub(super) fn helper_measurement() -> Result<Vec<u8>, Report<ReleaseError>> {
     let root = tool_root(&path)?;
     let working =
         PathBuf::from(std::env::var("TMPDIR").map_err(|error| recipe_error(error.to_string()))?);
-    if !working.starts_with("/boundary/writable")
-        || working
-            .components()
-            .any(|part| matches!(part, Component::ParentDir))
-    {
+    if !super::gnu::is_private_working_dir(&working) {
         return Err(recipe_error("Fastly helper requires private TMPDIR"));
     }
     let version = query(&root.join("bin/rustc"), "-vV", &working, &path)?;

@@ -747,7 +747,7 @@ fn independent_object_copy(input: &Path, output: &Path) {
 #[test]
 #[ignore = "requires explicitly selected current-lock Git object data; no acquisition qualification"]
 fn actual_current_lock_git_material_closure() {
-    let input = std::env::var_os("TS_RELEASE_CARGO_GIT_FIXTURE")
+    let input = std::env::var_os("TRUSTED_SERVER__RELEASE_CARGO_GIT_FIXTURE")
         .map(PathBuf::from)
         .expect("should explicitly select original Git object data");
     let bytes = fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"))

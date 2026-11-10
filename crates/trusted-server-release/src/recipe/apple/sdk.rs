@@ -544,22 +544,23 @@ mod tests {
     #[test]
     #[ignore = "requires the explicitly selected local Xcode SDK and a receipt destination; copies the SDK, never modifies Xcode"]
     fn ordinary_ci_selected_sdk_detached_snapshot_smoke() {
-        let destination = std::env::var_os("TS_RELEASE_APPLE_SDK_SMOKE_RECEIPT")
+        let destination = std::env::var_os("TRUSTED_SERVER__RELEASE_APPLE_SDK_SMOKE_RECEIPT")
             .map(PathBuf::from)
             .expect("should explicitly supply a fresh smoke receipt destination");
         let cancellation = Cancellation::default();
         let deadline = Instant::now() + Duration::from_secs(15 * 60);
         // This explicit local observation never changes CI link selection or
         // grants qualification to the measured installed developer tools.
-        let apple = match std::env::var_os("TS_RELEASE_APPLE_SDK_SMOKE_DEVELOPER_ROOT") {
-            Some(root) => super::super::AppleDeveloperTools::measure_selected_developer(
-                PathBuf::from(root),
-                deadline,
-                &cancellation,
-            ),
-            None => super::super::AppleDeveloperTools::for_ordinary_ci(deadline, &cancellation),
-        }
-        .expect("should measure Xcode and stage the selected SDK");
+        let apple =
+            match std::env::var_os("TRUSTED_SERVER__RELEASE_APPLE_SDK_SMOKE_DEVELOPER_ROOT") {
+                Some(root) => super::super::AppleDeveloperTools::measure_selected_developer(
+                    PathBuf::from(root),
+                    deadline,
+                    &cancellation,
+                ),
+                None => super::super::AppleDeveloperTools::for_ordinary_ci(deadline, &cancellation),
+            }
+            .expect("should measure Xcode and stage the selected SDK");
         let root = apple.sdk_root().to_owned();
         let evidence = apple
             .candidate_measurement()

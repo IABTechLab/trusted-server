@@ -160,18 +160,20 @@ fn ordinary_cohort_is_exactly_the_fixed_release_assets() {
 
 #[test]
 fn ordinary_cohort_rejects_an_axum_row() {
-    let mut cohort = value(COHORT);
-    let mut row = cohort["artifacts"][3].clone();
-    row["name"] = json!("trusted-server-axum-x86_64-unknown-linux-gnu");
-    row["package"] = json!("trusted-server-adapter-axum");
-    row["bin"] = json!("trusted-server-axum");
-    cohort["artifacts"]
-        .as_array_mut()
-        .expect("should list cohort rows")
-        .push(row);
-    assert!(
-        check_inputs(&encode(&cohort), TOOLS, CLI_POLICY).is_err(),
-        "should refuse release assets outside the fixed set"
+    expect_rejected(
+        cohort_with(|cohort| {
+            let mut row = cohort["artifacts"][3].clone();
+            row["name"] = json!("trusted-server-axum-x86_64-unknown-linux-gnu");
+            row["package"] = json!("trusted-server-adapter-axum");
+            row["bin"] = json!("trusted-server-axum");
+            row["role"] = json!("server");
+            row["capabilities"] = json!(["axum-evaluation"]);
+            cohort["artifacts"]
+                .as_array_mut()
+                .expect("should list cohort rows")
+                .push(row);
+        }),
+        "unknown asset trusted-server-axum-x86_64-unknown-linux-gnu",
     );
 }
 

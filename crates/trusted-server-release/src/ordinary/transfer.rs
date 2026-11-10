@@ -8,7 +8,7 @@ use std::path::Path;
 
 use super::archive::{self, Profile};
 use super::run::{Archive, Bindings, Build};
-use super::{ASSET, Equality, Observation, compare, diagnostic, observation, require};
+use super::{ASSET, Equality, Observation, compare, diagnostic, observation, require, require_as};
 use crate::error::ReleaseError;
 
 /// Four exact-ID downloads in canonical build/observation, reproduction order.
@@ -108,7 +108,8 @@ fn observed(
     let started = observed.facts.environment.started_at_seconds;
     // Observations record whole seconds; the server upload interval above keeps
     // its full precision. Compare the observation's stated resolution here.
-    require(
+    require_as(
+        ReleaseError::RebuildIdentity,
         observed.facts.source_commit == bindings.context().source_commit
             && started >= build.started.unix_timestamp() as u64
             && started <= build.completed.unix_timestamp() as u64,

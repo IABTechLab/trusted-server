@@ -253,6 +253,16 @@ fn compiler_query(argument: &str, working: &Path) -> Result<String, Report<Relea
         .map_err(|error| recipe_error(format!("GNU query is not UTF-8: {error}")))
 }
 
+/// Reports whether a helper TMPDIR stays lexically inside the private writable
+/// mount; `..` components are refused because `Path::starts_with` keeps them.
+pub(super) fn is_private_working_dir(path: &Path) -> bool {
+    path.is_absolute()
+        && path.starts_with("/boundary/writable")
+        && !path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+}
+
 /// Writes the fixed installed-image measurement in the selected Linux namespace.
 ///
 /// # Errors
@@ -261,7 +271,7 @@ fn compiler_query(argument: &str, working: &Path) -> Result<String, Report<Relea
 /// compiler queries, unsupported sysroots and oversized installed inventories.
 /// This private helper supplies no selection or qualification capability.
 pub(crate) fn helper_measurement() -> Result<Vec<u8>, Report<ReleaseError>> {
-    if std::env::var_os("TRUSTED_SERVER_FASTLY_TOOL_MEASUREMENT").is_some() {
+    if std::env::var_os(super::fastly_tools::MODE).is_some() {
         return super::fastly_tools::helper_measurement();
     }
     if !cfg!(target_os = "linux") {
@@ -270,7 +280,7 @@ pub(crate) fn helper_measurement() -> Result<Vec<u8>, Report<ReleaseError>> {
     let working = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .ok_or_else(|| recipe_error("GNU helper requires private TMPDIR"))?;
-    if !working.is_absolute() || !working.starts_with("/boundary/writable") {
+    if !is_private_working_dir(&working) {
         return Err(recipe_error(
             "GNU helper TMPDIR is outside the private writable mount",
         ));

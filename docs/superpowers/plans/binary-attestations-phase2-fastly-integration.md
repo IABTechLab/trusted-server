@@ -1,6 +1,8 @@
 # Phase 2 Fastly release integration — Gate 1
 
-**Status:** Approved on 2026-10-26 for the ordinary-release adapter, writer, transfer binding and additive provenance subject, subject to the conditions below. Write and independently review the concrete implementation plan before implementation. Continue the frozen-source port meanwhile.
+**Status:** Approved on 2026-10-26 for the ordinary-release adapter, writer, transfer binding and additive provenance subject, subject to the conditions below. The concrete implementation plan was written, independently reviewed and implemented.
+
+**Current state (2026-11-10):** this is the approved Gate 1 record, implemented in #1449, which is open for review. Since approval, Phase 1 narrowed the release to four binaries and 18 files and removed the publisher's post-publish byte comparison, and release CI runs the gate on every push to `main` and every `v*` tag. Rehearsal sections below are dated history for the source they name; the latest rehearsal before the fourth review round is `.30` at `44557229a`, and current rehearsal status lives in #1449 comments and #1235.
 
 **Goal:** Require a fresh Fastly A/B build comparison in the existing release path, publish an authenticated `trusted-server-fastly.wasm.rebuild-check.json`, and preserve the Phase 1 verification commands and identities.
 
@@ -8,7 +10,7 @@
 
 Approve or revise the ordinary-release comparison adapter below, including its explicitly narrower claim, receipt fields, transfer binding and additive signing inputs. This is a real equality gate for the existing ordinary release builds. It is **not** qualification of #1262's controlled recipes, sandbox, materials or alternate-user environment. If Phase 2 must ship the full controlled-recipe profile instead, defer wiring until its bootstrap/material/tool acquisition and unqualified execution authority have a separately approved design; do not open the existing qualified selectors to satisfy a deadline.
 
-Gate 1 approval authorizes writing/reviewing the concrete implementation plan and then implementing this ordinary adapter within the approved design; a material design change requires renewed approval. No adapter code may land before that approval. Approval of this design alone does not approve a new trigger, IAB setting change, production/qualified selection or qualification resource. The integration must first be implemented and rehearsed in the fork. **Merging Phase 2 is the maintainer activation decision:** the next real tag enforces the Fastly gate, without a separate switch. Each release costs one additional fresh Fastly build plus comparison, and signing/publication waits for both builds. Budget up to the 90-minute build ceiling plus ten-minute comparison ceiling; observed added wall time must be reported from rehearsal. A mismatch means no release.
+Gate 1 approval authorizes writing/reviewing the concrete implementation plan and then implementing this ordinary adapter within the approved design; a material design change requires renewed approval. No adapter code may land before that approval. Approval of this design alone does not approve a new trigger, IAB setting change, production/qualified selection or qualification resource. The integration must first be implemented and rehearsed in the fork. **Merging Phase 2 is the maintainer activation decision:** release CI then runs the Fastly gate on every push to `main` and every `v*` tag, without a separate switch. Each run costs one additional fresh Fastly build plus comparison, and signing/publication waits for both builds. Budget up to the 90-minute build ceiling plus ten-minute comparison ceiling; observed added wall time must be reported from rehearsal. A mismatch means no release.
 
 ## Source findings and alternatives
 
@@ -68,9 +70,9 @@ Inside `release-build.yml`, the fixed build cohort is four binaries (seven befor
 
 For Fastly only, expand the exact unsigned input set from binary + SPDX to binary + SPDX + rebuild-check. Rehash all three inputs before/after signing and in the signed transfer receipt. The existing provenance attestation gains the rebuild-check as an additional subject; keep its bundle named `<asset>.provenance.sigstore.json`. Keep the binary-only SPDX attestation and `<asset>.sbom.sigstore.json` unchanged. All other assets' exact input/subject sets remain unchanged.
 
-In `release.yml`, preserve exact-name downloads into separate directories and validate the expanded Fastly receipt before release creation. Add only `trusted-server-fastly.wasm.rebuild-check.json` to publication: **29 existing assets become 30**. `SHA256SUMS` continues to cover every other published asset and never itself. Existing binary, SPDX and bundle names, SLSA/SPDX predicate URIs, reusable signer workflow/certificate identity, source pins and Phase 1 verification commands continue to work unchanged.
+In `release.yml`, preserve exact-name downloads into separate directories and validate the expanded Fastly receipt before release creation. Add only `trusted-server-fastly.wasm.rebuild-check.json` to publication: **17 existing assets become 18**. `SHA256SUMS` continues to cover every other published asset and never itself. Existing binary, SPDX and bundle names, SLSA/SPDX predicate URIs, reusable signer workflow/certificate identity, source pins and Phase 1 verification commands continue to work unchanged.
 
-Preserve single-shot listing/refusal, draft creation, uploads and publication by release ID; never resume or overwrite an existing tag/draft. Preserve prerelease/Latest behavior, immutable readback, strict release-attestation validation, bounded read-only retries, release membership checks and post-publish byte comparison. Expand exact asset membership/digest expectations to 30. Existing immutable releases are untouched.
+Preserve single-shot listing/refusal, draft creation, uploads and publication by release ID; never resume or overwrite an existing tag/draft. Preserve prerelease/Latest behavior, immutable readback, strict release-attestation validation, bounded read-only retries, and release membership checks. Expand exact asset membership/digest expectations to 18. Existing immutable releases are untouched.
 
 ## Failure behavior and bounds
 
@@ -82,22 +84,20 @@ Preserve single-shot listing/refusal, draft creation, uploads and publication by
 
 ## Verification and rehearsal plan
 
-1. Pure tests: writer positive contract; duplicate/malformed/extra fields; missing observations; wrong source, role, tool/JS/recipe identity; byte/size/digest mismatches; canonical changed after comparison; exact 30-file membership; checksum coverage; no successful receipt on failure. Every negative test must reach the intended validation rather than failing on an unrelated missing input.
+1. Pure tests: writer positive contract; duplicate/malformed/extra fields; missing observations; wrong source, role, tool/JS/recipe identity; byte/size/digest mismatches; canonical changed after comparison; exact 18-file membership; checksum coverage; no successful receipt on failure. Every negative test must reach the intended validation rather than failing on an unrelated missing input.
 2. CI-only process tests: real fresh A/B builds, altered ambient settings, deliberate mismatch/cancellation/output bounds and exact current-run transfer selection. Keep local tests pure and explicitly selected with a nonzero guard. All existing Phase 1 tests remain, including mutation/retry failure paths.
 3. Independent implementation and security review of ordinary authority, observations, transfer binding, permissions, receipt signing, cleanup and publish failure paths. Confirm no qualified/test-only constructor is newly reachable.
 4. After upstream CI is green on the exact reviewed head, use the next unused sequential lightweight fork rehearsal tag under the standing approval. Never tag, release or change settings in IAB; changes to fork settings still require approval.
 5. Positive rehearsal: all four binaries build; show A/B source/input identity, measured environment variation and complete final-byte match; print the real receipt and verify its digest/provenance subject. Confirm 18 exact release assets, immutable and prerelease/not-Latest behavior, release download, checksums, all release memberships, both binary provenance/SPDX verifications offline and online with exact `release-build.yml` pins, and shipped SPDX equality. Repeat the manual pinned Fastly package/validate/inspect/byte comparison and runtime/source-header/no-request-facts-log checks without deploying.
 6. Rehearsal failure proof: exercise a deterministic comparison mismatch in a CI-only negative fixture, proving no sign/publication dependent job runs. Do not push an intentionally altered source commit as a release rehearsal or add a debug bypass to the release path. A failed real rehearsal retains its tag/release and uses a fresh number only after fixing and obtaining exact-head green CI.
-7. Post the transcript, tag/run link and pass/fail result on the Phase 2 PR. Keep it draft without reviewers. Do not claim the full controlled-recipe profile or Phase 2 readiness if only the ordinary bridge is approved/proven.
+7. Post the transcript, tag/run link and pass/fail result on the Phase 2 PR. Do not claim the full controlled-recipe profile or Phase 2 readiness if only the ordinary bridge is approved/proven.
 
 ## Approval checklist
 
 - [x] User accepts the ordinary-release adapter's narrower equality claim for this Phase 2 slice.
 - [x] User approves the concrete informational writer/measurement/transfer contract and additive Fastly provenance subject.
 - [x] User approves implementation after a concrete plan is written and independently reviewed within this design; qualification types/selectors and new triggers remain closed.
-- [x] Rehearse the exact reviewed head and report time/cost and unchanged Phase 1 verification before merge. Merging Phase 2 activates the gate on the next real tag; no separate switch.
-
-**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). Rehearsal `.27` at `9eeccbb88` covers the Phase 1 narrowing merge (four binaries, 18 files); see the [compatibility and rehearsal record](#phase-1-narrowing-merge).
+- [x] Rehearse the exact reviewed head and report time/cost and unchanged Phase 1 verification before merge. Merging Phase 2 runs the gate on every push to `main` and every `v*` tag; no separate switch.
 
 ## Approved forward-compatibility and mismatch conditions
 
@@ -141,7 +141,7 @@ The approved build-side normalization amendment maps both actual checkout roots 
 
 Phase 3 will index and digest this same companion. Later controlled-recipe evidence may supersede the ordinary profile in the same filename using a distinct profile value while preserving compatible version-1 source, outcome and digest joins. Incompatible informational changes need an explicit reviewed version change; neither a filename change nor silently stronger interpretation is allowed.
 
-The Fastly provenance attestation adds the rebuild-check subject while retaining the existing reusable signer identity and bundle name. Rehearsal must prove that existing binary verification commands pass unchanged and separately verify the rebuild-check's provenance, release membership and checksum. Merging Phase 2 activates the gate on the next real tag, adding a second Fastly build and comparison before signing. A mismatch prevents release; retain bounded diagnostics and ask for a decision without exclusions or weaker comparison.
+The Fastly provenance attestation adds the rebuild-check subject while retaining the existing reusable signer identity and bundle name. Rehearsal must prove that existing binary verification commands pass unchanged and separately verify the rebuild-check's provenance, release membership and checksum. After merge, every push to `main` and every `v*` tag adds a second Fastly build and comparison before signing. A mismatch prevents release; retain bounded diagnostics and ask for a decision without exclusions or weaker comparison.
 
 #### Manual Fastly package directory headers
 

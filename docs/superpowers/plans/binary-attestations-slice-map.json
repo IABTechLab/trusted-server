@@ -608,9 +608,9 @@
     }
   ],
   "axum_amendment": {
-    "status": "Update for Axum before deferred slices reopen; frozen v1 contracts stay unchanged",
-    "executables": 7,
-    "phase1_release_files": 29,
+    "status": "Moot after the Phase 1 narrowing to four binaries (18 published files with the Phase 2 rebuild check); retained as history for a future Axum amendment. Frozen v1 contracts stay unchanged",
+    "executables": 4,
+    "phase1_release_files": 17,
     "requires_reviewed_schema_and_policy_amendment": true,
     "full_graph_note": "The frozen full graph has 4 release-wide files plus 7 per executable: 32 for 4 executables, or 53 for 7. Phase 1 publishes only 4 per executable plus SHA256SUMS: 29.",
     "paths": {

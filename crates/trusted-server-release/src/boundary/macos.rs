@@ -49,7 +49,7 @@ use crate::process::{BoundedCommand, ProcessResult};
 /// The fixed system `sandbox-exec` executable.
 pub(crate) const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// Environment variable carrying the per-run survivor-detection nonce.
-pub(crate) const RUN_NONCE_VARIABLE: &str = "TS_RELEASE_BOUNDARY_RUN";
+pub(crate) const RUN_NONCE_VARIABLE: &str = "TRUSTED_SERVER__RELEASE_BOUNDARY_RUN";
 /// Darwin `SYS_setpgid` (`<sys/syscall.h>`), identical on `arm64` and `x86_64`.
 pub(crate) const SYS_SETPGID: u32 = 82;
 /// Darwin `SYS_setsid` (`<sys/syscall.h>`), identical on `arm64` and `x86_64`.

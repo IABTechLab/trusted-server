@@ -111,6 +111,7 @@ pub(in crate::ordinary) fn checked_fixture() -> Checked {
 
 pub(in crate::ordinary) fn command_fixture(
     source: &std::path::Path,
+    adjust: impl Fn(&mut Value),
 ) -> ([Vec<u8>; 3], [Vec<u8>; 4]) {
     let mut fixture = Fixture::new();
     let identity = crate::ordinary::inputs::source_identity(source, &"a".repeat(40))
@@ -123,6 +124,7 @@ pub(in crate::ordinary) fn command_fixture(
         observed["cargo_lock_sha256"] = json!(identity.cargo_lock_sha256);
         observed["npm_lock_sha256"] = json!(identity.npm_lock_sha256);
         observed["tools"]["rustc"]["version"] = json!("rustc 1.98.1 (abcdef123 2026-01-01)");
+        adjust(&mut observed);
         fixture.archives[index] = zip(&[("fastly-observation.json", &encoded(&observed))], false);
     }
     fixture.refresh();
@@ -246,6 +248,56 @@ fn rejects_observed_start_outside_its_producing_job() {
     assert!(
         fixture.error().contains("observation source or start"),
         "should join observed time to the current producing job window"
+    );
+}
+
+#[test]
+fn rejects_canonical_observed_start_after_its_job_completed() {
+    let mut fixture = Fixture::new();
+    let mut observation = canonical_observation();
+    observation["environment"]["started_at_seconds"] = json!(1_700_000_011);
+    fixture.archives[1] = zip(
+        &[("fastly-observation.json", &encoded(&observation))],
+        false,
+    );
+    fixture.refresh();
+    assert!(
+        fixture.error().contains("observation source or start"),
+        "should reject an observed start after its producing job completed"
+    );
+}
+
+#[test]
+fn rejects_equal_transferred_bytes_that_retain_a_physical_root() {
+    let root = b"/example/workspace/ordinary-canonical-source/src/lib.rs";
+    let section = [
+        0,
+        u8::try_from(root.len() + 4).expect("should fit one LEB byte"),
+        3,
+    ];
+    let bytes = [WASM, &section, b"raw", root].concat();
+    let build = zip(
+        &[(ASSET, &bytes), (&format!("{ASSET}.spdx.json"), b"{}")],
+        false,
+    );
+    let mut fixture = Fixture::new();
+    fixture.archives[0] = build.clone();
+    fixture.archives[2] = build;
+    for (index, mut observation) in [
+        (1, canonical_observation()),
+        (3, reproduction_observation()),
+    ] {
+        observation["artifact"] =
+            json!({"size": bytes.len(), "sha256": hex::encode(Sha256::digest(&bytes))});
+        fixture.archives[index] = zip(
+            &[("fastly-observation.json", &encoded(&observation))],
+            false,
+        );
+    }
+    fixture.refresh();
+    assert!(
+        fixture.error().contains("unremapped path prefix"),
+        "should scan both transferred binaries for physical roots before sealing"
     );
 }
 

@@ -109,16 +109,136 @@ test('ordinary transport rejects metadata failures and oversized responses witho
     )
     assert.equal(called, false)
   }
+  let thrown = 0
   await assert.rejects(
     ordinaryApi(
       '/repos/example/release/actions/runs/17/artifacts?per_page=100',
       'fictional-token',
       async () => {
+        thrown++
         throw Error('https://example.com/fictional-secret fictional-token')
-      }
+      },
+      undefined,
+      async () => {}
     ),
     (error) => !/fictional-secret|fictional-token/.test(error.message)
   )
+  assert.equal(thrown, 3, 'should retry a network error at most twice')
+})
+
+test('ordinary transport retries only transient metadata failures inside its bound', async () => {
+  const path = '/repos/example/release/actions/runs/17/artifacts?per_page=100'
+  const waits = []
+  const wait = async (milliseconds) => {
+    waits.push(milliseconds)
+  }
+  for (const status of [503, 429]) {
+    let calls = 0
+    waits.length = 0
+    const fetched = await ordinaryApi(
+      path,
+      'fictional-token',
+      async () =>
+        ++calls === 1
+          ? new Response('busy', { status })
+          : new Response('{"total_count":0}'),
+      undefined,
+      wait
+    )
+    assert.equal(fetched.toString(), '{"total_count":0}')
+    assert.equal(calls, 2, `should retry one ${status}`)
+    assert.deepEqual(waits, [1_000], 'should back off before the retry')
+  }
+  let calls = 0
+  await assert.rejects(
+    ordinaryApi(
+      path,
+      'fictional-token',
+      async () => {
+        calls++
+        return new Response('busy', { status: 502 })
+      },
+      undefined,
+      wait
+    ),
+    /HTTP 502/
+  )
+  assert.equal(calls, 3, 'should stop after three attempts')
+  calls = 0
+  await assert.rejects(
+    ordinaryApi(
+      path,
+      'fictional-token',
+      async () => {
+        calls++
+        return new Response('missing', { status: 404 })
+      },
+      undefined,
+      wait
+    ),
+    /HTTP 404/
+  )
+  assert.equal(calls, 1, 'should never retry a non-transient status')
+  const deadline = AbortSignal.abort()
+  calls = 0
+  await assert.rejects(
+    ordinaryApi(
+      path,
+      'fictional-token',
+      async () => {
+        calls++
+        return new Response('{}')
+      },
+      deadline,
+      wait
+    )
+  )
+  assert.equal(calls, 0, 'should not start a request after the shared deadline')
+})
+
+test('ordinary archive retries request a fresh redirect for each attempt', async () => {
+  const directory = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const bytes = Buffer.from('fictional archive bytes')
+  const archive = {
+    id: 41,
+    size: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    file: 'canonical.zip',
+  }
+  const calls = []
+  try {
+    await ordinaryDownload(
+      {
+        repository: 'example/release',
+        archive,
+        token: 'fictional-token',
+        directory,
+      },
+      async (url) => {
+        calls.push(url)
+        if (url.endsWith('/zip'))
+          return new Response(null, {
+            status: 302,
+            headers: {
+              location: `https://example.com/archive?attempt=${calls.length}`,
+            },
+          })
+        return calls.length === 2
+          ? new Response('busy', { status: 503 })
+          : new Response(bytes)
+      },
+      async () => {}
+    )
+    assert.deepEqual(readFileSync(join(directory, archive.file)), bytes)
+    assert.equal(calls.length, 4, 'should retry the redirect and the blob')
+    assert.match(calls[0], /\/zip$/)
+    assert.match(calls[2], /\/zip$/)
+    assert.notEqual(calls[1], calls[3], 'should follow the fresh redirect')
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
 })
 
 test('ordinary transport downloads exact archive bytes without forwarding the API token', async () => {
@@ -740,6 +860,19 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
           'binary',
           'spdx',
           'duplicate-key',
+          'earlier-attempt',
+          'zero-attempt',
+          'version',
+          'asset',
+          'target',
+          'variant',
+          'reproduction-binary',
+          'same-job',
+          'job-id',
+          'fractional-job-id',
+          'size',
+          'build-binary',
+          'unsorted',
         ]
       : ['success', 'extra']) {
       const root = mkdtempSync(join(tmpdir(), 'ordinary-sign-'))
@@ -780,13 +913,34 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
           }
           if (mode === 'source') receipt.source_commit = 'b'.repeat(40)
           if (mode === 'run') receipt.canonical.run_id = 18
-          if (mode === 'attempt') receipt.reproduction.run_attempt = 1
+          // A later attempt cannot have sealed this run's receipt; an earlier
+          // one can, when "Re-run failed jobs" retries only a signing leg.
+          if (mode === 'attempt') receipt.reproduction.run_attempt = 3
+          if (mode === 'earlier-attempt') {
+            receipt.canonical.run_attempt = 1
+            receipt.reproduction.run_attempt = 1
+          }
+          if (mode === 'zero-attempt') receipt.canonical.run_attempt = 0
           if (mode === 'failed') receipt.outcome = 'mismatched'
           if (mode === 'profile') receipt.profile = 'controlled-recipe'
           if (mode === 'qualified') receipt.release_qualification = true
           if (mode === 'binary') receipt.canonical_sha256 = '0'.repeat(64)
           if (mode === 'spdx') receipt.canonical.spdx_sha256 = '0'.repeat(64)
-          let text = JSON.stringify(canonical(receipt)) + '\n'
+          if (mode === 'version') receipt.version = 2
+          if (mode === 'asset') receipt.asset = 'ts-x86_64-unknown-linux-gnu'
+          if (mode === 'target') receipt.target = 'wasm32-unknown-unknown'
+          if (mode === 'variant') receipt.variant = 'example'
+          if (mode === 'reproduction-binary')
+            receipt.reproduction_sha256 = '0'.repeat(64)
+          if (mode === 'same-job') receipt.reproduction.job_id = 101
+          if (mode === 'job-id') receipt.canonical.job_id = 0
+          if (mode === 'fractional-job-id') receipt.reproduction.job_id = 102.5
+          if (mode === 'size') receipt.reproduction.size += 1
+          if (mode === 'build-binary')
+            receipt.reproduction.sha256 = '0'.repeat(64)
+          let text =
+            JSON.stringify(mode === 'unsorted' ? receipt : canonical(receipt)) +
+            '\n'
           if (mode === 'duplicate-key') {
             assert.ok(text.startsWith('{'))
             text = '{"version":0,' + text.slice(1)
@@ -828,7 +982,7 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
           },
         }
         const execute = () => vm.runInNewContext(script, context)
-        if (mode !== 'success') {
+        if (mode !== 'success' && mode !== 'earlier-attempt') {
           assert.throws(execute, undefined, `${asset}: ${mode}`)
           assert.equal(
             fs.existsSync(join(root, 'inputs.sha256')),
@@ -1962,7 +2116,13 @@ test('workflows build, sign and publish exactly the release assets and restrict 
     names,
     'should validate the same exact input cohort'
   )
-  assert.deepEqual([...releaseAssets].sort(), names)
+  assert.deepEqual(
+    JSON.parse(readFileSync('scripts/release/release-cohort.json', 'utf8'))
+      .artifacts.map((artifact) => artifact.name)
+      .sort(),
+    names,
+    'should keep the closed cohort selection on the published binaries'
+  )
   for (const prefix of ['release-', 'signed-'])
     assert.deepEqual(
       [
@@ -2257,17 +2417,14 @@ test('failed comparison is proven by the Rust fixture and blocks the real sign a
   const native = job('test-axum')
   assert.match(
     native,
-    /ordinary_comparison_failure_prevents_signing_and_publication_sentinels -- --exact/
+    /ordinary_compare_mismatch_writes_no_companion -- --exact/
   )
   assert.match(native, /1 passed; 0 failed; 0 ignored;/)
   const fixture = readFileSync(
     'crates/trusted-server-release/tests/commands.rs',
     'utf8'
   )
-  assert.match(
-    fixture,
-    /fn ordinary_comparison_failure_prevents_signing_and_publication_sentinels\(/
-  )
+  assert.match(fixture, /fn ordinary_compare_mismatch_writes_no_companion\(/)
   assert.match(
     fixture,
     /stderr\(&result\)\.contains\("ordinary final-byte mismatch"\)/
@@ -2280,6 +2437,18 @@ test('failed comparison is proven by the Rust fixture and blocks the real sign a
   const build = readFileSync('.github/workflows/release-build.yml', 'utf8')
   const sign = job('sign', build)
   assert.match(sign, /needs: \[checks, build, fastly-comparison\]/)
+  // continue-on-error would turn a failed build or comparison into success.
+  for (const name of [
+    'fastly-canonical',
+    'fastly-reproduction',
+    'fastly-comparison',
+    'sign',
+  ])
+    assert.doesNotMatch(
+      job(name, build),
+      /continue-on-error/,
+      `${name} must fail closed`
+    )
   assert.doesNotMatch(
     jobCondition(sign),
     statusFunction,

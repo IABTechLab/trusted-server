@@ -4,7 +4,7 @@ use std::net::TcpStream;
 use std::process::Command;
 
 /// Marks the re-executed child.
-const CHILD: &str = "TS_DENIAL_GRANDCHILD";
+const CHILD: &str = "TRUSTED_SERVER__RELEASE_DENIAL_GRANDCHILD";
 
 fn main() {
     if std::env::var_os(CHILD).is_some() {

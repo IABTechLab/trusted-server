@@ -197,7 +197,7 @@ fn startup_measurement(runs: &[StartupObserved]) -> Value {
 ///
 /// The ordinary CI workflow always sets it: `measure` on scheduled and
 /// dispatched runs (and on a labelled pull request), `defer` otherwise.
-pub(super) const NATIVE_REPRODUCTION_VARIABLE: &str = "TS_RELEASE_NATIVE_REPRODUCTION";
+pub(super) const NATIVE_REPRODUCTION_VARIABLE: &str = "TRUSTED_SERVER__RELEASE_NATIVE_REPRODUCTION";
 /// The GitHub Actions variable naming the event that started the run.
 const GITHUB_EVENT_VARIABLE: &str = "GITHUB_EVENT_NAME";
 /// Events whose run exists to measure native reproduction, so may not defer it.
@@ -624,7 +624,7 @@ fn deferred_reproduction_is_recorded_explicitly() {
         "should keep the reproduction a measurement"
     );
     assert_eq!(
-        recorded["selector"], "TS_RELEASE_NATIVE_REPRODUCTION=defer",
+        recorded["selector"], "TRUSTED_SERVER__RELEASE_NATIVE_REPRODUCTION=defer",
         "should name the selection that deferred it"
     );
 }

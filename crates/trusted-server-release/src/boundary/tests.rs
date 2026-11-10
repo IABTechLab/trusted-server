@@ -29,9 +29,9 @@ use std::time::{Duration, Instant};
 use super::*;
 
 /// Environment selector `<mode>:<nonce>`; absent in normal test runs.
-const HELPER_SELECTOR: &str = "TS_RELEASE_BOUNDARY_HELPER";
+const HELPER_SELECTOR: &str = "TRUSTED_SERVER__RELEASE_BOUNDARY_HELPER";
 /// Environment variable carrying the nonce the selector must match.
-const HELPER_NONCE: &str = "TS_RELEASE_BOUNDARY_NONCE";
+const HELPER_NONCE: &str = "TRUSTED_SERVER__RELEASE_BOUNDARY_NONCE";
 /// Exact libtest name of [`helper_entry`].
 const HELPER_TEST: &str = "boundary::tests::helper_entry";
 /// Marks the helper's report after the libtest preamble.

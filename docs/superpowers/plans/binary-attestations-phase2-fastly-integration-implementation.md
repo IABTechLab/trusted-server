@@ -2,13 +2,13 @@
 
 **Phase 2 spec:** [ordinary Fastly release equality](../specs/2026-10-28-1235-binary-attestations-phase2-design.md), with its own source-checked review rounds. Tracking issue: #1235.
 
-**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). Rehearsal `.27` at `9eeccbb88` covers the Phase 1 narrowing merge (four binaries, 18 files); see the [compatibility and rehearsal record](binary-attestations-phase2-fastly-integration.md#phase-1-narrowing-merge).
+**Current state (2026-11-10):** this is the completed implementation record, implemented in #1449, which is open for review. Since approval, Phase 1 narrowed the release to four binaries and 18 files and removed the publisher's post-publish byte comparison, and release CI runs the gate on every push to `main` and every `v*` tag. Checked tasks and rehearsal sections below, including seven-binary and 30-file counts, are dated history for the source they name; the latest rehearsal before the fourth review round is `.30` at `44557229a`, and current rehearsal status lives in #1449 comments and #1235.
 
 **Goal:** Compare the actual canonical Fastly release bytes to a second fresh ordinary build, write and attest the approved version-1 informational rebuild-check, and block release on any mismatch.
 
 **Architecture:** Add an explicit ordinary comparison module to the producer, using strict documents, bounded reads, retained byte hashes and a separately identified ordinary receipt. No qualified/test-only recipe constructors become reachable. Keep the existing Phase 1 canonical producer and the reusable `sign` matrix identity. Run the second build and comparison inside the existing reusable workflow, then authenticate the additive companion as a provenance subject.
 
-**Activation:** Merging Phase 2 enables this on the next real tag. There is no additional switch beyond the existing publication variable. Each release adds a fresh Fastly build and a comparison; signing waits for both builds and equality. A mismatch means no release. Rehearsal records the observed extra time, with existing 90-minute build and proposed ten-minute comparison ceilings. Do not weaken equality or add exclusions if a real mismatch occurs.
+**Activation:** After merge, release CI runs this on every push to `main` and every `v*` tag. There is no additional switch; the existing publication variable gates only signing and publication. Each run adds a fresh Fastly build and a comparison; signing waits for both builds and equality. A mismatch means no release. Rehearsal records the observed extra time, with existing 90-minute build and proposed ten-minute comparison ceilings. Do not weaken equality or add exclusions if a real mismatch occurs.
 
 ## File boundaries
 
@@ -91,7 +91,7 @@ Every new ordinary module path is Gate 1 implementation, distinct from frozen-so
 - [x] Add a CI-only negative fixture using the real ordinary comparison executable on deliberately different fixture bytes. Its bounded process harness records the expected nonzero comparison and proves signing/publication sentinel stages are never invoked. Read-only CI canary jobs and their audit were later removed in review: their condition was a hard-coded output, so they only showed that GitHub skips a job whose `if:` is false. Contract tests instead require the actual release sign job to depend on successful comparison and the publisher to depend on that reusable workflow. Report this as negative CI fixture proof, not a deliberately failed release rehearsal. Do not add a release-path bypass, new trigger, or altered-source release tag. Retain CI-only cancellation/output-bound process tests.
 - [x] Rehearse the current reviewed supervision-fix head after green CI (`.20` at `5163241b9`, full transcript below): 30 exact assets, immutable/prerelease/not-Latest, source/transfer joins, A/B equality, genuine receipt, all online/offline predicates and memberships, signed sums/readback, SPDX equality, native smoke and pinned Fastly packaging/runtime without deployment. Historical `.16` remains valid only at its recorded source; its runtime supplement does not rehearse the later code fix.
 - [x] On a real mismatch, retain bounded diagnostics and stop for a user decision; never add exclusions or relax equality. On any other failed rehearsal, fix within scope after diagnosis and retry only at a fresh sequential tag after green CI.
-- [x] Post full transcript/results, actual size counts and source citations on draft #1449. Part of #1235; no separate tracking issue is required. Keep draft and request no reviewers.
+- [x] Post full transcript/results, actual size counts and source citations on #1449. Part of #1235; no separate tracking issue is required.
 
 ## Proposed normalization amendment after `cc7df930f`
 
@@ -162,7 +162,7 @@ The 2026-10-28 spec review found that bounded stderr did not fulfill the approve
 - Distinguish transfer unavailability/rejection, input rejection, identity mismatch, observed size/digest disagreement and complete-byte mismatch. Differing accurately observed final lengths still reach the byte-mismatch path.
 - On failure, retain this JSON and bounded human stderr as a CI-only failure artifact. Acquisition failure before comparator execution gets an unavailable-transfer diagnostic with no invented facts. A diagnostic writer failure logs outcome `failed` and cannot make a failed job pass. Neither diagnostic is signed, selected as a companion or published.
 - Pure tests cover typed stage/code paths, actual versus unavailable facts, the hard cap, no diagnostic on success and no companion on failure. The existing hosted negative process fixture must assert outcome `mismatched` and stage `bytes`. Run no local child-process test.
-- Independently review the final diagnostic flow, run touched gates, wait for exact-head green CI, then rehearse a fresh lightweight fork tag. Keep #1449 draft without reviewers and record the exact source; do not expand `.13` attribution.
+- Independently review the final diagnostic flow, run touched gates, wait for exact-head green CI, then rehearse a fresh lightweight fork tag. Record the exact source; do not expand `.13` attribution.
 
 Final diagnostic review found and corrected two completeness issues: unsafe/oversized transfers now differ from unavailable transfers, and failures after equality retain actual binary sizes/digests rather than unavailable markers. The independent security follow-up found no remaining blockers in these corrections; permissions and all signing/publication gates are unchanged. A partial fallback diagnostic can remain if its direct Node write is interrupted; the job remains failed and this evidence cannot authorize release.
 
@@ -192,7 +192,7 @@ The implementation CI separately passed 952 producer unit tests with nine existi
 
 ## Current-source rehearsal .20 (2026-10-29)
 
-**Current verification:** Rehearsal `.20` at `5163241b9` covered the earlier seven-binary release (30 files). Rehearsal `.27` at `9eeccbb88` covers the Phase 1 narrowing merge (four binaries, 18 files); see the [compatibility and rehearsal record](binary-attestations-phase2-fastly-integration.md#phase-1-narrowing-merge).
+See the current-state note at the top of this plan.
 
 Canonical and reproduction Wasm SHA-256 was `4fe7204f17df07a392f4e4b64f31eebf3b02179e57abee689ab0094990d0a572` (80,207,071 bytes). Reproduction took 282 seconds and comparison 122 seconds, overlapping native builds. Checkout/target roots, job count (4 versus 2), umask (0022 versus 0027) and start time varied; UID, locale and timezone stayed equal. The profile remains `ordinary-release-fastly-byte-equality-v1` with `release_qualification:false`. Native reproduction and controlled qualification remain outside this ordinary gate.
 

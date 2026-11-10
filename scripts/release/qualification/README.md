@@ -1,9 +1,14 @@
 # Disposable release qualification framework
 
-Phase 2 staging note: this catalog includes controlled destination fixtures, not
-a claim that their qualification or index/publication integrations are active.
-Controlled JS preparation still pins esbuild 0.27.3 while the current lock uses
-0.28.2; ordinary releases and Gate 1 do not use that observer. See the
+Phase 2 staging note: the text below is the frozen #1262 README from commit
+`122b78664`, kept as design context. Its status, CI and report statements
+describe that source, not this branch. Here, the candidate, Docker and Xcode
+tests are ignored and no workflow runs them; `src/distribution.rs`,
+`hosted-workflow.proposal.yml` and the dated reports exist only at the frozen
+commit, which the links below point to. No qualification or index/publication
+integration is active. Controlled JS preparation still pins esbuild 0.27.3
+while the current lock uses 0.28.2; ordinary releases and Gate 1 do not use
+that observer. See the
 [compatibility notes](../../../docs/superpowers/plans/binary-attestations-phase2-fastly-integration.md#controlled-js-observer-gap).
 
 Status: **Rust migration in progress; candidate recipes for all four assets pass ordinary CI, but Tasks 8–9 qualification remains incomplete**. No tool,
@@ -17,7 +22,7 @@ publishes no tag, signs no release and deploys no publisher service.
 
 ## Rust migration and Task 9 status
 
-Introduced Python qualification/recipe tooling and validator requirements are removed. Historical local socket/Cargo/tiny Mach-O probes are not selected macOS 15/GNU qualification. The [Rust migration addendum](../../../docs/superpowers/specs/2026-10-14-release-tooling-rust-migration.md) and [primary plan](../../../docs/superpowers/plans/2026-10-13-attested-release-implementation.md#rust-migration-and-current-execution-boundary) define the host-only `crates/trusted-server-release` tool. Strict document/policy checks, local source authentication, helper-closure fingerprinting, bounded Git/process execution and final-artifact inspection are implemented. Authenticated bootstrap/acquisition and actual qualification remain pending.
+Introduced Python qualification/recipe tooling and validator requirements are removed. Historical local socket/Cargo/tiny Mach-O probes are not selected macOS 15/GNU qualification. The [Rust migration addendum](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/docs/superpowers/specs/2026-10-14-release-tooling-rust-migration.md) and [primary plan](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/docs/superpowers/plans/2026-10-13-attested-release-implementation.md#rust-migration-and-current-execution-boundary) define the host-only `crates/trusted-server-release` tool. Strict document/policy checks, local source authentication, helper-closure fingerprinting, bounded Git/process execution and final-artifact inspection are implemented. Authenticated bootstrap/acquisition and actual qualification remain pending.
 
 The experimental macOS sandbox denies network access but does not own
 descendant cleanup the way a container does. Commit `60fafa717` supersedes the
@@ -58,9 +63,9 @@ defer the optional CLI reproduction, while scheduled/dispatched runs and PRs
 labelled before a triggering event measure it. Fastly equality and native
 canonical acceptance remain mandatory. `b4c8e0c0f` increases the ordinary-CI
 per-build wall to 45 minutes after Intel's optional reproduction again exhausted
-25 minutes in run 39540057202. The [schedule/cache report](2026-10-21-native-reproduction-schedule.md)
+25 minutes in run 39540057202. The [schedule/cache report](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/qualification/2026-10-21-native-reproduction-schedule.md)
 records baseline timings and pending validation; no Intel equality under the new
-wall is established. The [candidate index report](2026-10-21-candidate-release-index.md)
+wall is established. The [candidate index report](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/qualification/2026-10-21-candidate-release-index.md)
 records four successful per-asset entry checks, not a real cross-job assembly
 or completion of Task 13. None of these changes qualifies a production selection.
 
@@ -188,9 +193,9 @@ in the CONTAINER namespace, not only their host interpretation.
 The earlier local-only finding (a Docker client without a usable daemon, so no
 actual Linux execution proof) is superseded: ordinary Ubuntu 24.04 CI runs the
 real container boundary and the Linux candidate recipes, recorded in the
-[confined Cargo candidate](2026-10-16-confined-cargo-candidate.md) and
-[Linux CLI candidate](2026-10-16-linux-cli-candidate.md) reports and the
-[GNU follow-up](2026-10-20-linux-cli-gnu-follow-up.md). That is candidate
+[confined Cargo candidate](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/qualification/2026-10-16-confined-cargo-candidate.md) and
+[Linux CLI candidate](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/qualification/2026-10-16-linux-cli-candidate.md) reports and the
+[GNU follow-up](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/qualification/2026-10-20-linux-cli-gnu-follow-up.md). That is candidate
 evidence, not qualification. Rust MUST execute positive, denied and full-recipe
 controls with the same selected native probe and OCI image, not merely compare
 command arguments. Controls map approved workspace inputs to `/work`, with

@@ -626,7 +626,7 @@ mod tests {
     #[ignore = "requires explicit ordinary CI CLI fixture and Linux Docker; starts only its own named container"]
     fn startup_timeout_removes_only_its_owned_container() {
         let root = PathBuf::from(
-            std::env::var_os("TS_RELEASE_CLI_FIXTURE_ROOT")
+            std::env::var_os("TRUSTED_SERVER__RELEASE_CLI_FIXTURE_ROOT")
                 .expect("should explicitly supply the fixture root"),
         );
         let raw = crate::documents::read_bounded(

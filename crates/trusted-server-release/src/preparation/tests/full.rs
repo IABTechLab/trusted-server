@@ -35,14 +35,14 @@ pub(crate) struct JsFixtureRun {
 }
 
 /// Runs two fresh offline JS builds from the fixture named by
-/// `TS_RELEASE_JS_FIXTURE_ROOT` and returns the retained A handoff.
+/// `TRUSTED_SERVER__RELEASE_JS_FIXTURE_ROOT` and returns the retained A handoff.
 ///
 /// # Panics
 ///
 /// Panics when the fixture is missing or any preparation, boundary or build
 /// step fails; this is an explicit CI fixture, not a production path.
 pub(crate) fn run_two_fresh_js_builds() -> JsFixtureRun {
-    let fixture = std::env::var_os("TS_RELEASE_JS_FIXTURE_ROOT")
+    let fixture = std::env::var_os("TRUSTED_SERVER__RELEASE_JS_FIXTURE_ROOT")
         .map(PathBuf::from)
         .expect("should explicitly supply original-only fixture root");
     let fixture = fs::canonicalize(fixture).expect("should resolve fixture root");
@@ -246,14 +246,14 @@ fn two_fresh_js_builds(
 
 /// Runs the two fresh JS builds and exports the retained handoff and its
 /// measurement into the fresh directory named by
-/// `TS_RELEASE_JS_HANDOFF_EXPORT`, for the macOS candidate jobs to adopt.
+/// `TRUSTED_SERVER__RELEASE_JS_HANDOFF_EXPORT`, for the macOS candidate jobs to adopt.
 ///
 /// The export is an unauthenticated ordinary CI artifact; adoption labels it
 /// so, and nothing here is release qualification.
 #[test]
-#[ignore = "requires explicit original-only fixture, an export destination and Linux Docker; run separately in producer CI"]
+#[ignore = "requires explicit original-only fixture, an export destination and Linux Docker; frozen #1262 producer test, no workflow runs it"]
 fn export_js_handoff_for_candidates() {
-    let destination = std::env::var_os("TS_RELEASE_JS_HANDOFF_EXPORT")
+    let destination = std::env::var_os("TRUSTED_SERVER__RELEASE_JS_HANDOFF_EXPORT")
         .map(PathBuf::from)
         .expect("should explicitly supply the JS handoff export destination");
     let run = run_two_fresh_js_builds();
@@ -272,7 +272,7 @@ fn export_js_handoff_for_candidates() {
 }
 
 #[test]
-#[ignore = "requires explicit original-only fixture and Linux Docker; run separately in producer CI"]
+#[ignore = "requires explicit original-only fixture and Linux Docker; frozen #1262 producer test, no workflow runs it"]
 fn real_two_fresh_js_builds() {
     let run = run_two_fresh_js_builds();
     fs::write(

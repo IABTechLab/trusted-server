@@ -379,7 +379,7 @@ fn fresh_run_signature_matches_no_existing_process() {
     fs::write(&allow, b"").expect("should write allow marker");
     fs::write(&deny, b"").expect("should write deny marker");
     let matches = matching(&RunSignature {
-        variable: "TS_RELEASE_BOUNDARY_RUN",
+        variable: "TRUSTED_SERVER__RELEASE_BOUNDARY_RUN",
         nonce: "fictional-unused-nonce",
         allow: &allow,
         deny: &deny,
@@ -407,13 +407,13 @@ fn processes_started_before_the_run_are_never_matched() {
     fs::copy("/bin/sleep", &sleeper).expect("should copy a visible sleeper");
     let mut carrier = std::process::Command::new(&sleeper)
         .arg("30")
-        .env("TS_RELEASE_BOUNDARY_RUN", nonce)
+        .env("TRUSTED_SERVER__RELEASE_BOUNDARY_RUN", nonce)
         .spawn()
         .expect("should start an own nonce carrier");
     let carrier_pid = libc::pid_t::try_from(carrier.id()).expect("should fit a pid");
     std::thread::sleep(Duration::from_millis(100));
     let signature = |started_after_micros| RunSignature {
-        variable: "TS_RELEASE_BOUNDARY_RUN",
+        variable: "TRUSTED_SERVER__RELEASE_BOUNDARY_RUN",
         nonce,
         allow: &allow,
         deny: &deny,

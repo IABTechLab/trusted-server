@@ -486,7 +486,8 @@ jobs:
             ts-x86_64-unknown-linux-gnu,
           ]
     steps:
-      # Only fixed inline checks execute here; never checkout or execute build inputs.
+      # Only fixed inline checks execute here, on the pinned hosted Node; never
+      # checkout or execute build inputs.
       # The checks job reads the pinned Node version, since this job has no checkout.
       - uses: actions/setup-node@v5
         with:
@@ -527,7 +528,7 @@ jobs:
             const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
             if (!bytes.equals(Buffer.from(JSON.stringify(canonical(receipt)) + '\n'))) throw Error('Noncanonical or ambiguous rebuild check');
             if (receipt.version !== 1 || receipt.profile !== 'ordinary-release-fastly-byte-equality-v1' || receipt.release_qualification !== false || receipt.source_commit !== source || receipt.asset !== asset || receipt.target !== 'wasm32-wasip1' || receipt.variant !== 'default' || receipt.outcome !== 'matched' || receipt.canonical_sha256 !== hash(binary) || receipt.reproduction_sha256 !== hash(binary)) throw Error('Rebuild check identity or equality mismatch');
-            for (const build of [receipt.canonical, receipt.reproduction]) if (!build || build.run_id !== Number(run) || build.run_attempt !== Number(attempt) || !Number.isSafeInteger(build.job_id) || build.job_id <= 0 || build.size !== binary.length || build.sha256 !== hash(binary)) throw Error('Rebuild check run or binary mismatch');
+            for (const build of [receipt.canonical, receipt.reproduction]) if (!build || build.run_id !== Number(run) || !Number.isSafeInteger(build.run_attempt) || build.run_attempt < 1 || build.run_attempt > Number(attempt) || !Number.isSafeInteger(build.job_id) || build.job_id <= 0 || build.size !== binary.length || build.sha256 !== hash(binary)) throw Error('Rebuild check run or binary mismatch');
             if (receipt.canonical.job_id === receipt.reproduction.job_id || receipt.canonical.spdx_sha256 !== hash(spdx)) throw Error('Rebuild check job or SPDX mismatch');
             fs.writeFileSync(`release-assets/${companion}`, bytes, {flag:'wx'});
             inputs.push(companion);

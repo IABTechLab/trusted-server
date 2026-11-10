@@ -1,9 +1,10 @@
 //! Informational ordinary-release observations; these confer no qualification.
 //!
 //! Parsing and pairing establish neither source eligibility nor tool provenance.
-//! Before comparison is enabled, the runtime recorder and transfer join must
-//! enforce source-owned tool pins and actual filesystem identities; these
-//! observation roots are only checked lexically here.
+//! The recorder checks tool version strings against the source pins and holds
+//! root identities only while it measures; it does not prove which compiler
+//! Cargo invoked. The transfer join re-checks version pins against the
+//! comparison checkout; observation roots are only checked lexically here.
 
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
@@ -27,9 +28,13 @@ pub(crate) use commands::{compare_transfers, measure_build, prepare_rustflags, t
 
 const PROFILE: &str = "ordinary-release-fastly-byte-equality-v1";
 const ASSET: &str = "trusted-server-fastly.wasm";
-const GAPS: [&str; 4] = [
+/// Unsupported assurances every observation must name. `cargo-home-unvaried`
+/// records that both builds share the runner's unremapped Cargo home, whose
+/// dependency source paths remain in the final bytes.
+const GAPS: [&str; 5] = [
     "alternate-user-unqualified",
     "boundary-unqualified",
+    "cargo-home-unvaried",
     "materials-unqualified",
     "tools-unqualified",
 ];
@@ -74,13 +79,18 @@ pub(crate) fn compare(
     left: &[u8],
     right: &[u8],
 ) -> Result<Equality, Report<ReleaseError>> {
-    pair(&canonical, &reproduction)
-        .map_err(|report| diagnostic::tag(report, diagnostic::Code::IdentityMismatch))?;
+    pair(&canonical, &reproduction).map_err(|report| {
+        diagnostic::tag(
+            report.change_context(ReleaseError::RebuildIdentity),
+            diagnostic::Code::IdentityMismatch,
+        )
+    })?;
     let mut digests = Vec::new();
     for (observed, bytes) in [(&canonical, left), (&reproduction, right)] {
         let size = u64::try_from(bytes.len())
             .map_err(|_| Report::new(ReleaseError::Document).attach("ordinary size overflow"))?;
-        require(
+        require_as(
+            ReleaseError::RebuildMismatch,
             size > 0 && size <= Role::Executable.limit() && size == observed.facts.artifact.size,
             "ordinary executable changed after observation: size or byte bound rejected",
         )
@@ -90,7 +100,8 @@ pub(crate) fn compare(
             )
         })?;
         let digest = hex::encode(Sha256::digest(bytes));
-        require(
+        require_as(
+            ReleaseError::RebuildMismatch,
             digest == observed.facts.artifact.sha256,
             "ordinary executable changed after observation",
         )
@@ -112,7 +123,7 @@ pub(crate) fn compare(
             let end = start.saturating_add(16).min(bytes.len());
             hex::encode(&bytes[start..end])
         };
-        return Err(Report::new(ReleaseError::Document)
+        return Err(Report::new(ReleaseError::RebuildMismatch)
             .attach(format!(
                 "ordinary final-byte mismatch: canonical_size={}, reproduction_size={}, \
              canonical_sha256={}, reproduction_sha256={}, first_offset={}, \
@@ -258,11 +269,19 @@ struct Artifact {
     sha256: String,
 }
 
-fn require(condition: bool, message: &'static str) -> Result<(), Report<ReleaseError>> {
+fn require_as(
+    error: ReleaseError,
+    condition: bool,
+    message: &'static str,
+) -> Result<(), Report<ReleaseError>> {
     if !condition {
-        return Err(Report::new(ReleaseError::Document).attach(message));
+        return Err(Report::new(error).attach(message));
     }
     Ok(())
+}
+
+fn require(condition: bool, message: &'static str) -> Result<(), Report<ReleaseError>> {
+    require_as(ReleaseError::Document, condition, message)
 }
 
 fn digest(text: &str, length: usize) -> bool {

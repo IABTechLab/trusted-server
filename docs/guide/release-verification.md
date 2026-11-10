@@ -120,10 +120,12 @@ reviewed signer and source. Both are required.
 
 ## Fastly's ordinary rebuild check
 
-Merging Phase 2 activates the equality gate on the next real tag, using the
-existing publication enablement variable with no additional switch. Each release
-adds a second fresh Fastly build, after the first completes, and a read-only
-comparison. Both full final Wasm files must match byte for byte; a mismatch
+The release workflow runs the equality gate on every push to `main` and on every
+`v*` tag, with no separate switch; `RELEASE_PUBLICATION_ENABLED` still gates
+only signing and publication. Each run adds a second fresh Fastly build, after
+the first completes, and a read-only comparison. Both full final Wasm files must
+match byte for byte. A mismatch fails the run: on `main` it leaves that commit
+without the passing release checks required before tagging, and on a tag it
 prevents all signing and publication. Debug information and custom sections are
 retained. The CLI binaries have no A/B release gate; native reproduction remains
 later measured coverage.
@@ -133,8 +135,14 @@ time. Both receive the identical four-map target-scoped Cargo argument pair:
 their checkout roots map to `/trusted-server`, and their target roots map to
 `/cargo-target`. Normalized compiler source-path identity is intentionally
 shared. The retained argument bytes are checked against both observations, and
-the complete binaries are scanned for surviving physical paths. This is ordinary
-hosted equality, with `release_qualification:false`; controlled
+the complete binaries are scanned for those four physical roots. Dependency
+sources under the runner's `CARGO_HOME` (`/home/runner/.cargo/registry/src`
+and `/home/runner/.cargo/git/checkouts`) are not remapped and remain in the
+debug sections; both jobs run as the same runner user with the same `HOME` and
+`CARGO_HOME`, so equality also depends on that shared path. The observations
+and companion record this as the `cargo-home-unvaried` gap. This is ordinary
+equality between two jobs on the same hosted image, not an independently
+reproducible build recipe, with `release_qualification:false`; controlled
 material/tool/boundary closure and an alternate user remain unqualified.
 
 `trusted-server-fastly.wasm.rebuild-check.json` is a third subject in the
@@ -185,6 +193,8 @@ For offline companion verification, first obtain its SHA-256 independently as
 provenance bundle and trusted roots:
 
 ```bash
+set -euo pipefail
+CHECK=trusted-server-fastly.wasm.rebuild-check.json
 shasum -a 256 --check APPROVED_REBUILD_CHECK_SHA256SUMS
 gh attestation verify "$CHECK" --repo "$REPO" --source-ref "refs/tags/$TAG" \
   --source-digest "$COMMIT" --signer-digest "$COMMIT" --deny-self-hosted-runners \
@@ -195,8 +205,12 @@ gh attestation verify "$CHECK" --repo "$REPO" --source-ref "refs/tags/$TAG" \
 
 Acquire the roots as described below before disconnecting. Keep the companion's
 profile/source/binary-digest check and the separate online immutable-membership
-record with the deployment evidence. A partial rerun fails closed on old-attempt
-evidence; an existing immutable release is refused rather than published again.
+record with the deployment evidence. The signing job accepts a companion sealed
+in this run's current or an earlier attempt, so "Re-run failed jobs" can retry
+a failed signing leg without rebuilding. A rerun that includes the comparison
+binds the build jobs GitHub carries over into the new attempt, which are still
+this run's real pair. An existing immutable release is refused rather than
+published again.
 
 Stop if any check fails. Keep the outputs, reviewed source identity, bundles
 and checksums with your deployment record. These checks do not approve a
@@ -290,8 +304,6 @@ and actual configuration are runtime resources. This manual route does not
 create links, push configuration, implement staging, or supply recovery
 guarantees.
 
-From the private directory:
-
 The canonical Fastly CI job also exercises this route on its freshly built wasm,
 using the `.tool-versions` CLI version and a source-pinned archive checksum.
 After downloading the CLI, it clears inherited credentials and runs in a
@@ -299,6 +311,8 @@ network namespace with no active interfaces or retained capabilities. CLI
 configuration and caches live only in the job's fresh temporary directory.
 The job logs pack, validation, strict archive inspection and both byte comparisons;
 the rehearsal transcript links that job. No deployment command is run.
+
+From the private directory:
 
 ```bash
 fastly compute pack --wasm-binary ./trusted-server-fastly.wasm
@@ -362,8 +376,8 @@ records the input classes found by a one-time audit against an earlier main;
 it is not re-run automatically. It does not claim a complete native tool closure
 or hermetic build.
 
-Phase 1 does not ship `release-index.json`, `tsjs-inventory.json`, build-evidence,
-build-recipe or rebuild-check files. Their names remain reserved for later
+Releases do not yet ship `release-index.json`, `tsjs-inventory.json`,
+build-evidence or build-recipe files. Their names remain reserved for later
 phases.
 
 The build scrubs inherited environment values and scans every executable for
@@ -462,8 +476,8 @@ to recover a failed read-only check.
 After a failed or indeterminate mutation, inspect the recorded release ID and
 all matching drafts read-only. Do not rerun uploads, delete a release, or reuse
 the tag without an independently approved recovery decision. Published immutable
-releases are never overwritten. A fresh release needs a fresh approved tag;
-Phase 2's full reconciliation and incident owner remains deferred.
+releases are never overwritten. A fresh release needs a fresh approved tag.
+Full reconciliation and an incident owner remain later work.
 
 Phase 1 accepts only lightweight tags whose raw tag reference points directly
 to the expected source commit. Annotated tags have a separate tag-object identity

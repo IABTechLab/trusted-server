@@ -47,7 +47,14 @@ pub(super) struct Archive {
     pub(super) size: u64,
 }
 
-/// One current-attempt successful producing job and its exact two uploads.
+/// One successful producing job listed for the current attempt, and its exact
+/// two uploads.
+///
+/// GitHub lists a job carried over from an earlier attempt under the rerun
+/// attempt, with that attempt's `run_attempt` and its original uploads. Binding
+/// such a job is intended: the bytes are still this run's real pair, and a
+/// comparison-only rerun needs no rebuild. The `run_attempt` join only rejects
+/// a job listing fetched for a different attempt.
 #[derive(Debug)]
 pub(super) struct Build {
     pub(super) job_id: u64,

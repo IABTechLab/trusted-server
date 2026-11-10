@@ -110,7 +110,7 @@ fn bind_wasm_denial_case(fixture: &CargoFixture, member: &str) -> DenialCase {
 }
 
 #[test]
-#[ignore = "requires the explicit ordinary CI Cargo fixture and Linux Docker; run separately in producer CI"]
+#[ignore = "requires the explicit ordinary CI Cargo fixture and Linux Docker; frozen #1262 producer test, no workflow runs it"]
 fn cargo_children_inherit_denial() {
     let fixture = cargo_fixture();
     let mut observed = BTreeMap::new();
@@ -385,7 +385,7 @@ fn scan_final_bytes(fixture: &CargoFixture, builds: [&FastlyBuild; 2]) -> RemapS
 }
 
 #[test]
-#[ignore = "requires explicit JS and Cargo ordinary CI fixtures, Linux Docker and the pinned Viceroy; run separately in producer CI"]
+#[ignore = "requires explicit JS and Cargo ordinary CI fixtures, Linux Docker and the pinned Viceroy; frozen #1262 producer test, no workflow runs it"]
 fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
     let fixture = cargo_fixture();
     let js = run_two_fresh_js_builds();
@@ -479,9 +479,9 @@ struct RuntimeGateInputs<'a> {
     checked: &'a FastlyEqualityChecked,
 }
 
-/// Selects the pinned Viceroy named by `TS_RELEASE_VICEROY`.
+/// Selects the pinned Viceroy named by `TRUSTED_SERVER__RELEASE_VICEROY`.
 fn pinned_viceroy() -> SelectedViceroy {
-    let path = std::env::var_os("TS_RELEASE_VICEROY")
+    let path = std::env::var_os("TRUSTED_SERVER__RELEASE_VICEROY")
         .map(PathBuf::from)
         .expect("should explicitly supply the pinned Viceroy executable");
     SelectedViceroy::select(&path).expect("should select the pinned Viceroy 0.21.0")

@@ -31,6 +31,13 @@ fn rejected() -> Report<ReleaseError> {
     Report::new(ReleaseError::Document).attach("ordinary path normalization inputs rejected")
 }
 
+/// Keeps the specific Cargo-configuration cause beneath the generic rejection.
+fn rejected_because(cause: Report<ReleaseError>) -> Report<ReleaseError> {
+    cause
+        .change_context(ReleaseError::Document)
+        .attach("ordinary path normalization inputs rejected")
+}
+
 fn text(path: &Path) -> Result<String, Report<ReleaseError>> {
     path.to_str()
         .filter(|value| {
@@ -200,9 +207,9 @@ pub(super) fn validate_configuration(
             }
         }
     }
-    recipe::check_no_extensionless_config(checkout, false).map_err(|_| rejected())?;
+    recipe::check_no_extensionless_config(checkout, false).map_err(rejected_because)?;
     let bytes = documents::read_bounded(&checkout.join(".cargo/config.toml"), Role::Metadata)?;
-    recipe::check_cargo_config(&bytes.bytes).map_err(|_| rejected())?;
+    recipe::check_cargo_config(&bytes.bytes).map_err(rejected_because)?;
     let table: toml::Value =
         toml::from_str(std::str::from_utf8(&bytes.bytes).map_err(|_| rejected())?)
             .map_err(|_| rejected())?;

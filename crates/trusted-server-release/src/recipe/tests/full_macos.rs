@@ -41,10 +41,10 @@ pub(super) fn macos_cargo_fixture() -> CargoFixture {
 }
 
 /// The Darwin `ts` asset of the running producer's architecture, which must
-/// build for the `HOST_TARGET` the CI job asserted.
+/// build for the `TRUSTED_SERVER__RELEASE_HOST_TARGET` the CI job asserted.
 pub(super) fn job_host_asset() -> AssetId {
-    let host_target =
-        std::env::var("HOST_TARGET").expect("should name the HOST_TARGET the job asserted");
+    let host_target = std::env::var("TRUSTED_SERVER__RELEASE_HOST_TARGET")
+        .expect("should name the TRUSTED_SERVER__RELEASE_HOST_TARGET the job asserted");
     darwin_cli_asset(std::env::consts::ARCH, &host_target)
         .expect("should select the Darwin ts asset of the host architecture")
 }
@@ -130,7 +130,7 @@ fn bind_darwin_denial_case(
 }
 
 #[test]
-#[ignore = "requires the explicit ordinary CI macOS Cargo fixture, Xcode and the macOS sandbox; run separately in producer CI"]
+#[ignore = "requires the explicit ordinary CI macOS Cargo fixture, Xcode and the macOS sandbox; frozen #1262 producer test, no workflow runs it"]
 fn cargo_children_inherit_denial_macos() {
     let fixture = macos_cargo_fixture();
     let target = job_host_asset().artifact().target;

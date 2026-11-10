@@ -226,7 +226,7 @@ fn assembles_only_whitelisted_ordinary_facts_from_retained_inputs() {
             .as_array()
             .expect("should record gaps")
             .len(),
-        4,
+        5,
         "should preserve every unsupported assurance"
     );
     assert_eq!(

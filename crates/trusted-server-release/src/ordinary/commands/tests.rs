@@ -14,6 +14,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_observations(|_| {})
+    }
+
+    fn with_observations(adjust: impl Fn(&mut serde_json::Value)) -> Self {
         let temporary = tempfile::tempdir().expect("should create command fixture");
         let root = fs::canonicalize(temporary.path()).expect("should resolve fixture root");
         let input = root.join("input");
@@ -28,7 +32,8 @@ impl Fixture {
         .expect("should retain comparison compiler pin");
         fs::write(source.checkout.join(".tool-versions"), b"nodejs 24.20.0\n")
             .expect("should retain comparison Node pin");
-        let (metadata, zip) = crate::ordinary::transfer::tests::command_fixture(&source.checkout);
+        let (metadata, zip) =
+            crate::ordinary::transfer::tests::command_fixture(&source.checkout, adjust);
         for (name, bytes) in ["context.json", "jobs.json", "artifacts.json"]
             .into_iter()
             .zip(metadata)
@@ -176,6 +181,10 @@ fn aliased_metadata_and_archive_roots_are_rejected() {
 fn equally_claimed_inputs_must_match_the_independent_comparison_source() {
     for (file, bytes) in [
         ("Cargo.lock", "changed lock"),
+        (
+            "crates/trusted-server-js/lib/package-lock.json",
+            "changed npm lock",
+        ),
         ("scripts/release/phase1-build.sh", "changed recipe"),
         (".tool-versions", "nodejs 24.12.0\n"),
     ] {
@@ -195,6 +204,33 @@ fn equally_claimed_inputs_must_match_the_independent_comparison_source() {
         assert!(
             !fixture.output.exists(),
             "should create no companion for invented input facts"
+        );
+    }
+}
+
+#[test]
+fn equally_recorded_tool_versions_must_match_the_comparison_source_pins() {
+    for (tool, version) in [
+        ("rustc", "rustc 1.97.0 (abcdef123 2026-01-01)"),
+        ("node", "v24.12.0"),
+    ] {
+        let fixture = Fixture::with_observations(|observed| {
+            observed["tools"][tool]["version"] = serde_json::json!(version);
+        });
+        let error = compare_transfers(
+            &fixture.input,
+            &fixture.archives,
+            &fixture.source.checkout,
+            &fixture.output,
+        )
+        .expect_err("should reject equal tool versions that differ from the source pins");
+        assert!(
+            format!("{error:?}").contains("recorded tool versions differ"),
+            "should reach the compare-time {tool} pin check"
+        );
+        assert!(
+            !fixture.output.exists(),
+            "should create no companion for an unpinned {tool}"
         );
     }
 }

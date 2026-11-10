@@ -49,8 +49,12 @@ fn bind(input: &Path) -> Result<run::Bindings, Report<ReleaseError>> {
     let context = transfer_read(&input.join("context.json"), Role::Metadata)?;
     let jobs = transfer_read(&input.join("jobs.json"), Role::Metadata)?;
     let artifacts = transfer_read(&input.join("artifacts.json"), Role::Metadata)?;
-    run::bind(&context.bytes, &jobs.bytes, &artifacts.bytes)
-        .map_err(|report| diagnostic::tag(report, diagnostic::Code::IdentityMismatch))
+    run::bind(&context.bytes, &jobs.bytes, &artifacts.bytes).map_err(|report| {
+        diagnostic::tag(
+            report.change_context(ReleaseError::RebuildIdentity),
+            diagnostic::Code::IdentityMismatch,
+        )
+    })
 }
 
 fn available(path: &Path) -> Result<(), Report<ReleaseError>> {

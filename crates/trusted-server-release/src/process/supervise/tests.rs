@@ -1,8 +1,29 @@
-//! Pure syscall-sequence checks; no process or signal is created.
+//! Syscall-sequence checks, plus one real group probe that must never signal.
 
 use std::io;
+use std::os::unix::process::CommandExt as _;
 
 use super::*;
+
+#[test]
+fn confirmation_never_kills_a_live_group() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .expect("should spawn a live group leader");
+    let group = libc::pid_t::try_from(child.id()).expect("should fit pid_t");
+    let report = confirm_group_gone(group).expect_err("should report a still-present group");
+    let alive = child.try_wait().expect("should poll the leader").is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        report.downcast_ref::<ProcessFailure>(),
+        Some(&ProcessFailure::GroupSurvived),
+        "should classify a present group as surviving"
+    );
+    assert!(alive, "should observe the group without signalling it");
+}
 
 #[test]
 fn confirmation_only_observes_after_reaping() {

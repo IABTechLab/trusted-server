@@ -410,7 +410,7 @@ pub(super) fn equality_measurement(
 }
 
 /// Names the dependency build cache the CI job restored, or `miss`.
-const CI_BUILD_CACHE_VARIABLE: &str = "TS_RELEASE_CI_BUILD_CACHE";
+const CI_BUILD_CACHE_VARIABLE: &str = "TRUSTED_SERVER__RELEASE_CI_BUILD_CACHE";
 /// What the provenance records when the job reported no cache outcome.
 const UNREPORTED_BUILD_CACHE: &str = "unreported";
 

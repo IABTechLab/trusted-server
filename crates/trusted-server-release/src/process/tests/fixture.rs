@@ -14,9 +14,9 @@ use tempfile::TempDir;
 use super::*;
 
 /// Environment selector `<mode>:<nonce>`; absent in normal test runs.
-pub(super) const HELPER_SELECTOR: &str = "TS_RELEASE_PROCESS_HELPER";
+pub(super) const HELPER_SELECTOR: &str = "TRUSTED_SERVER__RELEASE_PROCESS_HELPER";
 /// Environment variable carrying the nonce the selector must match.
-pub(super) const HELPER_NONCE: &str = "TS_RELEASE_PROCESS_NONCE";
+pub(super) const HELPER_NONCE: &str = "TRUSTED_SERVER__RELEASE_PROCESS_NONCE";
 /// Exact libtest name of [`super::helper_entry`].
 pub(super) const HELPER_TEST: &str = "process::tests::helper_entry";
 /// Exit status of a helper whose fork, pipe or pid-file setup failed.
@@ -24,7 +24,7 @@ pub(super) const HELPER_SETUP_FAILED: i32 = 90;
 /// Exit status of an unknown helper mode.
 const HELPER_UNKNOWN_MODE: i32 = 97;
 /// Environment variable naming the directory where helpers record pids.
-pub(super) const HELPER_PIDS: &str = "TS_RELEASE_PROCESS_PIDS";
+pub(super) const HELPER_PIDS: &str = "TRUSTED_SERVER__RELEASE_PROCESS_PIDS";
 /// How long sleeping helpers wait; every supervision bound must stay below it.
 pub(super) const HELPER_SLEEP: Duration = Duration::from_secs(30);
 /// Marks the start of helper stdout after the test harness preamble.

@@ -353,14 +353,10 @@ fn producer_dispatch_remains_closed_for_every_invocation() {
             "should emit no result or release bytes"
         );
         assert!(
-            stderr(&output).contains("release execution remains disabled"),
-            "should explain pending execution gate"
+            stderr(&output).contains("Invalid release tool invocation"),
+            "should report a usage error for {arguments:?}"
         );
         if !arguments.is_empty() {
-            assert!(
-                stderr(&output).contains("Invalid release invocation"),
-                "should report a usage error for {arguments:?}"
-            );
             assert!(
                 stderr(&output).contains("invalid invocation:"),
                 "should surface the argument error kind for {arguments:?}"
@@ -615,6 +611,15 @@ fn bootstrap_checks_rust_toolchain_at_its_repository_root() {
 
 /// Process fixtures stay in this CI-only integration harness, never the pure selection.
 fn ordinary_measurement(root: &Path, node_body: &str) -> Output {
+    ordinary_measurement_with(root, node_body, |_, _| {})
+}
+
+/// Runs the measurement after `adjust` may change the tools or the request.
+fn ordinary_measurement_with(
+    root: &Path,
+    node_body: &str,
+    adjust: impl FnOnce(&Path, &mut Value),
+) -> Output {
     let checkout = root.join("workspace/ordinary-canonical-source");
     let target = root.join("temp/ordinary-fastly-canonical-target");
     fs::create_dir_all(&checkout).expect("should create ordinary source root");
@@ -715,7 +720,7 @@ fn ordinary_measurement(root: &Path, node_body: &str) -> Output {
         )
         .expect("should set fixture executable permissions");
     }
-    let request = json!({
+    let mut request = json!({
         "role":"canonical","source_commit":"a".repeat(40),
         "environment":{
             "checkout_root":checkout,"target_root":target,"started_at_seconds":1700000000_u64,
@@ -726,6 +731,7 @@ fn ordinary_measurement(root: &Path, node_body: &str) -> Output {
         "cargo_messages":target.join("messages.jsonl"),"cargo_metadata":target.join("metadata.json"),
         "rustflags":root.join("arguments/rustflags.json")
     });
+    adjust(&checkout, &mut request);
     let request_path = root.join("request.json");
     fs::write(
         &request_path,
@@ -800,6 +806,94 @@ fn ordinary_measurement_command_rejects_wrong_versions_and_sanitizes_failed_quer
         assert!(
             !root.join("observed").exists(),
             "should retain no output after failed measurement"
+        );
+    }
+}
+
+#[test]
+fn ordinary_measurement_command_rejects_unsafe_tool_selection_and_claimed_owner() {
+    type Adjust = fn(&Path, &mut Value);
+    let cases: [(&str, &str, Adjust, &str); 6] = [
+        (
+            "wrapper name",
+            "printf 'v24.20.0\\n'",
+            |checkout, request| {
+                let renamed = checkout.join("tools/node-wrapper");
+                fs::rename(checkout.join("tools/node"), &renamed).expect("should rename node");
+                request["node"] = json!(renamed);
+            },
+            "not a shim",
+        ),
+        (
+            "symlinked shim",
+            "printf 'v24.20.0\\n'",
+            |checkout, request| {
+                let shim = checkout.join("tools/shim");
+                fs::create_dir(&shim).expect("should create shim directory");
+                std::os::unix::fs::symlink(checkout.join("tools/node"), shim.join("node"))
+                    .expect("should link shim");
+                request["node"] = json!(shim.join("node"));
+            },
+            "not a shim",
+        ),
+        (
+            "non-executable mode",
+            "printf 'v24.20.0\\n'",
+            |checkout, _| {
+                fs::set_permissions(
+                    checkout.join("tools/node"),
+                    fs::Permissions::from_mode(0o644),
+                )
+                .expect("should clear executable bits");
+            },
+            "privileged or not executable",
+        ),
+        (
+            "setuid mode",
+            "printf 'v24.20.0\\n'",
+            |checkout, _| {
+                fs::set_permissions(
+                    checkout.join("tools/node"),
+                    fs::Permissions::from_mode(0o4755),
+                )
+                .expect("should set the setuid bit");
+            },
+            "privileged or not executable",
+        ),
+        (
+            "self-modifying tool",
+            "printf 'v24.20.0\\n'; printf '#\\n' >> \"$0\"",
+            |_, _| {},
+            "changed while querying",
+        ),
+        (
+            "claimed owner",
+            "printf 'v24.20.0\\n'",
+            |_, request| {
+                let uid = request["environment"]["uid"]
+                    .as_u64()
+                    .expect("should record the fixture owner");
+                request["environment"]["uid"] = json!(uid + 1);
+            },
+            "source, role or environment is invalid",
+        ),
+    ];
+    for (label, body, adjust, reason) in cases {
+        let temporary = tempdir().expect("should create unsafe tool fixture");
+        let root = fs::canonicalize(temporary.path()).expect("should resolve process fixture");
+        let result = ordinary_measurement_with(&root, body, adjust);
+        assert!(
+            !result.status.success(),
+            "should reject the {label} before recording an observation"
+        );
+        assert!(
+            stderr(&result).contains(reason),
+            "should report `{reason}` for the {label}, got: {}",
+            stderr(&result)
+        );
+        assert!(
+            !root.join("observed").exists(),
+            "should retain no output for the {label}"
         );
     }
 }
@@ -925,7 +1019,7 @@ fn bounded_negative_compare(root: &Path, source: &Path) -> Output {
 }
 
 #[test]
-fn ordinary_comparison_failure_prevents_signing_and_publication_sentinels() {
+fn ordinary_compare_mismatch_writes_no_companion() {
     let temporary = tempdir().expect("should create a CI-only negative fixture");
     let root = fs::canonicalize(temporary.path()).expect("should resolve the negative fixture");
     let measured = ordinary_measurement(&root, "printf 'v24.20.0\\n'");

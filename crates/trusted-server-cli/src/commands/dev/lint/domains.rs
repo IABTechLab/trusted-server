@@ -108,7 +108,8 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "schema.org",
     // Canonical JSON Schema draft identifiers in the carried release schemas.
     "json-schema.org",
-    // Canonical SPDX schema identity and license identifiers in the carried schema.
+    // SPDX 2.3 schema `$id` and RDF term URIs in the carried JSON schema,
+    // which cannot carry a per-line suppression.
     "spdx.org",
     // Versioning / changelogs
     "semver.org",

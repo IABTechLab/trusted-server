@@ -8,7 +8,7 @@
 //! is gated (Mach-O acceptance in completion, the debug map and measured
 //! SDK, the remap and final-path scans, planted operator values, native
 //! startup); the reproduction build is a recorded measurement only, and
-//! runs only when `TS_RELEASE_NATIVE_REPRODUCTION=measure` (otherwise the
+//! runs only when `TRUSTED_SERVER__RELEASE_NATIVE_REPRODUCTION=measure` (otherwise the
 //! measurement records it as deferred to the scheduled run).
 
 use std::fs;
@@ -249,7 +249,7 @@ fn write_measurement(fixture: &CargoFixture, measurement: &serde_json::Value) {
 }
 
 #[test]
-#[ignore = "requires the explicit macOS Cargo fixture, the exported Linux JS handoff, Xcode and a native macOS 15 runner; run separately in producer CI"]
+#[ignore = "requires the explicit macOS Cargo fixture, the exported Linux JS handoff, Xcode and a native macOS 15 runner; frozen #1262 producer test, no workflow runs it"]
 fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
     // Read before measuring Xcode so a missing selection fails in seconds.
     let native_reproduction = native_reproduction_from_env();
@@ -265,7 +265,7 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
     )
     .expect("should authenticate the fixture's tracked source");
     let locked = LockedMaterials::from_source(&source).expect("should derive the locked materials");
-    let exported = std::env::var_os("TS_RELEASE_JS_HANDOFF_ROOT")
+    let exported = std::env::var_os("TRUSTED_SERVER__RELEASE_JS_HANDOFF_ROOT")
         .map(PathBuf::from)
         .expect("should explicitly supply the downloaded JS handoff root");
     let exported = fs::canonicalize(exported).expect("should resolve the JS handoff root");

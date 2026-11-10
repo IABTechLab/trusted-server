@@ -114,6 +114,9 @@ fn rejects_uploads_before_job_start_even_within_the_same_second() {
 
 #[test]
 fn rejects_foreign_source_runs_attempts_and_unsuccessful_jobs() {
+    // The attempt-scoped jobs endpoint lists carried-over jobs under the current
+    // attempt; a different `run_attempt` means the listing was fetched for
+    // another attempt.
     for (pointer, value) in [
         ("/jobs/0/run_id", json!(43)),
         ("/jobs/0/run_attempt", json!(2)),
@@ -138,6 +141,24 @@ fn rejects_foreign_source_runs_attempts_and_unsuccessful_jobs() {
             "should reach the source/run/attempt join for {pointer}"
         );
     }
+}
+
+#[test]
+fn rejects_a_second_upload_with_the_same_artifact_name() {
+    let mut response = artifacts();
+    let mut stale = response["artifacts"][0].clone();
+    stale["id"] = json!(299);
+    response["artifacts"]
+        .as_array_mut()
+        .expect("should hold artifacts")
+        .push(stale);
+    response["total_count"] = json!(5);
+    let error = bind(&encoded(&request()), &encoded(&jobs()), &encoded(&response))
+        .expect_err("should reject an ambiguous artifact name");
+    assert!(
+        format!("{error:?}").contains("upload name is absent or duplicated"),
+        "should refuse to bind when an earlier upload shares the artifact name"
+    );
 }
 
 #[test]

@@ -466,9 +466,7 @@ enum KnownSchema {
 impl KnownSchema {
     fn bytes(&self) -> &'static [u8] {
         match self {
-            Self::ReleaseIndex => include_bytes!(
-                "../../../docs/superpowers/specs/schemas/release-index-v1.schema.json"
-            ),
+            Self::ReleaseIndex => include_bytes!("../schemas/release-index-v1.schema.json"),
             Self::Qualification => {
                 include_bytes!("../../../scripts/release/qualification/results.schema.json")
             }

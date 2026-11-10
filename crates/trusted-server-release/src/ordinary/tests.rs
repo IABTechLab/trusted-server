@@ -40,6 +40,7 @@ pub(super) fn fixture() -> Value {
         "gaps": [
             "alternate-user-unqualified",
             "boundary-unqualified",
+            "cargo-home-unvaried",
             "materials-unqualified",
             "tools-unqualified"
         ]
@@ -223,6 +224,16 @@ fn rejects_false_environment_variation_and_swapped_roles() {
         assert!(
             format!("{error:?}").contains("environment pairing rejected"),
             "should reach the pairing rule for {field}"
+        );
+    }
+    for (field, value) in [("umask", json!(23)), ("jobs", json!(2))] {
+        let mut changed = fixture();
+        changed["environment"][field] = value;
+        let error = pair(&parse(&changed), &parse(&reproduction()))
+            .expect_err("should reject canonical-side variation outside the fixed pairing");
+        assert!(
+            format!("{error:?}").contains("environment pairing rejected"),
+            "should reach the pairing rule for canonical {field}"
         );
     }
     assert!(
