@@ -120,9 +120,10 @@ fn rotate_posts_json_with_credentials_and_prints_the_kids() {
     let server = FixtureServer::start(|request| {
         assert_eq!(request.method, "POST", "should POST");
         assert_eq!(request.path, "/_ts/admin/keys/rotate", "should hit rotate");
-        assert!(
-            request.header("authorization").is_some(),
-            "should send basic auth"
+        assert_eq!(
+            request.header("authorization"),
+            Some("Basic YWRtaW46YWRtaW4tcGFzcw=="),
+            "should send basic auth for admin and the password from the environment"
         );
         assert_eq!(
             request.header("content-type"),
@@ -379,4 +380,80 @@ fn redirects_are_not_followed() {
 
     assert!(outcome.is_err(), "should refuse a redirected rotation");
     assert_eq!(server.request_count(), 1, "should not follow the redirect");
+}
+
+#[test]
+fn a_delete_settles_local_refusals_before_prompting() {
+    let server = FixtureServer::start(|_request| FixtureResponse::html(deactivate_success(true)));
+    let mut missing_password = ScriptedConfirm::new(true, true);
+    let mut out = Vec::new();
+
+    let outcome = with_password(None, || {
+        run(
+            deactivate(&server, true, false),
+            &mut missing_password,
+            &mut out,
+        )
+    });
+
+    let error = outcome.expect_err("should require the password");
+    assert!(
+        error.contains("TRUSTED_SERVER_ADMIN_PASSWORD"),
+        "should name the variable: {error}"
+    );
+    assert!(
+        !missing_password.asked,
+        "should refuse before asking to confirm a missing password"
+    );
+
+    let mut insecure_service = ScriptedConfirm::new(true, true);
+    let error = with_password(Some("admin-pass"), || {
+        run(
+            KeysCommand::Deactivate(DeactivateArgs {
+                service: ServiceArgs {
+                    service: "http://edge.example.com".to_owned(),
+                    username: "admin".to_owned(),
+                },
+                kid: "ts-2024-01-01".to_owned(),
+                delete: true,
+                yes: false,
+            }),
+            &mut insecure_service,
+            &mut out,
+        )
+    })
+    .expect_err("should refuse insecure remote transport");
+    assert!(error.contains("HTTPS"), "should explain: {error}");
+    assert!(
+        !insecure_service.asked,
+        "should refuse before asking to confirm an insecure service"
+    );
+    assert_eq!(server.request_count(), 0, "should send nothing");
+}
+
+#[test]
+fn an_empty_remaining_list_reads_as_unknown() {
+    let server = FixtureServer::start(|_request| {
+        FixtureResponse::html(
+            serde_json::json!({
+                "success": true,
+                "message": "Key deactivated successfully",
+                "deactivated_kid": "ts-2024-01-01",
+                "deleted": false,
+                "remaining_active_kids": []
+            })
+            .to_string(),
+        )
+    });
+
+    let (outcome, rendered) = run_with(
+        deactivate(&server, false, false),
+        &mut ScriptedConfirm::new(false, false),
+    );
+
+    outcome.expect("should succeed");
+    assert!(
+        rendered.contains("remaining active kids: (unknown: the service could not list them)"),
+        "should not claim that no keys remain: {rendered}"
+    );
 }

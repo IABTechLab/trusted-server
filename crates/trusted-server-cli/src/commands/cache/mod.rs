@@ -44,8 +44,6 @@ pub struct PurgeArgs {
     pub username: String,
 }
 
-pub use crate::admin_client::ADMIN_PASSWORD_ENVIRONMENT_VARIABLE;
-
 /// Run a `ts cache` subcommand.
 ///
 /// # Errors

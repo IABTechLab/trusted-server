@@ -2,14 +2,14 @@
 //!
 //! `ts cache purge` and `ts keys` all call basic-auth admin routes on a running service.
 //! They share one implementation of the transport rules here so that the service URL
-//! checks, the password source, redirect refusal and 401 guidance cannot drift apart
-//! between commands.
+//! checks ([`crate::url_guard::service_endpoint`]), the password source, redirect refusal
+//! and 401 guidance cannot drift apart between commands.
 
 use std::time::Duration;
 
 use reqwest::StatusCode;
 
-use crate::error::{CliResult, cli_error};
+use crate::error::CliResult;
 
 /// Environment variable carrying the admin password.
 ///
@@ -29,31 +29,6 @@ pub(crate) struct AdminResponse {
     pub(crate) status: StatusCode,
     /// Response body as text.
     pub(crate) body: String,
-}
-
-/// Join the service base URL and an admin path without doubling or dropping a slash.
-///
-/// # Errors
-///
-/// Returns an error when `service` is not an absolute base URL, carries credentials, a
-/// path, query or fragment, or uses plaintext HTTP to a non-loopback host.
-pub(crate) fn admin_endpoint(service: &str, path: &str) -> CliResult<String> {
-    let mut url =
-        reqwest::Url::parse(service).map_err(|_| "--service must be an absolute HTTPS URL")?;
-    crate::url_guard::require_credential_safe_transport(&url, "--service")?;
-    if url.host().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || !url.path().trim_matches('/').is_empty()
-    {
-        return cli_error(
-            "--service must be a base HTTPS URL without credentials, a path, query, or fragment",
-        );
-    }
-    url.set_path(path);
-    Ok(url.to_string())
 }
 
 /// Read the admin password from [`ADMIN_PASSWORD_ENVIRONMENT_VARIABLE`].
@@ -88,7 +63,7 @@ pub(crate) fn post_admin_json(
     username: &str,
     body: String,
 ) -> CliResult<AdminResponse> {
-    let endpoint = admin_endpoint(service, path)?;
+    let endpoint = crate::url_guard::service_endpoint(service, path)?;
     let password = admin_password()?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -120,65 +95,4 @@ pub(crate) fn post_admin_json(
             .map_err(|error| format!("could not read the response from {endpoint}: {error}"))?;
         Ok(AdminResponse { status, body })
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_endpoint_url_survives_a_trailing_slash() {
-        for service in [
-            "https://edge.example.com",
-            "https://edge.example.com/",
-            "https://edge.example.com///",
-        ] {
-            assert_eq!(
-                admin_endpoint(service, "/_ts/admin/cache/purge")
-                    .expect("should accept a secure base URL"),
-                "https://edge.example.com/_ts/admin/cache/purge",
-                "{service} must resolve to one well-formed endpoint"
-            );
-        }
-    }
-
-    #[test]
-    fn only_loopback_services_may_use_plaintext_http() {
-        for service in [
-            "http://127.0.0.1:8080",
-            "http://[::1]:8080",
-            "http://localhost:8080",
-        ] {
-            assert!(
-                admin_endpoint(service, "/_ts/admin/keys/rotate").is_ok(),
-                "should permit loopback development: {service}"
-            );
-        }
-        for service in [
-            "http://192.0.2.1",     // allow-domain: 192.0.2.1
-            "http://[2001:db8::1]", // allow-domain: 2001:db8::1
-            "http://localhost.example.com",
-        ] {
-            assert!(
-                admin_endpoint(service, "/_ts/admin/keys/rotate").is_err(),
-                "should refuse remote plaintext transport: {service}"
-            );
-        }
-    }
-
-    #[test]
-    fn service_urls_cannot_redirect_the_admin_path_or_embed_credentials() {
-        for service in [
-            "not a URL",
-            "https://example.com/path",
-            "https://example.com?query=1",
-            "https://example.com#fragment",
-            "https://user:example-password@example.com",
-        ] {
-            assert!(
-                admin_endpoint(service, "/_ts/admin/keys/rotate").is_err(),
-                "should require an unambiguous service base URL: {service}"
-            );
-        }
-    }
 }

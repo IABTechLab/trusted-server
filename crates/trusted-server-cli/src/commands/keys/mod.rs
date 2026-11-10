@@ -10,7 +10,7 @@ use std::io::{BufRead, IsTerminal as _, Write};
 use clap::Subcommand;
 use serde::Deserialize;
 
-use crate::admin_client::{AdminResponse, UNAUTHORIZED_HINT, post_admin_json};
+use crate::admin_client::{AdminResponse, UNAUTHORIZED_HINT, admin_password, post_admin_json};
 use crate::error::{CliResult, cli_error};
 
 const ROTATE_PATH: &str = "/_ts/admin/keys/rotate";
@@ -87,7 +87,9 @@ pub struct TerminalConfirm;
 
 impl Confirm for TerminalConfirm {
     fn is_interactive(&self) -> bool {
-        std::io::stdin().is_terminal()
+        // The prompt is written to stderr and answered on stdin, so both must reach a
+        // person, as `ts audit ad-templates generate` already requires.
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
     }
 
     fn confirm(&mut self, question: &str) -> CliResult<bool> {
@@ -186,6 +188,10 @@ fn run_deactivate(
     out: &mut impl Write,
 ) -> CliResult<()> {
     if args.delete && !args.yes {
+        // Settle every local refusal before asking, so an operator never confirms a
+        // permanent deletion that the CLI then rejects without sending it.
+        crate::url_guard::service_endpoint(&args.service.service, DEACTIVATE_PATH)?;
+        admin_password()?;
         if !confirm.is_interactive() {
             return cli_error(
                 "--delete removes the key from storage permanently; pass --yes to confirm \
@@ -213,12 +219,19 @@ fn run_deactivate(
         "key deactivation"
     };
     let parsed: DeactivateResponse = parse_success(&response, operation)?;
+    // A successful deactivation always leaves at least one active key, because the service
+    // refuses to remove the last one. An empty list means the service could not read the
+    // list back after the change, not that no keys remain.
+    let remaining = if parsed.remaining_active_kids.is_empty() {
+        "(unknown: the service could not list them)".to_owned()
+    } else {
+        parsed.remaining_active_kids.join(", ")
+    };
     writeln!(
         out,
-        "deactivated kid: {}\ndeleted: {}\nremaining active kids: {}",
+        "deactivated kid: {}\ndeleted: {}\nremaining active kids: {remaining}",
         parsed.deactivated_kid,
         if parsed.deleted { "yes" } else { "no" },
-        join_kids(&parsed.remaining_active_kids),
     )
     .map_err(|error| format!("failed to write the deactivation result: {error}"))
 }
@@ -337,5 +350,26 @@ mod tests {
             error.contains("cannot deactivate the current signing key"),
             "should show the server's error: {error}"
         );
+    }
+
+    /// Parses [`KeysCommand`] the way `ts keys` does.
+    #[derive(Debug, clap::Parser)]
+    struct KeysCli {
+        #[command(subcommand)]
+        command: KeysCommand,
+    }
+
+    #[test]
+    fn yes_without_delete_is_rejected() {
+        <KeysCli as clap::Parser>::try_parse_from([
+            "keys",
+            "deactivate",
+            "--service",
+            "https://edge.example.com",
+            "--kid",
+            "ts-2024-01-01",
+            "--yes",
+        ])
+        .expect_err("should reject --yes without --delete; it only pre-approves a deletion");
     }
 }
