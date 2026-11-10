@@ -2835,6 +2835,7 @@ mod tests {
                     (
                         ProviderId::from_str(id).expect("should parse fictional provider ID"),
                         ProviderConfig {
+                            allow_insecure_http: false,
                             protocol: "openrtb-2.6".to_string(),
                             profile: "standard".to_string(),
                             endpoint: "https://example.test/openrtb".to_string(),
@@ -2867,6 +2868,7 @@ mod tests {
                     (
                         ProviderId::from_str(id).expect("should parse fictional provider ID"),
                         ProviderConfig {
+                            allow_insecure_http: false,
                             protocol: "openrtb-2.6".to_string(),
                             profile: "prebid-server".to_string(),
                             endpoint: format!("https://{id}.example.test/openrtb"),
@@ -2903,6 +2905,7 @@ mod tests {
                     (
                         ProviderId::from_str(id).expect("should parse fictional provider ID"),
                         ProviderConfig {
+                            allow_insecure_http: false,
                             protocol: "openrtb-2.6".to_string(),
                             profile: "aps".to_string(),
                             endpoint: "https://aps.example/e/pb/bid".to_string(),
