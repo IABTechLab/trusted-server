@@ -1,3 +1,5 @@
+use std::net::{Ipv4Addr, SocketAddr};
+
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
 use edgezero_core::app::Hooks as _;
 use log::LevelFilter;
@@ -8,6 +10,12 @@ const LOG_LEVEL_ENV: &str = "RUST_LOG";
 
 /// Log level used when `RUST_LOG` is unset or unrecognized.
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
+
+/// Environment variable carrying a full listen socket address.
+const LISTEN_ADDR_ENV: &str = "TRUSTED_SERVER_LISTEN_ADDR";
+
+/// Environment variable carrying a loopback listen port.
+const PORT_ENV: &str = "PORT";
 
 #[allow(clippy::print_stderr)]
 fn main() {
@@ -26,15 +34,21 @@ fn main() {
         eprintln!("warning: logger init failed: {e}");
     }
 
-    let config = match port_from_env() {
-        // When PORT is set, bind to a specific address so integration tests
-        // can allocate a fresh OS port each run and avoid TIME_WAIT flakiness.
-        Some(port) => AxumDevServerConfig {
-            addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+    let listen =
+        std::env::var_os(LISTEN_ADDR_ENV).map(|value| value.to_string_lossy().into_owned());
+    let port = std::env::var_os(PORT_ENV).map(|value| value.to_string_lossy().into_owned());
+    let config = match listen_address(listen.as_deref(), port.as_deref()) {
+        Ok(Some(addr)) => AxumDevServerConfig {
+            addr,
             enable_ctrl_c: true,
         },
-        // Normal development path: read bind address from axum.toml.
-        None => AxumDevServerConfig::default(),
+        Ok(None) => AxumDevServerConfig::default(),
+        // Silently falling back to another address would surprise tooling
+        // that expects the server where it asked for it.
+        Err(message) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
     };
 
     log::info!("Listening on http://{}", config.addr);
@@ -65,21 +79,30 @@ fn parse_log_level(configured: Option<&str>) -> Result<LevelFilter, &str> {
     }
 }
 
-/// Read a port number from the `PORT` environment variable.
+/// Selects the listen address from `TRUSTED_SERVER_LISTEN_ADDR` and `PORT`.
 ///
-/// Returns `None` when the variable is unset. Exits non-zero if the value
-/// is set but cannot be parsed — silently falling back to a different port
-/// would surprise tooling that expects the server at the requested address.
-#[allow(clippy::print_stderr)]
-fn port_from_env() -> Option<u16> {
-    let raw = std::env::var("PORT").ok()?;
-    match raw.parse() {
-        Ok(port) => Some(port),
-        Err(e) => {
-            eprintln!("error: PORT env var '{raw}' is not a valid u16: {e}");
-            std::process::exit(1);
-        }
+/// `TRUSTED_SERVER_LISTEN_ADDR` takes a full socket address such as
+/// `0.0.0.0:8080` or `[::]:8080`, which a container needs to accept outside
+/// connections. Otherwise `PORT` binds the loopback address on that port, so
+/// integration tests can allocate a fresh OS port each run. With neither set,
+/// `Ok(None)` keeps the adapter's default loopback address.
+///
+/// # Errors
+///
+/// Returns a message naming the variable when a set value is not a valid
+/// socket address or port.
+fn listen_address(listen: Option<&str>, port: Option<&str>) -> Result<Option<SocketAddr>, String> {
+    if let Some(raw) = listen {
+        return raw.parse().map(Some).map_err(|error| {
+            format!("{LISTEN_ADDR_ENV}={raw:?} is not a valid socket address: {error}")
+        });
     }
+    let Some(raw) = port else {
+        return Ok(None);
+    };
+    raw.parse::<u16>()
+        .map(|port| Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port))))
+        .map_err(|error| format!("{PORT_ENV}={raw:?} is not a valid u16: {error}"))
 }
 
 #[cfg(test)]
@@ -88,6 +111,52 @@ mod tests {
 
     #[test]
     fn crate_compiles() {}
+
+    #[test]
+    fn listen_address_prefers_the_full_socket_address() {
+        assert_eq!(
+            listen_address(Some("0.0.0.0:8080"), Some("9000")),
+            Ok(Some(SocketAddr::from(([0, 0, 0, 0], 8080)))),
+            "should bind every interface when the full address is set"
+        );
+        assert_eq!(
+            listen_address(Some("[::]:8080"), None),
+            Ok(Some(
+                "[::]:8080".parse().expect("should parse IPv6 fixture")
+            )),
+            "should accept an IPv6 listen address"
+        );
+    }
+
+    #[test]
+    fn listen_address_keeps_port_on_loopback_and_default_when_unset() {
+        assert_eq!(
+            listen_address(None, Some("9000")),
+            Ok(Some(SocketAddr::from(([127, 0, 0, 1], 9000)))),
+            "should keep PORT on the loopback address"
+        );
+        assert_eq!(
+            listen_address(None, None),
+            Ok(None),
+            "should keep the adapter default when nothing is set"
+        );
+    }
+
+    #[test]
+    fn listen_address_rejects_invalid_values_naming_the_variable() {
+        for (listen, port, variable) in [
+            (Some("0.0.0.0"), None, LISTEN_ADDR_ENV),
+            (Some(""), Some("9000"), LISTEN_ADDR_ENV),
+            (None, Some("70000"), PORT_ENV),
+        ] {
+            let message =
+                listen_address(listen, port).expect_err("should reject an unusable listen setting");
+            assert!(
+                message.starts_with(variable),
+                "should name {variable} in the error, got: {message}"
+            );
+        }
+    }
 
     #[test]
     fn parse_log_level_defaults_to_info_when_unset_or_blank() {

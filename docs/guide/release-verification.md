@@ -278,6 +278,61 @@ copy that verified file into a directory on their `PATH` as `ts` and make it
 executable. Verify before first execution. Individual commands may still require
 a source checkout and provider tools; see [CLI](./cli.md).
 
+## Download from GitHub Packages
+
+When a maintainer enables package publication, each release also appears in
+the repository's **Packages** list. These packages copy the release; they add no
+new trust. Verify the files you pull exactly as you verify release downloads.
+
+| Package                 | Tag              | Contents                                                            |
+| ----------------------- | ---------------- | ------------------------------------------------------------------- |
+| `trusted-server-cli`    | `<tag>-<target>` | `ts-<target>`, its SPDX SBOM and both Sigstore bundles              |
+| `trusted-server-fastly` | `<tag>`          | `trusted-server-fastly.wasm`, its SBOM, both bundles, rebuild check |
+| `trusted-server-axum`   | `<tag>`          | Axum server container image for `linux/amd64`                       |
+
+The CLI and Fastly packages are OCI artifacts, not runnable images. Each file
+is one layer, and each layer's digest is that file's SHA-256 from the release's
+`SHA256SUMS`. The packages job downloads the published release, checks every
+file against `SHA256SUMS`, then pushes. It never overwrites an existing tag.
+
+```bash
+set -euo pipefail
+# Take REPO, TAG and COMMIT from your independent source review.
+REPO=Example-Org/trusted-server
+TAG=v1.2.3
+COMMIT=0123456789abcdef0123456789abcdef01234567
+TARGET=x86_64-unknown-linux-gnu
+OWNER=$(printf '%s' "${REPO%%/*}" | tr '[:upper:]' '[:lower:]')
+asset="ts-$TARGET"
+oras pull "ghcr.io/$OWNER/trusted-server-cli:$TAG-$TARGET" --output pulled
+cd pulled
+gh attestation verify "$asset" --repo "$REPO" --bundle "$asset.provenance.sigstore.json" \
+  --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" --signer-digest "$COMMIT" \
+  --deny-self-hosted-runners --predicate-type https://slsa.dev/provenance/v1 \
+  --signer-workflow "$REPO/.github/workflows/release-build.yml"
+gh release verify-asset "$TAG" "$asset" --repo "$REPO"
+```
+
+The final command confirms the pulled bytes are the published release asset. To
+check the SBOM too, run the per-asset loop from
+[Download and verify](#download-and-verify) in the `pulled` directory. `oras
+pull` needs no login for a public package.
+
+The Axum image is an ordinary build of the tagged source. It is outside the
+reproducible release cohort: no rebuild check, SBOM or release asset covers it,
+only GitHub build provenance attached to the image digest. Verify it before
+running it:
+
+```bash
+image="ghcr.io/$OWNER/trusted-server-axum:$TAG"
+gh attestation verify "oci://$image" --repo "$REPO" \
+  --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" --signer-digest "$COMMIT" \
+  --deny-self-hosted-runners --predicate-type https://slsa.dev/provenance/v1 \
+  --signer-workflow "$REPO/.github/workflows/release.yml"
+```
+
+See [Axum development server](./axum-dev#run-the-container-image) for running it.
+
 ## Deploy the verified Fastly wasm
 
 Keep the verified download unchanged. The ordinary source-build route does not
@@ -514,6 +569,12 @@ commands below only inspect settings; this workflow applies none of them.
   release build it gets. A later `main` push cancels an older run that is still
   waiting in the workflow's concurrency group; re-run a cancelled run before
   tagging its commit. Phase 1 does not enforce source eligibility.
+- **Settings → Secrets and variables → Actions → Variables:** set
+  `PACKAGE_PUBLICATION_ENABLED` to `true` to mirror releases into GitHub
+  Packages. Without it, the `packages` and `axum-image` jobs are skipped and the
+  release is unaffected. After the first package publish, check each package's
+  visibility under the organization's **Packages** settings; make it public
+  only when the release is public.
 - Push the commit to a branch, normally `main`, before pushing its lightweight
   tag. The build `checks` job refuses a tagged commit that is on no branch,
   before anything is built or signed: in fork rehearsals, draft creation

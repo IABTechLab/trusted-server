@@ -45,6 +45,38 @@ rewrite its origin URL to the Axum listener, and remove the original URL. The
 exit trap stops the Axum process and stub origin, then removes the temporary
 config, local-push output, bodies, headers, and logs.
 
+## Listen address
+
+Axum listens on `127.0.0.1:8787` by default. `PORT` keeps the loopback address
+and changes only the port. `TRUSTED_SERVER_LISTEN_ADDR` takes a full socket
+address, such as `0.0.0.0:8080` or `[::]:8080`, and wins over `PORT`. An invalid
+value of either stops the process at startup instead of falling back.
+
+## Run the container image
+
+`crates/trusted-server-adapter-axum/Dockerfile` builds the server image from the
+repository root. Releases with package publication enabled push it to GHCR as
+`trusted-server-axum`; see
+[Download from GitHub Packages](./release-verification#download-from-github-packages)
+to verify it. The image runs as a non-root user without a shell, listens on
+`0.0.0.0:8080`, and reads the same config and secret variables as the smoke
+above:
+
+```bash
+docker build --file crates/trusted-server-adapter-axum/Dockerfile \
+  --tag trusted-server-axum .
+docker run --rm --publish 8080:8080 \
+  --env TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG \
+  --env TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD \
+  --env TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET \
+  --env TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE \
+  trusted-server-axum
+```
+
+`--env NAME` without a value passes that variable from your shell, so secrets
+stay out of the command line. The support status above still applies inside the
+container.
+
 ## Logging
 
 Axum logs to standard output at `info` by default. Set `RUST_LOG` to a single
