@@ -664,7 +664,9 @@ test('workflow signs only tags, separates privileged jobs, and never checks out 
   assert.match(triggers, /tags: \['v\*'\]/)
   assert.doesNotMatch(workflow, /workflow_dispatch|--clobber/)
   // The publisher job checks out only its own script, template and tool pins.
-  const publisher = release.split('\n  release:')[1]
+  const jobs = (name) =>
+    release.split(`\n  ${name}:`)[1]?.split(/\n {2}(?=[\w-]+:\n)/)[0]
+  const publisher = jobs('release')
   assert.equal((publisher.match(/actions\/checkout@/g) ?? []).length, 1)
   assert.match(publisher, /persist-credentials: false/)
   assert.deepEqual(
@@ -683,6 +685,35 @@ test('workflow signs only tags, separates privileged jobs, and never checks out 
   assert.match(publisher, /GH_SHA256: [a-f0-9]{64}\n/)
   assert.match(publisher, /sha256sum --check/)
   assert.match(publisher, /node publisher\/scripts\/release\/publish\.mjs\n/)
+  // The package job mirrors only the published release; it never builds.
+  const packages = jobs('packages')
+  assert.ok(packages, 'should define the package publication job')
+  assert.match(packages, /needs: release\n/)
+  assert.match(packages, /vars\.PACKAGE_PUBLICATION_ENABLED == 'true'/)
+  assert.equal((packages.match(/actions\/checkout@/g) ?? []).length, 1)
+  assert.match(packages, /persist-credentials: false/)
+  assert.deepEqual(
+    packages
+      .match(/sparse-checkout: \|\n((?: {12}\S.*\n)+)/)[1]
+      .trim()
+      .split(/\s+/),
+    [
+      '.tool-versions',
+      'scripts/release/publish.mjs',
+      'scripts/release/packages.mjs',
+      'scripts/release/release-notes.md',
+    ]
+  )
+  assert.doesNotMatch(packages, /cargo |npm |phase1-build|contents: write/)
+  assert.match(packages, /ORAS_SHA256: [a-f0-9]{64}\n/)
+  assert.match(packages, /node publisher\/scripts\/release\/packages\.mjs\n/)
+  // The Axum image job may build, but holds no release-writing authority.
+  const image = jobs('axum-image')
+  assert.ok(image, 'should define the Axum image job')
+  assert.match(image, /needs: release\n/)
+  assert.match(image, /vars\.PACKAGE_PUBLICATION_ENABLED == 'true'/)
+  assert.doesNotMatch(image, /contents: write|--clobber/)
+  assert.match(image, /persist-credentials: false/)
   // Match the repository convention: actions are referenced by major tag.
   for (const line of [workflow, release]
     .join('\n')
