@@ -149,7 +149,7 @@ mod tests {
             .collect();
         let mut registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         assert!(
-            registry.mark_provider_owned("ids.example.com"),
+            registry.mark_provider_owned("ids.example.com", None),
             "should mark the provider source as owned"
         );
         registry

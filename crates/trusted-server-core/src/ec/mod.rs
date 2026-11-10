@@ -118,9 +118,6 @@ pub enum EidSyncSource {
     /// Admitted `GET /_ts/page-bids` SPA navigation.
     #[display("page_bids")]
     PageBids,
-    /// Request that generated a new EC identity during finalization.
-    #[display("new_ec")]
-    NewEc,
 }
 
 /// Request-scoped view of one EC identity-graph lookup.
@@ -632,6 +629,11 @@ impl EcContext {
     /// Stores the navigation permit issued by the router.
     pub fn set_navigation_permit(&mut self, permit: NavigationPermit) {
         self.navigation_permit = PermitSlot(Some(permit));
+    }
+
+    /// Whether this request still holds its page-load write permit.
+    pub(crate) fn has_navigation_permit(&self) -> bool {
+        self.navigation_permit.0.is_some()
     }
 
     /// Takes the navigation permit; returns `None` after the first call.

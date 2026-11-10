@@ -5,6 +5,7 @@
 //! lookup by source domain and API key hash.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU16;
 
 use error_stack::{Report, ResultExt as _};
 
@@ -50,6 +51,9 @@ pub struct PartnerConfig {
     /// Whether an enabled identity provider claims this source. Browser
     /// ingest skips it and batch sync rejects it.
     pub provider_owned: bool,
+    /// TCF vendor ID of the provider that owns this source, when configured.
+    /// Its UIDs leave the server only while that vendor has consent.
+    pub owner_tcf_vendor_id: Option<NonZeroU16>,
 }
 
 /// In-memory partner registry with O(1) lookups by source domain and API key hash.
@@ -210,10 +214,10 @@ impl PartnerRegistry {
 
     /// Builds the registry from `[ec]` settings without provider ownership.
     ///
-    /// For adapters with no identity-provider implementations: no source is
-    /// provider-owned, so browser-supplied IDs are ingested for every source.
-    /// Kind registration is unknown here, so no unregistered-kind warning is
-    /// logged; use [`Self::from_ec_with_kinds`] where kinds are known.
+    /// For adapters with no identity-provider implementations, which refuse
+    /// to start with an enabled provider: no source is provider-owned, so
+    /// browser-supplied IDs are ingested for every source. Use
+    /// [`Self::from_ec_with_kinds`] where kinds are known.
     ///
     /// # Errors
     ///
@@ -226,12 +230,12 @@ impl PartnerRegistry {
     /// by an enabled identity provider whose kind is registered as
     /// provider-owned.
     ///
-    /// An enabled provider with an unregistered kind never runs, so its
-    /// sources stay open to browser ingest and a warning is logged.
-    ///
     /// # Errors
     ///
-    /// Returns the same errors as [`Self::from_config`].
+    /// Returns the same errors as [`Self::from_config`], and
+    /// [`TrustedServerError::Configuration`] for an enabled provider whose
+    /// kind is not registered: it could never run, and its sources would
+    /// silently go back to browser ingest.
     pub fn from_ec_with_kinds(
         ec: &Ec,
         is_registered_kind: impl Fn(&str) -> bool,
@@ -239,15 +243,16 @@ impl PartnerRegistry {
         let mut registry = Self::from_config(&ec.partners)?;
         for provider in ec.identity_providers.iter().filter(|p| p.enabled) {
             if !is_registered_kind(provider.kind()) {
-                log::warn!(
-                    "Identity provider '{}' has unregistered kind '{}'; its sources stay browser-ingested",
-                    provider.id,
-                    provider.kind()
-                );
-                continue;
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "identity provider `{}` has kind `{}`, which this build does not include",
+                        provider.id,
+                        provider.kind()
+                    ),
+                }));
             }
             for source in &provider.sources {
-                registry.mark_provider_owned(source);
+                registry.mark_provider_owned(source, provider.tcf_vendor_id);
             }
         }
         Ok(registry)
@@ -282,16 +287,18 @@ impl PartnerRegistry {
         self.get(domain)
     }
 
-    /// Marks `source` as owned by an enabled identity provider.
+    /// Marks `source` as owned by an enabled identity provider, recording the
+    /// provider's TCF vendor ID, if any.
     ///
     /// Returns `false` when the source has no `[[ec.partners]]` entry.
-    pub fn mark_provider_owned(&mut self, source: &str) -> bool {
+    pub fn mark_provider_owned(&mut self, source: &str, tcf_vendor_id: Option<NonZeroU16>) -> bool {
         let Ok(normalized) = normalize_partner_source_domain(source) else {
             return false;
         };
         match self.by_source_domain.get_mut(&normalized) {
             Some(partner) => {
                 partner.provider_owned = true;
+                partner.owner_tcf_vendor_id = tcf_vendor_id;
                 true
             }
             None => false,
@@ -381,6 +388,7 @@ fn build_partner_config(
         pull_sync_rate_limit: partner.pull_sync_rate_limit,
         ts_pull_token: partner.ts_pull_token.clone(),
         provider_owned: false,
+        owner_tcf_vendor_id: None,
     }
 }
 
@@ -543,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn from_ec_skips_providers_with_unregistered_kinds() {
+    fn from_ec_with_kinds_rejects_an_unregistered_kind() {
         let mut ec = crate::test_support::tests::create_test_settings().ec;
         ec.partners = vec![make_partner(
             "ids.example.com",
@@ -556,13 +564,16 @@ mod tests {
             .expect("should parse enabled provider"),
         ];
 
-        let with_kinds = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
-            .expect("should build registry");
+        let error = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
+            .expect_err("should reject an enabled provider with an unregistered kind");
         let plain = PartnerRegistry::from_ec(&ec).expect("should build registry");
 
         assert!(
-            !with_kinds.is_provider_owned("ids.example.com"),
-            "should not claim sources for an unregistered kind"
+            matches!(
+                error.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should report a configuration error"
         );
         assert!(
             !plain.is_provider_owned("ids.example.com"),
@@ -715,7 +726,7 @@ mod tests {
         let mut registry =
             PartnerRegistry::from_config(&[pull_partner]).expect("should build registry");
 
-        registry.mark_provider_owned("pull.example.com");
+        registry.mark_provider_owned("pull.example.com", None);
 
         assert!(
             registry.pull_enabled_partners().is_empty(),

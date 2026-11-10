@@ -38,7 +38,7 @@ use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::trace::{TraceTerminalResponse, is_trace_path};
 use trusted_server_core::version_header::{apply_git_version_header, git_version_header_value};
-use trusted_server_identity_providers::{build_after_response_coordinator, partner_registry};
+use trusted_server_identity_providers::partner_registry;
 
 mod app;
 mod backend;
@@ -579,6 +579,7 @@ fn edgezero_main(
                     run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
                     run_after_response_lookups(
                         settings,
+                        app_state.as_deref(),
                         &partner_registry,
                         &mut ec_state,
                         after_response,
@@ -614,6 +615,7 @@ fn edgezero_main(
                             );
                             run_after_response_lookups(
                                 &settings,
+                                None,
                                 &partner_registry,
                                 &mut ec_state,
                                 after_response,
@@ -704,13 +706,12 @@ fn apply_edgezero_ec_finalize(
         pending,
     }) = identity
     {
-        let transport =
-            PlatformLookupTransport::new(&ec_state.services, settings.proxy.certificate_check);
+        let transport = PlatformLookupTransport::new(&ec_state.services);
         let results = futures::executor::block_on(coordinator.collect(&transport, pending));
         ec_state.ec_context.set_lookup_results(results);
     }
     let partner_registry = match state {
-        Some(state) => state.partner_registry()?,
+        Some(state) => state.partner_registry(),
         None => Arc::new(partner_registry(&settings.ec)?),
     };
     let finalize_kv_graph = if ec_state.use_finalize_kv {
@@ -765,6 +766,7 @@ fn run_edgezero_pull_sync_after_send(
 /// for.
 fn run_after_response_lookups(
     settings: &Settings,
+    state: Option<&AppState>,
     partner_registry: &Arc<PartnerRegistry>,
     ec_state: &mut EcFinalizeState,
     lookups: Option<AfterResponseLookups>,
@@ -782,14 +784,8 @@ fn run_after_response_lookups(
         log::debug!("After-response lookups skipped: EC changed during the request");
         return;
     }
-    let coordinator = match build_after_response_coordinator(settings, Arc::clone(partner_registry))
-    {
-        Ok(Some(coordinator)) => coordinator,
-        Ok(None) => return,
-        Err(report) => {
-            log::error!("After-response identity providers disabled for this request: {report:?}");
-            return;
-        }
+    let Some(coordinator) = state.and_then(|state| state.after_response_identity.as_ref()) else {
+        return;
     };
     let Some(graph) = maybe_identity_graph(settings) else {
         return;
@@ -803,8 +799,7 @@ fn run_after_response_lookups(
         log::debug!("After-response lookups skipped: new EC or no live row");
         return;
     }
-    let transport =
-        PlatformLookupTransport::new(&ec_state.services, settings.proxy.certificate_check);
+    let transport = PlatformLookupTransport::new(&ec_state.services);
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
     let now = current_timestamp();
     let pending = futures::executor::block_on(coordinator.dispatch(

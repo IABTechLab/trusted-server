@@ -60,7 +60,16 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
         }
     };
 
-    let mut entry = base.clone();
+    // Prune first so an expired record frees its slot for browser ingest.
+    // Pruning alone never triggers a write; it rides along with a real change.
+    let mut entry = base;
+    for record in entry.ids.values_mut() {
+        record.prune_expired(input.now);
+    }
+    entry.prune_opt_outs(input.now);
+    entry.ids.retain(|_, record| !record.uid.is_empty());
+    let pruned = entry.clone();
+
     let lookups_apply = input.lookups.is_for(input.ec_id);
     apply_browser_ingest(&mut entry, input.browser_ingest, input.registry);
     let written = if lookups_apply {
@@ -74,18 +83,13 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
         }
         Vec::new()
     };
-    // Pruning alone never triggers a write; it rides along with a real change.
-    let changed = entry != base;
-    for record in entry.ids.values_mut() {
-        record.prune_expired(input.now);
-    }
-    entry.prune_opt_outs(input.now);
-    entry.ids.retain(|_, record| !record.uid.is_empty());
     enforce_size_cap(&mut entry, &written);
+    // Compared after the cap, which may trim the only real change away.
+    let changed = entry != pruned;
 
     match expected {
         None => Some(RowChange::Create(entry)),
-        Some(_) if !changed || entry == base => None,
+        Some(_) if !changed => None,
         Some(expected) => Some(RowChange::Update { entry, expected }),
     }
 }
@@ -236,7 +240,10 @@ mod tests {
         ])
         .expect("should build registry");
         for source in owned {
-            assert!(registry.mark_provider_owned(source), "should mark {source}");
+            assert!(
+                registry.mark_provider_owned(source, None),
+                "should mark {source}"
+            );
         }
         registry
     }
@@ -648,6 +655,45 @@ mod tests {
         assert!(
             change.is_none(),
             "should not write only to prune an expired UID"
+        );
+    }
+
+    #[test]
+    fn browser_ingest_fills_a_slot_freed_by_an_expired_record() {
+        // The source is not provider-owned (its provider was disabled), so the
+        // browser may fill it once the expired provider record is pruned.
+        let registry = registry(&[]);
+        let ingest = [PartnerIdUpdate::new("ids.example.com", "browser-1")];
+        let lookups = LookupResults::default();
+        let mut entry = live_entry();
+        let expired = KvUid::new(
+            UidValue::try_from("old-1").expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            Expiry::At(UnixSeconds::new(1500)),
+        );
+        entry.ids.insert(
+            "ids.example.com".to_owned(),
+            KvPartnerId::from_eids(
+                vec![KvEid::new(EidFields::default(), vec![expired])],
+                UnixSeconds::new(1000),
+            )
+            .expect("should build provider record"),
+        );
+
+        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+
+        let Some(RowChange::Update { entry, .. }) = change else {
+            panic!("should plan an update that fills the freed slot");
+        };
+        assert_eq!(
+            entry
+                .ids
+                .get("ids.example.com")
+                .map(|record| record.uid.as_str()),
+            Some("browser-1"),
+            "should store the browser UID in place of the expired record"
         );
     }
 

@@ -21,6 +21,7 @@ crates/
   trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
   trusted-server-adapter-spin/          # Fermyon Spin entry point (wasm32-wasip1 component)
   trusted-server-cli/                   # Host-target `ts` operator CLI
+  trusted-server-identity-providers/    # Server-side identity provider kinds (used by the Fastly adapter)
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```

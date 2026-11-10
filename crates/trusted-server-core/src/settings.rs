@@ -608,7 +608,8 @@ pub struct IdentityProviderConfig {
     /// When the provider's lookup runs on a navigation.
     #[serde(default)]
     pub collect: CollectTiming,
-    /// Most lookups per EC per hour, when set; unset means unlimited.
+    /// Most lookups per EC hash per hour, when set; unset means unlimited.
+    /// ECs behind one client IP share the budget.
     ///
     /// The Fastly limiter enforces this as a per-minute budget of at least
     /// one, so values below 60 behave like 60 per hour.
@@ -703,10 +704,20 @@ pub struct Ec {
 
     /// Shared time budget, in milliseconds, for all provider lookups on one
     /// navigation.
+    ///
+    /// `Ec` denies unknown fields, so this and the other identity fields are
+    /// skipped from serialization at their defaults: a config blob without
+    /// providers then still loads in a runtime built before them.
     #[serde(
         default = "Ec::default_identity_budget_ms",
+        skip_serializing_if = "Ec::is_default_identity_budget_ms",
         deserialize_with = "from_value_or_str"
     )]
+    #[validate(range(
+        min = 1,
+        max = 1000,
+        message = "must be between 1 and 1000 milliseconds"
+    ))]
     pub identity_budget_ms: u64,
 
     /// Time budget, in milliseconds, for lookups of providers with
@@ -714,12 +725,22 @@ pub struct Ec {
     /// response has been sent.
     #[serde(
         default = "Ec::default_identity_after_response_budget_ms",
+        skip_serializing_if = "Ec::is_default_identity_after_response_budget_ms",
         deserialize_with = "from_value_or_str"
     )]
+    #[validate(range(
+        min = 1,
+        max = 5000,
+        message = "must be between 1 and 5000 milliseconds"
+    ))]
     pub identity_after_response_budget_ms: u64,
 
     /// Server-side identity providers.
-    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "vec_from_seq_or_map"
+    )]
     pub identity_providers: Vec<IdentityProviderConfig>,
 }
 
@@ -761,6 +782,16 @@ impl Ec {
     #[must_use]
     pub const fn default_identity_after_response_budget_ms() -> u64 {
         2000
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_default_identity_budget_ms(value: &u64) -> bool {
+        *value == Self::default_identity_budget_ms()
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_default_identity_after_response_budget_ms(value: &u64) -> bool {
+        *value == Self::default_identity_after_response_budget_ms()
     }
 
     /// Returns `true` if `passphrase` matches a known placeholder value
@@ -4420,6 +4451,53 @@ mod tests {
             restored.html_finalization_timeout_ms, 1500,
             "should preserve timeout"
         );
+    }
+
+    /// `Ec` denies unknown fields, so a binary built before identity providers
+    /// existed must still accept a blob that configures none.
+    #[test]
+    fn default_identity_settings_are_omitted_for_rollback() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+
+        let serialized = serde_json::to_value(&settings.ec).expect("should serialize ec settings");
+
+        for field in [
+            "identity_budget_ms",
+            "identity_after_response_budget_ms",
+            "identity_providers",
+        ] {
+            assert!(
+                serialized.get(field).is_none(),
+                "should omit default {field} for older binaries: {serialized}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_budgets_are_range_checked() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        for (page, after_response, invalid) in [
+            (1, 1, false),
+            (1000, 5000, false),
+            (0, 2000, true),
+            (1001, 2000, true),
+            (200, 0, true),
+            (200, 5001, true),
+        ] {
+            let ec = Ec {
+                identity_budget_ms: page,
+                identity_after_response_budget_ms: after_response,
+                ..settings.ec.clone()
+            };
+
+            assert_eq!(
+                ec.validate().is_err(),
+                invalid,
+                "should enforce identity budget bounds for {page} and {after_response}"
+            );
+        }
     }
 
     /// `DebugConfig` denies unknown fields, so a binary built before

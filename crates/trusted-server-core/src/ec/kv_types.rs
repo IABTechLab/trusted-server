@@ -36,10 +36,18 @@ pub const MAX_SEEN_DOMAINS: usize = 50;
 pub const MAX_STORED_DOMAIN_LENGTH: usize = 255;
 
 /// Maximum allowed length (in bytes) for a partner UID across all sync
-/// mechanisms (pixel, batch, pull) and identity providers. Sized for
-/// `LiveRamp` envelopes (about 700 bytes). Defined centrally to ensure
-/// consistent validation.
-pub const MAX_UID_LENGTH: usize = 1024;
+/// mechanisms (pixel, batch, pull) and browser ingest. Defined centrally to
+/// ensure consistent validation.
+///
+/// Builds before identity providers reject a row holding a longer UID, so
+/// these writers stay at this limit until rollback past them is no longer
+/// supported; only provider writes use [`MAX_STORED_UID_LENGTH`].
+pub const MAX_UID_LENGTH: usize = 512;
+
+/// Maximum length (in bytes) of a UID a row may hold: the limit for identity
+/// provider writes and for reading stored rows. Sized for `LiveRamp` envelopes
+/// (about 700 bytes).
+pub const MAX_STORED_UID_LENGTH: usize = 1024;
 
 /// How long a provider opt-out keeps that provider from being called again,
 /// in seconds. Matches the longest lifetime a provider UID may have.
@@ -48,7 +56,7 @@ pub const OPT_OUT_MEMORY_SECONDS: u64 = 30 * 24 * 60 * 60;
 /// Full KV entry stored as the body of an EC identity graph record.
 ///
 /// **KV key:** Full EC ID (`{64hex}.{6alnum}`).
-/// **KV value:** JSON-serialized `KvEntry` (max ~5KB).
+/// **KV value:** JSON-serialized `KvEntry` (at most [`MAX_ENTRY_BYTES`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvEntry {
     /// Schema version — always [`SCHEMA_VERSION`].
@@ -112,7 +120,8 @@ pub struct KvGeo {
     pub dma: Option<i64>,
 }
 
-/// Maximum serialized size of a KV entry body written by a page load.
+/// Maximum serialized size of a KV entry body. Every writer refuses a larger
+/// row; only the page-load planner trims entries to fit.
 pub const MAX_ENTRY_BYTES: usize = 16 * 1024;
 
 /// A partner ID record within a KV entry, keyed by source domain.
@@ -196,27 +205,32 @@ impl KvPartnerId {
         if self.eids.is_empty() && !self.uid.is_empty() {
             return false;
         }
-        let before = self.clone();
+        let mut changed = false;
         for eid in &mut self.eids {
+            let held = eid.uids.len();
             eid.uids.retain(|uid| uid.is_live(now));
+            changed |= eid.uids.len() != held;
         }
         self.eids.retain(|eid| !eid.uids.is_empty());
-        self.uid = self
+        let first = self
             .eids
             .first()
             .and_then(|eid| eid.uids.first())
-            .map(|uid| uid.id().as_str().to_owned())
-            .unwrap_or_default();
-        *self != before
+            .map_or("", |uid| uid.id().as_str());
+        if self.uid != first {
+            self.uid = first.to_owned();
+            changed = true;
+        }
+        changed
     }
 
     /// Drops entries left without UIDs and resyncs `uid`.
     ///
     /// Returns whether the record still holds a UID within
-    /// [`MAX_UID_LENGTH`].
+    /// [`MAX_STORED_UID_LENGTH`].
     fn retain_readable(&mut self) -> bool {
         if self.eids.is_empty() {
-            return self.uid.len() <= MAX_UID_LENGTH;
+            return self.uid.len() <= MAX_STORED_UID_LENGTH;
         }
         self.eids.retain(|eid| !eid.uids.is_empty());
         self.uid = self
@@ -280,7 +294,7 @@ struct StoredId<'a> {
 }
 
 /// Deserializes stored UIDs, skipping any whose `id` exceeds
-/// [`MAX_UID_LENGTH`].
+/// [`MAX_STORED_UID_LENGTH`].
 ///
 /// A row written under a higher limit then still loads; an entry left
 /// without UIDs is removed by [`KvEntry::drop_unreadable_ids`]. Any other
@@ -292,7 +306,7 @@ fn deserialize_readable_uids<'de, D: Deserializer<'de>>(
     let mut uids = Vec::with_capacity(raw.len());
     for value in &raw {
         let oversized = serde_json::from_str::<StoredId<'_>>(value.get())
-            .is_ok_and(|stored| stored.id.len() > MAX_UID_LENGTH);
+            .is_ok_and(|stored| stored.id.len() > MAX_STORED_UID_LENGTH);
         if oversized {
             continue;
         }
@@ -628,7 +642,7 @@ impl KvEntry {
     /// Removes partner records holding no UID this build can serve.
     ///
     /// Lets this build load rows written by one with a higher
-    /// [`MAX_UID_LENGTH`] instead of rejecting the whole row. Returns the
+    /// [`MAX_STORED_UID_LENGTH`] instead of rejecting the whole row. Returns the
     /// number of records removed.
     pub fn drop_unreadable_ids(&mut self) -> usize {
         let before = self.ids.len();
@@ -779,9 +793,9 @@ impl KvEntry {
         }
 
         for (partner_id, partner_uid) in &self.ids {
-            if partner_uid.uid.len() > MAX_UID_LENGTH {
+            if partner_uid.uid.len() > MAX_STORED_UID_LENGTH {
                 return Err(format!(
-                    "partner ID '{partner_id}' exceeds MAX_UID_LENGTH ({})",
+                    "partner ID '{partner_id}' exceeds MAX_STORED_UID_LENGTH ({})",
                     partner_uid.uid.len()
                 ));
             }
@@ -1153,14 +1167,14 @@ mod tests {
         let mut entry = KvEntry::tombstone(1000);
         entry.ids.insert(
             "ssp_x".to_owned(),
-            KvPartnerId::single("x".repeat(MAX_UID_LENGTH + 1)),
+            KvPartnerId::single("x".repeat(MAX_STORED_UID_LENGTH + 1)),
         );
 
         let err = entry
             .validate()
             .expect_err("should reject oversized partner UIDs");
         assert!(
-            err.contains("MAX_UID_LENGTH"),
+            err.contains("MAX_STORED_UID_LENGTH"),
             "should describe the UID length validation failure"
         );
     }
@@ -1719,7 +1733,7 @@ mod tests {
         let mut entry = KvEntry::minimal("ids.example.com", "kept", 1);
         entry.ids.insert(
             "long.example.com".to_owned(),
-            KvPartnerId::single("x".repeat(MAX_UID_LENGTH + 1)),
+            KvPartnerId::single("x".repeat(MAX_STORED_UID_LENGTH + 1)),
         );
 
         let dropped = entry.drop_unreadable_ids();
@@ -1735,7 +1749,7 @@ mod tests {
 
     #[test]
     fn deserialize_drops_oversized_provider_uids() {
-        let long = "x".repeat(MAX_UID_LENGTH + 1);
+        let long = "x".repeat(MAX_STORED_UID_LENGTH + 1);
         let json = serde_json::json!({
             "v": SCHEMA_VERSION,
             "created": 1,

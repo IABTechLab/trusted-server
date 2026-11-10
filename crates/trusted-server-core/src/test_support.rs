@@ -7,6 +7,35 @@ pub mod tests {
     use crate::consent::types::{ConsentContext, ConsentSource, TcfConsent};
     use crate::settings::Settings;
 
+    /// GDPR consent with TCF Purposes 1 and 4 and the given vendor consents.
+    #[must_use]
+    pub fn consent_granting_vendors(vendor_consents: Vec<u16>) -> ConsentContext {
+        let mut purposes = vec![false; 24];
+        purposes[0] = true;
+        purposes[3] = true;
+        ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            tcf: Some(TcfConsent {
+                version: 2,
+                cmp_id: 1,
+                cmp_version: 1,
+                consent_screen: 0,
+                consent_language: "EN".to_owned(),
+                vendor_list_version: 1,
+                tcf_policy_version: 4,
+                created_ds: 0,
+                last_updated_ds: 0,
+                purpose_consents: purposes,
+                purpose_legitimate_interests: vec![false; 24],
+                vendor_consents,
+                vendor_legitimate_interests: Vec::new(),
+                special_feature_opt_ins: vec![false; 12],
+            }),
+            ..ConsentContext::default()
+        }
+    }
+
     #[must_use]
     pub fn crate_test_settings_str() -> String {
         r#"

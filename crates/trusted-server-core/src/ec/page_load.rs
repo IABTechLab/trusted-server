@@ -165,11 +165,6 @@ pub enum RowChange {
         /// Generation the row must still have.
         expected: Generation,
     },
-    /// Replace a live row with a withdrawal tombstone.
-    Tombstone {
-        /// Generation the row must still have.
-        expected: Generation,
-    },
 }
 
 /// Why the single write did not land.
@@ -366,27 +361,5 @@ mod tests {
             matches!(error.current_context(), KvWriteError::Conflict),
             "should report conflict"
         );
-    }
-
-    #[test]
-    fn commit_tombstone_marks_consent_withdrawn() {
-        let graph = KvIdentityGraph::in_memory("page_load");
-        let ec_id = format!("{}.ABC123", "a".repeat(64));
-        graph
-            .create(&ec_id, &live_entry())
-            .expect("should seed row");
-        let expected =
-            Generation::of(&graph.load_snapshot(&ec_id), &ec_id).expect("should read generation");
-
-        let committed = graph
-            .commit_page_load(permit(), &ec_id, RowChange::Tombstone { expected })
-            .expect("should write tombstone");
-
-        assert!(!committed.consent.ok, "should return tombstone");
-        let (stored, _) = graph
-            .get(&ec_id)
-            .expect("should read")
-            .expect("should exist");
-        assert!(!stored.consent.ok, "should persist tombstone");
     }
 }

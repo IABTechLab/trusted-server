@@ -34,6 +34,7 @@ const REASON_INVALID_PARTNER_UID: &str = "invalid_partner_uid";
 const REASON_INELIGIBLE: &str = "ineligible";
 const REASON_KV_UNAVAILABLE: &str = "kv_unavailable";
 const REASON_PROVIDER_OWNED: &str = "provider_owned";
+const REASON_ROW_FULL: &str = "row_full";
 
 /// Maximum number of mappings allowed in a single batch request.
 const MAX_BATCH_SIZE: usize = 1000;
@@ -277,6 +278,12 @@ fn process_mappings(
         match writer.upsert_partner_id_if_exists(&group.ec_id, partner_id, &group.partner_uid) {
             Ok(UpsertResult::Written | UpsertResult::Unchanged) => {
                 accepted += group.indexes.len();
+            }
+            Ok(UpsertResult::RowFull) => {
+                errors.extend(group.indexes.iter().map(|&index| MappingError {
+                    index,
+                    reason: REASON_ROW_FULL,
+                }));
             }
             Ok(UpsertResult::NotFound | UpsertResult::ConsentWithdrawn) => {
                 errors.extend(group.indexes.iter().map(|&index| MappingError {
@@ -593,6 +600,27 @@ mod tests {
                 .all(|error| error.reason == REASON_PROVIDER_OWNED),
             "should report provider_owned"
         );
+    }
+
+    #[test]
+    fn process_mappings_reports_a_full_row_and_continues() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::RowFull), Ok(UpsertResult::Written)]);
+
+        let mappings = vec![
+            mapping(&format!("{}.ABC123", "a".repeat(64)), "u1", 1),
+            mapping(&format!("{}.ABC123", "b".repeat(64)), "u2", 1),
+        ];
+
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+
+        assert_eq!(accepted, 1, "should accept the mapping after the full row");
+        assert_eq!(errors.len(), 1, "should report only the full row");
+        assert_eq!(errors[0].index, 0, "should report the full row's index");
+        assert_eq!(
+            errors[0].reason, REASON_ROW_FULL,
+            "should give a full row its own reason"
+        );
+        assert_eq!(writer.calls().len(), 2, "should continue past a full row");
     }
 
     #[test]

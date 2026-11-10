@@ -25,8 +25,8 @@ use crate::consent::{allows_eid_persistence, tcf_vendor_consent_denied};
 use crate::ec::EcKvSnapshot;
 use crate::ec::consent::ec_consent_granted;
 use crate::ec::eid_types::{ProviderId, SourceDomain, UnixSeconds};
+use crate::ec::generation::ec_hash;
 use crate::ec::kv_types::KvEntry;
-use crate::ec::page_load::RowChange;
 use crate::ec::provider::{
     ClientSignals, IdentityProvider, LookupInput, LookupOutcome, OwnedEntries, ProviderConfigError,
     ProviderEid, ProviderResponse, SourceInput, destination_allowed, parse_sources,
@@ -34,7 +34,7 @@ use crate::ec::provider::{
 };
 use crate::ec::rate_limiter::RateLimiter;
 use crate::ec::registry::PartnerRegistry;
-use crate::ec::write_plan::{WritePlanInput, plan_write};
+
 use crate::settings::IdentityProviderConfig;
 
 /// Coordinates server-side identity lookups for one navigation.
@@ -64,12 +64,6 @@ pub trait IdentityCoordinator {
         transport: &T,
         pending: PendingLookups<T::Pending>,
     ) -> LookupResults;
-
-    /// Merges browser ingest and lookup results into the navigation's single
-    /// row change.
-    ///
-    /// Returns `None` when the row would not change, so no write is made.
-    fn plan_write(&self, input: &WritePlanInput<'_>) -> Option<RowChange>;
 }
 
 /// Request-scoped inputs to [`IdentityCoordinator::dispatch`].
@@ -148,25 +142,13 @@ pub struct RegisteredProvider<P> {
     pub config: IdentityProviderConfig,
     /// The built provider.
     pub provider: P,
-    rate_limit_per_hour: Option<NonZeroU32>,
 }
 
 impl<P> RegisteredProvider<P> {
     /// Pairs a configuration entry with its built provider.
     #[must_use]
     pub fn new(config: IdentityProviderConfig, provider: P) -> Self {
-        Self {
-            config,
-            provider,
-            rate_limit_per_hour: None,
-        }
-    }
-
-    /// Applies an hourly per-EC lookup limit (carried over from pull sync).
-    #[must_use]
-    pub fn with_rate_limit(mut self, per_hour: NonZeroU32) -> Self {
-        self.rate_limit_per_hour = Some(per_hour);
-        self
+        Self { config, provider }
     }
 }
 
@@ -241,11 +223,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
     fn register(
         registered: RegisteredProvider<P>,
     ) -> Result<Registered<P>, Report<ProviderConfigError>> {
-        let RegisteredProvider {
-            config,
-            provider,
-            rate_limit_per_hour,
-        } = registered;
+        let RegisteredProvider { config, provider } = registered;
         let sources = parse_sources(&config)?;
         let capable: HashSet<&SourceDomain> = provider
             .capabilities()
@@ -269,7 +247,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                     .map(|domain| Box::from(domain.as_str()))
                     .collect(),
                 tcf_vendor_id: config.tcf_vendor_id,
-                rate_limit_per_hour,
+                rate_limit_per_hour: config.rate_limit_per_hour,
             },
             provider,
         })
@@ -326,14 +304,17 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         (due, input_blocked)
     }
 
-    /// Whether the provider's hourly per-EC limit is reached. Limiter errors
-    /// fail open, matching pull sync.
+    /// Whether the provider's hourly limit is reached. Limiter errors fail
+    /// open, matching pull sync.
+    ///
+    /// The bucket is the EC hash (derived from the client IP), not the full
+    /// EC ID, so ECs behind one IP share it and a client that clears cookies
+    /// cannot reset it.
     fn rate_limited(registered: &Registered<P>, lookup: &LookupContext<'_>) -> bool {
         let Some(limit) = registered.policy.rate_limit_per_hour else {
             return false;
         };
-        let hash = lookup.ec_id.split('.').next().unwrap_or(lookup.ec_id);
-        let key = format!("identity:{}:{hash}", registered.id);
+        let key = format!("identity:{}:{}", registered.id, ec_hash(lookup.ec_id));
         match lookup.rate_limiter.exceeded(&key, limit.get()) {
             Ok(exceeded) => exceeded,
             Err(report) => {
@@ -534,8 +515,10 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 // Only a due source without a live UID may take a generated
                 // ID: a refresh-due source keeps its UID and goes to lookup.
                 eids.retain(|eid| {
-                    due.iter().any(|source| source.as_str() == eid.source)
-                        && !Self::holds_live_uid(entry, &eid.source, lookup.now)
+                    SourceDomain::try_from(eid.source.as_ref()).is_ok_and(|source| {
+                        due.contains(&source)
+                            && !Self::holds_live_uid(entry, source.as_str(), lookup.now)
+                    })
                 });
                 if !eids.is_empty() {
                     pending.generated.push(Tagged {
@@ -552,12 +535,15 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             let mut request = match registered.provider.build_request(&input) {
                 Ok(request) => request,
                 Err(report) => {
-                    log::debug!(
+                    log::warn!(
                         "Identity lookup: provider={} request not built: {}",
                         registered.id,
                         report.current_context()
                     );
-                    pending.early.push(skip(SkipReason::Input));
+                    pending.early.push(Tagged {
+                        provider,
+                        value: LookupStatus::RequestFailed,
+                    });
                     continue;
                 }
             };
@@ -627,10 +613,6 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             log_outcome(lookup);
         }
         LookupResults::new(&ec_id, lookups)
-    }
-
-    fn plan_write(&self, input: &WritePlanInput<'_>) -> Option<RowChange> {
-        plan_write(input)
     }
 }
 
@@ -1178,10 +1160,10 @@ mod tests {
 
     #[test]
     fn rate_limited_provider_is_skipped() {
-        let coordinator = coordinator_with(
-            RegisteredProvider::new(provider_config(""), echo_provider(SourceInput::Anonymous))
-                .with_rate_limit(NonZeroU32::new(1).expect("should be non-zero")),
-        );
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config("rate_limit_per_hour = 1"),
+            echo_provider(SourceInput::Anonymous),
+        ));
         let transport = CannedTransport::new(ok_reply);
 
         let results = run_with(
@@ -1469,8 +1451,54 @@ mod tests {
         );
     }
 
-    /// An echo provider that generates its ID instead of looking it up.
-    struct GeneratingProvider(EchoProvider);
+    /// An echo provider whose request can never be built.
+    struct UnbuildableProvider(EchoProvider);
+
+    impl IdentityProvider for UnbuildableProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            _lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            Err(Report::new(ProviderError::Request))
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+    }
+
+    #[test]
+    fn a_request_the_provider_cannot_build_is_reported_as_a_failure() {
+        let coordinator = ProviderCoordinator::new(
+            vec![RegisteredProvider::new(
+                provider_config(""),
+                UnbuildableProvider(echo_provider(SourceInput::Anonymous)),
+            )],
+            partners(),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &missing(), &granting());
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::RequestFailed,
+            "should report a provider bug instead of a skip"
+        );
+    }
+
+    /// An echo provider that generates its ID for the given source instead of
+    /// looking it up.
+    struct GeneratingProvider(EchoProvider, &'static str);
 
     impl IdentityProvider for GeneratingProvider {
         fn capabilities(&self) -> &ProviderCapabilities {
@@ -1493,7 +1521,7 @@ mod tests {
 
         fn generate(&self, _lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
             Some(vec![ProviderEid {
-                source: Cow::Borrowed("ids.example.com"),
+                source: Cow::Borrowed(self.1),
                 inserter: None,
                 matcher: None,
                 mm: None,
@@ -1510,10 +1538,14 @@ mod tests {
     }
 
     fn generating_coordinator() -> ProviderCoordinator<GeneratingProvider> {
+        generating_coordinator_for("ids.example.com")
+    }
+
+    fn generating_coordinator_for(source: &'static str) -> ProviderCoordinator<GeneratingProvider> {
         ProviderCoordinator::new(
             vec![RegisteredProvider::new(
                 provider_config(""),
-                GeneratingProvider(echo_provider(SourceInput::Anonymous)),
+                GeneratingProvider(echo_provider(SourceInput::Anonymous), source),
             )],
             partners(),
             Duration::from_millis(200),
@@ -1537,6 +1569,21 @@ mod tests {
             lookup.entries[0].1[0].uids()[0].id().as_str(),
             "generated-1",
             "should store the generated ID"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send no lookup");
+    }
+
+    #[test]
+    fn a_generated_id_matches_its_due_source_after_normalizing() {
+        let coordinator = generating_coordinator_for("IDS.example.com");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &missing(), &granting());
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            matches!(lookup.status, LookupStatus::Found { kept: 1, .. }),
+            "should keep the generated UID for a differently cased source"
         );
         assert!(transport.sent.borrow().is_empty(), "should send no lookup");
     }

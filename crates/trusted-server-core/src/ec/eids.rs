@@ -7,6 +7,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use error_stack::{Report, ResultExt as _};
 
+use crate::consent::{ConsentContext, tcf_vendor_consent_denied};
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 
@@ -102,15 +103,22 @@ pub fn source_views<'row>(
 impl KvEntry {
     /// Iterates live entries for registered, `bidstream_enabled` sources in
     /// source order, borrowing from the row.
+    ///
+    /// A source whose owning provider has a TCF vendor ID is skipped while
+    /// `consent` withholds that vendor's consent.
     pub fn live_eids<'row>(
         &'row self,
         registry: &'row PartnerRegistry,
+        consent: &'row ConsentContext,
         now: UnixSeconds,
     ) -> impl Iterator<Item = EidView<'row>> + 'row {
         self.ids.iter().flat_map(move |(source, record)| {
-            let partner = registry
-                .get(source)
-                .filter(|partner| partner.bidstream_enabled);
+            let partner = registry.get(source).filter(|partner| {
+                partner.bidstream_enabled
+                    && !partner
+                        .owner_tcf_vendor_id
+                        .is_some_and(|vendor| tcf_vendor_consent_denied(consent, vendor))
+            });
             partner
                 .into_iter()
                 .flat_map(move |partner| source_views(source, record, partner.openrtb_atype, now))
@@ -175,6 +183,8 @@ mod tests {
     use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
+    use crate::test_support::tests::consent_granting_vendors;
+    use std::num::NonZeroU16;
 
     fn make_test_partner(source_domain: &str) -> EcPartner {
         EcPartner {
@@ -278,7 +288,7 @@ mod tests {
         );
 
         let eids: Vec<Eid> = entry
-            .live_eids(&registry, UnixSeconds::new(20))
+            .live_eids(&registry, &ConsentContext::default(), UnixSeconds::new(20))
             .map(Eid::from)
             .collect();
 
@@ -293,6 +303,37 @@ mod tests {
     }
 
     #[test]
+    fn live_eids_withhold_a_source_whose_owner_lacks_vendor_consent() {
+        let mut registry = registry_with("ids.example.com", true);
+        assert!(
+            registry.mark_provider_owned("ids.example.com", NonZeroU16::new(9999)),
+            "should mark the source"
+        );
+        let mut entry = KvEntry::minimal("ids.example.com", "placeholder", 1);
+        entry.ids.insert(
+            "ids.example.com".to_owned(),
+            provider_record(&[("p-1", Expiry::Never)]),
+        );
+        let denied = consent_granting_vendors(vec![1]);
+        let granted = consent_granting_vendors(vec![9999]);
+
+        assert_eq!(
+            entry
+                .live_eids(&registry, &denied, UnixSeconds::new(0))
+                .count(),
+            0,
+            "should withhold the provider's UIDs without its vendor consent"
+        );
+        assert_eq!(
+            entry
+                .live_eids(&registry, &granted, UnixSeconds::new(0))
+                .count(),
+            1,
+            "should serve the provider's UIDs with its vendor consent"
+        );
+    }
+
+    #[test]
     fn live_eids_respect_bidstream_flag() {
         let registry = registry_with("ids.example.com", false);
         let mut entry = KvEntry::minimal("ids.example.com", "v", 1);
@@ -300,7 +341,9 @@ mod tests {
             .ids
             .insert("ids.example.com".to_owned(), KvPartnerId::single("v"));
         assert_eq!(
-            entry.live_eids(&registry, UnixSeconds::new(0)).count(),
+            entry
+                .live_eids(&registry, &ConsentContext::default(), UnixSeconds::new(0))
+                .count(),
             0,
             "should hide non-bidstream source"
         );
@@ -314,7 +357,7 @@ mod tests {
             .ids
             .insert("ids.example.com".to_owned(), KvPartnerId::single("v"));
         let eids: Vec<Eid> = entry
-            .live_eids(&registry, UnixSeconds::new(0))
+            .live_eids(&registry, &ConsentContext::default(), UnixSeconds::new(0))
             .map(Eid::from)
             .collect();
         assert_eq!(eids[0].uids[0].id, "v", "should emit legacy uid");

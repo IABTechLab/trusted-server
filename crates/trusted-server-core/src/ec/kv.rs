@@ -23,7 +23,7 @@ use super::generation::ec_hash;
 use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use super::kv_types::{KvEntry, KvMetadata, KvNetwork, MAX_ENTRY_BYTES};
 use super::page_load::{AfterResponseWrite, Generation, KvWriteError, PageLoadWrite, RowChange};
-use super::{EcKvSnapshot, current_timestamp, log_id};
+use super::{EcKvSnapshot, checked_current_timestamp, current_timestamp, log_id};
 
 /// Maximum number of CAS retry attempts before giving up.
 const MAX_CAS_RETRIES: u32 = 5;
@@ -60,6 +60,17 @@ pub enum UpsertResult {
     ConsentWithdrawn,
     /// The partner ID already had the requested UID, so no write was needed.
     Unchanged,
+    /// The row with this partner ID would exceed [`MAX_ENTRY_BYTES`], so
+    /// nothing was written. Retrying gives the same result.
+    RowFull,
+}
+
+/// A serialized entry, or the size that kept it from being written.
+enum SerializedEntry {
+    /// Body and metadata ready to write.
+    Fits { body: String, meta: String },
+    /// The body is this many bytes, over [`MAX_ENTRY_BYTES`].
+    TooLarge(usize),
 }
 
 /// Partner UID update to apply to a KV identity graph entry.
@@ -161,10 +172,30 @@ impl KvIdentityGraph {
     }
 
     /// Serializes an entry body and metadata for insertion.
+    ///
+    /// A body over [`MAX_ENTRY_BYTES`] is an error; callers that report a
+    /// full row separately use [`Self::serialize_entry_unless_full`].
     fn serialize_entry(
         entry: &KvEntry,
         store_name: &str,
     ) -> Result<(String, String), Report<TrustedServerError>> {
+        match Self::serialize_entry_unless_full(entry, store_name)? {
+            SerializedEntry::Fits { body, meta } => Ok((body, meta)),
+            SerializedEntry::TooLarge(bytes) => Err(Report::new(TrustedServerError::KvStore {
+                store_name: store_name.to_owned(),
+                message: format!(
+                    "Refusing to write KV entry of {bytes} bytes (limit {MAX_ENTRY_BYTES})"
+                ),
+            })),
+        }
+    }
+
+    /// Serializes an entry body and metadata, reporting an oversized body as
+    /// [`SerializedEntry::TooLarge`] rather than an error.
+    fn serialize_entry_unless_full(
+        entry: &KvEntry,
+        store_name: &str,
+    ) -> Result<SerializedEntry, Report<TrustedServerError>> {
         entry.validate().map_err(|message| {
             Report::new(TrustedServerError::KvStore {
                 store_name: store_name.to_owned(),
@@ -177,13 +208,7 @@ impl KvIdentityGraph {
             message: "Failed to serialize KV entry body".to_owned(),
         })?;
         if body.len() > MAX_ENTRY_BYTES {
-            return Err(Report::new(TrustedServerError::KvStore {
-                store_name: store_name.to_owned(),
-                message: format!(
-                    "Refusing to write KV entry of {} bytes (limit {MAX_ENTRY_BYTES})",
-                    body.len()
-                ),
-            }));
+            return Ok(SerializedEntry::TooLarge(body.len()));
         }
         let meta = KvMetadata::from_entry(entry);
         let meta_str =
@@ -191,7 +216,10 @@ impl KvIdentityGraph {
                 store_name: store_name.to_owned(),
                 message: "Failed to serialize KV entry metadata".to_owned(),
             })?;
-        Ok((body, meta_str))
+        Ok(SerializedEntry::Fits {
+            body,
+            meta: meta_str,
+        })
     }
 
     /// Reads the raw stored body, metadata, and generation for an EC ID key.
@@ -354,13 +382,9 @@ impl KvIdentityGraph {
 
     /// Applies the navigation's single row change in one attempt.
     ///
-    /// The `permit` is consumed, so a navigation cannot write twice. A
-    /// successful tombstone write also records the existing
-    /// withdrawal-completion marker: that second insert is the one deliberate
-    /// exception to the one-write-per-page-load rule. It predates the rule and
-    /// is kept because later withdrawals rely on it to skip the strongly
-    /// consistent existence check of an already-withdrawn row; it never changes
-    /// the identity row itself.
+    /// The `permit` is consumed, so a navigation cannot write twice. Consent
+    /// withdrawals do not go through here: their tombstone is a privacy write
+    /// on any request ([`Self::tombstone_existing_from_snapshot`]).
     ///
     /// # Errors
     ///
@@ -375,29 +399,13 @@ impl KvIdentityGraph {
         change: RowChange,
     ) -> Result<KvEntry, Report<KvWriteError>> {
         permit.spend();
-        let is_tombstone = matches!(change, RowChange::Tombstone { .. });
-        let (entry, ttl, mode) = match change {
-            RowChange::Create(entry) => (entry, ENTRY_TTL, EcKvWriteMode::Add),
-            RowChange::Update { entry, expected } => (
-                entry,
-                ENTRY_TTL,
-                EcKvWriteMode::IfGenerationMatch(expected.get()),
-            ),
-            RowChange::Tombstone { expected } => (
-                KvEntry::tombstone(current_timestamp()),
-                TOMBSTONE_TTL,
-                EcKvWriteMode::IfGenerationMatch(expected.get()),
-            ),
+        let (entry, mode) = match change {
+            RowChange::Create(entry) => (entry, EcKvWriteMode::Add),
+            RowChange::Update { entry, expected } => {
+                (entry, EcKvWriteMode::IfGenerationMatch(expected.get()))
+            }
         };
-        self.write_row(ec_id, &entry, ttl, mode)?;
-        if is_tombstone {
-            // Deliberate exception to the one-write-per-page-load rule:
-            // the withdrawal-completion marker is a separate key that
-            // predates the rule. Later withdrawals use it to avoid a
-            // strongly consistent existence check on a row already
-            // withdrawn, and it never touches the identity row.
-            self.record_withdrawal_completion(ec_id, entry.consent.updated);
-        }
+        self.write_row(ec_id, &entry, ENTRY_TTL, mode)?;
         Ok(entry)
     }
 
@@ -459,8 +467,9 @@ impl KvIdentityGraph {
     /// - **Existing tombstone** (`consent.ok = false`) — CAS overwrite with
     ///   the new entry. Retries up to [`MAX_CAS_RETRIES`] on conflict.
     ///
-    /// This method is reserved for explicit same-key revival. Production EC
-    /// generation uses [`Self::create_if_absent`] with a freshly generated ID.
+    /// This method is reserved for explicit same-key revival. A freshly
+    /// generated EC's row is created by the navigation's page-load write
+    /// ([`Self::commit_page_load`]).
     ///
     /// # Errors
     ///
@@ -635,11 +644,29 @@ impl KvIdentityGraph {
             if !apply_partner_id_updates(&mut entry, updates) {
                 return current;
             }
-            let Ok((body, meta_str)) = Self::serialize_entry(&entry, self.store_name()) else {
-                return EcKvSnapshot::Failed {
-                    ec_id: ec_id.to_owned(),
+            let (body, meta_str) =
+                match Self::serialize_entry_unless_full(&entry, self.store_name()) {
+                    Ok(SerializedEntry::Fits { body, meta }) => (body, meta),
+                    Ok(SerializedEntry::TooLarge(bytes)) => {
+                        log::warn!(
+                            "snapshot partner upsert for '{}' skipped: row would be {bytes} bytes \
+                             (limit {MAX_ENTRY_BYTES})",
+                            log_id(ec_id)
+                        );
+                        return EcKvSnapshot::Failed {
+                            ec_id: ec_id.to_owned(),
+                        };
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "snapshot partner upsert for '{}' could not serialize the row: {err:?}",
+                            log_id(ec_id)
+                        );
+                        return EcKvSnapshot::Failed {
+                            ec_id: ec_id.to_owned(),
+                        };
+                    }
                 };
-            };
             match self.write_entry(
                 ec_id,
                 &body,
@@ -836,7 +863,18 @@ impl KvIdentityGraph {
                 super::kv_types::KvPartnerId::single(uid.to_owned()),
             );
 
-            let (body, meta_str) = Self::serialize_entry(&entry, self.store_name())?;
+            let (body, meta_str) =
+                match Self::serialize_entry_unless_full(&entry, self.store_name())? {
+                    SerializedEntry::Fits { body, meta } => (body, meta),
+                    SerializedEntry::TooLarge(bytes) => {
+                        log::warn!(
+                            "upsert_partner_id_if_exists: row for '{}' would be {bytes} bytes \
+                             (limit {MAX_ENTRY_BYTES}); partner '{partner_id}' not written",
+                            log_id(ec_id),
+                        );
+                        return Ok(UpsertResult::RowFull);
+                    }
+                };
 
             match self.write_entry(
                 ec_id,
@@ -1074,7 +1112,6 @@ impl KvIdentityGraph {
         self.overwrite_withdrawal_tombstone(ec_id).map(Some)
     }
 
-    #[cfg(test)]
     fn overwrite_withdrawal_tombstone(
         &self,
         ec_id: &str,
@@ -1096,6 +1133,199 @@ impl KvIdentityGraph {
                 message: format!("Failed to write tombstone for key '{}'", log_id(ec_id)),
             })
         })
+    }
+
+    /// Writes a withdrawal tombstone only when an existing row can be confirmed.
+    ///
+    /// This is a privacy write outside the one-write-per-page-load rule: it
+    /// runs on any finalized request that carries an explicit withdrawal and
+    /// an EC cookie, whatever the route or response status.
+    ///
+    /// Existing-key-only behavior is deliberate: a forged or expired `ts-ec`
+    /// cookie must not mint a row. But a *point read* cannot prove absence on
+    /// an eventually-consistent store, and dropping a withdrawal is worse than
+    /// a redundant read, so absence is established in two stages:
+    ///
+    /// 1. Any snapshot that is not a usable `Present` for this EC ID — a
+    ///    publisher preload that read `Missing`, a read that `Failed`, or one
+    ///    lacking a CAS generation — is re-read.
+    /// 2. A re-read that still reports the row absent is checked against
+    ///    [`key_exists_confirmed`](Self::key_exists_confirmed), which reads
+    ///    the primary data source.
+    ///
+    /// A tombstone is idempotent, so a CAS conflict re-reads and retries up to
+    /// [`MAX_CAS_RETRIES`] times. Resolving the initial snapshot happens
+    /// outside the retry counter.
+    pub(crate) fn tombstone_existing_from_snapshot(
+        &self,
+        ec_id: &str,
+        snapshot: EcKvSnapshot,
+    ) -> EcKvSnapshot {
+        let mut current = match snapshot {
+            EcKvSnapshot::Present {
+                ec_id: ref snapshot_id,
+                ref entry,
+                ..
+            } if snapshot_id == ec_id && !entry.consent.ok => return snapshot,
+            EcKvSnapshot::Present {
+                ec_id: ref snapshot_id,
+                generation: Some(_),
+                ..
+            } if snapshot_id == ec_id => snapshot,
+            _ => self.load_snapshot(ec_id),
+        };
+
+        for _attempt in 0..MAX_CAS_RETRIES {
+            let generation = match current {
+                EcKvSnapshot::Present {
+                    ec_id: ref snapshot_id,
+                    ref entry,
+                    ..
+                } if snapshot_id == ec_id && !entry.consent.ok => return current,
+                EcKvSnapshot::Present {
+                    ec_id: ref snapshot_id,
+                    generation: Some(generation),
+                    ..
+                } if snapshot_id == ec_id => generation,
+                // A missing row (including one that disappeared mid-retry) is
+                // only a no-op once absence is proven against the primary data
+                // source.
+                EcKvSnapshot::Missing {
+                    ec_id: ref snapshot_id,
+                } if snapshot_id == ec_id => {
+                    return self.tombstone_unproven_missing(
+                        ec_id,
+                        current,
+                        checked_current_timestamp(),
+                    );
+                }
+                // A refreshed read that failed (or any other unusable state)
+                // fails closed rather than silently dropping the withdrawal.
+                _ => {
+                    return EcKvSnapshot::Failed {
+                        ec_id: ec_id.to_owned(),
+                    };
+                }
+            };
+
+            let tombstone = KvEntry::tombstone(current_timestamp());
+            let Ok((body, meta_str)) = Self::serialize_entry(&tombstone, self.store_name()) else {
+                return EcKvSnapshot::Failed {
+                    ec_id: ec_id.to_owned(),
+                };
+            };
+            match self.write_entry(
+                ec_id,
+                &body,
+                &meta_str,
+                TOMBSTONE_TTL,
+                EcKvWriteMode::IfGenerationMatch(generation),
+            ) {
+                Ok(EcKvWriteOutcome::Written) => {
+                    self.record_withdrawal_completion(ec_id, tombstone.consent.updated);
+                    return EcKvSnapshot::Present {
+                        ec_id: ec_id.to_owned(),
+                        entry: Box::new(tombstone),
+                        generation: None,
+                    };
+                }
+                Ok(EcKvWriteOutcome::PreconditionFailed) => {
+                    current = self.load_snapshot(ec_id);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "conditional withdrawal tombstone failed for '{}': {err:?}",
+                        log_id(ec_id)
+                    );
+                    return EcKvSnapshot::Failed {
+                        ec_id: ec_id.to_owned(),
+                    };
+                }
+            }
+        }
+
+        log::warn!(
+            "withdrawal tombstone for '{}': CAS conflict after {MAX_CAS_RETRIES} retries; the \
+             identity-graph row may still be live with consent granted",
+            log_id(ec_id)
+        );
+        EcKvSnapshot::Failed {
+            ec_id: ec_id.to_owned(),
+        }
+    }
+
+    /// Resolves a withdrawal whose row read as missing.
+    ///
+    /// A still-valid completion marker or a confirmed absent root means
+    /// there is nothing to withdraw, and a forged cookie must not mint a row. A
+    /// key that provably exists is tombstoned unconditionally because no CAS
+    /// generation is available after a missed read. Marker-check failure falls
+    /// back to that privacy write; root-existence failure leaves withdrawal
+    /// unresolved rather than silently dropped.
+    fn tombstone_unproven_missing(
+        &self,
+        ec_id: &str,
+        missing: EcKvSnapshot,
+        now: Option<u64>,
+    ) -> EcKvSnapshot {
+        match self.withdrawal_marker_exists(ec_id, now) {
+            Ok(true) => {
+                log::debug!(
+                    "withdrawal tombstone for '{}': completion marker already exists",
+                    log_id(ec_id)
+                );
+                return missing;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                // Marker failure must not weaken withdrawal. Fall back to the
+                // existing root existence check and unconditional privacy write.
+                log::warn!(
+                    "withdrawal completion marker lookup failed for '{}': {err:?}",
+                    log_id(ec_id)
+                );
+            }
+        }
+
+        match self.key_exists_confirmed(ec_id) {
+            Ok(false) => missing,
+            Ok(true) => {
+                log::warn!(
+                    "withdrawal tombstone for '{}': point read missed a row the store still \
+                     lists; writing an unconditional tombstone",
+                    log_id(ec_id)
+                );
+                match self.overwrite_withdrawal_tombstone(ec_id) {
+                    Ok(tombstone) => {
+                        self.record_withdrawal_completion(ec_id, tombstone.consent.updated);
+                        EcKvSnapshot::Present {
+                            ec_id: ec_id.to_owned(),
+                            entry: Box::new(tombstone),
+                            generation: None,
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "unconditional withdrawal tombstone failed for '{}': {err:?}",
+                            log_id(ec_id)
+                        );
+                        EcKvSnapshot::Failed {
+                            ec_id: ec_id.to_owned(),
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "withdrawal tombstone for '{}': existence check failed, cannot confirm \
+                     absence: {err:?}",
+                    log_id(ec_id)
+                );
+                EcKvSnapshot::Failed {
+                    ec_id: ec_id.to_owned(),
+                }
+            }
+        }
     }
 
     /// Counts the number of keys sharing the same EC hash prefix.
@@ -1170,7 +1400,20 @@ impl KvIdentityGraph {
         network.cluster_size = Some(cluster_size);
         updated_entry.network = Some(network);
 
-        let (body, meta_str) = Self::serialize_entry(&updated_entry, self.store_name())?;
+        let (body, meta_str) =
+            match Self::serialize_entry_unless_full(&updated_entry, self.store_name())? {
+                SerializedEntry::Fits { body, meta } => (body, meta),
+                SerializedEntry::TooLarge(bytes) => {
+                    // The computed value is still valid; only the cache write
+                    // is skipped.
+                    log::warn!(
+                        "evaluate_cluster: row for '{}' would be {bytes} bytes \
+                         (limit {MAX_ENTRY_BYTES}); cluster_size not stored",
+                        log_id(ec_id)
+                    );
+                    return Ok(Some(cluster_size));
+                }
+            };
 
         match self.write_entry(
             ec_id,
@@ -1225,6 +1468,16 @@ impl KvIdentityGraph {
         ))
     }
 
+    /// A graph holding `entry` at `ec_id` whose reads succeed and whose
+    /// writes all fail.
+    pub(crate) fn write_failing_with(ec_id: &str, entry: &KvEntry) -> Self {
+        let store = super::kv_backend::test_support::WriteFailingEcKv::new();
+        let (body, meta) = Self::serialize_entry(entry, store.store_name())
+            .expect("should serialize the seed row");
+        store.seed(ec_id, &body, &meta);
+        Self::new(store)
+    }
+
     /// Test helper: a graph backed by an in-memory store with generation
     /// tracking.
     pub(crate) fn in_memory(store_name: impl Into<String>) -> Self {
@@ -1271,9 +1524,8 @@ mod tests {
     use super::*;
     use crate::ec::checked_current_timestamp;
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue, UnixSeconds};
-    use crate::ec::kv_backend::test_support::InMemoryEcKv;
+    use crate::ec::kv_backend::test_support::{InMemoryEcKv, WriteFailingEcKv};
     use crate::ec::kv_types::{KvEid, KvUid};
-    use crate::ec::page_load::{Generation, NavigationPermit};
 
     fn snapshot_ec_id() -> String {
         format!("{}.ABC123", "a".repeat(64))
@@ -1314,7 +1566,7 @@ mod tests {
         entry.ids.insert(
             "ssp_x".to_owned(),
             crate::ec::kv_types::KvPartnerId::single(
-                "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
+                "x".repeat(crate::ec::kv_types::MAX_STORED_UID_LENGTH + 1),
             ),
         );
         entry.ids.insert(
@@ -1354,7 +1606,7 @@ mod tests {
         entry.ids.insert(
             "ssp_x".to_owned(),
             crate::ec::kv_types::KvPartnerId::single(
-                "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
+                "x".repeat(crate::ec::kv_types::MAX_STORED_UID_LENGTH + 1),
             ),
         );
 
@@ -1997,6 +2249,46 @@ mod tests {
     }
 
     #[test]
+    fn upsert_partner_id_if_exists_reports_a_full_row_without_writing() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = live_entry();
+        let uid = "u".repeat(500);
+        let mut partner = 0;
+        while serde_json::to_string(&entry)
+            .expect("should serialize entry")
+            .len()
+            < MAX_ENTRY_BYTES - 600
+        {
+            entry.ids.insert(
+                format!("ssp{partner}.example.com"),
+                crate::ec::kv_types::KvPartnerId::single(uid.clone()),
+            );
+            partner += 1;
+        }
+        kv.create(&ec_id, &entry)
+            .expect("should create a near-full row");
+
+        let result = kv
+            .upsert_partner_id_if_exists(&ec_id, "full.example.com", &uid)
+            .expect("should report a full row as a result, not an error");
+
+        assert_eq!(
+            result,
+            UpsertResult::RowFull,
+            "should refuse a partner ID that would overflow the row"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read the row")
+            .expect("should keep the row");
+        assert!(
+            !stored.ids.contains_key("full.example.com"),
+            "should not write the refused partner ID"
+        );
+    }
+
+    #[test]
     fn upsert_partner_id_if_exists_writes_and_detects_unchanged() {
         let kv = KvIdentityGraph::in_memory("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
@@ -2339,53 +2631,6 @@ mod tests {
                 }
                 return Err(self.marker_error("delete"));
             }
-            self.inner.delete(key)
-        }
-    }
-
-    /// [`EcKvStore`] whose reads succeed but every write fails, simulating a
-    /// store that becomes unwritable mid-request.
-    struct WriteFailingEcKv {
-        inner: InMemoryEcKv,
-    }
-
-    impl WriteFailingEcKv {
-        fn new() -> Self {
-            Self {
-                inner: InMemoryEcKv::new("write-failing-store"),
-            }
-        }
-    }
-
-    impl EcKvStore for WriteFailingEcKv {
-        fn store_name(&self) -> &str {
-            self.inner.store_name()
-        }
-        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-            self.inner.lookup(key)
-        }
-        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-            self.inner.key_exists(key)
-        }
-
-        fn insert(
-            &self,
-            _key: &str,
-            _write: EcKvWrite<'_>,
-        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
-            Err(Report::new(TrustedServerError::KvStore {
-                store_name: self.inner.store_name().to_owned(),
-                message: "write failing test store".to_owned(),
-            }))
-        }
-        fn list_keys_with_prefix(
-            &self,
-            prefix: &str,
-            limit: u32,
-        ) -> Result<Vec<String>, Report<TrustedServerError>> {
-            self.inner.list_keys_with_prefix(prefix, limit)
-        }
-        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
             self.inner.delete(key)
         }
     }
@@ -3123,13 +3368,13 @@ mod tests {
     }
 
     fn tombstone_via_page_load(kv: &KvIdentityGraph, ec_id: &str) {
-        let snapshot = kv.load_snapshot(ec_id);
-        let expected = Generation::of(&snapshot, ec_id).expect("should read generation");
-        let permit = NavigationPermit::for_test()
-            .confirm(http::StatusCode::OK)
-            .expect("should confirm permit");
-        kv.commit_page_load(permit, ec_id, RowChange::Tombstone { expected })
-            .expect("should write tombstone");
+        let outcome = kv.tombstone_existing_from_snapshot(ec_id, EcKvSnapshot::NotRead);
+        assert!(
+            outcome
+                .entry_for(ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "should write tombstone"
+        );
     }
 
     #[test]

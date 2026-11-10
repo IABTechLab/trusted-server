@@ -11,7 +11,7 @@ use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::value::RawValue;
 
-use super::kv_types::MAX_UID_LENGTH;
+use super::kv_types::MAX_STORED_UID_LENGTH;
 use super::partner::normalize_partner_source_domain;
 
 /// Maximum serialized size of an `ext` object, in bytes.
@@ -27,7 +27,7 @@ pub enum EidValidationError {
     /// The UID is blank.
     #[display("UID is empty")]
     EmptyUid,
-    /// The UID exceeds [`MAX_UID_LENGTH`].
+    /// The UID exceeds [`MAX_STORED_UID_LENGTH`].
     #[display("UID is too long")]
     UidTooLong,
     /// The agent type is negative.
@@ -170,7 +170,7 @@ impl<'de> Deserialize<'de> for SourceDomain {
     }
 }
 
-/// A non-blank UID of at most [`MAX_UID_LENGTH`] bytes, kept verbatim.
+/// A non-blank UID of at most [`MAX_STORED_UID_LENGTH`] bytes, kept verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, derive_more::Display)]
 #[serde(try_from = "String")]
 pub struct UidValue(Box<str>);
@@ -186,7 +186,7 @@ impl UidValue {
         if value.trim().is_empty() {
             return Err(EidValidationError::EmptyUid);
         }
-        if value.len() > MAX_UID_LENGTH {
+        if value.len() > MAX_STORED_UID_LENGTH {
             return Err(EidValidationError::UidTooLong);
         }
         Ok(())
@@ -380,7 +380,12 @@ impl RawJson {
         if text.len() > MAX_EXT_BYTES || !text.trim_start().starts_with('{') {
             return Err(EidValidationError::InvalidExt);
         }
-        Ok(())
+        // `RawValue` skips nested values without serde_json's recursion limit,
+        // so parse once here: an `ext` that cannot become a `Value` would make
+        // `to_value` panic on every serve of the row.
+        serde_json::from_str::<serde_json::Value>(text)
+            .map(|_| ())
+            .map_err(|_| EidValidationError::InvalidExt)
     }
 }
 
@@ -440,7 +445,7 @@ mod tests {
     #[test]
     fn uid_value_rejects_blank_and_oversized() {
         assert!(UidValue::try_from("  ").is_err(), "should reject blank UID");
-        let long = "a".repeat(MAX_UID_LENGTH + 1);
+        let long = "a".repeat(MAX_STORED_UID_LENGTH + 1);
         assert!(
             UidValue::try_from(long.as_str()).is_err(),
             "should reject oversized UID"
@@ -532,6 +537,23 @@ mod tests {
         assert!(
             RawJson::try_from(big.as_ref()).is_err(),
             "should reject oversized ext"
+        );
+    }
+
+    #[test]
+    fn raw_json_rejects_ext_nested_past_the_parse_limit() {
+        let depth = 150;
+        let text = format!("{}1{}", r#"{"a":"#.repeat(depth), "}".repeat(depth));
+        let raw: Box<RawValue> =
+            serde_json::from_str(&text).expect("should read deep JSON as a raw value");
+        assert!(
+            text.len() <= MAX_EXT_BYTES,
+            "should fit the size limit so only the depth is under test"
+        );
+
+        assert!(
+            RawJson::try_from(raw).is_err(),
+            "should reject an ext that cannot be parsed into a value"
         );
     }
 

@@ -26,6 +26,7 @@ use serde_json::Value as JsonValue;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
 
+use crate::consent::ConsentContext;
 use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use crate::cookies::extract_cookie_value;
 use crate::error::TrustedServerError;
@@ -508,9 +509,15 @@ fn iso_timestamp(unix_seconds: u64) -> Option<String> {
 /// Derives the auction EID view for a valid entry through the same
 /// [`KvEntry::live_eids`] resolution the live auction uses, reporting why each
 /// stored ID was skipped.
+///
+/// Vendor consent belongs to the visitor's request, which this diagnostic
+/// does not have, so no source is withheld for it here.
 fn build_auction_view(registry: &PartnerRegistry, entry: &KvEntry) -> AuctionEidsView {
     let now = UnixSeconds::new(current_timestamp());
-    let eids = entry.live_eids(registry, now).map(Eid::from).collect();
+    let eids = entry
+        .live_eids(registry, &ConsentContext::default(), now)
+        .map(Eid::from)
+        .collect();
 
     let mut skipped = Vec::new();
     for (source_domain, partner_uid) in &entry.ids {
@@ -1442,7 +1449,7 @@ mod tests {
 
     #[test]
     fn eids_lookup_reports_configured_source_without_valid_uid() {
-        let oversized_uid = "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1);
+        let oversized_uid = "x".repeat(crate::ec::kv_types::MAX_STORED_UID_LENGTH + 1);
         let cookie = eids_cookie_for(&serde_json::json!([{
             "source": "bidstream.example",
             "uids": [
@@ -1596,7 +1603,11 @@ mod tests {
 
         let view_json = serde_json::to_value(&view.eids).expect("should serialize view eids");
         let live: Vec<Eid> = entry
-            .live_eids(&registry, UnixSeconds::new(current_timestamp()))
+            .live_eids(
+                &registry,
+                &ConsentContext::default(),
+                UnixSeconds::new(current_timestamp()),
+            )
             .map(Eid::from)
             .collect();
         assert_eq!(

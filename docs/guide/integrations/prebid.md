@@ -865,12 +865,10 @@ page or auction. When available, the opaque value follows the standard path:
 2. The current `/auction` request includes that entry.
 3. Trusted Server merges and consent-gates it, then forwards it to Prebid
    Server as `user.ext.eids`.
-4. After the response, the same `/auction` request ingests the body entry into
-   an EC/KV partner configured with `source_domain = "liveramp.com"`, when that
-   partner UID is not already stored.
-5. The browser also persists the opaque value in the bounded `ts-eids` cookie,
-   which lets requests without an EID body, such as `GET /_ts/page-bids` and
-   page navigations, ingest it.
+4. The browser also persists the opaque value in the bounded `ts-eids` cookie.
+   The next top-level page navigation ingests it into an EC/KV partner
+   configured with `source_domain = "liveramp.com"`, when that partner UID is
+   not already stored. `/auction` and `GET /_ts/page-bids` never write KV.
 
 Trusted Server treats the RampID envelope as an opaque string. Do not log,
 decode, publish, or dimension metrics by the value. Source names, counts,
@@ -902,20 +900,20 @@ server-to-server ATS API.
 
 ### Degraded behavior
 
-| Condition                                                 | Result                                                                                             |
-| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| TCF Purpose 1 or LiveRamp vendor consent is denied        | Default `tcfControl` blocks IdentityLink resolution and storage                                    |
-| TCF Purpose 3 or 4 alone is denied                        | Resolution/storage continues under defaults; publisher rules may differ                            |
-| The user opts out under a US state signal                 | No LiveRamp EID is forwarded; the auction continues                                                |
-| LiveRamp cannot recognize the browser                     | IdentityLink yields no EID; the auction continues                                                  |
-| LiveRamp network resolution fails                         | The current auction continues without RampID                                                       |
-| The managed module is missing from the bundle             | Existing diagnostics report the missing module; auctions continue                                  |
-| The origin is not approved by LiveRamp                    | Resolution yields no usable EID; the auction continues                                             |
-| EC/KV is unavailable                                      | A current-request EID can still reach `/auction`; persistence degrades                             |
-| The resolved envelope exceeds the 1024-byte EID value cap | The envelope is dropped from both the `/auction` payload and EC persistence; the auction continues |
-| The CMP is callable but never returns a settled result    | The managed entry is never seeded; no vendor call, no identity storage, and the auction continues  |
-| Two managed entries address one Prebid submodule          | The later entry is dropped with a logged error; the first entry's configuration takes effect       |
-| A silent CMP stub is replaced by a working CMP            | The shim re-subscribes to the replacement; a CMP that already answered once keeps its own wait     |
+| Condition                                                | Result                                                                                             |
+| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| TCF Purpose 1 or LiveRamp vendor consent is denied       | Default `tcfControl` blocks IdentityLink resolution and storage                                    |
+| TCF Purpose 3 or 4 alone is denied                       | Resolution/storage continues under defaults; publisher rules may differ                            |
+| The user opts out under a US state signal                | No LiveRamp EID is forwarded; the auction continues                                                |
+| LiveRamp cannot recognize the browser                    | IdentityLink yields no EID; the auction continues                                                  |
+| LiveRamp network resolution fails                        | The current auction continues without RampID                                                       |
+| The managed module is missing from the bundle            | Existing diagnostics report the missing module; auctions continue                                  |
+| The origin is not approved by LiveRamp                   | Resolution yields no usable EID; the auction continues                                             |
+| EC/KV is unavailable                                     | A current-request EID can still reach `/auction`; persistence degrades                             |
+| The resolved envelope exceeds the 512-byte EID value cap | The envelope is dropped from both the `/auction` payload and EC persistence; the auction continues |
+| The CMP is callable but never returns a settled result   | The managed entry is never seeded; no vendor call, no identity storage, and the auction continues  |
+| Two managed entries address one Prebid submodule         | The later entry is dropped with a logged error; the first entry's configuration takes effect       |
+| A silent CMP stub is replaced by a working CMP           | The shim re-subscribes to the replacement; a CMP that already answered once keeps its own wait     |
 
 The TCF rows assume either the managed-ID automatic setup described above or a
 publisher-owned Prebid GDPR configuration. A CMP API and its policy remain
@@ -932,7 +930,7 @@ domain, booleans, source names, counts, and status codes:
    `identityLink` entry with the test Placement ID.
 2. With positive consent, confirm `idl_env` is created or refreshed.
 3. Record the byte length of the resolved envelope — the length only, never the
-   value — and confirm it is at or below the 1024-byte EID value cap. Anything
+   value — and confirm it is at or below the 512-byte EID value cap. Anything
    above it is dropped as described in the degraded-behavior table.
 4. Confirm `pbjs.getUserIdsAsEids()` reports source `liveramp.com` without
    recording its value.
@@ -958,9 +956,9 @@ Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions
 2. **Server-side EIDs from the EC/KV identity graph** are resolved on the edge from the current EC ID.
 3. Trusted Server **merges and deduplicates** both sets before calling Prebid Server.
 4. The merged result is forwarded downstream as `user.ext.eids` in the OpenRTB request.
-5. After the response, Trusted Server adds matched partner UIDs that are missing from the EC identity graph, reading the `ts-eids` cookie, then the `/auction` request-body EIDs, then the `sharedId` cookie. Because the body carries the untrimmed EID set, `/auction` ingestion is not limited by the size-capped `ts-eids` cookie.
+5. On the next top-level page navigation, Trusted Server adds matched partner UIDs that are missing from the EC identity graph, reading the `ts-eids` cookie, then the `sharedId` cookie. The `/auction` request-body EIDs go to bidders on that request only and are never stored, so ingestion is limited by the size-capped `ts-eids` cookie.
 
-The `ts-eids` cookie still matters for requests without an EID body, such as `GET /_ts/page-bids` and page navigations, where it is the source for both EID fallback and identity-graph ingestion. Identity-graph EID writes follow the same consent rule as bidstream forwarding: under GDPR, TCF Purpose 1 and Purpose 4 must both be consented.
+The `ts-eids` cookie also supplies the EID fallback for requests without an EID body, such as `GET /_ts/page-bids`. Identity-graph EID writes follow the same consent rule as bidstream forwarding: under GDPR, TCF Purpose 1 and Purpose 4 must both be consented.
 
 This means Prebid auctions get same-request transparency for browser-resolved IDs without giving up the durability of the server-managed EC identity graph.
 

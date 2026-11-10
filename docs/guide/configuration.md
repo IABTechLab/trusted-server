@@ -757,8 +757,8 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 | `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                     |
 | `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
 | `partners`                          | Array          | No       | Static partner registry entries                                         |
-| `identity_budget_ms`                | Integer        | No       | Shared time budget for identity provider lookups (default 200)          |
-| `identity_after_response_budget_ms` | Integer        | No       | Time budget for `collect = "after_response"` lookups (default 2000)     |
+| `identity_budget_ms`                | Integer        | No       | Shared identity lookup budget, 1–1000 ms (default 200)                  |
+| `identity_after_response_budget_ms` | Integer        | No       | After-response lookup budget, 1–5000 ms (default 2000)                  |
 | `identity_providers`                | Array          | No       | Server-side identity providers (see below)                              |
 
 ::: tip Partner keying
@@ -800,9 +800,20 @@ share the `identity_budget_ms` budget, and are collected before the response is
 finalized. Results go into the navigation's single EC row write. A lookup that
 times out or fails leaves the row unchanged.
 
-Lookups run only for an existing or newly issued EC, only when consent allows
-EID persistence, and, when `tcf_vendor_id` is set and TCF applies to the
-request, only with TCF vendor consent for that vendor.
+Lookups run only for an EC issued on an earlier request (an EC minted on this
+navigation is looked up on the next one), only when consent allows EID
+persistence, and, when `tcf_vendor_id` is set and TCF applies to the request,
+only with TCF vendor consent for that vendor. The same vendor consent gates
+egress: while it is withheld, the provider's stored UIDs are left out of
+auction `user.eids`, `x-ts-eids` and `/_ts/api/v1/identify`. Without
+`tcf_vendor_id`, a provider is gated by the EID-persistence purposes alone, so
+set it for any provider that has a TCF vendor ID.
+
+Identity providers run only on Fastly. The Axum, Cloudflare and Spin adapters
+refuse to start when an enabled provider is configured. On Fastly, an enabled
+provider whose `kind` this build does not include, or whose `settings` its kind
+rejects, also fails startup. Lookups always verify the provider's TLS
+certificate, whatever `proxy.certificate_check` says.
 
 A provider owns its `sources`: its results replace whatever the row holds for
 them, and batch sync rejects them and pull sync skips them. Browser-resolved IDs
@@ -816,14 +827,14 @@ again until the 30 days pass.
 | Field                 | Type    | Required | Description                                                             |
 | --------------------- | ------- | -------- | ----------------------------------------------------------------------- |
 | `id`                  | String  | Yes      | Stable provider ID used in logs, metrics and KV ownership               |
-| `kind`                | String  | Yes      | Provider implementation built into this release                         |
+| `kind`                | String  | Yes      | Provider implementation; must be one this build includes                |
 | `enabled`             | Boolean | No       | Whether the provider runs (default `true`)                              |
 | `endpoint`            | String  | Yes      | HTTPS lookup URL; its host must be in `allowed_domains`                 |
 | `allowed_domains`     | Array   | Yes      | Hosts the provider may call                                             |
 | `sources`             | Array   | Yes      | Source domains the provider owns; each needs an `[[ec.partners]]` entry |
 | `tcf_vendor_id`       | Integer | No       | TCF vendor ID that must have vendor consent                             |
 | `collect`             | String  | No       | `"page"` (default) or `"after_response"`; see below                     |
-| `rate_limit_per_hour` | Integer | No       | Most lookups per EC per hour; unset means unlimited. See the note below |
+| `rate_limit_per_hour` | Integer | No       | Most lookups per EC hash per hour; unset means unlimited. See below     |
 | `secrets.token`       | String  | No       | Key in `trusted_server_secrets` for the provider's API token            |
 | `settings`            | Table   | No       | Provider-specific settings, parsed by the provider kind                 |
 
@@ -832,6 +843,10 @@ again until the 30 days pass.
 ```toml
 [ec]
 identity_budget_ms = 200
+
+[[ec.partners]]
+name = "Example IDs"
+source_domain = "ids.example.com"
 
 [[ec.identity_providers]]
 id = "example-provider"
@@ -845,19 +860,33 @@ token = "example_provider_token"
 ```
 
 `collect = "after_response"` lookups run after the response is sent, within
-`identity_after_response_budget_ms`, and only for an EC whose row already
-existed before the navigation. Their results reach the row in a follow-up write.
+`identity_after_response_budget_ms`, and only when `ec_store` is configured,
+the response is not a redirect, the navigation's own write succeeded (or had
+nothing to change), and the EC was not minted on this navigation. Their results
+reach the row in a follow-up write.
 
 ::: warning Rate limit granularity
-On Fastly, `rate_limit_per_hour` is enforced as a per-minute budget rounded up
-to at least one lookup per minute, so any value below 60 behaves like 60 per
-hour. Values of 60 and above are enforced as `ceil(value / 60)` per minute.
+`rate_limit_per_hour` is counted per EC hash, which is derived from the client
+IP, so ECs behind one IP (a NAT or carrier gateway) share the budget. On
+Fastly it is enforced as a per-minute budget rounded up to at least one lookup
+per minute, so any value below 60 behaves like 60 per hour. Values of 60 and
+above are enforced as `ceil(value / 60)` per minute.
 :::
 
 **Validation**: configuration validation fails when an enabled provider's
-`endpoint` is not HTTPS or its host is not in `allowed_domains`, when a source
-has no `[[ec.partners]]` entry, or when two enabled providers claim the same
-source. Deploy validation also rejects an empty `secrets.token` key name.
+`endpoint` is not HTTPS or its host is not in `allowed_domains`, when it claims
+no sources, when a source has no `[[ec.partners]]` entry, when two enabled
+providers claim the same source, or when its `id` is empty or shared with
+another enabled provider. `identity_budget_ms` must be 1–1000 and
+`identity_after_response_budget_ms` 1–5000. Deploy validation also rejects an
+empty `secrets.token` key name.
+
+::: warning Rollback
+A config blob that configures identity providers, or sets either identity
+budget to a non-default value, cannot be loaded by a build from before
+identity providers. Roll the runtime back only with a blob that leaves them
+out.
+:::
 
 ### Field Details
 
@@ -2519,11 +2548,11 @@ push as proof that a Cloudflare or Spin multi-provider plan can start.
 ### Deadline behavior
 
 Auction response collection waits only until an absolute deadline measured from
-dispatch, including headers and complete response bodies. One nonblocking snapshot
+dispatch, including headers and complete response bodies. One final snapshot
 retains complete available responses after a slow origin; unfinished providers
 become timeouts and mediation cannot start with an exhausted budget. Backend
-timeout rounding does not extend network waiting.
-Provider bids that are already complete at the final nonblocking snapshot remain
+timeout rounding does not extend network waiting. On Fastly the snapshot may wait up to 1 ms per partially received body so the host can surface bytes that already arrived, and keeps a response whose headers arrived by the cutoff.
+Provider bids that are already complete at the final snapshot remain
 eligible even after `tmax`; mediation starts only with remaining budget and
 rejects responses collected after its cutoff.
 

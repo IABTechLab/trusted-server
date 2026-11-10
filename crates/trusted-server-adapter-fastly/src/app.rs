@@ -88,7 +88,7 @@
 
 use std::cell::RefCell;
 use std::net::IpAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
@@ -99,7 +99,7 @@ use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
 };
 use edgezero_core::router::RouterService;
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
@@ -148,11 +148,13 @@ use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
-use trusted_server_core::settings::{CollectTiming, ProxyAssetRoute, Settings};
+use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
-use trusted_server_identity_providers::{build_coordinator_with, partner_registry};
+use trusted_server_identity_providers::{
+    build_after_response_coordinator, build_coordinator_with, partner_registry,
+};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -201,26 +203,18 @@ pub(crate) struct AppState {
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
-    /// Partner registry built on first use and reused for the state's lifetime.
-    pub(crate) partner_registry: OnceLock<Arc<PartnerRegistry>>,
+    /// Partner registry, built with the state.
+    pub(crate) partner_registry: Arc<PartnerRegistry>,
+    /// Coordinator for providers collected before the response, if any.
+    pub(crate) page_identity: Option<Arc<ProviderCoordinator>>,
+    /// Coordinator for providers collected after the response, if any.
+    pub(crate) after_response_identity: Option<Arc<ProviderCoordinator>>,
 }
 
 impl AppState {
-    /// Returns the partner registry, building it on first use.
-    ///
-    /// A failed build is not cached, so every caller sees its error.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`partner_registry`].
-    pub(crate) fn partner_registry(
-        &self,
-    ) -> Result<Arc<PartnerRegistry>, Report<TrustedServerError>> {
-        if let Some(registry) = self.partner_registry.get() {
-            return Ok(Arc::clone(registry));
-        }
-        let registry = Arc::new(partner_registry(&self.settings.ec)?);
-        Ok(Arc::clone(self.partner_registry.get_or_init(|| registry)))
+    /// Returns the partner registry.
+    pub(crate) fn partner_registry(&self) -> Arc<PartnerRegistry> {
+        Arc::clone(&self.partner_registry)
     }
 }
 
@@ -228,8 +222,9 @@ impl AppState {
 ///
 /// # Errors
 ///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
+/// Returns an error when settings, the auction orchestrator, the integration
+/// registry, the partner registry or an enabled identity provider fail to
+/// initialise.
 pub(crate) fn build_state(
     stores: &RuntimeStoreConfig,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
@@ -261,13 +256,30 @@ pub(crate) fn build_state_from_settings(
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
+    // A provider that cannot run must stop startup: skipping it would quietly
+    // hand its sources back to browser ingest.
+    let partner_registry = Arc::new(partner_registry(&settings.ec)?);
+    let page_identity = build_coordinator_with(&settings, Arc::clone(&partner_registry))
+        .change_context(TrustedServerError::Configuration {
+            message: "identity provider configuration is invalid".to_owned(),
+        })?
+        .map(Arc::new);
+    let after_response_identity =
+        build_after_response_coordinator(&settings, Arc::clone(&partner_registry))
+            .change_context(TrustedServerError::Configuration {
+                message: "identity provider configuration is invalid".to_owned(),
+            })?
+            .map(Arc::new);
+
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         default_kv_store,
         auction_telemetry_sink,
-        partner_registry: OnceLock::new(),
+        partner_registry,
+        page_identity,
+        after_response_identity,
     }))
 }
 
@@ -369,7 +381,7 @@ pub(crate) struct EcFinalizeState {
 
 /// Identity lookups dispatched for this navigation, collected before finalize.
 pub(crate) struct IdentityLookups {
-    pub(crate) coordinator: ProviderCoordinator,
+    pub(crate) coordinator: Arc<ProviderCoordinator>,
     pub(crate) pending: PendingLookups<PlatformPendingRequest>,
 }
 
@@ -377,8 +389,8 @@ pub(crate) struct IdentityLookups {
 /// has been sent.
 ///
 /// The router owns the request, so the request signals the providers read are
-/// copied here. The coordinator is built and the lookups dispatched only after
-/// the response, so neither delays the page.
+/// copied here. The lookups are dispatched only after the response, so they
+/// never delay the page.
 pub(crate) struct AfterResponseLookups {
     pub(crate) ec_id: String,
     pub(crate) client_ip: Option<IpAddr>,
@@ -442,15 +454,7 @@ fn prepare_after_response_lookups(
     req: &Request,
     ec: &EcRequestState,
 ) -> Option<AfterResponseLookups> {
-    let has_after_response_provider = state
-        .settings
-        .ec
-        .identity_providers
-        .iter()
-        .any(|config| config.enabled && config.collect == CollectTiming::AfterResponse);
-    if !has_after_response_provider {
-        return None;
-    }
+    state.after_response_identity.as_ref()?;
     ec.kv_graph.as_ref()?;
     let ec_id = ec.ec_context.ec_value()?.to_owned();
     let signals = ProviderRequestSignals::read(req, ec);
@@ -463,46 +467,27 @@ fn prepare_after_response_lookups(
 
 /// Starts identity-provider lookups for a permitted publisher navigation.
 ///
-/// Returns `None` when no provider is enabled, the request has no EC, or the
-/// identity graph is unavailable. A provider configuration that cannot be
-/// built is logged and disables lookups for this request.
+/// Returns `None` when no provider is enabled, the request has no EC or one
+/// minted on this request, or the identity graph is unavailable.
 async fn dispatch_identity_lookups(
     state: &AppState,
     services: &RuntimeServices,
     req: &Request,
     ec: &mut EcRequestState,
 ) -> Option<IdentityLookups> {
-    if !state
-        .settings
-        .ec
-        .identity_providers
-        .iter()
-        .any(|config| config.enabled)
-    {
+    let coordinator = Arc::clone(state.page_identity.as_ref()?);
+    let graph = ec.kv_graph.as_ref()?;
+    // An EC minted on this request has no row yet and may never be issued,
+    // so it is not sent to vendors; a later navigation looks it up.
+    if ec.ec_context.ec_generated() {
         return None;
     }
-    let partners = match state.partner_registry() {
-        Ok(partners) => partners,
-        Err(report) => {
-            log::error!("Identity providers disabled for this request: {report:?}");
-            return None;
-        }
-    };
-    let coordinator = match build_coordinator_with(&state.settings, partners) {
-        Ok(Some(coordinator)) => coordinator,
-        Ok(None) => return None,
-        Err(report) => {
-            log::error!("Identity providers disabled for this request: {report:?}");
-            return None;
-        }
-    };
-    let graph = ec.kv_graph.as_ref()?;
     let ec_id = ec.ec_context.ec_value()?.to_owned();
     if matches!(ec.ec_context.kv_snapshot(), EcKvSnapshot::NotRead) {
         let snapshot = graph.load_snapshot(&ec_id);
         ec.ec_context.set_kv_snapshot(snapshot);
     }
-    let transport = PlatformLookupTransport::new(services, state.settings.proxy.certificate_check);
+    let transport = PlatformLookupTransport::new(services);
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
     let signals = ProviderRequestSignals::read(req, ec);
     let now = trusted_server_core::ec::current_timestamp();
@@ -774,20 +759,19 @@ async fn execute_named(
         handler,
         NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
     ) {
-        let response = state
-            .partner_registry()
-            .and_then(|registry| match handler {
-                NamedRouteHandler::AdminEcLookup => {
-                    // Deliberately do not use an EC request-state graph: that
-                    // copy is bot-gated, while operators use curl for this
-                    // authenticated diagnostic.
-                    let kv = crate::maybe_identity_graph(&state.settings);
-                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
-                }
-                NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
-                _ => unreachable!("admin diagnostics should use early dispatch"),
-            })
-            .unwrap_or_else(|error| http_error(&error));
+        let registry = state.partner_registry();
+        let response = match handler {
+            NamedRouteHandler::AdminEcLookup => {
+                // Deliberately do not use an EC request-state graph: that
+                // copy is bot-gated, while operators use curl for this
+                // authenticated diagnostic.
+                let kv = crate::maybe_identity_graph(&state.settings);
+                handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
+            }
+            NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
+            _ => unreachable!("admin diagnostics should use early dispatch"),
+        }
+        .unwrap_or_else(|error| http_error(&error));
         return Ok(response);
     }
 
@@ -856,7 +840,7 @@ async fn run_named_route(
                 cors_preflight_identify(&state.settings, &req)
             } else {
                 let kv = crate::require_identity_graph(&state.settings)?;
-                let partner_registry = state.partner_registry()?;
+                let partner_registry = state.partner_registry();
                 handle_identify(
                     &state.settings,
                     &kv,
@@ -870,7 +854,7 @@ async fn run_named_route(
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Auction => {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Auction);
-            let partner_registry = state.partner_registry()?;
+            let partner_registry = state.partner_registry();
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
@@ -894,7 +878,7 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 return Ok(page_bids_preflight_denied());
             }
-            let partner_registry = state.partner_registry()?;
+            let partner_registry = state.partner_registry();
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
@@ -941,7 +925,7 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
-        let partner_registry = state.partner_registry()?;
+        let partner_registry = state.partner_registry();
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
         handle_batch_sync(&kv, &partner_registry, &limiter, req)
     });
@@ -1088,44 +1072,40 @@ async fn dispatch_fallback(
         // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
         // server-side EIDs, same as the legacy auction.
         let slots = state.settings.creative_opportunity_slots();
-        match state.partner_registry() {
-            Ok(partner_registry) => {
-                let auction = AuctionDispatch {
-                    integration_registry: &state.registry,
-                    orchestrator: &state.orchestrator,
-                    slots,
-                    registry: Some(&*partner_registry),
-                };
-                match handle_publisher_request(
-                    &state.settings,
-                    services,
-                    ec.kv_graph.as_ref(),
-                    &mut ec.ec_context,
-                    auction,
-                    req,
-                    EdgeCacheHeader::SurrogateControl,
+        let partner_registry = state.partner_registry();
+        let auction = AuctionDispatch {
+            integration_registry: &state.registry,
+            orchestrator: &state.orchestrator,
+            slots,
+            registry: Some(&*partner_registry),
+        };
+        match handle_publisher_request(
+            &state.settings,
+            services,
+            ec.kv_graph.as_ref(),
+            &mut ec.ec_context,
+            auction,
+            req,
+            EdgeCacheHeader::SurrogateControl,
+        )
+        .await
+        {
+            Ok(pub_response) => {
+                // Origin start succeeded on the sole publisher-page
+                // path. Authorize orphan recovery only for real-browser
+                // document navigations so named routes, integration
+                // proxies, and filter short circuits cannot rotate an
+                // identity.
+                ec.ec_context.set_recovery_eligible(is_publisher_navigation);
+                publisher_response_into_streaming_response(
+                    pub_response,
+                    &method,
+                    Arc::clone(&state.settings),
+                    state.registry.as_ref(),
+                    Arc::clone(&state.orchestrator),
+                    services.clone(),
                 )
                 .await
-                {
-                    Ok(pub_response) => {
-                        // Origin start succeeded on the sole publisher-page
-                        // path. Authorize orphan recovery only for real-browser
-                        // document navigations so named routes, integration
-                        // proxies, and filter short circuits cannot rotate an
-                        // identity.
-                        ec.ec_context.set_recovery_eligible(is_publisher_navigation);
-                        publisher_response_into_streaming_response(
-                            pub_response,
-                            &method,
-                            Arc::clone(&state.settings),
-                            state.registry.as_ref(),
-                            Arc::clone(&state.orchestrator),
-                            services.clone(),
-                        )
-                        .await
-                    }
-                    Err(e) => Err(e),
-                }
             }
             Err(e) => Err(e),
         }
@@ -1852,7 +1832,9 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
-            partner_registry: std::sync::OnceLock::new(),
+            partner_registry: Arc::new(PartnerRegistry::empty()),
+            page_identity: None,
+            after_response_identity: None,
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -2858,15 +2840,27 @@ mod tests {
     }
 
     #[test]
-    fn partner_registry_is_built_once_per_state() {
-        let state = build_state_from_settings(test_settings()).expect("should build test state");
+    fn enabled_provider_with_unregistered_kind_fails_startup() {
+        let mut settings = test_settings();
+        settings.ec.partners.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "Example IDs",
+                "source_domain": "ids.example.com"
+            }))
+            .expect("should parse partner"),
+        );
+        settings.ec.identity_providers.push(
+            toml::from_str(
+                "id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/v1\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse provider"),
+        );
 
-        let first = state.partner_registry().expect("should build the registry");
-        let second = state.partner_registry().expect("should reuse the registry");
+        let result = build_state_from_settings(settings);
 
         assert!(
-            Arc::ptr_eq(&first, &second),
-            "should return the cached registry"
+            result.is_err(),
+            "should refuse to start with a provider this build cannot run"
         );
     }
 
@@ -3041,8 +3035,22 @@ mod tests {
         let mut settings = test_settings();
         settings.ec.ec_store = Some("ec_identity_store".to_owned());
         settings.ec.partners = vec![partner];
-        settings.ec.identity_providers = vec![provider_config.clone()];
+        // This build registers no kind, so the app state is built without the
+        // provider and the test supplies its registry and coordinator.
         let router = TrustedServerApp::routes_for_state(&app_state_for_settings(settings.clone()));
+        let partners = {
+            let mut with_provider = settings.ec.clone();
+            with_provider.identity_providers = vec![provider_config.clone()];
+            Arc::new(
+                PartnerRegistry::from_ec_with_kinds(&with_provider, |_| true)
+                    .expect("should build registry"),
+            )
+        };
+        let app_state = AppState {
+            partner_registry: Arc::clone(&partners),
+            ..Arc::into_inner(app_state_for_settings(settings.clone()))
+                .expect("should own the app state")
+        };
         let mut request = navigation_request("/article");
         // Viceroy geolocates loopback to a US privacy state; a US Privacy
         // string without a sale opt-out lets the navigation mint an EC.
@@ -3082,14 +3090,11 @@ mod tests {
         }));
         let coordinator = ProviderCoordinator::new(
             vec![RegisteredProvider::new(provider_config, provider)],
-            Arc::new(
-                PartnerRegistry::from_ec_with_kinds(&settings.ec, |_| true)
-                    .expect("should build registry"),
-            ),
+            partners,
             Duration::from_millis(200),
         )
         .expect("should build coordinator");
-        let transport = PlatformLookupTransport::new(&state.services, false);
+        let transport = PlatformLookupTransport::new(&state.services);
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::NonRegulated,
             ..Default::default()
@@ -3112,10 +3117,10 @@ mod tests {
 
         let result = crate::apply_edgezero_ec_finalize(
             &settings,
-            None,
+            Some(&app_state),
             &mut state,
             Some(super::IdentityLookups {
-                coordinator,
+                coordinator: Arc::new(coordinator),
                 pending,
             }),
             &mut response,

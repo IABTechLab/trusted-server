@@ -344,10 +344,10 @@ fn with_placeholder_partner_tokens(ec: &Ec) -> Ec {
     ec
 }
 
-/// Checks the identity-provider rules core owns (spec §12.1).
+/// Checks the identity-provider rules core owns.
 ///
-/// Unknown kinds and capability checks need the provider crate and are
-/// enforced when the adapter builds the coordinator.
+/// Unknown kinds and capability checks need the provider crate; the adapter
+/// builds the coordinators at startup and fails to start on either.
 fn validate_identity_providers(ec: &Ec) -> Result<(), Report<TrustedServerError>> {
     if ec.identity_providers.is_empty() {
         return Ok(());

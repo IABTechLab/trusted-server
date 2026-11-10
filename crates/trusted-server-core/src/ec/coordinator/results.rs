@@ -51,8 +51,6 @@ impl DropCounts {
 /// Why a provider was not called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
-    /// The provider is disabled.
-    Disabled,
     /// Consent does not permit this provider.
     Consent,
     /// None of its sources is due.
@@ -84,6 +82,8 @@ pub enum LookupStatus {
     Timeout,
     /// A non-success HTTP status.
     HttpError(http::StatusCode),
+    /// The provider could not build its request.
+    RequestFailed,
     /// The request could not be sent or the body exceeded the limit.
     TransportFailed,
     /// The body could not be parsed at all.
@@ -101,9 +101,9 @@ impl LookupStatus {
             Self::NoMatch => "no_match",
             Self::Timeout => "timeout",
             Self::HttpError(_) => "http_error",
+            Self::RequestFailed => "request_error",
             Self::TransportFailed => "transport_error",
             Self::InvalidResponse => "invalid_response",
-            Self::Skipped(SkipReason::Disabled) => "skipped_disabled",
             Self::Skipped(SkipReason::Consent) => "skipped_consent",
             Self::Skipped(SkipReason::NotDue) => "skipped_not_due",
             Self::Skipped(SkipReason::Input) => "skipped_input",

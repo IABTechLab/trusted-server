@@ -86,6 +86,12 @@ passphrase = "ec_passphrase"
 ec_store = "ec_identity_store"
 # Max concurrent partner pull-sync requests.
 pull_sync_concurrency = 3
+# Optional identity-provider budgets (see [[ec.identity_providers]] below).
+# Every page-phase provider shares one budget (1-1000 ms):
+# identity_budget_ms = 200
+# Budget for providers with collect = "after_response", which run after the
+# response is sent and write their results in a follow-up write (1-5000 ms):
+# identity_after_response_budget_ms = 2000
 # Optional cluster-heuristic tuning (defaults shown):
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
@@ -107,31 +113,29 @@ pull_sync_concurrency = 3
 # batch_rate_limit = 60      # max batch-sync requests/min (default 60)
 # pull_sync_enabled = false  # default false
 
-# Optional server-side identity providers, looked up on publisher navigations
-# before the origin fetch. Every enabled provider shares one time budget:
-# identity_budget_ms = 200  # default 200
-# Budget for providers with collect = "after_response", which run after the
-# response is sent and write their results in a follow-up write:
-# identity_after_response_budget_ms = 2000
+# Optional server-side identity providers (Fastly only), looked up on publisher
+# navigations before the origin fetch. Their budgets are set in [ec] above. An
+# enabled provider whose kind this build does not include fails startup.
 #
 # [[ec.identity_providers]]
 # id = "example-provider"
-# Must name a provider kind built into this release.
 # kind = "example-kind"
 # enabled = false
 # endpoint = "https://ids.example.com/v1/lookup"
 # The endpoint host must be listed here.
 # allowed_domains = ["ids.example.com"]
-# Each source needs an [[ec.partners]] entry and must be claimed by only one
-# enabled provider.
+# Each source needs an [[ec.partners]] entry (for example one with
+# source_domain = "ids.example.com") and must be claimed by only one enabled
+# provider.
 # sources = ["ids.example.com"]
-# Optional: require TCF vendor consent for this provider.
+# Optional: require TCF vendor consent for lookups and for sending this
+# provider's stored IDs to bidders.
 # tcf_vendor_id = 9999
 # "page" (default) collects before the response; "after_response" collects
-# after it is sent, only for an EC whose row already exists.
+# after it is sent, only for an EC issued on an earlier request.
 # collect = "page"
-# Optional: most lookups per EC per hour. On Fastly this is enforced per
-# minute with a minimum of one, so values below 60 behave like 60.
+# Optional: most lookups per EC hash (client IP) per hour. On Fastly this is
+# enforced per minute with a minimum of one, so values below 60 behave like 60.
 # rate_limit_per_hour = 60
 # Secret Store key name, resolved like other secret references.
 # [ec.identity_providers.secrets]

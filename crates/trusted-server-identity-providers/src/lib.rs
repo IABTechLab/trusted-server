@@ -29,12 +29,13 @@ pub fn is_registered_kind(_kind: &str) -> bool {
     false
 }
 
-/// Builds the partner registry, marking only sources claimed by enabled
-/// providers whose kind is registered as provider-owned.
+/// Builds the partner registry, marking the sources claimed by enabled
+/// providers as provider-owned.
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`PartnerRegistry::from_ec`].
+/// Returns the same errors as [`PartnerRegistry::from_ec_with_kinds`],
+/// including for an enabled provider whose kind is not registered.
 pub fn partner_registry(ec: &Ec) -> Result<PartnerRegistry, Report<TrustedServerError>> {
     PartnerRegistry::from_ec_with_kinds(ec, is_registered_kind)
 }
@@ -76,9 +77,6 @@ pub fn build_coordinator(
 
 /// Builds the page-phase coordinator against an already built partner
 /// registry.
-///
-/// Enabled providers with an unregistered kind are skipped; building the
-/// registry with [`partner_registry`] already warned about them.
 ///
 /// # Errors
 ///
@@ -131,17 +129,10 @@ fn build_phase_coordinator(
         .ec
         .identity_providers
         .iter()
-        .filter(|config| {
-            config.enabled && config.collect == timing && is_registered_kind(config.kind())
-        })
+        .filter(|config| config.enabled && config.collect == timing)
         .map(|config| {
-            build(config, &config.secrets).map(|provider| {
-                let registered = RegisteredProvider::new(config.clone(), provider);
-                match config.rate_limit_per_hour {
-                    Some(per_hour) => registered.with_rate_limit(per_hour),
-                    None => registered,
-                }
-            })
+            build(config, &config.secrets)
+                .map(|provider| RegisteredProvider::new(config.clone(), provider))
         })
         .collect::<Result<Vec<_>, Report<ProviderConfigError>>>()?;
     if registered.is_empty() {
@@ -208,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_unknown_kind_is_skipped_and_claims_no_sources() {
+    fn enabled_unknown_kind_fails_the_build() {
         let mut settings = create_test_settings();
         settings.ec.identity_providers = vec![
             toml::from_str(
@@ -217,14 +208,11 @@ mod tests {
             .expect("should parse"),
         ];
 
-        let coordinator =
-            build_coordinator(&settings).expect("should skip unregistered provider kinds");
-        let registry = partner_registry(&settings.ec).expect("should build registry");
+        let result = build_coordinator(&settings);
 
-        assert!(coordinator.is_none(), "should build no coordinator");
         assert!(
-            !registry.is_provider_owned("ids.example.com"),
-            "should leave unregistered provider sources to browser ingest"
+            result.is_err(),
+            "should fail instead of skipping an enabled provider of an unknown kind"
         );
     }
 

@@ -136,17 +136,19 @@ impl core::error::Error for TransportError {}
 /// canonicalized, keeping the number of registered dynamic backends bounded.
 pub struct PlatformLookupTransport<'s> {
     services: &'s RuntimeServices,
-    certificate_check: bool,
     next: Cell<u32>,
 }
 
 impl<'s> PlatformLookupTransport<'s> {
     /// Borrows the request's runtime services.
+    ///
+    /// Lookups always verify the provider's certificate: they carry the EC ID
+    /// and the provider's credential, so `proxy.certificate_check` (meant for
+    /// development origins) does not apply to them.
     #[must_use]
-    pub fn new(services: &'s RuntimeServices, certificate_check: bool) -> Self {
+    pub fn new(services: &'s RuntimeServices) -> Self {
         Self {
             services,
-            certificate_check,
             next: Cell::new(0),
         }
     }
@@ -191,7 +193,7 @@ impl LookupTransport for PlatformLookupTransport<'_> {
                 host,
                 port: url.port(),
                 host_header_override: None,
-                certificate_check: self.certificate_check,
+                certificate_check: true,
                 first_byte_timeout: timeout,
                 between_bytes_timeout: timeout,
                 discriminator: Some(format!("ts-identity-{sequence}")),
@@ -349,7 +351,7 @@ mod tests {
         client.push_response(200, b"{\"a\":1}".to_vec());
         client.push_response(204, Vec::new());
         let services = build_services_with_http_client(client.clone());
-        let transport = PlatformLookupTransport::new(&services, true);
+        let transport = PlatformLookupTransport::new(&services);
         let deadline = Deadline::after(Duration::from_millis(200));
 
         let results = futures::executor::block_on(async {
@@ -411,7 +413,7 @@ mod tests {
         client.push_response(200, Vec::new());
         client.push_select_delay(Duration::from_millis(50));
         let services = build_services_with_http_client(client.clone());
-        let transport = PlatformLookupTransport::new(&services, true);
+        let transport = PlatformLookupTransport::new(&services);
 
         let results = gather_one(&transport, Deadline::after(Duration::from_millis(1)));
 
@@ -427,7 +429,7 @@ mod tests {
         let client = Arc::new(StubHttpClient::new());
         client.push_response(200, vec![b'x'; MAX_PROVIDER_RESPONSE_BYTES + 1]);
         let services = build_services_with_http_client(client.clone());
-        let transport = PlatformLookupTransport::new(&services, true);
+        let transport = PlatformLookupTransport::new(&services);
 
         let results = gather_one(&transport, Deadline::after(Duration::from_millis(200)));
 
@@ -445,7 +447,7 @@ mod tests {
     fn gather_with_no_requests_returns_nothing() {
         let client = Arc::new(StubHttpClient::new());
         let services = build_services_with_http_client(client.clone());
-        let transport = PlatformLookupTransport::new(&services, true);
+        let transport = PlatformLookupTransport::new(&services);
 
         let results = futures::executor::block_on(
             transport.gather(Vec::new(), Deadline::after(Duration::from_millis(1))),

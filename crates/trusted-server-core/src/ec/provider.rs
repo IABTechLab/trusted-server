@@ -25,14 +25,16 @@ use crate::consent::ConsentContext;
 use crate::ec::eid_types::{ProviderId, SourceDomain, UnixSeconds};
 use crate::ec::kv_types::{KvEid, KvEntry};
 use crate::ec::registry::PartnerRegistry;
-use crate::settings::{IdentityProviderConfig, ProviderSecrets};
+use crate::error::TrustedServerError;
+use crate::settings::{Ec, IdentityProviderConfig, ProviderSecrets};
 
 /// Builds lookup requests and parses lookup responses for one identity provider.
 ///
 /// Implementations must not perform I/O or read the clock; the coordinator
 /// executes requests and applies consent, transport, validation, expiry and
-/// persistence policy.
-pub trait IdentityProvider {
+/// persistence policy. Coordinators are built once and shared for the
+/// application's lifetime, so implementations are `Send + Sync`.
+pub trait IdentityProvider: Send + Sync {
     /// Describes which sources and EID shapes this provider can return.
     fn capabilities(&self) -> &ProviderCapabilities;
 
@@ -477,11 +479,12 @@ pub(crate) fn destination_allowed<S: AsRef<str>>(url: &Url, allowed_domains: &[S
 
 /// Checks the configuration rules core owns for every enabled provider
 /// (spec §12.1): the endpoint is an `https` URL whose host is in
-/// `allowed_domains`, every source has an `[[ec.partners]]` entry, and no
-/// source is claimed by two enabled providers.
+/// `allowed_domains`, it claims at least one source, every source has an
+/// `[[ec.partners]]` entry, no source is claimed by two enabled providers, and
+/// every enabled provider has a non-empty id of its own.
 ///
-/// Unknown kinds and capability checks need the provider crate and are
-/// enforced when the coordinator is built.
+/// Unknown kinds and capability checks need the provider crate; the adapter
+/// builds the coordinators at startup and fails to start on either.
 ///
 /// # Errors
 ///
@@ -492,7 +495,18 @@ pub fn validate_enabled_configs<'a>(
     partners: &PartnerRegistry,
 ) -> Result<(), Report<ProviderConfigError>> {
     let mut claimed: HashSet<SourceDomain> = HashSet::new();
+    let mut ids: HashSet<&str> = HashSet::new();
     for config in configs.into_iter().filter(|config| config.enabled) {
+        // The id keys UID ownership, opt-outs and the rate-limit bucket in
+        // the row, so two providers sharing one would read, refresh and clear
+        // each other's IDs.
+        let id = config.id.trim();
+        if id.is_empty() || !ids.insert(id) {
+            return Err(Report::new(ProviderConfigError::Invalid).attach(format!(
+                "provider id `{}` is empty or used by another enabled provider",
+                config.id
+            )));
+        }
         let endpoint = Url::parse(&config.endpoint)
             .change_context(ProviderConfigError::Invalid)
             .attach_with(|| format!("endpoint for provider `{}` is not a URL", config.id))?;
@@ -502,7 +516,12 @@ pub fn validate_enabled_configs<'a>(
                 config.id
             )));
         }
-        for source in parse_sources(config)? {
+        let sources = parse_sources(config)?;
+        if sources.is_empty() {
+            return Err(Report::new(ProviderConfigError::Invalid)
+                .attach(format!("provider `{}` claims no sources", config.id)));
+        }
+        for source in sources {
             if partners.find_by_source_domain(source.as_str()).is_none() {
                 return Err(Report::new(ProviderConfigError::Invalid).attach(format!(
                     "source `{source}` of provider `{}` has no [[ec.partners]] entry",
@@ -518,6 +537,28 @@ pub fn validate_enabled_configs<'a>(
         }
     }
     Ok(())
+}
+
+/// Fails when `[ec]` enables an identity provider on an adapter that has no
+/// provider implementations.
+///
+/// Ignoring the provider would leave its sources open to browser ingest with
+/// no sign that it never runs.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] naming the first enabled
+/// provider.
+pub fn reject_enabled_providers(ec: &Ec, adapter: &str) -> Result<(), Report<TrustedServerError>> {
+    match ec.identity_providers.iter().find(|config| config.enabled) {
+        Some(config) => Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "identity provider `{}` is enabled, but the {adapter} adapter does not run identity providers",
+                config.id
+            ),
+        })),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -749,6 +790,65 @@ mod tests {
             .expect_err("should reject double claim");
 
         assert_invalid(&error);
+    }
+
+    #[test]
+    fn validate_enabled_configs_rejects_a_provider_without_sources() {
+        let mut empty = config(&json!({}));
+        empty.sources = Vec::new();
+
+        let error = validate_enabled_configs([&empty], &partners())
+            .expect_err("should reject a provider that claims no sources");
+
+        assert_invalid(&error);
+    }
+
+    #[test]
+    fn validate_enabled_configs_rejects_shared_or_empty_id() {
+        let registry = PartnerRegistry::from_config(&[
+            serde_json::from_value(json!({
+                "name": "ids", "source_domain": "ids.example.com"
+            }))
+            .expect("should build partner"),
+            serde_json::from_value(json!({
+                "name": "other", "source_domain": "other.example.com"
+            }))
+            .expect("should build partner"),
+        ])
+        .expect("should build registry");
+        let first = config(&json!({}));
+        let mut shared = config(&json!({}));
+        shared.sources = vec!["other.example.com".to_owned()];
+        let mut empty = config(&json!({}));
+        empty.id = "  ".to_owned();
+
+        let error = validate_enabled_configs([&first, &shared], &registry)
+            .expect_err("should reject a shared provider id");
+        assert_invalid(&error);
+        let error = validate_enabled_configs([&empty], &registry)
+            .expect_err("should reject an empty provider id");
+        assert_invalid(&error);
+    }
+
+    #[test]
+    fn reject_enabled_providers_fails_only_for_an_enabled_provider() {
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        let mut disabled = config(&json!({}));
+        disabled.enabled = false;
+        ec.identity_providers = vec![disabled];
+        reject_enabled_providers(&ec, "Axum").expect("should accept a disabled provider");
+
+        ec.identity_providers.push(config(&json!({})));
+        let error =
+            reject_enabled_providers(&ec, "Axum").expect_err("should reject an enabled provider");
+
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should report a configuration error"
+        );
     }
 
     #[test]

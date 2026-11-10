@@ -17,7 +17,7 @@ use crate::ec::EcKvSnapshot;
 use crate::ec::current_timestamp;
 use crate::ec::eid_types::UnixSeconds;
 use crate::ec::kv::KvIdentityGraph;
-use crate::ec::kv_types::MAX_UID_LENGTH;
+use crate::ec::kv_types::{MAX_STORED_UID_LENGTH, MAX_UID_LENGTH};
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
@@ -537,7 +537,12 @@ pub(crate) fn resolve_auction_eids(
     }
 
     let now = UnixSeconds::new(current_timestamp());
-    Some(entry.live_eids(registry, now).map(Eid::from).collect())
+    Some(
+        entry
+            .live_eids(registry, ec_context.consent(), now)
+            .map(Eid::from)
+            .collect(),
+    )
 }
 
 pub(crate) fn resolve_client_auction_eids(
@@ -657,7 +662,9 @@ pub(crate) fn merge_auction_eids(
         } = eid;
         let mut kept = Vec::with_capacity(uids.len());
         for uid in uids {
-            if uid.id.trim().is_empty() || uid.id.len() > MAX_UID_LENGTH {
+            // Stored provider UIDs may reach the stored limit; client UIDs
+            // were already capped at `MAX_UID_LENGTH` when parsed.
+            if uid.id.trim().is_empty() || uid.id.len() > MAX_STORED_UID_LENGTH {
                 continue;
             }
             // A duplicate keeps the earlier UID's fields but fills its
@@ -2166,6 +2173,26 @@ mod tests {
             "should keep client entry ext"
         );
         assert_eq!(merged[1].uids[0].id, "u2", "should keep client uid");
+    }
+
+    #[test]
+    fn merge_auction_eids_keeps_a_stored_provider_uid_past_the_ingest_limit() {
+        let long = "p".repeat(MAX_UID_LENGTH + 100);
+        let resolved_eids = Some(vec![Eid::new(
+            "ids.example.com".to_string(),
+            vec![Uid {
+                id: long.clone(),
+                atype: Some(1),
+                ext: None,
+            }],
+        )]);
+
+        let merged = merge_auction_eids(None, resolved_eids).expect("should merge EIDs");
+
+        assert_eq!(
+            merged[0].uids[0].id, long,
+            "should send a stored UID within the stored limit"
+        );
     }
 
     #[test]

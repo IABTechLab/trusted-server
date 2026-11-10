@@ -42,7 +42,7 @@ maps to a stable base.
 
 ### Request Lifecycle
 
-Every request passes through four phases. EC generation only happens on organic routes (publisher proxy, integration proxy, auction) — read-only endpoints like `/identify` and `/batch-sync` skip generation entirely. During pre-routing, Trusted Server builds consent from request-local cookies, headers, geolocation, and policy defaults; it does not load consent from a separate KV store.
+Every request passes through four phases. A new EC is minted, and its row created, only on a top-level publisher navigation: a `GET` through the publisher proxy with `Sec-Fetch-Dest: document`, `Sec-Fetch-Mode: navigate` and no `prefetch` token in `Sec-Purpose`. Clients that send no Fetch Metadata get no EC, and a prefetch or prerender (`Sec-Purpose: prefetch;prerender`) never mints or writes. Integration proxies and `/auction` use an existing EC but never mint one, and read-only endpoints like `/identify` and `/batch-sync` skip generation entirely. During pre-routing, Trusted Server builds consent from request-local cookies, headers, geolocation, and policy defaults; it does not load consent from a separate KV store.
 
 ```mermaid
 sequenceDiagram
@@ -133,7 +133,7 @@ Partner identities flow into the KV identity graph through three channels. Each 
 ```mermaid
 flowchart LR
     subgraph Browser-initiated
-        Prebid["Prebid EIDs<br/><i>/auction body + ts-eids + sharedId</i><br/>Response-time ingestion"]
+        Prebid["Prebid EIDs<br/><i>ts-eids + sharedId</i><br/>Navigation-time ingestion"]
     end
 
     subgraph Server-initiated
@@ -148,7 +148,7 @@ flowchart LR
 
 ### Prebid EID Flow
 
-Browser-resolved Prebid EIDs reach the identity graph when Trusted Server finalizes a top-level document navigation, the only request that writes KV. It collects matched partner UIDs from two request-local sources, applied in this order so that, when both carry the same partner, the later source's UID is the candidate offered to KV:
+Browser-resolved Prebid EIDs reach the identity graph when Trusted Server finalizes a top-level document navigation, the only request that writes browser-resolved IDs to KV. It collects matched partner UIDs from two request-local sources, applied in this order so that, when both carry the same partner, the later source's UID is the candidate offered to KV:
 
 1. the `ts-eids` cookie,
 2. the `sharedId` cookie.
@@ -184,7 +184,7 @@ The `sharedId` cookie follows a similar path but is written directly by Prebid's
 
 Cookie persistence runs only on top-level document navigations (`Sec-Fetch-Dest: document` and `Sec-Fetch-Mode: navigate`). `POST /auction`, `GET /_ts/page-bids`, static assets, analytics, integration requests, filter short circuits, and other subresources do not persist these cookies.
 
-Each navigation attempts at most one conditional write. If another writer wins, Trusted Server reads the row once and does not write again from that request. A matching value completes the sync; an absent or different value is deferred.
+Each navigation makes at most one conditional page-load write, which carries browser ingest and page-phase identity-provider results together. If another writer wins, the navigation's changes are dropped without a re-read; a later navigation offers them again. Two writes sit outside that rule: a consent withdrawal's tombstone is written on any request that carries the EC cookie, with bounded retries, and `collect = "after_response"` identity providers make one follow-up write after the response is sent. Batch sync and pull sync write through their own channels.
 
 Browser cookies do not carry a trustworthy value timestamp or sequence. Trusted Server therefore adds missing partner IDs but does not replace a different stored UID from a browser-supplied EID, even on later eligible requests. Pull- or push-enabled partners can replace that value through their authoritative synchronization path. A cookie-only partner retains the stored UID until an authoritative freshness rule is introduced or the EC row expires.
 
@@ -262,7 +262,7 @@ The relevant OpenRTB structure forwarded to Prebid Server and downstream partner
 }
 ```
 
-Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. Browser-supplied EIDs, from the `/auction` request body, the `ts-eids` cookie, or the `sharedId` cookie, only fill partner UIDs that are missing from KV; a different stored UID is kept, as described in [Prebid EID Flow](#prebid-eid-flow).
+Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. Browser-supplied EIDs from the `ts-eids` or `sharedId` cookie only fill partner UIDs that are missing from KV (the `/auction` request body goes to bidders only and is never stored); a different stored UID is kept, as described in [Prebid EID Flow](#prebid-eid-flow).
 
 ### Pull-Sync Completeness Marker
 

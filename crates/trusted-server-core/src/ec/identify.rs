@@ -11,6 +11,7 @@ use url::Url;
 
 use super::auth::authenticate_bearer;
 use super::consent::ec_consent_granted;
+use crate::consent::tcf_vendor_consent_denied;
 use crate::error::TrustedServerError;
 use crate::openrtb::Eid;
 use crate::settings::Settings;
@@ -97,11 +98,17 @@ pub fn handle_identify(
                 // write back with the live-entry TTL.
                 log::trace!("Identify found tombstone for '{}'", log_id(ec_id));
             } else {
-                // Extract only this partner's first live entry.
+                // Extract only this partner's first live entry. A
+                // provider-owned source is withheld while its owner lacks TCF
+                // vendor consent, as in the bidstream.
                 let now = UnixSeconds::new(current_timestamp());
+                let vendor_denied = partner
+                    .owner_tcf_vendor_id
+                    .is_some_and(|vendor| tcf_vendor_consent_denied(ec_context.consent(), vendor));
                 eid = entry
                     .ids
                     .get(&partner.source_domain)
+                    .filter(|_| !vendor_denied)
                     .and_then(|record| {
                         source_views(&partner.source_domain, record, partner.openrtb_atype, now)
                             .next()
@@ -341,7 +348,8 @@ mod tests {
     use crate::ec::registry::PartnerRegistry;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{consent_granting_vendors, create_test_settings};
+    use std::num::NonZeroU16;
 
     const VALID_API_TOKEN: &str = "identify-test-token-32-bytes-min";
 
@@ -778,10 +786,24 @@ mod tests {
     }
 
     fn identify_body_for_record(record: KvPartnerId) -> serde_json::Value {
+        let registry =
+            PartnerRegistry::from_config(&[make_test_partner("ssp.example.com", VALID_API_TOKEN)])
+                .expect("should build registry");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..ConsentContext::default()
+        };
+        identify_body_with(record, &registry, consent)
+    }
+
+    fn identify_body_with(
+        record: KvPartnerId,
+        registry: &PartnerRegistry,
+        consent: ConsentContext,
+    ) -> serde_json::Value {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::in_memory("identify_store");
-        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
-        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut entry = KvEntry::minimal("other.example.com", "other-uid", 1);
         entry.ids.insert("ssp.example.com".to_owned(), record);
@@ -792,9 +814,9 @@ mod tests {
             .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let ec_context = EcContext::new_for_test(Some(ec_id), consent);
 
-        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+        let response = handle_identify(&settings, &kv, registry, &req, &ec_context)
             .expect("should construct identify response");
 
         assert_eq!(response.status(), StatusCode::OK, "should return 200");
@@ -802,6 +824,30 @@ mod tests {
             &response.into_body().into_bytes().unwrap_or_default(),
         )
         .expect("should decode identify response JSON")
+    }
+
+    #[test]
+    fn handle_identify_withholds_a_source_whose_owner_lacks_vendor_consent() {
+        let mut registry =
+            PartnerRegistry::from_config(&[make_test_partner("ssp.example.com", VALID_API_TOKEN)])
+                .expect("should build registry");
+        assert!(
+            registry.mark_provider_owned("ssp.example.com", NonZeroU16::new(9999)),
+            "should mark the source provider-owned"
+        );
+        let record = || provider_record("live", Expiry::Never);
+
+        let denied = identify_body_with(record(), &registry, consent_granting_vendors(vec![1]));
+        let granted = identify_body_with(record(), &registry, consent_granting_vendors(vec![9999]));
+
+        assert!(
+            denied.get("uid").is_none(),
+            "should withhold the UID without the owner's vendor consent"
+        );
+        assert_eq!(
+            granted["uid"], "live",
+            "should return the UID with the owner's vendor consent"
+        );
     }
 
     #[test]
