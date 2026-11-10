@@ -506,8 +506,11 @@ jobs:
         env:
           ASSET: ${{ matrix.asset }}
           SOURCE_COMMIT: ${{ github.sha }}
+          NODE_VERSION: ${{ needs.checks.outputs.node }}
         run: |
           set -euo pipefail
+          # Validate only on the pinned Node that setup-node installed.
+          test "$(node --version)" = "v$NODE_VERSION"
           node <<'NODE'
           // BEGIN SIGNING INPUTS
           const fs = require('node:fs');

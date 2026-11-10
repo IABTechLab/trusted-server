@@ -230,6 +230,47 @@ mod tests {
 
     use super::*;
 
+    /// Locked packages that declare install scripts without a reviewed hook.
+    ///
+    /// `esbuild@0.28.2` is the known controlled-observer gap (the reviewed hook
+    /// is 0.27.3), and `fsevents@2.3.3` is an optional macOS-only package. Any
+    /// other hook-carrying lock change must update this list deliberately.
+    const KNOWN_UNREVIEWED_INSTALL_SCRIPTS: [&str; 2] = ["esbuild@0.28.2", "fsevents@2.3.3"];
+
+    #[test]
+    fn current_lock_lists_only_known_unreviewed_install_scripts() {
+        let lock: Value = serde_json::from_slice(
+            &std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../trusted-server-js/lib/package-lock.json"
+            ))
+            .expect("should read the current npm lock"),
+        )
+        .expect("should parse the current npm lock");
+        let packages = lock["packages"]
+            .as_object()
+            .expect("should list locked packages");
+        let mut unreviewed: Vec<String> = packages
+            .iter()
+            .filter(|(_, entry)| entry["hasInstallScript"] == true)
+            .filter_map(|(path, entry)| {
+                let name = path.rsplit("node_modules/").next()?;
+                let version = entry["version"].as_str()?;
+                let reviewed = REVIEWED_HOOKS
+                    .iter()
+                    .any(|(hook_name, hook_version, _, _)| {
+                        *hook_name == name && *hook_version == version
+                    });
+                (!reviewed).then(|| format!("{name}@{version}"))
+            })
+            .collect();
+        unreviewed.sort();
+        assert_eq!(
+            unreviewed, KNOWN_UNREVIEWED_INSTALL_SCRIPTS,
+            "should change the unreviewed install-script set only deliberately"
+        );
+    }
+
     #[test]
     fn empty_development_script_does_not_authorize_a_lifecycle_hook() {
         let mut manifest =

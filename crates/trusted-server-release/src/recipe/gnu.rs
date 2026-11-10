@@ -444,33 +444,10 @@ fn validate_measurement(measurement: &Measurement) -> Result<(), Report<ReleaseE
 }
 
 impl GnuEvidence {
-    /// Returns whether installed-file measurements lack a complete tool closure.
-    pub(crate) fn tool_closure_unmeasured(&self) -> bool {
-        !self.full_closure_measured
-    }
-    /// Returns whether acquisition is recorded as an unqualified candidate measurement.
-    pub(crate) fn original_acquisition_unverified(&self) -> bool {
-        self.acquisition == "unqualified_candidate_measurement"
-    }
     /// Supplies fictional typed observations for projection tests only.
     #[cfg(test)]
     pub(crate) fn projection_fixture() -> Self {
         tests::projection_fixture()
-    }
-    /// Supplies an unreviewed fictional file role for fail-closed adapter tests.
-    #[cfg(test)]
-    pub(crate) fn projection_fixture_with_unknown_file_role() -> Self {
-        let mut fixture = Self::projection_fixture();
-        let file = fixture
-            .measurement
-            .selected_files
-            .remove("compiler_runtime")
-            .expect("should have fictional runtime archive");
-        fixture
-            .measurement
-            .selected_files
-            .insert("unreviewed_compiler_resource".to_owned(), file);
-        fixture
     }
     /// Returns the conservative installed-image tree identity.
     pub(crate) fn installed_files_sha256(&self) -> &str {

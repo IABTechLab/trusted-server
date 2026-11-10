@@ -770,6 +770,10 @@ test('signing job shell refuses symlinked, extra, empty and changed inputs', () 
         GITHUB_RUN_ID: '17',
         GITHUB_RUN_ATTEMPT: '2',
         GITHUB_OUTPUT: join(root, 'github-output'),
+        // The step checks the pinned Node; pin whichever node PATH selects.
+        NODE_VERSION: execFileSync('node', ['--version'], { encoding: 'utf8' })
+          .trim()
+          .slice(1),
       }
       const run = (script, extra = {}) =>
         spawnSync('bash', ['-c', script], {
@@ -2966,6 +2970,35 @@ test('build checks refuse a tagged commit that is on no branch', () => {
       )
   }
 })
+test('signing step refuses a Node other than the pinned version before validating', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const step = 'Validate signing inputs and retain their digests'
+  assert.match(
+    workflow.split(`- name: ${step}`)[1],
+    /\n {10}NODE_VERSION: \$\{\{ needs\.checks\.outputs\.node \}\}\n/,
+    'should compare against the Node version the checks job pinned'
+  )
+  for (const [installed, status] of [
+    ['v24.20.0', 0],
+    ['v20.20.2', 1],
+  ]) {
+    const result = runStep(
+      workflow,
+      step,
+      {
+        node: `if [ "$1" = --version ]; then echo ${installed}; else cat >/dev/null; echo validated; fi`,
+      },
+      { NODE_VERSION: '24.20.0' }
+    )
+    assert.equal(result.status, status, `${installed}: ${result.stderr}`)
+    assert.equal(
+      result.stdout.includes('validated'),
+      status === 0,
+      `${installed}: should validate signing inputs only on the pinned Node`
+    )
+  }
+})
+
 test('publisher step refuses a Node other than the pinned version before publishing', () => {
   const release = readFileSync('.github/workflows/release.yml', 'utf8')
   const step = 'Verify handoff, create once, publish by release ID and verify'

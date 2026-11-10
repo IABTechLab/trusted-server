@@ -142,20 +142,6 @@ pub(crate) fn projection_fixture(target: ReleaseTarget) -> PlatformEvidence {
     collect(&fixture, &tools).expect("should collect measured platform fixture")
 }
 
-/// Measures an actual detached fictional SDK for the platform adapter tests.
-pub(crate) fn projection_detached_sdk_fixture() -> PlatformEvidence {
-    let fixture = Fixture::new(ReleaseTarget::Aarch64AppleDarwin);
-    let tools = fixture
-        .tools()
-        .with_apple_developer_tools(fixture.apple_with_detached(true));
-    collect(&fixture, &tools).expect("should collect detached SDK fixture")
-}
-
-/// Measures a detached SDK and an in-place fictional toolchain.
-pub(crate) fn projection_measured_toolchain_fixture() -> PlatformEvidence {
-    projection_toolchain_with_libtapi_fixture(false)
-}
-
 /// Measures a fictional toolchain with an explicitly selected optional TAPI file.
 pub(crate) fn projection_toolchain_with_libtapi_fixture(libtapi: bool) -> PlatformEvidence {
     let fixture = Fixture::new(ReleaseTarget::Aarch64AppleDarwin);
