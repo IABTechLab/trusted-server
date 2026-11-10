@@ -656,7 +656,7 @@ mod tests {
         String::from_utf8(output).expect("should produce UTF-8 HTML")
     }
 
-    fn process_prebid_script_with_asset_mode(mode: &str) -> String {
+    fn process_script_with_asset(path: &str, origin_url: &str, mode: &str) -> String {
         // `create_test_settings` enables `[integrations.prebid]` with the default
         // `script_patterns`, so its attribute rewriter matches `/prebid.min.js`.
         let mut settings = create_test_settings();
@@ -667,26 +667,52 @@ mod tests {
                 &json!({
                     "enabled": true,
                     "assets": [{
-                        "path": "/assets/vendor-pb.js",
-                        "origin_url": "https://cdn.example.com/prebid.min.js",
+                        "path": path,
+                        "origin_url": origin_url,
                         "proxy": mode
                     }]
                 }),
             )
             .expect("should insert JS asset proxy config");
         let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let html = r#"<html><body><script src="https://cdn.example.com/prebid.min.js"></script></body></html>"#;
+        let html = format!(r#"<html><body><script src="{origin_url}"></script></body></html>"#);
 
-        process_html_with_registry(html, registry)
+        process_html_with_registry(&html, registry)
+    }
+
+    fn process_prebid_script_with_asset_mode(mode: &str) -> String {
+        process_script_with_asset(
+            "/assets/vendor-pb.js",
+            "https://cdn.example.com/prebid.min.js",
+            mode,
+        )
     }
 
     #[test]
     fn js_asset_proxy_rewriter_takes_precedence_over_prebid_script_removal() {
+        // Settings validation rejects this asset because it would load a second
+        // Prebid.js; the registry does not validate, so this pins rewriter order.
         let processed = process_prebid_script_with_asset_mode("enabled");
 
         assert!(
             processed.contains(r#"<script src="/assets/vendor-pb.js"></script>"#),
             "JS asset proxy should rewrite before Prebid removes the script: {processed}"
+        );
+    }
+
+    #[test]
+    fn enabled_js_asset_proxy_replacement_is_not_rewritten_by_prebid() {
+        // The proxied `path` matches Prebid `script_patterns`; the replacement
+        // must be terminal so Prebid does not remove the rewritten script.
+        let processed = process_script_with_asset(
+            "/assets/prebid.min.js",
+            "https://cdn.example.com/vendor.js",
+            "enabled",
+        );
+
+        assert!(
+            processed.contains(r#"<script src="/assets/prebid.min.js"></script>"#),
+            "JS asset proxy replacement should be terminal: {processed}"
         );
     }
 
