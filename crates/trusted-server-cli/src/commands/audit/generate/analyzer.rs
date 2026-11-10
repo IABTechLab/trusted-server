@@ -73,11 +73,19 @@ pub(crate) fn analyze_collected_page(collected: &CollectedPage) -> CliResult<Aud
     if lockr_metadata.peek().is_some() {
         integrations.insert("lockr".to_string(), LOCKR_APP_ID_SELECTOR.to_string());
     }
-    let lockr_app_id = lockr_metadata
+    let mut lockr_app_ids = lockr_metadata
         .filter_map(|element| element.value().attr("content"))
         .map(str::trim)
-        .find(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
+        .filter(|value| !value.is_empty());
+    let lockr_app_id = lockr_app_ids.next().map(ToOwned::to_owned);
+    if let Some(first) = &lockr_app_id
+        && lockr_app_ids.any(|other| other != first.as_str())
+    {
+        warnings.push(
+            "page carries more than one distinct lockr app ID; the draft uses the first"
+                .to_string(),
+        );
+    }
 
     for tag in &collected.script_tags {
         if let Some(src) = &tag.src {
@@ -328,6 +336,46 @@ mod tests {
                 .any(|integration| integration.id == "gpt"),
             "should detect GPT from browser collected scripts"
         );
+    }
+
+    #[test]
+    fn analyze_collected_page_warns_only_on_distinct_lockr_app_ids() {
+        for (other_id, conflicting) in [(" first-app-id ", false), ("second-app-id", true)] {
+            let collected = CollectedPage {
+                requested_url: "https://publisher.example/page".to_string(),
+                final_url: "https://publisher.example/page".to_string(),
+                page_title: None,
+                html: format!(
+                    r#"<meta name="lockr-signin-app_id"><meta name="lockr-signin-app_id" content=" "><meta name="lockr-signin-app_id" content=" first-app-id "><meta name="lockr-signin-app_id" content="{other_id}"><meta name="lockr-signin-app_id" content="{other_id}">"#
+                ),
+                script_tags: Vec::new(),
+                network_requests: Vec::new(),
+                gpt_slots: Vec::new(),
+                links: Vec::new(),
+                sitemap_locs: Vec::new(),
+                warnings: vec!["existing warning".to_string()],
+            };
+
+            let artifact =
+                analyze_collected_page(&collected).expect("should analyze collected page");
+
+            assert_eq!(
+                artifact.lockr_app_id.as_deref(),
+                Some("first-app-id"),
+                "should retain the first nonempty normalized ID"
+            );
+            let mut expected_warnings = vec!["existing warning".to_string()];
+            if conflicting {
+                expected_warnings.push(
+                    "page carries more than one distinct lockr app ID; the draft uses the first"
+                        .to_string(),
+                );
+            }
+            assert_eq!(
+                artifact.warnings, expected_warnings,
+                "should preserve existing warnings and warn once only for distinct IDs without echoing them"
+            );
+        }
     }
 
     #[test]

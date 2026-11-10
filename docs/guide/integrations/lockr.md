@@ -17,7 +17,11 @@ The integration is off when the section is absent. When the section exists, `ena
 To discover the ID automatically, run
 [`ts audit generate <url>`](/guide/cli#audit-a-public-page). It fills `app_id` from
 nonempty page metadata but explicitly leaves the generated integration disabled.
-Verify SDK/API behavior on the intended serving domain before enabling it.
+If Trusted Server serves a hostname that is not registered with Lockr, set
+`origin_override` to the publisher's authorized, registered origin. Enable the
+integration on a staging service and run the [verification](#verification) checks
+before enabling it in production. The checks require the integration's routes to
+be enabled.
 
 | Field               | Default                                             | Behavior                                                                        |
 | ------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------- |

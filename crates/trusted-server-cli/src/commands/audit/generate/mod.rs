@@ -457,10 +457,14 @@ fn build_draft_config_with_generator(
     }
 
     if let Some(app_id) = &artifact.lockr_app_id {
-        draft
-            .push_str("\n# Verify lockr SDK/API behavior on the serving domain before enabling.\n");
-        draft.push_str("[integrations.lockr]\nenabled = false\n");
-        draft.push_str(&format!("app_id = {}\n", toml_string(app_id)));
+        draft = draft.replacen(
+            "# [integrations.lockr]\n# enabled = true\n# app_id = \"your-lockr-app-id\"",
+            &format!(
+                "# Enable lockr on staging and verify SDK/API behavior before production use.\n[integrations.lockr]\nenabled = false\napp_id = {}",
+                toml_string(app_id),
+            ),
+            1,
+        );
     }
 
     for integration in detected {
@@ -2417,13 +2421,21 @@ mod tests {
                     .as_array()
                     .expect("should record detected integrations");
                 assert_eq!(integrations.len(), 1, "should detect lockr exactly once");
-                assert_eq!(integrations[0]["id"].as_str(), Some("lockr"));
+                assert_eq!(
+                    integrations[0]["id"].as_str(),
+                    Some("lockr"),
+                    "should record lockr as the detected integration"
+                );
                 assert_eq!(
                     integrations[0]["evidence"].as_str(),
                     Some("meta[name=\"lockr-signin-app_id\"]"),
                     "should retain metadata evidence even when a script also detects lockr"
                 );
-                assert_eq!(artifact["js_asset_count"].as_integer(), Some(0));
+                assert_eq!(
+                    artifact["js_asset_count"].as_integer(),
+                    Some(0),
+                    "should not count inline scripts as JS assets"
+                );
 
                 let draft =
                     fs::read_to_string(args.config.as_ref().expect("should set config path"))
@@ -2431,7 +2443,11 @@ mod tests {
                 let config: toml::Value =
                     toml::from_str(&draft).expect("should parse generated config");
                 let lockr = &config["integrations"]["lockr"];
-                assert_eq!(lockr["app_id"].as_str(), Some(expected_id));
+                assert_eq!(
+                    lockr["app_id"].as_str(),
+                    Some(expected_id),
+                    "should write the normalized app ID to the draft config"
+                );
                 assert_eq!(
                     lockr["enabled"].as_bool(),
                     Some(false),
@@ -2447,6 +2463,40 @@ mod tests {
                     warnings.is_empty(),
                     "should pass deploy validation: {warnings:?}"
                 );
+                let enabled = draft.replacen(
+                    "[integrations.lockr]\nenabled = false\n",
+                    "[integrations.lockr]\nenabled = true\n",
+                    1,
+                );
+                assert_ne!(enabled, draft, "should find the generated lockr section");
+                validate::check_candidate(&enabled, &draft)
+                    .expect("should pass deploy validation once lockr is enabled");
+                assert!(
+                    !draft.contains("# [integrations.lockr]"),
+                    "should fill the template's lockr block instead of retaining a second example"
+                );
+                assert_eq!(
+                    draft
+                        .lines()
+                        .filter(|line| *line == "[integrations.lockr]")
+                        .count(),
+                    1,
+                    "should generate exactly one lockr table"
+                );
+                let optional_setting = draft.replacen(
+                    "# api_endpoint = \"https://identity.example.com\"",
+                    "api_endpoint = \"https://identity.example.com\"",
+                    1,
+                );
+                let with_optional: toml::Value = toml::from_str(&optional_setting)
+                    .expect("should parse after uncommenting a lockr setting");
+                assert_eq!(
+                    with_optional["integrations"]["lockr"]["api_endpoint"].as_str(),
+                    Some("https://identity.example.com"),
+                    "should keep optional settings in the generated lockr section"
+                );
+                validate::check_candidate(&optional_setting, &draft)
+                    .expect("should validate after uncommenting a lockr setting");
             }
         }
     }
