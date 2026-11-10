@@ -682,6 +682,8 @@ the store state needed to enumerate active public keys.
 **Example:**
 
 ```bash
+ts keys list --service https://edge.example.com [--json]
+# or
 curl https://edge.example.com/.well-known/trusted-server.json
 ```
 
@@ -739,6 +741,9 @@ policy. `[request_signing]` storage must be readable.
 **Example:**
 
 ```bash
+ts keys verify --service https://edge.example.com --kid ts-2025-01-A \
+  --payload 'SGVsbG8gV29ybGQ=' --signature 'abc123...'
+# or
 curl -X POST https://edge.example.com/verify-signature \
   -H "Content-Type: application/json" \
   -d '{"payload":"SGVsbG8gV29ybGQ=","signature":"abc123...","kid":"ts-2025-01-A"}'

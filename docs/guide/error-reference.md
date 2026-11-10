@@ -471,8 +471,8 @@ echo -n "Hello World" | base64
 **Wrong key ID:**
 
 ```bash
-# Check current key ID
-curl https://edge.example.com/.well-known/trusted-server.json | jq '.jwks.keys[].kid'
+# List the published key IDs
+ts keys list --service https://edge.example.com
 ```
 
 **Signature from wrong key:**
