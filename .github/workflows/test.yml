@@ -406,7 +406,10 @@ jobs:
             echo "release build accepted a branch source" >&2
             exit 1
           fi
-          grep -F 'release source must be exactly 40 lowercase ASCII hexadecimal bytes' "$RUNNER_TEMP/release-refusal.log"
+          if ! grep -F 'release source must be exactly 40 lowercase ASCII hexadecimal bytes' "$RUNNER_TEMP/release-refusal.log"; then
+            cat "$RUNNER_TEMP/release-refusal.log" >&2
+            exit 1
+          fi
 
       - name: cargo test (browser fixtures)
         if: runner.os == 'macOS'

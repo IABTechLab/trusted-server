@@ -6,8 +6,8 @@ use edgezero_cli::args::{
     ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs,
     ConfigValidateArgs, DeployArgs, HealthcheckArgs, ProvisionArgs, RollbackArgs, ServeArgs,
 };
-use trusted_server_core::build_info::{BuildInfo, BuildVariant};
 use trusted_server_core::config::TrustedServerAppConfig;
+use trusted_server_core::constants::TS_GIT_VERSION;
 
 use crate::commands::audit::{AuditArgs, run_audit};
 use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
@@ -15,20 +15,13 @@ use crate::commands::config::init::{ConfigInitArgs, run_config_init};
 use crate::commands::pbs::{self, PbsArgs};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
-/// Immutable facts compiled into the owning CLI product.
-pub const BUILD_INFO: BuildInfo = BuildInfo::new(
-    env!("CARGO_PKG_VERSION"),
-    env!("TRUSTED_SERVER__BUILD_TARGET"),
-    BuildVariant::Default,
-);
-
+// Labels the fields so the package version is not read as the release tag.
 static VERSION_TEXT: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "package={} source={} target={} variant={}",
-        BUILD_INFO.package_version(),
-        BUILD_INFO.source().unwrap_or("unknown"),
-        BUILD_INFO.target(),
-        BUILD_INFO.variant()
+        "package={} source={} target={} variant=default",
+        env!("CARGO_PKG_VERSION"),
+        TS_GIT_VERSION.unwrap_or("unknown"),
+        env!("TRUSTED_SERVER__BUILD_TARGET"),
     )
 });
 

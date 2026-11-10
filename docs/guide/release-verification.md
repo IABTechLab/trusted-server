@@ -40,7 +40,7 @@ Each `<binary>.spdx.json` is a **conservative build dependency inventory** of
 the selected Cargo target and the installed npm build tree used for that build.
 It records the final executable's SHA-256 and Cargo's package version; the
 release tag is not part of the SBOM. SPDX 2.3 is the published format. The
-conversion preserves package identities but drops dependency relationships; the
+inventory records package identities but no dependency relationships; the
 document adds only the binary-root `DESCRIBES` relationship.
 
 The inventory includes npm build tools and may include packages removed by
@@ -282,10 +282,13 @@ name = "example-app"
 
 Do not copy operator config, secrets, local fixtures or build hooks into that
 directory. Approve the destination service and base version, and inspect their
-Config, KV and Secret Store links beforehand. The logical config-store ID comes
-from the release tag's tracked `edgezero.toml`; physical store names and actual
-configuration are runtime resources. This manual route does not create links,
-push configuration, implement staging, or supply recovery guarantees.
+Config, KV and Secret Store links beforehand. The wasm opens its Config Store
+and Secret Store by the logical IDs in the release tag's tracked
+`edgezero.toml` (`trusted_server_config` and `trusted_server_secrets`), so the
+base version must already link them under those names; physical store names
+and actual configuration are runtime resources. This manual route does not
+create links, push configuration, implement staging, or supply recovery
+guarantees.
 
 From the private directory:
 
@@ -321,8 +324,9 @@ fastly compute deploy --package ./pkg/example-app.tar.gz \
   --service-id '99999' --version '7' --no-default-domain
 ```
 
-This command can activate production and change an active/locked base version
-by cloning it; confirm its behavior for the pinned CLI before use. Retain the
+This command can activate production: it clones an active or locked base
+version, uploads the package to the new version and activates it. Confirm its
+behavior for the pinned CLI before use. Retain the
 verified wasm, manifest, package digest, previous active version and observed
 result. No build step may replace or annotate the verified wasm. Automated
 EdgeZero prepared-payload deployment and operation recovery are later phases.
@@ -381,7 +385,8 @@ Tags with a SemVer prerelease part (such as `-rc.1`) publish as prereleases and
 never become Latest. Stable tags publish as normal releases with
 `make_latest: legacy`; GitHub chooses Latest by version/date rather than forcing
 a backport release to Latest. Whether to authorize tags from rc branches is a
-maintainer decision; Phase 1 does not validate branch ancestry or rulesets.
+maintainer decision; Phase 1 requires the tagged commit to be on some branch but
+does not check which one, and does not read rulesets.
 
 Before creating anything, the publisher runs `gh attestation verify` for every
 binary and predicate, and for the Fastly rebuild check, against the signing
@@ -392,102 +397,67 @@ Publication then lists releases, including drafts, and refuses every existing
 matching tag. It creates one draft, logs and retains its release ID, and binds
 uploads and the final publish mutation to that ID. It checks the exact
 signing-approved asset set, validates each upload response's size and SHA-256
-digest before publication, and checks immutable membership after publication.
+digest before publication. After publication it checks that the release is
+immutable and that its verified release attestation lists exactly those assets
+and digests.
 The reviewed publication owner remains later work. There are no automatic
 mutation retries or draft-resume claims.
 
-The tag-reference read, the release listing before creation and every
-create/upload/publish mutation remain single-shot. Every API read, including
-that listing, times out after at most 10s; release-attestation list reads use at
-most 4s. Mutations have no client-side timeout and are bounded by the 15-minute
-job limit: aborting a create, upload or publish cannot cancel a change GitHub
-already accepted.
+The eight pre-creation `gh attestation verify` runs, the tag-reference read, the
+release listing before creation and every create/upload/publish mutation remain
+single-shot. Each pre-creation verification times out after 60s. Every API read,
+including that listing, times out after at most 10s. Mutations have no
+client-side timeout and are bounded by the 15-minute job limit: aborting a
+create, upload or publish cannot cancel a change GitHub already accepted.
 
-Only post-publish reads may retry: the release metadata GETs by ID and by tag,
-the release-attestation list read and failed `gh release verify` proof fetches.
-Each read has at most three attempts, with 2s then 5s backoff. A supplied
-`Retry-After` can increase a delay, capped at 10s. A shared three-minute window,
-starting at publication, bounds retry scheduling, and each read times out no
-later than that window's end. `Connection: close` remains enabled for API calls.
-Retries require a recognized transport error, timeout, HTTP 5xx or 429. GitHub
-CLI errors are classified conservatively: an otherwise empty-output HTTP 5xx/429
-diagnostic or a recognized transport/timeout code may retry; ambiguous failures
-stop, except the release verification described below. Successful responses with
-wrong identity, immutability, membership or digests stop immediately.
+Only the two post-publish reads retry: the release read by ID, then
+`gh release verify` for the tag. GitHub creates the release attestation after
+publication, so it may not be listed yet. Each read makes at most five attempts,
+waiting 2s/5s/10s/20s between them, inside one three-minute window that starts
+at publication. An API read times out after at most 10s and a verification after
+at most 30s, and neither runs past the window. `Connection: close` remains
+enabled for API calls.
 
-Before cryptographic release verification, the availability check runs at most
-five checks, each with one release-attestation list read, and waits
-2s/5s/10s/20s between them (37s total waiting). Each list read retries transient
-failures like the other post-publish reads, so the check can make up to 15
-GETs. Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with
-no current-tag record may also wait. Other non-200 statuses fail. A separate 60s
-deadline bounds availability checking within the shared three-minute window.
+Any failed read is retried. GitHub CLI 2.102.0 reports a record that is not yet
+listed and a bundle-fetch or network failure as `no attestations for tag …`,
+and a trusted-root failure the same way as a failed signature, so the publisher
+does not classify its errors. A returned result that fails a check stops at
+once: the release must have the created ID and expected release type, be
+published and be immutable, and the verified release attestation must name this
+repository, tag, release ID and source commit and list exactly the published
+assets with their SHA-256 digests. When the attempts or the window run out, the
+job fails with `Published release read failed; the release is already
+published` or `Release attestation verification failed; the release is already
+published`, with the last failure, if any, as its cause. The job log records every wait.
 
-A record may carry its bundle inline or only a `bundle_url`; without an inline
-bundle its tag is unknown until GitHub CLI fetches it. GitHub CLI reports a
-bundle-fetch, trusted-root or network failure the same way as a record that is
-not yet listed, so any failed `gh release verify` is retried at the next
-availability check. A fetched result is then checked: its decoded bundle must
-equal the statement GitHub CLI verified, name this release, commit and exact
-asset digests, and equal the inline bundle when the API supplied one. Malformed
-records, duplicate current-tag records and identity/source/asset mismatches stop
-immediately.
-
-The availability check ends with one of these errors:
-
-- the last `gh release verify` error, after the fifth check or when the 60s
-  deadline leaves no time for another check;
-- `Release attestation availability window exhausted`, at the deadline without
-  a failed proof;
-- `Release already published and immutable; release attestation unavailable
-after five checks`, after the fifth check without a failed proof;
-- `Release attestation availability retry window exhausted`, when the deadline
-  cuts a transient retry short, with the failure that caused the retry as its
-  cause;
-- `Release attestation availability verification window exhausted`, when a read
-  starts or finishes after the deadline.
-
-Other-tag records are logged and ignored by the publisher's own availability
-check, but GitHub CLI still fetches all returned bundle URLs before filtering by
-tag. An unavailable older bundle can therefore fail the current release's
-read-only verification. Preserve the immutable release and follow the read-only
-recovery procedure below. Filter-before-fetch behavior remains a dependency
-follow-up: track it upstream and qualify a GitHub CLI version that supplies it
-before claiming isolation from other tags. Logs show every wait or availability
-on the first check.
+GitHub CLI fetches every bundle returned for the commit before filtering by tag.
+An unavailable older bundle, for example from an earlier prerelease of the same
+commit, can therefore fail `gh release verify` for the current release, in the
+publisher, in the procedure above and in the recovery checks below, until that
+bundle can be fetched again. Preserve the immutable release, rerun the read-only
+checks later, and do not rerun publication. Filter-before-fetch behavior remains
+a dependency follow-up: track it upstream and qualify a GitHub CLI version that
+supplies it before claiming isolation from other tags.
 
 If any post-publish check fails, the release has already been published; a
 failure does not undo publication or establish that immutability was verified.
 Confirm its state using the recorded release ID. For an immutable release, keep
-its tag and assets unchanged and rerun only the following read-only checks in
-the directory containing the downloaded assets. Set `RELEASE_ID` to the ID from
-the release job log; retain the reviewed `REPO`, `TAG`, `COMMIT` and `ASSETS`
-values from the verification procedure above.
+its tag and assets unchanged. Set `RELEASE_ID` to the ID from the release job
+log, and `REPO` and `TAG` to the reviewed values, then run these read-only
+checks:
 
 ```bash
 set -euo pipefail
-test "${#ASSETS[@]}" -eq 4
 gh api "repos/$REPO/releases/$RELEASE_ID" \
   --jq '{id, tag_name, draft, immutable, assets: [.assets[] | {name, size, digest}]}'
 test "$(gh api "repos/$REPO/releases/tags/$TAG" --jq '.id')" = "$RELEASE_ID"
 test "$(gh api "repos/$REPO/releases/$RELEASE_ID" --jq '.immutable')" = true
-test "$(gh release verify "$TAG" --repo "$REPO" --format json \
-  --jq '.verificationResult.statement.predicate.tag')" = "$TAG"
-gh release verify "$TAG" --repo "$REPO"
-for asset in "${ASSETS[@]}"; do
-  for suffix in '' .spdx.json .provenance.sigstore.json .sbom.sigstore.json; do
-    gh release verify-asset "$TAG" "$asset$suffix" --repo "$REPO"
-  done
-done
-gh release verify-asset "$TAG" trusted-server-fastly.wasm.rebuild-check.json --repo "$REPO"
-gh release verify-asset "$TAG" SHA256SUMS --repo "$REPO"
-shasum -a 256 --check SHA256SUMS
 ```
 
-Then rerun the signer identity check for provenance and SPDX for each binary,
-including the SPDX predicate comparison, exactly as documented above. Preserve
-the successful verification outputs with the release record; do not rerun the
-publication job to recover a failed read-only check.
+Then run the [download and verify](#download-and-verify) block above in a new
+private directory, changing only its reviewed pins. Preserve the successful
+verification outputs with the release record; do not rerun the publication job
+to recover a failed read-only check.
 
 After a failed or indeterminate mutation, inspect the recorded release ID and
 all matching drafts read-only. Do not rerun uploads, delete a release, or reuse
@@ -500,9 +470,10 @@ to the expected source commit. Annotated tags have a separate tag-object identit
 and are refused before building, and again before release creation.
 
 Before the first production release, rehearse the reviewed commit in a separate
-public repository with Actions and immutable releases enabled. Use a fresh,
-lightweight `v0.0.0-rehearsal.N` tag for each attempt and retain verification
-outputs in the release PR. Keep rehearsal tags and releases out of the upstream
+public repository with Actions and immutable releases enabled and the
+`RELEASE_PUBLICATION_ENABLED=true` variable set. Push the commit to a branch
+there first. Use a fresh, lightweight `v0.0.0-rehearsal.N` tag for each attempt
+and retain verification outputs in the release PR. Keep rehearsal tags and releases out of the upstream
 repository. For production, confirm the required settings and checks, then
 follow the maintainer release authorization process before tagging or deploying.
 
@@ -520,22 +491,30 @@ commands below only inspect settings; this workflow applies none of them.
   team's name and ID in the maintainer release record; avoid broad role bypasses.
   See [repository ruleset configuration](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository).
 - Before tagging, confirm that the release build checks passed on the `main` push
-  of the commit you intend to tag (the `check-runs` command below lists them).
-  Release builds run only on `main` pushes and `v*` tags, so commits on other
-  branches have no such checks, and a tag-triggered check cannot pass before its
-  own tag exists. A later `main` push cancels an older run that is still waiting
-  in the workflow's concurrency group; re-run a cancelled run before tagging its
-  commit. Source eligibility and the later policy reader are not enforced by
-  Phase 1.
+  of the commit you intend to tag: the `Binary attestations` workflow's
+  `build / checks` and four `build / Build <asset>` check runs, which the
+  `check-runs` command below lists. Release builds run only on `main` pushes and
+  `v*` tags, so commits on other branches have no such checks, and a
+  tag-triggered check cannot pass before its own tag exists. Before authorizing
+  a tag on another branch, such as an rc branch, rehearse that exact commit in a
+  separate repository as described above; its tag build is otherwise the first
+  release build it gets. A later `main` push cancels an older run that is still
+  waiting in the workflow's concurrency group; re-run a cancelled run before
+  tagging its commit. Phase 1 does not enforce source eligibility.
 - Push the commit to a branch, normally `main`, before pushing its lightweight
   tag. The build `checks` job refuses a tagged commit that is on no branch,
   before anything is built or signed: in fork rehearsals, draft creation
-  returned HTTP 403 for such a commit. After that refusal, push the commit to a
-  branch and use a fresh tag. If a draft creation still returns HTTP 403 and the
-  release listing shows no release or draft for the tag, re-run only the failed
-  release job within the 7-day artifact retention. This rerun is the approved
-  recovery for that failure only; other failed mutations follow the recovery
-  rules above. An annotated tag is refused before building.
+  returned HTTP 403 for such a commit. The check reads the branches when the job
+  runs, so after that refusal push the commit to a branch and re-run the failed
+  jobs; nothing was built or signed. A release job that fails before creating a
+  draft (handoff or signing-bundle verification, or the tag reference), or whose
+  draft creation returns HTTP 403 (for example, because the branch was deleted
+  after the check), also creates nothing. If the release listing then shows no
+  release or draft for the tag, re-run only the failed release job within the
+  7-day artifact retention, after pushing the commit to a branch again for a 403.
+  This rerun is the approved recovery for those failures only; other failed
+  mutations follow the recovery rules above. An annotated tag is refused before
+  building.
 
 ```bash
 REPO=IABTechLab/trusted-server

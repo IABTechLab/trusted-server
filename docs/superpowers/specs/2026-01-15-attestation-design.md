@@ -1,6 +1,6 @@
 # Runtime Integration Attestation Architecture
 
-> **Status:** Historical proposal. Binary-attestation sections are superseded in direction by the [October release artifact specification](2026-10-09-1235-release-attestation-design.md), which becomes the implementation contract upon approval. Runtime/configuration proposals remain reference material for #161.
+> **Status:** Historical proposal. Binary-attestation sections are superseded by the [Phase 1 release specification](2026-10-09-1235-release-attestation-design.md) and, for later phases, the frozen destination design it links. Runtime/configuration proposals remain reference material for #161.
 > **Author:** Architecture Team
 > **Date:** January 2026
 

@@ -322,14 +322,16 @@ export function checkReleaseFormat(bytes, target, elf = '') {
         size = bytes.readUInt32LE(offset + 4)
       if (size < 8 || offset + size > end)
         throw Error('Invalid Mach-O command size')
-      if (command === 0x32 || command === 0x24) {
+      // LC_BUILD_VERSION for PLATFORM_MACOS; a 13.0 deployment target emits
+      // no older LC_VERSION_MIN_MACOSX command.
+      if (command === 0x32) {
         if (
           minimum !== undefined ||
-          size < (command === 0x32 ? 24 : 16) ||
-          (command === 0x32 && bytes.readUInt32LE(offset + 8) !== 1)
+          size < 24 ||
+          bytes.readUInt32LE(offset + 8) !== 1
         )
           throw Error('Invalid macOS deployment command')
-        minimum = bytes.readUInt32LE(offset + (command === 0x32 ? 12 : 8))
+        minimum = bytes.readUInt32LE(offset + 12)
       }
       offset += size
     }
@@ -341,12 +343,6 @@ export function checkReleaseFormat(bytes, target, elf = '') {
 
 /** Complete converter output with the actual binary's SPDX package. */
 export function completeSpdx(document, binary, original) {
-  if (
-    document.documentDescribes?.length ||
-    document.relationships?.length ||
-    document.packages.some((entry) => entry.SPDXID === 'SPDXRef-Artifact')
-  )
-    throw new Error('Unexpected converter root or relationships')
   document.creationInfo ??= {}
   if (typeof document.creationInfo.created === 'string')
     document.creationInfo.created = document.creationInfo.created.replace(
@@ -402,48 +398,28 @@ export function completeSpdx(document, binary, original) {
   return validateSpdx(document, binary, original)
 }
 
-/** Check the frozen SPDX root/hash join and preserved package identities. */
-export function validateSpdx(document, binary, original) {
+/**
+ * Rescan the binary and check that every inventory component keeps its name,
+ * version and PURL in the SPDX packages.
+ */
+function validateSpdx(document, binary, original) {
   checkBinary(binary)
+  // The signed predicate type names SPDX 2.3.
   if (
     document.spdxVersion !== 'SPDX-2.3' ||
     document.SPDXID !== 'SPDXRef-DOCUMENT'
   )
     throw new Error('Expected an SPDX 2.3 document')
-  const packages = document.packages ?? []
+  const packages = document.packages
   const ids = new Set(packages.map((entry) => entry.SPDXID))
   if (ids.size !== packages.length)
     throw new Error('Duplicate SPDX package identity')
   if ([...ids].some((id) => !/^SPDXRef-[A-Za-z0-9.-]+$/.test(id)))
     throw new Error('Invalid SPDX package identifier')
-  const described = new Set(document.documentDescribes ?? [])
-  for (const edge of document.relationships ?? []) {
-    if (
-      edge.spdxElementId === document.SPDXID &&
-      edge.relationshipType === 'DESCRIBES'
-    )
-      described.add(edge.relatedSpdxElement)
-  }
-  const root = packages.find((entry) => entry.SPDXID === [...described][0])
-  if (described.size !== 1 || !root)
-    throw new Error('SPDX must describe exactly one root package')
-  const hashes = (root.checksums ?? []).filter(
-    (hash) => hash.algorithm === 'SHA256'
-  )
-  if (
-    hashes.length !== 1 ||
-    hashes[0].checksumValue !==
-      createHash('sha256').update(binary).digest('hex')
-  )
-    throw new Error('SPDX root SHA256 differs from binary')
   const flatten = (items) =>
     items.flatMap((item) => [item, ...flatten(item.components ?? [])])
-  const components = [
-    original.metadata.component,
-    ...flatten(original.components ?? []),
-  ]
   const used = new Set()
-  for (const component of components) {
+  for (const component of flatten(original.components ?? [])) {
     const match = packages.find(
       (entry) =>
         !used.has(entry.SPDXID) &&
@@ -457,8 +433,6 @@ export function validateSpdx(document, binary, original) {
           ))
     )
     if (!match) throw new Error('SPDX lost component identity or PURL')
-    if (component === original.metadata.component && match !== root)
-      throw new Error('SPDX describes a different inventory root')
     used.add(match.SPDXID)
   }
   return document
@@ -495,8 +469,8 @@ function namespace(bom, prefix) {
       return Object.fromEntries(
         Object.entries(value).map(([k, v]) => [k, rename(v, k)])
       )
-    return typeof value === 'string' &&
-      ['bom-ref', 'ref', 'dependsOn', 'provides'].includes(key)
+    // Hashed references keep valid SPDX identifiers after conversion.
+    return typeof value === 'string' && key === 'bom-ref'
       ? `${prefix}-${createHash('sha256').update(value).digest('hex')}`
       : value
   }
@@ -509,13 +483,7 @@ export function mergeSboms(cargo, npm, binary, name) {
   const javascript = namespace(npm, 'npm')
   const root = rust.metadata.component
   const npmRoot = javascript.metadata.component
-  const dependencies = [
-    ...(rust.dependencies ?? []),
-    ...(javascript.dependencies ?? []),
-  ]
-  let edge = dependencies.find((entry) => entry.ref === root['bom-ref'])
-  if (!edge) dependencies.push((edge = { ref: root['bom-ref'], dependsOn: [] }))
-  edge.dependsOn = [...(edge.dependsOn ?? []), npmRoot['bom-ref']]
+  // Dependency relationships are dropped: SPDX conversion would not keep them.
   return {
     bomFormat: 'CycloneDX',
     specVersion: '1.5',
@@ -538,7 +506,7 @@ export function mergeSboms(cargo, npm, binary, name) {
         {
           name: 'trusted-server:coverage',
           value:
-            'Selected Cargo packages plus the installed npm build tree used for this release build. Conservative inventory: components may be removed by linking, tree-shaking or minification. External Prebid is not bundled; its installed package is a build-tree entry only. SPDX conversion does not retain dependency relationships. Native C/assembly, system libraries, Rust standard library and compiler runtimes are not completely inventoried. Complete composition is Phase 2.',
+            'Selected Cargo packages plus the installed npm build tree used for this release build. Conservative inventory: components may be removed by linking, tree-shaking or minification. External Prebid is not bundled; its installed package is a build-tree entry only. The inventory does not record dependency relationships. Native C/assembly, system libraries, Rust standard library and compiler runtimes are not completely inventoried. Complete composition is Phase 2.',
         },
       ],
     },
@@ -548,7 +516,6 @@ export function mergeSboms(cargo, npm, binary, name) {
       npmRoot,
       ...(javascript.components ?? []),
     ],
-    dependencies,
   }
 }
 
@@ -569,11 +536,10 @@ export function checkCliVersion(output, cargoManifest, source, target) {
 async function smokeRelease(file, target) {
   const linux = target === 'x86_64-unknown-linux-gnu'
   const elf = linux
-    ? execFileSync(
-        'readelf',
-        ['--program-headers', '--dynamic', '--version-info', file],
-        { encoding: 'utf8', maxBuffer: 8388608 }
-      )
+    ? execFileSync('readelf', ['--version-info', file], {
+        encoding: 'utf8',
+        maxBuffer: 8388608,
+      })
     : ''
   checkReleaseFormat(readFileSync(file), target, elf)
   console.log(

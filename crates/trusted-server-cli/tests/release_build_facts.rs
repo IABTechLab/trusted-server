@@ -1,4 +1,4 @@
-//! Host checks of actual owning build scripts and the compiled CLI binary.
+//! Host checks of the CLI build script and the compiled CLI binary.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
-use trusted_server_cli::BUILD_INFO;
-use trusted_server_core::build_info::BuildVariant;
+use trusted_server_core::constants::TS_GIT_VERSION;
 
 const SOURCE: &str = "abcdef0123456789abcdef0123456789abcdef01";
 
@@ -49,89 +48,68 @@ fn owner_command(script: &Path) -> Command {
 // Release control and source validation belongs to core's build script, which
 // every product build runs; `git_version_resolve.rs` covers that rule.
 #[test]
-fn actual_owner_scripts_emit_only_own_target() {
+fn cli_build_script_emits_only_its_target() {
     let directory = tempfile::tempdir().expect("should create fixture");
-    for owner in ["trusted-server-cli"] {
-        let script = compile_build_script(owner, &directory);
-        let mut outputs = Vec::new();
-        for tag in ["v1.2.3", "v1.2.4"] {
-            let output = owner_command(&script)
-                .env("TRUSTED_SERVER__RELEASE_BUILD", "1")
-                .env("TRUSTED_SERVER__GIT_VERSION", SOURCE)
-                .env("GITHUB_REF_NAME", tag)
-                .env("GITHUB_RUN_ID", tag)
+    let script = compile_build_script("trusted-server-cli", &directory);
+    let mut outputs = Vec::new();
+    for tag in ["v1.2.3", "v1.2.4"] {
+        let output = owner_command(&script)
+            .env("TRUSTED_SERVER__RELEASE_BUILD", "1")
+            .env("TRUSTED_SERVER__GIT_VERSION", SOURCE)
+            .env("GITHUB_REF_NAME", tag)
+            .env("GITHUB_RUN_ID", tag)
+            .output()
+            .expect("should run release build script");
+        assert!(output.status.success(), "should run the CLI build script");
+        outputs.push(String::from_utf8(output.stdout).expect("should emit UTF-8 directives"));
+    }
+    outputs.push(
+        String::from_utf8(
+            owner_command(&script)
                 .output()
-                .expect("should run release owner script");
-            assert!(output.status.success(), "should run {owner} build script");
-            outputs.push(String::from_utf8(output.stdout).expect("should emit UTF-8 directives"));
-        }
-        outputs.push(
-            String::from_utf8(
-                owner_command(&script)
-                    .output()
-                    .expect("should run development script")
-                    .stdout,
-            )
-            .expect("should emit UTF-8 directives"),
+                .expect("should run development script")
+                .stdout,
+        )
+        .expect("should emit UTF-8 directives"),
+    );
+    for (index, directives) in outputs.iter().enumerate() {
+        // Release-only resource discovery is selected for the two release runs.
+        let release_cfg = if index < 2 {
+            "cargo:rustc-cfg=trusted_server_release_build\n"
+        } else {
+            ""
+        };
+        assert_eq!(
+            directives,
+            &format!(
+                "cargo:rerun-if-changed=build.rs\n\
+                 cargo:rerun-if-env-changed=TRUSTED_SERVER__RELEASE_BUILD\n\
+                 cargo:rustc-check-cfg=cfg(trusted_server_release_build)\n\
+                 {release_cfg}\
+                 cargo:rustc-env=TRUSTED_SERVER__BUILD_TARGET=example-target\n"
+            ),
+            "should emit only the target owned by Cargo TARGET"
         );
-        for (index, directives) in outputs.iter().enumerate() {
-            // Only the CLI selects release-only resource discovery, for the two
-            // release runs.
-            let cli_cfg = match (owner, index) {
-                ("trusted-server-cli", 2) => {
-                    "cargo:rerun-if-env-changed=TRUSTED_SERVER__RELEASE_BUILD\n\
-                     cargo:rustc-check-cfg=cfg(trusted_server_release_build)\n"
-                }
-                ("trusted-server-cli", _) => {
-                    "cargo:rerun-if-env-changed=TRUSTED_SERVER__RELEASE_BUILD\n\
-                     cargo:rustc-check-cfg=cfg(trusted_server_release_build)\n\
-                     cargo:rustc-cfg=trusted_server_release_build\n"
-                }
-                _ => "",
-            };
-            assert_eq!(
-                directives,
-                &format!(
-                    "cargo:rerun-if-changed=build.rs\n{cli_cfg}\
-                     cargo:rustc-env=TRUSTED_SERVER__BUILD_TARGET=example-target\n"
-                ),
-                "should emit only the target owned by Cargo TARGET for {owner}"
-            );
-        }
     }
 }
 
 #[test]
 fn actual_cli_version_reads_all_owning_facts_and_ignores_external_tags() {
-    assert_eq!(
-        BUILD_INFO.package_version(),
-        env!("CARGO_PKG_VERSION"),
-        "should own package version"
-    );
-    assert_eq!(
-        BUILD_INFO.source(),
-        trusted_server_core::constants::TS_GIT_VERSION,
-        "should consume the source owned by core"
-    );
-    assert_eq!(
-        BUILD_INFO.target(),
-        env!("TRUSTED_SERVER__BUILD_TARGET"),
-        "should own Cargo target"
-    );
-    assert_eq!(
-        BUILD_INFO.variant(),
-        BuildVariant::Default,
-        "should use CLI default variant"
-    );
     // CI compiles this test once in release mode; the supplied commit must
     // reach the actual CLI unchanged.
     if option_env!("TRUSTED_SERVER__RELEASE_BUILD").is_some() {
         assert_eq!(
-            BUILD_INFO.source(),
+            TS_GIT_VERSION,
             option_env!("TRUSTED_SERVER__GIT_VERSION"),
             "should compile the exact supplied release source into the actual CLI"
         );
     }
+    let expected = format!(
+        "ts package={} source={} target={} variant=default\n",
+        env!("CARGO_PKG_VERSION"),
+        TS_GIT_VERSION.unwrap_or("unknown"),
+        env!("TRUSTED_SERVER__BUILD_TARGET"),
+    );
     let directory = tempfile::tempdir().expect("should create outside-checkout fixture");
     for tag in ["v1.2.3", "v1.2.4"] {
         let output = Command::new(env!("CARGO_BIN_EXE_ts"))
@@ -147,12 +125,7 @@ fn actual_cli_version_reads_all_owning_facts_and_ignores_external_tags() {
         );
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
-            format!(
-                "ts package={} source={} target={} variant=default\n",
-                BUILD_INFO.package_version(),
-                BUILD_INFO.source().unwrap_or("unknown"),
-                BUILD_INFO.target()
-            ),
+            expected,
             "should label all four actual immutable facts"
         );
     }
