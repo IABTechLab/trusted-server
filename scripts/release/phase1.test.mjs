@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { completeSpdx, validateSpdx, checkReleaseFormat } from './phase1.mjs'
+import { completeSpdx, checkReleaseFormat } from './phase1.mjs'
 import { test } from 'node:test'
 import {
   readFileSync,
@@ -14,18 +14,14 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import * as fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { isDeepStrictEqual } from 'node:util'
 import {
   checkBinary,
   checkCliVersion,
   mergeSboms,
   sentinels,
 } from './phase1.mjs'
-import {
-  publish,
-  readRetrier,
-  releaseAssets,
-  releaseNotes,
-} from './publish.mjs'
+import { publish, releaseAssets, releaseNotes } from './publish.mjs'
 test('rejects every planted operator value, including inside binary data', () => {
   for (const marker of sentinels) {
     assert.throws(
@@ -83,12 +79,7 @@ test('merges independent graphs without colliding references and binds binary by
   assert.equal(output.metadata.component.components, undefined)
   assert.equal(output.metadata.component.hashes[0].alg, 'SHA-256')
   assert.equal(output.metadata.component.hashes[0].content.length, 64)
-  assert.deepEqual(
-    output.dependencies.find(
-      (d) => d.ref === output.metadata.component['bom-ref']
-    ).dependsOn,
-    [output.components[0]['bom-ref'], output.components[2]['bom-ref']]
-  )
+  assert.equal(output.dependencies, undefined)
   assert.equal(
     new Set(output.components.map((c) => c['bom-ref'])).size,
     output.components.length
@@ -101,6 +92,14 @@ test('merges independent graphs without colliding references and binds binary by
   assert.throws(
     () => mergeSboms({}, bom('npm'), Buffer.from('binary'), 'example'),
     /CycloneDX/
+  )
+  // Both inventories reach the merged components that SPDX validation checks.
+  const names = (items) =>
+    items.flatMap((item) => [item.name, ...names(item.components ?? [])])
+  assert.deepEqual(
+    names(output.components).sort(),
+    ['cargo-dependency', 'cargo-nested', 'npm', 'npm-dependency', 'npm-nested'],
+    'should keep every Cargo and npm component'
   )
 })
 test('workflow signs only tags, separates privileged jobs, and never checks out in signing', () => {
@@ -304,7 +303,7 @@ test('release notes link to the guide at the tag and carry no commands', () => {
   })
 })
 test('publication binds exact signing handoffs and refuses drafts, corruption and partial uploads', async (t) => {
-  // Record each read's command timeout so availability reads can be bounded.
+  // Record each read's timeout so every read can be shown to be bounded.
   const timeouts = new WeakMap()
   const timeout = AbortSignal.timeout.bind(AbortSignal)
   t.mock.method(AbortSignal, 'timeout', (delay) => {
@@ -325,7 +324,10 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'malformed-tag',
     'bundle-verification-failure',
     'bundle-sbom-mismatch',
+    'bundle-sbom-duplicate',
     'identity-late',
+    'identity-transient',
+    'identity-never',
     'large-sbom-output',
     'publication-disabled',
     'prerelease-mismatch',
@@ -346,21 +348,15 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'upload-size',
     'mutable',
     'wrong-id',
-    'published-asset-digest',
-    'published-asset-extra',
-    'published-asset-renamed',
-    'attestation-404-then-present',
-    'attestation-after-two-waits',
-    'attestation-404-never',
-    'attestation-non-200',
-    'attestation-list-transient',
-    'attestation-user-initiated',
-    'attestation-truncated',
-    'attestation-duplicate-subject',
-    'attestation-payload-type',
-    'attestation-201',
-    'attestation-auth-error',
+    'published-wrong-id',
+    'published-wrong-tag',
+    'published-draft',
+    'published-prerelease-flipped',
+    'attestation-late',
+    'attestation-never',
+    'attestation-past-deadline',
     'attestation-malformed',
+    'attestation-wrong-tag',
     'attestation-wrong-tag-shape',
     'attestation-wrong-id',
     'attestation-wrong-repository',
@@ -368,29 +364,12 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'attestation-wrong-assets',
     'attestation-missing-asset',
     'attestation-extra-asset',
-    'attestation-duplicate',
-    'attestation-other-tag',
-    'attestation-other-tag-before-current',
-    'attestation-other-malformed',
-    'attestation-other-unverifiable',
-    'attestation-substituted-bundle',
-    'attestation-statement-mismatch',
-    'attestation-verification-failure',
-    'attestation-verify-transient',
-    'attestation-verify-past-deadline',
-    'attestation-proof-late-failure',
-    'attestation-late-reads',
-    'attestation-list-past-deadline',
-    'attestation-null-bundle',
-    'attestation-null-bundle-late',
-    'attestation-null-bundle-never',
-    'attestation-null-bundle-no-url',
-    'attestation-null-bundle-wrong-assets',
+    'attestation-duplicate-subject',
   ]) {
     const root = mkdtempSync(join(tmpdir(), 'phase1-publish-'))
     const calls = []
     const uploaded = []
-    const stable = mode.startsWith('stable') || mode === 'attestation-other-tag'
+    const stable = mode === 'stable'
     const tag =
       mode === 'build-metadata-tag'
         ? 'v1.0.0+build-1'
@@ -401,22 +380,25 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             : stable
               ? 'v1.0.0'
               : 'v0.0.0-example'
-    const opaque = mode.startsWith('attestation-null-bundle')
     // Real SBOM results embed the whole SPDX document and exceed 1 MiB.
     const spdxDocument = (asset) =>
       mode === 'large-sbom-output'
         ? { fixture: asset, padding: 'x'.repeat(2 * 1024 * 1024) }
         : { fixture: asset }
     const waits = [],
-      ignored = []
+      logs = [],
+      // Retried reads catch every error, so a failed stub assertion is also
+      // recorded here.
+      violations = []
+    const check = (condition, message) => {
+      if (!condition) violations.push(message)
+      assert.ok(condition, message)
+    }
     // Whether a gh command ran since the last API call.
     let ghSinceFetch = false
     let verifies = 0,
-      now = 0,
-      // The availability window starts when the identity reads finish.
-      availabilityEnd = 60000
-    let polls = 0,
-      observed = []
+      identityReads = 0,
+      now = 0
     try {
       for (const asset of assets) {
         const build = join(root, 'build', asset)
@@ -467,16 +449,11 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         prerelease: !stable && mode !== 'prerelease-mismatch',
         draft,
         immutable: mode !== 'mutable',
-        assets: uploaded.map((item, index) => ({
-          ...item,
-          digest:
-            mode === 'published-asset-digest' && index === 0
-              ? `sha256:${'0'.repeat(64)}`
-              : item.digest,
-        })),
+        assets: uploaded,
       })
-      const attestation = (attested = tag) => {
-        const statement = {
+      const statement = () => {
+        const attested = mode === 'attestation-wrong-tag' ? 'v9.9.9' : tag
+        const result = {
           _type: 'https://in-toto.io/Statement/v1',
           predicateType: 'https://in-toto.io/attestation/release/v0.2',
           predicate: {
@@ -495,50 +472,29 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             })),
           ],
         }
-        if (mode === 'attestation-wrong-id')
-          statement.predicate.databaseId = '43'
+        if (mode === 'attestation-wrong-id') result.predicate.databaseId = '43'
         if (mode === 'attestation-wrong-repository')
-          statement.predicate.repository = 'example/other'
+          result.predicate.repository = 'example/other'
         if (mode === 'attestation-wrong-source')
-          statement.subject[0].digest.sha1 = 'b'.repeat(40)
-        if (
-          mode === 'attestation-wrong-assets' ||
-          mode === 'attestation-null-bundle-wrong-assets'
-        )
-          statement.subject[1].digest.sha256 = '0'.repeat(64)
-        if (mode === 'attestation-missing-asset') statement.subject.pop()
+          result.subject[0].digest.sha1 = 'b'.repeat(40)
+        if (mode === 'attestation-wrong-assets')
+          result.subject[1].digest.sha256 = '0'.repeat(64)
+        if (mode === 'attestation-missing-asset') result.subject.pop()
         if (mode === 'attestation-extra-asset')
-          statement.subject.push({
+          result.subject.push({
             name: 'unexpected',
             digest: { sha256: '0'.repeat(64) },
           })
-        if (mode === 'attestation-wrong-tag-shape') statement.predicate.tag = 42
+        if (mode === 'attestation-wrong-tag-shape') result.predicate.tag = 42
         if (mode === 'attestation-duplicate-subject')
-          statement.subject.push(statement.subject[1])
-        return {
-          initiator: 'github',
-          bundle: {
-            mediaType: 'application/vnd.dev.sigstore.bundle.v0.3+json',
-            verificationMaterial: {},
-            dsseEnvelope: {
-              payloadType:
-                mode === 'attestation-payload-type'
-                  ? 'application/json'
-                  : 'application/vnd.in-toto+json',
-              payload: Buffer.from(JSON.stringify(statement)).toString(
-                'base64'
-              ),
-              signatures: [{ sig: 'fixture' }],
-            },
-          },
-        }
+          result.subject.push(result.subject[1])
+        return result
       }
       const fetch = async (url, options = {}) => {
         const u = new URL(url)
         const method = options.method ?? 'GET'
-        assert.equal(
-          Boolean(options.signal),
-          method === 'GET',
+        check(
+          Boolean(options.signal) === (method === 'GET'),
           `should time-bound every read and only reads: ${method} ${u.pathname}`
         )
         // A synchronous gh check between API calls leaves pooled sockets
@@ -561,6 +517,11 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         if (u.pathname.includes('/git/ref/tags/')) {
           assert.equal(method, 'GET')
           assert.equal(decodeURIComponent(u.pathname.split('/').at(-1)), tag)
+          assert.equal(
+            timeouts.get(options.signal),
+            10000,
+            'should bound the tag reference read to 10s'
+          )
           if (mode === 'missing-tag') return response({}, 404)
           if (mode === 'malformed-tag') return response({})
           return response({
@@ -572,81 +533,12 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             },
           })
         }
-        if (u.pathname.includes('/attestations/')) {
-          polls++
-          assert.equal(method, 'GET')
-          assert.equal(u.searchParams.get('predicate_type'), 'release')
-          assert.ok(
-            now < availabilityEnd,
-            'should not start a read after the deadline'
-          )
+        if (u.pathname.endsWith('/releases') && method === 'GET') {
           assert.equal(
             timeouts.get(options.signal),
-            Math.min(4000, availabilityEnd - now),
-            'should bound every availability read by the availability deadline'
+            10000,
+            'should bound the release listing read to 10s'
           )
-          // Two transient failures push the third read close to the deadline.
-          if (mode === 'attestation-late-reads' && [5, 6].includes(polls))
-            return response({}, 503, { 'retry-after': '10' })
-          // The second failure runs until its timeout, so its retry would end
-          // after the availability deadline.
-          if (mode === 'attestation-list-past-deadline' && polls >= 5) {
-            if (polls === 6) now += timeouts.get(options.signal)
-            return response({}, 503, { 'retry-after': '10' })
-          }
-          if (
-            mode === 'attestation-non-200' ||
-            (mode === 'attestation-list-transient' && polls === 1)
-          )
-            return response({}, 503)
-          if (mode === 'attestation-201') return response({}, 201)
-          if (mode === 'attestation-auth-error') return response({}, 403)
-          if (mode === 'attestation-malformed')
-            return response({ attestations: null })
-          if (opaque)
-            return response({
-              attestations: [
-                {
-                  initiator: 'github',
-                  bundle: null,
-                  ...(mode === 'attestation-null-bundle-no-url'
-                    ? {}
-                    : { bundle_url: 'https://example.com/bundle' }),
-                },
-              ],
-            })
-          const other = attestation('v1.0.0-rc.1')
-          if (mode === 'attestation-other-malformed')
-            other.bundle.dsseEnvelope.payload = '!invalid!'
-          const delay =
-            mode === 'attestation-404-then-present'
-              ? 1
-              : [
-                    'attestation-after-two-waits',
-                    'attestation-other-tag-before-current',
-                  ].includes(mode)
-                ? 2
-                : mode === 'attestation-404-never'
-                  ? 5
-                  : [
-                        'attestation-verify-past-deadline',
-                        'attestation-late-reads',
-                        'attestation-list-past-deadline',
-                      ].includes(mode)
-                    ? 4
-                    : 0
-          if (polls <= delay && mode !== 'attestation-other-tag-before-current')
-            return response({ message: 'Not Found' }, 404)
-          observed = polls <= delay ? [] : [attestation()]
-          if (mode === 'attestation-duplicate') observed.push(attestation())
-          if (mode === 'attestation-user-initiated')
-            observed.unshift({ initiator: 'user', bundle: 'not a bundle' })
-          if (mode === 'attestation-truncated')
-            observed = Array(100).fill(observed[0])
-          if (mode.startsWith('attestation-other-')) observed.unshift(other)
-          return response({ attestations: observed })
-        }
-        if (u.pathname.endsWith('/releases') && method === 'GET') {
           if (mode === 'api-error') return response('denied', 503)
           const page = Number(u.searchParams.get('page'))
           if (mode === 'draft-page-2')
@@ -705,21 +597,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             201
           )
         }
-        if (method === 'GET' && /\/releases\/(?:42|tags\/)/.test(u.pathname))
-          assert.equal(
-            timeouts.get(options.signal),
-            Math.min(10000, 180000 - now),
-            'should bound every identity read by the post-publish window'
-          )
-        if (u.pathname.includes('/releases/tags/')) {
-          availabilityEnd = Math.min(180000, now + 60000)
-          return response({
-            ...release(false),
-            id: mode === 'wrong-id' ? 43 : 42,
-          })
-        }
         if (u.pathname.endsWith('/releases/42')) {
-          if (method === 'PATCH')
+          if (method === 'PATCH') {
             assert.deepEqual(
               JSON.parse(options.body),
               {
@@ -729,15 +608,32 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
               },
               'should publish with the release type and Latest policy'
             )
-          // The first identity read ends late in the post-publish window.
-          else if (mode === 'identity-late') now = 175000
-          const current = release(method !== 'PATCH' && uploaded.length === 0)
-          if (mode === 'published-asset-extra')
-            current.assets.push({ name: 'unexpected', size: 1 })
-          // Same count and unique names, but one name is not in the set.
-          if (mode === 'published-asset-renamed' && current.assets.length)
-            current.assets[0] = { ...current.assets[0], name: 'unexpected' }
-          return response(current)
+            return response({
+              ...release(false),
+              id: mode === 'published-wrong-id' ? 43 : 42,
+            })
+          }
+          identityReads++
+          check(
+            timeouts.get(options.signal) === Math.min(10000, 180000 - now),
+            'should bound every identity read by the post-publish window'
+          )
+          if (
+            mode === 'identity-never' ||
+            (mode === 'identity-transient' && identityReads === 1)
+          )
+            return response({}, 503)
+          // The identity read ends late in the post-publish window.
+          if (['identity-late', 'attestation-past-deadline'].includes(mode))
+            now = 175000
+          return response({
+            ...release(mode === 'published-draft'),
+            id: mode === 'wrong-id' ? 43 : 42,
+            ...(mode === 'published-wrong-tag' ? { tag_name: 'v9.9.9' } : {}),
+            ...(mode === 'published-prerelease-flipped'
+              ? { prerelease: stable }
+              : {}),
+          })
         }
         throw Error(`Unexpected ${method} ${url}`)
       }
@@ -793,18 +689,22 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           )
           if (mode === 'bundle-verification-failure' && index === 3)
             throw Error('Signature verification failed')
-          const output = JSON.stringify([
-            {
-              verificationResult: {
-                statement: {
-                  predicate:
-                    mode === 'bundle-sbom-mismatch'
+          // A provenance result carries an SLSA predicate, never the SPDX.
+          const result = {
+            verificationResult: {
+              statement: {
+                predicate:
+                  kind === 'provenance'
+                    ? { buildDefinition: { buildType: 'fixture' } }
+                    : mode === 'bundle-sbom-mismatch'
                       ? { fixture: 'other' }
                       : spdxDocument(name),
-                },
               },
             },
-          ])
+          }
+          const output = JSON.stringify(
+            mode === 'bundle-sbom-duplicate' ? [result, result] : [result]
+          )
           if (mode !== 'large-sbom-output') return Buffer.from(output)
           // Pass the large result through a real child process with the
           // publisher's own options, so Node's output buffer limit applies.
@@ -821,65 +721,36 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           )
         }
         verifies++
-        const verifiedTag = args[1].at(-1)
-        assert.equal(verifiedTag, tag, 'should verify only the current tag')
-        assert.equal(
-          args[2].timeout,
-          Math.min(10000, availabilityEnd - now),
-          'should bound proof verification by the availability deadline'
+        check(
+          isDeepStrictEqual(args, [
+            'gh',
+            [
+              'release',
+              'verify',
+              '--repo',
+              'example/project',
+              '--format',
+              'json',
+              '--',
+              tag,
+            ],
+            { timeout: Math.min(30000, 180000 - now), stdio: 'pipe' },
+          ]),
+          'should verify only the current tag within the post-publish window'
         )
-        // The first proof fails, so the next availability check reads the
-        // API again after a gh command.
-        if (mode === 'idle-socket' && verifies === 1)
-          throw Error('Signature verification failed')
-        if (mode === 'attestation-verify-transient' && verifies === 1)
-          throw Object.assign(Error('gh failed'), {
-            stderr: Buffer.from('HTTP 503: Service Unavailable'),
-          })
-        // Each proof fetch runs until its command timeout.
-        if (mode === 'attestation-verify-past-deadline' && verifies <= 2) {
+        // The failed verification runs until its command timeout.
+        if (mode === 'attestation-past-deadline') {
           now += args[2].timeout
-          throw Object.assign(Error('timeout'), { code: 'ETIMEDOUT' })
-        }
-        // Every failed proof fetch runs until its command timeout, so the
-        // check before the next wait finds the deadline too close.
-        if (mode === 'attestation-proof-late-failure') {
-          now += args[2].timeout
-          throw Error('Signature verification failed')
+          throw Error('no attestations for tag')
         }
         if (
-          mode === 'attestation-verification-failure' ||
-          mode === 'attestation-null-bundle-never' ||
-          (mode === 'attestation-null-bundle-late' && verifies === 1)
+          mode === 'attestation-never' ||
+          (mode === 'attestation-late' && verifies <= 2)
         )
-          throw Error('Signature verification failed')
-        assert.ok(
-          polls > 0,
-          'should read release-attestation availability before verification'
-        )
-        const bundle = opaque
-          ? attestation().bundle
-          : structuredClone(
-              observed.find(
-                (r) =>
-                  r.initiator === 'github' &&
-                  JSON.parse(
-                    Buffer.from(r.bundle.dsseEnvelope.payload, 'base64')
-                  ).predicate.tag === verifiedTag
-              ).bundle
-            )
-        if (mode === 'attestation-substituted-bundle')
-          bundle.dsseEnvelope.signatures[0].sig = 'different'
-        const statement = JSON.parse(
-          Buffer.from(bundle.dsseEnvelope.payload, 'base64')
-        )
-        if (mode === 'attestation-statement-mismatch')
-          statement.predicate.databaseId = '99'
+          throw Error('no attestations for tag')
+        if (mode === 'attestation-malformed') return Buffer.from('{}')
         return Buffer.from(
-          JSON.stringify({
-            attestation: { bundle },
-            verificationResult: { statement },
-          })
+          JSON.stringify({ verificationResult: { statement: statement() } })
         )
       }
       const execute = () =>
@@ -900,10 +771,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             waits.push(delay)
             now += delay
           },
-          log: (...args) => {
-            if (args[0] === 'Ignored release attestation for other tag:')
-              ignored.push(args[1])
-          },
+          log: (...args) => logs.push(args.join(' ')),
           warn: () => {},
         })
       const successful = [
@@ -911,61 +779,61 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'idle-socket',
         'stable',
         'identity-late',
+        'identity-transient',
         'large-sbom-output',
-        'attestation-404-then-present',
-        'attestation-after-two-waits',
-        'attestation-other-tag',
-        'attestation-other-tag-before-current',
-        'attestation-other-unverifiable',
-        'attestation-verify-transient',
-        'attestation-list-transient',
-        'attestation-late-reads',
-        'attestation-user-initiated',
-        'attestation-null-bundle',
-        'attestation-null-bundle-late',
+        'attestation-late',
       ].includes(mode)
+      // Post-publish failures name the stage and keep the last failure.
+      const exhausted = (label, cause) => (error) =>
+        error.message === `${label} failed; the release is already published` &&
+        cause.test(error.cause?.message)
       const expectedError = {
         'non-semver-tag': /Invalid repository or tag/,
         'build-metadata-tag': /Invalid repository or tag/,
         'leading-zero-tag': /Invalid repository or tag/,
         'upload-size': /Upload mismatch/,
-        'attestation-verification-failure': /Signature verification failed/,
-        'attestation-proof-late-failure': /Signature verification failed/,
         'bundle-verification-failure': /Signature verification failed/,
         'bundle-sbom-mismatch': /Signed SBOM differs from the shipped SPDX/,
-        'attestation-truncated': /truncated/,
-        'attestation-duplicate-subject': /Invalid release attestation subjects/,
-        'attestation-payload-type': /Malformed release attestation bundle/,
+        'bundle-sbom-duplicate': /Signed SBOM differs from the shipped SPDX/,
         'draft-page-2': /already exists/,
         'symlink-input': /Invalid file/,
         'upload-digest': /Upload mismatch/,
-        'published-asset-digest': /Published asset digest mismatch/,
-        'published-asset-extra': /Published asset set mismatch/,
-        'published-asset-renamed': /Unexpected published asset/,
-        'attestation-404-never': /unavailable after five checks/,
-        // The deadline names its window and keeps the failure that caused the
-        // retry.
-        'attestation-verify-past-deadline': (error) =>
-          error.message ===
-            'Release attestation availability retry window exhausted' &&
-          error.cause?.code === 'ETIMEDOUT',
-        'attestation-list-past-deadline': (error) =>
-          error.message ===
-            'Release attestation availability retry window exhausted' &&
-          error.cause?.status === 503,
         'signed-extra': /Unexpected artifact contents/,
         'created-wrong-tag': /Invalid created release identity/,
         'created-not-draft': /Invalid created release identity/,
         'created-not-prerelease': /Invalid created release identity/,
-        'attestation-statement-mismatch': /statement mismatch/,
-        'attestation-substituted-bundle': /bundle mismatch/,
-        'attestation-null-bundle-never': /Signature verification failed/,
-        'attestation-null-bundle-no-url':
-          /Malformed release attestation bundle/,
-        'attestation-null-bundle-wrong-assets': /identity or assets mismatch/,
+        mutable: /identity or immutability mismatch/,
+        'wrong-id': /identity or immutability mismatch/,
+        'published-wrong-id': /identity or immutability mismatch/,
+        'published-wrong-tag': /identity or immutability mismatch/,
+        'published-draft': /identity or immutability mismatch/,
+        'published-prerelease-flipped': /identity or immutability mismatch/,
+        'prerelease-mismatch': /Invalid created release identity/,
+        'identity-never': exhausted('Published release read', /503/),
+        'attestation-never': exhausted(
+          'Release attestation verification',
+          /no attestations/
+        ),
+        'attestation-past-deadline': exhausted(
+          'Release attestation verification',
+          /no attestations/
+        ),
+        'attestation-malformed': /Malformed release attestation statement/,
+        'attestation-wrong-tag-shape':
+          /Malformed release attestation statement/,
+        'attestation-wrong-repository':
+          /Malformed release attestation statement/,
+        'attestation-wrong-source': /Invalid release attestation subjects/,
+        'attestation-duplicate-subject': /Invalid release attestation subjects/,
+        'attestation-wrong-tag': /identity or assets mismatch/,
+        'attestation-wrong-id': /identity or assets mismatch/,
+        'attestation-wrong-assets': /identity or assets mismatch/,
+        'attestation-missing-asset': /identity or assets mismatch/,
+        'attestation-extra-asset': /identity or assets mismatch/,
       }[mode]
       if (successful) await execute()
       else await assert.rejects(execute, expectedError, mode)
+      assert.deepEqual(violations, [], mode)
       if (
         [
           'draft',
@@ -987,6 +855,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           'signed-extra',
           'bundle-verification-failure',
           'bundle-sbom-mismatch',
+          'bundle-sbom-duplicate',
         ].includes(mode)
       )
         assert.ok(
@@ -1018,10 +887,30 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           ),
           'should upload nothing to a release with the wrong identity'
         )
-      // Immutability is verified before any availability read.
-      if (mode === 'mutable') assert.equal(polls, 0, mode)
       if (['upload-error', 'upload-digest', 'upload-size'].includes(mode))
         assert.ok(!calls.some(([method]) => method === 'PATCH'), mode)
+      // Recovery starts from the logged ID, so it is logged before the
+      // created identity is checked.
+      if (successful || mode.startsWith('created-'))
+        assert.ok(logs.includes('Created release ID: 42'), mode)
+      // Only failed reads wait; a returned result that fails a check, such
+      // as a mutable release or a wrong statement, stops at once.
+      assert.deepEqual(
+        waits,
+        {
+          'identity-transient': [2000],
+          'identity-never': [2000, 5000, 10000, 20000],
+          'attestation-late': [2000, 5000],
+          'attestation-never': [2000, 5000, 10000, 20000],
+        }[mode] ?? [],
+        mode
+      )
+      assert.equal(
+        verifies,
+        { 'attestation-late': 3, 'attestation-never': 5 }[mode] ??
+          (successful || mode.startsWith('attestation-') ? 1 : 0),
+        mode
+      )
       if (successful) {
         assert.equal(uploaded.length, assets.length * 4 + 1)
         // Two-space lines are what `shasum -a 256 --check` accepts.
@@ -1040,57 +929,6 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           bundleChecks
         )
         assert.equal(
-          verifies,
-          [
-            'idle-socket',
-            'attestation-verify-transient',
-            'attestation-null-bundle-late',
-          ].includes(mode)
-            ? 2
-            : 1,
-          mode
-        )
-      }
-      if (mode.startsWith('attestation-')) {
-        const expectedWaits = [
-          'attestation-404-never',
-          'attestation-null-bundle-never',
-          'attestation-verification-failure',
-        ].includes(mode)
-          ? [2000, 5000, 10000, 20000]
-          : [
-                'attestation-404-then-present',
-                'attestation-null-bundle-late',
-              ].includes(mode)
-            ? [2000]
-            : [
-                  'attestation-after-two-waits',
-                  'attestation-other-tag-before-current',
-                ].includes(mode)
-              ? [2000, 5000]
-              : []
-        // Transient read retries wait inside one availability check.
-        const retried = {
-          'attestation-verify-transient': [[2000], 1],
-          'attestation-verify-past-deadline': [
-            [2000, 5000, 10000, 20000, 2000],
-            5,
-          ],
-          'attestation-list-transient': [[2000], 2],
-          'attestation-late-reads': [
-            [2000, 5000, 10000, 20000, 10000, 10000],
-            7,
-          ],
-          'attestation-list-past-deadline': [
-            [2000, 5000, 10000, 20000, 10000],
-            6,
-          ],
-          'attestation-non-200': [[2000, 5000], 3],
-          'attestation-proof-late-failure': [[2000, 5000, 10000], 4],
-        }[mode]
-        assert.deepEqual(waits, retried?.[0] ?? expectedWaits, mode)
-        assert.equal(polls, retried?.[1] ?? expectedWaits.length + 1, mode)
-        assert.equal(
           calls.filter(
             ([method, path]) => method === 'POST' && path.endsWith('/releases')
           ).length,
@@ -1098,27 +936,14 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           mode
         )
         assert.equal(
-          calls.filter(
-            ([method, path]) =>
-              method === 'POST' && path.split('?')[0].endsWith('/assets')
-          ).length,
-          assets.length * 4 + 1,
-          mode
-        )
-        assert.equal(
           calls.filter(([method]) => method === 'PATCH').length,
           1,
           mode
         )
-        assert.deepEqual(
-          ignored,
-          ['attestation-other-tag', 'attestation-other-unverifiable'].includes(
-            mode
-          )
-            ? ['"v1.0.0-rc.1"']
-            : mode === 'attestation-other-tag-before-current'
-              ? Array(3).fill('"v1.0.0-rc.1"')
-              : [],
+        assert.ok(
+          logs.includes(
+            `Verified release: ${tag} signature and attestation statement match`
+          ),
           mode
         )
       }
@@ -1171,32 +996,21 @@ test('acquires the locked workspace graph before offline SBOM resolution', () =>
 })
 // SPDX conversion retains the binary root and conservative package inventory.
 const binary = Buffer.from('fictional binary')
+// Converter output: package entries only, before the binary root is added.
 function spdxFixture() {
-  const root = {
-    SPDXID: 'SPDXRef-Root',
-    name: 'example.wasm',
-    checksums: [
-      {
-        algorithm: 'SHA256',
-        checksumValue: createHash('sha256').update(binary).digest('hex'),
-      },
-    ],
-  }
   const component = {
     name: 'example-package',
     version: '1.0.0',
     purl: 'pkg:npm/example-package@1.0.0',
   }
   const original = {
-    metadata: { component: { name: root.name } },
+    metadata: { component: { name: 'example.wasm' } },
     components: [component],
   }
   const document = {
     spdxVersion: 'SPDX-2.3',
     SPDXID: 'SPDXRef-DOCUMENT',
-    documentDescribes: [root.SPDXID],
     packages: [
-      root,
       {
         SPDXID: 'SPDXRef-Package',
         name: component.name,
@@ -1206,36 +1020,11 @@ function spdxFixture() {
         ],
       },
     ],
-    relationships: [
-      {
-        spdxElementId: 'SPDXRef-DOCUMENT',
-        relationshipType: 'DESCRIBES',
-        relatedSpdxElement: root.SPDXID,
-      },
-    ],
   }
   return { original, document }
 }
-test('SPDX preserves a binary-bound root and package versions/PURLs', () => {
-  const { original, document } = spdxFixture()
-  assert.equal(validateSpdx(document, binary, original), document)
-  delete document.documentDescribes
-  assert.doesNotThrow(() => validateSpdx(document, binary, original))
-})
-test('SPDX rejects root/hash ambiguity and lost package identities', () => {
+test('SPDX rejects lost or ambiguous package identities', () => {
   for (const mutate of [
-    (d) => {
-      d.spdxVersion = 'SPDX-2.2'
-    },
-    (d) => {
-      d.documentDescribes.push('SPDXRef-Package')
-    },
-    (d) => {
-      d.packages[0].checksums[0].checksumValue = '0'.repeat(64)
-    },
-    (d) => {
-      d.packages[0].checksums.push(d.packages[0].checksums[0])
-    },
     (d) => {
       d.packages.push(d.packages[0])
     },
@@ -1243,59 +1032,69 @@ test('SPDX rejects root/hash ambiguity and lost package identities', () => {
       d.packages.pop()
     },
     (d) => {
-      d.packages[1].versionInfo = '2.0.0'
+      d.packages[0].SPDXID = 'SPDXRef-path+file:///example'
     },
     (d) => {
-      d.packages[1].externalRefs = []
+      d.packages[0].versionInfo = '2.0.0'
+    },
+    (d) => {
+      d.packages[0].externalRefs = []
+    },
+    (d) => {
+      d.spdxVersion = 'SPDX-2.2'
     },
   ]) {
     const { document, original } = spdxFixture()
     mutate(document)
-    assert.throws(() => validateSpdx(document, binary, original))
+    assert.throws(
+      () => completeSpdx(document, binary, original),
+      /SPDX (2\.3 document|package identity|package identifier|lost component)/
+    )
   }
-  // A converter package named like the root, listed before it, must not stand
-  // in for the described root.
-  const { document, original } = spdxFixture()
-  document.packages.unshift({
-    SPDXID: 'SPDXRef-Impostor',
-    name: document.packages[0].name,
-  })
-  assert.throws(
-    () => validateSpdx(document, binary, original),
-    /SPDX describes a different inventory root/
-  )
 })
-test('SPDX validation rescans the final binary for planted operator values', () => {
+test('SPDX completion rescans the final binary for planted operator values', () => {
   const planted = Buffer.concat([binary, Buffer.from(sentinels[0])])
   const { original, document } = spdxFixture()
-  document.packages[0].checksums[0].checksumValue = createHash('sha256')
-    .update(planted)
-    .digest('hex')
   assert.throws(
-    () => validateSpdx(document, planted, original),
+    () => completeSpdx(document, planted, original),
     /operator configuration/
   )
 })
 test('completes real converter package output with a binary-bound root', () => {
   const { original, document } = spdxFixture()
-  document.packages.shift()
-  delete document.documentDescribes
-  delete document.relationships
-  completeSpdx(document, binary, original)
+  Object.assign(original.metadata.component, {
+    version: '1.0.0',
+    purl: 'pkg:cargo/example@1.0.0',
+  })
+  assert.equal(completeSpdx(document, binary, original), document)
+  // Pin the whole described root and its DESCRIBES relationship.
+  assert.deepEqual(document.packages.at(-1), {
+    SPDXID: 'SPDXRef-Artifact',
+    name: 'example.wasm',
+    versionInfo: '1.0.0',
+    downloadLocation: 'NOASSERTION',
+    filesAnalyzed: false,
+    licenseConcluded: 'NOASSERTION',
+    licenseDeclared: 'NOASSERTION',
+    copyrightText: 'NOASSERTION',
+    externalRefs: [
+      {
+        referenceCategory: 'PACKAGE-MANAGER',
+        referenceType: 'purl',
+        referenceLocator: 'pkg:cargo/example@1.0.0',
+      },
+    ],
+    checksums: [{ algorithm: 'SHA256', checksumValue: hash(binary) }],
+  })
   assert.deepEqual(document.documentDescribes, ['SPDXRef-Artifact'])
-  assert.equal(document.packages.at(-1).filesAnalyzed, false)
-  assert.throws(() => completeSpdx(document, binary, original), /Unexpected/)
-})
-test('completed SPDX is validated before it is returned', () => {
-  const { original, document } = spdxFixture()
-  document.packages.shift()
-  delete document.documentDescribes
-  delete document.relationships
-  document.packages[0].externalRefs = []
-  assert.throws(
-    () => completeSpdx(document, binary, original),
-    /identity or PURL/
-  )
+  assert.deepEqual(document.relationships, [
+    {
+      spdxElementId: 'SPDXRef-DOCUMENT',
+      relationshipType: 'DESCRIBES',
+      relatedSpdxElement: 'SPDXRef-Artifact',
+    },
+  ])
+  assert.throws(() => completeSpdx(document, binary, original), /Duplicate/)
 })
 test('release command line checks binaries, final bytes and SPDX output', () => {
   const root = mkdtempSync(join(tmpdir(), 'phase1-cli-'))
@@ -1329,9 +1128,6 @@ test('release command line checks binaries, final bytes and SPDX output', () => 
     assert.match(invalid.stderr, /wasm/)
 
     const { original, document } = spdxFixture()
-    document.packages.shift()
-    delete document.documentDescribes
-    delete document.relationships
     original.metadata.properties = [
       { name: 'trusted-server:coverage', value: 'Fixture coverage.' },
     ]
@@ -1403,47 +1199,6 @@ test('every canary the release build plants is a scanned sentinel', () => {
       `should pass ${name} into the GNU builder`
     )
 })
-test('post-publish retries distinguish transient failures and cap Retry-After', async () => {
-  for (const [error, failures, expected] of [
-    [{ cause: { code: 'UND_ERR_SOCKET' } }, 1, [2000]],
-    [{ status: 503 }, 9, [2000, 5000]],
-    [{ status: 503, elapsed: 180000 }, 9, []],
-    [{ status: 429, retryAfter: '30' }, 1, [10000]],
-    [{ status: 429, retryAfter: '3' }, 1, [3000]],
-    [{ status: 403 }, 9, []],
-    [{ name: 'TimeoutError' }, 1, [2000]],
-    [{ status: 429, retryAfter: 'Thu, 01 Jan 1970 00:00:03 GMT' }, 1, [3000]],
-    [new Error('Published asset digest mismatch'), 9, []],
-    [{ stderr: Buffer.from('HTTP 503: Service Unavailable') }, 1, [2000]],
-    [{ stderr: Buffer.from('verification failed: HTTP 503') }, 9, []],
-  ]) {
-    const waits = [],
-      logs = []
-    let attempts = 0,
-      now = 0
-    const retry = readRetrier({
-      deadline: 180000,
-      now: () => now,
-      sleep: async (ms) => {
-        waits.push(ms)
-        now += ms
-      },
-      warn: (line) => logs.push(line),
-    })
-    const operation = () => {
-      now += error.elapsed ?? 0
-      if (++attempts <= failures) throw error
-      return 'verified'
-    }
-    if (failures === 1) assert.equal(await retry(operation), 'verified')
-    else await assert.rejects(() => retry(operation))
-    assert.deepEqual(waits, expected)
-    assert.equal(attempts, expected.length + 1)
-    assert.equal(logs.length, expected.length)
-    assert.ok(logs.every((line) => /attempt [23]\/3/.test(line)))
-  }
-})
-
 test('rejects invalid wasm, foreign ELF and GNU symbols above 2.34', () => {
   const wasm = Buffer.from('0061736d01000000', 'hex')
   checkReleaseFormat(wasm, 'wasm32-wasip1')
@@ -1585,7 +1340,41 @@ test('workflows build, sign and publish exactly the release assets and restrict 
     'Refuse annotated release tags',
     'Refuse tags on commits outside every branch',
   ])
-    assert.ok(checks.includes(`\n      - name: ${step}\n`), step)
+    assert.ok(
+      checks.includes(
+        `\n      - name: ${step}\n        if: startsWith(github.ref, 'refs/tags/')\n`
+      ),
+      `should run on every tag: ${step}`
+    )
+  assert.ok(
+    checks.includes(
+      '\n      - run: node --test scripts/release/phase1.test.mjs\n'
+    ),
+    'should run the release suite before the tag checks'
+  )
+  // The build inherits only the toolchain paths and the source commit.
+  const clean = runBlock(
+    build,
+    'Build and generate the build inventory in a clean environment'
+  )
+  assert.match(clean, /^env -i PATH="\$PATH" /m)
+  assert.deepEqual(
+    [...clean.matchAll(/\b([A-Z_]+)="/g)].map((match) => match[1]),
+    [
+      'PATH',
+      'HOME',
+      'CARGO_HOME',
+      'RUSTUP_HOME',
+      'TMPDIR',
+      'RUNNER_TEMP',
+      'SOURCE_COMMIT',
+    ]
+  )
+  // Provenance covers the binary and its SPDX document.
+  assert.match(
+    sign,
+    /subject-path: \|\n {12}release-assets\/\$\{\{ matrix\.asset \}\}\n {12}release-assets\/\$\{\{ matrix\.asset \}\}\.spdx\.json\n/
+  )
   // The branch check needs every branch's history.
   assert.match(
     checks,
@@ -1613,6 +1402,10 @@ test('workflows build, sign and publish exactly the release assets and restrict 
 test('release build keeps locked builds, pinned generators and final integrity checks', () => {
   const script = readFileSync('scripts/release/phase1-build.sh', 'utf8')
   const commands = script.split('\n').filter((line) => !/^\s*#/.test(line))
+  // Under bash 3.2 (macOS /bin/bash) a failing standalone [[ ]] does not stop
+  // set -e, and CI runs this suite on Linux, so each one must exit explicitly.
+  for (const line of commands.filter((line) => line.startsWith('[[')))
+    assert.match(line, /\]\] \|\| \{ .+; exit 1; \}$/, line)
   const builds = commands.filter((line) => /\bcargo build\b/.test(line))
   assert.equal(
     builds.length,
@@ -1666,6 +1459,14 @@ test('release build keeps locked builds, pinned generators and final integrity c
   )
   assert.match(script, /cargo install \\\n[^\n]*--locked/)
   assert.match(script, /cargo metadata --locked/)
+  // The generator defaults to the host target; inventory the built target and
+  // the whole installed npm build tree.
+  step(
+    '  --manifest-path "crates/$build_package/Cargo.toml" --target "$build_target" \\'
+  )
+  step(
+    'npm --prefix crates/trusted-server-js/lib sbom --sbom-format cyclonedx > "$tool_root/npm.cdx.json"'
+  )
   // Generator crate and every converter binary are checksum-pinned before use.
   assert.match(
     script,
@@ -1765,17 +1566,12 @@ test('release preflight rejects inherited controls in an isolated script fixture
 })
 test('SPDX identifies all producing tools and normalizes license spacing', () => {
   const { document, original } = spdxFixture()
-  document.documentDescribes = []
-  document.relationships = []
-  document.packages = document.packages.filter(
-    (p) => p.SPDXID !== 'SPDXRef-Root'
-  )
   document.packages[0].licenseDeclared = 'Apache-2.0  OR  MIT'
-  original.metadata.component.version = 'v1.2.3-example'
+  original.metadata.component.version = '1.2.3'
   const output = completeSpdx(document, binary, original)
   assert.equal(
     output.packages.find((p) => p.SPDXID === 'SPDXRef-Artifact').versionInfo,
-    'v1.2.3-example'
+    '1.2.3'
   )
   assert.equal(output.packages[0].licenseDeclared, 'Apache-2.0 OR MIT')
   assert.ok(output.creationInfo.creators.includes('Tool: cyclonedx-cli-0.33.1'))
@@ -1783,28 +1579,6 @@ test('SPDX identifies all producing tools and normalizes license spacing', () =>
     output.creationInfo.creators.includes('Tool: trusted-server-phase1')
   )
 })
-test('post-publish reads cannot succeed after the shared deadline', async () => {
-  let now = 0
-  const retry = readRetrier({
-    deadline: 180000,
-    now: () => now,
-    warn: () => assert.fail('should not retry deadline exhaustion'),
-  })
-  await assert.rejects(
-    () =>
-      retry(() => {
-        now = 180000
-        return 'late success'
-      }),
-    /window exhausted/
-  )
-  await assert.rejects(
-    () =>
-      retry(() => assert.fail('should not start a read after the deadline')),
-    /^Error: Post-publish verification window exhausted$/
-  )
-})
-
 test('SPDX creation timestamps use whole-second UTC without changing the instant second', () => {
   for (const created of [
     '2026-01-01T12:34:56.9290415Z',
@@ -1812,11 +1586,6 @@ test('SPDX creation timestamps use whole-second UTC without changing the instant
     '2026-01-01T12:34:56Z',
   ]) {
     const { document, original } = spdxFixture()
-    document.documentDescribes = []
-    document.relationships = []
-    document.packages = document.packages.filter(
-      (p) => p.SPDXID !== 'SPDXRef-Root'
-    )
     document.creationInfo = { created, creators: ['Tool: example-converter'] }
     const output = completeSpdx(document, binary, original)
     assert.equal(output.creationInfo.created, '2026-01-01T12:34:56Z')
@@ -1861,7 +1630,9 @@ test('release build cleans owned config and inventory on success and failure', (
       )
       stub('node', 'exit 0')
       stub('npm', 'echo "{}"')
-      stub('shasum', 'exit 0')
+      // Read the piped checksum line like the real shasum, so printf never
+      // writes into a closed pipe.
+      stub('shasum', '/bin/cat >/dev/null')
       stub('tar', 'exit 0')
       stub(
         'cat',
@@ -1985,7 +1756,9 @@ test('smoke accepts only the release build facts in ts --version', () => {
       output
     )
 })
-// Runs a workflow step's shell with stub tools, as GitHub's `bash -eo pipefail`.
+// Runs a workflow step's shell with stub tools. GitHub runs steps without
+// `shell:` as `bash -e {0}`; this helper adds pipefail, which is stricter, and
+// no step depends on it.
 const runStep = (workflow, step, stubs, env) => {
   const bin = mkdtempSync(join(tmpdir(), 'phase1-step-'))
   try {
@@ -2038,6 +1811,22 @@ test('build checks refuse a tag reference that is not a lightweight tag at the c
     assert.equal(result.status, status, `${reference}: ${result.stderr}`)
     if (reference?.startsWith('tag'))
       assert.match(result.stdout, /::error::Release tags must be lightweight/)
+  }
+})
+test('build checks refuse a tag the publisher would reject', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const script = runBlock(workflow, 'Refuse non-SemVer release tags')
+  for (const [tag, status] of [
+    ['v1.2.3', 0],
+    ['v1.2.3-rc.1', 0],
+    ['v1.2', 1],
+    ['v1.2.3+build.1', 1],
+  ]) {
+    const result = spawnSync('bash', ['-e', '-c', script], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH, RELEASE_TAG: tag },
+    })
+    assert.equal(result.status, status, `${tag}: ${result.stderr}`)
   }
 })
 test('build checks refuse a tagged commit that is on no branch', () => {

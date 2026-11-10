@@ -45,25 +45,6 @@ export function releaseNotes(repo, tag) {
 }
 
 /**
- * Decodes and checks a release attestation's DSSE envelope.
- */
-function decodeStatement(bundle, repo, source) {
-  const envelope = bundle?.dsseEnvelope
-  if (
-    envelope?.payloadType !== 'application/vnd.in-toto+json' ||
-    typeof envelope.payload !== 'string' ||
-    !envelope.payload ||
-    !Array.isArray(envelope.signatures) ||
-    !envelope.signatures.length
-  )
-    throw Error('Malformed release attestation bundle')
-  const bytes = Buffer.from(envelope.payload, 'base64')
-  if (bytes.toString('base64') !== envelope.payload)
-    throw Error('Malformed release attestation payload')
-  return checkStatement(JSON.parse(bytes.toString()), repo, source)
-}
-
-/**
  * Checks a release attestation statement for this repository and source
  * commit, and returns its asset subjects.
  */
@@ -101,60 +82,6 @@ function checkStatement(statement, repo, source) {
   )
     throw Error('Invalid release attestation subjects')
   return { statement, subjects }
-}
-
-/**
- * Returns a reader that retries transient post-publish read failures (at most
- * three attempts) and never returns a result after `deadline`. `label` names
- * the window in its errors; a retry cut short by the deadline keeps the failure
- * that caused it as `cause`.
- */
-export function readRetrier({
-  deadline,
-  label = 'Post-publish',
-  now = Date.now,
-  sleep = (delay) => new Promise((resolve) => setTimeout(resolve, delay)),
-  warn = console.warn,
-}) {
-  return async (operation) => {
-    for (let attempt = 1; ; attempt++)
-      try {
-        if (now() >= deadline)
-          throw Error(`${label} verification window exhausted`)
-        const result = await operation()
-        if (now() >= deadline)
-          throw Error(`${label} verification window exhausted`)
-        return result
-      } catch (error) {
-        const stderr = error.stderr?.toString().trim() ?? ''
-        const transient =
-          !error.stdout?.length &&
-          (error.name === 'TimeoutError' ||
-            error.status === 429 ||
-            (error.status >= 500 && error.status <= 599) ||
-            /^(ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR_SOCKET|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT)$/.test(
-              error.cause?.code ?? error.code
-            ) ||
-            /^HTTP (429|5\d\d): [^\r\n]+$/.test(stderr))
-        if (!transient || attempt === 3) throw error
-        const after =
-          Number(error.retryAfter) * 1000 ||
-          Date.parse(error.retryAfter) - now()
-        const delay = Math.min(
-          10000,
-          Math.max(
-            [2000, 5000][attempt - 1],
-            Number.isFinite(after) ? after : 0
-          )
-        )
-        if (now() + delay >= deadline)
-          throw Error(`${label} retry window exhausted`, { cause: error })
-        warn(
-          `${label} read retry: attempt ${attempt + 1}/3, transient ${error.status ?? 'transport/CLI'} failure, wait ${delay}ms`
-        )
-        await sleep(delay)
-      }
-  }
 }
 
 /**
@@ -303,16 +230,10 @@ export async function publish({
       ...(method === 'GET' ? { signal: AbortSignal.timeout(timeout) } : {}),
       ...(body ? { body: JSON.stringify(body) } : {}),
     })
-    if (
-      !response.ok ||
-      (endpoint.startsWith('attestations/') && response.status !== 200)
-    )
+    if (!response.ok)
       throw Object.assign(
         Error(`GitHub API failed: ${method} ${endpoint} ${response.status}`),
-        {
-          status: response.status,
-          retryAfter: response.headers.get('retry-after'),
-        }
+        { status: response.status }
       )
     return response.json()
   }
@@ -380,199 +301,72 @@ export async function publish({
     prerelease,
     make_latest,
   })
-  const retryDeadline = now() + 180000
-  const remaining = (limit) =>
-    Math.max(1, Math.min(limit, retryDeadline - now()))
-  const retryRead = readRetrier({ deadline: retryDeadline, now, sleep, warn })
-  const verifyIdentity = async () => {
-    const release = await retryRead(() =>
-      api(`releases/${id}`, 'GET', undefined, remaining(10000))
-    )
-    if (
-      published.id !== id ||
-      release.id !== id ||
-      release.tag_name !== tag ||
-      release.draft !== false ||
-      release.immutable !== true ||
-      release.prerelease !== prerelease
-    )
-      throw Error('Published release identity or immutability mismatch')
-    if (
-      !Array.isArray(release.assets) ||
-      release.assets.length !== files.length ||
-      new Set(release.assets.map((item) => item.name)).size !== files.length
-    )
-      throw Error('Published asset set mismatch')
-    for (const item of release.assets) {
-      if (!files.includes(item.name)) throw Error('Unexpected published asset')
-      const bytes = asset(item.name)
-      if (item.size !== bytes.length || item.digest !== `sha256:${hash(bytes)}`)
-        throw Error('Published asset digest mismatch')
+  // Post-publish reads can lag publication. Each read retries any failure at
+  // most five times within one shared three-minute window; a returned result
+  // that fails a check stops at once.
+  const deadline = now() + 180000
+  const poll = async (label, limit, read) => {
+    let failure
+    for (const delay of [0, 2000, 5000, 10000, 20000]) {
+      if (now() + delay >= deadline) break
+      if (delay) {
+        warn(`${label}: ${failure.message}; retry in ${delay}ms`)
+        await sleep(delay)
+      }
+      try {
+        return await read(Math.max(1, Math.min(limit, deadline - now())))
+      } catch (error) {
+        failure = error
+      }
     }
-    const byTag = await retryRead(() =>
-      api(
-        `releases/tags/${encodeURIComponent(tag)}`,
-        'GET',
-        undefined,
-        remaining(10000)
-      )
-    )
-    if (byTag.id !== id) throw Error('Published tag identity mismatch')
+    throw Error(`${label} failed; the release is already published`, {
+      cause: failure,
+    })
   }
-  await verifyIdentity()
-  // The current release's attestation must name this release, commit and the
-  // exact uploaded asset digests.
-  const checkCurrent = ({ statement, subjects }) => {
-    if (
-      statement.predicate.tag !== tag ||
-      statement.predicate.databaseId !== String(id) ||
-      subjects.length !== files.length ||
-      subjects.some(
-        (subject) =>
-          !files.includes(subject.name) ||
-          subject.digest.sha256 !== hash(asset(subject.name))
-      )
-    )
-      throw Error('Current release attestation identity or assets mismatch')
-  }
-  // The release attestation can be created after the immutable release
-  // becomes visible. Every availability read and proof fetch, including its
-  // transient retries and command timeout, ends at this deadline.
-  const availabilityDeadline = Math.min(retryDeadline, now() + 60000)
-  const availabilityRemaining = (limit) =>
-    Math.max(1, Math.min(limit, availabilityDeadline - now()))
-  const retryAvailabilityRead = readRetrier({
-    deadline: availabilityDeadline,
-    label: 'Release attestation availability',
-    now,
-    sleep,
-    warn,
-  })
-  // `gh release verify` fetches the bundle itself (inline or via bundle_url)
-  // and returns it with the statement it verified. Check both, and compare
-  // with the inline record when the API supplied one.
-  const fetchProof = () =>
-    retryAvailabilityRead(() =>
+  const release = await poll('Published release read', 10000, (timeout) =>
+    api(`releases/${id}`, 'GET', undefined, timeout)
+  )
+  if (
+    published.id !== id ||
+    release.id !== id ||
+    release.tag_name !== tag ||
+    release.draft !== false ||
+    release.immutable !== true ||
+    release.prerelease !== prerelease
+  )
+    throw Error('Published release identity or immutability mismatch')
+  // GitHub creates the release attestation from the published release, so it
+  // can appear after the release. Its verified statement must name this
+  // release, commit and the exact uploaded asset digests.
+  const proof = await poll(
+    'Release attestation verification',
+    30000,
+    (timeout) =>
       JSON.parse(
         execFileSync(
           'gh',
           ['release', 'verify', '--repo', repo, '--format', 'json', '--', tag],
-          { timeout: availabilityRemaining(10000), stdio: 'pipe' }
+          { timeout, stdio: 'pipe' }
         )
       )
+  )
+  const { statement, subjects } = checkStatement(
+    proof?.verificationResult?.statement,
+    repo,
+    source
+  )
+  if (
+    statement.predicate.tag !== tag ||
+    statement.predicate.databaseId !== String(id) ||
+    subjects.length !== files.length ||
+    subjects.some(
+      (subject) =>
+        !files.includes(subject.name) ||
+        subject.digest.sha256 !== hash(asset(subject.name))
     )
-  const checkProof = (proof, inline) => {
-    const bundle = proof?.attestation?.bundle
-    const decoded = decodeStatement(bundle, repo, source)
-    if (
-      !isDeepStrictEqual(decoded.statement, proof.verificationResult?.statement)
-    )
-      throw Error('Verified release attestation statement mismatch')
-    checkCurrent(decoded)
-    if (inline && !isDeepStrictEqual(bundle, inline.bundle))
-      throw Error('Verified release attestation bundle mismatch')
-  }
-  // GitHub CLI reports a bundle-fetch, trusted-root or network failure the
-  // same way as a record that is not yet listed, so any failed proof fetch is
-  // retried until the availability checks run out. A fetched proof that fails
-  // a check is final.
-  let pending
-  const exhausted = () =>
-    pending ?? Error('Release attestation availability window exhausted')
-  for (let attempt = 1; ; attempt++) {
-    if (now() >= availabilityDeadline) throw exhausted()
-    // Only this endpoint maps HTTP 404 to an unavailable record. Other
-    // statuses fail once transient retries are exhausted.
-    let page,
-      missing = false
-    try {
-      page = await retryAvailabilityRead(() =>
-        api(
-          `attestations/sha1:${source}?per_page=100&predicate_type=release`,
-          'GET',
-          undefined,
-          availabilityRemaining(4000)
-        )
-      )
-    } catch (error) {
-      if (error.status !== 404) throw error
-      page = { attestations: [] }
-      missing = true
-    }
-    if (!Array.isArray(page.attestations) || page.attestations.length >= 100)
-      throw Error('Invalid or truncated release attestation response')
-    const records = []
-    let opaque = 0
-    for (const record of page.attestations) {
-      if (!record || typeof record.initiator !== 'string')
-        throw Error('Malformed release attestation record')
-      if (record.initiator !== 'github') continue
-      // The API may omit the inline bundle and supply only `bundle_url`.
-      if (record.bundle == null) {
-        if (typeof record.bundle_url !== 'string' || !record.bundle_url)
-          throw Error('Malformed release attestation bundle')
-        opaque++
-        continue
-      }
-      records.push({
-        ...record,
-        ...decodeStatement(record.bundle, repo, source),
-      })
-    }
-    const current = records.filter(
-      (record) => record.statement.predicate.tag === tag
-    )
-    if (current.length > 1)
-      throw Error('Multiple release attestations for current tag')
-    if (current.length) checkCurrent(current[0])
-    // Another tag's release (for example an earlier prerelease on this commit)
-    // can be ignored by this availability check. GitHub CLI may still fetch
-    // its bundle before filtering by tag during the cryptographic checks.
-    for (const record of records.filter(
-      (record) => record.statement.predicate.tag !== tag
-    ))
-      log(
-        'Ignored release attestation for other tag:',
-        JSON.stringify(record.statement.predicate.tag)
-      )
-    // Without an inline bundle the record's tag is unknown until GitHub CLI
-    // fetches it.
-    pending = undefined
-    if (current.length || opaque) {
-      let proof
-      try {
-        proof = await fetchProof()
-      } catch (error) {
-        pending = error
-      }
-      if (proof) {
-        checkProof(proof, current[0])
-        log(
-          attempt === 1
-            ? 'Release attestation available on first check'
-            : `Release attestation available on check ${attempt}/5`
-        )
-        log(
-          'Verified release:',
-          tag,
-          'signature and attestation statement match'
-        )
-        break
-      }
-    }
-    if (attempt === 5) {
-      if (pending) throw pending
-      throw Error(
-        'Release already published and immutable; release attestation unavailable after five checks'
-      )
-    }
-    const delay = [2000, 5000, 10000, 20000][attempt - 1]
-    if (now() + delay >= availabilityDeadline) throw exhausted()
-    warn(
-      `Release attestation availability: attempt ${attempt + 1}/5, ${missing ? 'HTTP 404' : pending ? 'not yet verifiable' : 'HTTP 200, no current-tag record'}, wait ${delay}ms`
-    )
-    await sleep(delay)
-  }
+  )
+    throw Error('Current release attestation identity or assets mismatch')
+  log('Verified release:', tag, 'signature and attestation statement match')
 }
 
 if (import.meta.main)

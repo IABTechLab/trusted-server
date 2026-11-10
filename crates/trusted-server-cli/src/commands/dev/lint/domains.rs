@@ -116,7 +116,7 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     // Specs (supply chain)
     "in-toto.io",
     "rslstandard.org",
-    // SLSA: canonical provenance predicate and build specification references.
+    // SLSA: canonical provenance predicate in the release verification guide.
     "slsa.dev",
     // SPDX: canonical document predicate in the release verification guide.
     "spdx.dev",
@@ -326,20 +326,12 @@ mod allow_check_tests {
             "should allow the canonical spdx.dev reference"
         );
         assert!(
-            !is_allowed("cyclonedx.org", &nothing_suppressed()),
-            "should require per-line suppression for the inventory format reference"
-        );
-        assert!(
             is_allowed("cli.github.com", &nothing_suppressed()),
             "should allow the canonical cli.github.com reference"
         );
         assert!(
             !is_allowed("unapproved.slsa.dev", &nothing_suppressed()),
             "should reject unapproved slsa.dev subdomains"
-        );
-        assert!(
-            !is_allowed("unapproved.cyclonedx.org", &nothing_suppressed()),
-            "should reject unapproved cyclonedx.org subdomains"
         );
         // But NOT subdomains of REFERENCE_HOSTS (exact-match).
         assert!(!is_allowed("other.github.com", &nothing_suppressed()));

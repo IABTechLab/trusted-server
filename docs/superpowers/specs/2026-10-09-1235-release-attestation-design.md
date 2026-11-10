@@ -20,7 +20,7 @@ on) match the destination design, so its full clauses can be found there.
 
 This document specifies only Phase 1. Phase 1 makes no reproducibility claim and
 has no custom verifier. The phase boundaries follow
-[aram356's round-1 architecture review](https://github.com/IABTechLab/trusted-server/pull/1262#pullrequestreview-5484754857):
+[the round-1 architecture review](https://github.com/IABTechLab/trusted-server/pull/1262#pullrequestreview-5484754857):
 
 | Reviewer boundary                                     | Phase 1                                   | Later                                       |
 | ----------------------------------------------------- | ----------------------------------------- | ------------------------------------------- |
@@ -128,8 +128,8 @@ binary's SHA-256 and Cargo's package version (the release tag stays external).
 It conservatively inventories the selected Cargo target and the installed npm
 build tree. The pipeline is checksum-pinned cargo-cyclonedx 0.5.9 and
 `npm sbom`, merged in `phase1.mjs`, converted by checksum-pinned cyclonedx-cli
-0.33.1 and completed and validated by `phase1.mjs validate-spdx`. Conversion
-drops dependency relationships. The signed SBOM predicate must equal the
+0.33.1 and completed and validated by `phase1.mjs validate-spdx`. The merged
+inventory records no dependency relationships. The signed SBOM predicate must equal the
 shipped SPDX file.
 
 ### R-FACTS — build facts
@@ -145,10 +145,11 @@ the CLI's build script supplies the Cargo target. Tags and run IDs stay external
 All builds use `--release --locked` and strip native debug info
 (`CARGO_PROFILE_RELEASE_STRIP=debuginfo`). The wasm keeps its profile.
 
-- **Linux GNU:** built in a digest-pinned UBI 9.6 (glibc 2.34) container. The
-  final bytes must be a 64-bit x86-64 ELF with no `GLIBC_` requirement above
-  2.34. `ts --version` must match in digest-pinned Debian 12, Ubuntu 22.04 and
-  UBI 9 containers.
+- **Linux GNU:** built in a container from a digest-pinned UBI 9.6 (glibc 2.34)
+  base image; its compilers and build tools come from an unpinned `dnf install`,
+  and the build log records the resulting image ID. The final bytes must be a
+  64-bit x86-64 ELF with no `GLIBC_` requirement above 2.34. `ts --version` must
+  match in digest-pinned Debian 12, Ubuntu 22.04 and UBI 9 containers.
 - **macOS:** `MACOSX_DEPLOYMENT_TARGET=13.0`. The final Mach-O must match the
   target CPU and carry a 13.0 minimum. `ts --version` must match on the runner.
   The binaries are not notarized.
@@ -163,8 +164,8 @@ commit. The build `checks` job and the publisher both enforce these rules. The
 `checks` job also requires the tagged commit to be on at least one branch: in
 fork rehearsals, draft creation returned HTTP 403 for a commit reachable only
 through its tag. Which branches may be released (for example, whether rc
-branches may be tagged) is a maintainer decision; Phase 1 does not validate
-ancestry or rulesets.
+branches may be tagged) is a maintainer decision; Phase 1 does not check which
+branch holds the commit, and does not read rulesets.
 
 ### R-SIGN — signer
 
@@ -189,15 +190,16 @@ There is no settings token. The publisher:
    by that ID, checking each upload's size and SHA-256.
 5. Publishes by ID. SemVer prereleases are prereleases and never Latest; stable
    tags use `make_latest: legacy`.
-6. Reads the release by ID and by tag and requires `immutable == true`, the
-   exact asset set, and matching sizes and digests.
-7. Waits for the release attestation and verifies it with `gh release verify`.
-   Its statement must name this release, commit and the exact asset digests.
+6. Reads the release by ID and requires its identity, release type and
+   `immutable == true`.
+7. Verifies the release attestation with `gh release verify`. Its verified
+   statement must name this repository, tag, release ID and commit, and list
+   exactly the 17 published assets with their local SHA-256 digests.
 
-Mutations are never retried. Post-publish reads may retry transient failures
-within a three-minute window, and the release-attestation check has its own
-60-second deadline inside it. The guide lists the exact bounds and the
-read-only recovery procedure.
+Mutations are never retried. The two post-publish reads retry any failure, at
+most five attempts within one three-minute window; a returned result that fails
+a check stops at once. The guide lists the exact bounds and the read-only
+recovery procedure.
 
 ### R-MANUAL — operator route
 
@@ -218,14 +220,15 @@ Rust producer and publication owner replace them in later phases.
 Before `RELEASE_PUBLICATION_ENABLED` is set, a maintainer must enable immutable
 releases, add an active `v*` tag ruleset restricting creation, update and
 deletion to the release team, and approve tag-push authority and required
-checks. Until both settings are in place, any writer who can push a `v*` tag can
+checks. Until the tag ruleset is active, any writer who can push a `v*` tag can
 start that tag's own `release.yml`. The guide's checklist gives read-only
 commands that confirm each setting.
 
 ## Rehearsal
 
 Rehearse the reviewed commit in a separate public repository with Actions and
-immutable releases enabled, using a fresh lightweight `v0.0.0-rehearsal.N` tag
+immutable releases enabled and `RELEASE_PUBLICATION_ENABLED=true`. Push the
+commit to a branch there, then use a fresh lightweight `v0.0.0-rehearsal.N` tag
 for each attempt. A rehearsal qualifies only the commit, workflows and binaries
 it ran; a later change to any of them needs a new rehearsal before the first
 production tag. A fork rehearsal does not qualify the upstream repository's own
