@@ -1605,7 +1605,9 @@ mod tests {
             Ok(TransportResponse {
                 status: http::StatusCode::OK,
                 headers: http::HeaderMap::new(),
-                body: bytes::Bytes::from("x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1)),
+                body: bytes::Bytes::from(
+                    "x".repeat(crate::ec::kv_types::MAX_STORED_UID_LENGTH + 1),
+                ),
             })
         });
 
