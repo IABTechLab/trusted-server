@@ -234,6 +234,33 @@ mod tests {
     }
 
     #[test]
+    fn keys_verify_accepts_values_that_start_with_a_hyphen() {
+        // Trusted Server signs with unpadded base64url, whose alphabet includes `-`, so
+        // about one signature in 64 starts with one.
+        let args = parse(&[
+            "ts",
+            "keys",
+            "verify",
+            "--service",
+            "https://edge.example.com",
+            "--kid",
+            "ts-2024-01-15",
+            "--payload",
+            "-example-payload",
+            "--signature",
+            "-LRTQNDx",
+        ]);
+        let Command::Keys(crate::commands::keys::KeysCommand::Verify(verify)) = args.command else {
+            panic!("expected keys verify command");
+        };
+        assert_eq!(
+            verify.payload, "-example-payload",
+            "should keep the payload"
+        );
+        assert_eq!(verify.signature, "-LRTQNDx", "should keep the signature");
+    }
+
+    #[test]
     fn parses_prebid_server_inspect() {
         assert!(
             Args::try_parse_from([

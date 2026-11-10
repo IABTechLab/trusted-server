@@ -78,23 +78,79 @@ fn list_json_prints_the_discovery_document_unchanged() {
 
     let rendered = String::from_utf8(out).expect("output should be UTF-8");
     assert_eq!(
-        rendered.trim_end_matches('\n'),
-        body,
-        "should print the service's document byte for byte"
+        rendered,
+        format!("{body}\n"),
+        "should print the service's document byte for byte, plus a final newline"
     );
 }
 
 #[test]
 fn list_reports_a_failed_fetch_as_an_error() {
-    let server =
-        FixtureServer::start(|_request| FixtureResponse::html("not found").with_status(404));
+    for (status, hint) in [(404, "names a Trusted Server"), (500, "jwks_store")] {
+        let server = FixtureServer::start(move |_request| {
+            FixtureResponse::html("error").with_status(status)
+        });
+
+        let mut out = Vec::new();
+        let error = run(KeysCommand::List(list_args(&server, false)), &mut out)
+            .expect_err("should fail on an error status");
+
+        assert!(
+            error.contains(&status.to_string()),
+            "should name the status: {error}"
+        );
+        assert!(
+            error.contains(hint),
+            "should point at the likely cause: {error}"
+        );
+        assert!(out.is_empty(), "should print no keys");
+    }
+}
+
+#[test]
+fn list_does_not_follow_a_redirect() {
+    let server = FixtureServer::start(|request| {
+        if request.path == "/.well-known/trusted-server.json" {
+            FixtureResponse::html("")
+                .with_status(302)
+                .with_header("location", "/moved.json")
+        } else {
+            json_response(discovery_body())
+        }
+    });
 
     let mut out = Vec::new();
     let error = run(KeysCommand::List(list_args(&server, false)), &mut out)
-        .expect_err("should fail on a 404");
+        .expect_err("should refuse a redirected discovery document");
 
-    assert!(error.contains("404"), "should name the status: {error}");
+    assert!(error.contains("302"), "should name the redirect: {error}");
     assert!(out.is_empty(), "should print no keys");
+    assert_eq!(server.request_count(), 1, "should not follow the redirect");
+}
+
+#[test]
+fn list_json_rejects_a_page_that_is_not_a_discovery_document() {
+    let server = FixtureServer::start(|_request| FixtureResponse::html("<html>login</html>"));
+
+    let mut out = Vec::new();
+    run(KeysCommand::List(list_args(&server, true)), &mut out)
+        .expect_err("should validate the document even with --json");
+
+    assert!(out.is_empty(), "should not print the page as keys");
+}
+
+#[test]
+fn verify_reports_a_rejected_request_as_an_error() {
+    let server = FixtureServer::start(|_request| {
+        FixtureResponse::html("payload too large").with_status(413)
+    });
+
+    let mut out = Vec::new();
+    let error =
+        run(KeysCommand::Verify(verify_args(&server)), &mut out).expect_err("should fail on a 413");
+
+    assert!(error.contains("413"), "should name the status: {error}");
+    assert!(out.is_empty(), "should print no verification result");
 }
 
 #[test]

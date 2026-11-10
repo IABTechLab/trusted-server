@@ -1,4 +1,5 @@
-//! Transport checks shared by the commands that send an operator's credentials to a URL.
+//! Transport checks shared by the commands that send an operator's credentials to a URL
+//! or report what a service answered.
 //!
 //! One implementation rather than one per command: a second copy is a second place for the
 //! loopback exemption to drift, and every command that gets this wrong sends a session
@@ -28,8 +29,8 @@ fn is_loopback(url: &reqwest::Url) -> bool {
 pub(crate) fn require_credential_safe_transport(url: &reqwest::Url, flag: &str) -> CliResult<()> {
     if url.scheme() != "https" && !(url.scheme() == "http" && is_loopback(url)) {
         return cli_error(format!(
-            "{flag} requires HTTPS to protect the credentials sent with the request; HTTP is \
-             allowed only for loopback development services"
+            "{flag} requires HTTPS so the request and the service's answer cannot be read or \
+             altered in transit; HTTP is allowed only for loopback development services"
         ));
     }
     if !url.username().is_empty() || url.password().is_some() {

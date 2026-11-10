@@ -48,11 +48,11 @@ pub struct VerifyArgs {
     pub kid: String,
 
     /// Canonical payload that was signed.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub payload: String,
 
     /// Base64-encoded signature to check.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub signature: String,
 }
 

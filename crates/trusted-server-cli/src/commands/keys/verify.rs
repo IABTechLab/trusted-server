@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 
+use crate::ad_templates::output::escape_terminal_text;
 use crate::commands::keys::{KeysRequest, VerifyArgs, send};
 use crate::error::{CliResult, cli_error};
 use crate::run::RunOutcome;
@@ -32,18 +33,28 @@ fn interpret(body: &str) -> CliResult<(String, RunOutcome)> {
         .map_err(|error| format!("invalid verification response: {error}"))?;
     if response.verified {
         return Ok((
-            format!("verified: signature is valid for kid {}", response.kid),
+            format!(
+                "verified: signature is valid for kid {}",
+                escape_terminal_text(&response.kid)
+            ),
             RunOutcome::Success,
         ));
     }
-    let detail = response
-        .error
-        .map(|error| format!(" ({error})"))
-        .unwrap_or_default();
+    // The service folds an unknown kid, a malformed signature, and an unreadable signing
+    // store into this one sanitized value, so name the possibilities instead of echoing it.
+    let detail = match response.error.as_deref() {
+        Some("internal verification error") => " (the service could not check it: the kid \
+             may not exist, the signature may not be 64 bytes of base64, or the service could \
+             not read its keys)"
+            .to_owned(),
+        Some(error) => format!(" ({})", escape_terminal_text(error)),
+        None => String::new(),
+    };
     Ok((
         format!(
             "not verified: {} for kid {}{detail}",
-            response.message, response.kid
+            escape_terminal_text(&response.message),
+            escape_terminal_text(&response.kid)
         ),
         RunOutcome::AssertionFailed,
     ))
@@ -132,6 +143,43 @@ mod tests {
 
         assert_eq!(outcome, RunOutcome::AssertionFailed, "should exit non-zero");
         assert!(line.contains("Invalid signature"), "got: {line}");
+    }
+
+    #[test]
+    fn the_sanitized_internal_error_names_its_possible_causes() {
+        let body = json!({
+            "verified": false,
+            "kid": "ts-2099-01-01",
+            "message": "Verification error",
+            "error": "internal verification error",
+        })
+        .to_string();
+
+        let (line, outcome) = interpret(&body).expect("should interpret");
+
+        assert_eq!(outcome, RunOutcome::AssertionFailed, "should exit non-zero");
+        assert!(
+            line.contains("the kid may not exist"),
+            "should name what the service could not check: {line}"
+        );
+    }
+
+    #[test]
+    fn service_controlled_fields_are_escaped() {
+        let body = json!({
+            "verified": false,
+            "kid": "ts-2024-01-15\u{1b}[2K",
+            "message": "Signature verification failed\u{1b}[1G",
+            "error": "Invalid signature\u{1b}]0;title\u{7}",
+        })
+        .to_string();
+
+        let (line, _) = interpret(&body).expect("should interpret");
+
+        assert!(
+            !line.contains('\u{1b}') && !line.contains('\u{7}'),
+            "should not pass control characters to the terminal: {line:?}"
+        );
     }
 
     #[test]

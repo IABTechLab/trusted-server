@@ -4,6 +4,7 @@ use core::fmt::Write as _;
 
 use serde::Deserialize;
 
+use crate::ad_templates::output::escape_terminal_text;
 use crate::commands::keys::{KeysRequest, ListArgs, send};
 use crate::error::{CliResult, cli_error};
 
@@ -39,9 +40,9 @@ fn render_keys(body: &str) -> CliResult<String> {
         writeln!(
             rendered,
             "{}\t{}\t{}",
-            key.kid.as_deref().unwrap_or("<no kid>"),
-            key.kty.as_deref().unwrap_or("-"),
-            key.crv.as_deref().unwrap_or("-"),
+            escape_terminal_text(key.kid.as_deref().unwrap_or("<no kid>")),
+            escape_terminal_text(key.kty.as_deref().unwrap_or("-")),
+            escape_terminal_text(key.crv.as_deref().unwrap_or("-")),
         )
         .expect("should write to a String");
     }
@@ -59,10 +60,12 @@ pub fn run_list(args: &ListArgs, out: &mut impl std::io::Write) -> CliResult<()>
     let endpoint = crate::url_guard::service_endpoint(&args.service, DISCOVERY_PATH)?;
     let (status, body) = send(&endpoint, &KeysRequest::Get)?;
     if !status.is_success() {
-        let hint = if status.as_u16() == 404 {
-            " — request signing may be disabled on this service"
-        } else {
-            ""
+        // Every adapter registers the discovery route, so a 404 means `--service` names
+        // something other than a Trusted Server, while unreadable signing stores answer 500.
+        let hint = match status.as_u16() {
+            404 => " — check that --service names a Trusted Server deployment",
+            500 => " — the service could not read its signing keys; check its jwks_store",
+            _ => "",
         };
         return cli_error(format!(
             "fetching the discovery document failed: {status}{hint}\n{}",
@@ -113,6 +116,24 @@ mod tests {
         assert!(
             rendered.contains("no active signing keys"),
             "should say no keys are published, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn service_controlled_fields_cannot_forge_lines_or_columns() {
+        let body = json!({
+            "version": "1.0",
+            "jwks": { "keys": [
+                { "kty": "OKP", "crv": "Ed25519", "kid": "\u{1b}[2Kts-2024-09-09\tforged" },
+            ]}
+        })
+        .to_string();
+
+        let rendered = render_keys(&body).expect("should render a valid document");
+
+        assert_eq!(
+            rendered, "\\u{001B}[2Kts-2024-09-09\\u{0009}forged\tOKP\tEd25519\n",
+            "should escape control characters, tabs included, in service-controlled fields"
         );
     }
 
