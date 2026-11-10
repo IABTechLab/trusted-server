@@ -354,3 +354,30 @@ test('accepts expression timeouts and rejects a zero timeout', () => {
     assertRejected(root, /timeout-minutes/)
   })
 })
+
+test('ignores include and exclude when collecting matrix dimensions', () => {
+  withFixture(({ root, workflowsPath }) => {
+    const formatPath = path.join(workflowsPath, 'format.yml')
+    const source = workflow(
+      'format-rust',
+      authorGroup('format-rust', '$' + '{{ matrix.os }}'),
+      { matrix: true }
+    )
+    writeFileSync(
+      formatPath,
+      source.replace(
+        '        os: [ubuntu-latest]',
+        [
+          '        os: [ubuntu-latest, macos-latest]',
+          '        include:',
+          '          - os: ubuntu-latest',
+          '            experimental: true',
+          '        exclude:',
+          '          - os: macos-latest',
+        ].join('\n')
+      )
+    )
+    const result = runGuard(root)
+    assert.equal(result.status, 0, result.stdout + '\n' + result.stderr)
+  })
+})
