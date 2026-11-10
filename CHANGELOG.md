@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** With `[integrations.prebid]` enabled, JS asset entries with
+  `proxy = "enabled"` whose `origin_url` matches Prebid `script_patterns`
+  now fail deploy validation and runtime startup. Before upgrading the
+  server, use the new `ts` CLI to run `ts config validate`, change overlapping
+  assets to `proxy = "disabled"` (preserves Prebid interception) or
+  `proxy = "blocked"`, and publish the corrected config with `ts config push`.
+  JS Asset Proxy now rewrites script tags before every other integration, and
+  its `enabled` replacement is final: no later integration rewrites or removes
+  the proxied tag.
 - The Lockr browser module no longer polls for private SDK state or mutates its API host, removing the "Lockr SDK not detected" timeout warning (#1247). Root-relative Lockr XHR API requests and rewritten SDK URLs now stay on the page origin even with an external `<base href>`. Custom or unreplaced legacy SDKs that relied on the removed host rewrite must route their own API calls through `/integrations/lockr/api`; `rewrite_sdk = false` leaves static SDK tags unchanged but does not disable dynamic interception. See the [Lockr migration guide](docs/guide/integrations/lockr.md#migration-from-the-sdk-host-shim).
 - Auction response collection now bounds network waiting by `[auction].timeout_ms`
   measured from dispatch, including delayed headers and trickling bodies on all

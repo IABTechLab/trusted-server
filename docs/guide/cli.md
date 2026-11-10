@@ -342,6 +342,10 @@ register routes or rewrite HTML until you set
 runtime-injected scripts; JS Asset Proxy only rewrites matching script `src` URLs
 present in HTML processed by Trusted Server.
 
+While `[integrations.prebid]` is enabled, an entry whose URL matches Prebid
+`script_patterns` cannot be `"enabled"`; keep it `"disabled"` so Prebid
+intercepts the script, or set it to `"blocked"`.
+
 If a config already exists, avoid overwriting it:
 
 ```bash
