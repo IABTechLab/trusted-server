@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Read as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -620,6 +621,17 @@ fn ordinary_measurement_with(
     node_body: &str,
     adjust: impl FnOnce(&Path, &mut Value),
 ) -> Output {
+    ordinary_measurement_command(root, node_body, adjust)
+        .output()
+        .expect("should execute fixed measurement command only in CI")
+}
+
+/// Builds the fixture and returns the unlaunched measurement command.
+fn ordinary_measurement_command(
+    root: &Path,
+    node_body: &str,
+    adjust: impl FnOnce(&Path, &mut Value),
+) -> Command {
     let checkout = root.join("workspace/ordinary-canonical-source");
     let target = root.join("temp/ordinary-fastly-canonical-target");
     let cargo_home = root.join("temp/ordinary-canonical-cargo-home");
@@ -741,7 +753,8 @@ fn ordinary_measurement_with(
         serde_json::to_vec(&request).expect("should encode capture"),
     )
     .expect("should retain capture");
-    Command::new(RELEASE_BIN)
+    let mut command = Command::new(RELEASE_BIN);
+    command
         .current_dir(root)
         .env_clear()
         .env("GH_TOKEN", "fictional-credential-canary")
@@ -749,9 +762,8 @@ fn ordinary_measurement_with(
         .arg("--request")
         .arg(request_path)
         .arg("--output")
-        .arg(root.join("observed"))
-        .output()
-        .expect("should execute fixed measurement command only in CI")
+        .arg(root.join("observed"));
+    command
 }
 
 #[test]
@@ -782,6 +794,41 @@ fn ordinary_measurement_command_queries_only_versions_without_inherited_secrets(
             .join("observed/trusted-server-fastly.wasm.rebuild-check.json")
             .exists(),
         "should not manufacture equality from one build"
+    );
+}
+
+#[test]
+fn ordinary_measurement_command_waits_for_children_despite_inherited_ignored_sigchld() {
+    let temporary = tempdir().expect("should create process fixture");
+    let root = fs::canonicalize(temporary.path()).expect("should resolve process fixture");
+    let mut command = ordinary_measurement_command(&root, "printf 'v24.20.0\\n'", |_, _| {});
+    // SAFETY: the closure runs in the forked child before exec and only calls
+    // `signal`, which is async-signal-safe. An ignored SIGCHLD survives exec,
+    // so the producer starts the way an ignoring parent would launch it.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::signal(libc::SIGCHLD, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let result = command
+        .output()
+        .expect("should execute fixed measurement command only in CI");
+    assert!(
+        result.status.success(),
+        "should keep tool-query children waitable under an inherited ignored SIGCHLD: {}",
+        stderr(&result)
+    );
+    let observed: Value = serde_json::from_slice(
+        &fs::read(root.join("observed/fastly-observation.json"))
+            .expect("should retain unpublished observation"),
+    )
+    .expect("should parse real observation");
+    assert_eq!(
+        observed["tools"]["node"]["version"], "v24.20.0",
+        "should measure child version output under an inherited ignored SIGCHLD"
     );
 }
 

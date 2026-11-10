@@ -191,7 +191,9 @@ fn main() -> ExitCode {
     let inherited: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     Report::set_color_mode(ColorMode::None);
     let arguments: Vec<OsString> = std::env::args_os().collect();
-    match run(&inherited, &arguments) {
+    // Restore waitable children before any thread or child exists; an
+    // ignoring launcher would otherwise let the kernel reap supervised leaders.
+    match process::establish_waitable_children().and_then(|()| run(&inherited, &arguments)) {
         Ok(status) => status,
         Err(report) => {
             notice(format_args!("{report:?}"));

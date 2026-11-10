@@ -296,3 +296,20 @@ fn group_signal_refuses_init_and_broadcast_ids() {
         "should refuse before calling killpg, without a synthesized errno"
     );
 }
+
+#[test]
+fn inherited_ignored_sigchld_refuses_spawn_until_the_default_is_restored() {
+    let dir = workspace();
+
+    let result = helper(&dir, "ignored-sigchld", limits(SLACK))
+        .run()
+        .expect("should supervise the isolated supervisor helper");
+
+    assert_eq!(
+        result.outcome(),
+        ProcessOutcome::Exited { code: 0 },
+        "should refuse spawning under an ignored SIGCHLD ({SIGCHLD_NOT_REFUSED}), restore the \
+         default ({SIGCHLD_NOT_RESTORED}) and then supervise normally \
+         ({SIGCHLD_RESTORED_RUN_FAILED})"
+    );
+}

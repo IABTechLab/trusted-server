@@ -66,6 +66,7 @@ pub(super) fn run_helper(mode: &str) -> i32 {
     output_mode(mode)
         .or_else(|| group_mode(mode))
         .or_else(|| secret_mode(mode))
+        .or_else(|| supervisor_mode(mode))
         .unwrap_or(HELPER_UNKNOWN_MODE)
 }
 
@@ -149,6 +150,42 @@ fn group_mode(mode: &str) -> Option<i32> {
         }
         _ => None,
     }
+}
+
+/// Exit status when an auto-reaping SIGCHLD disposition is not refused.
+pub(super) const SIGCHLD_NOT_REFUSED: i32 = 81;
+/// Exit status when restoring the default SIGCHLD action fails.
+pub(super) const SIGCHLD_NOT_RESTORED: i32 = 82;
+/// Exit status when a spawn after restoring SIGCHLD does not succeed.
+pub(super) const SIGCHLD_RESTORED_RUN_FAILED: i32 = 83;
+
+/// Modes where this isolated helper process acts as the supervisor itself.
+///
+/// They change process-wide signal state, so they run only here and never in
+/// the shared test process.
+fn supervisor_mode(mode: &str) -> Option<i32> {
+    (mode == "ignored-sigchld").then(|| {
+        // SAFETY: ignoring SIGCHLD changes only this helper process's
+        // disposition, the state an ignoring launcher would leave behind.
+        if unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) } == libc::SIG_ERR {
+            return HELPER_SETUP_FAILED;
+        }
+        let nested = workspace();
+        let refused = helper(&nested, "print", limits(SLACK)).run();
+        if !matches!(
+            refused.as_ref().err().and_then(failure),
+            Some(ProcessFailure::UnwaitableChildren)
+        ) {
+            return SIGCHLD_NOT_REFUSED;
+        }
+        if establish_waitable_children().is_err() {
+            return SIGCHLD_NOT_RESTORED;
+        }
+        match helper(&nested, "print", limits(SLACK)).run() {
+            Ok(result) if result.outcome() == (ProcessOutcome::Exited { code: 0 }) => 0,
+            _ => SIGCHLD_RESTORED_RUN_FAILED,
+        }
+    })
 }
 
 /// Modes that echo secret-classified environment values.

@@ -25,9 +25,10 @@ use std::thread;
 
 use self::fixture::{
     CUT_KEPT, CUT_PADDING, CUT_SECRET, HELPER_NONCE, HELPER_PIDS, HELPER_SELECTOR,
-    HELPER_SETUP_FAILED, HELPER_TEST, LARGE_STDERR, OVERLAP_FIRST, OVERLAP_SECOND, SECRET, SLACK,
-    TIMEOUT_WALL, authorized_mode, failure, force_kill, harness_arguments, helper, helper_selector,
-    is_alive, is_dead_soon, limits, payload, read_pid, run_helper, supervision_bound, test_binary,
+    HELPER_SETUP_FAILED, HELPER_TEST, LARGE_STDERR, OVERLAP_FIRST, OVERLAP_SECOND, SECRET,
+    SIGCHLD_NOT_REFUSED, SIGCHLD_NOT_RESTORED, SIGCHLD_RESTORED_RUN_FAILED, SLACK, TIMEOUT_WALL,
+    authorized_mode, failure, force_kill, harness_arguments, helper, helper_selector, is_alive,
+    is_dead_soon, limits, payload, read_pid, run_helper, supervision_bound, test_binary,
     unauthorized_helper_run, workspace,
 };
 use super::supervise::{signal_group, unreaped_failure};

@@ -105,6 +105,88 @@ fn group_signal(process_group: libc::pid_t, signal: libc::c_int) -> io::Result<(
     }
 }
 
+/// Reads the SIGCHLD action without changing it.
+fn sigchld_action() -> io::Result<libc::sigaction> {
+    // SAFETY: `sigaction` is plain integer and mask data; all-zero is a valid
+    // value for the kernel to overwrite.
+    let mut current: libc::sigaction = unsafe { core::mem::zeroed() };
+    // SAFETY: a null new action only reads the disposition into `current`,
+    // which is valid and writable for the call's duration.
+    let result = unsafe { libc::sigaction(libc::SIGCHLD, core::ptr::null(), &raw mut current) };
+    if result == 0 {
+        Ok(current)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Returns whether `action` lets the kernel reap exited children itself.
+fn auto_reaps(action: &libc::sigaction) -> bool {
+    action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0
+}
+
+/// Refuses to spawn while exited children would be reaped automatically.
+///
+/// An ignored SIGCHLD or `SA_NOCLDWAIT` survives `exec`. On Linux it makes
+/// the kernel reap the leader at exit, so `waitid` reports `ECHILD` and the
+/// group ID is no longer pinned when [`settle`] would signal it.
+///
+/// # Errors
+///
+/// Returns [`ProcessFailure::UnwaitableChildren`] for an auto-reaping
+/// disposition, or [`ProcessFailure::Signal`] when it cannot be read.
+pub(super) fn require_waitable_children() -> Result<(), Report<ReleaseError>> {
+    let action = sigchld_action().map_err(|source| {
+        process_error(
+            ProcessFailure::Signal {
+                errno: source.raw_os_error(),
+            },
+            format!("cannot read the SIGCHLD disposition: {source}"),
+        )
+    })?;
+    if auto_reaps(&action) {
+        return Err(process_error(
+            ProcessFailure::UnwaitableChildren,
+            "SIGCHLD is ignored or SA_NOCLDWAIT is set, so exited children cannot be observed",
+        ));
+    }
+    Ok(())
+}
+
+/// Restores the default SIGCHLD action so spawned children stay waitable.
+///
+/// Call this at process start, before any thread or child exists: it changes
+/// process-wide signal state inherited from the launching parent.
+///
+/// # Errors
+///
+/// Returns [`ReleaseError::Process`] when the action cannot be set or the
+/// resulting disposition still reaps children automatically.
+pub(crate) fn establish_waitable_children() -> Result<(), Report<ReleaseError>> {
+    // SAFETY: all-zero is `SIG_DFL` with no flags; the mask is then emptied
+    // explicitly.
+    let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+    action.sa_sigaction = libc::SIG_DFL;
+    // SAFETY: `sa_mask` is a valid, writable signal set owned by `action`.
+    unsafe {
+        libc::sigemptyset(&raw mut action.sa_mask);
+    }
+    // SAFETY: `action` is a fully initialised action read for the call's
+    // duration; a null old action is permitted.
+    let result =
+        unsafe { libc::sigaction(libc::SIGCHLD, &raw const action, core::ptr::null_mut()) };
+    if result != 0 {
+        let source = io::Error::last_os_error();
+        return Err(process_error(
+            ProcessFailure::Signal {
+                errno: source.raw_os_error(),
+            },
+            format!("cannot restore the default SIGCHLD disposition: {source}"),
+        ));
+    }
+    require_waitable_children()
+}
+
 fn observation_failure(source: &io::Error) -> Report<ReleaseError> {
     process_error(
         ProcessFailure::Signal {

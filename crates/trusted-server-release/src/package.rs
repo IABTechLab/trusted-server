@@ -346,12 +346,14 @@ pub(crate) fn inspect_package(
     let mut retained = RetainedArchive::open(directory.join(format!("{name}.tar.gz")))?;
     let archive_sha256 = retained.hash()?;
     let module = module_member(&mut retained, &name, &approved.bytes)?;
-    let facts = inspect_wasm(&module)?;
-    if facts.sha256() != expected_wasm_sha256 {
+    // Authenticate the retained bytes before the Wasm parser sees them, so an
+    // unapproved module cannot drive parser allocations.
+    if digest(&module) != expected_wasm_sha256 {
         return Err(rejected(
             "actual package module differs from independently verified executable",
         ));
     }
+    inspect_wasm(&module)?;
     drop(module);
     let rechecked_module = module_member(&mut retained, &name, &approved.bytes)?;
     if digest(&rechecked_module) != expected_wasm_sha256 || retained.hash()? != archive_sha256 {

@@ -289,6 +289,16 @@ fn rejects_changed_module_and_manifest_bytes() {
 }
 
 #[test]
+fn rejects_unapproved_module_before_inspection() {
+    let error = check_archive(&archive(MANIFEST, b"not-wasm"), &digest(WASM))
+        .expect_err("should reject unapproved bytes before inspection");
+    assert!(
+        format!("{error:?}").contains("actual package module differs"),
+        "should check the independently approved digest before parsing Wasm"
+    );
+}
+
+#[test]
 fn rejects_malformed_and_component_modules_even_with_matching_hashes() {
     for wasm in [
         &b"not-wasm"[..],

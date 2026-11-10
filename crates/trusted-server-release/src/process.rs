@@ -14,6 +14,12 @@
 //! the leader reaped (polling, bounded by the kill grace, never a blocking
 //! wait), and read-only `killpg(pgid, 0)` probes confirm disappearance.
 //!
+//! That pinning needs a waitable leader. An inherited ignored SIGCHLD or
+//! `SA_NOCLDWAIT` lets the kernel reap the leader at exit, so the binary
+//! restores the default SIGCHLD action at startup and every spawn fails with
+//! [`ProcessFailure::UnwaitableChildren`] while children would be reaped
+//! automatically.
+//!
 //! A residual pgid-reuse window remains after reaping: if every member is
 //! already gone and the ID is recycled before confirmation, a probe can
 //! observe the unrelated group and cause a bounded false cleanup failure.
@@ -97,7 +103,8 @@ use error_stack::Report;
 use self::environment::{EnvironmentValue, is_credential};
 use self::pipes::{DrainedOutput, Pipes};
 use self::redact::{REDACTED, redact, redact_cut_tail, redacted_text};
-use self::supervise::{KILL_GRACE, Watch, observe, reap_within, settle};
+pub(crate) use self::supervise::establish_waitable_children;
+use self::supervise::{KILL_GRACE, Watch, observe, reap_within, require_waitable_children, settle};
 use crate::error::ReleaseError;
 
 /// Maximum stderr bytes shown in a failure excerpt (display bound only).
@@ -187,6 +194,9 @@ pub(crate) enum ProcessFailure {
     /// The child ran but did not exit with status zero.
     #[display("child did not succeed")]
     Unsuccessful,
+    /// SIGCHLD handling would reap the leader before its group is killed.
+    #[display("SIGCHLD disposition reaps children automatically")]
+    UnwaitableChildren,
 }
 
 /// A file-mode creation mask a child runs under, restricted to permission bits.
@@ -419,6 +429,7 @@ impl BoundedCommand {
 
     /// Spawns the child and returns it with its usable process-group ID.
     fn spawn_group(&self) -> Result<(Child, libc::pid_t), Report<ReleaseError>> {
+        require_waitable_children()?;
         let mut child = self.command().spawn().map_err(|source| {
             process_error(
                 ProcessFailure::Spawn {
