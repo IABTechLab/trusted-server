@@ -398,8 +398,9 @@ ts keys deactivate --service https://edge.example.com --kid ts-2024-01-15 --dele
 ```
 
 `--delete` removes the key from storage for good, so the command asks before
-sending. A non-interactive run (CI, cron) must pass `--yes` alongside
-`--delete`, or the command refuses. The command prints the deactivated kid,
+sending. A run whose stdin or stderr is not a terminal (CI, cron, or stderr
+redirected to a log) must pass `--yes` alongside `--delete`, or the command
+refuses. The command prints the deactivated kid,
 whether it was deleted and the remaining active kids. The server's refusals —
 an invalid kid, deactivating the current kid, deactivating the last active key
 — exit non-zero with the server's `error` message.

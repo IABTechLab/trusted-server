@@ -793,7 +793,8 @@ ts keys rotate --service https://edge.example.com [--kid custom-key-id]
 
 `ts keys rotate` reads the password from `TRUSTED_SERVER_ADMIN_PASSWORD` only,
 so it never reaches shell history or `ps`. Fallback with curl, reading
-credentials from a netrc file:
+credentials from a netrc file (mode `600`) that holds one line,
+`machine edge.example.com login admin password <admin-password>`:
 
 ```bash
 curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
@@ -857,8 +858,8 @@ defines no dedicated cache, CORS, or rate-limit policy.
 ts keys deactivate --service https://edge.example.com --kid ts-2025-01-14-A [--delete [--yes]]
 ```
 
-`--delete` asks for confirmation before sending; a non-interactive run must
-add `--yes`. Fallback with curl:
+`--delete` asks for confirmation before sending; a run whose stdin or stderr
+is not a terminal must add `--yes`. Fallback with curl:
 
 ```bash
 curl -X POST https://edge.example.com/_ts/admin/keys/deactivate \
