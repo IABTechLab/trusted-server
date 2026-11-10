@@ -873,6 +873,12 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
           'size',
           'build-binary',
           'unsorted',
+          'unknown-asset',
+          'bad-source',
+          'bad-run',
+          'bad-attempt',
+          'oversized-binary',
+          'oversized-companion',
         ]
       : ['success', 'extra']) {
       const root = mkdtempSync(join(tmpdir(), 'ordinary-sign-'))
@@ -952,6 +958,17 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
             )
           if (mode === 'extra')
             writeFileSync(join(root, 'comparison', 'unexpected'), 'extra')
+          // Sparse files reach the size bound without allocating it.
+          if (mode === 'oversized-binary')
+            fs.truncateSync(
+              join(root, 'release-assets', asset),
+              512 * 1024 * 1024 + 1
+            )
+          if (mode === 'oversized-companion')
+            fs.truncateSync(
+              join(root, 'comparison', `${asset}.rebuild-check.json`),
+              32 * 1024 * 1024 + 1
+            )
         } else if (mode === 'extra')
           writeFileSync(join(root, 'release-assets', 'unexpected'), 'extra')
         const local = (path) => join(root, path)
@@ -959,10 +976,11 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
           Buffer,
           process: {
             env: {
-              ASSET: asset,
-              SOURCE_COMMIT: 'a'.repeat(40),
-              GITHUB_RUN_ID: '17',
-              GITHUB_RUN_ATTEMPT: '2',
+              ASSET: mode === 'unknown-asset' ? 'ts-example-unknown' : asset,
+              SOURCE_COMMIT:
+                mode === 'bad-source' ? 'A'.repeat(40) : 'a'.repeat(40),
+              GITHUB_RUN_ID: mode === 'bad-run' ? '017' : '17',
+              GITHUB_RUN_ATTEMPT: mode === 'bad-attempt' ? '2x' : '2',
               GITHUB_OUTPUT: 'outputs',
             },
           },
@@ -983,7 +1001,16 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
         }
         const execute = () => vm.runInNewContext(script, context)
         if (mode !== 'success' && mode !== 'earlier-attempt') {
-          assert.throws(execute, undefined, `${asset}: ${mode}`)
+          // These modes must stop at their own guard, not a later check.
+          const reason = {
+            'unknown-asset': /Invalid signing identity/,
+            'bad-source': /Invalid signing identity/,
+            'bad-run': /Invalid signing identity/,
+            'bad-attempt': /Invalid signing identity/,
+            'oversized-binary': /Invalid signing input/,
+            'oversized-companion': /Invalid signing input/,
+          }[mode]
+          assert.throws(execute, reason, `${asset}: ${mode}`)
           assert.equal(
             fs.existsSync(join(root, 'inputs.sha256')),
             false,

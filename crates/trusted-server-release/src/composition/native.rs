@@ -668,14 +668,6 @@ impl NativeArchive {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn fixture_for_projection(
-    name: &str,
-    context: UnitContext,
-) -> (NativeInventory, CargoObservations) {
-    tests::fixture_for_projection(name, context)
-}
-
 /// Returns the reviewed Cargo wrapper version for a native implementation.
 pub(crate) fn reviewed_wrapper_version(name: &str) -> Option<&'static str> {
     reviewed(name).map(|rule| rule.version)

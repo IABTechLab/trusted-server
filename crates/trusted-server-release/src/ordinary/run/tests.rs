@@ -144,6 +144,22 @@ fn rejects_foreign_source_runs_attempts_and_unsuccessful_jobs() {
 }
 
 #[test]
+fn rejects_a_job_that_completes_before_it_starts() {
+    let mut response = jobs();
+    response["jobs"][0]["completed_at"] = json!("2023-11-14T22:13:09Z");
+    let error = bind(
+        &encoded(&request()),
+        &encoded(&response),
+        &encoded(&artifacts()),
+    )
+    .expect_err("should reject an inverted job interval");
+    assert!(
+        format!("{error:?}").contains("ordinary job interval rejected"),
+        "should reach the job interval rule"
+    );
+}
+
+#[test]
 fn rejects_a_second_upload_with_the_same_artifact_name() {
     let mut response = artifacts();
     let mut stale = response["artifacts"][0].clone();

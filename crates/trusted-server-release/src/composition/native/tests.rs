@@ -635,30 +635,3 @@ fn checks_attempt_deadlines_during_collection_and_rehash() {
     );
     assert!(result.is_err(), "should reject a cancelled capture attempt");
 }
-
-pub(super) fn fixture_for_projection(
-    name: &str,
-    context: UnitContext,
-) -> (NativeInventory, CargoObservations) {
-    let mut fixture = Fixture::new(name);
-    if context == UnitContext::Host {
-        let output = fixture.root.join("target/release/build/native/out");
-        fs::create_dir_all(&output).expect("should create host output");
-        for entry in fs::read_dir(&fixture.observations.build_scripts[0].out_dir)
-            .expect("should list archives")
-        {
-            let entry = entry.expect("should read archive entry");
-            fs::copy(entry.path(), output.join(entry.file_name()))
-                .expect("should copy host archive");
-        }
-        fixture.observations.units[0].context = context;
-        fixture.observations.build_scripts[0].context = context;
-        fixture.observations.build_scripts[0].out_dir = output.clone();
-        fixture.observations.build_scripts[0].linked_paths =
-            vec![format!("native={}", output.display())];
-    }
-    let inventory = fixture
-        .collect()
-        .expect("should collect owner-checked native fixture");
-    (inventory, fixture.observations)
-}

@@ -420,3 +420,47 @@ fn rejects_a_cargo_home_other_than_the_role_private_home() {
         );
     }
 }
+
+#[test]
+fn rejects_compare_time_identity_environment_and_acquisition_changes() {
+    for (pointer, value, reason) in [
+        (
+            "/target",
+            json!("wasm32-unknown-unknown"),
+            "identity or qualification claim rejected",
+        ),
+        (
+            "/variant",
+            json!("example"),
+            "identity or qualification claim rejected",
+        ),
+        (
+            "/environment/locale",
+            json!("en_US.UTF-8"),
+            "environment observations rejected",
+        ),
+        (
+            "/environment/timezone",
+            json!("Europe/Example"),
+            "environment observations rejected",
+        ),
+        (
+            "/tools/acquisition",
+            json!("example-acquisition"),
+            "tool observations rejected",
+        ),
+    ] {
+        let mut input = fixture();
+        *input
+            .pointer_mut(pointer)
+            .expect("should locate fixture field") = value;
+        let Err(error) = observation(&serde_json::to_vec(&input).expect("should encode fixture"))
+        else {
+            panic!("should reject a changed {pointer}");
+        };
+        assert!(
+            format!("{error:?}").contains(reason),
+            "should reach the `{reason}` rule for {pointer}"
+        );
+    }
+}

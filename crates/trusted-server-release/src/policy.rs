@@ -104,33 +104,6 @@ pub(crate) struct FixedArtifact {
     recipe_environment: &'static str,
 }
 
-impl FixedArtifact {
-    /// Renders this asset's fixed release-index identity fields.
-    ///
-    /// The result is exactly the governing schema's per-asset `oneOf` row: the
-    /// name, role, kind, package, target, default variant, assurance profile,
-    /// the single compiled capability and the compatibility triple. Nothing in
-    /// it comes from JSON input, so it can never add `fastly-staging`.
-    #[allow(dead_code, reason = "consumed by Phase 3 index construction")]
-    pub(crate) fn index_identity(&self) -> Value {
-        json!({
-            "name": self.name,
-            "role": self.role,
-            "kind": self.kind,
-            "package": self.package,
-            "target": self.target.triple(),
-            "variant": "default",
-            "assurance_profile": self.assurance_profile,
-            "capabilities": [self.capability],
-            "compatibility": {
-                "runtime": self.runtime,
-                "minimum_version": self.minimum_version,
-                "architecture": self.architecture,
-            },
-        })
-    }
-}
-
 /// The four controlled destination rows, which are also the ordinary release assets.
 ///
 /// These recipes and index identities remain closed.

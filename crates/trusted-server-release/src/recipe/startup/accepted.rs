@@ -301,23 +301,6 @@ impl NativeStartupAccepted {
         }
     }
 
-    /// Exports successful startup facts for this exact completed build.
-    ///
-    /// # Errors
-    ///
-    /// Rejects changed retained outputs or another source, role, asset, artifact
-    /// or selected CLI version. JSON provides diagnostics without authority.
-    pub(crate) fn diagnostic_for(
-        &self,
-        completed: &RecipeCompleted,
-    ) -> Result<Value, Report<ReleaseError>> {
-        let actual = Owner::from_completed(completed)?;
-        self.owner.check_same(&actual)?;
-        let record = self.diagnostic_record()?;
-        completed.rehash_for_handoff()?;
-        Ok(record)
-    }
-
     fn diagnostic_record(&self) -> Result<Value, Report<ReleaseError>> {
         let observation = match &self.observed {
             Observed::Linux(runs) => {
