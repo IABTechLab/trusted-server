@@ -891,6 +891,7 @@ ec_store = "ec_identity_store"
 name = "Mocktioneer SSP"
 source_domain = "mocktioneer.example"
 bidstream_enabled = true
+# mirror_enabled = true  # mirror provider-written UIDs to a JS-readable cookie (default false)
 # api_token = "partner_api_token"  # only for inbound identify or batch sync
 # ts_pull_token = "partner_ts_pull_token"  # required when pull sync is enabled
 ```

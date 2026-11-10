@@ -461,14 +461,19 @@ fn joined_cookie_header(req: &Request) -> String {
 /// permitted publisher navigation.
 ///
 /// Returns `None` when no after-response provider (including a pull-sync
-/// partner) is enabled, the request has no EC, or the identity graph is
-/// unavailable.
+/// partner) is enabled, the client failed the browser check, the request has
+/// no EC, or the identity graph is unavailable.
 fn prepare_after_response_lookups(
     state: &AppState,
     req: &Request,
     ec: &EcRequestState,
 ) -> Option<AfterResponseLookups> {
     state.after_response_identity.as_ref()?;
+    // Bot gate: pull sync and other after-response lookups disclose the EC ID
+    // to partners, so they run only for recognized browsers.
+    if !ec.is_real_browser {
+        return None;
+    }
     ec.kv_graph.as_ref()?;
     let ec_id = ec.ec_context.ec_value()?.to_owned();
     let signals = ProviderRequestSignals::read(req, ec);
@@ -3475,6 +3480,60 @@ mod tests {
                 .device_signals()
                 .is_some_and(DeviceSignals::looks_like_browser),
             "browser-shaped JA4/H2 signals from the request extension must mark the request as a real browser"
+        );
+    }
+
+    #[test]
+    fn after_response_lookups_run_only_for_real_browsers() {
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "Pull partner",
+                "source_domain": "partner.example.com",
+                "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"],
+                "ts_pull_token": "example-pull-token-32-bytes-minimum",
+            }))
+            .expect("should build pull-sync partner"),
+        ];
+        let state = build_state_from_settings(settings).expect("should build app state");
+        let browser_request = || {
+            let mut req = request_builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/article")
+                .header(header::COOKIE, format!("ts-ec={}.test01", "a".repeat(64)))
+                .body(Body::empty())
+                .expect("should build request");
+            req.extensions_mut().insert(DeviceSignals::derive(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+                Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+                Some("1:65536;2:0;4:6291456;6:262144"),
+            ));
+            req
+        };
+        let context = RequestContext::new(browser_request(), PathParams::default());
+        let services = build_per_request_services(&state, &context);
+        let req = browser_request();
+        let mut ec = super::build_ec_request_state(&state.settings, &services, &req);
+        assert!(
+            ec.is_real_browser,
+            "should classify the request as a browser"
+        );
+
+        let browser = super::prepare_after_response_lookups(&state, &req, &ec);
+        ec.is_real_browser = false;
+        let bot = super::prepare_after_response_lookups(&state, &req, &ec);
+
+        assert!(
+            browser.is_some(),
+            "should prepare pull sync for a real browser"
+        );
+        assert!(
+            bot.is_none(),
+            "should never prepare pull sync for a client that fails the browser check"
         );
     }
 

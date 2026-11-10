@@ -131,14 +131,14 @@ pub fn build(
 /// One `pull-sync` provider per partner with pull sync enabled, built from the
 /// partner's existing fields with no config change.
 ///
-/// Pull sync runs after the response has been sent, as it did before it
-/// became a provider, so a slow partner never delays the page and a new EC
-/// whose row does not exist yet is never pulled. Its hourly rate limit is
-/// the partner's `pull_sync_rate_limit` (`None` when it is 0).
+/// Pull sync runs after the response has been sent, so a slow partner never
+/// delays the page and a new EC whose row does not exist yet is never pulled.
+/// Its hourly rate limit is the partner's `pull_sync_rate_limit`, which
+/// partner validation keeps nonzero.
 pub fn pull_sync_providers(ec: &Ec) -> impl Iterator<Item = IdentityProviderConfig> + '_ {
     ec.partners
         .iter()
-        .filter(|partner| partner.pull_sync_enabled)
+        .filter(|partner| partner.runs_pull_sync())
         .filter_map(|partner| {
             let endpoint = partner.pull_sync_url.clone()?;
             let mut config = IdentityProviderConfig::new(

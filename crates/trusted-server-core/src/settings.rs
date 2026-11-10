@@ -503,6 +503,11 @@ pub struct EcPartner {
     /// Whether this partner's UIDs appear in auction `user.eids`.
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
+    /// Whether this partner's provider-written UIDs are mirrored to the
+    /// JS-readable `__Host-ts-eids-mirror` cookie. Off by default; takes
+    /// effect only with `bidstream_enabled`.
+    #[serde(default, deserialize_with = "from_value_or_str")]
+    pub mirror_enabled: bool,
     /// Plaintext API token used by inbound batch sync and identify requests.
     ///
     /// When present, the token is hashed at startup for auth lookups. Omitting
@@ -543,6 +548,13 @@ pub struct EcPartner {
 }
 
 impl EcPartner {
+    /// Whether this partner runs pull sync as an identity provider, which
+    /// makes its source provider-owned.
+    #[must_use]
+    pub fn runs_pull_sync(&self) -> bool {
+        self.pull_sync_enabled && self.pull_sync_url.is_some()
+    }
+
     /// Known partner secret placeholders (`api_token` and `ts_pull_token`) that
     /// must not be used in deployments.
     pub const API_TOKEN_PLACEHOLDERS: &[&str] = &[
@@ -5161,6 +5173,7 @@ mod tests {
             source_domain: "canary-partner.example".to_string(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
+            mirror_enabled: false,
             api_token: Some(Redacted::new(CANARY_EC_PARTNER_API_TOKEN.to_string())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
@@ -7217,6 +7230,7 @@ source_domain = "partner.example.com"
             source_domain: "partner.example.com".to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
+            mirror_enabled: false,
             api_token: api_token.map(|token| Redacted::new(token.to_owned())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: true,

@@ -732,6 +732,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            mirror_enabled: false,
             api_token: Some(Redacted::new(format!(
                 "token-{source_domain}-32-bytes-minimum-value"
             ))),
@@ -1616,6 +1617,10 @@ mod tests {
             registry.mark_provider_owned("sharedid.org", None),
             "should mark the provider source"
         );
+        assert!(
+            registry.reject_ingest("sharedid.org"),
+            "should reject browser ingest for the configured provider's source"
+        );
         let mut response = empty_response();
 
         // Act
@@ -2049,8 +2054,9 @@ mod tests {
         let mut ec_context = returning_user_context(&ec_id, snapshot, navigation);
         ec_context.set_mirror_cookie_for_test(mirror);
         ec_context.set_lookup_results(lookups);
-        let mut registry = PartnerRegistry::from_config(&[make_partner("ids.example.com")])
-            .expect("should build registry");
+        let mut partner = make_partner("ids.example.com");
+        partner.mirror_enabled = true;
+        let mut registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
         registry.mark_provider_owned("ids.example.com", None);
         let mut response = empty_response();
 

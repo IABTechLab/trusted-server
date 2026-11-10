@@ -4,7 +4,7 @@ use base64::Engine as _;
 use serde_json::{Map, Value};
 
 use crate::consent::ConsentContext;
-use crate::consent::allows_eid_persistence;
+use crate::consent::{allows_eid_persistence, tcf_vendor_consent_denied};
 use crate::ec::consent::ec_consent_granted;
 use crate::ec::eid_types::{Expiry, UnixSeconds};
 use crate::ec::kv_types::{KvEid, KvEntry, KvUid};
@@ -36,7 +36,9 @@ impl MirrorValue {
 
 /// Builds the mirror from the row as it stands after this navigation.
 ///
-/// Holds live, provider-written UIDs of `bidstream_enabled` partners, in
+/// Holds live, provider-written UIDs of partners with both
+/// `bidstream_enabled` and `mirror_enabled` whose owning provider's TCF vendor
+/// consent is not denied, in
 /// partner config order, as unpadded base64url JSON
 /// `{"v":1,"eids":[...]}`. UIDs that would push the value past
 /// [`MAX_MIRROR_BYTES`] are skipped, as are UIDs that fail to serialize.
@@ -59,10 +61,16 @@ pub fn build_mirror(
         return MirrorCookie::Expire;
     };
     let mut mirror = MirrorBuilder::default();
-    for partner in partners
-        .in_config_order()
-        .filter(|partner| partner.bidstream_enabled)
-    {
+    // A partner opts in with `mirror_enabled`, and a UID never reaches the
+    // page while its owning provider's TCF vendor consent is denied, as it
+    // never reaches the bidstream (`KvEntry::live_eids`).
+    for partner in partners.in_config_order().filter(|partner| {
+        partner.bidstream_enabled
+            && partner.mirror_enabled
+            && !partner
+                .owner_tcf_vendor_id
+                .is_some_and(|vendor| tcf_vendor_consent_denied(consent, vendor))
+    }) {
         let Some(record) = row.ids.get(&partner.source_domain) else {
             continue;
         };
@@ -230,11 +238,18 @@ mod tests {
     use super::*;
     use crate::ec::eid_types::{AgentType, EidFields, ProviderId, UidValue};
     use crate::ec::kv_types::KvPartnerId;
+    use crate::test_support::tests::consent_granting_vendors;
     use serde_json::json;
+    use std::num::NonZeroU16;
 
     fn partners(bidstream: bool) -> PartnerRegistry {
+        partners_with(bidstream, true)
+    }
+
+    fn partners_with(bidstream: bool, mirror: bool) -> PartnerRegistry {
         let partner = serde_json::from_value(json!({
-            "name": "ids", "source_domain": "ids.example.com", "bidstream_enabled": bidstream
+            "name": "ids", "source_domain": "ids.example.com",
+            "bidstream_enabled": bidstream, "mirror_enabled": mirror
         }))
         .expect("should build partner");
         PartnerRegistry::from_config(&[partner]).expect("should build registry")
@@ -333,6 +348,66 @@ mod tests {
     }
 
     #[test]
+    fn mirror_is_off_unless_the_partner_opts_in() {
+        let entry = row(vec![uid("live", Expiry::Never)]);
+
+        let mirror = build_mirror(
+            Some(&entry),
+            &granting(),
+            &partners_with(true, false),
+            UnixSeconds::new(1000),
+        );
+
+        assert_eq!(
+            mirror,
+            MirrorCookie::Expire,
+            "should not mirror a bidstream partner without mirror_enabled"
+        );
+        assert!(
+            !serde_json::from_value::<crate::settings::EcPartner>(json!({
+                "name": "ids", "source_domain": "ids.example.com"
+            }))
+            .expect("should build partner")
+            .mirror_enabled,
+            "should default mirror_enabled to off"
+        );
+    }
+
+    #[test]
+    fn withholds_uids_whose_owner_lacks_vendor_consent() {
+        let entry = row(vec![uid("live", Expiry::Never)]);
+        let mut registry = partners(true);
+        assert!(
+            registry.mark_provider_owned("ids.example.com", NonZeroU16::new(9999)),
+            "should mark the source"
+        );
+        let now = UnixSeconds::new(1000);
+
+        let denied = build_mirror(
+            Some(&entry),
+            &consent_granting_vendors(vec![1]),
+            &registry,
+            now,
+        );
+        let granted = build_mirror(
+            Some(&entry),
+            &consent_granting_vendors(vec![9999]),
+            &registry,
+            now,
+        );
+
+        assert_eq!(
+            denied,
+            MirrorCookie::Expire,
+            "should not mirror a UID whose owner's vendor consent is denied"
+        );
+        assert!(
+            matches!(granted, MirrorCookie::Set(_)),
+            "should mirror the UID once the vendor has consent"
+        );
+    }
+
+    #[test]
     fn does_not_mirror_browser_ingested_uid_of_pull_sync_source() {
         let mut entry = KvEntry::tombstone(1000);
         entry.consent.ok = true;
@@ -341,7 +416,7 @@ mod tests {
             .insert("ids.example.com".to_owned(), KvPartnerId::single("browser"));
         let pull_partner = serde_json::from_value(json!({
             "name": "ids", "source_domain": "ids.example.com", "bidstream_enabled": true,
-            "pull_sync_enabled": true, "pull_sync_url": "https://sync.example.com/pull",
+            "mirror_enabled": true, "pull_sync_enabled": true, "pull_sync_url": "https://sync.example.com/pull",
             "pull_sync_allowed_domains": ["sync.example.com"],
             "ts_pull_token": "example-pull-token-32-bytes-minimum"
         }))

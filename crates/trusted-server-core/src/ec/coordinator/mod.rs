@@ -319,6 +319,17 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
     }
 
     /// Whether the row holds a live provider-written UID for `source`.
+    /// Whether any provider has a due source in `entry`, ignoring consent and
+    /// rate limits, so a caller can skip a row read that cannot lead to a
+    /// lookup. `None` (no row known) counts every source as due.
+    #[must_use]
+    pub fn any_due(&self, entry: Option<&KvEntry>, now: UnixSeconds) -> bool {
+        self.providers.iter().any(|registered| {
+            !entry.is_some_and(|entry| entry.opted_out(&registered.id, now))
+                && !Self::due_sources(registered, entry, now).0.is_empty()
+        })
+    }
+
     fn holds_live_uid(entry: Option<&KvEntry>, source: &str, now: UnixSeconds) -> bool {
         entry
             .and_then(|entry| entry.ids.get(source))
@@ -721,7 +732,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                     .pull_sync_concurrency
                     .is_some_and(|max| pull_sync_dispatched >= max.get())
             {
-                pending.early.push(skip(SkipReason::RateLimited));
+                pending.early.push(skip(SkipReason::ConcurrencyCap));
                 continue;
             }
             let input = LookupInput {
@@ -1529,6 +1540,33 @@ mod tests {
     }
 
     #[test]
+    fn any_due_is_false_only_when_every_source_is_held() {
+        let coordinator = pull_sync_pair(None);
+        let now = UnixSeconds::new(1000);
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry
+            .ids
+            .insert("a.example.com".to_owned(), KvPartnerId::single("held-a"));
+
+        assert!(
+            coordinator.any_due(None, now),
+            "should count every source as due without a known row"
+        );
+        assert!(
+            coordinator.any_due(Some(&entry), now),
+            "should report the source that is still missing"
+        );
+        entry
+            .ids
+            .insert("b.example.com".to_owned(), KvPartnerId::single("held-b"));
+        assert!(
+            !coordinator.any_due(Some(&entry), now),
+            "should report nothing due once every pull-sync source is held"
+        );
+    }
+
+    #[test]
     fn pull_sync_concurrency_caps_dispatched_lookups() {
         let coordinator = pull_sync_pair(NonZeroUsize::new(1));
         let transport = CannedTransport::new(not_found_reply);
@@ -1539,8 +1577,13 @@ mod tests {
         let statuses: Vec<LookupStatus> = results.iter().map(|lookup| lookup.status).collect();
         assert_eq!(
             statuses[1],
-            LookupStatus::Skipped(SkipReason::RateLimited),
+            LookupStatus::Skipped(SkipReason::ConcurrencyCap),
             "should skip the pull-sync lookup past the cap"
+        );
+        assert_eq!(
+            statuses[1].metric_name(),
+            "skipped_concurrency_cap",
+            "should log the cap apart from the rate limit"
         );
     }
 

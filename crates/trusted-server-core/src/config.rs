@@ -458,9 +458,17 @@ fn validate_identity_providers(ec: &Ec) -> Result<(), Report<TrustedServerError>
     // fail the coordinator build on every request.
     for config in ec.identity_providers.iter().filter(|config| config.enabled) {
         if let Some(source) = config.sources.iter().find(|source| {
-            partners
+            let claimed = partners
                 .find_by_source_domain(source)
-                .is_some_and(|partner| partner.pull_sync_enabled && partner.pull_sync_url.is_some())
+                .map(|partner| partner.source_domain.as_str());
+            claimed.is_some()
+                && ec.partners.iter().any(|partner| {
+                    partner.runs_pull_sync()
+                        && partners
+                            .find_by_source_domain(&partner.source_domain)
+                            .map(|config| config.source_domain.as_str())
+                            == claimed
+                })
         }) {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
@@ -1694,6 +1702,50 @@ gam_network_id = "99999"
         assert!(
             err.to_string().contains("pull-sync partner"),
             "should explain the double claim: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_accepts_disabled_provider_sharing_a_pull_sync_source() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({ "enabled": false }));
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "ids",
+                "source_domain": "ids.example.com",
+                "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"],
+                "ts_pull_token": "example-pull-token-32-bytes-minimum",
+            }))
+            .expect("should build partner"),
+        ];
+
+        validate_settings_for_runtime(&settings)
+            .expect("should accept a disabled provider sharing a pull-sync source");
+    }
+
+    #[test]
+    fn runtime_validation_rejects_a_pull_token_invalid_in_a_header() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({ "enabled": false }));
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "ids",
+                "source_domain": "ids.example.com",
+                "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"],
+                "ts_pull_token": "example-pull-token\n32-bytes-minimum",
+            }))
+            .expect("should build partner"),
+        ];
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject a pull token that cannot form a header");
+
+        assert!(
+            err.to_string().contains("pull sync config invalid")
+                || format!("{err:?}").contains("Authorization header"),
+            "should explain the invalid pull token: {err:?}"
         );
     }
 

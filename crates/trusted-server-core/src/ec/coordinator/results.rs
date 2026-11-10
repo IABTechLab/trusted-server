@@ -63,6 +63,9 @@ pub enum SkipReason {
     Destination,
     /// The provider's hourly rate limit is reached.
     RateLimited,
+    /// Pull sync already dispatched `pull_sync_concurrency` partners on this
+    /// navigation.
+    ConcurrencyCap,
     /// The vendor or its cookies report an opt-out; the provider's stored
     /// UIDs are removed.
     OptedOut,
@@ -118,6 +121,7 @@ impl LookupStatus {
             Self::Skipped(SkipReason::Input) => "skipped_input",
             Self::Skipped(SkipReason::RateLimited) => "skipped_rate_limited",
             Self::Skipped(SkipReason::Region) => "skipped_region",
+            Self::Skipped(SkipReason::ConcurrencyCap) => "skipped_concurrency_cap",
             Self::Skipped(SkipReason::SnapshotUnavailable) => "skipped_snapshot_unavailable",
             Self::Skipped(SkipReason::Destination) => "destination_rejected",
             Self::Skipped(SkipReason::OptedOut) => "skipped_opted_out",

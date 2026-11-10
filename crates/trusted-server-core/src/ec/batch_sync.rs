@@ -172,7 +172,7 @@ fn handle_batch_sync_with_writer(
     let (accepted, errors) = process_mappings_for_partner(
         writer,
         &partner.source_domain,
-        registry.rejects_batch_sync(&partner.source_domain),
+        registry.rejects_ingest(&partner.source_domain),
         &body.mappings,
     );
 
@@ -438,6 +438,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            mirror_enabled: false,
             api_token: Some(Redacted::new(api_token.to_owned())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
@@ -1034,7 +1035,7 @@ mod tests {
     fn handle_batch_sync_rejects_mappings_for_a_configured_provider_source() {
         let mut registry = test_registry();
         assert!(
-            registry.reject_batch_sync("ssp.example.com"),
+            registry.reject_ingest("ssp.example.com"),
             "should mark the configured provider source"
         );
         let limiter = MockRateLimiter {

@@ -739,6 +739,15 @@ pub(crate) fn run_after_response_lookups(
         return;
     };
     let settings = &*state.settings;
+    // The request snapshot holds the row as finalize left it. A source held
+    // there is still held in the live row unless consent was withdrawn, which
+    // blocks the lookup anyway, so the live read is skipped when nothing is due.
+    let now = current_timestamp();
+    let request_entry = ec_state.ec_context.kv_snapshot().entry_for(&lookups.ec_id);
+    if !coordinator.any_due(request_entry, UnixSeconds::new(now)) {
+        log::debug!("After-response lookups skipped: nothing due");
+        return;
+    }
     let Some(graph) = maybe_identity_graph(settings) else {
         return;
     };
@@ -753,7 +762,6 @@ pub(crate) fn run_after_response_lookups(
     }
     let transport = PlatformLookupTransport::new(&ec_state.services);
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    let now = current_timestamp();
     let pending = futures::executor::block_on(coordinator.dispatch(
         &transport,
         &LookupContext {
