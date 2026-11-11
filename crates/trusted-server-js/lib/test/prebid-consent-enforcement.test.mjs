@@ -144,6 +144,8 @@ async function runGdprPage(
     deferPrebidCmpResponse = false,
     lateCmp = false,
     queueAuction = true,
+    prepareRelayBeforeLateConfig = false,
+    throwAfterRelayConfig = false,
     replaceTcfApiBeforeLateEvent = false,
     replaceStalledCmp = false,
     tcDataOverrides,
@@ -220,6 +222,7 @@ async function runGdprPage(
   pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
   pageWindow.__tsjs_prebid = {
     clientSideBidders: [],
+    relaySoftVendorException: prepareRelayBeforeLateConfig,
     managedUserIds: [
       {
         name: 'identityLink',
@@ -244,6 +247,18 @@ async function runGdprPage(
     publisherConfig.consentManagement = publisherConsentManagement;
   }
   pageWindow.pbjs.setConfig(publisherConfig);
+  const consentPatches = [];
+  const originalSetConfig = pageWindow.pbjs.setConfig.bind(pageWindow.pbjs);
+  pageWindow.pbjs.setConfig = (value) => {
+    if (Object.prototype.hasOwnProperty.call(value, 'consentManagement')) {
+      consentPatches.push(JSON.parse(JSON.stringify(value.consentManagement)));
+    }
+    const result = originalSetConfig(value);
+    if (throwAfterRelayConfig && Array.isArray(value.consentManagement?.gdpr?.rules)) {
+      throw new Error('synthetic relay config subscriber failure');
+    }
+    return result;
+  };
   if (lateCmp && queueAuction) {
     pageWindow.pbjs.que.push(() => {
       pageWindow.pbjs.requestBids({ adUnits: [], bidsBackHandler: () => {} });
@@ -254,6 +269,33 @@ async function runGdprPage(
     await new Promise((resolve) => setTimeout(resolve, 25));
     pageWindow.__tcfapi = cmp;
   }
+
+  const consentCheckpoint = () => ({
+    registered: registeredConsentListenerCount,
+    removed: removedConsentListenerCount,
+    remaining: consentListeners.size,
+    listenerIds: [...consentListeners.keys()],
+    originalTcfApiRestored: pageWindow.__tcfapi === cmp,
+    patchCount: consentPatches.length,
+    consentManagement: JSON.parse(
+      JSON.stringify(pageWindow.pbjs.getConfig('consentManagement') ?? null)
+    ),
+  });
+  const beforeRelay = consentCheckpoint();
+  if (prepareRelayBeforeLateConfig) {
+    pageWindow.pbjs.requestBids({
+      adUnits: [
+        {
+          code: 'example-relay-slot',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          bids: [{ bidder: 'trustedServer', params: {} }],
+        },
+      ],
+      timeout: 100,
+      bidsBackHandler: () => {},
+    });
+  }
+  const afterRelay = consentCheckpoint();
 
   if (latePublisherConsentManagement !== undefined) {
     pageWindow.pbjs.setConfig({ consentManagement: latePublisherConsentManagement });
@@ -308,6 +350,10 @@ async function runGdprPage(
   }
 
   return {
+    beforeRelay,
+    afterRelay,
+    consentPatches,
+    close: () => dom.window.close(),
     requestedUrls,
     cookies: pageWindow.document.cookie,
     consentManagement: pageWindow.pbjs.getConfig('consentManagement'),
@@ -479,6 +525,102 @@ describe('external bundle TCF enforcement', () => {
 
     expect(consentManagement.gdpr).toEqual(publisherConsentManagement.gdpr);
   });
+
+  it('keeps automatic CMP ownership while preparing a nonempty relay auction', async () => {
+    const result = await runGdprPage(
+      { purpose1: false, vendor97: false },
+      { prepareRelayBeforeLateConfig: true }
+    );
+    try {
+      const relayPatches = result.consentPatches.slice(result.beforeRelay.patchCount);
+      console.log(
+        '[relay-automatic-cmp]',
+        JSON.stringify({
+          before: result.beforeRelay,
+          after: result.afterRelay,
+          relayPatches,
+        })
+      );
+      expect(result.beforeRelay.consentManagement.gdpr.cmpApi).toBe('iab');
+      expect(result.beforeRelay.registered).toBe(2);
+      expect(result.beforeRelay.remaining).toBe(1);
+      for (const automaticListener of result.beforeRelay.listenerIds) {
+        expect.soft(result.afterRelay.listenerIds).toContain(automaticListener);
+      }
+      expect.soft(relayPatches.some((patch) => patch.gdpr?.enabled === false)).toBe(false);
+    } finally {
+      result.close();
+    }
+  });
+
+  it('retains a pre-existing publisher setter around internal relay rule updates', async () => {
+    const result = await runGdprPage(
+      { purpose1: false, vendor97: false },
+      { prepareRelayBeforeLateConfig: true }
+    );
+    try {
+      const rulePatch = result.consentPatches
+        .slice(result.beforeRelay.patchCount)
+        .find((patch) => Array.isArray(patch.gdpr?.rules));
+      expect(rulePatch?.gdpr.rules).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            purpose: 'basicAds',
+            softVendorExceptions: expect.arrayContaining(['trustedServer']),
+          }),
+        ])
+      );
+    } finally {
+      result.close();
+    }
+  });
+
+  it.each([
+    [false, false],
+    [true, false],
+    [true, true],
+  ])(
+    'keeps publisher takeover protected after a nonempty automatic-CMP relay auction, deferred=%s, subscriber throws=%s',
+    async (deferPrebidCmpResponse, throwAfterRelayConfig) => {
+      const result = await runGdprPage(
+        { purpose1: false, vendor97: false },
+        {
+          prepareRelayBeforeLateConfig: true,
+          deferPrebidCmpResponse,
+          throwAfterRelayConfig,
+          latePublisherConsentManagement: {
+            gdpr: {
+              cmpApi: 'static',
+              consentData: tcData({ purpose1: false, vendor97: false }),
+            },
+          },
+          cmpEventAfterLateConfig: {},
+        }
+      );
+      try {
+        console.log(
+          '[relay-publisher-takeover]',
+          JSON.stringify({
+            before: result.beforeRelay,
+            after: result.afterRelay,
+            consentPatches: result.consentPatches,
+            registered: result.registeredConsentListenerCount,
+            removed: result.removedConsentListenerCount,
+            remaining: result.remainingConsentListenerCount,
+            vendorRequests: envelopeRequests(result.requestedUrls).length,
+          })
+        );
+        expect(result.beforeRelay.consentManagement.gdpr.cmpApi).toBe('iab');
+        expect(result.beforeRelay.originalTcfApiRestored).toBe(true);
+        expect.soft(result.afterRelay.originalTcfApiRestored).toBe(true);
+        expect.soft(result.remainingConsentListenerCount).toBe(0);
+        expect.soft(envelopeRequests(result.requestedUrls)).toEqual([]);
+        expect.soft(result.cookies).not.toContain(LIVE_RAMP_STORAGE_NAME);
+      } finally {
+        result.close();
+      }
+    }
+  );
 
   it('retires automatic IAB consent when late static GDPR configuration takes ownership', async () => {
     const deniedStaticConsent = {
