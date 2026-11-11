@@ -1,6 +1,5 @@
-use std::net::{Ipv4Addr, SocketAddr};
-
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
+use edgezero_core::addr::{BindAddrResolution, resolve_bind_addr};
 use edgezero_core::app::Hooks as _;
 use log::LevelFilter;
 use trusted_server_adapter_axum::app::TrustedServerApp;
@@ -11,10 +10,13 @@ const LOG_LEVEL_ENV: &str = "RUST_LOG";
 /// Log level used when `RUST_LOG` is unset or unrecognized.
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
 
-/// Environment variable carrying a full listen socket address.
-const LISTEN_ADDR_ENV: &str = "TRUSTED_SERVER_LISTEN_ADDR";
+/// `EdgeZero` environment variable carrying the listen IP address.
+const HOST_ENV: &str = "EDGEZERO__ADAPTER__HOST";
 
-/// Environment variable carrying a loopback listen port.
+/// `EdgeZero` environment variable carrying the listen port.
+const EDGEZERO_PORT_ENV: &str = "EDGEZERO__ADAPTER__PORT";
+
+/// Environment variable carrying a listen port for local tooling and tests.
 const PORT_ENV: &str = "PORT";
 
 #[allow(clippy::print_stderr)]
@@ -34,21 +36,24 @@ fn main() {
         eprintln!("warning: logger init failed: {e}");
     }
 
-    let listen =
-        std::env::var_os(LISTEN_ADDR_ENV).map(|value| value.to_string_lossy().into_owned());
-    let port = std::env::var_os(PORT_ENV).map(|value| value.to_string_lossy().into_owned());
-    let config = match listen_address(listen.as_deref(), port.as_deref()) {
-        Ok(Some(addr)) => AxumDevServerConfig {
-            addr,
-            enable_ctrl_c: true,
-        },
-        Ok(None) => AxumDevServerConfig::default(),
-        // Silently falling back to another address would surprise tooling
+    let env = |name: &str| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned());
+    let (host, edgezero_port, port) = (env(HOST_ENV), env(EDGEZERO_PORT_ENV), env(PORT_ENV));
+    let resolution = match bind_address(host.as_deref(), edgezero_port.as_deref(), port.as_deref())
+    {
+        Ok(resolution) => resolution,
+        // Silently falling back to another port would surprise tooling
         // that expects the server where it asked for it.
         Err(message) => {
             eprintln!("error: {message}");
             std::process::exit(1);
         }
+    };
+    for warning in &resolution.warnings {
+        log::warn!("{warning}");
+    }
+    let config = AxumDevServerConfig {
+        addr: resolution.addr,
+        enable_ctrl_c: true,
     };
 
     log::info!("Listening on http://{}", config.addr);
@@ -79,83 +84,128 @@ fn parse_log_level(configured: Option<&str>) -> Result<LevelFilter, &str> {
     }
 }
 
-/// Selects the listen address from `TRUSTED_SERVER_LISTEN_ADDR` and `PORT`.
+/// Resolves the listen address with `EdgeZero`'s precedence.
 ///
-/// `TRUSTED_SERVER_LISTEN_ADDR` takes a full socket address such as
-/// `0.0.0.0:8080` or `[::]:8080`, which a container needs to accept outside
-/// connections. Otherwise `PORT` binds the loopback address on that port, so
-/// integration tests can allocate a fresh OS port each run. With neither set,
-/// `Ok(None)` keeps the adapter's default loopback address.
+/// `EDGEZERO__ADAPTER__HOST` and `EDGEZERO__ADAPTER__PORT` win, so a container
+/// can listen on `0.0.0.0`. `PORT` is the port fallback local tooling uses to
+/// allocate a fresh port per run. Otherwise the address is `127.0.0.1:8787`.
+/// An invalid `EdgeZero` value falls back with a warning, as `EdgeZero` does.
+/// `PORT` is read only when it is the fallback, so a valid
+/// `EDGEZERO__ADAPTER__PORT` makes any `PORT` irrelevant.
 ///
 /// # Errors
 ///
-/// Returns a message naming the variable when a set value is not a valid
-/// socket address or port.
-fn listen_address(listen: Option<&str>, port: Option<&str>) -> Result<Option<SocketAddr>, String> {
-    if let Some(raw) = listen {
-        return raw.parse().map(Some).map_err(|error| {
-            format!("{LISTEN_ADDR_ENV}={raw:?} is not a valid socket address: {error}")
-        });
-    }
-    let Some(raw) = port else {
-        return Ok(None);
+/// Returns a message naming `PORT` when it is the fallback and is not a
+/// nonzero port number.
+fn bind_address(
+    host: Option<&str>,
+    edgezero_port: Option<&str>,
+    port: Option<&str>,
+) -> Result<BindAddrResolution, String> {
+    let edgezero_port_valid =
+        edgezero_port.is_some_and(|raw| raw.parse::<u16>().is_ok_and(|value| value != 0));
+    let fallback_port = match port {
+        Some(raw) if !edgezero_port_valid => match raw.parse::<u16>() {
+            Ok(0) => {
+                return Err(format!(
+                    "{PORT_ENV}=\"0\" is not supported (would bind to a random OS port)"
+                ));
+            }
+            Ok(value) => Some(value),
+            Err(error) => return Err(format!("{PORT_ENV}={raw:?} is not a valid u16: {error}")),
+        },
+        _ => None,
     };
-    raw.parse::<u16>()
-        .map(|port| Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port))))
-        .map_err(|error| format!("{PORT_ENV}={raw:?} is not a valid u16: {error}"))
+    Ok(resolve_bind_addr(host, edgezero_port, None, fallback_port))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::*;
 
     #[test]
     fn crate_compiles() {}
 
     #[test]
-    fn listen_address_prefers_the_full_socket_address() {
+    fn bind_address_uses_edgezero_host_and_port_first() {
+        let resolution = bind_address(Some("0.0.0.0"), Some("8080"), Some("9000"))
+            .expect("should accept valid listen settings");
         assert_eq!(
-            listen_address(Some("0.0.0.0:8080"), Some("9000")),
-            Ok(Some(SocketAddr::from(([0, 0, 0, 0], 8080)))),
-            "should bind every interface when the full address is set"
+            resolution.addr,
+            SocketAddr::from(([0, 0, 0, 0], 8080)),
+            "should bind every interface on the EdgeZero port"
         );
+        assert!(
+            resolution.warnings.is_empty(),
+            "should not warn on valid values"
+        );
+        let resolution =
+            bind_address(Some("::"), None, Some("9000")).expect("should accept an IPv6 host");
         assert_eq!(
-            listen_address(Some("[::]:8080"), None),
-            Ok(Some(
-                "[::]:8080".parse().expect("should parse IPv6 fixture")
-            )),
-            "should accept an IPv6 listen address"
+            resolution.addr,
+            "[::]:9000".parse().expect("should parse IPv6 fixture"),
+            "should fall back to PORT when no EdgeZero port is set"
         );
     }
 
     #[test]
-    fn listen_address_keeps_port_on_loopback_and_default_when_unset() {
+    fn bind_address_keeps_port_and_default_on_loopback() {
+        let resolution = bind_address(None, None, Some("9000")).expect("should accept PORT");
         assert_eq!(
-            listen_address(None, Some("9000")),
-            Ok(Some(SocketAddr::from(([127, 0, 0, 1], 9000)))),
+            resolution.addr,
+            SocketAddr::from(([127, 0, 0, 1], 9000)),
             "should keep PORT on the loopback address"
         );
+        let resolution = bind_address(None, None, None).expect("should accept no settings");
         assert_eq!(
-            listen_address(None, None),
-            Ok(None),
-            "should keep the adapter default when nothing is set"
+            resolution.addr,
+            SocketAddr::from(([127, 0, 0, 1], 8787)),
+            "should keep the EdgeZero loopback default"
         );
     }
 
     #[test]
-    fn listen_address_rejects_invalid_values_naming_the_variable() {
-        for (listen, port, variable) in [
-            (Some("0.0.0.0"), None, LISTEN_ADDR_ENV),
-            (Some(""), Some("9000"), LISTEN_ADDR_ENV),
-            (None, Some("70000"), PORT_ENV),
-        ] {
-            let message =
-                listen_address(listen, port).expect_err("should reject an unusable listen setting");
-            assert!(
-                message.starts_with(variable),
-                "should name {variable} in the error, got: {message}"
-            );
-        }
+    fn bind_address_warns_on_invalid_edgezero_values_and_rejects_invalid_port() {
+        let resolution = bind_address(Some("localhost"), Some("0"), None)
+            .expect("should fall back from invalid EdgeZero values");
+        assert_eq!(
+            resolution.addr,
+            SocketAddr::from(([127, 0, 0, 1], 8787)),
+            "should fall back to the loopback default"
+        );
+        assert!(
+            resolution
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with(HOST_ENV))
+                && resolution
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.starts_with(EDGEZERO_PORT_ENV)),
+            "should warn naming each invalid EdgeZero variable, got: {:?}",
+            resolution.warnings
+        );
+        let resolution = bind_address(Some("0.0.0.0"), Some("8080"), Some("not-a-port"))
+            .expect("should ignore PORT when the EdgeZero port is valid");
+        assert_eq!(
+            resolution.addr,
+            SocketAddr::from(([0, 0, 0, 0], 8080)),
+            "should not read a platform-injected PORT inside the image"
+        );
+        let message = bind_address(None, None, Some("0"))
+            .expect_err("should reject PORT=0 instead of binding a random port");
+        assert!(
+            message.starts_with(PORT_ENV),
+            "should name PORT for the zero port, got: {message}"
+        );
+        let message = bind_address(Some("0.0.0.0"), None, Some("70000"))
+            .expect_err("should reject an invalid PORT");
+        assert!(
+            message.starts_with(PORT_ENV),
+            "should name PORT in the error, got: {message}"
+        );
     }
 
     #[test]

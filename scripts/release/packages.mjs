@@ -3,7 +3,8 @@
 // The packages job runs this file from the tagged commit after the release
 // job. It downloads the release by tag, checks every file against the
 // release's SHA256SUMS, and pushes each binary with its evidence files as one
-// artifact. It never builds, signs or changes the release.
+// artifact. It never builds, signs or changes the release. GHCR tags are
+// mutable, so the write-once rule here applies only at publish time.
 import * as fs from 'node:fs'
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
@@ -116,6 +117,8 @@ export function checkManifest(manifest, entry, sums) {
   const layers = manifest?.layers
   if (
     manifest?.artifactType !== entry.artifactType ||
+    manifest.config?.mediaType !== 'application/vnd.oci.empty.v1+json' ||
+    manifest.subject !== undefined ||
     !Array.isArray(layers) ||
     layers.length !== entry.files.length
   )
@@ -135,19 +138,37 @@ export function checkManifest(manifest, entry, sums) {
 }
 
 /**
- * Reports whether a reference already resolves, keeping tags write-once.
+ * Returns the manifest a reference resolves to, or null when it is absent.
+ *
+ * Only the registry's not-found answer means absent. Any other failure, such
+ * as a network or server error, stops the publish instead of risking an
+ * overwrite.
  */
-function exists(run, reference) {
+function existingManifest(run, reference) {
   try {
-    run('oras', ['manifest', 'fetch', '--descriptor', reference])
-    return true
-  } catch {
-    return false
+    return JSON.parse(
+      run('oras', ['manifest', 'fetch', reference], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    )
+  } catch (error) {
+    const stderr = String(error?.stderr ?? '')
+    // oras reports a registry 404 as `<reference>: not found`; any other
+    // message containing "not found", such as missing credentials, is not
+    // an answer about this tag.
+    const escaped = reference.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    if (new RegExp(`${escaped}: not found\\s*$`, 'm').test(stderr)) return null
+    throw Error(`Cannot check whether ${reference} exists: ${stderr.trim()}`, {
+      cause: error,
+    })
   }
 }
 
 /**
  * Downloads the published release, checks it and pushes every artifact.
+ *
+ * A tag that already holds exactly the planned files is kept, so a re-run
+ * completes a partial publish. A tag with any other content is refused.
  */
 export function publishPackages({ env, run = defaultRun, log = console.log }) {
   const repo = env.GH_REPO
@@ -171,11 +192,32 @@ export function publishPackages({ env, run = defaultRun, log = console.log }) {
     throw Error(`Release ${tag} is not published`)
   const directory = fs.mkdtempSync(join(env.RUNNER_TEMP ?? '/tmp', 'release-'))
   run('gh', ['release', 'download', tag, '--repo', repo, '--dir', directory])
+  // Authenticate SHA256SUMS against the release attestation, so the digests
+  // below come from the published release, not only from the download.
+  run('gh', [
+    'release',
+    'verify-asset',
+    tag,
+    join(directory, 'SHA256SUMS'),
+    '--repo',
+    repo,
+  ])
   const sums = checkDownload(directory, plan)
-  for (const entry of plan)
-    if (exists(run, entry.reference))
-      throw Error(`Refusing to overwrite ${entry.reference}`)
+  const pending = []
   for (const entry of plan) {
+    const existing = existingManifest(run, entry.reference)
+    if (existing === null) {
+      pending.push(entry)
+      continue
+    }
+    try {
+      checkManifest(existing, entry, sums)
+    } catch (error) {
+      throw Error(`Refusing to overwrite ${entry.reference}`, { cause: error })
+    }
+    log('Package already published with the expected files:', entry.reference)
+  }
+  for (const entry of pending) {
     run(
       'oras',
       [

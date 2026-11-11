@@ -39,6 +39,7 @@ function releaseDirectory() {
 function manifestFor(entry, sums) {
   return {
     artifactType: entry.artifactType,
+    config: { mediaType: 'application/vnd.oci.empty.v1+json' },
     annotations: {
       ...entry.annotations,
       'org.opencontainers.image.created': '2026-01-01T00:00:00Z',
@@ -154,6 +155,15 @@ test('checks the pushed manifest layers, order and annotations', () => {
     /differs/,
     'should reject reordered layers'
   )
+  const referring = manifestFor(entry, sums)
+  referring.subject = {
+    mediaType: 'application/vnd.oci.image.manifest.v1+json',
+  }
+  assert.throws(
+    () => checkManifest(referring, entry, sums),
+    /Unexpected manifest/,
+    'should reject a manifest that refers to another one'
+  )
   const unlinked = manifestFor(entry, sums)
   delete unlinked.annotations['org.opencontainers.image.source']
   assert.throws(
@@ -163,11 +173,18 @@ test('checks the pushed manifest layers, order and annotations', () => {
   )
 })
 
-test('publishes every package once from the published release', () => {
-  const directory = releaseDirectory()
-  const plan = packagePlan(repo, tag, commit)
-  const sums = checkDownload(directory, plan)
-  const pushed = new Map()
+/** Returns an error shaped like a failed `oras` call with this stderr. */
+function registryError(stderr) {
+  return Object.assign(Error('Command failed'), { stderr })
+}
+
+/** Builds a fake `gh`/`oras` runner over an in-memory registry. */
+function fakeRunner(
+  directory,
+  plan,
+  sums,
+  { registry = new Map(), fail } = {}
+) {
   const calls = []
   const run = (command, args, options = {}) => {
     calls.push([command, ...args])
@@ -179,50 +196,138 @@ test('publishes every package once from the published release', () => {
         fs.copyFileSync(join(directory, name), join(target, name))
       return ''
     }
+    if (command === 'gh' && args[1] === 'verify-asset') {
+      assert.match(args[3], /SHA256SUMS$/, 'should authenticate SHA256SUMS')
+      return ''
+    }
     if (command === 'oras' && args[0] === 'push') {
-      assert.equal(
-        options.cwd !== undefined,
-        true,
-        'should push from the download'
-      )
+      assert.ok(options.cwd, 'should push from the download')
       const entry = plan.find(({ reference }) => reference === args[1])
-      pushed.set(args[1], manifestFor(entry, sums))
+      registry.set(args[1], manifestFor(entry, sums))
       return ''
     }
     if (command === 'oras' && args[0] === 'manifest') {
       const reference = args.at(-1)
-      if (!pushed.has(reference)) throw Error('not found')
-      return JSON.stringify(pushed.get(reference))
+      if (fail?.(reference))
+        throw registryError('Error: 503 Service Unavailable')
+      if (!registry.has(reference))
+        throw registryError(
+          `Error response from registry: ${reference}: not found`
+        )
+      return JSON.stringify(registry.get(reference))
     }
     throw Error(`unexpected call ${command} ${args.join(' ')}`)
   }
-  const env = {
-    GH_REPO: repo,
-    RELEASE_TAG: tag,
-    SOURCE_COMMIT: commit,
-    PACKAGE_PUBLICATION_ENABLED: 'true',
-    RUNNER_TEMP: tmpdir(),
-  }
-  publishPackages({ env, run, log: () => {} })
+  return { run, calls, registry }
+}
+
+const enabledEnv = {
+  GH_REPO: repo,
+  RELEASE_TAG: tag,
+  SOURCE_COMMIT: commit,
+  PACKAGE_PUBLICATION_ENABLED: 'true',
+  RUNNER_TEMP: tmpdir(),
+}
+
+test('publishes every package once from the authenticated release', () => {
+  const directory = releaseDirectory()
+  const plan = packagePlan(repo, tag, commit)
+  const sums = checkDownload(directory, plan)
+  const { run, calls, registry } = fakeRunner(directory, plan, sums)
+  publishPackages({ env: enabledEnv, run, log: () => {} })
   assert.deepEqual(
-    [...pushed.keys()],
+    [...registry.keys()],
     plan.map(({ reference }) => reference),
     'should push one artifact per release binary'
   )
-  assert.throws(
-    () => publishPackages({ env, run, log: () => {} }),
-    /Refusing to overwrite/,
-    'should keep published tags write-once'
+  const verify = calls.findIndex((call) => call[2] === 'verify-asset')
+  const push = calls.findIndex((call) => call[1] === 'push')
+  assert.ok(
+    verify >= 0 && verify < push,
+    'should authenticate SHA256SUMS before pushing'
+  )
+  calls.length = 0
+  publishPackages({ env: enabledEnv, run, log: () => {} })
+  assert.equal(
+    calls.filter((call) => call[1] === 'push').length,
+    0,
+    'should keep matching tags on a re-run instead of pushing again'
   )
   assert.throws(
     () =>
       publishPackages({
-        env: { ...env, PACKAGE_PUBLICATION_ENABLED: 'false' },
+        env: { ...enabledEnv, PACKAGE_PUBLICATION_ENABLED: 'false' },
         run,
         log: () => {},
       }),
     /not enabled/,
     'should stay closed until a maintainer enables publication'
+  )
+})
+
+test('completes a partial publish and refuses differing tags', () => {
+  const directory = releaseDirectory()
+  const plan = packagePlan(repo, tag, commit)
+  const sums = checkDownload(directory, plan)
+  const registry = new Map([[plan[0].reference, manifestFor(plan[0], sums)]])
+  const partial = fakeRunner(directory, plan, sums, { registry })
+  publishPackages({ env: enabledEnv, run: partial.run, log: () => {} })
+  assert.deepEqual(
+    partial.calls.filter((call) => call[1] === 'push').map((call) => call[2]),
+    plan.slice(1).map(({ reference }) => reference),
+    'should push only the missing packages'
+  )
+  const changed = manifestFor(plan[1], sums)
+  changed.layers[0].digest = `sha256:${'0'.repeat(64)}`
+  const differing = fakeRunner(directory, plan, sums, {
+    registry: new Map([[plan[1].reference, changed]]),
+  })
+  assert.throws(
+    () =>
+      publishPackages({ env: enabledEnv, run: differing.run, log: () => {} }),
+    /Refusing to overwrite/,
+    'should refuse a tag that holds other content'
+  )
+  assert.equal(
+    differing.calls.filter((call) => call[1] === 'push').length,
+    0,
+    'should refuse before pushing anything'
+  )
+})
+
+test('treats only the registry not-found answer for the tag as absent', () => {
+  const directory = releaseDirectory()
+  const plan = packagePlan(repo, tag, commit)
+  const sums = checkDownload(directory, plan)
+  const { run } = fakeRunner(directory, plan, sums)
+  const credentials = (command, args, options) => {
+    if (command === 'oras' && args[0] === 'manifest')
+      throw registryError('Error: credentials not found in native keychain')
+    return run(command, args, options)
+  }
+  assert.throws(
+    () => publishPackages({ env: enabledEnv, run: credentials, log: () => {} }),
+    /Cannot check whether/,
+    'should not read an unrelated "not found" as an absent tag'
+  )
+})
+
+test('stops when the registry cannot say whether a tag exists', () => {
+  const directory = releaseDirectory()
+  const plan = packagePlan(repo, tag, commit)
+  const sums = checkDownload(directory, plan)
+  const flaky = fakeRunner(directory, plan, sums, {
+    fail: (reference) => reference === plan[2].reference,
+  })
+  assert.throws(
+    () => publishPackages({ env: enabledEnv, run: flaky.run, log: () => {} }),
+    /Cannot check whether .* exists: Error: 503/,
+    'should not treat a registry error as an absent tag'
+  )
+  assert.equal(
+    flaky.calls.filter((call) => call[1] === 'push').length,
+    0,
+    'should push nothing after an unknown existence check'
   )
 })
 
@@ -247,4 +352,41 @@ test('refuses a draft release', () => {
     /is not published/,
     'should publish packages only from a published release'
   )
+})
+
+test('keeps the Axum image on the repository tool pins', () => {
+  const read = (path) =>
+    fs.readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8')
+  const dockerfile = read('crates/trusted-server-adapter-axum/Dockerfile')
+  const node = read('.tool-versions').match(/^nodejs\s+(\S+)$/m)[1]
+  const rust = read('rust-toolchain.toml').match(/^channel = "([^"]+)"$/m)[1]
+  assert.match(
+    dockerfile,
+    new RegExp(
+      `library/node:${node.replaceAll('.', '\\.')}-bookworm-slim@sha256:[0-9a-f]{64} `
+    ),
+    'should build with the .tool-versions Node, pinned by digest'
+  )
+  assert.ok(
+    dockerfile.includes(`test "$(node --version)" = v${node};`),
+    'should assert the copied Node version'
+  )
+  assert.match(
+    dockerfile,
+    new RegExp(
+      `library/rust:${rust.replaceAll('.', '\\.')}-bookworm@sha256:[0-9a-f]{64} `
+    ),
+    'should build with the rust-toolchain.toml channel, pinned by digest'
+  )
+  assert.ok(
+    dockerfile.includes(`ENV RUSTUP_TOOLCHAIN=${rust}\n`),
+    'should pin rustup to the installed channel'
+  )
+  assert.match(
+    dockerfile,
+    /library\/debian:bookworm-slim@sha256:[0-9a-f]{64}\n/,
+    'should pin the runtime base by digest'
+  )
+  assert.match(dockerfile, /\nUSER 10001:10001\n/, 'should run as UID 10001')
+  assert.match(dockerfile, /\nSTOPSIGNAL SIGINT\n/, 'should stop with SIGINT')
 })

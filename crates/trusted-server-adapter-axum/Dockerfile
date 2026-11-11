@@ -2,10 +2,12 @@
 #
 # Build from the repository root:
 #   docker build --file crates/trusted-server-adapter-axum/Dockerfile \
-#     --build-arg TRUSTED_SERVER_VERSION=v1.2.3 --tag trusted-server-axum .
+#     --build-arg TRUSTED_SERVER_VERSION="$(git rev-parse HEAD)" \
+#     --tag trusted-server-axum .
 #
 # The image is an ordinary build with build provenance only. It is not part of
 # the reproducible release cohort that the binary release rebuild checks cover.
+# Axum is development status; see docs/guide/axum-dev.md.
 
 # The tsjs build script runs npm; this is the `.tool-versions` Node.
 FROM docker.io/library/node:24.20.0-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS node
@@ -21,10 +23,15 @@ RUN set -eu; \
     test "$(node --version)" = v24.20.0; \
     npm --version
 
+# Use the installed toolchain as is: rust-toolchain.toml would otherwise make
+# rustup download its extra wasm targets, an unpinned network input.
+ENV RUSTUP_TOOLCHAIN=1.98.1
+
 WORKDIR /src
 COPY . .
 
-# The checkout has no `.git`, so the release tag names the embedded version.
+# The checkout has no `.git`, so pass the source commit as the embedded
+# version, as the release binaries do.
 ARG TRUSTED_SERVER_VERSION
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
@@ -38,13 +45,25 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     install -D -m 0755 "target/$host/release/trusted-server-axum" \
       /out/trusted-server-axum
 
-# Distroless keeps glibc, CA certificates and a nonroot user, with no shell.
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
+# Debian slim with CA certificates only: no Node, compiler, config or secrets.
+# Trusted Server's origin fetches use compiled-in webpki roots; only EdgeZero's
+# own client reads this system store.
+FROM docker.io/library/debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+
+RUN set -eu; \
+    apt-get update; \
+    apt-get install --yes --no-install-recommends ca-certificates; \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/trusted-server-axum /usr/local/bin/trusted-server-axum
 
-# Containers must accept connections from outside their own loopback.
-ENV TRUSTED_SERVER_LISTEN_ADDR=0.0.0.0:8080
+# Containers must accept connections from outside their own loopback. The
+# process writes nothing, so it runs with a read-only root filesystem.
+ENV EDGEZERO__ADAPTER__HOST=0.0.0.0 \
+    EDGEZERO__ADAPTER__PORT=8080
 EXPOSE 8080
-USER nonroot:nonroot
+# The server shuts down on SIGINT only, and a PID 1 without a SIGTERM handler
+# would ignore `docker stop` until the kill timeout.
+STOPSIGNAL SIGINT
+USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/trusted-server-axum"]

@@ -104,7 +104,8 @@ jobs:
           test "$(node --version)" = "v$NODE_VERSION"
           node publisher/scripts/release/publish.mjs
   # Mirrors the published release into GHCR: one OCI artifact per binary with
-  # its SPDX SBOM and Sigstore bundles. Tags are write-once.
+  # its SPDX SBOM and Sigstore bundles. An existing tag is refused unless it
+  # already holds exactly the release files; GHCR tags stay mutable.
   packages:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.PACKAGE_PUBLICATION_ENABLED == 'true'
     needs: release
@@ -171,7 +172,8 @@ jobs:
           node publisher/scripts/release/packages.mjs
   # Builds the Axum server image from the tagged source and pushes it to GHCR
   # with GitHub build provenance. It is an ordinary build, outside the
-  # reproducible release cohort.
+  # reproducible release cohort. If a push or attestation fails, delete the
+  # package version before re-running; see the maintainer checklist.
   axum-image:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.PACKAGE_PUBLICATION_ENABLED == 'true'
     needs: release
@@ -196,19 +198,24 @@ jobs:
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/trusted-server-axum"
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          if docker manifest inspect "$image:$RELEASE_TAG" > /dev/null 2>&1; then
+          # GHCR tags are mutable; refuse to replace one at publish time. Only
+          # the registry's not-found answer counts as absent.
+          if lookup="$(docker buildx imagetools inspect "$image:$RELEASE_TAG" 2>&1)"; then
             echo "Refusing to overwrite $image:$RELEASE_TAG" >&2
+            exit 1
+          elif ! grep -qF -- "$image:$RELEASE_TAG: not found" <<< "$lookup"; then
+            echo "Cannot check whether $image:$RELEASE_TAG exists: $lookup" >&2
             exit 1
           fi
           docker buildx build \
             --file crates/trusted-server-adapter-axum/Dockerfile \
             --platform linux/amd64 \
             --provenance=false --sbom=false \
-            --build-arg "TRUSTED_SERVER_VERSION=$RELEASE_TAG" \
+            --build-arg "TRUSTED_SERVER_VERSION=$SOURCE_COMMIT" \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \
             --label "org.opencontainers.image.version=$RELEASE_TAG" \
-            --label "org.opencontainers.image.description=Trusted Server on Axum $RELEASE_TAG" \
+            --label "org.opencontainers.image.description=Trusted Server on Axum $RELEASE_TAG (development status)" \
             --tag "$image:$RELEASE_TAG" \
             --metadata-file "$RUNNER_TEMP/image.json" \
             --push .
