@@ -17,13 +17,24 @@ use trusted_server_core::auction::{
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID};
-use trusted_server_core::ec::EcContext;
+use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::consent::ec_consent_withdrawn;
+use trusted_server_core::ec::device::DeviceSignals;
+use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
+use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::kv_backend::EcKvStore;
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
-use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
+use trusted_server_core::http_util::is_navigation_request;
+use trusted_server_core::integrations::{
+    IntegrationRegistry, ProxyDispatchInput, RequestFilterRegistryInput,
+    RequestFilterRegistryOutcome,
+};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -52,6 +63,8 @@ pub struct AppState {
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
     services: Option<RuntimeServices>,
+    partners: PartnerRegistry,
+    ec_graph: Option<Arc<dyn Fn() -> KvIdentityGraph + Send + Sync>>,
 }
 
 /// Build the application state from explicit settings.
@@ -74,12 +87,15 @@ fn build_state_with_services(
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+    let partners = PartnerRegistry::from_config(&settings.ec.partners)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         services,
+        partners,
+        ec_graph: None,
     }))
 }
 
@@ -88,6 +104,17 @@ impl AppState {
         ctx.extensions().get::<Arc<Self>>().cloned().ok_or_else(|| {
             EdgeError::service_unavailable("Trusted Server application state is not initialized")
         })
+    }
+
+    pub(crate) fn set_ec_store<S>(&mut self, store: S)
+    where
+        S: EcKvStore + Clone + Send + Sync + 'static,
+    {
+        self.ec_graph = Some(Arc::new(move || KvIdentityGraph::new(store.clone())));
+    }
+
+    fn identity_graph(&self) -> Option<KvIdentityGraph> {
+        self.ec_graph.as_ref().map(|factory| factory())
     }
 
     fn services_for_request(&self, ctx: &RequestContext) -> Result<RuntimeServices, EdgeError> {
@@ -188,9 +215,13 @@ where
 /// Unknown, which fails the auction consent gate closed even for consented
 /// users. Geo comes from the immutable managed request snapshot. Off, untrusted
 /// or unavailable results remain Unknown unless real consent supplies it. A
-/// malformed consent string is logged and falls back to the default
-/// (fail-closed) context rather than being silently swallowed.
-fn build_ec_context(state: &AppState, services: &RuntimeServices, req: &Request) -> EcContext {
+/// malformed EC cookie fails closed before dispatch rather than silently
+/// substituting a context. Consent decoding remains owned by core.
+fn build_ec_context(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: &Request,
+) -> Result<EcContext, Report<TrustedServerError>> {
     let geo_info = services
         .geo()
         .lookup(services.client_info().client_ip)
@@ -199,10 +230,89 @@ fn build_ec_context(state: &AppState, services: &RuntimeServices, req: &Request)
             None
         });
     EcContext::read_from_request_with_geo(&state.settings, req, services, geo_info.as_ref())
-        .unwrap_or_else(|e| {
-            log::warn!("EC context read failed: {e:?}");
-            EcContext::default()
+}
+
+/// Native has no trusted TLS/JA4 fingerprint from CloudFront/ALB. Classify only
+/// obvious browser traffic from UA, then require checked client metadata and
+/// shared navigation/consent gates before issuance. This is a heuristic, not
+/// authentication, and forwarded fingerprint headers are deliberately ignored.
+fn native_browser_signals(req: &Request) -> (DeviceSignals, bool) {
+    let ua = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let signals = DeviceSignals::derive(ua, None, None);
+    let browser = signals.platform_class.is_some()
+        && ["Firefox/", "Chrome/", "Safari/"]
+            .iter()
+            .any(|token| ua.contains(token))
+        && !ua.to_ascii_lowercase().contains("bot");
+    (signals, browser)
+}
+
+fn cookie_value(req: &Request, name: &str) -> Option<String> {
+    req.headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(key, _)| key.trim() == name)
+        .map(|(_, value)| value.trim().to_owned())
+}
+
+struct NativeEcRequest {
+    context: EcContext,
+    graph: Option<KvIdentityGraph>,
+    browser: bool,
+    eids_cookie: Option<String>,
+    sharedid_cookie: Option<String>,
+}
+
+impl NativeEcRequest {
+    fn read(
+        state: &AppState,
+        services: &RuntimeServices,
+        req: &Request,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let mut context = build_ec_context(state, services, req)?;
+        let (signals, browser) = native_browser_signals(req);
+        context.set_device_signals(signals);
+        Ok(Self {
+            context,
+            graph: state.identity_graph(),
+            browser,
+            eids_cookie: cookie_value(req, COOKIE_TS_EIDS),
+            sharedid_cookie: cookie_value(req, COOKIE_SHAREDID),
         })
+    }
+
+    async fn finalize(mut self, state: &AppState, mut response: Response) -> Response {
+        // Revocation must remain writable even for a hardened/non-browser UA.
+        let graph = self
+            .graph
+            .as_ref()
+            .filter(|_| self.browser || ec_consent_withdrawn(self.context.consent()));
+        ec_finalize_response(
+            &state.settings,
+            &mut self.context,
+            graph,
+            &state.partners,
+            self.eids_cookie.as_deref(),
+            self.sharedid_cookie.as_deref(),
+            &mut response,
+        )
+        .await;
+        response
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EcRoute {
+    Publisher,
+    Auction,
+    PageBids,
 }
 
 // ---------------------------------------------------------------------------
@@ -226,16 +336,77 @@ async fn dispatch_fallback(
         return handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback);
     }
 
-    if state.registry.has_route(&method, &path) {
-        let mut ec_context = EcContext::default();
-        return state
+    dispatch_ec_route(state, services, req, EcRoute::Publisher).await
+}
+
+async fn dispatch_ec_route(
+    state: &AppState,
+    services: &RuntimeServices,
+    mut req: Request,
+    route: EcRoute,
+) -> Result<Response, Report<TrustedServerError>> {
+    let mut ec = NativeEcRequest::read(state, services, &req)?;
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let effects = match state
+        .registry
+        .filter_request(RequestFilterRegistryInput {
+            settings: &state.settings,
+            services,
+            req: &mut req,
+            geo_info: ec.context.geo_info(),
+        })
+        .await
+    {
+        Ok(RequestFilterRegistryOutcome::Continue(effects)) => effects,
+        Ok(RequestFilterRegistryOutcome::Respond { response, effects }) => {
+            let mut response = ec.finalize(state, *response).await;
+            effects.apply_to_response(&mut response);
+            return Ok(response);
+        }
+        Err(error) => return Ok(ec.finalize(state, http_error(&error)).await),
+    };
+    // Borrows of the graph and context remain local to this request. Neither
+    // the non-Send graph nor a response snapshot enters shared App extensions.
+    let graph = ec.graph.as_ref().filter(|_| ec.browser);
+    let auction = AuctionDispatch {
+        orchestrator: &state.orchestrator,
+        slots: state.settings.creative_opportunity_slots(),
+        registry: Some(&state.partners),
+    };
+    let result = match route {
+        EcRoute::Auction => {
+            handle_auction(
+                &state.settings,
+                &state.orchestrator,
+                graph,
+                Some(&state.partners),
+                &mut ec.context,
+                services,
+                req,
+            )
+            .await
+        }
+        EcRoute::PageBids => {
+            handle_page_bids(
+                &state.settings,
+                services,
+                graph,
+                auction,
+                &mut ec.context,
+                req,
+            )
+            .await
+        }
+        EcRoute::Publisher if state.registry.has_route(&method, &path) => state
             .registry
             .handle_proxy(ProxyDispatchInput {
                 method: &method,
                 path: &path,
                 settings: &state.settings,
-                kv: None,
-                ec_context: &mut ec_context,
+                kv: graph,
+                allow_generation: false,
+                ec_context: &mut ec.context,
                 services,
                 req,
             })
@@ -244,38 +415,54 @@ async fn dispatch_fallback(
                 Err(Report::new(TrustedServerError::BadRequest {
                     message: format!("Unknown integration route: {path}"),
                 }))
-            });
-    }
-
-    // Run the server-side auction with the configured creative-opportunity
-    // slots; `handle_publisher_request` matches them against the request path.
-    let mut ec_context = build_ec_context(state, services, &req);
-    let auction = AuctionDispatch {
-        orchestrator: &state.orchestrator,
-        slots: state.settings.creative_opportunity_slots(),
-        registry: None,
+            }),
+        EcRoute::Publisher => {
+            let navigation = method == Method::GET
+                && is_navigation_request(&req)
+                && state.settings.asset_route_for_path(&path).is_none();
+            if navigation {
+                ec.context.set_eid_sync_source(EidSyncSource::Navigation);
+            }
+            let eligible = navigation && ec.browser && graph.is_some();
+            if eligible
+                && let Err(error) = ec.context.generate_if_needed(&state.settings, graph).await
+            {
+                log::warn!("native EC generation failed: {error:?}");
+            }
+            match handle_publisher_request(
+                &state.settings,
+                services,
+                graph,
+                &mut ec.context,
+                auction,
+                req,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            {
+                Ok(publisher_response) => {
+                    ec.context.set_recovery_eligible(eligible);
+                    buffer_publisher_response_async(
+                        publisher_response,
+                        &method,
+                        &state.settings,
+                        &state.registry,
+                        &state.orchestrator,
+                        services,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        }
     };
-    let publisher_response = handle_publisher_request(
-        &state.settings,
-        services,
-        None,
-        &mut ec_context,
-        auction,
-        req,
-        EdgeCacheHeader::SMaxageFallback,
-    )
-    .await?;
-    // Async finalize so the dispatched auction is collected and its bids are
-    // injected before `</body>` (the sync buffer path would drop them).
-    buffer_publisher_response_async(
-        publisher_response,
-        &method,
-        &state.settings,
-        &state.registry,
-        &state.orchestrator,
-        services,
-    )
-    .await
+    // Convert handled route errors before finalization, so withdrawal is not
+    // lost when an origin/auction fails. There is exactly one finalize call.
+    let mut response = ec
+        .finalize(state, result.unwrap_or_else(|error| http_error(&error)))
+        .await;
+    effects.apply_to_response(&mut response);
+    Ok(response)
 }
 
 fn fallback_handler() -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
@@ -303,6 +490,7 @@ enum NamedRouteHandler {
     LegacyAdminDenied,
     Auction,
     PageBids,
+    Identify,
     FirstPartyProxy,
     FirstPartyClick,
     FirstPartySign,
@@ -325,8 +513,13 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 17] {
+fn named_routes() -> [NamedRoute; 18] {
     [
+        NamedRoute {
+            path: "/_ts/api/v1/identify",
+            primary_methods: &[Method::GET, Method::OPTIONS],
+            handler: NamedRouteHandler::Identify,
+        },
         NamedRoute {
             path: "/.well-known/trusted-server.json",
             primary_methods: &[Method::GET],
@@ -487,31 +680,39 @@ fn named_route_handler(
                         Ok(resp)
                     }
                     NamedRouteHandler::AdminEcNotSupported => {
-                        // The EC identity graph is Fastly KV backed; the Axum
-                        // dev server has no store to read.
+                        // Enabling native operator EC diagnostics is separate
+                        // from the browser/server lifecycle.
                         Ok(admin_ec_lookup_not_supported())
                     }
                     NamedRouteHandler::AdminEidsLookup => {
-                        let partner_registry =
-                            PartnerRegistry::from_config(&state.settings.ec.partners)?;
-                        handle_admin_eids_lookup(&partner_registry, &req)
+                        handle_admin_eids_lookup(&state.partners, &req)
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
+                    NamedRouteHandler::Identify => {
+                        // Read-only identity lookup never enters generation or
+                        // response finalization, including cookie ingestion.
+                        if req.method() == Method::OPTIONS {
+                            cors_preflight_identify(&state.settings, &req)
+                        } else {
+                            let context = build_ec_context(&state, &services, &req)?;
+                            let graph = state.identity_graph().ok_or_else(|| {
+                                Report::new(TrustedServerError::KvStore {
+                                    store_name: "native EC".to_owned(),
+                                    message: "native EC provider is not selected".to_owned(),
+                                })
+                            })?;
+                            handle_identify(
+                                &state.settings,
+                                &graph,
+                                &state.partners,
+                                &req,
+                                &context,
+                            )
+                            .await
+                        }
+                    }
                     NamedRouteHandler::Auction => {
-                        // Build the geo-aware EC context so the auction consent
-                        // gate sees the caller's jurisdiction — `EcContext::default()`
-                        // fails it closed for consented users.
-                        let mut ec_context = build_ec_context(&state, &services, &req);
-                        handle_auction(
-                            &state.settings,
-                            &state.orchestrator,
-                            None,
-                            None,
-                            &mut ec_context,
-                            &services,
-                            req,
-                        )
-                        .await
+                        dispatch_ec_route(&state, &services, req, EcRoute::Auction).await
                     }
                     NamedRouteHandler::PageBids => {
                         // SPA re-auction endpoint. `OPTIONS` is a CORS preflight
@@ -520,21 +721,7 @@ fn named_route_handler(
                         if req.method() == Method::OPTIONS {
                             Ok(page_bids_preflight_denied())
                         } else {
-                            let mut ec_context = build_ec_context(&state, &services, &req);
-                            let auction = AuctionDispatch {
-                                orchestrator: &state.orchestrator,
-                                slots: state.settings.creative_opportunity_slots(),
-                                registry: None,
-                            };
-                            handle_page_bids(
-                                &state.settings,
-                                &services,
-                                None,
-                                auction,
-                                &mut ec_context,
-                                req,
-                            )
-                            .await
+                            dispatch_ec_route(&state, &services, req, EcRoute::PageBids).await
                         }
                     }
                     NamedRouteHandler::FirstPartyProxy => {
@@ -660,6 +847,31 @@ impl TrustedServerApp {
         services: RuntimeServices,
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_services(settings, Some(services))?;
+        Ok(build_router(Some(state)))
+    }
+
+    /// Builds a router with an explicit live conditional EC store.
+    ///
+    /// This seam uses the same request-local graph and lifecycle as production.
+    /// It never reads provider selection from the environment.
+    ///
+    /// # Errors
+    /// Returns an error when settings or runtime plans cannot initialize.
+    ///
+    /// # Panics
+    /// Panics if a newly built application state unexpectedly has another owner.
+    pub fn routes_with_settings_services_and_ec_store<S>(
+        settings: Settings,
+        services: RuntimeServices,
+        store: S,
+    ) -> Result<RouterService, Report<TrustedServerError>>
+    where
+        S: EcKvStore + Clone + Send + Sync + 'static,
+    {
+        let mut state = build_state_with_services(settings, Some(services))?;
+        Arc::get_mut(&mut state)
+            .expect("should uniquely own new app state")
+            .set_ec_store(store);
         Ok(build_router(Some(state)))
     }
 }

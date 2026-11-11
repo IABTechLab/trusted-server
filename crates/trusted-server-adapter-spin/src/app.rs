@@ -705,6 +705,7 @@ fn build_router(state: Option<Arc<AppState>>) -> RouterService {
                         path: &path,
                         settings: &state.settings,
                         kv: None,
+                        allow_generation: true,
                         ec_context: &mut ec_context,
                         services: &services,
                         req,

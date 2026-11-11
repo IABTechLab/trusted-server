@@ -22,10 +22,13 @@ path = "src/main.rs"
 default = []
 aws-appconfig-agent = ["edgezero-adapter-axum/aws-appconfig-agent"]
 aws-secrets-manager = ["edgezero-adapter-axum/aws-secrets-manager"]
+aws-dynamodb-ec = ["dep:aws-config", "dep:aws-sdk-dynamodb"]
 geo-cloudfront = ["edgezero-adapter-axum/geo-cloudfront"]
 
 [dependencies]
 async-trait = { workspace = true }
+aws-config = { version = "=1.12.0", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
+aws-sdk-dynamodb = { version = "=1.120.0", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 edgezero-adapter-axum = { workspace = true, features = ["axum"] }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
