@@ -1963,6 +1963,17 @@ Each `[[integrations.js_asset_proxy.assets]]` entry:
 | `proxy`             | String  | `enabled` | `enabled`, `disabled`, or `blocked` (removes script tags) |
 | `cache_ttl_seconds` | Integer | None      | Optional per-asset downstream cache TTL override          |
 
+JS Asset Proxy decides first for each script whose `src` matches an asset's
+`origin_url`, before other integrations rewrite the tag: `enabled` serves it
+from `path`, `blocked` removes the script, and `disabled` leaves it to other
+integrations.
+
+While `[integrations.prebid]` is enabled, an `enabled` asset whose `origin_url`
+matches Prebid `script_patterns` fails `ts config validate` and server startup,
+because it would load a second Prebid.js next to the managed bundle. Use
+`proxy = "disabled"` to let Prebid intercept the script, or `proxy = "blocked"`
+to remove it.
+
 ### lockr Integration
 
 **Section**: `[integrations.lockr]`

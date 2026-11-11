@@ -467,6 +467,10 @@ Optional Ed25519 request signing for bid request authentication and fraud preven
 
 The `script_patterns` configuration controls which publisher-provided Prebid scripts are intercepted and replaced with empty JavaScript. Trusted Server always injects its managed first-party `/integrations/prebid/bundle.js` script for the configured external bundle, so interception prevents duplicate Prebid instances.
 
+A `[[integrations.js_asset_proxy.assets]]` entry for an intercepted URL must use
+`proxy = "disabled"` (Prebid intercepts it) or `proxy = "blocked"`; `enabled`
+fails validation.
+
 **Pattern Matching**:
 
 - **Suffix matching**: `/prebid.min.js` matches any URL ending with that path

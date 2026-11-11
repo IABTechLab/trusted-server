@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** With `[integrations.prebid]` enabled, JS asset entries with
+  `proxy = "enabled"` whose `origin_url` matches Prebid `script_patterns`
+  now fail deploy validation and runtime startup. Before upgrading the
+  server, use the new `ts` CLI to run `ts config validate`, change overlapping
+  assets to `proxy = "disabled"` (preserves Prebid interception) or
+  `proxy = "blocked"`, and publish the corrected config with `ts config push`.
+  JS Asset Proxy now rewrites script tags before every other integration, and
+  its `enabled` replacement is final: no later integration rewrites or removes
+  the proxied tag.
 - The attested Fastly wasm reports `x-ts-version` as the full 40-character source commit; deploy-pipeline builds keep the tag, branch or short-commit value described below.
 - **Breaking:** `ts --version` now prints `ts package=<version> source=<source> target=<triple> variant=default` instead of `ts <version>`. `source` is the full commit in attested release binaries, and otherwise the development ref, short commit or `unknown`. Update scripts that parse the old output.
 - **Breaking:** Creative rewrite proxy, click, CSS, `srcset`, sign-response, rebuild-response, and injected creative TSJS URLs are now absolute on `publisher.public_origin`. Review the [default authority, cookie scope, and coordinated upgrade/rollback warning for `public_origin`](docs/guide/configuration.md#publisher-configuration) before deployment. Existing root-relative signed proxy and click inputs remain accepted. TSJS bundle selection and hash calculation are unchanged.

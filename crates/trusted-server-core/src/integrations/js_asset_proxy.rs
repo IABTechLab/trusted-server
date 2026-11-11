@@ -657,6 +657,144 @@ mod tests {
         String::from_utf8(output).expect("should produce UTF-8 HTML")
     }
 
+    fn process_script_with_asset(path: &str, origin_url: &str, mode: &str) -> String {
+        // `create_test_settings` enables `[integrations.prebid]` with the default
+        // `script_patterns`, so its attribute rewriter matches `/prebid.min.js`.
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                JS_ASSET_PROXY_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "assets": [{
+                        "path": path,
+                        "origin_url": origin_url,
+                        "proxy": mode
+                    }]
+                }),
+            )
+            .expect("should insert JS asset proxy config");
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let html = format!(r#"<html><body><script src="{origin_url}"></script></body></html>"#);
+
+        process_html_with_registry(&html, registry)
+    }
+
+    fn process_prebid_script_with_asset_mode(mode: &str) -> String {
+        process_script_with_asset(
+            "/assets/vendor-pb.js",
+            "https://cdn.example.com/prebid.min.js",
+            mode,
+        )
+    }
+
+    #[test]
+    fn js_asset_proxy_rewriter_takes_precedence_over_prebid_script_removal() {
+        // Settings validation rejects this asset because it would load a second
+        // Prebid.js; the registry does not validate, so this pins rewriter order.
+        let processed = process_prebid_script_with_asset_mode("enabled");
+
+        assert!(
+            processed.contains(r#"<script src="/assets/vendor-pb.js"></script>"#),
+            "JS asset proxy should rewrite before Prebid removes the script: {processed}"
+        );
+    }
+
+    #[test]
+    fn enabled_js_asset_proxy_replacement_is_not_rewritten_by_prebid() {
+        // The proxied `path` matches Prebid `script_patterns`; the replacement
+        // must be terminal so Prebid does not remove the rewritten script.
+        let processed = process_script_with_asset(
+            "/assets/prebid.min.js",
+            "https://cdn.example.com/vendor.js",
+            "enabled",
+        );
+
+        assert!(
+            processed.contains(r#"<script src="/assets/prebid.min.js"></script>"#),
+            "JS asset proxy replacement should be terminal: {processed}"
+        );
+    }
+
+    /// Appends `?chained` so a test can see whether a replacement reached it.
+    struct AppendChainedRewriter;
+
+    impl IntegrationAttributeRewriter for AppendChainedRewriter {
+        fn integration_id(&self) -> &'static str {
+            "append_chained"
+        }
+
+        fn handles_attribute(&self, attribute: &str) -> bool {
+            attribute == "src"
+        }
+
+        fn rewrite(
+            &self,
+            _attr_name: &str,
+            attr_value: &str,
+            _ctx: &IntegrationAttributeContext<'_>,
+        ) -> AttributeRewriteAction {
+            AttributeRewriteAction::replace(format!("{attr_value}?chained"))
+        }
+    }
+
+    #[test]
+    fn js_asset_proxy_replacement_is_terminal_while_other_replacements_chain() {
+        let proxy: Arc<dyn IntegrationAttributeRewriter> =
+            JsAssetProxyIntegration::new(config_with_assets(vec![asset(
+                "/assets/vendor.js",
+                "https://cdn.example.com/vendor.js",
+                JsAssetProxyMode::Enabled,
+            )]));
+        let chained: Arc<dyn IntegrationAttributeRewriter> = Arc::new(AppendChainedRewriter);
+        let registry = IntegrationRegistry::from_rewriters(
+            vec![proxy, Arc::clone(&chained), chained],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            registry.rewrite_attribute(
+                "src",
+                "https://cdn.example.com/vendor.js",
+                &rewrite_context()
+            ),
+            crate::integrations::AttributeRewriteOutcome::Replaced("/assets/vendor.js".to_string()),
+            "later rewriters should not see the JS asset proxy replacement"
+        );
+        assert_eq!(
+            registry.rewrite_attribute(
+                "src",
+                "https://cdn.example.com/other.js",
+                &rewrite_context()
+            ),
+            crate::integrations::AttributeRewriteOutcome::Replaced(
+                "https://cdn.example.com/other.js?chained?chained".to_string()
+            ),
+            "other replacements should keep chaining"
+        );
+    }
+
+    #[test]
+    fn blocked_js_asset_proxy_entry_removes_prebid_script() {
+        let processed = process_prebid_script_with_asset_mode("blocked");
+
+        assert!(
+            !processed.contains("prebid.min.js") && !processed.contains("<script"),
+            "blocked JS asset should remove the script element: {processed}"
+        );
+    }
+
+    #[test]
+    fn disabled_js_asset_proxy_entry_lets_prebid_remove_script() {
+        let processed = process_prebid_script_with_asset_mode("disabled");
+
+        assert!(
+            !processed.contains("prebid.min.js") && !processed.contains("<script"),
+            "disabled JS asset should defer to Prebid script interception: {processed}"
+        );
+    }
+
     #[test]
     fn disabled_config_does_not_register_routes() {
         let mut settings = create_test_settings();

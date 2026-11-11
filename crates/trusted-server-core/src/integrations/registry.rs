@@ -921,6 +921,16 @@ impl IntegrationRegistry {
             }
         }
 
+        // `js_asset_proxy` is the operator's per-URL override, so it runs before
+        // every native attribute rewriter regardless of registration order, and
+        // `rewrite_attribute` treats its replacement as terminal. Other
+        // replacements chain and removals short-circuit. The sort is stable, so
+        // the other rewriters keep registration order.
+        inner.html_rewriters.sort_by_key(|rewriter| {
+            rewriter.integration_id()
+                != crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID
+        });
+
         let registry = Self {
             inner: Arc::new(inner),
             plan: Some(plan),
@@ -1057,6 +1067,9 @@ impl IntegrationRegistry {
     }
 
     /// Give integrations a chance to rewrite HTML attributes.
+    ///
+    /// Replacements chain through later rewriters, except a `js_asset_proxy`
+    /// replacement, which is returned as is. A removal ends the chain.
     #[must_use]
     pub fn rewrite_attribute(
         &self,
@@ -1073,6 +1086,13 @@ impl IntegrationRegistry {
             match rewriter.rewrite(attr_name, &current, ctx) {
                 AttributeRewriteAction::Keep => {}
                 AttributeRewriteAction::Replace(next_value) => {
+                    // A `js_asset_proxy` replacement is the operator's explicit
+                    // per-URL decision, so no later rewriter sees or changes it.
+                    if rewriter.integration_id()
+                        == crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID
+                    {
+                        return AttributeRewriteOutcome::Replaced(next_value);
+                    }
                     current = next_value;
                     changed = true;
                 }
@@ -1244,6 +1264,16 @@ impl IntegrationRegistry {
         }
 
         map.into_values().collect()
+    }
+
+    /// Return attribute rewriter integration IDs in execution order.
+    #[cfg(test)]
+    pub(crate) fn attribute_rewriter_ids(&self) -> Vec<&'static str> {
+        self.inner
+            .html_rewriters
+            .iter()
+            .map(|rewriter| rewriter.integration_id())
+            .collect()
     }
 
     /// Return whether an integration is enabled in this registry.
