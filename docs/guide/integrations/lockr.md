@@ -47,6 +47,16 @@ For example, `/integrations/lockr/api/example?mode=test` forwards to `https://id
 
 ### SDK URL rewriting
 
+Server-side attribute rewriting and the browser script guard recognize only
+`aim.loc.kr` and `identity.loc.kr` URLs whose pathname contains
+`identity-lockr` and ends in `.js`, case-insensitively. Absolute HTTP(S) and
+protocol-relative URLs are supported. Other scripts on those hosts, lookalike
+hosts, and vendor names embedded in another URL's path or query are not claimed.
+
+Query strings and fragments do not prevent SDK recognition. Matching URLs use
+`/integrations/lockr/sdk`, which serves the configured `sdk_url`; the original
+query and fragment are not forwarded to upstream.
+
 With `rewrite_sdk = true`, the server rewrites matching Lockr SDK URLs in HTML to an absolute first-party URL ending in `/integrations/lockr/sdk`, using the request scheme and request host. An external `<base href>` does not redirect the rewritten SDK load to another origin.
 
 The Lockr browser module also intercepts matching dynamically inserted SDK scripts and preload or prefetch links. It rewrites them to `window.location.origin` plus `/integrations/lockr/sdk`. This interception remains active when `rewrite_sdk = false`; that setting controls server-side HTML attribute rewriting only.

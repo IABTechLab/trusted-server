@@ -245,10 +245,10 @@ sleep 1
 
 info "Generating stub config (mode: $MODE)"
 python3 - "$REPO_ROOT/trusted-server.example.toml" "$WORK/app.toml" "$CONFIG_MODE" \
-  "$ORIGIN_PORT" "$BID_PORT" <<'PYEOF'
+  "$ORIGIN_PORT" "$BID_PORT" "$TS_PORT" <<'PYEOF'
 import sys
 
-src, out, mode, origin_port, bid_port = sys.argv[1:6]
+src, out, mode, origin_port, bid_port, ts_port = sys.argv[1:7]
 s = open(src).read()
 
 def replace_once(content, old, new, description):
@@ -262,6 +262,12 @@ s = replace_once(
     'origin_url = "https://origin.example.com"',
     f'origin_url = "http://127.0.0.1:{origin_port}"',
     "publisher origin",
+)
+s = replace_once(
+    s,
+    'public_origin = "https://ads.example.com"',
+    f'public_origin = "http://127.0.0.1:{ts_port}"',
+    "publisher public origin",
 )
 s = replace_once(
     s,

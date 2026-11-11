@@ -3,6 +3,62 @@
 //! Shared by `build.rs` and `tests/git_version_resolve.rs` via `#[path]`, so it
 //! must stay dependency-free.
 
+use std::ffi::OsStr;
+
+/// Returns the exact source commit in release mode, or `None` in development.
+///
+/// # Errors
+///
+/// Rejects any present release control except `1`, and release sources other
+/// than exactly 40 lowercase ASCII hexadecimal bytes.
+pub fn release_source(
+    control: Option<&OsStr>,
+    source: Option<&OsStr>,
+) -> Result<Option<String>, &'static str> {
+    match control {
+        None => return Ok(None),
+        Some(value) if value == OsStr::new("1") => {}
+        Some(_) => return Err("TRUSTED_SERVER__RELEASE_BUILD must be exactly 1 when present"),
+    }
+    let source = source
+        .and_then(OsStr::to_str)
+        .ok_or("release builds require TRUSTED_SERVER__GIT_VERSION as a full lowercase commit")?;
+    if source.len() != 40
+        || !source
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("release source must be exactly 40 lowercase ASCII hexadecimal bytes");
+    }
+    Ok(Some(source.to_owned()))
+}
+
+/// Resolve the actual build source, calling local Git only in development.
+///
+/// # Errors
+///
+/// Returns release input errors before invoking the fallback.
+pub fn resolve_build_source(
+    control: Option<&OsStr>,
+    source: Option<&OsStr>,
+    local_git: impl FnOnce() -> Option<String>,
+) -> Result<Option<String>, &'static str> {
+    if let Some(commit) = release_source(control, source)? {
+        return Ok(Some(commit));
+    }
+    let override_value = source.and_then(OsStr::to_str);
+    if override_value.is_some_and(is_usable) {
+        Ok(resolve_git_version(&Candidates {
+            override_value,
+            exact_tag: None,
+            branch: None,
+            commit: None,
+        }))
+    } else {
+        Ok(local_git())
+    }
+}
+
 /// Raw candidates for the deployed git version, in priority order.
 pub struct Candidates<'a> {
     /// `TRUSTED_SERVER__GIT_VERSION`, supplied by the deploy pipeline.
