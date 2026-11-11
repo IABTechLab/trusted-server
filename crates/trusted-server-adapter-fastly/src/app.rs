@@ -3154,7 +3154,7 @@ mod tests {
     fn page_phase_lookups_reach_the_write_for_a_returning_ec() {
         // Arrange
         let fixture = identity_fixture(false);
-        let ec_id = format!("{}.pg0001", "6".repeat(64));
+        let ec_id = format!("{}.pg0001", "c".repeat(64));
         seed_live_row(&fixture.graph, &ec_id);
 
         // Act
@@ -3319,7 +3319,7 @@ mod tests {
     fn after_response_lookups_skip_a_row_withdrawn_before_the_phase() {
         // Arrange
         let fixture = after_response_fixture();
-        let ec_id = format!("{}.ar0005", "5".repeat(64));
+        let ec_id = format!("{}.ar0005", "b".repeat(64));
         seed_live_row(&fixture.graph, &ec_id);
         let (mut ec_state, lookups) =
             finalized_navigation(&fixture, Some(&ec_id), IpAddr::V4(Ipv4Addr::LOCALHOST));
