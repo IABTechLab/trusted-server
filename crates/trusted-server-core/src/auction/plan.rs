@@ -1141,7 +1141,7 @@ mod tests {
     #[test]
     fn insecure_http_requires_an_explicit_per_provider_opt_in() {
         let mut demo = provider("prebid-server");
-        demo.endpoint = "http://192.0.2.1:8000".to_string();
+        demo.endpoint = "http://pbs.example.com:8000".to_string();
         assert!(
             AuctionPlan::compile(config(BTreeMap::from([(id("demo"), demo.clone())]))).is_err(),
             "should reject HTTP without the provider's explicit opt-in"
@@ -1151,7 +1151,7 @@ mod tests {
             .expect("should compile an explicitly opted-in HTTP provider");
         assert_eq!(
             plan.providers()[0].endpoint.as_str(),
-            "http://192.0.2.1:8000/openrtb2/auction",
+            "http://pbs.example.com:8000/openrtb2/auction",
             "should normalize the opted-in Prebid Server endpoint"
         );
         let mut other = provider("standard");
