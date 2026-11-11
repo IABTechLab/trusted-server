@@ -18,8 +18,8 @@
   "asset": {
     "header connection": { "item": 6, "head": [] },
     "header keep-alive": { "item": 6, "head": [] },
-    "header content-length": { "item": 6, "head": ["20"] },
-    "header transfer-encoding": { "item": 6, "head": [] }
+    "header content-length": { "item": 25, "head": ["20"] },
+    "header transfer-encoding": { "item": 25, "head": [] }
   },
   "trace-method": {
     "header allow": {

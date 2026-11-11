@@ -2623,10 +2623,9 @@ pub async fn publisher_response_into_streaming_response(
         PublisherResponse::Buffered(mut response) => {
             // Fastly requests the origin body as a stream before the response is
             // classified, so a buffered-unmodified response can still hold an
-            // `EdgeBody::Stream`. A bodiless response (HEAD, 204, 205, 304) must
-            // stay bodiless, because delivery streams any `EdgeBody::Stream`
-            // to the client, so drop the body and correct
-            // its framing (204/205 Content-Length; HEAD/304 preserved).
+            // `EdgeBody::Stream`. Delivery streams any `EdgeBody::Stream` to the
+            // client, so a bodiless response (HEAD, 204, 205, 304) drops its body
+            // and corrects its framing (204/205 Content-Length; HEAD/304 preserved).
             if !response_carries_body(method, response.status()) {
                 make_response_bodiless(&mut response);
             }

@@ -475,9 +475,8 @@ fn is_wasi_forbidden_outbound_header(name: &str) -> bool {
 /// Spin's WASI HTTP API sends one request and returns the original response; it
 /// exposes no redirect-follow policy. Each trait call therefore reaches exactly
 /// one `spin_sdk::http::send` boundary and returns an original 3xx to core. Host
-/// tests cannot instantiate Spin's WASI transport, so the common
-/// `StubHttpClient` driver records the one-send 3xx behavior while adapter tests
-/// cover request/response policy around that single boundary.
+/// tests cannot instantiate Spin's WASI transport, so adapter tests cover
+/// request/response policy around that single boundary.
 ///
 /// Backend phase timeouts remain unsupported. Callers requiring an absolute
 /// cutoff use [`PlatformHttpClient::select_until`].

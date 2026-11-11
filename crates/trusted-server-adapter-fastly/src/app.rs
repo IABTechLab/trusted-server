@@ -124,7 +124,7 @@ use trusted_server_core::integrations::{
     RequestFilterRegistryOutcome,
 };
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformGeo as _, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -146,8 +146,8 @@ use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, version_synthesized_headers};
 use crate::platform::{
-    FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
-    FastlyPlatformSecretStore, UnavailableKvStore,
+    FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformHttpClient,
+    FastlyPlatformSecretStore, RequestGeo, UnavailableKvStore,
 };
 use crate::sandbox::RetainedApp;
 use crate::tinybird::{QueueingTelemetrySink, TelemetryQueue};
@@ -243,7 +243,8 @@ pub(crate) fn build_state_from_settings(
 /// The outbound client is the one `EdgeZero`'s Fastly request conversion
 /// installs in the request context, with the proxy marker turned off. The
 /// config and secret stores make their management API writes through it. The
-/// clock is the context's monotonic clock.
+/// clock is the context's monotonic clock. Geo answers from the request's
+/// [`RequestGeo`], the lookup the entry point ran once.
 ///
 /// With Tinybird enabled, the auction telemetry sink queues NDJSON on the
 /// request's [`TelemetryQueue`], which the entry point inserts and sends after
@@ -252,7 +253,7 @@ pub(crate) fn build_state_from_settings(
 /// # Errors
 ///
 /// Returns an internal [`EdgeError`] when the request carries no outbound
-/// client, or no telemetry queue while Tinybird is enabled.
+/// client, no [`RequestGeo`], or no telemetry queue while Tinybird is enabled.
 fn build_per_request_services(
     state: &AppState,
     ctx: &RequestContext,
@@ -276,6 +277,11 @@ fn build_per_request_services(
             EdgeError::internal(std::io::Error::other("request has no outbound client"))
         })?
         .with_proxy_marker(false);
+    let request_geo = ctx
+        .extensions()
+        .get::<RequestGeo>()
+        .cloned()
+        .ok_or_else(|| EdgeError::internal(std::io::Error::other("request has no geo")))?;
 
     let mut services = RuntimeServices::builder();
     if state.settings.tinybird.enabled {
@@ -309,7 +315,7 @@ fn build_per_request_services(
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .outbound_client(outbound_client)
         .clock(ctx.monotonic_clock())
-        .geo(Arc::new(FastlyPlatformGeo))
+        .geo(Arc::new(request_geo))
         .client_info(client_info)
         .build())
 }
@@ -1271,11 +1277,13 @@ fn fallback_route_handler(
 /// `EdgeZero` [`Hooks`] implementation for the Trusted Server application.
 pub struct TrustedServerApp;
 
-/// Assembles the application from the settings `load` returns.
+/// Assembles the application from loaded `settings`.
 ///
 /// Builds the [`AppState`] and its routes, then [`App::from_router`], which
 /// applies the name, [`Hooks::configure`], and the platform check exactly once.
 /// The entry point retains the result in its sandbox only on success.
+/// `log_context` ends the settings or state failure log, so it matches the
+/// request that triggered assembly.
 ///
 /// # Errors
 ///
@@ -1283,9 +1291,10 @@ pub struct TrustedServerApp;
 /// fail, or the `configure` error, either of which the entry point answers
 /// with `EdgeZero`'s assembly-error response.
 pub(crate) fn assemble_app(
-    load: impl FnOnce() -> Result<Settings, Report<TrustedServerError>>,
+    settings: Result<Settings, Report<TrustedServerError>>,
+    log_context: &str,
 ) -> Result<RetainedApp, EdgeError> {
-    let state = startup_state(load)?;
+    let state = startup_state(settings, log_context)?;
     let app = App::from_router::<TrustedServerApp>(
         TrustedServerApp::routes_for_state(&state),
         FASTLY_PLATFORM,
@@ -1293,19 +1302,20 @@ pub(crate) fn assemble_app(
     Ok(RetainedApp { app, state })
 }
 
-/// Builds the [`AppState`] from the settings `load` returns.
+/// Builds the [`AppState`] from loaded `settings`.
 ///
 /// # Errors
 ///
 /// Returns the [`EdgeError`] from [`startup_error`] after logging the full
-/// report.
+/// report, followed by `log_context`.
 fn startup_state(
-    load: impl FnOnce() -> Result<Settings, Report<TrustedServerError>>,
+    settings: Result<Settings, Report<TrustedServerError>>,
+    log_context: &str,
 ) -> Result<Arc<AppState>, EdgeError> {
-    load()
+    settings
         .and_then(build_state_from_settings)
         .map_err(|report| {
-            log::error!("failed to build application state: {report:?}");
+            log::error!("failed to build application state: {report:?}{log_context}");
             startup_error(&report)
         })
 }
@@ -1317,10 +1327,7 @@ impl TrustedServerApp {
                 Arc::clone(&state.settings),
                 Arc::new(trace_metadata),
             )))
-            .middleware(FinalizeResponseMiddleware::new(
-                Arc::clone(&state.settings),
-                Arc::new(FastlyPlatformGeo),
-            ))
+            .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
         let fallback_handler = fallback_route_handler(Arc::clone(state));
@@ -1368,14 +1375,11 @@ fn trace_metadata(request: &RequestParts) -> TraceMetadata {
                 .and_then(|context| context.client_ip),
             ..ClientInfo::default()
         });
-    let geo = client_info.client_ip.and_then(|client_ip| {
-        FastlyPlatformGeo
-            .lookup(Some(client_ip))
-            .unwrap_or_else(|_| {
-                log::warn!("trace_geo_unavailable");
-                None
-            })
-    });
+    let geo = request
+        .extensions
+        .get::<RequestGeo>()
+        .and_then(RequestGeo::geo)
+        .cloned();
     TraceMetadata { client_info, geo }
 }
 
@@ -1399,8 +1403,10 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> Result<RouterService, EdgeError> {
-        let state =
-            startup_state(|| load_settings_from_config_store(&RuntimeStoreConfig::logical()))?;
+        let state = startup_state(
+            load_settings_from_config_store(&RuntimeStoreConfig::logical()),
+            "",
+        )?;
         Ok(Self::routes_for_state(&state))
     }
 
@@ -1455,7 +1461,7 @@ mod tests {
     use futures::StreamExt as _;
     use futures::executor::block_on;
     use trusted_server_core::auction::AuctionEventBatch;
-    use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
+    use trusted_server_core::constants::{ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE};
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::integrations::{
@@ -1463,7 +1469,7 @@ mod tests {
         RequestFilterEffects, RequestFilterInput,
     };
     use trusted_server_core::platform::{
-        ClientInfo, HttpClient, PlatformBackend, PlatformBackendSpec, PlatformError,
+        ClientInfo, GeoInfo, HttpClient, PlatformBackend, PlatformBackendSpec, PlatformError,
         PlatformKvStore, PlatformTemplateCache, PlatformTemplateCacheReservation, RuntimeServices,
         TemplateCacheError, TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss,
         TemplateCacheReservation, TemplateEntry, TemplateMetadata, UnavailableHttpClient,
@@ -1474,6 +1480,7 @@ mod tests {
     };
     use trusted_server_core::test_support::{insert_outbound_client, nextjs_auction};
 
+    use crate::platform::RequestGeo;
     use crate::tinybird::TelemetryQueue;
 
     #[test]
@@ -1546,10 +1553,12 @@ mod tests {
     fn route(router: &RouterService, mut request: edgezero_core::http::Request) -> Response {
         // `oneshot` skips `EdgeZero`'s request conversion, which installs the
         // adapter's default client, so install one that fails every request.
+        // It also skips the entry point's `prepare`, so add an empty geo.
         insert_outbound_client(
             &mut request,
             HttpClient::with_client(ScriptedHttpClient::forbidding()),
         );
+        request.extensions_mut().insert(RequestGeo::default());
         block_on(router.oneshot(request)).expect("should route request")
     }
 
@@ -1605,12 +1614,14 @@ mod tests {
     }
 
     /// Wraps `request` in a context that carries `client`, as `EdgeZero`'s Fastly
-    /// request conversion installs its default client.
+    /// request conversion installs its default client, and an empty
+    /// [`RequestGeo`], as the entry point inserts one.
     fn context_with_client(
         mut request: edgezero_core::http::Request,
         client: HttpClient,
     ) -> RequestContext {
         request.extensions_mut().insert(client);
+        request.extensions_mut().insert(RequestGeo::default());
         RequestContext::new(request, PathParams::default())
     }
 
@@ -1657,13 +1668,71 @@ mod tests {
     }
 
     #[test]
+    fn per_request_services_reject_a_request_without_geo() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let mut request = empty_request(Method::GET, "/article");
+        request
+            .extensions_mut()
+            .insert(ScriptedHttpClient::forbidding().http_client());
+        let context = RequestContext::new(request, PathParams::default());
+
+        let error = build_per_request_services(&state, &context)
+            .expect_err("should reject a request with no geo");
+
+        assert_eq!(
+            error.to_string(),
+            "internal error: request has no geo",
+            "should name the missing geo"
+        );
+    }
+
+    #[test]
+    fn per_request_services_answer_geo_from_the_entry_point_lookup() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let reader_ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7));
+        let held = GeoInfo {
+            city: "Springfield".to_owned(),
+            country: "US".to_owned(),
+            continent: "NorthAmerica".to_owned(),
+            latitude: 39.78,
+            longitude: -89.65,
+            metro_code: 648,
+            region: Some("IL".to_owned()),
+            asn: None,
+        };
+        let mut request = empty_request(Method::GET, "/article");
+        request.extensions_mut().insert(ClientInfo {
+            client_ip: Some(reader_ip),
+            ..ClientInfo::default()
+        });
+        let mut context =
+            context_with_client(request, ScriptedHttpClient::forbidding().http_client());
+        context
+            .extensions_mut()
+            .insert(RequestGeo::new(Some(reader_ip), Some(held)));
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+
+        assert_eq!(
+            services
+                .geo()
+                .lookup(services.client_info().client_ip)
+                .expect("should answer geo")
+                .map(|geo| geo.city),
+            Some("Springfield".to_owned()),
+            "should answer the client IP from the entry point's lookup"
+        );
+    }
+
+    #[test]
     fn per_request_services_queue_telemetry_when_tinybird_is_enabled() {
         let mut settings = test_settings();
         settings.tinybird = crate::tinybird::tests::enabled_config();
         let state = build_state_from_settings(settings).expect("should build test state");
         let queue = TelemetryQueue::default();
         let mut request = empty_request(Method::GET, "/article");
-        request.extensions_mut().insert(Arc::clone(&queue));
+        request.extensions_mut().insert(queue.clone());
         let context = context_with_client(request, ScriptedHttpClient::forbidding().http_client());
 
         let services = build_per_request_services(&state, &context)
@@ -1679,7 +1748,7 @@ mod tests {
             "should enable the telemetry sink"
         );
         assert_eq!(
-            queue.lock().expect("should read the queue").len(),
+            queue.take().len(),
             1,
             "should queue the batch on the request's queue instead of sending it"
         );
@@ -1906,7 +1975,7 @@ mod tests {
             (Method::PATCH, "/_ts/trace", StatusCode::METHOD_NOT_ALLOWED),
         ] {
             let mut request = empty_request(method, path);
-            request.extensions_mut().insert(Arc::clone(&telemetry));
+            request.extensions_mut().insert(telemetry.clone());
             let response = route(&router, request);
             assert_eq!(
                 response.status(),
@@ -1934,10 +2003,7 @@ mod tests {
             "should never touch identity KV for trace"
         );
         assert!(
-            telemetry
-                .lock()
-                .expect("should inspect the telemetry queue")
-                .is_empty(),
+            telemetry.take().is_empty(),
             "should never queue auction telemetry for trace"
         );
         assert!(
@@ -2069,7 +2135,10 @@ mod tests {
         // Request 1: the linked store has no app config blob.
         let error = sandbox
             .initialize(|| {
-                assemble_app(|| load_settings_from_config_store(&RuntimeStoreConfig::logical()))
+                assemble_app(
+                    load_settings_from_config_store(&RuntimeStoreConfig::logical()),
+                    "",
+                )
             })
             .expect_err("should fail assembly without an app config blob");
         assert!(
@@ -2107,7 +2176,7 @@ mod tests {
 
         // Request 2: the blob is restored.
         sandbox
-            .initialize(|| assemble_app(|| Ok(test_settings())))
+            .initialize(|| assemble_app(Ok(test_settings()), ""))
             .expect("should assemble once the blob is restored");
         let second = crate::sandbox::SandboxCounters::capture(&sandbox, 2, "request-2");
 
@@ -2129,7 +2198,22 @@ mod tests {
 
     #[test]
     fn assembly_runs_configure_once_with_the_edge_policies() {
-        let retained = assemble_app(|| Ok(test_settings())).expect("should assemble the app");
+        let retained = assemble_app(Ok(test_settings()), "").expect("should assemble the app");
+        let headers = edgezero_core::http::HeaderMap::new();
+        let request_start = edgezero_core::time::MonotonicInstant::now();
+        let egress_started_at = request_start
+            .checked_add(Duration::from_secs(5))
+            .expect("should represent an egress start after the request start");
+        let head = edgezero_core::response_egress::ResponseEgressHead::new(
+            StatusCode::OK,
+            edgezero_core::http::Version::HTTP_11,
+            &headers,
+            None,
+            request_start,
+            None,
+        );
+
+        let policy = (retained.app.response_egress_policy())(&head, egress_started_at);
 
         assert_eq!(
             retained.app.platform(),
@@ -2140,6 +2224,69 @@ mod tests {
             retained.app.name(),
             TrustedServerApp::name(),
             "should name the app after its hooks"
+        );
+        assert_eq!(
+            policy.write_deadline.instant(),
+            egress_started_at
+                .checked_add(trusted_server_core::edge_app::RESPONSE_WRITE_DEADLINE)
+                .expect("should represent the expected deadline"),
+            "should install configure's write deadline instead of EdgeZero's default"
+        );
+    }
+
+    /// Sets `FASTLY_SERVICE_VERSION` for one test and restores it on drop.
+    struct ServiceVersionGuard(Option<String>);
+
+    impl ServiceVersionGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var(ENV_FASTLY_SERVICE_VERSION).ok();
+            // SAFETY: the wasm32-wasip1 test binary runs its tests one at a
+            // time on one thread, so nothing reads the environment meanwhile.
+            unsafe { std::env::set_var(ENV_FASTLY_SERVICE_VERSION, value) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for ServiceVersionGuard {
+        fn drop(&mut self) {
+            // SAFETY: as in `set`, the test binary is single-threaded.
+            unsafe {
+                match &self.0 {
+                    Some(previous) => std::env::set_var(ENV_FASTLY_SERVICE_VERSION, previous),
+                    None => std::env::remove_var(ENV_FASTLY_SERVICE_VERSION),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn configure_failure_fails_assembly_with_500_and_retries_next_request() {
+        let mut sandbox = crate::sandbox::Sandbox::default();
+
+        // A service version past the synthesized set's 4096-byte bound is the
+        // smallest configure failure a deployment can reach.
+        let guard = ServiceVersionGuard::set(&"9".repeat(4097));
+        let error = sandbox
+            .initialize(|| assemble_app(Ok(test_settings()), ""))
+            .expect_err("should fail assembly when configure rejects the synthesized set");
+        drop(guard);
+
+        assert_eq!(
+            error.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer a configure failure with a 500"
+        );
+        assert!(
+            sandbox.state().is_none(),
+            "should retain nothing after configure fails"
+        );
+        sandbox
+            .initialize(|| assemble_app(Ok(test_settings()), ""))
+            .expect("should assemble on the next request once configure succeeds");
+        assert_eq!(
+            sandbox.initialization_attempts(),
+            2,
+            "should retry assembly on the next request"
         );
     }
 
@@ -2198,8 +2345,9 @@ mod tests {
         // FinalizeResponseMiddleware for header injection.
         //
         // This is safe to run without Viceroy: enforce_basic_auth is pure Rust
-        // (reads settings + request headers only) and FastlyPlatformGeo.lookup(None)
-        // short-circuits without calling any Fastly ABI.
+        // (reads settings + request headers only) and the finalize middleware
+        // reads the empty RequestGeo that `route` inserts, so nothing calls a
+        // Fastly ABI.
         let router = test_router();
         let req = empty_request(Method::POST, "/_ts/admin/keys/rotate");
 

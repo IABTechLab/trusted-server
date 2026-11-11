@@ -1556,7 +1556,6 @@ async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
     }
 }
 
-#[allow(clippy::panic)]
 /// A TCF v2 `euconsent-v2` cookie that grants Purpose 1.
 ///
 /// The test server has no geo source, so the jurisdiction is unknown and the
@@ -1654,6 +1653,7 @@ async fn axum_cloudflare_and_spin_send_no_telemetry() {
     }
 }
 
+#[allow(clippy::panic)]
 #[cfg(test)]
 mod trace_parity {
     use std::net::IpAddr;

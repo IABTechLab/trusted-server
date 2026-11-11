@@ -29,7 +29,24 @@ const TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH: usize = 512;
 ///
 /// The Fastly entry point creates one per request and `prepare` inserts a
 /// clone into the request extensions, where the per-request services find it.
-pub(crate) type TelemetryQueue = Arc<Mutex<Vec<String>>>;
+/// Clones share one queue: [`QueueingTelemetrySink`] pushes onto it during
+/// the request, and [`send_queued_batches`] takes the bodies after delivery.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TelemetryQueue(Arc<Mutex<Vec<String>>>);
+
+impl TelemetryQueue {
+    fn push(&self, body: String) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(body);
+    }
+
+    /// Takes every queued body, leaving the queue empty.
+    pub(crate) fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
 
 /// Auction telemetry sink that queues each batch as NDJSON instead of sending it.
 pub(crate) struct QueueingTelemetrySink {
@@ -78,30 +95,29 @@ impl AuctionTelemetrySink for QueueingTelemetrySink {
             batch.row_count(),
             body.len()
         );
-        self.queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(body);
+        self.queue.push(body);
         Ok(())
     }
 }
 
 /// Sends every body queued on `queue` to `config`'s Events API, one request each.
 ///
-/// Best effort: a failed request is logged and the rest are still sent. Each
-/// request carries the 2 s Tinybird timeout and bypasses the cache.
+/// Best effort: a failed request is logged, followed by `log_context`, and the
+/// rest are still sent. Each request carries the 2 s Tinybird timeout and
+/// bypasses the cache.
 pub(crate) async fn send_queued_batches(
     client: &HttpClient,
     config: &TinybirdSettings,
     queue: &TelemetryQueue,
+    log_context: &str,
 ) {
-    let bodies = std::mem::take(&mut *queue.lock().unwrap_or_else(PoisonError::into_inner));
+    let bodies = queue.take();
     if bodies.is_empty() {
         return;
     }
     let Some(token) = config.auction_token_secret.as_ref() else {
         log::error!(
-            "dropping {} queued auction telemetry batch(es): no Tinybird auction token is resolved",
+            "dropping {} queued auction telemetry batch(es): no Tinybird auction token is resolved{log_context}",
             bodies.len()
         );
         return;
@@ -125,7 +141,7 @@ pub(crate) async fn send_queued_batches(
             .cache_policy(OutboundCachePolicy::Bypass),
             Err(error) => {
                 log::warn!(
-                    "failed to build the Tinybird Events API request: {} ({})",
+                    "failed to build the Tinybird Events API request: {} ({}){log_context}",
                     error.status(),
                     error.kind()
                 );
@@ -141,12 +157,12 @@ pub(crate) async fn send_queued_batches(
         match client.send(request).await {
             Ok(response) if response.status().is_success() => {}
             Ok(response) => log::warn!(
-                "Tinybird Events API answered {} for dataset {}",
+                "Tinybird Events API answered {} for dataset {}{log_context}",
                 response.status(),
                 config.auction_dataset
             ),
             Err(error) => log::warn!(
-                "Tinybird Events API request failed with {} ({})",
+                "Tinybird Events API request failed with {} ({}){log_context}",
                 error.status(),
                 error.kind()
             ),
@@ -253,8 +269,12 @@ pub(crate) mod tests {
             .build()
     }
 
-    fn queued(queue: &TelemetryQueue) -> Vec<String> {
-        queue.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    fn queue_of(bodies: &[&str]) -> TelemetryQueue {
+        let queue = TelemetryQueue::default();
+        for body in bodies {
+            queue.push((*body).to_owned());
+        }
+        queue
     }
 
     /// Asserts `request` is one Events API POST of `body` with today's headers.
@@ -306,14 +326,14 @@ pub(crate) mod tests {
     #[test]
     fn sink_queues_ndjson_with_the_full_user_agent_and_sends_nothing() {
         let queue = TelemetryQueue::default();
-        let sink = QueueingTelemetrySink::new(&enabled_config(), Arc::clone(&queue));
+        let sink = QueueingTelemetrySink::new(&enabled_config(), queue.clone());
 
         futures::executor::block_on(
             sink.emit_auction_events(&test_services(), AuctionEventBatch::new(vec![test_row()])),
         )
         .expect("should queue the batch");
 
-        let bodies = queued(&queue);
+        let bodies = queue.take();
         let [body] = bodies.as_slice() else {
             panic!("should queue one body, got {bodies:?}");
         };
@@ -327,20 +347,20 @@ pub(crate) mod tests {
     #[test]
     fn empty_batch_queues_nothing() {
         let queue = TelemetryQueue::default();
-        let sink = QueueingTelemetrySink::new(&enabled_config(), Arc::clone(&queue));
+        let sink = QueueingTelemetrySink::new(&enabled_config(), queue.clone());
 
         futures::executor::block_on(
             sink.emit_auction_events(&test_services(), AuctionEventBatch::new(Vec::new())),
         )
         .expect("should ignore the empty batch");
 
-        assert!(queued(&queue).is_empty(), "should queue no empty batch");
+        assert!(queue.take().is_empty(), "should queue no empty batch");
     }
 
     #[test]
     fn sink_rejects_a_row_count_oversize_before_queueing() {
         let queue = TelemetryQueue::default();
-        let sink = QueueingTelemetrySink::new(&enabled_config(), Arc::clone(&queue));
+        let sink = QueueingTelemetrySink::new(&enabled_config(), queue.clone());
         let rows = vec![test_row(); TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH + 1];
 
         let result = futures::executor::block_on(
@@ -352,7 +372,7 @@ pub(crate) mod tests {
             "best-effort caller will suppress this error"
         );
         assert!(
-            queued(&queue).is_empty(),
+            queue.take().is_empty(),
             "should not queue an oversized row batch"
         );
     }
@@ -368,15 +388,13 @@ pub(crate) mod tests {
                 ScriptedReply::status(StatusCode::ACCEPTED),
             );
         }
-        let queue = TelemetryQueue::new(Mutex::new(vec![
-            "{\"row\":1}\n".to_owned(),
-            "{\"row\":2}\n".to_owned(),
-        ]));
+        let queue = queue_of(&["{\"row\":1}\n", "{\"row\":2}\n"]);
 
         clock.drive(send_queued_batches(
             &client.http_client(),
             &enabled_config(),
             &queue,
+            "",
         ));
 
         let requests = client.requests();
@@ -385,7 +403,7 @@ pub(crate) mod tests {
         };
         assert_events_request(first, "{\"row\":1}\n");
         assert_events_request(second, "{\"row\":2}\n");
-        assert!(queued(&queue).is_empty(), "should drain the queue");
+        assert!(queue.take().is_empty(), "should drain the queue");
     }
 
     #[test]
@@ -405,15 +423,13 @@ pub(crate) mod tests {
                 EVENTS_URI,
                 ScriptedReply::status(StatusCode::ACCEPTED),
             );
-        let queue = TelemetryQueue::new(Mutex::new(vec![
-            "{\"row\":1}\n".to_owned(),
-            "{\"row\":2}\n".to_owned(),
-        ]));
+        let queue = queue_of(&["{\"row\":1}\n", "{\"row\":2}\n"]);
 
         clock.drive(send_queued_batches(
             &client.http_client(),
             &enabled_config(),
             &queue,
+            "",
         ));
 
         assert_eq!(
@@ -431,6 +447,7 @@ pub(crate) mod tests {
             &client.http_client(),
             &enabled_config(),
             &TelemetryQueue::default(),
+            "",
         ));
 
         client.assert_no_requests();

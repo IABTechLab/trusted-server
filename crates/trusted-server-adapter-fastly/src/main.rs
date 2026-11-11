@@ -1,5 +1,4 @@
 use std::convert::Infallible;
-use std::sync::Arc;
 
 use edgezero_adapter_fastly::request::{
     send_assembly_error, send_request_with_registries_and_hooks,
@@ -21,7 +20,6 @@ use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::RequestFilterEffects;
-use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::proxy::AssetProxyCachePolicy;
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
@@ -54,11 +52,11 @@ use crate::middleware::{
     HEADER_X_TS_FINALIZED, apply_finalize_headers, per_request_synthesized_headers,
     resolve_geo_for_response,
 };
-use crate::platform::{FastlyPlatformGeo, client_info_from_request, resolve_client_ip};
+use crate::platform::{RequestGeo, client_info_from_request, resolve_client_ip};
 use crate::post_delivery::{FinalizeState, run_post_delivery};
 use crate::sandbox::{
     RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDiagnostics, instance_id,
-    metrics_enabled,
+    metrics_enabled, request_log_context,
 };
 use crate::tinybird::TelemetryQueue;
 // Only the reuse path builds a serving loop, so the retirement snapshots have
@@ -259,8 +257,12 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
     // `initialize` retains only success and returns the error unchanged, so a
     // transient config-store failure answers this request and the next
     // callback retries assembly.
+    let log_context = request_log_context(ordinal, &request_id);
     let assembled = sandbox.initialize(|| {
-        assemble_app(|| load_settings_from_config_store(&RuntimeStoreConfig::logical()))
+        assemble_app(
+            load_settings_from_config_store(&RuntimeStoreConfig::logical()),
+            &log_context,
+        )
     });
     let counters = SandboxCounters::capture(sandbox, ordinal, &request_id);
     match assembled.and_then(|()| retained_app(sandbox)) {
@@ -350,13 +352,10 @@ fn serve(
     // build_per_request_services and EC bot classification.
     let client_info = client_info_from_request(&req, resolved_client_ip);
     let device_signals = (!trace_path).then(|| derive_device_signals(&req));
-    // One lookup serves both this request's synthesized headers and `finalize`.
-    let geo = FastlyPlatformGeo
-        .lookup(client_info.client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("entry-point geo lookup failed: {e}");
-            None
-        });
+    // The request's one geo lookup. It serves the synthesized headers and
+    // `finalize` here, and, from the request extensions, the finalize
+    // middleware, the trace metadata and the per-request services.
+    let request_geo = RequestGeo::lookup_once(client_info.client_ip);
     let queue = TelemetryQueue::default();
 
     let prepare = |_req: &mut FastlyRequest, extensions: &mut Extensions| {
@@ -365,12 +364,13 @@ fn serve(
             extensions.insert(device_signals);
         }
         extensions.insert(client_info);
-        extensions.insert(Arc::clone(&queue));
-        extensions.insert(per_request_synthesized_headers(settings, geo.as_ref()));
+        extensions.insert(queue.clone());
+        extensions.insert(per_request_synthesized_headers(settings, request_geo.geo()));
+        extensions.insert(request_geo.clone());
     };
     let inputs = FinalizeInputs {
         settings,
-        geo: geo.as_ref(),
+        geo: request_geo.geo(),
         counters,
     };
     let delivery = send_request_with_registries_and_hooks(
@@ -381,7 +381,7 @@ fn serve(
         |response: &mut HttpResponse| finalize_response(response, &inputs),
     );
     handle_delivery(delivery, counters, |state| {
-        run_post_delivery(state, &queue, settings);
+        run_post_delivery(state, &queue, settings, &counters.log_context());
     });
 }
 
@@ -422,8 +422,8 @@ fn finalize_response(
     let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
 
     if !take_finalize_sentinel(response) {
-        let geo_info = resolve_geo_for_response(response, || inputs.geo.cloned());
-        apply_finalize_headers(inputs.settings, geo_info.as_ref(), response);
+        let geo = resolve_geo_for_response(response, inputs.geo);
+        apply_finalize_headers(inputs.settings, geo, response);
     }
 
     if let Some(policy) = asset_cache_policy {
@@ -437,7 +437,10 @@ fn finalize_response(
                 ec_state,
             }),
             Err(e) => {
-                log::error!("EC finalize skipped: failed to build partner registry: {e:?}");
+                log::error!(
+                    "EC finalize skipped: failed to build partner registry: {e:?}{}",
+                    inputs.counters.log_context()
+                );
                 None
             }
         }
@@ -704,8 +707,8 @@ pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use base64::Engine as _;
     use edgezero_adapter_fastly::request::FastlyService;
@@ -724,9 +727,7 @@ mod tests {
     use trusted_server_core::integrations::HeaderMutation;
     use trusted_server_core::trace::TracePreDispatchHook;
 
-    use crate::delivery::tests::{
-        committed, committed_then_failed, routed_delivery, unknown_commit,
-    };
+    use crate::delivery::tests::{committed, committed_then_failed};
 
     fn test_settings() -> Settings {
         Settings::from_toml(
@@ -1084,47 +1085,61 @@ mod tests {
     #[test]
     fn reused_sandbox_keeps_serving_after_delivery_failure() {
         let mut sandbox = Sandbox::default();
-        sandbox
-            .initialize(|| assemble_app(|| Ok(test_settings())))
-            .expect("should assemble the first request's app");
-        let mut post_delivery = Vec::new();
+        let settings = test_settings();
+        let mut statuses = Vec::new();
+        let mut post_delivery = 0;
 
-        // The first requests fail after commitment and with an unknown commit.
-        // Neither may end serving or drop the retained app.
-        handle_delivery(
-            routed_delivery(|envelope| {
-                committed_then_failed(
-                    envelope,
-                    edgezero_adapter_fastly::delivery::DeliveryError::Transport,
-                )
-            }),
-            &counters(),
-            |state| post_delivery.push(state),
-        );
-        handle_delivery(routed_delivery(unknown_commit), &counters(), |state| {
-            post_delivery.push(state);
-        });
+        // Two requests through one sandbox, each the way `handle_request`
+        // runs them. The first fails after commitment, which must neither
+        // end serving nor drop the retained app.
+        for request in 0..2 {
+            sandbox
+                .initialize(|| assemble_app(Ok(test_settings()), ""))
+                .expect("should assemble or reuse the app");
+            let retained = retained_app(&sandbox).expect("should retain the app");
+            let counters = SandboxCounters::capture(&sandbox, request + 1, "request-example");
+            let inputs = FinalizeInputs {
+                settings: &settings,
+                geo: None,
+                counters: &counters,
+            };
 
-        // The next request in the same sandbox reuses the retained app.
-        sandbox
-            .initialize(|| -> Result<RetainedApp, EdgeError> {
-                panic!("a retained app must not be rebuilt after a delivery failure")
-            })
-            .expect("should reuse the retained app");
+            let delivery = FastlyService::new(&retained.app).run_request_with_hooks_for_test(
+                FastlyRequest::get("https://publisher.example.com/static/tsjs=tsjs-unified.min.js"),
+                |_req, extensions| {
+                    extensions.insert(RequestGeo::default());
+                },
+                |response: &mut HttpResponse| {
+                    statuses.push(response.status());
+                    finalize_response(response, &inputs)
+                },
+                |envelope| {
+                    if request == 0 {
+                        committed_then_failed(
+                            envelope,
+                            edgezero_adapter_fastly::delivery::DeliveryError::Transport,
+                        )
+                    } else {
+                        committed(envelope)
+                    }
+                },
+            );
+            handle_delivery(delivery, &counters, |_state| post_delivery += 1);
+        }
 
-        assert!(
-            sandbox.state().is_some(),
-            "should keep the app retained after a delivery failure"
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::OK],
+            "should route both requests through the retained app"
         );
         assert_eq!(
-            SandboxCounters::capture(&sandbox, 3, "request-3").builds,
+            sandbox.initialization_attempts(),
             1,
-            "should serve every request from the first build"
+            "should serve the second request from the first build"
         );
         assert_eq!(
-            post_delivery.len(),
-            1,
-            "should run post-delivery work only for the committed application body"
+            post_delivery, 2,
+            "should run post-delivery work after each committed application body, the one that failed after commitment included"
         );
     }
 
@@ -1614,19 +1629,30 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::panic)]
-    fn entry_point_finalize_skips_geo_lookup_for_401() {
+    fn entry_point_finalize_withholds_geo_from_401() {
         let settings = test_settings();
+        let request_geo = GeoInfo {
+            city: "Springfield".to_owned(),
+            country: "US".to_owned(),
+            continent: "NorthAmerica".to_owned(),
+            latitude: 39.78,
+            longitude: -89.65,
+            metro_code: 648,
+            region: Some("IL".to_owned()),
+            asn: None,
+        };
         let mut response = response_builder()
             .status(edgezero_core::http::StatusCode::UNAUTHORIZED)
             .body(EdgeBody::empty())
             .expect("should build response");
 
-        let geo_info = resolve_geo_for_response(&response, || {
-            panic!("should skip entry-point geo lookup for 401 responses");
-        });
-        apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
+        let geo = resolve_geo_for_response(&response, Some(&request_geo));
+        apply_finalize_headers(&settings, geo, &mut response);
 
+        assert!(
+            geo.is_none(),
+            "should withhold the request's geo from a 401"
+        );
         assert_eq!(
             response
                 .headers()

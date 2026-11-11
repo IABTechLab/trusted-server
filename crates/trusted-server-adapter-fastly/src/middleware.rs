@@ -2,7 +2,7 @@
 //!
 //! Provides two middleware types used by the `EdgeZero` entry point:
 //!
-//! - [`FinalizeResponseMiddleware`] — geo lookup and standard TS header injection
+//! - [`FinalizeResponseMiddleware`]: standard TS header injection, with the request's geo
 //! - [`AuthMiddleware`] — basic-auth enforcement via [`enforce_basic_auth`]
 //!
 //! Registration order in [`crate::app`]: `FinalizeResponseMiddleware` outermost,
@@ -12,7 +12,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use edgezero_adapter_fastly::context::FastlyRequestContext;
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -29,9 +28,10 @@ use trusted_server_core::constants::{
 };
 use trusted_server_core::edge_app::synthesized_response_headers;
 use trusted_server_core::geo::GeoInfo;
-use trusted_server_core::platform::{ClientInfo, PlatformGeo};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::version_header::apply_git_version_header;
+
+use crate::platform::RequestGeo;
 
 pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
 
@@ -39,11 +39,15 @@ pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
 // FinalizeResponseMiddleware
 // ---------------------------------------------------------------------------
 
-/// Outermost middleware: performs geo lookup and injects all standard TS response headers.
+/// Outermost middleware: injects all standard TS response headers.
 ///
 /// Registered first in the middleware chain so that it wraps all inner middleware
 /// (including [`AuthMiddleware`]) and the handler. This guarantees every registered-route
-/// response — including auth-rejected ones — carries a consistent set of headers.
+/// response, including auth-rejected ones, carries a consistent set of headers.
+///
+/// Geo comes from the request's [`RequestGeo`], the lookup the entry point ran
+/// once for the resolved client IP. A request without one carries
+/// `X-Geo-Info-Available: false`.
 ///
 /// Router-level 405/404 responses for unregistered HTTP methods (e.g. TRACE) bypass the
 /// middleware chain. Those are covered by a second call to [`apply_finalize_headers`] at
@@ -61,27 +65,19 @@ pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
 /// 4. Operator-configured `settings.response_headers` (can override any managed header)
 pub struct FinalizeResponseMiddleware {
     settings: Arc<Settings>,
-    geo: Arc<dyn PlatformGeo>,
 }
 
 impl FinalizeResponseMiddleware {
-    /// Creates a new [`FinalizeResponseMiddleware`] with the given settings and geo lookup service.
-    pub fn new(settings: Arc<Settings>, geo: Arc<dyn PlatformGeo>) -> Self {
-        Self { settings, geo }
+    /// Creates a new [`FinalizeResponseMiddleware`] with the given settings.
+    pub fn new(settings: Arc<Settings>) -> Self {
+        Self { settings }
     }
 }
 
 #[async_trait(?Send)]
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        let client_ip = ctx.extensions().get::<ClientInfo>().map_or_else(
-            || {
-                ctx.extensions()
-                    .get::<FastlyRequestContext>()
-                    .and_then(|c| c.client_ip)
-            },
-            |info| info.client_ip,
-        );
+        let request_geo = ctx.extensions().get::<RequestGeo>().cloned();
 
         let mut response = match next.run(ctx).await {
             Ok(r) => r,
@@ -91,14 +87,9 @@ impl Middleware for FinalizeResponseMiddleware {
             }
         };
 
-        let geo_info = resolve_geo_for_response(&response, || {
-            self.geo.lookup(client_ip).unwrap_or_else(|e| {
-                log::warn!("geo lookup failed: {e}");
-                None
-            })
-        });
-
-        apply_finalize_headers(&self.settings, geo_info.as_ref(), &mut response);
+        let geo =
+            resolve_geo_for_response(&response, request_geo.as_ref().and_then(RequestGeo::geo));
+        apply_finalize_headers(&self.settings, geo, &mut response);
         response
             .headers_mut()
             .insert(HEADER_X_TS_FINALIZED, HeaderValue::from_static("1"));
@@ -156,14 +147,13 @@ impl Middleware for AuthMiddleware {
 // Shared geo resolution helper
 // ---------------------------------------------------------------------------
 
-/// Resolves geo for a response, skipping the lookup for 401 responses.
+/// The geo a response's headers report: none for a 401, the request's `geo` otherwise.
 ///
-/// Returns `None` for authentication rejections (401) without calling `lookup_geo`
-/// to avoid unnecessary work and exposing geo data to unauthenticated callers.
-/// All other responses call `lookup_geo` and return its result.
+/// Authentication rejections (401) carry no geo, so geo data never reaches an
+/// unauthenticated caller.
 ///
 /// Used by both [`FinalizeResponseMiddleware`] and the entry point's `finalize`
-/// step in `main.rs` so the 401-skip rule is defined in one place.
+/// step in `main.rs` so the 401 rule is defined in one place.
 ///
 /// # Parity note
 ///
@@ -173,14 +163,14 @@ impl Middleware for AuthMiddleware {
 /// is intentionally more conservative: geo data is not sent to any
 /// unauthenticated caller regardless of whether the 401 originated from this
 /// server or the upstream origin.
-pub(crate) fn resolve_geo_for_response<F>(response: &Response, lookup_geo: F) -> Option<GeoInfo>
-where
-    F: FnOnce() -> Option<GeoInfo>,
-{
+pub(crate) fn resolve_geo_for_response<'geo>(
+    response: &Response,
+    geo: Option<&'geo GeoInfo>,
+) -> Option<&'geo GeoInfo> {
     if response.status() == StatusCode::UNAUTHORIZED {
         None
     } else {
-        lookup_geo()
+        geo
     }
 }
 
@@ -326,7 +316,7 @@ fn is_synthesizable(name: &HeaderName, value: &HeaderValue) -> bool {
 ///
 /// `None` when the version is unset, or when it is not a valid header value,
 /// which is logged.
-pub(crate) fn fastly_version_header_value(service_version: Option<&str>) -> Option<HeaderValue> {
+fn fastly_version_header_value(service_version: Option<&str>) -> Option<HeaderValue> {
     match HeaderValue::from_str(service_version?) {
         Ok(value) => Some(value),
         Err(_) => {
@@ -358,7 +348,7 @@ mod tests {
 
     use std::collections::HashMap;
     use std::net::IpAddr;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
@@ -366,9 +356,7 @@ mod tests {
     use edgezero_core::http::{HeaderName, Method, StatusCode, request_builder, response_builder};
     use edgezero_core::middleware::Next;
     use edgezero_core::params::PathParams;
-    use error_stack::Report;
     use futures::executor::block_on;
-    use trusted_server_core::platform::{ClientInfo, PlatformError, PlatformGeo};
     use trusted_server_core::response_privacy::apply_inactive_ad_stack_browser_cache_policy;
 
     fn empty_response() -> Response {
@@ -384,31 +372,6 @@ mod tests {
             .body(Body::empty())
             .expect("should build test request");
         RequestContext::new(req, PathParams::new(HashMap::new()))
-    }
-
-    struct FixedGeo(Option<GeoInfo>);
-
-    impl PlatformGeo for FixedGeo {
-        fn lookup(&self, _: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-            Ok(self.0.clone())
-        }
-    }
-
-    struct RecordingGeo {
-        lookups: Arc<Mutex<Vec<Option<IpAddr>>>>,
-    }
-
-    impl PlatformGeo for RecordingGeo {
-        fn lookup(
-            &self,
-            client_ip: Option<IpAddr>,
-        ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-            self.lookups
-                .lock()
-                .expect("should lock recorded geo lookups")
-                .push(client_ip);
-            Ok(None)
-        }
     }
 
     fn test_settings() -> Settings {
@@ -662,103 +625,42 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn finalize_handle_uses_client_info_ip_for_geo_lookup() {
+    fn finalize_handle_reports_the_request_geo() {
         let reader_ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7));
-        let peer_ip = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
         let settings = settings_with_response_headers(vec![]);
-        let lookups = Arc::new(Mutex::new(Vec::new()));
-        let middleware = FinalizeResponseMiddleware::new(
-            Arc::new(settings),
-            Arc::new(RecordingGeo {
-                lookups: Arc::clone(&lookups),
-            }),
-        );
+        let middleware = FinalizeResponseMiddleware::new(Arc::new(settings));
         let mut ctx = empty_ctx();
-        ctx.extensions_mut().insert(ClientInfo {
-            client_ip: Some(reader_ip),
-            ..ClientInfo::default()
-        });
-        ctx.extensions_mut().insert(FastlyRequestContext {
-            client_ip: Some(peer_ip),
-        });
+        ctx.extensions_mut().insert(RequestGeo::new(
+            Some(reader_ip),
+            Some(sample_geo("Springfield")),
+        ));
         let handler =
             Arc::new(
                 |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
             );
 
-        block_on(middleware.handle(ctx, Next::new(&[], &*handler))).expect("should succeed");
+        let response =
+            block_on(middleware.handle(ctx, Next::new(&[], &*handler))).expect("should succeed");
 
-        assert_eq!(
-            *lookups.lock().expect("should lock recorded geo lookups"),
-            vec![Some(reader_ip)],
-            "should look up geo using the resolved ClientInfo IP"
-        );
-    }
-
-    #[test]
-    fn finalize_handle_preserves_none_from_present_client_info() {
-        let peer_ip = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
-        let settings = settings_with_response_headers(vec![]);
-        let lookups = Arc::new(Mutex::new(Vec::new()));
-        let middleware = FinalizeResponseMiddleware::new(
-            Arc::new(settings),
-            Arc::new(RecordingGeo {
-                lookups: Arc::clone(&lookups),
-            }),
-        );
-        let mut ctx = empty_ctx();
-        ctx.extensions_mut().insert(ClientInfo::default());
-        ctx.extensions_mut().insert(FastlyRequestContext {
-            client_ip: Some(peer_ip),
-        });
-        let handler =
-            Arc::new(
-                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+        for (name, value) in [
+            ("x-geo-city", "Springfield"),
+            ("x-geo-info-available", "true"),
+        ] {
+            assert_eq!(
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok()),
+                Some(value),
+                "should report {name} from the entry point's geo"
             );
-
-        block_on(middleware.handle(ctx, Next::new(&[], &*handler))).expect("should succeed");
-
-        assert_eq!(
-            *lookups.lock().expect("should lock recorded geo lookups"),
-            vec![None],
-            "should preserve no IP from the authoritative ClientInfo"
-        );
-    }
-
-    #[test]
-    fn finalize_handle_uses_fastly_context_ip_when_client_info_is_absent() {
-        let peer_ip = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
-        let settings = settings_with_response_headers(vec![]);
-        let lookups = Arc::new(Mutex::new(Vec::new()));
-        let middleware = FinalizeResponseMiddleware::new(
-            Arc::new(settings),
-            Arc::new(RecordingGeo {
-                lookups: Arc::clone(&lookups),
-            }),
-        );
-        let mut ctx = empty_ctx();
-        ctx.extensions_mut().insert(FastlyRequestContext {
-            client_ip: Some(peer_ip),
-        });
-        let handler =
-            Arc::new(
-                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
-            );
-
-        block_on(middleware.handle(ctx, Next::new(&[], &*handler))).expect("should succeed");
-
-        assert_eq!(
-            *lookups.lock().expect("should lock recorded geo lookups"),
-            vec![Some(peer_ip)],
-            "should fall back to the Fastly request context IP"
-        );
+        }
     }
 
     #[test]
     fn finalize_handle_injects_geo_unavailable_on_ok_response() {
         let settings = settings_with_response_headers(vec![]);
-        let middleware =
-            FinalizeResponseMiddleware::new(Arc::new(settings), Arc::new(FixedGeo(None)));
+        let middleware = FinalizeResponseMiddleware::new(Arc::new(settings));
         let handler =
             Arc::new(
                 |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
@@ -780,8 +682,7 @@ mod tests {
     #[test]
     fn finalize_handle_marks_response_as_finalized() {
         let settings = settings_with_response_headers(vec![]);
-        let middleware =
-            FinalizeResponseMiddleware::new(Arc::new(settings), Arc::new(FixedGeo(None)));
+        let middleware = FinalizeResponseMiddleware::new(Arc::new(settings));
         let handler =
             Arc::new(
                 |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
@@ -803,8 +704,7 @@ mod tests {
     #[test]
     fn finalize_handle_absorbs_handler_error_and_injects_headers() {
         let settings = settings_with_response_headers(vec![]);
-        let middleware =
-            FinalizeResponseMiddleware::new(Arc::new(settings), Arc::new(FixedGeo(None)));
+        let middleware = FinalizeResponseMiddleware::new(Arc::new(settings));
         let handler = Arc::new(|_ctx: RequestContext| async move {
             Err::<Response, EdgeError>(EdgeError::service_unavailable("test error"))
         });
@@ -823,25 +723,22 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::panic)]
-    fn finalize_handle_skips_geo_lookup_for_401() {
-        struct PanicGeo;
-        impl PlatformGeo for PanicGeo {
-            fn lookup(&self, _: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-                panic!("should not call geo for 401 responses")
-            }
-        }
-
+    fn finalize_handle_withholds_geo_for_401() {
         let settings = settings_with_response_headers(vec![]);
-        let middleware = FinalizeResponseMiddleware::new(Arc::new(settings), Arc::new(PanicGeo));
+        let middleware = FinalizeResponseMiddleware::new(Arc::new(settings));
+        let mut ctx = empty_ctx();
+        ctx.extensions_mut().insert(RequestGeo::new(
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7))),
+            Some(sample_geo("Springfield")),
+        ));
         let handler = Arc::new(|_ctx: RequestContext| async move {
             let mut resp = empty_response();
             *resp.status_mut() = StatusCode::UNAUTHORIZED;
             Ok::<Response, EdgeError>(resp)
         });
 
-        let response = block_on(middleware.handle(empty_ctx(), Next::new(&[], &*handler)))
-            .expect("should succeed without calling geo");
+        let response =
+            block_on(middleware.handle(ctx, Next::new(&[], &*handler))).expect("should succeed");
 
         assert_eq!(
             response.status(),
@@ -854,7 +751,11 @@ mod tests {
                 .get("x-geo-info-available")
                 .and_then(|v| v.to_str().ok()),
             Some("false"),
-            "should set geo-unavailable header without calling geo for 401"
+            "should withhold the request geo from a 401"
+        );
+        assert!(
+            response.headers().get("x-geo-city").is_none(),
+            "should leave out the geo city on a 401"
         );
     }
 
@@ -869,8 +770,7 @@ mod tests {
         // collapsed them because fastly::Response uses set_header (last-wins).
         // This test verifies the EdgeZero middleware chain is header-transparent.
         let settings = settings_with_response_headers(vec![]);
-        let middleware =
-            FinalizeResponseMiddleware::new(Arc::new(settings), Arc::new(FixedGeo(None)));
+        let middleware = FinalizeResponseMiddleware::new(Arc::new(settings));
         let handler = Arc::new(|_ctx: RequestContext| async move {
             let resp = response_builder()
                 .header("set-cookie", "session=abc; Path=/; HttpOnly")

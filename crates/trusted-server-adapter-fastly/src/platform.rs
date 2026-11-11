@@ -565,9 +565,8 @@ fn apply_fastly_cache_intent(request: &mut fastly::Request, intent: &PlatformCac
 /// the origin response; it has no client-side redirect-follow mode. Consequently
 /// each trait call below performs exactly one underlying `.send()` or
 /// `.send_async()`, and an original 3xx remains visible to core. The host test
-/// environment cannot register a real Fastly backend, so the common
-/// `StubHttpClient` driver test records the one-send 3xx behavior while adapter
-/// tests cover request conversion and the single-send boundary.
+/// environment cannot register a real Fastly backend, so adapter tests cover
+/// request conversion and the single-send boundary.
 ///
 /// Deadline collection requires [`PlatformCacheIntent::Bypass`], which all
 /// auction requests use. This guarantees a direct SDK pending handle that can
@@ -772,6 +771,50 @@ impl PlatformGeo for FastlyPlatformGeo {
         Ok(client_ip
             .and_then(geo_lookup)
             .map(|geo| geo_from_fastly(&geo)))
+    }
+}
+
+/// The geo result the entry point looks up once for a request's resolved client IP.
+///
+/// `prepare` inserts it into the request extensions. The finalize middleware,
+/// the trace metadata, and the per-request services read it, so a request makes
+/// one host geo lookup however many steps use geo.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RequestGeo {
+    client_ip: Option<IpAddr>,
+    geo: Option<GeoInfo>,
+}
+
+impl RequestGeo {
+    /// Holds `geo` as the lookup result for `client_ip`.
+    pub(crate) fn new(client_ip: Option<IpAddr>, geo: Option<GeoInfo>) -> Self {
+        Self { client_ip, geo }
+    }
+
+    /// Looks up `client_ip` once with Fastly's geo database.
+    pub(crate) fn lookup_once(client_ip: Option<IpAddr>) -> Self {
+        let geo = client_ip
+            .and_then(geo_lookup)
+            .map(|geo| geo_from_fastly(&geo));
+        Self::new(client_ip, geo)
+    }
+
+    /// The request's geo, if the lookup found any.
+    pub(crate) fn geo(&self) -> Option<&GeoInfo> {
+        self.geo.as_ref()
+    }
+}
+
+impl PlatformGeo for RequestGeo {
+    /// Answers the request's own IP from the held result, without a host lookup.
+    ///
+    /// Any other IP is looked up with [`FastlyPlatformGeo`].
+    fn lookup(&self, client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+        if client_ip == self.client_ip {
+            Ok(self.geo.clone())
+        } else {
+            FastlyPlatformGeo.lookup(client_ip)
+        }
     }
 }
 

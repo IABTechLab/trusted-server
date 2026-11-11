@@ -38,14 +38,24 @@ pub(crate) struct FinalizeState {
 }
 
 /// Sends the queued telemetry, then runs pull sync for `state`, on a fresh client and clock.
+///
+/// `log_context` ends each failure log, so it matches the delivered response.
 pub(crate) fn run_post_delivery(
     state: Option<FinalizeState>,
     queue: &TelemetryQueue,
     settings: &Settings,
+    log_context: &str,
 ) {
     let client = HttpClient::with_client(FastlyOutboundClient::new()).with_proxy_marker(false);
     let clock = MonotonicClock::default();
-    futures::executor::block_on(post_delivery_work(state, queue, settings, &client, &clock));
+    futures::executor::block_on(post_delivery_work(
+        state,
+        queue,
+        settings,
+        &client,
+        &clock,
+        log_context,
+    ));
 }
 
 /// The post-delivery work itself, on `client` and `clock`: telemetry, then pull sync.
@@ -55,10 +65,11 @@ async fn post_delivery_work(
     settings: &Settings,
     client: &HttpClient,
     clock: &MonotonicClock,
+    log_context: &str,
 ) {
-    send_queued_batches(client, &settings.tinybird, queue).await;
+    send_queued_batches(client, &settings.tinybird, queue, log_context).await;
     if let Some(state) = state {
-        pull_sync(state, settings, client, clock).await;
+        pull_sync(state, settings, client, clock, log_context).await;
     }
 }
 
@@ -68,6 +79,7 @@ async fn pull_sync(
     settings: &Settings,
     client: &HttpClient,
     clock: &MonotonicClock,
+    log_context: &str,
 ) {
     let FinalizeState {
         partner_registry,
@@ -78,9 +90,11 @@ async fn pull_sync(
     }
 
     let prepared_context = build_pull_sync_context(&ec_state.ec_context, &partner_registry);
-    let Some((context, kv)) =
-        prepare_pull_sync_after_send(prepared_context, || require_identity_graph(settings))
-    else {
+    let Some((context, kv)) = prepare_pull_sync_after_send(
+        prepared_context,
+        || require_identity_graph(settings),
+        log_context,
+    ) else {
         return;
     };
 
@@ -101,6 +115,7 @@ async fn pull_sync(
 fn prepare_pull_sync_after_send<F>(
     context: Option<PullSyncContext>,
     graph_factory: F,
+    log_context: &str,
 ) -> Option<(PullSyncContext, KvIdentityGraph)>
 where
     F: FnOnce() -> Result<KvIdentityGraph, Report<TrustedServerError>>,
@@ -109,7 +124,7 @@ where
     let kv = match graph_factory() {
         Ok(kv) => kv,
         Err(err) => {
-            log::debug!("Pull sync: identity graph unavailable, skipping: {err:?}");
+            log::debug!("Pull sync: identity graph unavailable, skipping: {err:?}{log_context}");
             return None;
         }
     };
@@ -118,8 +133,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, PoisonError};
-
     use edgezero_adapter_fastly::delivery::DeliveryError;
     use edgezero_core::http::{Method, StatusCode};
     use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink as _};
@@ -149,20 +162,16 @@ mod tests {
         }
     }
 
-    /// A queue holding the NDJSON the queueing sink wrote for one auction.
+    /// A queue holding the NDJSON the queueing sink wrote for one auction, and that body.
     fn queue_with_one_auction() -> (TelemetryQueue, String) {
         let queue = TelemetryQueue::default();
-        let sink = QueueingTelemetrySink::new(&enabled_config(), Arc::clone(&queue));
-        futures::executor::block_on(
-            sink.emit_auction_events(&test_services(), AuctionEventBatch::new(vec![test_row()])),
-        )
-        .expect("should queue the auction's telemetry");
-        let body = queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .first()
-            .cloned()
-            .expect("should queue one body");
+        let sink = QueueingTelemetrySink::new(&enabled_config(), queue.clone());
+        let batch = AuctionEventBatch::new(vec![test_row()]);
+        let body = batch
+            .to_ndjson(enabled_config().max_body_bytes)
+            .expect("should serialize the auction's telemetry");
+        futures::executor::block_on(sink.emit_auction_events(&test_services(), batch))
+            .expect("should queue the auction's telemetry");
         (queue, body)
     }
 
@@ -189,6 +198,7 @@ mod tests {
                 &settings,
                 &client.http_client(),
                 &clock.monotonic_clock(),
+                "",
             ));
         });
 
@@ -212,6 +222,7 @@ mod tests {
                 &settings,
                 &client.http_client(),
                 &clock.monotonic_clock(),
+                "",
             ));
         };
 
@@ -224,11 +235,7 @@ mod tests {
         );
 
         client.assert_no_requests();
-        assert_eq!(
-            queue.lock().unwrap_or_else(PoisonError::into_inner).len(),
-            1,
-            "should leave the telemetry unsent"
-        );
+        assert_eq!(queue.take().len(), 1, "should leave the telemetry unsent");
     }
 
     #[test]
@@ -248,6 +255,7 @@ mod tests {
             &settings_with_tinybird(),
             &client.http_client(),
             &clock.monotonic_clock(),
+            "",
         ));
 
         let requests = client.requests();
@@ -255,25 +263,23 @@ mod tests {
             panic!("should send the queued auction once, got {requests:?}");
         };
         assert_events_request(request, &body);
-        assert!(
-            queue
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_empty(),
-            "should drain the queue"
-        );
+        assert!(queue.take().is_empty(), "should drain the queue");
     }
 
     #[test]
     fn pull_sync_noop_states_skip_post_send_graph_factory() {
         let calls = std::cell::Cell::new(0);
-        let result = prepare_pull_sync_after_send(None, || {
-            calls.set(calls.get() + 1);
-            Err(Report::new(TrustedServerError::KvStore {
-                store_name: "unexpected".to_owned(),
-                message: "graph factory should not run".to_owned(),
-            }))
-        });
+        let result = prepare_pull_sync_after_send(
+            None,
+            || {
+                calls.set(calls.get() + 1);
+                Err(Report::new(TrustedServerError::KvStore {
+                    store_name: "unexpected".to_owned(),
+                    message: "graph factory should not run".to_owned(),
+                }))
+            },
+            "",
+        );
         assert!(
             result.is_none(),
             "a skipped pull-sync plan should return none"
@@ -288,10 +294,11 @@ mod tests {
 
         clock.drive(post_delivery_work(
             None,
-            &TelemetryQueue::new(Mutex::new(Vec::new())),
+            &TelemetryQueue::default(),
             &settings_with_tinybird(),
             &client.http_client(),
             &clock.monotonic_clock(),
+            "",
         ));
 
         client.assert_no_requests();
@@ -399,6 +406,7 @@ mod tests {
                     &settings,
                     &client.http_client(),
                     &clock.monotonic_clock(),
+                    "",
                 ));
             },
         );
@@ -436,6 +444,7 @@ mod tests {
                     &settings,
                     &client.http_client(),
                     &clock.monotonic_clock(),
+                    "",
                 ));
             },
         );

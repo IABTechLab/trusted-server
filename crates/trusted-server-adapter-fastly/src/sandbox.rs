@@ -175,13 +175,19 @@ impl SandboxCounters {
     /// It matches the counters a committed response carries, so a failure
     /// after commitment can be reconciled with that response.
     pub(crate) fn log_context(&self) -> String {
-        format!(
-            " [instance={} ordinal={} request={}]",
-            instance_id(),
-            self.ordinal,
-            self.request_id
-        )
+        request_log_context(self.ordinal, &self.request_id)
     }
+}
+
+/// The ` [instance=.. ordinal=.. request=..]` suffix for request `ordinal`.
+///
+/// The entry point uses it before the counters are captured, so the
+/// assembly failure log matches [`SandboxCounters::log_context`].
+pub(crate) fn request_log_context(ordinal: u64, request_id: &str) -> String {
+    format!(
+        " [instance={} ordinal={ordinal} request={request_id}]",
+        instance_id()
+    )
 }
 
 /// Guest-instance identifier used to attribute requests to a sandbox.

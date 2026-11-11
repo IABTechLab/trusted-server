@@ -49,8 +49,6 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
-import { resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 
 const USAGE = `Usage:
@@ -584,10 +582,9 @@ async function main() {
 }
 
 // Run only as a command, so the test file can import the compare logic.
-if (
-  process.argv[1] !== undefined &&
-  fileURLToPath(import.meta.url) === resolve(process.argv[1])
-) {
+// `import.meta.main` holds through a symlinked path, where comparing the
+// module URL with `process.argv[1]` would skip `main` and exit 0 silently.
+if (import.meta.main) {
   try {
     const code = await main()
     if (code !== undefined) {

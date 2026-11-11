@@ -1,11 +1,55 @@
 import assert from 'node:assert/strict'
-import { test } from 'node:test'
+import { spawnSync } from 'node:child_process'
+import { mkdtempSync, rmSync, symlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { after, test } from 'node:test'
+import { fileURLToPath } from 'node:url'
 
 import {
   InputError,
   classifyDifferences,
   parseExpected,
 } from './fastly-response-diff.mjs'
+
+const SCRIPT = fileURLToPath(
+  new URL('./fastly-response-diff.mjs', import.meta.url)
+)
+
+const scratch = mkdtempSync(path.join(tmpdir(), 'fastly-response-diff-'))
+after(() => rmSync(scratch, { recursive: true, force: true }))
+
+let links = 0
+
+/** Runs the script through a symlink to it, the way a symlinked checkout or macOS /tmp would. */
+function runThroughSymlink(args) {
+  links += 1
+  const link = path.join(scratch, `linked-${links}.mjs`)
+  symlinkSync(SCRIPT, link)
+  return spawnSync(process.execPath, [link, ...args], { encoding: 'utf8' })
+}
+
+test('the script runs as a command through a symlinked path', () => {
+  const result = runThroughSymlink(['--help'])
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(
+    result.stdout,
+    /^Usage:/,
+    'should print the usage instead of skipping main'
+  )
+})
+
+test('the script rejects bad arguments through a symlinked path', () => {
+  const result = runThroughSymlink(['http://127.0.0.1:1'])
+
+  assert.equal(result.status, 2, 'should exit 2 on bad input, not 0')
+  assert.match(
+    result.stderr,
+    /fastly-response-diff: Usage:/,
+    'should report the bad input'
+  )
+})
 
 const REQUESTS = [{ id: 'trace-method' }, { id: 'head-root' }]
 
