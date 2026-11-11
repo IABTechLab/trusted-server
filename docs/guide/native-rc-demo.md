@@ -5,7 +5,8 @@ compatibility. Its TS starting point is historical main
 `2dd968aeebeb2cc0d5110115f64e0ad58e2e1d13`, the contributor-documentation update
 already merged into the original demo. The original final demo is TS
 `2423a2ed2aefc2d4905219efd5910c9af5f2a930` plus separately preserved dirty inputs.
-All selected EdgeZero declarations use the original public demo revision
+All selected EdgeZero declarations use the `ts-axum-rc-20261111` tag, which
+resolves to the original public demo revision
 `83d7a6296d285e135c4ea70021b19e6c8dca7e9f`, available in draft EdgeZero #431.
 
 This is not a new qualification of that historical combination. Fresh checks
