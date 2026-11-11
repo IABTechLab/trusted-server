@@ -226,14 +226,6 @@ struct StubPendingResponse {
 pub(crate) struct StubHttpClient {
     calls: Mutex<Vec<String>>,
     responses: Mutex<VecDeque<StubHttpResponse>>,
-    // Queued select() outcomes; true makes that select return ready: Err.
-    select_errors: Mutex<VecDeque<bool>>,
-    // Reported by supports_streaming_responses(); set true to emulate Fastly's
-    // streaming response support.
-    streaming_responses_supported: std::sync::atomic::AtomicBool,
-    pending_streaming_responses_supported: std::sync::atomic::AtomicBool,
-    cache_intents: Mutex<Vec<PlatformCacheIntent>>,
-    stream_response_flags: Mutex<Vec<bool>>,
 }
 
 struct StubHttpResponse {
@@ -247,24 +239,7 @@ impl StubHttpClient {
         Self {
             calls: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::new()),
-            select_errors: Mutex::new(VecDeque::new()),
-            streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
-            pending_streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
-            cache_intents: Mutex::new(Vec::new()),
-            stream_response_flags: Mutex::new(Vec::new()),
         }
-    }
-
-    /// Make `supports_streaming_responses()` report the given value.
-    pub fn set_streaming_responses_supported(&self, supported: bool) {
-        self.streaming_responses_supported
-            .store(supported, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Make `supports_pending_streaming_responses()` report the given value.
-    pub fn set_pending_streaming_responses_supported(&self, supported: bool) {
-        self.pending_streaming_responses_supported
-            .store(supported, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Queue a canned response by status code and body bytes.
@@ -293,70 +268,25 @@ impl StubHttpClient {
             });
     }
 
-    /// Inject a `select()` error: the next call to `select()` will return
-    /// `ready: Err(...)` with the failed request's backend name in
-    /// `failed_backend_name`. The corresponding queued response is consumed.
-    pub fn push_select_error(&self) {
-        self.select_errors
-            .lock()
-            .expect("should lock select_errors")
-            .push_back(true);
-    }
-
     /// Return backend names recorded across all `send` calls, in order.
     pub fn recorded_backend_names(&self) -> Vec<String> {
         self.calls.lock().expect("should lock calls").clone()
-    }
-
-    /// Return the cache intent captured per `send` or `send_async` call, in order.
-    pub(crate) fn recorded_cache_intents(&self) -> Vec<PlatformCacheIntent> {
-        self.cache_intents
-            .lock()
-            .expect("should lock cache intents")
-            .clone()
-    }
-
-    /// Return streaming-response flags captured per `send` call, in order.
-    pub fn recorded_stream_response_flags(&self) -> Vec<bool> {
-        self.stream_response_flags
-            .lock()
-            .expect("should lock stream response flags")
-            .clone()
     }
 }
 
 // ?Send matches PlatformHttpClient. See http.rs for the full rationale.
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for StubHttpClient {
-    fn supports_streaming_responses(&self) -> bool {
-        self.streaming_responses_supported
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn supports_pending_streaming_responses(&self) -> bool {
-        self.pending_streaming_responses_supported
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     async fn send(
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        let stream_response = request.stream_response && self.supports_streaming_responses();
         let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         self.calls
             .lock()
             .expect("should lock calls")
             .push(request.backend_name.clone());
 
-        self.cache_intents
-            .lock()
-            .expect("should lock cache intents")
-            .push(request.cache_intent.clone());
-        self.stream_response_flags
-            .lock()
-            .expect("should lock stream response flags")
-            .push(request.stream_response);
         let response = self
             .responses
             .lock()
@@ -372,7 +302,6 @@ impl PlatformHttpClient for StubHttpClient {
                 body: response.body,
                 headers: response.headers,
             },
-            stream_response,
             request_is_head,
         )?;
 
@@ -383,26 +312,17 @@ impl PlatformHttpClient for StubHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-        if request.stream_response && !self.supports_pending_streaming_responses() {
+        if request.stream_response {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("streaming responses are not supported with StubHttpClient send_async"));
         }
 
         let backend_name = request.backend_name.clone();
-        let stream_response = request.stream_response;
         let request_method = request.request.method().clone();
         self.calls
             .lock()
             .expect("should lock calls")
             .push(backend_name.clone());
-        self.cache_intents
-            .lock()
-            .expect("should lock cache intents")
-            .push(request.cache_intent.clone());
-        self.stream_response_flags
-            .lock()
-            .expect("should lock stream response flags")
-            .push(stream_response);
         let response = self
             .responses
             .lock()
@@ -418,7 +338,7 @@ impl PlatformHttpClient for StubHttpClient {
             headers: response.headers,
         };
         Ok(PlatformPendingRequest::new(pending)
-            .with_response_handling(stream_response, request_method)
+            .with_response_handling(false, request_method)
             .with_backend_name(backend_name))
     }
 
@@ -470,14 +390,6 @@ impl PlatformHttpClient for StubHttpClient {
                 .attach("select called with empty pending_requests list"));
         }
 
-        if pending_requests
-            .iter()
-            .any(PlatformPendingRequest::stream_response)
-        {
-            return Err(Report::new(PlatformError::HttpClient)
-                .attach("stream-marked pending request requires direct wait"));
-        }
-
         let ready_platform = pending_requests.remove(0);
         let stub = ready_platform
             .downcast::<StubPendingResponse>()
@@ -499,24 +411,7 @@ impl PlatformHttpClient for StubHttpClient {
             })
             .collect();
 
-        let should_error = self
-            .select_errors
-            .lock()
-            .expect("should lock select_errors")
-            .pop_front()
-            .unwrap_or(false);
-
-        if should_error {
-            return Ok(PlatformSelectResult {
-                ready: Err(Report::new(PlatformError::HttpClient).attach(format!(
-                    "injected select error for backend '{ready_backend_name}'"
-                ))),
-                remaining,
-                failed_backend_name: Some(ready_backend_name),
-            });
-        }
-
-        let edge_response = build_stub_pending_response(stub, false, false)?;
+        let edge_response = build_stub_pending_response(stub, false)?;
 
         let ready = Ok(PlatformResponse::new(edge_response).with_backend_name(ready_backend_name));
 
@@ -531,14 +426,13 @@ impl PlatformHttpClient for StubHttpClient {
         &self,
         pending: PlatformPendingRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        let stream_response = pending.stream_response();
         let request_is_head = pending.request_method() == Some(&edgezero_core::http::Method::HEAD);
         let stub = pending.downcast::<StubPendingResponse>().map_err(|_| {
             Report::new(PlatformError::HttpClient)
                 .attach("unexpected inner type in StubHttpClient::wait")
         })?;
         let backend_name = stub.backend_name.clone();
-        let response = build_stub_pending_response(stub, stream_response, request_is_head)?;
+        let response = build_stub_pending_response(stub, request_is_head)?;
         Ok(PlatformResponse::new(response).with_backend_name(backend_name))
     }
 }
@@ -548,7 +442,6 @@ fn validate_deadline_cache_bypass(
     pending: PlatformPendingRequest,
 ) -> Result<PlatformPendingRequest, (Option<String>, Report<PlatformError>)> {
     let backend_name = pending.backend_name().map(str::to_owned);
-    let stream_response = pending.stream_response();
     let request_method = pending.request_method().cloned();
     let stub = pending.downcast::<StubPendingResponse>().map_err(|_| {
         (
@@ -569,14 +462,13 @@ fn validate_deadline_cache_bypass(
         pending = pending.with_backend_name(name);
     }
     if let Some(method) = request_method {
-        pending = pending.with_response_handling(stream_response, method);
+        pending = pending.with_response_handling(false, method);
     }
     Ok(pending)
 }
 
 fn build_stub_pending_response(
     stub: StubPendingResponse,
-    stream_response: bool,
     request_is_head: bool,
 ) -> Result<edgezero_core::http::Response, Report<PlatformError>> {
     let mut builder = edgezero_core::http::response_builder().status(stub.status);
@@ -586,12 +478,10 @@ fn build_stub_pending_response(
     let carries_body = !request_is_head
         && !(100..200).contains(&stub.status)
         && !matches!(stub.status, 204 | 205 | 304);
-    let body = if !carries_body {
-        edgezero_core::body::Body::empty()
-    } else if stream_response {
-        edgezero_core::body::Body::stream(futures::stream::iter([bytes::Bytes::from(stub.body)]))
-    } else {
+    let body = if carries_body {
         edgezero_core::body::Body::from(stub.body)
+    } else {
+        edgezero_core::body::Body::empty()
     };
     builder.body(body).change_context(PlatformError::HttpClient)
 }
@@ -918,11 +808,6 @@ mod tests {
             vec!["stub-backend"],
             "should record the backend name"
         );
-        assert_eq!(
-            stub.recorded_cache_intents(),
-            vec![PlatformCacheIntent::Default],
-            "should record the default cache intent"
-        );
     }
 
     #[test]
@@ -1008,45 +893,6 @@ mod tests {
             names,
             vec!["backend-a", "backend-b"],
             "should record both send_async calls in order"
-        );
-        assert_eq!(
-            stub.recorded_cache_intents(),
-            vec![PlatformCacheIntent::Default, PlatformCacheIntent::Bypass],
-            "should record both send_async cache intents in order"
-        );
-    }
-
-    #[test]
-    fn stub_http_client_pending_stream_wait_is_direct_and_preserves_streaming() {
-        let stub = StubHttpClient::new();
-        stub.set_streaming_responses_supported(true);
-        stub.set_pending_streaming_responses_supported(true);
-        stub.push_response(200, b"streamed publisher body".to_vec());
-        // A direct single-handle wait must not route through select().
-        stub.push_select_error();
-        let req = PlatformHttpRequest::new(
-            request_builder()
-                .method("GET")
-                .uri("https://example.com/image.jpg")
-                .body(Body::empty())
-                .expect("should build request"),
-            "stub-backend",
-        )
-        .with_stream_response();
-
-        let pending = futures::executor::block_on(stub.send_async(req))
-            .expect("should start async streaming-response request");
-        let response = futures::executor::block_on(stub.wait(pending))
-            .expect("should wait directly for streaming response");
-
-        assert!(
-            response.response.body().is_stream(),
-            "should preserve the pending response body as a stream"
-        );
-        assert_eq!(
-            stub.recorded_stream_response_flags(),
-            vec![true],
-            "should record the streaming response request"
         );
     }
 

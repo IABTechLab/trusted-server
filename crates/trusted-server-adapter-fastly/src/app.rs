@@ -99,6 +99,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
 };
+use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::AuctionTelemetrySink;
@@ -908,6 +909,7 @@ async fn dispatch_fallback(
                     PublisherOriginOptions {
                         edge_header: EdgeCacheHeader::SurrogateControl,
                         input_cap: None,
+                        response_decoding: ResponseDecoding::Original,
                     },
                 )
                 .await
@@ -1475,6 +1477,7 @@ mod tests {
         HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
     };
     use edgezero_core::key_value_store::NoopKvStore;
+    use edgezero_core::outbound::ResponseDecoding;
     use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
@@ -3338,6 +3341,7 @@ mod tests {
                         PublisherOriginOptions {
                             edge_header: EdgeCacheHeader::SurrogateControl,
                             input_cap: None,
+                            response_decoding: ResponseDecoding::Original,
                         },
                     )
                     .await

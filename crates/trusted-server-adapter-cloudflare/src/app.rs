@@ -8,6 +8,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
 };
+use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -595,6 +596,12 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                     PublisherOriginOptions {
                         edge_header: EdgeCacheHeader::CloudflareCdnCacheControl,
                         input_cap: Some(input_cap),
+                        // Workers rewrites the inbound `Accept-Encoding` (to `br, gzip`
+                        // whether the client sent none or `identity`), so the client's
+                        // real preference is unknown here and the origin answers in a
+                        // coding the client may not accept. Decoding the origin body
+                        // serves identity bytes whatever the client sent.
+                        response_decoding: ResponseDecoding::Decode,
                     },
                 )
                 .await

@@ -34,7 +34,7 @@ use cookie::CookieJar;
 use edgezero_core::body::{Body as EdgeBody, BodyPayload};
 use edgezero_core::error::EdgeError;
 use edgezero_core::outbound::{
-    OutboundCachePolicy, OutboundRequest, OutboundResponse, OutboundScopeOwner,
+    OutboundCachePolicy, OutboundRequest, OutboundResponse, OutboundScopeOwner, ResponseDecoding,
 };
 use error_stack::{Report, ResultExt};
 use flate2::read::ZlibDecoder;
@@ -4902,6 +4902,13 @@ pub struct PublisherOriginOptions {
     /// raw bodies are collected under it, and processed HTML is decoded under
     /// it. `None` on Fastly, which streams the response.
     pub input_cap: Option<u64>,
+    /// Whether the origin body arrives in the coding the origin sent.
+    ///
+    /// [`ResponseDecoding::Original`] keeps the origin coding, so processed HTML
+    /// is re-encoded with it and raw bodies relay their encoded bytes.
+    /// [`ResponseDecoding::Decode`] hands Trusted Server identity bytes, bounded
+    /// at `input_cap` once decoded.
+    pub response_decoding: ResponseDecoding,
 }
 
 /// Whether `override_authority` names a different authority than `origin`.
@@ -4928,9 +4935,11 @@ fn host_override_differs(override_authority: &str, origin: &url::Url) -> bool {
 
 /// Builds the publisher origin request from the reader's request.
 ///
-/// The request keeps the inbound body and its read deadline, uploads at most
-/// [`PUBLISHER_UPLOAD_BYTES`], streams the response in its original coding,
-/// and caps the encoded response at `input_cap` when the adapter collects it.
+/// The request keeps the inbound body and its read deadline and uploads at most
+/// [`PUBLISHER_UPLOAD_BYTES`]. With [`ResponseDecoding::Original`] it streams
+/// the response in its original coding. With [`ResponseDecoding::Decode`] it
+/// decodes the response, and an adapter that collects it buffers it under
+/// `input_cap`. Either way the encoded response is capped at `input_cap`.
 ///
 /// # Errors
 ///
@@ -4941,7 +4950,7 @@ fn publisher_origin_request(
     target: Uri,
     host_authority_override: Option<&str>,
     cache_policy: OutboundCachePolicy,
-    input_cap: Option<u64>,
+    origin: PublisherOriginOptions,
 ) -> Result<OutboundRequest, Report<TrustedServerError>> {
     let forward_error = |error| {
         outbound_error(
@@ -4957,9 +4966,13 @@ fn publisher_origin_request(
         STREAMED_TIMEOUT,
     )
     .cache_policy(cache_policy)
-    .max_request_body_bytes(PUBLISHER_UPLOAD_BYTES);
-    if let Some(cap) = input_cap {
+    .max_request_body_bytes(PUBLISHER_UPLOAD_BYTES)
+    .response_decoding(origin.response_decoding);
+    if let Some(cap) = origin.input_cap {
         request = request.max_encoded_response_bytes(cap);
+        if origin.response_decoding == ResponseDecoding::Decode {
+            request = request.max_response_bytes(cap);
+        }
     }
     if let Some(authority) = host_authority_override {
         request = request
@@ -5073,19 +5086,7 @@ pub async fn handle_publisher_request(
     let active_ec_id = active_ec_id_owned.as_deref();
     let ec_id_owned = active_ec_id_owned.clone().filter(|_| ec_allowed);
     let ec_id = ec_id_owned.as_deref();
-    // A `Cookie` value that is not UTF-8 never reaches the origin: `EdgeZero` drops the
-    // field at dispatch and warns with its name. The forward still goes out, so the
-    // request is read here as if it carried no cookies.
-    let cookies_are_text = req
-        .headers()
-        .get_all(header::COOKIE)
-        .iter()
-        .all(|value| value.to_str().is_ok());
-    let cookie_jar = if cookies_are_text {
-        handle_request_cookies(&req)?
-    } else {
-        None
-    };
+    let cookie_jar = handle_request_cookies(&req)?;
     if let Some(registry) = auction.registry {
         ec_context.validate_pull_sync_marker(settings, registry);
     }
@@ -5103,7 +5104,6 @@ pub async fn handle_publisher_request(
         }));
     }
     let origin_host = settings.publisher.origin_host();
-    let origin_host_header = settings.publisher.origin_host_header();
     // Only an override that names another authority changes what the origin
     // receives. An equivalent one would change nothing but Fastly's backend
     // identity, so it sets none.
@@ -5112,6 +5112,10 @@ pub async fn handle_publisher_request(
         .origin_host_header_override
         .as_deref()
         .filter(|authority| host_override_differs(authority, &parsed_origin));
+    // The authority the origin receives as `Host`, so an equivalent override reads
+    // as no host change to the header rewrite and the template identity.
+    let origin_host_header =
+        host_authority_override.map_or_else(|| origin_host.clone(), str::to_owned);
     let origin_path_and_query = req
         .uri()
         .path_and_query()
@@ -5235,18 +5239,12 @@ pub async fn handle_publisher_request(
                 config.origin_is_cookie_independent(),
             )
         });
-    // A forward whose cookies the origin cannot see must not key or share a template.
-    let cookie_decision = if cookies_are_text {
-        evaluate_cookie_policy(
-            req.headers(),
-            key_cookie_names,
-            bypass_cookie_names,
-            cookie_independent,
-        )
-    } else {
-        TemplateCookieDecision::Bypass
-    };
-    let (cookie_disqualifies, cookie_values) = match cookie_decision {
+    let (cookie_disqualifies, cookie_values) = match evaluate_cookie_policy(
+        req.headers(),
+        key_cookie_names,
+        bypass_cookie_names,
+        cookie_independent,
+    ) {
         TemplateCookieDecision::Bypass => (true, Vec::new()),
         TemplateCookieDecision::Eligible(values) => (false, values),
     };
@@ -5407,7 +5405,7 @@ pub async fn handle_publisher_request(
         target_uri,
         host_authority_override,
         origin_cache_policy,
-        origin.input_cap,
+        origin,
     )?);
     let origin_client = services.outbound_client();
     let eid_cookie_may_need_persistence = cookie_jar
@@ -8178,7 +8176,9 @@ mod tests {
     const TEST_BUFFERED_INPUT_CAP: Option<u64> = Some(16 * 1024 * 1024);
 
     /// Host of the publisher origin in [`create_test_settings`].
-    const TEST_ORIGIN_HOST: &str = "origin.test-publisher.com";
+    fn test_origin_host() -> String {
+        create_test_settings().publisher.origin_host()
+    }
 
     /// The scripted upstream a publisher test sends its origin request and bids through.
     ///
@@ -8190,7 +8190,7 @@ mod tests {
     struct PublisherUpstream {
         clock: TestClock,
         client: ScriptedHttpClient,
-        origin_host: &'static str,
+        origin_host: String,
         origin_replies: Arc<Mutex<std::collections::VecDeque<ScriptedReply>>>,
         observer: Arc<Mutex<Option<UpstreamObserver>>>,
     }
@@ -8201,11 +8201,13 @@ mod tests {
     impl PublisherUpstream {
         /// An upstream whose origin is the [`create_test_settings`] origin.
         fn new() -> Self {
-            Self::for_origin(TEST_ORIGIN_HOST)
+            Self::for_origin(&test_origin_host())
         }
 
         /// An upstream whose origin answers requests to `origin_host`.
-        fn for_origin(origin_host: &'static str) -> Self {
+        fn for_origin(origin_host: &str) -> Self {
+            let origin_host = origin_host.to_owned();
+            let answered_host = origin_host.clone();
             let clock = TestClock::new();
             let script = ScriptedHttpClient::new(&clock);
             let rearm = script.clone();
@@ -8217,7 +8219,7 @@ mod tests {
             // Each origin request takes the next queued answer as it is recorded,
             // before the script looks its reply up.
             let client = script.with_request_observer(move |request| {
-                if request.uri.host() == Some(origin_host) {
+                if request.uri.host() == Some(answered_host.as_str()) {
                     let next = queued
                         .lock()
                         .expect("should lock the queued origin replies")
@@ -8280,7 +8282,7 @@ mod tests {
             self.client
                 .requests()
                 .into_iter()
-                .filter(|request| request.uri.host() == Some(self.origin_host))
+                .filter(|request| request.uri.host() == Some(self.origin_host.as_str()))
                 .collect()
         }
 
@@ -8918,6 +8920,7 @@ mod tests {
             PublisherOriginOptions {
                 edge_header: EdgeCacheHeader::SurrogateControl,
                 input_cap: None,
+                response_decoding: ResponseDecoding::Original,
             },
         )
         .await;
@@ -8951,7 +8954,7 @@ mod tests {
             && http
                 .origin_requests()
                 .first()
-                .is_some_and(|request| request.host_authority == "origin.test-publisher.com")
+                .is_some_and(|request| request.host_authority == test_origin_host())
             && recorded_headers.first().is_some_and(|headers| {
                 let header_value = |name: &str| {
                     headers
@@ -9138,6 +9141,7 @@ mod tests {
             PublisherOriginOptions {
                 edge_header: EdgeCacheHeader::SurrogateControl,
                 input_cap: None,
+                response_decoding: ResponseDecoding::Original,
             },
         )
         .await;
@@ -11032,6 +11036,7 @@ mod tests {
             PublisherOriginOptions {
                 edge_header: EdgeCacheHeader::SurrogateControl,
                 input_cap: None,
+                response_decoding: ResponseDecoding::Original,
             },
         )
         .await
@@ -12252,6 +12257,7 @@ mod tests {
                 PublisherOriginOptions {
                     edge_header: EdgeCacheHeader::SMaxageFallback,
                     input_cap: None,
+                    response_decoding: ResponseDecoding::Original,
                 },
             )
             .await
@@ -12364,6 +12370,7 @@ mod tests {
                         PublisherOriginOptions {
                             edge_header: EdgeCacheHeader::SMaxageFallback,
                             input_cap: None,
+                            response_decoding: ResponseDecoding::Original,
                         },
                     )
                     .await
@@ -12484,6 +12491,7 @@ mod tests {
                     PublisherOriginOptions {
                         edge_header: EdgeCacheHeader::SMaxageFallback,
                         input_cap: None,
+                        response_decoding: ResponseDecoding::Original,
                     },
                 )
                 .await
@@ -12568,6 +12576,7 @@ mod tests {
                 PublisherOriginOptions {
                     edge_header: EdgeCacheHeader::SMaxageFallback,
                     input_cap: None,
+                    response_decoding: ResponseDecoding::Original,
                 },
             )
             .await
@@ -12698,6 +12707,7 @@ mod tests {
                 PublisherOriginOptions {
                     edge_header: EdgeCacheHeader::SMaxageFallback,
                     input_cap: None,
+                    response_decoding: ResponseDecoding::Original,
                 },
             )
             .await
@@ -13276,6 +13286,7 @@ mod tests {
                     PublisherOriginOptions {
                         edge_header: EdgeCacheHeader::SMaxageFallback,
                         input_cap: None,
+                        response_decoding: ResponseDecoding::Original,
                     },
                 )
                 .await
@@ -14581,6 +14592,7 @@ mod tests {
                 PublisherOriginOptions {
                     edge_header: EdgeCacheHeader::SMaxageFallback,
                     input_cap: None,
+                    response_decoding: ResponseDecoding::Original,
                 },
             )
             .await
@@ -14750,6 +14762,7 @@ mod tests {
                 PublisherOriginOptions {
                     edge_header: EdgeCacheHeader::SMaxageFallback,
                     input_cap: None,
+                    response_decoding: ResponseDecoding::Original,
                 },
             )
             .await
@@ -15038,16 +15051,6 @@ mod tests {
                     HeaderValue::from_bytes(field).expect("should build cookie field"),
                 );
             }
-            request
-        }
-
-        // Exercise raw fields at the prepared-request boundary. Ordinary diagnostics
-        // preparation removes invalid fields/empty pairs before generic cookie handling.
-        fn prepared_cookie_policy_request(fields: &[&[u8]]) -> Request<EdgeBody> {
-            let mut request = cookie_policy_request(fields);
-            request.extensions_mut().insert(
-                crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision::default(),
-            );
             request
         }
 
@@ -15370,13 +15373,12 @@ mod tests {
 
         #[tokio::test]
         async fn template_cookie_publisher_malformed_later_fields_and_duplicates_bypass() {
+            // Request preparation already drops non-UTF-8 fields and empty pairs, so
+            // these are the malformed shapes that reach the evaluator.
             for fields in [
-                vec![b"ab_bucket=A".as_slice(), b"unknown=\xff".as_slice()],
                 vec![b"ab_bucket=A".as_slice(), b"ab_bucket=B".as_slice()],
                 vec![b"ab_bucket=A; ab_bucket=A".as_slice()],
                 vec![b"ab_bucket=A; broken".as_slice()],
-                vec![b"ab_bucket=A;".as_slice()],
-                vec![b"ab_bucket=A".as_slice(), b"".as_slice()],
             ] {
                 for warm in [false, true] {
                     let settings = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
@@ -15403,12 +15405,7 @@ mod tests {
                     let lookups = looked_up_cache_keys(&cache).len();
                     let stores = stored_cache_keys(&cache).len();
                     queue_shareable_html(&stub);
-                    let response = run(
-                        &settings,
-                        &services,
-                        prepared_cookie_policy_request(&fields),
-                    )
-                    .await;
+                    let response = run(&settings, &services, cookie_policy_request(&fields)).await;
                     assert_eq!(
                         response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
                         "bypass-request",
@@ -15432,56 +15429,6 @@ mod tests {
                     );
                 }
             }
-        }
-
-        #[tokio::test]
-        async fn template_cookie_publisher_non_utf8_cookie_bypasses_and_forwards_without_cookie() {
-            let settings = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
-            let stub = PublisherUpstream::new();
-            let cache = Arc::new(MemoryTemplateCache::default());
-            let services = services(&stub, Arc::clone(&cache));
-            queue_shareable_html(&stub);
-            let orchestrator = crate::auction::build_orchestrator(&settings)
-                .expect("should build the auction orchestrator");
-            let mut ec_context =
-                EcContext::new_for_test(None, crate::consent::ConsentContext::default());
-            let (response, _owner) = handle_publisher_request(
-                &settings,
-                &services,
-                None,
-                &mut ec_context,
-                AuctionDispatch {
-                    integration_registry: &IntegrationRegistry::empty_for_tests(),
-                    orchestrator: &orchestrator,
-                    slots: &[article_slot()],
-                    registry: None,
-                },
-                prepared_cookie_policy_request(&[b"ab_bucket=\xff"]),
-                PublisherOriginOptions {
-                    edge_header: EdgeCacheHeader::SMaxageFallback,
-                    input_cap: None,
-                },
-            )
-            .await
-            .expect("should forward a request whose cookie is not UTF-8");
-            assert!(
-                matches!(response, PublisherResponse::Stream { .. }),
-                "should serve the origin document"
-            );
-            assert!(
-                looked_up_cache_keys(&cache).is_empty(),
-                "should not key a shared template on a cookie the origin never sees"
-            );
-            assert!(
-                stored_cache_keys(&cache).is_empty(),
-                "should not store a template for a cookie the origin never sees"
-            );
-            let forwarded = stub.origin_requests();
-            assert_eq!(forwarded.len(), 1, "should reach the origin once");
-            assert!(
-                !forwarded[0].headers.contains_key(header::COOKIE),
-                "should reach the origin with no Cookie field"
-            );
         }
 
         #[tokio::test]
@@ -15862,6 +15809,7 @@ mod tests {
                         PublisherOriginOptions {
                             edge_header: EdgeCacheHeader::SMaxageFallback,
                             input_cap: None,
+                            response_decoding: ResponseDecoding::Original,
                         },
                     )
                     .await
@@ -16337,6 +16285,7 @@ mod tests {
                             PublisherOriginOptions {
                                 edge_header: EdgeCacheHeader::SMaxageFallback,
                                 input_cap: None,
+                                response_decoding: ResponseDecoding::Original,
                             },
                         )
                         .await
@@ -16721,6 +16670,7 @@ mod tests {
                             PublisherOriginOptions {
                                 edge_header: EdgeCacheHeader::SMaxageFallback,
                                 input_cap: None,
+                                response_decoding: ResponseDecoding::Original,
                             },
                         )
                         .await
@@ -17747,6 +17697,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 PublisherOriginOptions {
                     edge_header: EdgeCacheHeader::SMaxageFallback,
                     input_cap: None,
+                    response_decoding: ResponseDecoding::Original,
                 },
             )
             .await
@@ -19055,6 +19006,34 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
     }
 
     #[tokio::test]
+    async fn equivalent_host_override_redirect_with_cookie_stays_on_serving_host() {
+        let mut settings = create_test_settings();
+        settings.publisher.origin_url = "https://example.com".to_owned();
+        settings.publisher.origin_host_header_override = Some("example.com:443".to_owned());
+        let stub = PublisherUpstream::for_origin("example.com");
+        stub.queue_origin(
+            301,
+            Vec::new(),
+            vec![
+                (header::LOCATION.as_str(), "https://example.com/redirect"),
+                (header::SET_COOKIE.as_str(), "AWSALB=abc123; Path=/"),
+            ],
+        );
+        let services = stub.services();
+
+        let (response, _owner) =
+            run_publisher_proxy(&settings, &services, publisher_page_request()).await;
+
+        assert_eq!(
+            proxy_response_headers(&response)
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://publisher.example/redirect"),
+            "should treat an equivalent override as no host change and keep the redirect on the serving host"
+        );
+    }
+
+    #[tokio::test]
     async fn publisher_asset_policy_response_with_cookie_is_private_after_finalization() {
         let settings = Settings::from_toml(&format!(
             r#"{}
@@ -19188,8 +19167,9 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         fn range_aware_upstream() -> PublisherUpstream {
             let upstream = PublisherUpstream::new();
             let script = upstream.client.clone();
+            let origin_host = upstream.origin_host.clone();
             upstream.observe(move |request| {
-                if request.uri.host() != Some(TEST_ORIGIN_HOST) {
+                if request.uri.host() != Some(origin_host.as_str()) {
                     return;
                 }
                 let reply = if request.headers.contains_key(header::RANGE) {
@@ -19419,6 +19399,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 PublisherOriginOptions {
                     edge_header: EdgeCacheHeader::SMaxageFallback,
                     input_cap: None,
+                    response_decoding: ResponseDecoding::Original,
                 },
             )
             .await
@@ -19479,6 +19460,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 PublisherOriginOptions {
                     edge_header: EdgeCacheHeader::SurrogateControl,
                     input_cap: None,
+                    response_decoding: ResponseDecoding::Original,
                 },
             )
             .await
@@ -19555,6 +19537,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 PublisherOriginOptions {
                     edge_header: EdgeCacheHeader::SurrogateControl,
                     input_cap: None,
+                    response_decoding: ResponseDecoding::Original,
                 },
             )
             .await;
@@ -20619,6 +20602,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             PublisherOriginOptions {
                 edge_header: EdgeCacheHeader::SMaxageFallback,
                 input_cap: None,
+                response_decoding: ResponseDecoding::Original,
             },
         )
         .await
@@ -23849,6 +23833,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             PublisherOriginOptions {
                 edge_header: EdgeCacheHeader::SurrogateControl,
                 input_cap: None,
+                response_decoding: ResponseDecoding::Original,
             },
         ))
         .expect("should fetch the origin");
@@ -24167,6 +24152,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     PublisherOriginOptions {
                         edge_header: EdgeCacheHeader::SurrogateControl,
                         input_cap: None,
+                        response_decoding: ResponseDecoding::Original,
                     },
                 ))
                 .expect("should fetch a range-associated response");
@@ -24541,6 +24527,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                         PublisherOriginOptions {
                             edge_header: EdgeCacheHeader::SurrogateControl,
                             input_cap: None,
+                            response_decoding: ResponseDecoding::Original,
                         },
                     ))
                     .expect("should fetch complete success or error HTML");
@@ -24649,6 +24636,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 PublisherOriginOptions {
                     edge_header: EdgeCacheHeader::SurrogateControl,
                     input_cap: None,
+                    response_decoding: ResponseDecoding::Original,
                 },
             ))
             .expect("should classify the origin response");
@@ -29723,6 +29711,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 PublisherOriginOptions {
                     edge_header: EdgeCacheHeader::SMaxageFallback,
                     input_cap: None,
+                    response_decoding: ResponseDecoding::Original,
                 },
             )
             .await
@@ -29811,6 +29800,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 PublisherOriginOptions {
                     edge_header: EdgeCacheHeader::SMaxageFallback,
                     input_cap: None,
+                    response_decoding: ResponseDecoding::Original,
                 },
             )
             .await
@@ -29952,6 +29942,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     PublisherOriginOptions {
                         edge_header: EdgeCacheHeader::SMaxageFallback,
                         input_cap,
+                        response_decoding: ResponseDecoding::Original,
                     },
                 )
                 .await
@@ -29982,6 +29973,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     PublisherOriginOptions {
                         edge_header: EdgeCacheHeader::SurrogateControl,
                         input_cap: None,
+                        response_decoding: ResponseDecoding::Original,
                     },
                 )
                 .await
@@ -30350,8 +30342,9 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
         #[tokio::test]
         async fn equivalent_host_override_sets_none() {
-            for equivalent in ["Origin.Test-Publisher.COM", "origin.test-publisher.com:443"] {
+            for equivalent in ["Example.COM", "example.com:443"] {
                 let mut settings = create_test_settings();
+                settings.publisher.origin_url = "https://example.com".to_owned();
                 settings.publisher.origin_host_header_override = Some(equivalent.to_owned());
                 let fixture = OriginFixture::new(settings);
                 fixture.reply(
@@ -30371,7 +30364,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                         forwarded.host_authority.as_str(),
                         forwarded.has_host_authority_override
                     ),
-                    ("origin.test-publisher.com", false),
+                    ("example.com", false),
                     "should set no override for the equivalent authority {equivalent}"
                 );
             }

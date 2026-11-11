@@ -8,6 +8,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
 };
+use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -268,6 +269,7 @@ async fn dispatch_fallback(
         PublisherOriginOptions {
             edge_header: EdgeCacheHeader::SMaxageFallback,
             input_cap: Some(input_cap),
+            response_decoding: ResponseDecoding::Original,
         },
     )
     .await?;

@@ -264,14 +264,6 @@ impl Publisher {
             })
             .unwrap_or_else(|| self.origin_url.clone())
     }
-
-    /// Returns the outbound Host header for proxied publisher-origin requests.
-    #[must_use]
-    pub fn origin_host_header(&self) -> String {
-        self.origin_host_header_override
-            .clone()
-            .unwrap_or_else(|| self.origin_host())
-    }
 }
 
 #[derive(Default, Clone, Deserialize, Serialize)]
@@ -6263,8 +6255,8 @@ origin_host_header_override = "www.example.com:8443""#,
 
         let settings = Settings::from_toml(&toml_str).expect("should accept host header override");
         assert_eq!(
-            settings.publisher.origin_host_header(),
-            "www.example.com:8443",
+            settings.publisher.origin_host_header_override.as_deref(),
+            Some("www.example.com:8443"),
             "should use configured host header override"
         );
     }
@@ -7064,7 +7056,6 @@ source_domain = "partner.example.com"
                 settings.publisher.origin_host_header_override.as_deref(),
                 Some("www.example.com")
             );
-            assert_eq!(settings.publisher.origin_host_header(), "www.example.com");
         });
     }
 
@@ -7166,38 +7157,6 @@ source_domain = "partner.example.com"
             allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
-    }
-
-    #[test]
-    fn test_publisher_origin_host_header_defaults_to_origin_host() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com:8443".to_string(),
-            origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
-            allow_async_html_finish: false,
-        };
-
-        assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
-    }
-
-    #[test]
-    fn test_publisher_origin_host_header_uses_override() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com".to_string(),
-            origin_host_header_override: Some("www.example.com".to_string()),
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
-            allow_async_html_finish: false,
-        };
-
-        assert_eq!(publisher.origin_host_header(), "www.example.com");
     }
 
     #[test]

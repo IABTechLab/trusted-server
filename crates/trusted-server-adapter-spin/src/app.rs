@@ -13,6 +13,7 @@ use edgezero_core::http::{
     HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
 };
 use edgezero_core::ingress::{InboundOrigin, OriginSource};
+use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -874,6 +875,7 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                     PublisherOriginOptions {
                         edge_header: EdgeCacheHeader::SMaxageFallback,
                         input_cap: Some(input_cap),
+                        response_decoding: ResponseDecoding::Original,
                     },
                 )
                 .await

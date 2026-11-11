@@ -15,10 +15,10 @@ use trusted_server_adapter_cloudflare::app::TrustedServerApp;
 use trusted_server_core::constants::TS_GIT_VERSION;
 use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
-use trusted_server_core::test_support::insert_outbound_client;
 use trusted_server_core::test_support::scripted_client::{
     ScriptedHttpClient, ScriptedReply, TestClock,
 };
+use trusted_server_core::test_support::{gzip, insert_outbound_client};
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
@@ -895,9 +895,29 @@ fn html_document(len: usize) -> Vec<u8> {
     document
 }
 
-/// Asserts that an origin body of [`CLOUDFLARE_INPUT_CAP`] bytes is served and
-/// one byte more fails with 502 before egress.
-async fn assert_cloudflare_input_cap(content_type: &str, body: fn(usize) -> Vec<u8>) {
+/// The coding the scripted origin serves a body in.
+#[derive(Clone, Copy, Debug)]
+enum OriginCoding {
+    Identity,
+    Gzip,
+}
+
+/// A 200 origin reply carrying `body` with `content_type`, coded as `coding`.
+fn origin_reply(content_type: &str, body: &[u8], coding: OriginCoding) -> ScriptedReply {
+    let reply = ScriptedReply::status(StatusCode::OK).header("content-type", content_type);
+    match coding {
+        OriginCoding::Identity => reply.body(body.to_vec()),
+        OriginCoding::Gzip => reply.header("content-encoding", "gzip").body(gzip(body)),
+    }
+}
+
+/// Asserts that an origin body that decodes to [`CLOUDFLARE_INPUT_CAP`] bytes
+/// is served as identity and one byte more fails with 502 before egress.
+async fn assert_cloudflare_input_cap(
+    content_type: &str,
+    body: fn(usize) -> Vec<u8>,
+    coding: OriginCoding,
+) {
     let origin = ScriptedHttpClient::new(&TestClock::new());
     for (path, len) in [
         ("/at-cap", CLOUDFLARE_INPUT_CAP),
@@ -906,17 +926,18 @@ async fn assert_cloudflare_input_cap(content_type: &str, body: fn(usize) -> Vec<
         origin.respond_to(
             Method::GET,
             &format!("{ORIGIN}{path}"),
-            ScriptedReply::status(StatusCode::OK)
-                .header("content-type", content_type)
-                .body(body(len)),
+            origin_reply(content_type, &body(len), coding),
         );
     }
 
     let at_cap = route_to_origin(test_router(), publisher_get("/at-cap"), &origin).await;
     assert_eq!(
-        at_cap.status(),
-        StatusCode::OK,
-        "should serve a {content_type} body at the cap"
+        (
+            at_cap.status(),
+            at_cap.headers().get(header::CONTENT_ENCODING)
+        ),
+        (StatusCode::OK, None),
+        "should serve a {coding:?} {content_type} body at the cap as identity"
     );
     let served = at_cap
         .into_body()
@@ -924,7 +945,7 @@ async fn assert_cloudflare_input_cap(content_type: &str, body: fn(usize) -> Vec<
         .expect("should buffer the at-cap body");
     assert!(
         served.len() >= CLOUDFLARE_INPUT_CAP,
-        "should serve the whole {content_type} body at the cap, got {} bytes",
+        "should serve the whole {coding:?} {content_type} body at the cap, got {} bytes",
         served.len()
     );
 
@@ -932,16 +953,96 @@ async fn assert_cloudflare_input_cap(content_type: &str, body: fn(usize) -> Vec<
     assert_eq!(
         over_cap.status(),
         StatusCode::BAD_GATEWAY,
-        "should fail a {content_type} body one byte over the cap with 502"
+        "should fail a {coding:?} {content_type} body one byte over the cap with 502"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_body_at_cap_passes_and_one_over_fails_502_cloudflare() {
-    assert_cloudflare_input_cap("application/octet-stream", |len| vec![b'x'; len]).await;
+    assert_cloudflare_input_cap(
+        "application/octet-stream",
+        |len| vec![b'x'; len],
+        OriginCoding::Identity,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identity_html_at_cap_passes_and_one_over_fails_502_cloudflare() {
-    assert_cloudflare_input_cap("text/html", html_document).await;
+    assert_cloudflare_input_cap("text/html", html_document, OriginCoding::Identity).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gzip_raw_body_decoded_at_cap_passes_and_one_over_fails_502_cloudflare() {
+    assert_cloudflare_input_cap(
+        "application/octet-stream",
+        |len| vec![b'x'; len],
+        OriginCoding::Gzip,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gzip_html_decoded_at_cap_passes_and_one_over_fails_502_cloudflare() {
+    assert_cloudflare_input_cap("text/html", html_document, OriginCoding::Gzip).await;
+}
+
+/// Serves `path` from a gzip origin to a client that sends no `Accept-Encoding`.
+async fn fetch_gzip_origin(path: &str, content_type: &str, body: &[u8]) -> (Response, Vec<u8>) {
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+    origin.respond_to(
+        Method::GET,
+        &format!("{ORIGIN}{path}"),
+        origin_reply(content_type, body, OriginCoding::Gzip),
+    );
+    let request = publisher_get(path);
+    assert!(
+        !request.headers().contains_key(header::ACCEPT_ENCODING),
+        "should send no Accept-Encoding"
+    );
+    let mut response = route_to_origin(test_router(), request, &origin).await;
+    let served = std::mem::replace(response.body_mut(), Body::empty())
+        .into_bytes()
+        .expect("should buffer the served body");
+    (response, served.to_vec())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gzip_origin_html_reaches_a_client_without_accept_encoding_as_identity_cloudflare() {
+    let page = b"<html><head><title>Example</title></head><body><p>example</p></body></html>";
+
+    let (response, served) =
+        fetch_gzip_origin("/gzip-page", "text/html; charset=utf-8", page).await;
+
+    assert_eq!(
+        (
+            response.status(),
+            response.headers().get(header::CONTENT_ENCODING)
+        ),
+        (StatusCode::OK, None),
+        "should serve the processed page as identity"
+    );
+    let html = String::from_utf8(served).expect("should serve UTF-8 HTML");
+    assert!(
+        html.contains("/static/tsjs=") && html.contains("<p>example</p>"),
+        "should serve the decoded page with the TSJS tag: {html}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gzip_origin_raw_body_reaches_a_client_without_accept_encoding_as_identity_cloudflare() {
+    let bytes = b"example raw origin bytes";
+
+    let (response, served) =
+        fetch_gzip_origin("/asset.bin", "application/octet-stream", bytes).await;
+
+    assert_eq!(
+        (
+            response.status(),
+            response.headers().get(header::CONTENT_ENCODING),
+            served.as_slice()
+        ),
+        (StatusCode::OK, None, bytes.as_slice()),
+        "should relay the raw body decoded, as identity"
+    );
 }

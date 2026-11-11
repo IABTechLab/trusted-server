@@ -2156,8 +2156,20 @@ const GZIP_BID_JSON_GZIP: &[u8] = &[
     80, 177, 169, 65, 109, 44, 16, 2, 0, 181, 125, 165, 97, 140, 0, 0, 0,
 ];
 
-/// Bytes of the gzip-stored asset the range case slices.
-const RANGE_BYTES: usize = 50;
+/// The gzip-stored asset the range case slices: every byte value once, which
+/// `gzip -n -9` stores in one uncoded deflate block, so it is 279 bytes long.
+fn range_asset() -> Vec<u8> {
+    let mut asset = vec![31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 1, 0, 1, 255, 254];
+    asset.extend(0..=u8::MAX);
+    asset.extend([115, 140, 5, 41, 0, 1, 0, 0]);
+    asset
+}
+
+/// The `Range` the range case requests.
+const RANGE: &str = "bytes=0-99";
+
+/// The length of the part [`RANGE`] selects.
+const RANGE_LENGTH: usize = 100;
 
 #[test]
 fn encoded_fixtures_decode_to_their_plain_bodies() {
@@ -2168,17 +2180,19 @@ fn encoded_fixtures_decode_to_their_plain_bodies() {
             decode(PASSTHROUGH_HTML_BROTLI, Compression::Brotli),
             decode(PASSTHROUGH_SVG_BROTLI, Compression::Brotli),
             decode(GZIP_BID_JSON_GZIP, Compression::Gzip),
+            decode(&range_asset(), Compression::Gzip),
         ),
         (
             PASSTHROUGH_HTML.to_vec(),
             PASSTHROUGH_HTML.to_vec(),
             PASSTHROUGH_SVG.to_vec(),
             GZIP_BID_JSON.to_vec(),
+            (0..=u8::MAX).collect::<Vec<u8>>(),
         ),
         "should decode every precomputed fixture to its plain body"
     );
     assert!(
-        PASSTHROUGH_HTML_GZIP.len() > RANGE_BYTES,
+        range_asset().len() > RANGE_LENGTH,
         "should keep the range inside the stored asset"
     );
 }
@@ -2205,23 +2219,19 @@ fn encoded_passthrough_response(request: &OriginRequest) -> Vec<u8> {
             ],
             PASSTHROUGH_SVG_BROTLI,
         ),
-        "/asset.bin" => raw_response(
-            206,
-            &[
-                ("Content-Type", "application/octet-stream".to_owned()),
-                ("Content-Encoding", "gzip".to_owned()),
-                (
-                    "Content-Range",
-                    format!(
-                        "bytes 0-{}/{}",
-                        RANGE_BYTES - 1,
-                        PASSTHROUGH_HTML_GZIP.len()
-                    ),
-                ),
-                ("Content-Length", RANGE_BYTES.to_string()),
-            ],
-            &PASSTHROUGH_HTML_GZIP[..RANGE_BYTES],
-        ),
+        "/asset.bin" => {
+            let asset = range_asset();
+            raw_response(
+                206,
+                &[
+                    ("Content-Type", "application/octet-stream".to_owned()),
+                    ("Content-Encoding", "gzip".to_owned()),
+                    ("Content-Range", format!("bytes 0-99/{}", asset.len())),
+                    ("Content-Length", RANGE_LENGTH.to_string()),
+                ],
+                &asset[..RANGE_LENGTH],
+            )
+        }
         "/app.js" if request.header("if-none-match") == Some("\"example-js\"") => {
             raw_response(304, &[("ETag", "\"example-js\"".to_owned())], b"")
         }
@@ -2336,11 +2346,11 @@ fn br_svg_relays_byte_identical_with_length_and_etag_fastly() {
 #[test]
 #[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
 fn gzip_asset_range_returns_206_with_origin_content_range_fastly() {
-    let range = format!("bytes=0-{}", RANGE_BYTES - 1);
+    let asset = range_asset();
     with_encoded_passthrough(|base_url, origin| {
         let response = raw_client()
             .get(format!("{base_url}/asset.bin"))
-            .header("range", range.as_str())
+            .header("range", RANGE)
             .header("accept-encoding", "gzip")
             .send()
             .expect("should request the range");
@@ -2358,26 +2368,22 @@ fn gzip_asset_range_returns_206_with_origin_content_range_fastly() {
         );
         assert_eq!(
             response.bytes().expect("should read the range").as_ref(),
-            &PASSTHROUGH_HTML_GZIP[..RANGE_BYTES],
+            &asset[..RANGE_LENGTH],
             "should relay the encoded range unchanged"
         );
         assert!(
             origin
                 .requests()
                 .iter()
-                .any(|request| request.header("range") == Some(range.as_str())),
+                .any(|request| request.header("range") == Some(RANGE)),
             "should forward the Range header to the origin"
         );
         assert_eq!(
             head,
             (
                 206,
-                Some(format!(
-                    "bytes 0-{}/{}",
-                    RANGE_BYTES - 1,
-                    PASSTHROUGH_HTML_GZIP.len()
-                )),
-                Some(RANGE_BYTES.to_string())
+                Some(format!("bytes 0-99/{}", asset.len())),
+                Some(RANGE_LENGTH.to_string())
             ),
             "should return the origin range with its Content-Range"
         );

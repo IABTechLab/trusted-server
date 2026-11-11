@@ -6,6 +6,9 @@ pub mod logging;
 pub mod scripted_client;
 
 #[cfg(any(test, feature = "test-utils"))]
+use std::io::Write as _;
+
+#[cfg(any(test, feature = "test-utils"))]
 use edgezero_core::http::Request;
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -41,6 +44,28 @@ use http::{HeaderMap, HeaderValue, Method, header};
 #[cfg(any(test, feature = "test-utils"))]
 pub fn insert_outbound_client(request: &mut Request, client: HttpClient) {
     request.extensions_mut().insert(client);
+}
+
+/// Returns `bytes` gzip-encoded, for an origin fixture that serves a gzip body.
+///
+/// # Examples
+///
+/// ```ignore
+/// let body = gzip(b"<html></html>");
+/// assert_eq!(&body[..2], &[0x1f, 0x8b]);
+/// ```
+///
+/// # Panics
+///
+/// Panics if in-memory gzip encoding fails.
+#[cfg(any(test, feature = "test-utils"))]
+#[must_use]
+pub fn gzip(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(bytes)
+        .expect("should encode the gzip fixture");
+    encoder.finish().expect("should finish the gzip fixture")
 }
 
 /// Recomputes the S3 `SigV4` `Authorization` value for a request an origin received.
@@ -269,14 +294,14 @@ pub mod tests {
 /// drive byte-identical input.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod nextjs_auction {
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     use std::net::IpAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
     use error_stack::Report;
-    use flate2::{read::GzDecoder, write::GzEncoder};
+    use flate2::read::GzDecoder;
     use http::{Method, StatusCode};
 
     use crate::geo::GeoInfo;
@@ -581,11 +606,7 @@ pub mod nextjs_auction {
         #[must_use]
         pub fn with_html_response(html: &str, gzip: bool, chunked: bool) -> Self {
             let bytes = if gzip {
-                let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
-                encoder
-                    .write_all(html.as_bytes())
-                    .expect("should encode fixture gzip");
-                encoder.finish().expect("should finish fixture gzip")
+                super::gzip(html.as_bytes())
             } else {
                 html.as_bytes().to_vec()
             };
