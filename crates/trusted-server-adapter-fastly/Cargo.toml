@@ -39,6 +39,7 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
+edgezero-adapter-fastly = { workspace = true, features = ["fastly", "test-utils"] }
 bytes = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
 toml = { workspace = true }

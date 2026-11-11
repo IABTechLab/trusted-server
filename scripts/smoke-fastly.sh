@@ -10,7 +10,8 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 smoke_require_command cargo
 smoke_require_command curl
 smoke_require_command fastly
-smoke_require_command python3
+smoke_require_command node
+smoke_require_command jq
 smoke_require_command pgrep
 
 WORKSPACE=$(smoke_make_workspace fastly)
@@ -65,8 +66,12 @@ if [ ! -f "$WASM_BINARY" ]; then
 fi
 [ -f "$WASM_BINARY" ] || smoke_die "Fastly Wasm artifact not found: $WASM_BINARY"
 
-smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
-ORIGIN_PID=$SMOKE_ORIGIN_PID
+node "$REPO_ROOT/scripts/fixtures/smoke-origin.mjs" "$ORIGIN_PORT" \
+    >"$WORKSPACE/origin.log" 2>&1 &
+ORIGIN_PID=$!
+smoke_wait_http "http://127.0.0.1:$ORIGIN_PORT/" 200 \
+    "$WORKSPACE/origin-ready.body" "$WORKSPACE/origin-ready.headers"
+smoke_assert_process_alive "$ORIGIN_PID" "stub origin" "$WORKSPACE/origin.log"
 smoke_initialize_config "$FASTLY_PROJECT" "$WORKSPACE" "$ORIGIN_PORT"
 
 run_case() {
@@ -95,6 +100,20 @@ run_case() {
         "$body_path" "$headers_path"
     smoke_assert_process_alive "$APP_PID" "Fastly CLI" "$log_path"
     smoke_assert_process_alive "$ORIGIN_PID" "stub origin" "$WORKSPACE/origin.log"
+    if [ -z "$expected_diagnostic" ]; then
+        local upload_status
+        upload_status=$(curl --silent --show-error --max-time 5 \
+            --data-binary 'ts-lazy-upload-fixture' \
+            --header 'Content-Type: application/octet-stream' \
+            --dump-header "$WORKSPACE/upload.headers" \
+            --output "$WORKSPACE/upload.body" --write-out '%{http_code}' \
+            "http://127.0.0.1:$port/native-upload")
+        [ "$upload_status" = 200 ] || smoke_die "publisher POST did not reach the origin"
+        jq --exit-status '.received == "ts-lazy-upload-fixture"' \
+            "$WORKSPACE/upload.body" >/dev/null || smoke_die "publisher POST body was lost"
+        [ "$(grep -ic '^set-cookie:' "$WORKSPACE/upload.headers")" = 2 ] ||
+            smoke_die "closed Fastly delivery lost duplicate Set-Cookie fields"
+    fi
     smoke_stop_process "$APP_PID"
     APP_PID=""
 

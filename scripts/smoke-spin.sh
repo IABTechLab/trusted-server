@@ -28,12 +28,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 smoke_resolve_ts_binary "$REPO_ROOT"
-SPIN_WASM=${SPIN_WASM_PATH:-$REPO_ROOT/target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm}
+SPIN_WASM=${SPIN_WASM_PATH:-$REPO_ROOT/target/wasm32-wasip2/release/trusted_server_adapter_spin.wasm}
 if [ ! -f "$SPIN_WASM" ]; then
     cargo build \
         --manifest-path "$REPO_ROOT/Cargo.toml" \
         --package trusted-server-adapter-spin \
-        --target wasm32-wasip1 \
+        --target wasm32-wasip2 \
         --features spin \
         --release
 fi
@@ -46,7 +46,7 @@ smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT"
 SPIN_WORK="$WORKSPACE/spin"
 mkdir -p "$SPIN_WORK"
 sed \
-    "s|source = \"../../target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm\"|source = \"$SPIN_WASM\"|" \
+    "s|source = \"../../target/wasm32-wasip2/release/trusted_server_adapter_spin.wasm\"|source = \"$SPIN_WASM\"|" \
     "$REPO_ROOT/crates/trusted-server-adapter-spin/spin.toml" >"$SPIN_WORK/spin.toml"
 sed \
     -e "s|= \"crates/|= \"$REPO_ROOT/crates/|g" \
@@ -92,6 +92,20 @@ run_case() {
         "$body_path" "$headers_path"
     smoke_assert_process_alive "$APP_PID" "Spin" "$log_path"
     smoke_assert_process_alive "$ORIGIN_PID" "stub origin" "$WORKSPACE/origin.log"
+    if [ -n "$expected_diagnostic" ]; then
+        # Spin owns the listener. Failed invocation bootstrap is a host 500,
+        # never a routed TS error page or healthy application liveness.
+        smoke_wait_http "http://127.0.0.1:$port/health" 500 \
+            "$WORKSPACE/$case_name-health.body" "$WORKSPACE/$case_name-health.headers"
+        if grep -i --quiet '^x-ts-version:' "$WORKSPACE/$case_name-health.headers"; then
+            smoke_die "failed Spin bootstrap reached routed TS finalization"
+        fi
+    else
+        smoke_wait_http "http://127.0.0.1:$port/health" 200 \
+            "$WORKSPACE/$case_name-health.body" "$WORKSPACE/$case_name-health.headers"
+        [ "$(tr -d '\r\n' < "$WORKSPACE/$case_name-health.body")" = ok ] ||
+            smoke_die "Spin application health did not return ok"
+    fi
     smoke_stop_process "$APP_PID"
     APP_PID=""
 
@@ -108,14 +122,15 @@ run_case() {
         smoke_assert_failure \
             "$expected_status" \
             "$expected_diagnostic" \
-            "$component_log_dir/trusted-server_stderr.txt"
+            "$log_path"
+        smoke_wait_log "$log_path" 'Spin bootstrap failed before dispatch:'
     else
         smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
     fi
 }
 
-run_case missing-config "$BASE_PORT" "" 503 \
-    'failed to read Spin Trusted Server app-config blob'
+run_case missing-config "$BASE_PORT" "" 500 \
+    'required Spin config key is missing or disappeared during bootstrap'
 
 EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default \
     "$SMOKE_TS_BIN" config push \
@@ -127,12 +142,12 @@ EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default \
     --no-diff
 CONFIG_PUSHED=true
 
-run_case missing-handler "$((BASE_PORT + 1))" "$SPIN_HANDLER_VAR" 503 \
-    "resolved secret at \`handlers[0].password\` must not be empty"
-run_case missing-proxy "$((BASE_PORT + 2))" "$SPIN_PROXY_VAR" 503 \
-    "resolved secret at \`publisher.proxy_secret\` must not be empty"
-run_case missing-ec "$((BASE_PORT + 3))" "$SPIN_EC_VAR" 503 \
-    "resolved secret at \`ec.passphrase\` must not be empty"
+run_case missing-handler "$((BASE_PORT + 1))" "$SPIN_HANDLER_VAR" 500 \
+    'required Spin secret is empty or exceeds the 64 KiB limit'
+run_case missing-proxy "$((BASE_PORT + 2))" "$SPIN_PROXY_VAR" 500 \
+    'required Spin secret is empty or exceeds the 64 KiB limit'
+run_case missing-ec "$((BASE_PORT + 3))" "$SPIN_EC_VAR" 500 \
+    'required Spin secret is empty or exceeds the 64 KiB limit'
 run_case positive "$((BASE_PORT + 4))" "" 200
 
 echo "Spin first-success smoke passed"

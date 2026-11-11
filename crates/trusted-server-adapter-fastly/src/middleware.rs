@@ -19,7 +19,7 @@ use edgezero_core::http::{HeaderValue, Response, StatusCode};
 use edgezero_core::middleware::{Middleware, Next};
 use edgezero_core::response::IntoResponse;
 use std::net::IpAddr;
-use trusted_server_core::auth::enforce_basic_auth;
+use trusted_server_core::auth::enforce_basic_auth_parts as enforce_basic_auth;
 use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_FASTLY_VERSION,
@@ -70,8 +70,12 @@ impl FinalizeResponseMiddleware {
 #[async_trait(?Send)]
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        let client_ip = ctx.request().extensions().get::<ClientInfo>().map_or_else(
-            || FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip),
+        let client_ip = ctx.extensions().get::<ClientInfo>().map_or_else(
+            || {
+                ctx.extensions()
+                    .get::<FastlyRequestContext>()
+                    .and_then(|c| c.client_ip)
+            },
             |info| info.client_ip,
         );
 
@@ -131,7 +135,7 @@ impl AuthMiddleware {
 #[async_trait(?Send)]
 impl Middleware for AuthMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        match enforce_basic_auth(&self.settings, ctx.request_mut()) {
+        match enforce_basic_auth(&self.settings, ctx.parts_mut()) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
             Err(report) => {
@@ -591,16 +595,13 @@ mod tests {
             }),
         );
         let mut ctx = empty_ctx();
-        ctx.request_mut().extensions_mut().insert(ClientInfo {
+        ctx.extensions_mut().insert(ClientInfo {
             client_ip: Some(reader_ip),
             ..ClientInfo::default()
         });
-        FastlyRequestContext::insert(
-            ctx.request_mut(),
-            FastlyRequestContext {
-                client_ip: Some(peer_ip),
-            },
-        );
+        ctx.extensions_mut().insert(FastlyRequestContext {
+            client_ip: Some(peer_ip),
+        });
         let handler =
             Arc::new(
                 |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
@@ -627,15 +628,10 @@ mod tests {
             }),
         );
         let mut ctx = empty_ctx();
-        ctx.request_mut()
-            .extensions_mut()
-            .insert(ClientInfo::default());
-        FastlyRequestContext::insert(
-            ctx.request_mut(),
-            FastlyRequestContext {
-                client_ip: Some(peer_ip),
-            },
-        );
+        ctx.extensions_mut().insert(ClientInfo::default());
+        ctx.extensions_mut().insert(FastlyRequestContext {
+            client_ip: Some(peer_ip),
+        });
         let handler =
             Arc::new(
                 |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
@@ -662,12 +658,9 @@ mod tests {
             }),
         );
         let mut ctx = empty_ctx();
-        FastlyRequestContext::insert(
-            ctx.request_mut(),
-            FastlyRequestContext {
-                client_ip: Some(peer_ip),
-            },
-        );
+        ctx.extensions_mut().insert(FastlyRequestContext {
+            client_ip: Some(peer_ip),
+        });
         let handler =
             Arc::new(
                 |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },

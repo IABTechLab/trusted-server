@@ -80,24 +80,63 @@ pub fn enforce_basic_auth(
     settings: &Settings,
     req: &mut Request<EdgeBody>,
 ) -> Result<Option<Response<EdgeBody>>, Report<TrustedServerError>> {
-    // Cleared before any early return so no inherited marker can survive a call
-    // that did not itself validate a credential. Without this, a request marked
-    // upstream and then routed to an unprotected path would keep an assertion
-    // nothing checked.
     req.extensions_mut().remove::<EdgeTerminatedAuthorization>();
+    let decision = check_basic_auth(settings, req.uri().path(), req.headers())?;
+    Ok(apply_auth_decision(decision, req.extensions_mut()))
+}
 
-    let path = req.uri().path();
+/// Enforces Basic authentication without accessing or replacing the request body.
+///
+/// Clears any inherited authorization marker before checking the request head.
+///
+/// # Errors
+///
+/// Returns a configuration error for an invalid handler or an unprotected admin path.
+pub fn enforce_basic_auth_parts(
+    settings: &Settings,
+    parts: &mut http::request::Parts,
+) -> Result<Option<Response<EdgeBody>>, Report<TrustedServerError>> {
+    parts.extensions.remove::<EdgeTerminatedAuthorization>();
+    let decision = check_basic_auth(settings, parts.uri.path(), &parts.headers)?;
+    Ok(apply_auth_decision(decision, &mut parts.extensions))
+}
+
+enum AuthDecision {
+    Unprotected,
+    Authorized(EdgeTerminatedAuthorization),
+    Challenge,
+}
+
+fn apply_auth_decision(
+    decision: AuthDecision,
+    extensions: &mut http::Extensions,
+) -> Option<Response<EdgeBody>> {
+    match decision {
+        AuthDecision::Unprotected => None,
+        AuthDecision::Authorized(marker) => {
+            extensions.insert(marker);
+            None
+        }
+        AuthDecision::Challenge => Some(unauthorized_response()),
+    }
+}
+
+fn check_basic_auth(
+    settings: &Settings,
+    path: &str,
+    headers: &http::HeaderMap,
+) -> Result<AuthDecision, Report<TrustedServerError>> {
     let Some(handler) = settings.handler_for_path(path)? else {
         if Settings::is_admin_path(path) {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!("Admin path `{path}` has no configured handler"),
             }));
         }
-        return Ok(None);
+        return Ok(AuthDecision::Unprotected);
     };
 
-    let Some((username, password, authorization_digest)) = extract_credentials(req) else {
-        return Ok(Some(unauthorized_response()));
+    let Some((username, password, authorization_digest)) = extract_credentials(headers) else {
+        return Ok(AuthDecision::Challenge);
     };
 
     // Hash before comparing to normalise lengths — `ct_eq` on raw byte slices
@@ -113,14 +152,12 @@ pub fn enforce_basic_auth(
         .ct_eq(&Sha256::digest(password.as_bytes()));
 
     if bool::from(username_match & password_match) {
-        // Record that TS itself consumed this credential, so the shared template
-        // cache can distinguish it from a credential meant for the origin.
-        req.extensions_mut()
-            .insert(EdgeTerminatedAuthorization(authorization_digest));
-        Ok(None)
+        Ok(AuthDecision::Authorized(EdgeTerminatedAuthorization(
+            authorization_digest,
+        )))
     } else {
-        log::warn!("Basic auth failed for path: {}", req.uri().path());
-        Ok(Some(unauthorized_response()))
+        log::warn!("Basic auth failed for path: {path}");
+        Ok(AuthDecision::Challenge)
     }
 }
 
@@ -134,11 +171,11 @@ pub fn enforce_basic_auth(
 /// operator credential was used.
 #[must_use]
 pub fn authenticated_username(req: &Request<EdgeBody>) -> Option<String> {
-    extract_credentials(req).map(|(username, _password, _digest)| username)
+    extract_credentials(req.headers()).map(|(username, _password, _digest)| username)
 }
 
-fn extract_credentials(req: &Request<EdgeBody>) -> Option<(String, String, [u8; 32])> {
-    let mut header_values = req.headers().get_all(header::AUTHORIZATION).iter();
+fn extract_credentials(headers: &http::HeaderMap) -> Option<(String, String, [u8; 32])> {
+    let mut header_values = headers.get_all(header::AUTHORIZATION).iter();
     let header_value = header_values.next()?;
     if header_values.next().is_some() {
         return None;

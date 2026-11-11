@@ -1,3 +1,4 @@
+# SDK 7 emits wasi:http 0.3.0 and requires Spin >= 4.1.0.
 spin_manifest_version = 2
 
 [application]
@@ -34,7 +35,7 @@ route = "/..."
 component = "trusted-server"
 
 [component.trusted-server]
-source = "../../target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm"
+source = "../../target/wasm32-wasip2/release/trusted_server_adapter_spin.wasm"
 # Wildcard outbound is required because the first-party proxy and ad-serving
 # paths reach arbitrary, operator-configured publisher and ad origins that are
 # not known at build time. Both https and http are allowed because some upstream
@@ -52,5 +53,5 @@ v_trusted_x5fserver_x5fsecrets_v_partner_x5fts_x5fpull_x5ftoken = "{{ v_trusted_
 v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword = "{{ v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword }}"
 
 [component.trusted-server.build]
-command = "cargo build --target wasm32-wasip1 --release -p trusted-server-adapter-spin --features spin"
+command = "cargo build --target wasm32-wasip2 --release -p trusted-server-adapter-spin --features spin"
 watch = ["src/**/*.rs", "Cargo.toml", "../../edgezero.toml", "spin.toml"]

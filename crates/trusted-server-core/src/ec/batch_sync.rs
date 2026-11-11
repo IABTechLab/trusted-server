@@ -29,6 +29,9 @@ use super::log_id;
 use super::rate_limiter::RateLimiter;
 use super::registry::PartnerRegistry;
 
+/// Maximum request bytes buffered by the adapter for existing batch sync.
+pub const MAX_BODY_SIZE: usize = 2 * 1024 * 1024;
+
 const REASON_INVALID_EC_ID: &str = "invalid_ec_id";
 const REASON_INVALID_PARTNER_UID: &str = "invalid_partner_uid";
 const REASON_INELIGIBLE: &str = "ineligible";
@@ -141,7 +144,6 @@ fn handle_batch_sync_with_writer(
     }
 
     // 3. Parse body (with size limit to prevent OOM before validation)
-    const MAX_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MB
     if content_length_exceeds_limit(&req, MAX_BODY_SIZE) {
         return Ok(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -149,7 +151,12 @@ fn handle_batch_sync_with_writer(
         ));
     }
 
-    let body_bytes = req.into_body().into_bytes().unwrap_or_default();
+    let body_bytes = req.into_body().into_bytes().ok_or_else(|| {
+        Report::new(TrustedServerError::BadRequest {
+            message: "batch-sync request body must be buffered by the adapter under its byte limit"
+                .to_owned(),
+        })
+    })?;
     if body_bytes.len() > MAX_BODY_SIZE {
         return Ok(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,

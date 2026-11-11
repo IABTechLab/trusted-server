@@ -15,7 +15,7 @@
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::body::{Body as EdgeBody, BodyContent};
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
 use http::{Method, Request, Response, StatusCode, header};
@@ -836,8 +836,8 @@ impl GoogleTagManagerIntegration {
         body: EdgeBody,
         max_size: usize,
     ) -> Result<Vec<u8>, PayloadSizeError> {
-        match body {
-            EdgeBody::Once(bytes) => {
+        match body.into_content() {
+            BodyContent::Once(bytes) => {
                 if bytes.len() > max_size {
                     log::warn!(
                         "POST body size {} exceeds max {} (rejected before proxy)",
@@ -851,7 +851,7 @@ impl GoogleTagManagerIntegration {
                 }
                 Ok(bytes.to_vec())
             }
-            EdgeBody::Stream(mut stream) => {
+            BodyContent::Stream(mut stream) => {
                 let mut body_bytes = Vec::new();
                 while let Some(chunk_result) = stream.next().await {
                     let chunk = chunk_result.map_err(|error| {
@@ -1093,6 +1093,67 @@ mod tests {
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+
+    #[test]
+    fn managed_beacon_bodies_obey_explicit_size_limit() {
+        futures::executor::block_on(async {
+            for streaming in [false, true] {
+                for limit in [3, 4] {
+                    let body = if streaming {
+                        EdgeBody::stream(futures::stream::iter([
+                            bytes::Bytes::from_static(b"ab"),
+                            bytes::Bytes::from_static(b"cd"),
+                        ]))
+                    } else {
+                        EdgeBody::from("abcd")
+                    }
+                    .with_buffered_json_policy(
+                        std::num::NonZeroUsize::new(1).expect("should be positive"),
+                        false,
+                    );
+                    let result =
+                        GoogleTagManagerIntegration::collect_request_body_bounded(body, limit)
+                            .await;
+                    if limit == 4 {
+                        assert_eq!(
+                            result.expect("should accept beacon at limit"),
+                            b"abcd",
+                            "should collect managed beacon content with the beacon limit"
+                        );
+                    } else {
+                        assert!(
+                            matches!(
+                                result,
+                                Err(PayloadSizeError::TooLarge { actual: 4, max: 3 })
+                            ),
+                            "should retain beacon payload-too-large classification"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn managed_beacon_body_reports_external_stream_error() {
+        futures::executor::block_on(async {
+            let body = EdgeBody::from_external_stream(futures::stream::iter([
+                Ok(bytes::Bytes::from_static(b"ab")),
+                Err(std::io::Error::other("fixture stream failure")),
+            ]))
+            .with_buffered_json_policy(
+                std::num::NonZeroUsize::new(1).expect("should be positive"),
+                false,
+            );
+            let error = GoogleTagManagerIntegration::collect_request_body_bounded(body, 4)
+                .await
+                .expect_err("should report beacon stream error");
+            assert!(
+                matches!(error, PayloadSizeError::StreamRead(_)),
+                "should retain beacon stream-read classification"
+            );
+        });
+    }
 
     #[test]
     fn container_id_validation_matches_gtm_pattern() {

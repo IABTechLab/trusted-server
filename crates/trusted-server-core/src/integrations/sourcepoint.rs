@@ -2655,10 +2655,10 @@ mod tests {
     }
 
     fn take_body_bytes(resp: Response<EdgeBody>) -> Vec<u8> {
-        match resp.into_body() {
-            EdgeBody::Once(b) => b.to_vec(),
-            EdgeBody::Stream(_) => vec![],
-        }
+        resp.into_body()
+            .into_bytes()
+            .expect("should carry a buffered test response body")
+            .to_vec()
     }
 
     #[test]

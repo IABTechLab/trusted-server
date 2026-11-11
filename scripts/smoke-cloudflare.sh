@@ -11,15 +11,14 @@ smoke_require_command bash
 smoke_require_command cargo
 smoke_require_command curl
 smoke_require_command jq
-smoke_require_command python3
+smoke_require_command node
+smoke_require_command setsid
 smoke_require_command wrangler
 smoke_require_command pgrep
 
 EXPECTED_WRANGLER=$(awk '$1 == "wrangler" { print $2 }' "$REPO_ROOT/.tool-versions")
-[ -n "$EXPECTED_WRANGLER" ] || smoke_die "missing Wrangler pin in .tool-versions"
-ACTUAL_WRANGLER=$(wrangler --version | sed -nE 's/^([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')
-[ "$ACTUAL_WRANGLER" = "$EXPECTED_WRANGLER" ] ||
-    smoke_die "Wrangler $EXPECTED_WRANGLER is required; found ${ACTUAL_WRANGLER:-unknown}"
+EXPECTED_WRANGLER=${EXPECTED_WRANGLER:-${WRANGLER_VERSION:-}}
+[ -n "$EXPECTED_WRANGLER" ] || smoke_die "missing Wrangler pin in .tool-versions or WRANGLER_VERSION"
 
 WORKSPACE=$(smoke_make_workspace cloudflare)
 ORIGIN_PORT=${CLOUDFLARE_SMOKE_ORIGIN_PORT:-19089}
@@ -27,23 +26,61 @@ BASE_PORT=${CLOUDFLARE_SMOKE_PORT:-19080}
 ORIGIN_PID=""
 APP_PID=""
 
-cleanup() {
-    smoke_stop_process "$APP_PID"
-    smoke_stop_process "$ORIGIN_PID"
-    smoke_remove_workspace "$WORKSPACE"
+stop_worker() {
+    [ -n "$APP_PID" ] || return 0
+    kill -TERM -- "-$APP_PID" 2>/dev/null || true
+    local attempt
+    for attempt in {1..50}; do
+        kill -0 -- "-$APP_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -KILL -- "-$APP_PID" 2>/dev/null || true
+    wait "$APP_PID" 2>/dev/null || true
+    APP_PID=""
 }
-trap cleanup EXIT INT TERM
 
+cleanup() {
+    stop_worker
+    smoke_stop_process "$ORIGIN_PID"
+    if [ "${CLOUDFLARE_SMOKE_KEEP_WORKSPACE:-0}" = 1 ]; then
+        echo "Cloudflare smoke artifacts: $WORKSPACE"
+    else
+        smoke_remove_workspace "$WORKSPACE"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Build a missing CLI with the caller's Cargo/rustup homes before isolating Wrangler.
 smoke_resolve_ts_binary "$REPO_ROOT"
+
+# Local-only Wrangler must not inherit operator credentials or configuration.
+while IFS= read -r name; do
+    case "$name" in
+        CLOUDFLARE_*TOKEN*|CLOUDFLARE_*KEY*|CLOUDFLARE_ACCOUNT_ID|CLOUDFLARE_EMAIL|CF_*) unset "$name" ;;
+    esac
+done < <(compgen -e)
+export HOME="$WORKSPACE/home"
+export XDG_CONFIG_HOME="$HOME/.config"
+export XDG_CACHE_HOME="$HOME/.cache"
+export WRANGLER_HOME="$HOME/.wrangler"
+export CLOUDFLARE_SEND_METRICS=false
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$WRANGLER_HOME"
+ACTUAL_WRANGLER=$(wrangler --version | sed -nE 's/^([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')
+[ "$ACTUAL_WRANGLER" = "$EXPECTED_WRANGLER" ] ||
+    smoke_die "Wrangler $EXPECTED_WRANGLER is required; found ${ACTUAL_WRANGLER:-unknown}"
+
 CLOUDFLARE_ROOT="$REPO_ROOT/crates/trusted-server-adapter-cloudflare"
-if [ ! -f "$CLOUDFLARE_ROOT/build/index.js" ]; then
-    (cd "$CLOUDFLARE_ROOT" && bash build.sh)
-fi
 [ -f "$CLOUDFLARE_ROOT/build/index.js" ] ||
     smoke_die "Cloudflare Worker bundle not found: $CLOUDFLARE_ROOT/build/index.js"
 
-smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
-ORIGIN_PID=$SMOKE_ORIGIN_PID
+node "$REPO_ROOT/scripts/fixtures/smoke-origin.mjs" "$ORIGIN_PORT" \
+    >"$WORKSPACE/origin.log" 2>&1 &
+ORIGIN_PID=$!
+smoke_wait_http "http://127.0.0.1:$ORIGIN_PORT/" 200 \
+    "$WORKSPACE/origin-ready.body" "$WORKSPACE/origin-ready.headers"
+smoke_assert_process_alive "$ORIGIN_PID" "stub origin" "$WORKSPACE/origin.log"
 smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT"
 
 CLOUDFLARE_WORK="$WORKSPACE/cloudflare"
@@ -140,7 +177,7 @@ run_case() {
     write_runtime_config "$config_path" "$config_json" "$missing_key"
     (
         cd "$CLOUDFLARE_WORK"
-        exec wrangler dev \
+        exec setsid wrangler dev --local \
             --config "$config_path" \
             --port "$port" \
             --ip 127.0.0.1
@@ -150,8 +187,21 @@ run_case() {
         "$body_path" "$headers_path"
     smoke_assert_process_alive "$APP_PID" "Wrangler" "$log_path"
     smoke_assert_process_alive "$ORIGIN_PID" "stub origin" "$WORKSPACE/origin.log"
-    smoke_stop_process "$APP_PID"
-    APP_PID=""
+    if [ -z "$expected_diagnostic" ]; then
+        local upload_status
+        upload_status=$(curl --silent --show-error --max-time 5 \
+            --data-binary 'ts-lazy-upload-fixture' \
+            --header 'Content-Type: application/octet-stream' \
+            --dump-header "$WORKSPACE/upload.headers" \
+            --output "$WORKSPACE/upload.body" --write-out '%{http_code}' \
+            "http://127.0.0.1:$port/native-upload")
+        [ "$upload_status" = 200 ] || smoke_die "publisher POST did not reach the origin"
+        jq --exit-status '.received == "ts-lazy-upload-fixture"' \
+            "$WORKSPACE/upload.body" >/dev/null || smoke_die "publisher POST body was lost"
+        [ "$(grep -ic '^set-cookie:' "$WORKSPACE/upload.headers")" = 2 ] ||
+            smoke_die "Cloudflare delivery lost duplicate Set-Cookie fields"
+    fi
+    stop_worker
 
     if [ -n "$expected_diagnostic" ]; then
         grep --fixed-strings --quiet 'Your Worker has access to the following bindings:' "$log_path" ||

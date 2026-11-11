@@ -3051,9 +3051,15 @@ impl Settings {
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     #[cfg(test)]
     pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
+        // Cargo exports rustc-env build metadata to native test processes too.
+        // It is not an application setting and must not enter strict deserialization.
+        let source = std::env::vars()
+            .filter(|(name, _)| name != "TRUSTED_SERVER__GIT_VERSION")
+            .collect();
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
-            .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
+            .separator(ENVIRONMENT_VARIABLE_SEPARATOR)
+            .source(Some(source));
 
         let toml = File::from_str(toml_str, FileFormat::Toml);
         let config = Config::builder()
@@ -6256,6 +6262,14 @@ source_domain = "partner.example.com"
             settings.is_err(),
             "unknown top-level fields should be rejected"
         );
+    }
+
+    #[test]
+    fn legacy_settings_loader_ignores_compiled_git_metadata() {
+        temp_env::with_var("TRUSTED_SERVER__GIT_VERSION", Some("fixture-build"), || {
+            Settings::from_toml_and_env(&crate_test_settings_str())
+                .expect("should ignore build metadata in the test-only legacy settings loader");
+        });
     }
 
     #[test]

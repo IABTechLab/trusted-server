@@ -60,7 +60,7 @@ jobs:
       - name: Set up rust toolchain
         uses: ./.github/actions/setup-rust
         with:
-          target: wasm32-wasip1,wasm32-unknown-unknown
+          target: wasm32-wasip1,wasm32-wasip2,wasm32-unknown-unknown
           components: "clippy, rustfmt"
           cache-key: cargo-clippy
 
@@ -85,7 +85,7 @@ jobs:
       - name: Run cargo clippy (Spin — native)
         run: cargo clippy-spin-native
 
-      - name: Run cargo clippy (Spin — wasm32-wasip1)
+      - name: Run cargo clippy (Spin — wasm32-wasip2)
         run: cargo clippy-spin-wasm
 
       - name: Run host-target CLI clippy
