@@ -116,7 +116,7 @@ does today. Do not place this field in production examples.
 ```toml
 [ec.storage]
 provider = "celld"
-endpoint = "https://stores.example.internal:7780"
+endpoint = "https://stores.example.com:7780"
 store = "checkout-identity"
 
 [ec.storage.access]
