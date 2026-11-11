@@ -458,17 +458,9 @@ fn validate_identity_providers(ec: &Ec) -> Result<(), Report<TrustedServerError>
     // fail the coordinator build on every request.
     for config in ec.identity_providers.iter().filter(|config| config.enabled) {
         if let Some(source) = config.sources.iter().find(|source| {
-            let claimed = partners
+            partners
                 .find_by_source_domain(source)
-                .map(|partner| partner.source_domain.as_str());
-            claimed.is_some()
-                && ec.partners.iter().any(|partner| {
-                    partner.runs_pull_sync()
-                        && partners
-                            .find_by_source_domain(&partner.source_domain)
-                            .map(|config| config.source_domain.as_str())
-                            == claimed
-                })
+                .is_some_and(|partner| partner.runs_pull_sync)
         }) {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
@@ -1743,9 +1735,8 @@ gam_network_id = "99999"
             .expect_err("should reject a pull token that cannot form a header");
 
         assert!(
-            err.to_string().contains("pull sync config invalid")
-                || format!("{err:?}").contains("Authorization header"),
-            "should explain the invalid pull token: {err:?}"
+            format!("{err:?}").contains("Authorization header"),
+            "should name the Authorization header problem: {err:?}"
         );
     }
 

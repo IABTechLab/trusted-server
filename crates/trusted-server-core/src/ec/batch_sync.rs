@@ -172,7 +172,7 @@ fn handle_batch_sync_with_writer(
     let (accepted, errors) = process_mappings_for_partner(
         writer,
         &partner.source_domain,
-        registry.rejects_ingest(&partner.source_domain),
+        registry.is_provider_owned(&partner.source_domain),
         &body.mappings,
     );
 
@@ -995,12 +995,8 @@ mod tests {
 
     #[test]
     fn handle_batch_sync_accepts_mappings_for_a_pull_sync_owned_source() {
-        // Arrange: pull sync owns the source, but no configured provider does.
-        let mut registry = test_registry();
-        assert!(
-            registry.mark_provider_owned("ssp.example.com", None),
-            "should mark the pull-sync source"
-        );
+        // Arrange: pull sync runs for the source, but no configured provider owns it.
+        let registry = test_registry();
         let limiter = MockRateLimiter {
             should_exceed: false,
         };
@@ -1035,7 +1031,7 @@ mod tests {
     fn handle_batch_sync_rejects_mappings_for_a_configured_provider_source() {
         let mut registry = test_registry();
         assert!(
-            registry.reject_ingest("ssp.example.com"),
+            registry.mark_provider_owned("ssp.example.com", None),
             "should mark the configured provider source"
         );
         let limiter = MockRateLimiter {

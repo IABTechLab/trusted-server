@@ -57,8 +57,12 @@ pub struct PartnerConfig {
     pub pull_sync_rate_limit: u32,
     /// Outbound bearer token for pull sync requests.
     pub ts_pull_token: Option<Redacted<String>>,
-    /// Whether an enabled identity provider, including the partner's own
-    /// pull sync, claims this source.
+    /// Whether the partner runs pull sync as an identity provider
+    /// ([`EcPartner::runs_pull_sync`]). Browser ingest and batch sync still
+    /// fill its source.
+    pub runs_pull_sync: bool,
+    /// Whether an enabled configured identity provider claims this source.
+    /// Browser ingest skips it and batch sync rejects it.
     pub provider_owned: bool,
     /// TCF vendor IDs of the configured providers, enabled or disabled, that
     /// claim this source. Its UIDs leave the server only while every one of
@@ -68,11 +72,6 @@ pub struct PartnerConfig {
     /// source where GDPR applies. Its UIDs then never leave the server for a
     /// visitor whose jurisdiction is GDPR.
     pub excluded_where_gdpr_applies: bool,
-    /// Whether browser ingest and batch sync reject this source's IDs: an
-    /// enabled configured provider owns it. A source owned only by its
-    /// partner's pull sync keeps accepting both, as it did before pull sync
-    /// became a provider.
-    pub ingest_rejected: bool,
 }
 
 impl PartnerConfig {
@@ -158,6 +157,8 @@ impl PartnerRegistry {
                     })
                 })?;
 
+            validate_mirror_requires_bidstream(partner, &normalized_source)?;
+
             if partner.pull_sync_enabled {
                 validate_pull_sync_fields(
                     partner.pull_sync_url.as_deref(),
@@ -222,6 +223,8 @@ impl PartnerRegistry {
                 None
             };
 
+            validate_mirror_requires_bidstream(partner, &normalized_source)?;
+
             let config = build_partner_config(partner, &normalized_source, api_key_hash.as_deref());
 
             validate_rate_limits(&config).change_context(TrustedServerError::Configuration {
@@ -269,8 +272,8 @@ impl PartnerRegistry {
     }
 
     /// Builds the registry from `[ec]` settings and marks every source claimed
-    /// by an enabled identity provider, and every pull-sync partner when the
-    /// `pull-sync` kind is registered, as provider-owned.
+    /// by an enabled identity provider whose kind is registered as
+    /// provider-owned.
     ///
     /// # Errors
     ///
@@ -295,7 +298,6 @@ impl PartnerRegistry {
             }
             for source in &provider.sources {
                 registry.mark_provider_owned(source, provider.tcf_vendor_id);
-                registry.reject_ingest(source);
             }
         }
         // A disabled provider's stored UIDs stay behind its vendor consent,
@@ -304,14 +306,6 @@ impl PartnerRegistry {
             for source in &provider.sources {
                 registry.keep_vendor_gate(source, provider.tcf_vendor_id);
             }
-        }
-        let pull_sync_registered = is_registered_kind(PULL_SYNC_KIND);
-        for partner in ec
-            .partners
-            .iter()
-            .filter(|partner| pull_sync_registered && partner.runs_pull_sync())
-        {
-            registry.mark_provider_owned(&partner.source_domain, None);
         }
         Ok(registry)
     }
@@ -400,31 +394,6 @@ impl PartnerRegistry {
             .is_some_and(|partner| partner.provider_owned)
     }
 
-    /// Marks `source` as owned by an enabled configured provider, so browser
-    /// ingest and batch sync reject its IDs. Returns whether `source` is
-    /// registered.
-    pub fn reject_ingest(&mut self, source: &str) -> bool {
-        let Ok(normalized) = normalize_partner_source_domain(source) else {
-            return false;
-        };
-        match self.by_source_domain.get_mut(&normalized) {
-            Some(partner) => {
-                partner.ingest_rejected = true;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Whether browser ingest and batch sync reject IDs for `source`
-    /// (spec §8.5): an enabled configured provider owns it. Pull-sync
-    /// ownership alone rejects neither.
-    #[must_use]
-    pub fn rejects_ingest(&self, source: &str) -> bool {
-        self.find_by_source_domain(source)
-            .is_some_and(|partner| partner.ingest_rejected)
-    }
-
     /// Partners in `[[ec.partners]]` order.
     pub fn in_config_order(&self) -> impl Iterator<Item = &PartnerConfig> {
         self.order
@@ -495,11 +464,27 @@ fn build_partner_config(
         pull_sync_ttl_sec: partner.pull_sync_ttl_sec,
         pull_sync_rate_limit: partner.pull_sync_rate_limit,
         ts_pull_token: partner.ts_pull_token.clone(),
+        runs_pull_sync: partner.runs_pull_sync(),
         provider_owned: false,
         owner_tcf_vendor_ids: Vec::new(),
         excluded_where_gdpr_applies: false,
-        ingest_rejected: false,
     }
+}
+
+/// Rejects `mirror_enabled` without `bidstream_enabled`: the mirror only
+/// carries bidstream UIDs, so the flag alone would silently do nothing.
+fn validate_mirror_requires_bidstream(
+    partner: &EcPartner,
+    normalized_source: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    if partner.mirror_enabled && !partner.bidstream_enabled {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "ec.partners: '{normalized_source}' sets mirror_enabled without bidstream_enabled"
+            ),
+        }));
+    }
+    Ok(())
 }
 
 fn validate_rate_limits(config: &PartnerConfig) -> Result<(), Report<TrustedServerError>> {
@@ -685,16 +670,20 @@ mod tests {
             "should keep the disabled provider's vendor consent gate"
         );
         assert!(
-            registry.is_provider_owned("pull.example.com"),
-            "should mark pull-sync partner source"
-        );
-        assert!(
-            registry.rejects_ingest("ids.example.com"),
-            "should reject browser and batch ingest for a configured provider's source"
-        );
-        assert!(
-            !registry.rejects_ingest("pull.example.com"),
+            !registry.is_provider_owned("pull.example.com"),
             "should keep browser and batch ingest for a source owned only by pull sync"
+        );
+        assert!(
+            registry
+                .get("pull.example.com")
+                .is_some_and(|partner| partner.runs_pull_sync),
+            "should record that the partner runs pull sync"
+        );
+        assert!(
+            !registry
+                .get("ids.example.com")
+                .is_some_and(|partner| partner.runs_pull_sync),
+            "should not record pull sync for a partner without it"
         );
     }
 
@@ -1049,6 +1038,36 @@ mod tests {
             registry.get("ssp.example.com").is_some(),
             "should accept minimum-length token"
         );
+    }
+
+    #[test]
+    fn mirror_without_bidstream_is_rejected() {
+        let mut partner = make_partner("ids.example.com", &valid_api_token("token-m"));
+        partner.mirror_enabled = true;
+
+        let runtime = PartnerRegistry::from_config(std::slice::from_ref(&partner))
+            .expect_err("should reject mirror_enabled without bidstream_enabled at startup");
+        let deploy = PartnerRegistry::validate_config_for_deploy(std::slice::from_ref(&partner))
+            .expect_err("should reject mirror_enabled without bidstream_enabled at push");
+
+        for error in [runtime, deploy] {
+            assert!(
+                format!("{error:?}").contains("mirror_enabled without bidstream_enabled"),
+                "should name the misconfiguration: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_with_bidstream_is_accepted() {
+        let mut partner = make_partner("ids.example.com", &valid_api_token("token-m"));
+        partner.mirror_enabled = true;
+        partner.bidstream_enabled = true;
+
+        PartnerRegistry::from_config(std::slice::from_ref(&partner))
+            .expect("should accept mirror_enabled with bidstream_enabled");
+        PartnerRegistry::validate_config_for_deploy(std::slice::from_ref(&partner))
+            .expect("should accept mirror_enabled with bidstream_enabled at push");
     }
 
     #[test]

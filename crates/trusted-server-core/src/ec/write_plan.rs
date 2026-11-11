@@ -109,7 +109,7 @@ fn apply_browser_ingest(
 ) -> Vec<String> {
     let mut ingested = Vec::new();
     for update in updates {
-        if registry.rejects_ingest(&update.partner_id) {
+        if registry.is_provider_owned(&update.partner_id) {
             log::trace!(
                 "EC write planner: skipping browser UID for provider-owned source '{}'",
                 update.partner_id
@@ -351,7 +351,6 @@ mod tests {
                 registry.mark_provider_owned(source, None),
                 "should mark {source}"
             );
-            assert!(registry.reject_ingest(source), "should reject {source}");
         }
         registry
     }
@@ -931,12 +930,8 @@ mod tests {
 
     #[test]
     fn browser_ingest_fills_a_source_owned_only_by_pull_sync() {
-        // Arrange: pull sync owns the source but rejects no ingest.
-        let mut registry = registry(&[]);
-        assert!(
-            registry.mark_provider_owned("ids.example.com", None),
-            "should mark the pull-sync source"
-        );
+        // Arrange: pull sync runs for the source, but no configured provider owns it.
+        let registry = registry(&[]);
         let snapshot = present(&live_entry());
         let ingest = ingest_owned();
         let lookups = failed_lookup(LookupStatus::Skipped(SkipReason::NotDue));

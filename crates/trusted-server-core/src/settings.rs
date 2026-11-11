@@ -506,7 +506,11 @@ pub struct EcPartner {
     /// Whether this partner's provider-written UIDs are mirrored to the
     /// JS-readable `__Host-ts-eids-mirror` cookie. Off by default; takes
     /// effect only with `bidstream_enabled`.
-    #[serde(default, deserialize_with = "from_value_or_str")]
+    #[serde(
+        default,
+        skip_serializing_if = "is_false",
+        deserialize_with = "from_value_or_str"
+    )]
     pub mirror_enabled: bool,
     /// Plaintext API token used by inbound batch sync and identify requests.
     ///
@@ -4750,6 +4754,41 @@ mod tests {
         assert!(
             serialized.get("sandbox_metrics_enabled").is_none(),
             "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn default_partner_omits_mirror_enabled_for_rollback() {
+        let partner: EcPartner = serde_json::from_value(json!({
+            "name": "ids",
+            "source_domain": "ids.example.com",
+        }))
+        .expect("should deserialize partner");
+
+        let serialized = serde_json::to_value(&partner).expect("should serialize partner");
+
+        assert!(
+            serialized.get("mirror_enabled").is_none(),
+            "a default partner must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn enabled_mirror_serializes_and_round_trips() {
+        let partner: EcPartner = serde_json::from_value(json!({
+            "name": "ids",
+            "source_domain": "ids.example.com",
+            "mirror_enabled": true,
+        }))
+        .expect("should deserialize partner");
+
+        let serialized = serde_json::to_value(&partner).expect("should serialize partner");
+        let restored: EcPartner =
+            serde_json::from_value(serialized).expect("should deserialize serialized partner");
+
+        assert!(
+            restored.mirror_enabled,
+            "an enabled mirror must survive a round trip"
         );
     }
 

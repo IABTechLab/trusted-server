@@ -318,7 +318,6 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
             })
     }
 
-    /// Whether the row holds a live provider-written UID for `source`.
     /// Whether any provider has a due source in `entry`, ignoring consent and
     /// rate limits, so a caller can skip a row read that cannot lead to a
     /// lookup. `None` (no row known) counts every source as due.
@@ -330,6 +329,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         })
     }
 
+    /// Whether the row holds a live provider-written UID for `source`.
     fn holds_live_uid(entry: Option<&KvEntry>, source: &str, now: UnixSeconds) -> bool {
         entry
             .and_then(|entry| entry.ids.get(source))

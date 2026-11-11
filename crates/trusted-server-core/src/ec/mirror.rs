@@ -333,7 +333,7 @@ mod tests {
         );
         assert!(
             matches!(
-                build_mirror(Some(&entry), &granting(), &partners(false), now),
+                build_mirror(Some(&entry), &granting(), &partners_with(false, false), now),
                 MirrorCookie::Expire
             ),
             "should expire for non-bidstream sources"
@@ -421,9 +421,7 @@ mod tests {
             "ts_pull_token": "example-pull-token-32-bytes-minimum"
         }))
         .expect("should build partner");
-        let mut pull =
-            PartnerRegistry::from_config(&[pull_partner]).expect("should build registry");
-        pull.mark_provider_owned("ids.example.com", None);
+        let pull = PartnerRegistry::from_config(&[pull_partner]).expect("should build registry");
 
         let mirror = build_mirror(Some(&entry), &granting(), &pull, UnixSeconds::new(1000));
 
