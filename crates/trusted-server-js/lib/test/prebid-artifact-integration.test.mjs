@@ -223,12 +223,16 @@ function expectNoUnexpectedNetworkActivity(stubs) {
   ).toEqual([]);
 }
 
-function installServerState(pageWindow, { analytics = false, managedUserIds } = {}) {
+function installServerState(
+  pageWindow,
+  { analytics = false, managedUserIds, relaySoftVendorException } = {}
+) {
   pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
   pageWindow.__tsjs_prebid = {
     clientSideBidders: [],
     serverSideBidders: ['appnexus'],
     ...(managedUserIds ? { managedUserIds } : {}),
+    ...(relaySoftVendorException === undefined ? {} : { relaySoftVendorException }),
   };
 
   if (analytics) {
@@ -326,17 +330,19 @@ function expectManifest(manifest, analytics) {
 
 describe('tsjs-prebid production artifacts', () => {
   it.each([
-    { purpose2: true, mapping: undefined, auctionRequests: 1 },
-    { purpose2: false, mapping: undefined, auctionRequests: 0 },
-    { purpose2: true, mapping: 1, auctionRequests: 0 },
+    { relaySoftVendorException: undefined, purpose2: true, mapping: undefined, auctionRequests: 0 },
+    { relaySoftVendorException: false, purpose2: true, mapping: undefined, auctionRequests: 0 },
+    { relaySoftVendorException: true, purpose2: true, mapping: undefined, auctionRequests: 1 },
+    { relaySoftVendorException: true, purpose2: false, mapping: undefined, auctionRequests: 0 },
+    { relaySoftVendorException: true, purpose2: true, mapping: 1, auctionRequests: 0 },
   ])(
     'enforces actual TCF rules for relay consent: %j',
-    async ({ purpose2, mapping, auctionRequests }) => {
+    async ({ relaySoftVendorException, purpose2, mapping, auctionRequests }) => {
       const dom = createPage();
       try {
         const pageWindow = dom.window;
         const stubs = installNetworkAndConsoleStubs(pageWindow);
-        installServerState(pageWindow);
+        installServerState(pageWindow, { relaySoftVendorException });
         pageWindow.eval(noAnalyticsArtifact.bundleCode);
         pageWindow.eval(shimCode);
         expect(pageWindow.pbjs.installedModules).toContain('tcfControl');
@@ -381,6 +387,9 @@ describe('tsjs-prebid production artifacts', () => {
           ([resource]) => new URL(requestUrl(resource)).pathname === '/auction'
         );
         expect(requests).toHaveLength(auctionRequests);
+        if (relaySoftVendorException !== true) {
+          expect(pageWindow.pbjs.getConfig('consentManagement').gdpr).toEqual(gdpr);
+        }
         const enforcement = pageWindow.pbjs
           .getEvents()
           .filter(({ eventType }) => eventType === 'tcf2Enforcement')
