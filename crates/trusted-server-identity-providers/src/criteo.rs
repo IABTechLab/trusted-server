@@ -1,9 +1,11 @@
 //! Criteo identity provider: reads the Criteo ID from the first-party
 //! cookie Prebid's `criteoIdSystem` writes.
 //!
-//! Prebid stores Criteo's bid ID in `cto_bidid` and sends that value
-//! unchanged (still percent-encoded) as the `criteo.com` EID with agent
-//! type 1, so it is stored verbatim. No server call is made.
+//! Prebid stores Criteo's bid ID in `cto_bidid` with `encodeURIComponent`
+//! and sends the decoded value as the `criteo.com` EID with agent type 1,
+//! so the cookie is percent-decoded before it is stored. Like Prebid's
+//! `normalizeBidId`, a `{"criteoId":…}` value is unwrapped. No server call
+//! is made.
 
 use std::borrow::Cow;
 
@@ -16,7 +18,9 @@ use trusted_server_core::ec::provider::{
     RequestCookies,
 };
 
-use crate::common::{CookieReader, bounded_expiry, cookie_capabilities, device_eid, is_usable_id};
+use crate::common::{
+    CookieReader, bounded_expiry, cookie_capabilities, device_eid, is_usable_id, percent_decoded,
+};
 
 /// The Criteo provider kind.
 pub struct Criteo;
@@ -89,18 +93,28 @@ impl IdentityProvider for CriteoProvider {
         &self,
         cookies: RequestCookies<'cookie>,
     ) -> CookieRead<'cookie> {
-        let Some(id) = self
-            .cookies
-            .read(cookies, |value| is_usable_id(value).then_some(value.trim()))
-        else {
+        let Some(id) = self.cookies.read(cookies, |value| {
+            let id = bid_id(&percent_decoded(value))?;
+            is_usable_id(&id).then(|| id.trim().to_owned())
+        }) else {
             return CookieRead::Absent;
         };
         CookieRead::Found(vec![device_eid(
             &self.source,
-            Cow::Borrowed(id),
+            Cow::Owned(id),
             bounded_expiry(None),
         )])
     }
+}
+
+/// The bid ID in a decoded `cto_bidid` value, unwrapping the
+/// `{"criteoId":…}` form Prebid's `normalizeBidId` accepts.
+fn bid_id(decoded: &str) -> Option<String> {
+    if decoded.trim_start().starts_with('{') {
+        let value: serde_json::Value = serde_json::from_str(decoded).ok()?;
+        return value["criteoId"].as_str().map(str::to_owned);
+    }
+    Some(decoded.to_owned())
 }
 
 #[cfg(test)]
@@ -122,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn stores_the_bid_id_verbatim() {
+    fn stores_the_decoded_bid_id() {
         let eids = provider()
             .read_request_cookies(RequestCookies::new("cto_bidid=bidid-example%3D%3D"))
             .into_found()
@@ -134,10 +148,25 @@ mod tests {
         );
         let uid = &eids[0].uids[0];
         assert_eq!(
-            uid.id, "bidid-example%3D%3D",
-            "should keep the value encoded"
+            uid.id, "bidid-example==",
+            "should store the decoded value Prebid sends"
         );
         assert_eq!(uid.atype, Some(1), "should be device-based");
+    }
+
+    #[test]
+    fn unwraps_a_criteo_id_object() {
+        let eids = provider()
+            .read_request_cookies(RequestCookies::new(
+                "cto_bidid=%7B%22criteoId%22%3A%22bidid-example%22%7D",
+            ))
+            .into_found()
+            .expect("should read the bid ID");
+
+        assert_eq!(
+            eids[0].uids[0].id, "bidid-example",
+            "should store the wrapped bid ID"
+        );
     }
 
     #[test]
