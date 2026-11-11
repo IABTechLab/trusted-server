@@ -9,7 +9,10 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{
+    ConsentContext, consent_allows_server_side_auction, gate_eids_by_consent,
+    tcf_vendor_consent_denied,
+};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
@@ -377,6 +380,7 @@ pub async fn handle_auction(
 
     // Merge current-request client EIDs with KV-resolved EIDs, then apply
     // consent gating before attaching them to the auction request.
+    let client_eids = drop_vendor_denied_client_eids(client_eids, registry, ec_context.consent());
     let merged_eids = merge_auction_eids(client_eids, eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
@@ -637,6 +641,29 @@ fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
     Some(Uid { id, atype, ext })
 }
 
+/// Drops client EIDs whose source is owned by a configured identity provider
+/// whose TCF vendor consent is withheld.
+///
+/// Only sources marked by a configured provider carry a vendor ID, so with no
+/// providers configured the input is returned unchanged.
+pub(crate) fn drop_vendor_denied_client_eids(
+    client_eids: Option<Vec<Eid>>,
+    registry: Option<&PartnerRegistry>,
+    consent: &ConsentContext,
+) -> Option<Vec<Eid>> {
+    let Some(registry) = registry else {
+        return client_eids;
+    };
+    let mut eids = client_eids?;
+    eids.retain(|eid| {
+        !registry
+            .get(&eid.source)
+            .and_then(|partner| partner.owner_tcf_vendor_id)
+            .is_some_and(|vendor| tcf_vendor_consent_denied(consent, vendor))
+    });
+    Some(eids)
+}
+
 pub(crate) fn merge_auction_eids(
     client_eids: Option<Vec<Eid>>,
     resolved_eids: Option<Vec<Eid>>,
@@ -772,6 +799,107 @@ mod tests {
             .auction_telemetry_sink(telemetry_sink)
             .client_info(ClientInfo::default())
             .build()
+    }
+
+    fn vendor_denied_consent() -> ConsentContext {
+        let mut purposes = vec![false; 24];
+        purposes[0] = true;
+        purposes[3] = true;
+        ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            tcf: Some(crate::consent::types::TcfConsent {
+                version: 2,
+                cmp_id: 1,
+                cmp_version: 1,
+                consent_screen: 0,
+                consent_language: "EN".to_owned(),
+                vendor_list_version: 1,
+                tcf_policy_version: 4,
+                created_ds: 0,
+                last_updated_ds: 0,
+                purpose_consents: purposes,
+                purpose_legitimate_interests: vec![false; 24],
+                vendor_consents: Vec::new(),
+                vendor_legitimate_interests: Vec::new(),
+                special_feature_opt_ins: vec![false; 12],
+            }),
+            ..ConsentContext::default()
+        }
+    }
+
+    fn client_eids_for(sources: &[&str]) -> Option<Vec<Eid>> {
+        Some(
+            sources
+                .iter()
+                .map(|source| {
+                    Eid::new(
+                        *source,
+                        vec![Uid {
+                            id: format!("uid-{source}"),
+                            atype: Some(1),
+                            ext: None,
+                        }],
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn partner_registry(sources: &[&str]) -> PartnerRegistry {
+        let partners: Vec<crate::settings::EcPartner> = sources
+            .iter()
+            .map(|source| {
+                serde_json::from_value(json!({
+                    "name": source, "source_domain": source, "bidstream_enabled": true
+                }))
+                .expect("should build partner")
+            })
+            .collect();
+        PartnerRegistry::from_config(&partners).expect("should build registry")
+    }
+
+    #[test]
+    fn client_eids_of_a_vendor_denied_provider_source_are_dropped() {
+        // Arrange
+        let mut registry = partner_registry(&["ids.example.com", "other.example.com"]);
+        assert!(
+            registry.mark_provider_owned("ids.example.com", std::num::NonZeroU16::new(42)),
+            "should mark the provider source"
+        );
+        let client = client_eids_for(&["ids.example.com", "other.example.com"]);
+
+        // Act
+        let kept =
+            drop_vendor_denied_client_eids(client, Some(&registry), &vendor_denied_consent())
+                .expect("should keep the list");
+
+        // Assert
+        let sources: Vec<&str> = kept.iter().map(|eid| eid.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            vec!["other.example.com"],
+            "should drop only the vendor-denied provider source"
+        );
+    }
+
+    #[test]
+    fn client_eids_are_unchanged_without_providers() {
+        // Arrange
+        let registry = partner_registry(&["ids.example.com"]);
+        let client = client_eids_for(&["ids.example.com", "unregistered.example.com"]);
+        let before = serde_json::to_string(&client).expect("should serialize");
+
+        // Act
+        let kept =
+            drop_vendor_denied_client_eids(client, Some(&registry), &vendor_denied_consent());
+
+        // Assert
+        assert_eq!(
+            serde_json::to_string(&kept).expect("should serialize"),
+            before,
+            "should leave client EIDs byte-identical with no providers"
+        );
     }
 
     fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {

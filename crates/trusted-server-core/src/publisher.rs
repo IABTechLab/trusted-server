@@ -41,7 +41,8 @@ use sha2::Digest as _;
 use web_time::Instant;
 
 use crate::auction::endpoints::{
-    merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
+    drop_vendor_denied_client_eids, merge_auction_eids, resolve_auction_eids,
+    resolve_client_auction_eids,
 };
 use crate::auction::formats::sanitize_publisher_page_url;
 use crate::auction::orchestrator::{
@@ -6170,6 +6171,11 @@ fn apply_auction_eids_and_device(
         targeting.kv_snapshot,
         targeting.partner_registry,
         targeting.ec_context,
+    );
+    let client_eids = drop_vendor_denied_client_eids(
+        client_eids,
+        targeting.partner_registry,
+        targeting.ec_context.consent(),
     );
     let merged_eids = merge_auction_eids(client_eids, kv_eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
