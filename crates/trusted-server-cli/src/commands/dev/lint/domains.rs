@@ -111,9 +111,15 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "iabtechlab.com",
     "iabtechlab.github.io",
     "iabeurope.github.io",
+    // GitHub CLI: canonical verification command documentation.
+    "cli.github.com",
     // Specs (supply chain)
     "in-toto.io",
     "rslstandard.org",
+    // SLSA: canonical provenance predicate in the release verification guide.
+    "slsa.dev",
+    // SPDX: canonical document predicate in the release verification guide.
+    "spdx.dev",
     // Specs (other)
     "webassembly.org",
     // Fastly docs
@@ -311,6 +317,22 @@ mod allow_check_tests {
     fn reference_hosts_allowed_everywhere() {
         assert!(is_allowed("github.com", &nothing_suppressed()));
         assert!(is_allowed("docs.rs", &nothing_suppressed()));
+        assert!(
+            is_allowed("slsa.dev", &nothing_suppressed()),
+            "should allow the canonical slsa.dev reference"
+        );
+        assert!(
+            is_allowed("spdx.dev", &nothing_suppressed()),
+            "should allow the canonical spdx.dev reference"
+        );
+        assert!(
+            is_allowed("cli.github.com", &nothing_suppressed()),
+            "should allow the canonical cli.github.com reference"
+        );
+        assert!(
+            !is_allowed("unapproved.slsa.dev", &nothing_suppressed()),
+            "should reject unapproved slsa.dev subdomains"
+        );
         // But NOT subdomains of REFERENCE_HOSTS (exact-match).
         assert!(!is_allowed("other.github.com", &nothing_suppressed()));
     }
