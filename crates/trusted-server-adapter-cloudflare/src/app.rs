@@ -531,6 +531,22 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         ) -> Result<Response, EdgeError> {
             let services = state.services_for_request(&ctx);
             let mut req = ctx.into_request()?;
+            if req.uri().path() == trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH {
+                // Reserve this path without an identity graph; never forward
+                // consent snapshots or acknowledge an unpersisted revocation.
+                return Ok(
+                    match trusted_server_core::ec::consent_update::prepare_consent_update(
+                        &services, req,
+                    )
+                    .await
+                    {
+                        Ok(req) => trusted_server_core::ec::consent_update::handle_consent_update(
+                            &req, None,
+                        ),
+                        Err(response) => *response,
+                    },
+                );
+            }
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
