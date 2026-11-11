@@ -124,9 +124,8 @@ pull_sync_concurrency = 3
 # endpoint = "https://ids.example.com/v1/lookup"
 # The endpoint host must be listed here.
 # allowed_domains = ["ids.example.com"]
-# Each source needs an [[ec.partners]] entry (for example one with
-# source_domain = "ids.example.com") and must be claimed by only one enabled
-# provider.
+# Each source needs an [[ec.partners]] entry with a matching source_domain and
+# must be claimed by only one enabled provider.
 # sources = ["ids.example.com"]
 # Optional: require TCF vendor consent for lookups and for sending this
 # provider's stored IDs to bidders.

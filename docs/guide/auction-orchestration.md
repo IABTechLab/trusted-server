@@ -829,7 +829,7 @@ Until that callback lands, startup remains the mandatory target-aware gate.
 Auction requests start at dispatch and progress while the publisher origin loads.
 Response collection waits for headers and complete upstream bodies only until the
 original absolute deadline. At expiry, one final snapshot preserves complete
-responses already available; unfinished providers become timeouts. On Fastly the snapshot may wait up to 1 ms per partially received body so the host can surface bytes that already arrived, and keeps a response whose headers arrived by the cutoff. A slow origin
+responses already available; unfinished providers become timeouts. On Fastly the snapshot may wait up to 1 ms per partially received body so the host can surface bytes that already arrived, and reads on into the body of a response whose headers arrived by the cutoff instead of abandoning it. A slow origin
 never restarts the budget or causes an already-buffered bid to be discarded.
 Fastly has no upstream arrival timestamp, so this is a bound on network waiting,
 not bid eligibility based on an exact server-side arrival time. A mediator starts

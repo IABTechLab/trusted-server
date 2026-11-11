@@ -936,7 +936,7 @@ domain, booleans, source names, counts, and status codes:
    recording its value.
 5. Confirm a controlled Prebid Server request contains that source in
    `user.ext.eids`.
-6. Confirm a later request ingests the source into the configured
+6. Confirm a later top-level navigation ingests the source into the configured
    `liveramp.com` EC partner.
 7. Repeat with denied consent and confirm the envelope endpoint is not called,
    `idl_env` is not written, and no LiveRamp EID is forwarded.
@@ -980,7 +980,7 @@ sequenceDiagram
     T->>P: OpenRTB request\nuser.ext.eids = merged set
     P-->>T: OpenRTB bid response
     T-->>B: Auction response
-    T->>K: Ingest body eids + ts-eids/sharedId cookies\n(TCF Purpose 1 + 4 under GDPR)
+    Note over B,K: /auction writes nothing to KV; ts-eids and sharedId\nare ingested on the next top-level navigation
 ```
 
 ### Merge and deduplication rules

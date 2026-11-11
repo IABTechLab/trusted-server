@@ -851,6 +851,9 @@ source_domain = "ids.example.com"
 [[ec.identity_providers]]
 id = "example-provider"
 kind = "example-kind"
+# This release registers no provider kind; an enabled provider fails deploy
+# validation and startup.
+enabled = false
 endpoint = "https://ids.example.com/v1/lookup"
 allowed_domains = ["ids.example.com"]
 sources = ["ids.example.com"]
@@ -862,8 +865,11 @@ token = "example_provider_token"
 `collect = "after_response"` lookups run after the response is sent, within
 `identity_after_response_budget_ms`, and only when `ec_store` is configured,
 the response is not a redirect, the navigation's own write succeeded (or had
-nothing to change), and the EC was not minted on this navigation. Their results
-reach the row in a follow-up write.
+nothing to change), the row is live, and the EC was not minted on this
+navigation. A row recovered from an orphaned cookie on the same navigation
+qualifies. They also run behind an error response, including a `502` that
+Trusted Server generates when the origin is unreachable. Their results reach
+the row in a follow-up write. Providers run only on Fastly.
 
 ::: warning Rate limit granularity
 `rate_limit_per_hour` is counted per EC hash, which is derived from the client
@@ -879,13 +885,17 @@ no sources, when a source has no `[[ec.partners]]` entry, when two enabled
 providers claim the same source, or when its `id` is empty or shared with
 another enabled provider. `identity_budget_ms` must be 1–1000 and
 `identity_after_response_budget_ms` 1–5000. Deploy validation also rejects an
-empty `secrets.token` key name.
+empty `secrets.token` key name, and, because this release registers no
+provider kind, any enabled provider. A disabled provider's `secrets.token` is
+not resolved.
 
 ::: warning Rollback
 A config blob that configures identity providers, or sets either identity
 budget to a non-default value, cannot be loaded by a build from before
 identity providers. Roll the runtime back only with a blob that leaves them
-out.
+out. Rows holding a provider UID over 512 bytes also fail to load on such a
+build, and an older writer drops a row's `eids` and provider opt-outs when it
+rewrites the row.
 :::
 
 ### Field Details
@@ -2551,7 +2561,7 @@ Auction response collection waits only until an absolute deadline measured from
 dispatch, including headers and complete response bodies. One final snapshot
 retains complete available responses after a slow origin; unfinished providers
 become timeouts and mediation cannot start with an exhausted budget. Backend
-timeout rounding does not extend network waiting. On Fastly the snapshot may wait up to 1 ms per partially received body so the host can surface bytes that already arrived, and keeps a response whose headers arrived by the cutoff.
+timeout rounding does not extend network waiting. On Fastly the snapshot may wait up to 1 ms per partially received body so the host can surface bytes that already arrived, and reads on into the body of a response whose headers arrived by the cutoff instead of abandoning it.
 Provider bids that are already complete at the final snapshot remain
 eligible even after `tmax`; mediation starts only with remaining budget and
 rejects responses collected after its cutoff.

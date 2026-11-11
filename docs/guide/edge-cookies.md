@@ -42,7 +42,7 @@ maps to a stable base.
 
 ### Request Lifecycle
 
-Every request passes through four phases. A new EC is minted, and its row created, only on a top-level publisher navigation: a `GET` through the publisher proxy with `Sec-Fetch-Dest: document`, `Sec-Fetch-Mode: navigate` and no `prefetch` token in `Sec-Purpose`. Clients that send no Fetch Metadata get no EC, and a prefetch or prerender (`Sec-Purpose: prefetch;prerender`) never mints or writes. Integration proxies and `/auction` use an existing EC but never mint one, and read-only endpoints like `/identify` and `/batch-sync` skip generation entirely. During pre-routing, Trusted Server builds consent from request-local cookies, headers, geolocation, and policy defaults; it does not load consent from a separate KV store.
+Every request passes through four phases. A new EC is minted, and its row created, only on a top-level publisher navigation: a `GET` through the publisher proxy with `Sec-Fetch-Dest: document`, `Sec-Fetch-Mode: navigate` and no `prefetch` token in `Sec-Purpose`, answered with a response that is not a 301, 302, 303, 307 or 308 redirect. Clients that send no Fetch Metadata get no EC, and a prefetch or prerender (`Sec-Purpose: prefetch;prerender`) never mints or writes. Integration proxies and `/auction` use an existing EC but never mint one, and read-only endpoints like `/identify` and `/batch-sync` skip generation entirely. During pre-routing, Trusted Server builds consent from request-local cookies, headers, geolocation, and policy defaults; it does not load consent from a separate KV store.
 
 ```mermaid
 sequenceDiagram
@@ -182,7 +182,7 @@ Current TSJS writers preserve the full OpenRTB-style `{source, uids:[...]}` shap
 
 The `sharedId` cookie follows a similar path but is written directly by Prebid's SharedID module rather than by TSJS. The server reads it separately and maps it via the `sharedid.org` source domain.
 
-Cookie persistence runs only on top-level document navigations (`Sec-Fetch-Dest: document` and `Sec-Fetch-Mode: navigate`). `POST /auction`, `GET /_ts/page-bids`, static assets, analytics, integration requests, filter short circuits, and other subresources do not persist these cookies.
+Cookie persistence runs only on top-level publisher navigations: a `GET` through the publisher proxy with `Sec-Fetch-Dest: document`, `Sec-Fetch-Mode: navigate` and no `prefetch` in `Sec-Purpose`. `POST /auction`, `GET /_ts/page-bids`, static assets, analytics, integration requests, filter short circuits, and other subresources do not persist these cookies.
 
 Each navigation makes at most one conditional page-load write, which carries browser ingest and page-phase identity-provider results together. If another writer wins, the navigation's changes are dropped without a re-read; a later navigation offers them again. Two writes sit outside that rule: a consent withdrawal's tombstone is written on any request that carries the EC cookie, with bounded retries, and `collect = "after_response"` identity providers make one follow-up write after the response is sent. Batch sync and pull sync write through their own channels.
 
@@ -270,7 +270,7 @@ When the identity graph contains a UID for every pull-enabled partner, Trusted S
 
 A valid marker avoids a KV lookup only when pull-sync completeness is the sole reason to inspect the row. Auctions that need stored EIDs, browser EID-cookie ingestion, explicit withdrawal, and generation continue to use KV. The marker acts as recent proof that the row existed, so deletion of a previously complete row is not detected until the marker expires, at most one hour after issuance. Partner-set changes, passphrase rotation, malformed values, and expiration invalidate the marker and restore the normal lookup and orphan-recovery path.
 
-Pull sync runs after response delivery, so a partner response that fills the last missing UID cannot set the marker on that already-sent response. A later eligible request verifies the completed row and issues the marker. Explicit withdrawal expires both `ts-ec` and any present `ts-ec-pull-complete` marker even when KV is unavailable.
+Pull sync runs after response delivery, so a partner response that fills the last missing UID cannot set the marker on that already-sent response. A later eligible request verifies the completed row and issues the marker. Explicit withdrawal expires both `ts-ec` and any present `ts-ec-pull-complete` marker once the row is tombstoned or proven absent. While the tombstone cannot be written (KV unavailable, CAS retries exhausted, or a row that cannot be read), the cookie is kept so the next request that carries it retries the withdrawal.
 
 Issuing or expiring the marker adds `Set-Cookie` to the outgoing response. Cache-privacy handling makes an otherwise shareable response private when that happens. A valid marker is not refreshed on each request, so this cost is limited to responses that establish or clear marker state in exchange for avoiding later KV reads.
 
