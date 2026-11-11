@@ -746,6 +746,23 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
 #[cfg(test)]
 mod trace_dispatch_tests {
     use super::*;
+
+    #[test]
+    fn enabled_identity_provider_fails_startup() {
+        let mut settings = trace_settings(false);
+        settings.ec.identity_providers =
+            vec![trusted_server_core::test_support::fixtures::enabled_identity_provider()];
+
+        let Err(error) = build_state_with_settings(settings) else {
+            panic!("should refuse to start with an enabled identity provider");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-provider") && message.contains("Axum"),
+            "should name the provider and the adapter: {message}"
+        );
+    }
     use futures::executor::block_on;
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedClientIpConfig;

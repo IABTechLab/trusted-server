@@ -208,11 +208,14 @@ mod tests {
             .expect("should parse"),
         ];
 
-        let result = build_coordinator(&settings);
+        let Err(error) = build_coordinator(&settings) else {
+            panic!("should fail instead of skipping an enabled provider of an unknown kind");
+        };
 
+        let message = format!("{error:?}");
         assert!(
-            result.is_err(),
-            "should fail instead of skipping an enabled provider of an unknown kind"
+            message.contains("`p`") && message.contains("missing"),
+            "should name the provider and its unregistered kind: {message}"
         );
     }
 

@@ -2849,11 +2849,14 @@ mod tests {
             .expect("should parse provider"),
         );
 
-        let result = build_state_from_settings(settings);
+        let Err(error) = build_state_from_settings(settings) else {
+            panic!("should refuse to start with a provider this build cannot run");
+        };
 
+        let message = format!("{error:?}");
         assert!(
-            result.is_err(),
-            "should refuse to start with a provider this build cannot run"
+            message.contains("example-provider") && message.contains("example-kind"),
+            "should name the provider and its unregistered kind: {message}"
         );
     }
 
