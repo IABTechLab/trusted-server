@@ -745,6 +745,21 @@ fn push_bid_rows(
     delivered_winner_slots: Option<&HashSet<String>>,
 ) {
     let mut matched_wins = HashSet::new();
+    // Local ranking clones the selected bid, so its winner has an exact provider
+    // match. Mediation may rewrite the ID or price; only those slots fall back to
+    // the looser provider association.
+    let exact_winner_slots = result
+        .winning_bids
+        .iter()
+        .filter(|(_, winning)| {
+            result
+                .provider_responses
+                .iter()
+                .flat_map(|response| &response.bids)
+                .any(|bid| is_exact_winning_bid(bid, winning))
+        })
+        .map(|(slot_id, _)| slot_id.as_str())
+        .collect::<HashSet<_>>();
 
     for response in &result.provider_responses {
         for bid in &response.bids {
@@ -755,10 +770,8 @@ fn push_bid_rows(
                     delivered_winner_slots.is_none_or(|slots| slots.contains(*slot_id))
                         && !matched_wins.contains(*slot_id)
                         && bid_matches_winning_bid(bid, winning)
-                        // Local ranking clones the selected bid without changing its identity or price.
-                        // Mediation can replace both, so keep its original provider association.
-                        && (result.mediator_response.is_some()
-                            || (bid.bid_id == winning.bid_id && bid.price == winning.price))
+                        && (is_exact_winning_bid(bid, winning)
+                            || !exact_winner_slots.contains(slot_id.as_str()))
                 })
                 .map(|(slot_id, winning)| (slot_id.clone(), winning));
             let (is_win, price) = if let Some((slot_id, winning)) = matched_slot {
@@ -845,6 +858,12 @@ fn bid_matches_winning_bid(candidate: &Bid, winning: &Bid) -> bool {
         Some(winning_ad_id) => candidate.ad_id.as_deref() == Some(winning_ad_id),
         None => true,
     }
+}
+
+fn is_exact_winning_bid(candidate: &Bid, winning: &Bid) -> bool {
+    bid_matches_winning_bid(candidate, winning)
+        && candidate.bid_id == winning.bid_id
+        && candidate.price == winning.price
 }
 
 fn media_type_for_slot<'a>(request: &'a AuctionRequest, slot_id: &str) -> Option<&'a str> {
@@ -1523,6 +1542,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn local_winner_is_attributed_when_failed_mediator_response_is_kept() {
+        let request = test_request("failed-mediation");
+        let lower = bid("slot-1", "example-bidder", None, Some(1.5));
+        let higher = bid("slot-1", "example-bidder", None, Some(2.0));
+        let result = OrchestrationResult {
+            provider_responses: vec![AuctionResponse::success(
+                "provider-a",
+                vec![lower, higher.clone()],
+                2,
+            )],
+            mediator_response: Some(AuctionResponse::error("adserver_mock", 3)),
+            winning_bids: HashMap::from([("slot-1".to_owned(), higher)]),
+            total_time_ms: 5,
+            metadata: HashMap::new(),
+        };
+        let events = build_auction_events(
+            AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/auction", 1),
+            AuctionTerminalOutcome::Completed {
+                request: &request,
+                result: &result,
+                delivered_winner_slots: None,
+            },
+        );
+        let rows = events
+            .rows()
+            .iter()
+            .filter(|row| row.event_kind == "bid")
+            .map(|row| (row.price_cpm, row.is_win))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![(Some(1.5), Some(0)), (Some(2.0), Some(1))],
+            "should attribute the local winner even when a failed mediator response is kept"
+        );
     }
 
     #[test]

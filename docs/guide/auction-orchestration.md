@@ -916,7 +916,7 @@ The orchestrator is designed to be resilient:
 - **Provider parse failure** — If a response can't be parsed, an `AuctionResponse::error()` is recorded. Other results are unaffected.
 - **No providers configured** — Completes as a no-bid without provider I/O.
 - **No provider produces a valid bid** — Returns an empty `OrchestrationResult` with zero winning bids after recording provider outcomes.
-- **Mediator failure** — If mediation cannot run, including an HTTP non-2xx response, the orchestrator falls back to local ranking of collected provider bids with floor prices enforced. HTTP status and response parsing failures log a warning. As with other mediation failures, no mediator response or mediator telemetry row is recorded; the summary counts the locally selected winners. A valid successful no-bid response remains authoritative and does not trigger fallback.
+- **Mediator failure** — If mediation fails (the mediator cannot launch or answer within the auction budget, its request fails, it returns a non-2xx HTTP status or an error-status response, or its response cannot be read or parsed), the orchestrator falls back to local ranking of collected provider bids with floor prices enforced. HTTP status and response parsing failures log a warning. As with other mediation failures, no mediator response or mediator telemetry row is recorded; the summary counts the locally selected winners. A valid successful no-bid response, including an HTTP 204, remains authoritative and does not trigger fallback.
 - **Mediator returns bids without decoded prices** — Those bids are filtered out with a warning.
 
 ## Observability

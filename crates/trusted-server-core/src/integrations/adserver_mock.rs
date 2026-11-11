@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{Method, header};
+use http::{Method, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, HashMap};
@@ -387,6 +387,12 @@ impl AdServerMockProvider {
         dimensions_by_slot: Option<&BidDimensionIndex>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         let response = response.response;
+
+        // OpenRTB signals an empty auction with a bodiless 204, and the bidder
+        // providers already treat it that way. Keep it a final mediation no-bid.
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(AuctionResponse::no_bid("adserver_mock", response_time_ms));
+        }
 
         if !response.status().is_success() {
             return Err(Report::new(TrustedServerError::Auction {

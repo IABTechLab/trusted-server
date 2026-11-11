@@ -792,7 +792,11 @@ impl AuctionOrchestratorHarness {
                         None
                     }
                 };
-                if let Some(mediated) = mediated {
+                // An error status is not a mediation decision, however the provider
+                // reports it, so it falls back to local ranking like other failures.
+                if let Some(mediated) =
+                    mediated.filter(|response| response.status != BidStatus::Error)
+                {
                     let winners = mediated
                         .bids
                         .iter()
@@ -2691,7 +2695,11 @@ impl AuctionOrchestrator {
                     trace.observe_failure(observation);
                 }
 
-                if let Some(mediator_response) = mediator_response {
+                // An error status is not a mediation decision, however the provider
+                // reports it, so it falls back to local ranking like other failures.
+                if let Some(mediator_response) =
+                    mediator_response.filter(|response| response.status != BidStatus::Error)
+                {
                     let winning = mediator_response
                             .bids
                             .iter()
@@ -7160,6 +7168,35 @@ mod tests {
         body: &serde_json::Value,
         floor: f64,
     ) -> (AuctionRequest, OrchestrationResult) {
+        let body = serde_json::to_vec(body).expect("should serialize mediator response");
+        run_raw_mock_mediator_response(harness, status, body, floor).await
+    }
+
+    async fn run_raw_mock_mediator_response(
+        harness: bool,
+        status: u16,
+        body: Vec<u8>,
+        floor: f64,
+    ) -> (AuctionRequest, OrchestrationResult) {
+        let mediator = Arc::new(AdServerMockProvider::new(AdServerMockConfig {
+            enabled: true,
+            endpoint: "https://mediator.example/mediate".to_string(),
+            timeout_ms: 500,
+            ..AdServerMockConfig::default()
+        }));
+        run_mediated_provider_auction(harness, mediator, Some((status, body)), floor).await
+    }
+
+    /// Runs a planned auction whose single provider returns bids at 1.5 and 2.0.
+    ///
+    /// `mediator_http` is the stubbed mediator HTTP reply, or `None` for a
+    /// mediator that answers without HTTP.
+    async fn run_mediated_provider_auction(
+        harness: bool,
+        mediator: Arc<dyn AuctionProvider>,
+        mediator_http: Option<(u16, Vec<u8>)>,
+        floor: f64,
+    ) -> (AuctionRequest, OrchestrationResult) {
         let http = Arc::new(StubHttpClient::new());
         http.push_response(
             200,
@@ -7173,10 +7210,9 @@ mod tests {
             }))
             .expect("should serialize provider bids"),
         );
-        http.push_response(
-            status,
-            serde_json::to_vec(body).expect("should serialize mediator response"),
-        );
+        if let Some((status, body)) = mediator_http {
+            http.push_response(status, body);
+        }
         let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
@@ -7187,12 +7223,6 @@ mod tests {
             false,
         ))
         .expect("should compile planned auction");
-        let mediator = Arc::new(AdServerMockProvider::new(AdServerMockConfig {
-            enabled: true,
-            endpoint: "https://mediator.example/mediate".to_string(),
-            timeout_ms: 500,
-            ..AdServerMockConfig::default()
-        }));
         let mut request = planned_request();
         request.slots[0].floor_price = Some(floor);
         let settings = create_test_settings();
@@ -7331,6 +7361,84 @@ mod tests {
                         .and_then(|bid| bid.bid_id.as_deref()),
                     if has_winner { Some("mediated") } else { None },
                     "should honor the mediator decision instead of the higher local bid"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_mediator_no_content_is_a_final_no_bid() {
+        for harness in [false, true] {
+            let (_, result) = run_raw_mock_mediator_response(harness, 204, Vec::new(), 1.0).await;
+            assert_eq!(
+                result
+                    .mediator_response
+                    .as_ref()
+                    .map(|response| response.status.clone()),
+                Some(BidStatus::NoBid),
+                "should record a bodiless HTTP 204 as a mediation no-bid (harness={harness})"
+            );
+            assert!(
+                result.winning_bids.is_empty(),
+                "should keep the mediator's no-bid instead of ranking provider bids (harness={harness})"
+            );
+        }
+    }
+
+    struct ErrorStatusMediator;
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for ErrorStatusMediator {
+        fn provider_name(&self) -> &str {
+            "error-status-mediator"
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            Ok(ProviderRequestOutcome::Immediate(AuctionResponse::error(
+                self.provider_name(),
+                3,
+            )))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("error-status mediator response should not be parsed");
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            500
+        }
+    }
+
+    #[tokio::test]
+    async fn mediator_error_status_response_falls_back_to_local_ranking() {
+        for harness in [false, true] {
+            for floor in [1.0, 3.0] {
+                let (_, result) = run_mediated_provider_auction(
+                    harness,
+                    Arc::new(ErrorStatusMediator),
+                    None,
+                    floor,
+                )
+                .await;
+                assert!(
+                    result.mediator_response.is_none(),
+                    "should treat an error-status mediator response as failed mediation (harness={harness})"
+                );
+                assert_eq!(
+                    result
+                        .winning_bids
+                        .get("fictional-slot")
+                        .and_then(|bid| bid.bid_id.as_deref()),
+                    if floor < 2.0 { Some("higher") } else { None },
+                    "should rank provider bids locally with floors (harness={harness}, floor={floor})"
                 );
             }
         }
