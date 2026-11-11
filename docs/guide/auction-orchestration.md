@@ -763,6 +763,7 @@ Common provider fields and defaults:
 | `protocol`       | Required        | `openrtb-2.6`                                                  |
 | `profile`        | `standard`      | Typed OpenRTB behavior                                         |
 | `endpoint`       | Required        | Fixed absolute HTTPS endpoint                                  |
+| `allow_insecure_http` | `false`    | Explicit per-provider HTTP opt-in for approved demos/tests; traffic is unencrypted |
 | `timeout_ms`     | Profile default | PBS 1000 ms, APS 800 ms, standard inherits auction timeout     |
 | `routing`        | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles             |
 | `profile_config` | `{}`            | Profile-owned typed settings                                   |

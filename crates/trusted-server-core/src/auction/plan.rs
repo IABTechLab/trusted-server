@@ -135,6 +135,10 @@ pub struct ProviderConfig {
     pub profile: String,
     /// Fixed provider endpoint.
     pub endpoint: String,
+    /// Permit unencrypted HTTP for this provider only. Defaults to false.
+    /// Use only for explicitly approved demo/test endpoints.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_insecure_http: bool,
     /// Optional profile-default timeout override.
     #[serde(default)]
     pub timeout_ms: Option<u32>,
@@ -314,7 +318,12 @@ impl AuctionPlan {
                     "provider `{id}` profile_config must be an object"
                 )));
             }
-            let endpoint = canonicalize_endpoint(&id, registration.id, &raw.endpoint)?;
+            let endpoint = canonicalize_endpoint(
+                &id,
+                registration.id,
+                &raw.endpoint,
+                raw.allow_insecure_http,
+            )?;
             let timeout_ms = raw
                 .timeout_ms
                 .unwrap_or(match registration.default_timeout {
@@ -566,13 +575,14 @@ fn canonicalize_endpoint(
     provider_id: &ProviderId,
     profile_id: &str,
     value: &str,
+    allow_insecure_http: bool,
 ) -> Result<CanonicalProviderEndpoint, Report<TrustedServerError>> {
     let mut endpoint = Url::parse(value).map_err(|error| {
         configuration_error(format!(
             "provider `{provider_id}` endpoint must be an absolute HTTPS URL: {error}"
         ))
     })?;
-    if endpoint.scheme() != "https"
+    if !(endpoint.scheme() == "https" || (allow_insecure_http && endpoint.scheme() == "http"))
         || endpoint.host_str().is_none()
         || !endpoint.username().is_empty()
         || endpoint.password().is_some()
@@ -596,6 +606,10 @@ fn canonicalize_endpoint(
         normalize_prebid_server_endpoint(&mut endpoint);
     }
     Ok(CanonicalProviderEndpoint(endpoint))
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn normalize_prebid_server_endpoint(endpoint: &mut Url) {
@@ -644,6 +658,7 @@ mod tests {
 
     fn provider(profile: &str) -> ProviderConfig {
         ProviderConfig {
+            allow_insecure_http: false,
             protocol: "openrtb-2.6".to_string(),
             profile: profile.to_string(),
             endpoint: "https://bid.example/openrtb2/auction".to_string(),
@@ -1121,6 +1136,69 @@ mod tests {
         aps.endpoint = "https://aps.example/e/dtb/bid".to_string();
         aps.profile_config = serde_json::json!({"account_id": "example-account"});
         assert!(AuctionPlan::compile(config(BTreeMap::from([(id("aps"), aps)]))).is_err());
+    }
+
+    #[test]
+    fn insecure_http_requires_an_explicit_per_provider_opt_in() {
+        let mut demo = provider("prebid-server");
+        demo.endpoint = "http://pbs.example.com:8000".to_string();
+        assert!(
+            AuctionPlan::compile(config(BTreeMap::from([(id("demo"), demo.clone())]))).is_err()
+        );
+        demo.allow_insecure_http = true;
+        let plan = AuctionPlan::compile(config(BTreeMap::from([(id("demo"), demo.clone())])))
+            .expect("explicit demo HTTP endpoint should compile");
+        assert_eq!(
+            plan.providers()[0].endpoint.as_str(),
+            "http://pbs.example.com:8000/openrtb2/auction"
+        );
+        let mut other = provider("standard");
+        other.endpoint = "http://other.example/bid".to_string();
+        assert!(
+            AuctionPlan::compile(config(BTreeMap::from([
+                (id("demo"), demo),
+                (id("other"), other)
+            ])))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn insecure_http_opt_in_does_not_allow_credentials_fragments_or_other_schemes() {
+        for endpoint in [
+            "http://user:pass@pbs.example/bid",
+            "http://pbs.example/bid#fragment",
+            "ftp://pbs.example/bid",
+            "/relative",
+        ] {
+            let mut raw = provider("prebid-server");
+            raw.allow_insecure_http = true;
+            raw.endpoint = endpoint.to_string();
+            assert!(
+                AuctionPlan::compile(config(BTreeMap::from([(id("demo"), raw)]))).is_err(),
+                "should reject {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn insecure_http_default_preserves_existing_provider_wire_shape() {
+        let legacy = serde_json::to_value(provider("prebid-server")).unwrap();
+        assert!(legacy.get("allow_insecure_http").is_none());
+        assert!(
+            !serde_json::from_value::<ProviderConfig>(legacy)
+                .unwrap()
+                .allow_insecure_http
+        );
+        let mut opted_in = provider("prebid-server");
+        opted_in.allow_insecure_http = true;
+        let encoded = serde_json::to_value(opted_in).unwrap();
+        assert_eq!(encoded["allow_insecure_http"], true);
+        assert!(
+            serde_json::from_value::<ProviderConfig>(encoded)
+                .unwrap()
+                .allow_insecure_http
+        );
     }
 
     #[test]
