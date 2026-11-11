@@ -36,7 +36,10 @@ use crate::auction::types::{AuctionContext, AuctionRequest, MediaType};
 use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
 use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
-use crate::cookies::{CONSENT_COOKIE_NAMES, strip_cookies};
+use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_SOURCEPOINT_TCF};
+use crate::cookies::{
+    CONSENT_COOKIE_NAMES, parse_cookies_to_jar, strip_cookies, tcf_consent_cookie,
+};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
@@ -2097,16 +2100,32 @@ fn apply_prebid_header_values(
     let Some(cookie_value) = cookie else {
         return;
     };
-    if !consent_forwarding.strips_consent_cookies() {
-        to.headers_mut()
-            .insert(header::COOKIE, cookie_value.clone());
-        return;
-    }
     match cookie_value.to_str() {
         Ok(value) => {
-            let stripped = strip_cookies(value, CONSENT_COOKIE_NAMES);
-            if !stripped.is_empty()
-                && let Ok(cookie_header) = HeaderValue::from_str(&stripped)
+            let forwarded = if consent_forwarding.strips_consent_cookies() {
+                strip_cookies(value, CONSENT_COOKIE_NAMES)
+            } else {
+                let jar = parse_cookies_to_jar(value);
+                if jar.get(COOKIE_SOURCEPOINT_TCF).is_some() {
+                    // Preserve this RC's unrelated-cookie forwarding policy, but
+                    // transport the selected TC signal under its canonical name.
+                    let mut forwarded =
+                        strip_cookies(value, &[COOKIE_EUCONSENT_V2, COOKIE_SOURCEPOINT_TCF]);
+                    if let Some(selected) = tcf_consent_cookie(&jar) {
+                        if !forwarded.is_empty() {
+                            forwarded.push_str("; ");
+                        }
+                        forwarded.push_str(COOKIE_EUCONSENT_V2);
+                        forwarded.push('=');
+                        forwarded.push_str(selected.value());
+                    }
+                    forwarded
+                } else {
+                    value.to_owned()
+                }
+            };
+            if !forwarded.is_empty()
+                && let Ok(cookie_header) = HeaderValue::from_str(&forwarded)
             {
                 to.headers_mut().insert(header::COOKIE, cookie_header);
             }
@@ -9888,6 +9907,42 @@ set = { networkId = 42 }
             Some("203.0.113.9"),
             "should use only attested XFF"
         );
+    }
+
+    #[test]
+    fn sourcepoint_tcf_forwarding_preserves_canonical_precedence_and_rc_policy() {
+        for mode in [
+            ConsentForwardingMode::Both,
+            ConsentForwardingMode::CookiesOnly,
+            ConsentForwardingMode::OpenrtbOnly,
+        ] {
+            for (input, selected) in [
+                ("session=example; __Host-ts-tcf=bridge", "bridge"),
+                (
+                    "session=example; __Host-ts-tcf=bridge; euconsent-v2=publisher",
+                    "publisher",
+                ),
+            ] {
+                let from = http::Request::builder()
+                    .header(header::COOKIE, input)
+                    .body(EdgeBody::empty())
+                    .expect("should build inbound request");
+                let mut to = http::Request::new(EdgeBody::empty());
+                copy_request_headers(&from, &mut to, mode, None);
+                let expected = if mode.strips_consent_cookies() {
+                    "session=example".to_owned()
+                } else {
+                    format!("session=example; euconsent-v2={selected}")
+                };
+                assert_eq!(
+                    to.headers()
+                        .get(header::COOKIE)
+                        .and_then(|v| v.to_str().ok()),
+                    Some(expected.as_str()),
+                    "should select the same TC signal as extraction in {mode:?}"
+                );
+            }
+        }
     }
 
     #[test]

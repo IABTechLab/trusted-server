@@ -92,6 +92,8 @@ pub const INTERNAL_HEADERS: &[&str] = &[
 
 // Consent-related cookie names
 pub const COOKIE_EUCONSENT_V2: &str = "euconsent-v2";
+/// Host-only copy of the Sourcepoint TCF decision for first-party requests.
+pub const COOKIE_SOURCEPOINT_TCF: &str = "__Host-ts-tcf";
 pub const COOKIE_GPP: &str = "__gpp";
 pub const COOKIE_GPP_SID: &str = "__gpp_sid";
 pub const COOKIE_US_PRIVACY: &str = "us_privacy";

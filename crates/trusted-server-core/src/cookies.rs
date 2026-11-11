@@ -11,7 +11,9 @@ use error_stack::{Report, ResultExt as _};
 use http::Request;
 use http::header;
 
-use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
+use crate::constants::{
+    COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_SOURCEPOINT_TCF, COOKIE_US_PRIVACY,
+};
 use crate::error::TrustedServerError;
 
 /// Cookie names carrying privacy consent signals.
@@ -21,10 +23,17 @@ use crate::error::TrustedServerError;
 /// `OpenRTB` body instead.
 pub const CONSENT_COOKIE_NAMES: &[&str] = &[
     COOKIE_EUCONSENT_V2,
+    COOKIE_SOURCEPOINT_TCF,
     COOKIE_GPP,
     COOKIE_GPP_SID,
     COOKIE_US_PRIVACY,
 ];
+
+/// Prefers the CMP's own TCF cookie over the Sourcepoint bridge's fallback.
+pub(crate) fn tcf_consent_cookie(jar: &CookieJar) -> Option<&Cookie<'static>> {
+    jar.get(COOKIE_EUCONSENT_V2)
+        .or_else(|| jar.get(COOKIE_SOURCEPOINT_TCF))
+}
 
 /// Parses a cookie string into a [`CookieJar`].
 ///
