@@ -87,37 +87,169 @@ Each built-in policy version has one canonical policy document, a closed JSON ob
 
 Under any built-in policy, a `fail` or `unavailable` outcome on any check means the result is not `satisfied`. `fastly-official-deployment-v1` has no canonical document yet: its provider methods are assigned only when the Fastly qualification passes, and no conforming verifier issues it before then.
 
+Policy documents are normative evaluation inputs, not digest labels. Consumer administrators obtain built-in documents from the published vectors and custom documents from the policy owner out of band, validate them and pin their exact `id`, `version` and JCS SHA-256 digest in independent local configuration before enabling that policy. Issuer metadata advertises descriptors only; it is not a policy retrieval or trust update channel. Missing or mismatched documents fail `policy_untrusted`; no automatic fetch from an assessment-selected URL is allowed.
+
+| Policy field                                                  | Normative evaluation                                                                                                                                                                          |
+| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `checks.<name>.requirement: pass`                             | The named check must pass.                                                                                                                                                                    |
+| `pass_or_not_assessed`                                        | The check may pass or be not assessed; fail/unavailable never satisfies it.                                                                                                                   |
+| `checks.<name>.methods: null`                                 | A passing check must use a method in the consumer's independent allowlist.                                                                                                                    |
+| `methods: [...]`                                              | A passing check must satisfy both this list and the consumer allowlist. An empty list permits no passing method; a not-assessed check needs no method.                                        |
+| `build.assurance`                                             | The assessment assurance must be a member of this list.                                                                                                                                       |
+| `declared_methods`, `fingerprint_methods`, `artifact_methods` | The list corresponding to the actual assurance restricts `build.method`, in addition to the independent consumer allowlist; null delegates to that allowlist, and an empty list permits none. |
+| `max_assessment_lifetime_seconds`                             | Require `expires_at <= observed_from + limit`, in addition to PA-TIME and any stricter consumer bound. It is never measured from issuance.                                                    |
+
+Consumers evaluate the complete pinned document at stage 8; a local `required_checks` override cannot weaken it. Independent consumer configuration may impose stricter requirements. Method trust is checked at stage 5, while a `satisfied` result that contradicts the known document's required outcomes is `malformed` at stage 8.
+
 A verifier may add its own named policy, with retained policy digest, explicit check requirements, and consumer opt-in. A custom policy is not interchangeable with either built-in policy. No policy here certifies consent behavior, module safety, the truth of the full configuration, or outermost traffic placement. Additional profiles require their own reviewed specification, qualification, and negative tests before consumers enable them.
 
 ### PA-STATUS: signed withdrawal and key status
 
 A verifier publishes a status object for a requested assessment. Required fields are `schema: ts-publisher-status-v1`, `issuer`, `enrollment_id`, `assessment_id`, `binding_id`, `publisher_key_kid`, `sequence`, `assessment_status`, `enrollment_status`, `publisher_key_status`, `reason_codes`, `issued_at`, `expires_at`, and empty `extensions`.
 
-Statuses are `current`/`withdrawn` for the assessment, `active`/`withdrawn` for enrollment, and `active`/`compromised`/`retired` for the publisher key. `sequence` is a positive integer per enrollment, durably persisted by the verifier. It advances only when the enrollment's recorded status state changes: an assessment or enrollment withdrawal, a publisher-key status change, or an authorization-generation change. A status reissued or reused while that state is unchanged carries the current sequence, so concurrently current assessments in one enrollment, such as both versions during a rolling deployment, share it. Withdrawal and compromise are terminal for their identifier. Re-enrollment uses new identifiers; an expired assessment is not extended by a status response. A current status means no withdrawal is recorded, not that a fresh provider observation occurred. Before each current-status issuance or reuse, recheck any applicable separate operator authorization, enrollment, publisher key, assessment, and verifier signing-key validity at the current time. Its expiry is no later than the earliest of those authorization/assessment expiries and issued_at+60; a still-valid signature cannot extend an expired operator delegation. On operator-record expiry/withdrawal, stop current-status issuance and positive assessment publication, mark affected enrollment authorization withdrawn, and advance durable generation/sequence. Time passing across an expiry is a denial condition even if no event has yet updated the generation.
+1. Statuses are `current`/`withdrawn` for the assessment, `active`/`withdrawn` for enrollment, and `active`/`compromised`/`retired` for the publisher key. `sequence` is a positive integer per enrollment, durably persisted by the verifier.
 
-A publisher key rotation is a key transition within the enrollment (PA-ENROLLMENT): it advances the authorization generation and the sequence, the new key becomes `active`, and the old key becomes `retired` once its last assessment expires. Superseding a service version does not withdraw its assessment: that assessment stays `current` until expiry and is not renewed (PA-TIME). Recording a different accepted binding advances the authorization generation and therefore the public sequence under PA-RECOVERY. An unexpired old-binding assessment can obtain a fresh `current` status at that new sequence; after seeing a higher sequence, consumers reject older statuses, not the still-authorized assessment merely because its binding is older.
+2. It advances only when the enrollment's recorded status state changes: an assessment or enrollment withdrawal, a publisher-key status change, or an authorization-generation change.
 
-Status MUST satisfy `issued_at < expires_at <= issued_at + 60`. Consumers persist the highest seen sequence per verifier/enrollment, accept an equal sequence, and reject lower sequences. A lower sequence means the status predates a recorded state change, so a superseded `current` status for another assessment in the enrollment is correctly rejected. A fresh consumer may still accept an older signed status within its bounded lifetime; no instantaneous revocation is promised. Compromised-key status affects all assessments for that key in that enrollment; known cross-enrollment reuse triggers investigation and withdrawal of each affected enrollment. Status history and assessment expiry remain independent.
+3. A status reissued or reused while that state is unchanged carries the current sequence, so concurrently current assessments in one enrollment, such as both versions during a rolling deployment, share it.
+
+4. Withdrawal and compromise are terminal for their identifier.
+
+5. Re-enrollment uses new identifiers; an expired assessment is not extended by a status response.
+
+6. A current status means no withdrawal is recorded, not that a fresh provider observation occurred.
+
+7. Before each current-status issuance or reuse, recheck any applicable separate operator authorization, enrollment, publisher key, assessment, and verifier signing-key validity at the current time.
+
+8. Its expiry is no later than the earliest of those authorization/assessment expiries and issued_at+60; a still-valid signature cannot extend an expired operator delegation.
+
+9. On operator-record expiry/withdrawal, stop current-status issuance and positive assessment publication, mark affected enrollment authorization withdrawn, and advance durable generation/sequence.
+
+10. Time passing across an expiry is a denial condition even if no event has yet updated the generation.
+
+11. A publisher key rotation is a key transition within the enrollment (PA-ENROLLMENT): it advances the authorization generation and the sequence, the new key becomes `active`, and the old key becomes `retired` once its last assessment expires.
+
+12. Superseding a service version does not withdraw its assessment: that assessment stays `current` until expiry and is not renewed (PA-TIME).
+
+13. Recording a different accepted binding advances the authorization generation and therefore the public sequence under PA-RECOVERY.
+
+14. An unexpired old-binding assessment can obtain a fresh `current` status at that new sequence; after seeing a higher sequence, consumers reject older statuses, not the still-authorized assessment merely because its binding is older.
+
+15. Status MUST satisfy `issued_at < expires_at <= issued_at + 60`.
+
+16. Consumers persist the highest seen sequence per verifier/enrollment, accept an equal sequence, and reject lower sequences.
+
+17. A lower sequence means the status predates a recorded state change, so a superseded `current` status for another assessment in the enrollment is correctly rejected.
+
+18. A fresh consumer may still accept an older signed status within its bounded lifetime; no instantaneous revocation is promised.
+
+19. Compromised-key status affects all assessments for that key in that enrollment; known cross-enrollment reuse triggers investigation and withdrawal of each affected enrollment.
+
+20. Status history and assessment expiry remain independent.
 
 ## Enrollment and independent trust bootstrap
 
 ### PA-ENROLLMENT: authorize before endorsing
 
-The reference verifier accepts enrollment only through an authenticated operator workflow, not an anonymous public URL submission that automatically grants trust. Required private enrollment input is the full authorized tuple from PA-IDENTITY, publisher contact/recovery authorization, public key and validity, and selected policy. Provider observations additionally require an existing Fastly service ID, intended host mapping, and narrowly scoped provider credentials. The declaration profile can be satisfied without provider credentials or release acquisition; when no provider observation is collected, provider checks are not assessed. An optional fingerprint observation requires independent provider credentials and the host/service/version checks above, without upgrading declaration acceptance to official assurance. A Fastly service ID remains part of the operator-declared enrolled tuple; Axum declaration bindings may use null service identity in production, staging, or development as permitted by PA-BINDING. No signing private key is submitted to a verifier.
+1. The reference verifier accepts enrollment only through an authenticated operator workflow, not an anonymous public URL submission that automatically grants trust.
 
-The authenticated enrollment account MUST have a verifier-maintained authorization record permitting any non-null `operator_id` it submits. Null means publisher self-operation; the publisher host/key authorization supplies the finite authority interval and no separate operator identity is asserted. That record binds account identity, the exact canonical operator identifier, permitted publisher/deployment scope, authorization method, approver or delegating authority, evidence digest, validity interval, and withdrawal state. The default version 1 operator-control method, `operator-dns-control-v1`, is a fresh DNS proof at `_ts-operator.<operator-host>` with value `ts-operator-v1=<base64url(SHA-256(JCS(enrollment-challenge)))>`, using the same exact identifier, publisher/deployment/key scope, verifier issuer, nonce, and ten-minute deadline as the publisher challenge. The host is parsed from the authorized HTTPS operator identifier under PA-ROUTING; the verifier performs no arbitrary URL fetch. Operator DNS control grants technical authority for that identifier/scope, not a legal relationship. A documented preapproved association or delegation may be a separately named consumer-opted-in method; a self-submitted URL, publisher DNS proof, key possession, or an authenticated login alone does not establish that association. Do not fetch an arbitrary operator URL to manufacture proof. If the record is absent, expired, outside scope, or withdrawn, fail enrollment with `operator_unauthorized` before any positive assessment. Retain and recheck the authorization record on renewal, recovery, and assessment publication. A legitimate operator-identifier change, including switching between self-operation and a separate operator, requires new authorization/binding. An old publisher-key signature alone cannot authorize a third-party operator. Prefixed DNS owner names must fit DNS length limits; unrepresentable challenge names fail enrollment explicitly.
+2. Required private enrollment input is the full authorized tuple from PA-IDENTITY, publisher contact/recovery authorization, public key and validity, and selected policy.
+
+3. Provider observations additionally require an existing Fastly service ID, intended host mapping, and narrowly scoped provider credentials.
+
+4. The declaration profile can be satisfied without provider credentials or release acquisition; when no provider observation is collected, provider checks are not assessed.
+
+5. An optional fingerprint observation requires independent provider credentials and the host/service/version checks above, without upgrading declaration acceptance to official assurance.
+
+6. A Fastly service ID remains part of the operator-declared enrolled tuple; Axum declarations are isolated development fixtures with null service identity; no production/staging Axum support is introduced.
+
+7. No signing private key is submitted to a verifier.
+
+8. The authenticated enrollment account MUST have a verifier-maintained authorization record permitting any non-null `operator_id` it submits.
+
+9. Null means publisher self-operation; the publisher host/key authorization supplies the finite authority interval and no separate operator identity is asserted.
+
+10. That record binds account identity, the exact canonical operator identifier, permitted publisher/deployment scope, authorization method, approver or delegating authority, evidence digest, validity interval, and withdrawal state.
+
+11. The default version 1 operator-control method, `operator-dns-control-v1`, is a fresh DNS proof at `_ts-operator.<operator-host>` with value `ts-operator-v1=<base64url(SHA-256(JCS(enrollment-challenge)))>`, using the same exact identifier, publisher/deployment/key scope, verifier issuer, nonce, and ten-minute deadline as the publisher challenge.
+
+12. The host is parsed from the authorized HTTPS operator identifier under PA-ROUTING; the verifier performs no arbitrary URL fetch.
+
+13. Operator DNS control grants technical authority for that identifier/scope, not a legal relationship.
+
+14. The optional path is descriptive: the DNS controller can authorize every path under the same operator host, so distinct paths do not establish independent operators.
+
+15. A documented preapproved association or delegation may be a separately named consumer-opted-in method; a self-submitted URL, publisher DNS proof, key possession, or an authenticated login alone does not establish that association.
+
+16. Do not fetch an arbitrary operator URL to manufacture proof.
+
+17. If the record is absent, expired, outside scope, or withdrawn, fail enrollment with `operator_unauthorized` before any positive assessment.
+
+18. Retain and recheck the authorization record on renewal, recovery, and assessment publication.
+
+19. A legitimate operator-identifier change, including switching between self-operation and a separate operator, requires new authorization/binding.
+
+20. An old publisher-key signature alone cannot authorize a third-party operator.
+
+21. Prefixed DNS owner names must fit DNS length limits; unrepresentable challenge names fail enrollment explicitly.
 
 The verifier MUST also establish DNS control for the exact host and proof of possession of the exact key, rather than treating either as sufficient alone. A parent publisher domain is descriptive; it does not authorize arbitrary subdomains. Every host is enrolled explicitly. Neither a wildcard nor a string suffix check grants enrollment.
 
-The verifier creates a single-use enrollment challenge: a closed JSON object with `schema: ts-publisher-enrollment-challenge-v1`, `issuer`, `host`, `publisher_id`, `operator_id`, `deployment_id`, `provider`, `service_id`, `environment`, `publisher_key_kid`, random 32-byte base64url `nonce`, `issued_at`, and `expires_at` with `issued_at < expires_at <= issued_at + 600`. The operator publishes `ts-publisher-v1=<base64url(SHA-256(JCS(challenge)))>` as a TXT value at `_ts-attestation.<host>`. The verifier retains the exact challenge and hash, checks that value before its deadline using a documented trusted resolver, and does not accept unrelated existing tokens. A TXT record split into DNS character strings is joined within that one record; separate records are never concatenated. The DNS check, any operator DNS check and the key-possession fetch that follows must all complete before the challenge's `expires_at`; otherwise the attempt fails and a new challenge is required. Verifiers SHOULD confirm the TXT value from more than one network vantage point to reduce exposure to localized DNS hijacking, and record which resolvers they used.
+22. The verifier creates a single-use enrollment challenge: a closed JSON object with `schema: ts-publisher-enrollment-challenge-v1`, `issuer`, `host`, `publisher_id`, `operator_id`, `deployment_id`, `provider`, `service_id`, `environment`, `publisher_key_kid`, random 32-byte base64url `nonce`, `issued_at`, and `expires_at` with `issued_at < expires_at <= issued_at + 600`.
 
-The verifier then fetches fresh HTTPS publisher evidence and verifies it with the proposed key, matches the enrolled tuple, and corroborates provider host/service ownership and production version where the chosen policy requires them. Only after these steps may it issue an enrollment ID and assessment. DNS proves technical control under the resolver trust model, not legal ownership or that all requests use Trusted Server. DNSSEC validation status is retained; absence does not become a false DNSSEC claim. The operator may remove the enrollment TXT value after success. An explicit loopback development fixture substitutes a manually pinned host/key authorization for DNS and uses a separate test trust configuration; its environment is development, it cannot produce the production profile, and its objects MUST NOT be accepted by production trust configuration.
+23. The operator publishes `ts-publisher-v1=<base64url(SHA-256(JCS(challenge)))>` as a TXT value at `_ts-attestation.<host>`.
 
-Enrollment expires after at most 30 days and requires new DNS and key-possession challenges to renew. This is deliberate fresh-control proof, not a promise of zero DNS operations. Operator tooling SHOULD automate challenge publication, propagation checks, retry within the deadline, cleanup, and renewal scheduling using publisher-controlled DNS credentials; registries receive no DNS write credentials. For `operator-dns-control-v1`, operator authorization expires no later than 30 days after successful proof and no later than the publisher enrollment; a shorter registry policy may apply. Each publisher/deployment/key scope needs a fresh challenge at renewal, so multi-publisher operators incur per-scope DNS work. Separately approved delegation methods must state their own finite maximum lifetime. Persistent issuer/key/scope authorization remains the explicit task-force alternative for reducing that burden; it requires separate revocation rules. Propagation failure leaves the existing unexpired authorization unchanged and cannot silently extend it. A new key requires new proof and enrollment authorization; possession of an old key alone cannot authorize recovery. A routine rotation is a key transition within the existing enrollment: the verifier issues a fresh challenge naming the successor thumbprint, proves possession through `?kid=<successor>` before the successor is active (parent PA-KEYS), records the successor under a new authorization generation, advances the status sequence and issues the successor binding's assessment. Compromise recovery is different: it withdraws the enrollment and re-enrolls under a new `enrollment_id`. Production/staging, host, publisher/operator, deployment ID, or service changes require explicit enrollment review. A new service version within the enrolled service requires a new assessment/binding, not automatically new DNS proof. Suspected DNS/host ownership changes suspend renewal until reauthorization.
+24. The verifier retains the exact challenge and hash, checks that value before its deadline using a documented trusted resolver, and does not accept unrelated existing tokens.
+
+25. A TXT record split into DNS character strings is joined within that one record; separate records are never concatenated.
+
+26. The DNS check, any operator DNS check and the key-possession fetch that follows must all complete before the challenge's `expires_at`; otherwise the attempt fails and a new challenge is required.
+
+27. Verifiers SHOULD confirm the TXT value from more than one network vantage point to reduce exposure to localized DNS hijacking, and record which resolvers they used.
+
+28. The verifier then fetches fresh HTTPS publisher evidence and verifies it with the proposed key, matches the enrolled tuple, and corroborates provider host/service ownership and production version where the chosen policy requires them.
+
+29. Only after these steps may it issue an enrollment ID and assessment.
+
+30. DNS proves technical control under the resolver trust model, not legal ownership or that all requests use Trusted Server.
+
+31. DNSSEC validation status is retained; absence does not become a false DNSSEC claim.
+
+32. The operator may remove the enrollment TXT value after success.
+
+33. An explicit loopback development fixture substitutes a manually pinned host/key authorization for DNS and uses a separate test trust configuration; its environment is development, it cannot produce the production profile, and its objects MUST NOT be accepted by production trust configuration.
+
+34. Enrollment expires after at most 30 days and requires new DNS and key-possession challenges to renew.
+
+35. This is deliberate fresh-control proof, not a promise of zero DNS operations.
+
+36. Operator tooling SHOULD automate challenge publication, propagation checks, retry within the deadline, cleanup, and renewal scheduling using publisher-controlled DNS credentials; registries receive no DNS write credentials.
+
+37. For `operator-dns-control-v1`, operator authorization expires no later than 30 days after successful proof and no later than the publisher enrollment; a shorter registry policy may apply.
+
+38. Each publisher/deployment/key scope needs a fresh challenge at renewal, so multi-publisher operators incur per-scope DNS work.
+
+39. Separately approved delegation methods must state their own finite maximum lifetime.
+
+40. Persistent issuer/key/scope authorization remains the explicit task-force alternative for reducing that burden; it requires separate revocation rules.
+
+41. Propagation failure leaves the existing unexpired authorization unchanged and cannot silently extend it.
+
+42. A new key requires new proof and enrollment authorization; possession of an old key alone cannot authorize recovery.
+
+43. A routine rotation is a key transition within the existing enrollment: the verifier issues a fresh challenge naming the successor thumbprint, proves possession through `?kid=<successor>` before the successor is active (parent PA-KEYS), records the successor under a new authorization generation, advances the status sequence and issues the successor binding's assessment.
+
+44. Compromise recovery is different: it withdraws the enrollment and re-enrolls under a new `enrollment_id`.
+
+45. Production/staging, host, publisher/operator, deployment ID, or service changes require explicit enrollment review.
+
+46. A new service version within the enrolled service requires a new assessment/binding, not automatically new DNS proof.
+
+47. Suspected DNS/host ownership changes suspend renewal until reauthorization.
 
 ### PA-ENROLLMENT-API: provisional operator-interface sketch
 
-The following is a candidate follow-up for a common operator interface, not a frozen v1 wire API or a P1 prerequisite. P1 uses the authenticated enrollment workflow and operator-supplied inputs defined by PA-ENROLLMENT and PA-REFERENCE. A future interoperable API needs exact field names and closed request/response schemas, identifier formats, authentication/authorization binding, errors, response/work limits, idempotency and credential-provisioning rules before a tool can claim compatibility across verifiers. The paths below are illustrative operations under a configured issuer base:
+The following is a candidate follow-up for a common operator interface, not a frozen v1 wire API or a P1a prerequisite. P1b uses the authenticated enrollment workflow and operator-supplied inputs defined by PA-ENROLLMENT and PA-REFERENCE. A future interoperable API needs exact field names and closed request/response schemas, identifier formats, authentication/authorization binding, errors, response/work limits, idempotency and credential-provisioning rules before a tool can claim compatibility across verifiers. The paths below are illustrative operations under a configured issuer base:
 
 | Operation                                                         | Request                                                                                                                | Response                                                                                                                         |
 | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
@@ -145,7 +277,7 @@ Consumer trust configuration maps each trusted issuer to one or more publication
 
 ### PA-COLLECTION: deterministic independent assessment
 
-For each assessment, the verifier performs these steps under an operation ID and a total 60-second collection deadline. Provider/release steps apply only when required by the selected policy or explicitly requested as additional observations. When no additional provider observation is requested, the declaration profile skips provider/release steps and records those checks as `not_assessed`; it still validates enrollment, evidence, actual descriptor/projection consistency, clock, and key possession. Optional provider observations must satisfy their contextual evidence requirements and never upgrade declaration acceptance to official assurance. Public production Axum uses declaration enrollment with real DNS/TLS; only loopback fixtures use the isolated development exception:
+For each assessment, the verifier performs these steps under an operation ID and a total 60-second collection deadline. Provider/release steps apply only when required by the selected policy or explicitly requested as additional observations. When no additional provider observation is requested, the declaration profile skips provider/release steps and records those checks as `not_assessed`; it still validates enrollment, evidence, actual descriptor/projection consistency, clock, and key possession. Optional provider observations must satisfy their contextual evidence requirements and never upgrade declaration acceptance to official assurance. Production Fastly declarations require real DNS/TLS enrollment; Axum uses only the isolated development fixture exception:
 
 1. Load an active enrolled tuple, trusted publisher key, and appraisal policy; load provider credentials and authenticated release eligibility policy only when the selected collection requires them. Checking current enrollment state is a new observation; the retained original DNS proof has its own historical timestamp and 30-day authorization deadline and is not misrepresented as a new DNS lookup.
 2. Read provider host/service mapping, production active version, package identity and required resource links without reading the app-config payload solely for the identity projection. Record retrieval timestamps and retained response digests privately.
@@ -161,7 +293,7 @@ No write or deployment is necessary for collection. Missing credentials, 403/429
 
 Evidence lifetime is at most 60 seconds. Verifier assessment issuance MUST occur within 60 seconds after `observed_until`. An assessment MUST satisfy `observed_from <= observed_until <= issued_at < expires_at <= observed_from + 900`. Its expiry is also no later than publisher-key, enrollment, verifier-signing-key, or any applicable separate operator-authorization expiry; self-operation uses the finite publisher enrollment authority. The verifier computes that minimum at commit/publication, not just when collection begins. A non-null separate operator claim with no independently established finite validity interval cannot authorize a positive assessment. Old observations cannot receive a new 15-minute lease by re-signing them.
 
-Consumers require `issued_at <= now + 30`, unexpired evidence/assessment (valid while `now < expires_at`) and any explicitly required status, and `observed_until <= issued_at`. Clock skew allowance applies to future issuance and not-before checks; it never extends an expiry. A consumer may require a shorter observation age or lifetime. All interval and cross-object relationships are validated even when signatures are correct. Missing/unreliable runtime time is endpoint 503; verifier clock failure stops issuance; consumer clock failure stops current-assurance acceptance.
+Consumers require `issued_at <= now + 30`, unexpired evidence/assessment (valid while `now < expires_at`) and any explicitly required status, and `observed_until <= issued_at`. Clock skew allowance applies to future issuance and not-before checks; it never extends an expiry. A consumer may require a shorter observation age or lifetime. All interval and cross-object relationships are validated even when signatures are correct. A failed platform time operation is endpoint 503 (the endpoint cannot detect arbitrary clock drift); verifier clock failure stops issuance; consumer clock failure stops current-assurance acceptance.
 
 The default verifier renews positive assessments every five minutes, subject to provider rate limits and a configured queue. For the monitored Fastly profile it polls provider version/host state at least every 60 seconds; a new signed projection is checked for consistency during renewal. V1 deliberately uses polling. Audit-log polling may trigger earlier rechecks only after event visibility/completeness is qualified; no push feed or complete audit history is assumed. If that monitoring interval cannot be maintained, stop representing the service as currently monitored and stop new positive official assessments until a complete collection succeeds. Previously issued assessments retain their explicitly bounded validity unless withdrawn.
 
@@ -192,7 +324,7 @@ Live-status checking is a separately configured stricter consumer mode, not a fi
 A current publisher check MUST:
 
 1. Take expected host/environment, trusted issuers/keys, permitted policies/methods, and freshness/status settings from independent configuration.
-2. Generate a fresh nonce and fetch publisher evidence. Strictly validate JWS and schema with an enrolled/endorsed publisher key; unsigned discovery may supply candidate bytes only.
+2. Generate a fresh nonce and fetch publisher evidence. Strictly validate the JWS and schema, and verify the signature with the key in the evidence's own `binding.attestation_key`, whose thumbprint must equal the protected-header `kid`. That key is endorsed only through binding equality in step 4. Require the payload `nonce` to equal the generated nonce byte for byte (`nonce_mismatch`) and evidence times to satisfy PA-TIME (`stale`). Unsigned discovery may supply candidate bytes only. A valid evidence signature alone is self-declared, not independently trusted.
 3. Verify each candidate assessment with an allowed verifier key and exact message type, then validate policy, result, intervals, enrollment status, build assurance, release eligibility, and required check outcomes.
 4. Require full descriptor and binding-ID equality between fresh evidence and assessment, including host, deployment ID, service/version/environment, projection, key material, and validity.
 5. Under the default expiry-only mode, enforce assessment expiry and any independently known withdrawal/compromise. Only if the consumer explicitly requires live status, fetch it from the independently configured verifier base and match issuer, enrollment, assessment, binding, key, sequence, and timing; a live-status failure denies that stricter mode. A publisher cannot disable the consumer's configured checks.
@@ -201,11 +333,11 @@ A current publisher check MUST:
 Consumers evaluate in this order and report the reason code of the first stage that fails; they may also report later failures for diagnostics, but acceptance depends only on the first:
 
 1. Bounded decoding, duplicate-member rejection and limits (`malformed`).
-2. Protected header and message type, and lookup of a trusted key for the object's issuer (`signature_invalid`; an unknown issuer is `policy_untrusted`).
+2. Protected header and message type, and lookup of a trusted verifier key for an assessment/status issuer (evidence uses its binding key with matching thumbprint, pending endorsement) (`signature_invalid`; an unknown issuer is `policy_untrusted`).
 3. Strict Ed25519 signature verification (`signature_invalid`).
-4. Payload schema and cross-field consistency, including digest equalities and the per-check digest rules above (`malformed`).
+4. Payload schema and cross-field consistency, including digest equalities and the per-check digest rules above (`malformed`). First reject a Fastly staging/environment contradiction as `environment_mismatch`; an untrusted signer cannot bypass this binding invariant.
 5. Issuer, policy `id`/`version`/`digest` and method allowlists (`policy_untrusted`).
-6. Time: future issuance beyond the skew allowance, expiry, observation age (`stale`, `clock_unavailable`).
+6. Time: future issuance beyond the skew allowance, expiry, observation age (`stale`, `clock_unavailable`); for fresh evidence, first require exact equality with the locally generated nonce (`nonce_mismatch`).
 7. Exact equality with fresh evidence: host, environment, binding (`host_mismatch`, `environment_mismatch`, `binding_mismatch`).
 8. `result` against the policy's required checks; a `satisfied` result contradicting them is `malformed`.
 9. Build assurance and release eligibility against the consumer's requirement (`artifact_binding_unproven`, `release_ineligible`).
@@ -220,7 +352,7 @@ The assessment-only operation is explicitly historical/bounded-observation verif
 
 ### PA-REFERENCE: tools and registry boundary
 
-The delivery includes a host-target reference verifier/collector and a pure verification library, with machine-readable results and offline historical verification. Planning must select its concrete crate/CLI placement without making runtime core depend on host HTTP, GitHub CLI subprocesses, or credentials. Prefer a small host-only component exposed through the existing operator CLI when dependency/target separation permits. Names of future commands are not frozen by this spec.
+The delivery includes a host-target reference verifier/collector and a pure verification library, with machine-readable results and offline historical verification. Planning must select its concrete crate/CLI placement without making runtime core depend on host HTTP, GitHub CLI subprocesses, or credentials. Use a separate host-only verifier binary/crate sharing the pure verification library. Publisher provisioning belongs to a distinct attestation command namespace, not request-signing `ts keys`. Placement alone establishes no independence: a publisher-run verifier produces a self-assessment, and consumers MUST NOT configure it as independent merely because it runs this reference software. Independent trust requires an out-of-band decision about who operates the signing key. Names of future commands are not frozen by this spec.
 
 The reference collector consumes operator-supplied enrollment and, only for provider-backed profiles, read-only provider credentials, retains evidence, and produces signed assessments/status. Its local state writes are atomic and restrictive. A production operator owns scheduling, authenticated administration, durable sequence allocation, backup, serving, abuse controls, and signer isolation. Advance the status sequence and persist the changed status state atomically before signing or publishing a status that reflects the change, following PA-RECOVERY below. A failed publication must not undo recorded withdrawal. After restart, never reset a sequence; if durable monotonic state cannot be recovered, stop current issuance and use authenticated recovery with a new enrollment identifier rather than risk rollback. A deployment of this reference component is not automatically an endorsed public registry. A full multi-tenant hosted registry and UI require a separate operational design. The named demo-registry follow-up below is a smaller illustrative deployment, not a production accreditation service.
 
@@ -333,3 +465,5 @@ These tests qualify registry/reference-consumer behavior separately from the pub
 - **Self-review (Claude Code, independent contract review):** No blocking findings. Per-issuance status sequences could make a consumer reject a valid reused status for one of two concurrently current assessments during a rolling deployment; the sequence now advances only on recorded status-state changes, and the consumer matrix covers equal sequences.
 - **Correction review (Codex, independent contract and security reviewers):** Preserved issuance fencing while allowing refreshed current-sequence status for superseded assessments; capped cached acceptance by all applicable deadlines, preserved issuer/policy history, and marked the incomplete operator API as provisional.
 - **Correction follow-up (Codex, both independent reviewers):** No remaining blocking design/fixture findings after checking cache invalidation and boundary cases. Production registry operation and provider qualification remain unexecuted.
+
+- **Maintainer-feedback correction (Codex):** Defined pinned policy-document evaluation, explicit consumer nonce/key checks and verifier independence; aligned development-only Axum and split P1a/P1b. Runtime and operated-verifier qualification remain outstanding.

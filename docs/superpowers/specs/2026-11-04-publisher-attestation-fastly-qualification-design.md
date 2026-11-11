@@ -31,7 +31,7 @@ For a package with precisely one `bin/main.wasm` and one `fastly.toml` under the
 
 At [validate.go](https://github.com/fastly/cli/blob/34cef1b0bdbc35d0f1af883a1955d7fe9b3a5ad5/pkg/commands/compute/validate.go), `packageFiles` skips directories and delegates archive extraction; this code is not a security specification for unique paths/member types. Package validation checks expected basenames and must not substitute for a strict verifier grammar.
 
-The [provider API](https://www.fastly.com/documentation/reference/api/services/package/) describes `metadata.files_hash` as a hash of files within the package and exposes metadata GET and package PUT. It does not by itself establish server acceptance/selection grammar, identical hash calculation, or selected-module readback. The obsolete package `hashsum` is a different field and must not be substituted.
+The [provider API](https://www.fastly.com/documentation/reference/api/services/package/) describes `metadata.files_hash` as a hash of files within the package and exposes metadata GET and package PUT. It does not by itself establish server acceptance/selection grammar, identical hash calculation, or selected-module readback. The deprecated `metadata.hashsum` field is documented as the hash of the Compute package, deprecated in favor of `files_hash`; it is a different field and must not be substituted.
 
 ## 3. Security consequence
 

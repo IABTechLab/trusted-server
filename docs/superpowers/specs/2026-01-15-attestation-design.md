@@ -1,6 +1,6 @@
 # Runtime Integration Attestation Architecture
 
-> **Status:** Proposal
+> **Status:** Superseded by [Publisher attestation](2026-11-04-publisher-attestation-design.md). This historical proposal's full-configuration and embedded-checksum model is not the current contract.
 > **Author:** Architecture Team
 > **Date:** January 2026
 

@@ -205,6 +205,12 @@ jobs:
       - name: Build with VitePress (fails on dead links)
         run: npm run build
 
+      - name: Check publisher attestation fixtures
+        working-directory: .
+        run: |
+          node scripts/publisher-attestation/generate.mjs --check
+          node --test scripts/publisher-attestation/*.test.mjs
+
   docs-proposal-scripts:
     name: docs-proposal scripts
     runs-on: ubuntu-latest

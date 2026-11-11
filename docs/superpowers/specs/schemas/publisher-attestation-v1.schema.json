@@ -89,14 +89,27 @@
     "host": {
       "type": "string",
       "maxLength": 253,
-      "pattern": "^(?=.{1,253}$)(?![0-9]+(?:\\.[0-9]+)*$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$",
-      "$comment": "Protocol boundary accepts ASCII DNS only; canonicalize ASCII letters to lowercase, remove one terminal dot, reject invalid DNS syntax and IP literals. Already-encoded xn-- labels are opaque ASCII DNS labels; Unicode input is rejected, with no Unicode/UTS dependency."
+      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$",
+      "$comment": "Protocol boundary accepts ASCII DNS only; canonicalize ASCII letters to lowercase, remove one terminal dot, reject invalid DNS syntax and IP literals. Already-encoded xn-- labels are opaque ASCII DNS labels; Unicode input is rejected, with no Unicode/UTS dependency.",
+      "not": {
+        "pattern": "(?:^|\\.)(?:[0-9]+|0x[0-9a-f]*)$"
+      }
     },
     "httpsIdentifier": {
       "type": "string",
       "maxLength": 256,
-      "pattern": "^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?:/(?!\\.\\.?(?:/|$))[A-Za-z0-9._~-]+)*$",
-      "$comment": "Canonical HTTPS identifier (PA-IDENTIFIER): lowercase ASCII host without port, trailing dot or IP literal; optional path of non-empty unreserved-character segments, no trailing slash, no dot segments, no percent-encoding, userinfo, query or fragment. Compared as exact bytes. Host label/total length limits are enforced outside this pattern."
+      "pattern": "^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?:/[A-Za-z0-9._~-]+)*$",
+      "$comment": "Canonical HTTPS identifier (PA-IDENTIFIER): lowercase ASCII host without port, trailing dot or IP literal; optional path of non-empty unreserved-character segments, no trailing slash, no dot segments, no percent-encoding, userinfo, query or fragment. Compared as exact bytes. Host label/total length limits are enforced outside this pattern.",
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "^https://(?:[a-z0-9-]+\\.)*(?:[0-9]+|0x[0-9a-f]*)(?:/|$)"
+          },
+          {
+            "pattern": "/\\.\\.?(?:/|$)"
+          }
+        ]
+      }
     },
     "environment": {
       "enum": ["production", "staging", "development"]
@@ -394,7 +407,75 @@
         "extensions": {
           "$ref": "#/definitions/extensions"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "platform": {
+                "properties": {
+                  "provider": {
+                    "const": "axum"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "environment": {
+                "const": "development"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "platform": {
+                "properties": {
+                  "provider": {
+                    "const": "fastly"
+                  },
+                  "staging": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "environment": {
+                "enum": ["staging", "development"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "platform": {
+                "properties": {
+                  "provider": {
+                    "const": "fastly"
+                  },
+                  "staging": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "environment": {
+                "enum": ["production", "development"]
+              }
+            }
+          }
+        }
+      ]
     },
     "buildReport": {
       "type": "object",
@@ -965,6 +1046,9 @@
                     "properties": {
                       "provider": {
                         "const": "fastly"
+                      },
+                      "staging": {
+                        "type": "boolean"
                       }
                     }
                   }
@@ -1220,6 +1304,9 @@
             "properties": {
               "service_id": {
                 "type": "null"
+              },
+              "environment": {
+                "const": "development"
               }
             }
           }
@@ -1537,6 +1624,7 @@
             "invalid_request",
             "unknown_kid",
             "not_found",
+            "method_not_allowed",
             "misdirected_request",
             "conflict",
             "rate_limited",
