@@ -302,7 +302,8 @@ fn structured_cookie_eids_to_openrtb(entries: Vec<StructuredCookieEid>) -> Vec<E
 }
 
 fn structured_cookie_uid_to_openrtb(uid: StructuredCookieUid) -> Option<Uid> {
-    if uid.id.is_empty() {
+    // Cookie UIDs keep the browser limit; only provider writes may be longer.
+    if uid.id.is_empty() || uid.id.len() > MAX_UID_LENGTH {
         return None;
     }
 
@@ -322,7 +323,9 @@ fn structured_cookie_uid_to_openrtb(uid: StructuredCookieUid) -> Option<Uid> {
 fn legacy_cookie_eids_to_openrtb(entries: Vec<LegacyCookieEid>) -> Vec<Eid> {
     entries
         .into_iter()
-        .filter(|entry| !entry.source.is_empty() && !entry.id.is_empty())
+        .filter(|entry| {
+            !entry.source.is_empty() && !entry.id.is_empty() && entry.id.len() <= MAX_UID_LENGTH
+        })
         .map(|entry| {
             Eid::new(
                 entry.source,
@@ -448,6 +451,35 @@ mod tests {
             Some(571187),
             "should preserve PAIR's vendor-specific atype"
         );
+    }
+
+    #[test]
+    fn parse_prebid_eids_cookie_drops_uids_over_the_browser_limit() {
+        // Arrange
+        let long = "x".repeat(MAX_UID_LENGTH + 1);
+        let at_limit = "y".repeat(MAX_UID_LENGTH);
+        let structured = BASE64.encode(
+            json!([{ "source": "ids.example.com", "uids": [
+                { "id": long, "atype": 1 },
+                { "id": at_limit, "atype": 1 }
+            ]}])
+            .to_string(),
+        );
+        let legacy = BASE64
+            .encode(json!([{ "source": "ids.example.com", "id": long, "atype": 1 }]).to_string());
+
+        // Act
+        let structured = parse_prebid_eids_cookie(&structured).expect("should decode");
+        let legacy = parse_prebid_eids_cookie(&legacy).expect("should decode");
+
+        // Assert
+        let ids: Vec<usize> = structured[0].uids.iter().map(|uid| uid.id.len()).collect();
+        assert_eq!(
+            ids,
+            vec![MAX_UID_LENGTH],
+            "should keep only the UID within the limit"
+        );
+        assert!(legacy.is_empty(), "should drop an over-limit legacy UID");
     }
 
     #[test]
