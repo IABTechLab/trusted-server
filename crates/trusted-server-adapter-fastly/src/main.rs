@@ -577,13 +577,9 @@ fn edgezero_main(
                         counters.as_ref(),
                     );
                     run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
-                    run_after_response_lookups(
-                        settings,
-                        app_state.as_deref(),
-                        &partner_registry,
-                        &mut ec_state,
-                        after_response,
-                    );
+                    if let Some(state) = app_state.as_deref() {
+                        run_after_response_lookups(state, &mut ec_state, after_response);
+                    }
                     return;
                 }
                 Err(e) => {
@@ -612,13 +608,6 @@ fn edgezero_main(
                                 &settings,
                                 &partner_registry,
                                 &ec_state,
-                            );
-                            run_after_response_lookups(
-                                &settings,
-                                None,
-                                &partner_registry,
-                                &mut ec_state,
-                                after_response,
                             );
                             return;
                         }
@@ -764,10 +753,8 @@ fn run_edgezero_pull_sync_after_send(
 /// the page. Skipped unless finalize confirmed the navigation (it issues the
 /// follow-up permit) and the EC is still the one the lookups were prepared
 /// for.
-fn run_after_response_lookups(
-    settings: &Settings,
-    state: Option<&AppState>,
-    partner_registry: &Arc<PartnerRegistry>,
+pub(crate) fn run_after_response_lookups(
+    state: &AppState,
     ec_state: &mut EcFinalizeState,
     lookups: Option<AfterResponseLookups>,
 ) {
@@ -784,9 +771,10 @@ fn run_after_response_lookups(
         log::debug!("After-response lookups skipped: EC changed during the request");
         return;
     }
-    let Some(coordinator) = state.and_then(|state| state.after_response_identity.as_ref()) else {
+    let Some(coordinator) = state.after_response_identity.as_ref() else {
         return;
     };
+    let settings = &*state.settings;
     let Some(graph) = maybe_identity_graph(settings) else {
         return;
     };
@@ -821,8 +809,13 @@ fn run_after_response_lookups(
         return;
     }
     let results = futures::executor::block_on(coordinator.collect(&transport, pending));
-    let outcome =
-        commit_after_response_lookups(&graph, permit, partner_registry, &lookups.ec_id, &results);
+    let outcome = commit_after_response_lookups(
+        &graph,
+        permit,
+        &state.partner_registry,
+        &lookups.ec_id,
+        &results,
+    );
     log::info!("After-response lookups: write outcome={outcome}");
 }
 
