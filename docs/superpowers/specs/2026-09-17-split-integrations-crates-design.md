@@ -53,10 +53,11 @@ acceptable compatibility golden. The 2026-10-01 review checkpoint is
 `cb9452545`; it includes the post-discovery configuration-store, EC/EID,
 stored-request, origin-readthrough, first-impression, and deterministic
 context-allowlist changes recorded below. It is a review checkpoint, not the final
-implementation baseline. Implementation branching is blocked until every
-prerequisite fix lands; the recorded baseline is then the resulting
-`origin/main` commit plus captured Next.js/GTM/RSC and browser-runtime output
-goldens. This design changes only the configuration, activation, and ordering
+implementation baseline. Development may start from a recorded `origin/main`
+commit with missing prerequisite fixes stacked as separate, independently
+verified commits. They need not merge first. Before extraction, record the
+corrected stack-tip baseline, its ordered prerequisite commits, and captured
+Next.js/GTM/RSC and browser-runtime output goldens. This design changes only the configuration, activation, and ordering
 behavior called out explicitly in this document; all other corrected-baseline
 runtime, browser, CLI, and cache behavior is preserved.
 
@@ -198,9 +199,11 @@ recreated by this work.
 The following items are tracked at the 2026-10-01 review checkpoint. Their
 issue states can change before implementation; the final baseline gate checks
 behavior, not only whether an issue is closed. They are coordination inputs,
-not design authorities. “Prerequisite” means the focused fix lands on `main`
-and this specification records a new baseline before extraction begins; the
-crate split does not absorb that bug fix into a move commit.
+not design authorities. "Prerequisite" means the focused fix is present and
+verified in the recorded `origin/main` or a separate commit at the base of the
+implementation stack before extraction begins. This specification records that
+corrected baseline; the crate split does not absorb the bug fix into a move
+commit, and its merge is not a development gate.
 
 | Item         | Disposition                                                                                                                                                                                                                                                                                                        |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -272,10 +275,12 @@ contracts:
 - `2026-07-24-prevent-duplicate-gpt-slot-requests-design.md`: duplicate-slot
   behavior remains, while concrete GPT state and browser ownership move outward.
 
-Before either milestone branches for implementation, all prerequisite issues in
-the disposition table must have landed, then the baseline commit, output
-goldens, and locked EdgeZero revision are recorded again and every
-baseline-dependent inventory in this document is rechecked. Open or previously
+Before extraction begins, all prerequisite fixes in the disposition table must
+be present and verified on the implementation branch, whether already merged
+or stacked below extraction. Record the source `origin/main`, ordered
+prerequisite commits, corrected stack-tip baseline, output goldens, and locked
+EdgeZero revision, then recheck every baseline-dependent inventory in this
+document. A rebase that changes relevant inputs refreshes the affected evidence. Open or previously
 approved pull requests never override a decision in this specification merely
 because of their review status.
 
@@ -1140,10 +1145,18 @@ context into all later claims. It simulates both policy subjects: script source
 and script preload. An `enabled` policy must finish at that asset's
 configured first-party `path`; a `blocked` policy must finish in `Remove`, so an
 earlier compatible removal is accepted rather than called a conflict. Any other
-final outcome fails validate, diff, and push, naming every participating table,
-transition, element kind, original URL, and final outcome. Schema-1
-compatibility uses the frozen legacy chain and does not apply new schema-2
-operator-policy strictness.
+final outcome fails validate, diff, and push, identifying the source field or
+asset index, participating integration IDs, element kind, ordered transition
+actions, and final action. Actions are reported as `Unchanged`, `Replace`, or
+`Remove`, without value-bearing URLs. Schema-1 compatibility uses the frozen
+legacy chain and does not apply new schema-2 operator-policy strictness.
+
+CLI validation, stored-catalog checks, and runtime conflict diagnostics never
+emit raw original or replacement URLs or configured route paths to stdout,
+stderr, or structured logs. Credentials may appear in userinfo, paths, or query
+strings, so removing only userinfo or query parameters is insufficient. Full
+URLs remain available internally for exact matching and policy enforcement;
+this diagnostic contract does not change URL acceptance or rewrite behavior.
 
 `disabled` retains the asset definition without registering its proxy route or
 imposing an operator script-source outcome. Its own transition is `Unchanged`;
@@ -1153,9 +1166,10 @@ one. This preserves the existing three-state `JsAssetProxyMode` behavior.
 
 Runtime repeats the check, but catalog drift in a previously stored schema-2
 blob is not an all-routes startup failure. On an asset-policy mismatch it emits
-a sampled structured error containing the tables, URL, element kind, and build
-ID. The rewrite engine first records the original canonical script/preload URL
-and computes the complete ordinary chain, including a terminal `Remove`. Before
+a sampled structured error containing the same non-disclosing conflict fields
+plus the build ID. The rewrite engine first records the original canonical
+script/preload URL and computes the complete ordinary chain, including a terminal
+`Remove`. Before
 committing that outcome to the HTML processor, an engine-owned exact-URL policy
 clamp overrides it for this stored asset: enabled emits the original element
 with its source set to the configured first-party path, and blocked removes the
@@ -3371,8 +3385,8 @@ to preserve `cfg(test)` imports.
 
 ### Capability and behavior parity tests
 
-- After every prerequisite lands, a focused differential harness records the
-  exact baseline commit and captures actual output goldens for a matrix covering
+- After every prerequisite is present and verified on the stack, a focused
+  differential harness records the exact corrected baseline commit and captures actual output goldens for a matrix covering
   all integrations, APS/Prebid/standard providers including globally interleaved
   IDs, deferred Prebid, GPT diagnostics, Next.js/GTM script rewriting, RSC
   streaming, and the #1135 path. It compares hook order, rendered output,
@@ -3404,8 +3418,15 @@ to preserve `cfg(test)` imports.
   N+1 widens both a script-source claim and a native route into conflicts. The
   runtime remains available, enforces the exact operator asset policy, drops
   only the colliding integration-owned route, and emits sampled diagnostics
-  naming the tables, URL/path, and build ID; the candidate-versus-live-config
-  promotion gate rejects that release.
+  identifying source fields or asset indexes, participating integration IDs,
+  element kind, transition and final actions, and build ID without raw URLs or
+  configured route paths; the candidate-versus-live-config promotion gate
+  rejects that release.
+- Conflict-diagnostic sentinel tests put credentials in original and replacement
+  URL userinfo, paths, and query strings, and in colliding configured route paths.
+  CLI validate/diff/push errors, stored-catalog reports, and runtime structured
+  logs expose none of those values in stdout, stderr, or logs. Exact matching
+  and rewrite outcomes remain unchanged.
 - Catalog-drift asset tests cover both script sources and preloads with an
   earlier `Remove`, `Replace` then `Remove`, and an unchanged element. The
   engine-boundary clamp restores an enabled asset to its exact first-party path
@@ -3738,8 +3759,9 @@ crate dependencies from adapters.
 
 The open-defect and in-flight-work disposition table is the authoritative
 inventory of prerequisite fixes, milestone corrections, and coordination-only
-work. Each prerequisite lands independently with focused regression tests and
-is included in the newly recorded baseline before extraction. Move commits
+work. Each prerequisite is a separate commit with focused regression tests and
+is included in the recorded corrected baseline before extraction. It may remain
+unmerged beneath extraction commits during development. Move commits
 preserve that corrected baseline. Review findings are not a reason to add a
 plugin system, second configuration inventory, or unrelated public API.
 
@@ -3944,10 +3966,10 @@ The change is complete when:
 27. The one browser lease has a non-deadlocking authenticated nested path and
     cannot be reclaimed while a recorded child scope may survive; neutral and
     integration owner manifests hash only their artifact-affecting inputs.
-28. Before implementation branches, the review checkpoint is replaced by the
-    final post-prerequisite `origin/main` commit, current-main delta contracts
-    and output goldens are captured, and every baseline-dependent inventory is
-    rechecked.
+28. Before extraction, the review checkpoint is replaced by a corrected baseline
+    recording the source `origin/main` and ordered prerequisite commits, whether
+    merged or stacked. Current-main delta contracts and output goldens are
+    captured, and every baseline-dependent inventory is rechecked.
 
 ## Deferred Work
 
