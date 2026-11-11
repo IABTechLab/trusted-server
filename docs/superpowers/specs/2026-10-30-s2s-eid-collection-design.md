@@ -1509,13 +1509,42 @@ Per provider and navigation, one outcome: `found`, `no_match`, `timeout`,
 `http_error`, `transport_error`, `request_error`, `invalid_response`, `skipped_consent`,
 `skipped_not_due`, `skipped_input`, `skipped_rate_limited`, `skipped_opted_out`,
 `destination_rejected`; plus counts of
-entries and UIDs kept and dropped by reason. Per navigation, one write outcome:
-`written`, `no_change`, `conflict`, `error`, `not_permitted`,
-`no_generation`. A navigation that runs the after-response phase (§5.2.1) has
-one more write outcome: `written`, `unchanged`, `no_row`, `conflict` or
-`failed`. Logs include the
+entries and UIDs kept and dropped by reason. The page-load write emits no
+outcome label in PR A: a skipped write is logged with its error (a conflict,
+an existing row or a store error), and an update without a generation is
+logged as `no_generation`. A navigation that runs the after-response phase
+(§5.2.1) logs one write outcome: `written`, `unchanged`, `no_row`, `conflict`
+or `failed`. Logs include the
 provider ID, source, counts and durations, and the EC ID only in its existing
 truncated form. Raw UIDs, EID values and encrypted envelopes are never logged.
+
+### 12.3 Compatibility and rollout
+
+PR A changes behaviour that operators and integrators can observe:
+
+- **EC minting.** A new EC is minted, and its row written, only on a
+  top-level publisher navigation: a `GET` with `Sec-Fetch-Dest: document`,
+  `Sec-Fetch-Mode: navigate`, no `prefetch` in `Sec-Purpose`, and a response
+  that is not a 301, 302, 303, 307 or 308 redirect. Clients without Fetch
+  Metadata get no EC, and integration proxies no longer mint one.
+- **`user.id` withheld.** An EC minted on the current navigation is not sent
+  as `user.id`, and that navigation's auction carries no browser `ts-eids`,
+  until a later navigation finds its row.
+- **Browser EIDs.** `/auction` and page-bids no longer write browser EIDs; the
+  next navigation ingests them.
+- **Row size cap.** Rows are capped at 16 KiB (`MAX_ENTRY_BYTES`). Batch sync
+  reports `row_full`; a row written before the cap is trimmed only when a
+  write also carries a real change.
+- **Fastly snapshot.** The final auction snapshot may wait up to 1 ms per
+  partially received body and reads on into a response whose headers arrived
+  by the cutoff.
+- **Config blob rollback.** A blob that configures identity providers or sets
+  a non-default identity budget cannot be loaded by an older build; default
+  values are left out of the blob so an unchanged config stays compatible.
+- **Row rollback.** Rows with a provider UID over 512 bytes fail to load on an
+  older build, and an older writer drops `eids` and `opt_outs` (§6.3).
+- **Providers.** PR A registers no provider kind, so deploy validation and
+  every runtime refuse an enabled provider.
 
 ## 13. PR breakdown
 
