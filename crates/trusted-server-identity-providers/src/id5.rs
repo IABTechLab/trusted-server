@@ -27,12 +27,16 @@
 //! removed. A fetch reply whose `universal_uid` is `0` reports the same
 //! opt-out.
 //!
-//! The request field names for the client IP and user agent follow ID5's
-//! server-to-server integration and should be confirmed with ID5 for each
-//! partner account.
+//! `gpp_sid` is sent comma-joined, as ID5's own server-side client does.
+//! The client IP goes in `ip` (IPv4) or `ipv6`. The request field names for
+//! the client IP and user agent, and the `o`, `v`, `tml` and `nbPage`
+//! fields (ID5's server-side client sends `provider`, `domain` and `origin`
+//! instead), follow ID5's server-to-server integration and should be
+//! confirmed with ID5 for each partner account.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -56,7 +60,7 @@ use serde_json::value::RawValue;
 
 use crate::common::{
     CookieReader, LockrSettings, ReadsLockr, VendorEid, bounded_expiry, is_routable_ip,
-    is_usable_id, percent_decoded,
+    is_usable_id, join_section_ids, percent_decoded,
 };
 
 /// Formats the current time as the RFC 3339 `ts` the `/gs/v2` fetch requires.
@@ -180,13 +184,15 @@ struct FetchBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     gpp_string: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    gpp_sid: Option<&'a [u16]>,
+    gpp_sid: Option<String>,
     tml: &'a str,
     ts: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     ua: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipv6: Option<String>,
 }
 
 /// The top-level reply; each field is parsed separately so one bad shape
@@ -344,6 +350,7 @@ impl IdentityProvider for Id5Provider {
     ) -> Result<ProviderRequest, Report<ProviderError>> {
         let consent = lookup.consent;
         let origin = format!("https://{}", lookup.publisher_domain);
+        let routable_ip = lookup.client.ip.filter(|ip| is_routable_ip(*ip));
         let body = FetchBody {
             partner: self.partner_id,
             v: env!("CARGO_PKG_VERSION"),
@@ -353,15 +360,12 @@ impl IdentityProvider for Id5Provider {
             gdpr_consent: consent.raw_tc_string.as_deref(),
             us_privacy: consent.raw_us_privacy.as_deref(),
             gpp_string: consent.raw_gpp_string.as_deref(),
-            gpp_sid: consent.gpp_section_ids.as_deref(),
+            gpp_sid: consent.gpp_section_ids.as_deref().map(join_section_ids),
             tml: &origin,
             ts: request_timestamp()?,
             ua: lookup.client.user_agent,
-            ip: lookup
-                .client
-                .ip
-                .filter(|ip| is_routable_ip(*ip))
-                .map(|ip| ip.to_string()),
+            ip: routable_ip.filter(IpAddr::is_ipv4).map(|ip| ip.to_string()),
+            ipv6: routable_ip.filter(IpAddr::is_ipv6).map(|ip| ip.to_string()),
         };
         let body = serde_json::to_vec(&body).change_context(ProviderError::Request)?;
         let mut headers = HeaderMap::new();
@@ -387,7 +391,7 @@ impl IdentityProvider for Id5Provider {
             return Err(Report::new(ProviderError::InvalidResponse)
                 .attach(format!("ID5 returned status {}", response.status)));
         }
-        if std::str::from_utf8(response.body).is_ok_and(is_opt_out_cookie) {
+        if is_opt_out_reply(response.body) {
             return Ok(LookupOutcome::OptedOut);
         }
         let eids = self
@@ -411,24 +415,26 @@ impl IdentityProvider for Id5Provider {
     }
 }
 
-/// The ID5 opt-out UID.
-const OPT_OUT_UID: &str = "0";
-
-/// Whether one ID5 cookie value or fetch reply records an opt-out: a bare
-/// `0`, or a reply whose `universal_uid` is `0`.
+/// Whether one ID5 cookie value records an opt-out: a bare `0`, or a
+/// (possibly percent-encoded) reply whose `universal_uid` is `0`.
 fn is_opt_out_cookie(value: &str) -> bool {
     let decoded = percent_decoded(value);
     let decoded = decoded.trim();
     if !decoded.starts_with('{') {
-        return decoded == OPT_OUT_UID;
+        return decoded == OPTED_OUT_UID;
     }
-    serde_json::from_str::<serde_json::Value>(decoded)
+    is_opt_out_reply(decoded.as_bytes())
+}
+
+/// Whether a fetch reply body, taken as is, has a `universal_uid` of `0`.
+fn is_opt_out_reply(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|reply| {
             reply
                 .get("universal_uid")
                 .and_then(serde_json::Value::as_str)
-                .map(|uid| uid == OPT_OUT_UID)
+                .map(|uid| uid == OPTED_OUT_UID)
         })
         .unwrap_or(false)
 }
@@ -545,9 +551,8 @@ mod tests {
         assert_eq!(body["gdpr"], 0, "should send that GDPR does not apply");
         assert_eq!(body["us_privacy"], "1YNN", "should send US privacy");
         assert_eq!(
-            body["gpp_sid"],
-            json!([7, 8]),
-            "should send GPP section IDs as an array"
+            body["gpp_sid"], "7,8",
+            "should send GPP section IDs comma-joined"
         );
         assert_eq!(body["ip"], "11.22.33.44", "should send the client IP");
         assert_eq!(
@@ -581,6 +586,34 @@ mod tests {
             serde_json::from_slice(&request.body).expect("should send JSON");
 
         assert!(body.get("ip").is_none(), "should not send a private IP");
+    }
+
+    #[test]
+    fn sends_an_ipv6_address_as_ipv6() {
+        let provider = provider();
+        let consent = ConsentContext::default();
+        let lookup = LookupInput {
+            ec_id: "ec-example",
+            consent: &consent,
+            client: ClientSignals {
+                ip: Some("2001:4860::1".parse().expect("should parse ip")),
+                user_agent: None,
+            },
+            publisher_domain: "www.example.com",
+            due_sources: &[],
+            current: OwnedEntries::empty(),
+            cookies: RequestCookies::default(),
+            hashed_email: None,
+        };
+
+        let request = provider
+            .build_request(&lookup)
+            .expect("should build request");
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("should send JSON");
+
+        assert!(body.get("ip").is_none(), "should not send IPv6 as ip");
+        assert_eq!(body["ipv6"], "2001:4860::1", "should send ipv6");
     }
 
     #[test]
@@ -704,6 +737,24 @@ mod tests {
         assert!(
             matches!(outcome, LookupOutcome::OptedOut),
             "should report an opt-out for a universal_uid of 0"
+        );
+    }
+
+    #[test]
+    fn does_not_percent_decode_an_opt_out_reply() {
+        let provider = provider();
+        let headers = HeaderMap::new();
+        let body = serde_json::to_vec(&json!({
+            "universal_uid": "0",
+            "ext": { "note": "a%22b" },
+        }))
+        .expect("should encode body");
+
+        let outcome = respond(&*provider, &headers, &body);
+
+        assert!(
+            matches!(outcome, LookupOutcome::OptedOut),
+            "should read the reply as sent"
         );
     }
 
