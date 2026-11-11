@@ -28,14 +28,16 @@
 //! (default key `__uid2_advertising_token`) are read last, with the same
 //! parser.
 //!
-//! A `latestToken` of `"optout"` in any of those cookies reports an opt-out:
-//! no lookup is made and stored UID2 UIDs are removed.
+//! A `{"status":"optout"}` identity in `__uid_2` (the UID2 SDK's opt-out)
+//! or a `latestToken` of `"optout"` in any of those cookies reports an
+//! opt-out: no lookup is made and stored UID2 UIDs are removed.
 //!
 //! UID2 is not offered where GDPR applies: there the provider is skipped
-//! for consent, so its cookies are not read and no refresh is made.
+//! for region, so its cookies are not read, no refresh is made and the UIDs
+//! the row holds for it are removed.
 //!
 //! Parsing is lenient: an undecodable cookie, a missing token or expiry,
-//! or a blank or opt-out token reads as no ID. A JSON value is never stored
+//! or a blank or placeholder (`0`) token reads as no ID. A JSON value is never stored
 //! as a token.
 
 use std::borrow::Cow;
@@ -344,7 +346,13 @@ impl IdentityProvider for Uid2Provider {
         &self,
         cookies: RequestCookies<'cookie>,
     ) -> CookieRead<'cookie> {
-        let opted_out = self.cookies.any(cookies, |value| {
+        // The UID2 SDK records an opt-out as `{"status":"optout"}` in its
+        // identity cookie, Prebid as a `latestToken` of `"optout"`; either
+        // one, in any duplicate cookie, wins over every token.
+        let opted_out = cookies.get_all(&self.identity_cookie_name).any(|value| {
+            serde_json::from_str::<serde_json::Value>(&percent_decoded(value))
+                .is_ok_and(|identity| identity["status"] == REFRESH_OPT_OUT)
+        }) || self.cookies.any(cookies, |value| {
             matches!(token_cookie(value), Some(TokenCookie::OptedOut))
         });
         if opted_out {
@@ -533,6 +541,30 @@ mod tests {
         assert!(
             matches!(read, CookieRead::OptedOut),
             "should report the opt-out over any token"
+        );
+    }
+
+    #[test]
+    fn reports_an_sdk_opt_out_over_a_fallback_token() {
+        let provider = provider(&json!({}));
+        let live = identity_cookie(&json!({
+            "advertising_token": "AgAAAAowntoken",
+            "identity_expires": 4_700_000_000_000_u64,
+        }));
+        let opt_out = identity_cookie(&json!({ "status": "optout" }));
+        let fallback = prebid_cookie(&json!({
+            "latestToken": {
+                "advertising_token": "AgAAAAlatesttoken",
+                "identity_expires": 4_700_000_000_000_u64,
+            },
+        }));
+        let header = format!("{live}; {opt_out}; {fallback}");
+
+        let read = provider.read_request_cookies(RequestCookies::new(&header));
+
+        assert!(
+            matches!(read, CookieRead::OptedOut),
+            "should report the SDK opt-out over every token"
         );
     }
 
