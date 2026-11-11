@@ -84,6 +84,7 @@
 //! `EdgeZero`'s assembly-error response, which carries no TS headers, and
 //! retains nothing, so the next request retries.
 
+use std::fmt;
 use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
@@ -1292,7 +1293,7 @@ pub struct TrustedServerApp;
 /// with `EdgeZero`'s assembly-error response.
 pub(crate) fn assemble_app(
     settings: Result<Settings, Report<TrustedServerError>>,
-    log_context: &str,
+    log_context: &dyn fmt::Display,
 ) -> Result<RetainedApp, EdgeError> {
     let state = startup_state(settings, log_context)?;
     let app = App::from_router::<TrustedServerApp>(
@@ -1310,7 +1311,7 @@ pub(crate) fn assemble_app(
 /// report, followed by `log_context`.
 fn startup_state(
     settings: Result<Settings, Report<TrustedServerError>>,
-    log_context: &str,
+    log_context: &dyn fmt::Display,
 ) -> Result<Arc<AppState>, EdgeError> {
     settings
         .and_then(build_state_from_settings)
@@ -1405,7 +1406,7 @@ impl Hooks for TrustedServerApp {
     fn routes() -> Result<RouterService, EdgeError> {
         let state = startup_state(
             load_settings_from_config_store(&RuntimeStoreConfig::logical()),
-            "",
+            &"",
         )?;
         Ok(Self::routes_for_state(&state))
     }
@@ -1553,12 +1554,19 @@ mod tests {
     fn route(router: &RouterService, mut request: edgezero_core::http::Request) -> Response {
         // `oneshot` skips `EdgeZero`'s request conversion, which installs the
         // adapter's default client, so install one that fails every request.
-        // It also skips the entry point's `prepare`, so add an empty geo.
+        // It also skips the entry point's `prepare`, so add the geo `prepare`
+        // would hold for the request's client IP, without host geo data.
         insert_outbound_client(
             &mut request,
             HttpClient::with_client(ScriptedHttpClient::forbidding()),
         );
-        request.extensions_mut().insert(RequestGeo::default());
+        let client_ip = request
+            .extensions()
+            .get::<ClientInfo>()
+            .and_then(|info| info.client_ip);
+        request
+            .extensions_mut()
+            .insert(RequestGeo::new(client_ip, None));
         block_on(router.oneshot(request)).expect("should route request")
     }
 
@@ -2137,7 +2145,7 @@ mod tests {
             .initialize(|| {
                 assemble_app(
                     load_settings_from_config_store(&RuntimeStoreConfig::logical()),
-                    "",
+                    &"",
                 )
             })
             .expect_err("should fail assembly without an app config blob");
@@ -2176,7 +2184,7 @@ mod tests {
 
         // Request 2: the blob is restored.
         sandbox
-            .initialize(|| assemble_app(Ok(test_settings()), ""))
+            .initialize(|| assemble_app(Ok(test_settings()), &""))
             .expect("should assemble once the blob is restored");
         let second = crate::sandbox::SandboxCounters::capture(&sandbox, 2, "request-2");
 
@@ -2190,15 +2198,15 @@ mod tests {
             "should count one more build in the same sandbox"
         );
         assert_eq!(
-            second.log_context().split(' ').nth(1),
-            first.log_context().split(' ').nth(1),
+            second.log_context().to_string().split(' ').nth(1),
+            first.log_context().to_string().split(' ').nth(1),
             "should keep serving from the same sandbox instance"
         );
     }
 
     #[test]
     fn assembly_runs_configure_once_with_the_edge_policies() {
-        let retained = assemble_app(Ok(test_settings()), "").expect("should assemble the app");
+        let retained = assemble_app(Ok(test_settings()), &"").expect("should assemble the app");
         let headers = edgezero_core::http::HeaderMap::new();
         let request_start = edgezero_core::time::MonotonicInstant::now();
         let egress_started_at = request_start
@@ -2267,7 +2275,7 @@ mod tests {
         // smallest configure failure a deployment can reach.
         let guard = ServiceVersionGuard::set(&"9".repeat(4097));
         let error = sandbox
-            .initialize(|| assemble_app(Ok(test_settings()), ""))
+            .initialize(|| assemble_app(Ok(test_settings()), &""))
             .expect_err("should fail assembly when configure rejects the synthesized set");
         drop(guard);
 
@@ -2281,7 +2289,7 @@ mod tests {
             "should retain nothing after configure fails"
         );
         sandbox
-            .initialize(|| assemble_app(Ok(test_settings()), ""))
+            .initialize(|| assemble_app(Ok(test_settings()), &""))
             .expect("should assemble on the next request once configure succeeds");
         assert_eq!(
             sandbox.initialization_attempts(),
@@ -2346,7 +2354,7 @@ mod tests {
         //
         // This is safe to run without Viceroy: enforce_basic_auth is pure Rust
         // (reads settings + request headers only) and the finalize middleware
-        // reads the empty RequestGeo that `route` inserts, so nothing calls a
+        // reads the geo-less RequestGeo that `route` inserts, so nothing calls a
         // Fastly ABI.
         let router = test_router();
         let req = empty_request(Method::POST, "/_ts/admin/keys/rotate");
@@ -3373,7 +3381,7 @@ mod tests {
             .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(upstream.http_client())
             .clock(clock.monotonic_clock())
-            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .geo(Arc::new(RequestGeo::default()))
             .client_info(ClientInfo::default())
             .build()
     }
@@ -3551,7 +3559,7 @@ mod tests {
             .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(origin.http_client())
             .clock(clock.monotonic_clock())
-            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .geo(Arc::new(RequestGeo::default()))
             .client_info(ClientInfo::default())
             .build();
         let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));

@@ -347,7 +347,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::platform::{FastlyPlatformBackend, FastlyPlatformGeo};
+    use crate::platform::{FastlyPlatformBackend, RequestGeo};
 
     const BASE_URL: &str = "https://management.example.com";
     const API_KEY: &str = "example-api-key";
@@ -500,7 +500,7 @@ mod tests {
             .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(upstream.http_client())
             .clock(clock.monotonic_clock())
-            .geo(Arc::new(FastlyPlatformGeo))
+            .geo(Arc::new(RequestGeo::default()))
             .client_info(ClientInfo::default())
             .build()
     }

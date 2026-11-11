@@ -174,20 +174,32 @@ impl SandboxCounters {
     ///
     /// It matches the counters a committed response carries, so a failure
     /// after commitment can be reconciled with that response.
-    pub(crate) fn log_context(&self) -> String {
-        request_log_context(self.ordinal, &self.request_id)
+    pub(crate) fn log_context(&self) -> LogContext<'_> {
+        LogContext::new(self.ordinal, &self.request_id)
     }
 }
 
-/// The ` [instance=.. ordinal=.. request=..]` suffix for request `ordinal`.
+/// The ` [instance=.. ordinal=.. request=..]` suffix of a failure log.
 ///
-/// The entry point uses it before the counters are captured, so the
-/// assembly failure log matches [`SandboxCounters::log_context`].
-pub(crate) fn request_log_context(ordinal: u64, request_id: &str) -> String {
-    format!(
-        " [instance={} ordinal={ordinal} request={request_id}]",
-        instance_id()
-    )
+/// It is formatted only when a log writes it, so a request that logs no
+/// failure pays nothing for it. The entry point builds one before the
+/// counters are captured, so the assembly failure log matches
+/// [`SandboxCounters::log_context`].
+#[derive(Debug, Clone, Copy, derive_more::Display)]
+#[display(" [instance={} ordinal={ordinal} request={request_id}]", instance_id())]
+pub(crate) struct LogContext<'a> {
+    ordinal: u64,
+    request_id: &'a str,
+}
+
+impl<'a> LogContext<'a> {
+    /// The suffix for request `ordinal`, identified by `request_id`.
+    pub(crate) fn new(ordinal: u64, request_id: &'a str) -> Self {
+        Self {
+            ordinal,
+            request_id,
+        }
+    }
 }
 
 /// Guest-instance identifier used to attribute requests to a sandbox.
@@ -954,7 +966,7 @@ mod tests {
             "should capture the current counters whatever the metrics setting"
         );
         assert_eq!(
-            counters.log_context(),
+            counters.log_context().to_string(),
             format!(" [instance={} ordinal=7 request=req-7]", instance_id()),
             "should name the instance, ordinal, and request in failure logs"
         );

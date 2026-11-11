@@ -743,13 +743,10 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
 }
 
 // ---------------------------------------------------------------------------
-// FastlyPlatformGeo
+// RequestGeo
 // ---------------------------------------------------------------------------
 
 /// Convert a Fastly [`Geo`] value into a platform-neutral [`GeoInfo`].
-///
-/// Shared by `FastlyPlatformGeo::lookup` in `trusted-server-adapter-fastly` so
-/// that field mapping is never duplicated.
 fn geo_from_fastly(geo: &Geo) -> GeoInfo {
     GeoInfo {
         city: geo.city().to_string(),
@@ -760,17 +757,6 @@ fn geo_from_fastly(geo: &Geo) -> GeoInfo {
         metro_code: geo.metro_code(),
         region: geo.region().map(str::to_string),
         asn: None,
-    }
-}
-
-/// Fastly geo-lookup implementation of [`PlatformGeo`].
-pub struct FastlyPlatformGeo;
-
-impl PlatformGeo for FastlyPlatformGeo {
-    fn lookup(&self, client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-        Ok(client_ip
-            .and_then(geo_lookup)
-            .map(|geo| geo_from_fastly(&geo)))
     }
 }
 
@@ -787,16 +773,19 @@ pub(crate) struct RequestGeo {
 
 impl RequestGeo {
     /// Holds `geo` as the lookup result for `client_ip`.
+    #[cfg(test)]
     pub(crate) fn new(client_ip: Option<IpAddr>, geo: Option<GeoInfo>) -> Self {
         Self { client_ip, geo }
     }
 
     /// Looks up `client_ip` once with Fastly's geo database.
     pub(crate) fn lookup_once(client_ip: Option<IpAddr>) -> Self {
-        let geo = client_ip
-            .and_then(geo_lookup)
-            .map(|geo| geo_from_fastly(&geo));
-        Self::new(client_ip, geo)
+        Self {
+            client_ip,
+            geo: client_ip
+                .and_then(geo_lookup)
+                .map(|geo| geo_from_fastly(&geo)),
+        }
     }
 
     /// The request's geo, if the lookup found any.
@@ -808,12 +797,13 @@ impl RequestGeo {
 impl PlatformGeo for RequestGeo {
     /// Answers the request's own IP from the held result, without a host lookup.
     ///
-    /// Any other IP is looked up with [`FastlyPlatformGeo`].
+    /// Any other IP gets `Ok(None)`: there is no data for an IP this request
+    /// did not resolve.
     fn lookup(&self, client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         if client_ip == self.client_ip {
             Ok(self.geo.clone())
         } else {
-            FastlyPlatformGeo.lookup(client_ip)
+            Ok(None)
         }
     }
 }
@@ -923,6 +913,42 @@ mod tests {
         );
         req.set_header("fastly-client-ip", ip.as_ref());
         req
+    }
+
+    #[test]
+    fn request_geo_answers_only_the_ip_it_resolved() {
+        let resolved_ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7));
+        let other_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 44));
+        let request_geo = RequestGeo::new(
+            Some(resolved_ip),
+            Some(GeoInfo {
+                city: "Springfield".to_owned(),
+                country: "US".to_owned(),
+                continent: "NorthAmerica".to_owned(),
+                latitude: 39.78,
+                longitude: -89.65,
+                metro_code: 648,
+                region: Some("IL".to_owned()),
+                asn: None,
+            }),
+        );
+
+        let held = request_geo
+            .lookup(Some(resolved_ip))
+            .expect("should answer the resolved IP");
+        let other = request_geo
+            .lookup(Some(other_ip))
+            .expect("should answer another IP");
+
+        assert_eq!(
+            held.map(|geo| geo.city),
+            Some("Springfield".to_owned()),
+            "should return the held geo for the resolved IP"
+        );
+        assert!(
+            other.is_none(),
+            "should have no data for an IP this request did not resolve"
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! `EdgeZero` cancels an outbound request whose pending handle is dropped, so a
 //! request cannot be left to finish on its own while the response streams.
 
+use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -109,7 +110,7 @@ pub(crate) async fn send_queued_batches(
     client: &HttpClient,
     config: &TinybirdSettings,
     queue: &TelemetryQueue,
-    log_context: &str,
+    log_context: &dyn fmt::Display,
 ) {
     let bodies = queue.take();
     if bodies.is_empty() {
@@ -190,8 +191,8 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::platform::{
-        FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo,
-        FastlyPlatformSecretStore, UnavailableKvStore,
+        FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformSecretStore, RequestGeo,
+        UnavailableKvStore,
     };
 
     const TEST_USER_AGENT: &str =
@@ -264,7 +265,7 @@ pub(crate) mod tests {
             .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(ScriptedHttpClient::forbidding().http_client())
             .clock(TestClock::new().monotonic_clock())
-            .geo(Arc::new(FastlyPlatformGeo))
+            .geo(Arc::new(RequestGeo::default()))
             .client_info(ClientInfo::default())
             .build()
     }
@@ -394,7 +395,7 @@ pub(crate) mod tests {
             &client.http_client(),
             &enabled_config(),
             &queue,
-            "",
+            &"",
         ));
 
         let requests = client.requests();
@@ -429,7 +430,7 @@ pub(crate) mod tests {
             &client.http_client(),
             &enabled_config(),
             &queue,
-            "",
+            &"",
         ));
 
         assert_eq!(
@@ -447,7 +448,7 @@ pub(crate) mod tests {
             &client.http_client(),
             &enabled_config(),
             &TelemetryQueue::default(),
-            "",
+            &"",
         ));
 
         client.assert_no_requests();

@@ -14,6 +14,8 @@
 //! so both finish before it does. The client already has its response; each
 //! extends only the sandbox's lifetime.
 
+use std::fmt;
+
 use edgezero_adapter_fastly::outbound::FastlyOutboundClient;
 use edgezero_core::outbound::HttpClient;
 use edgezero_core::time::MonotonicClock;
@@ -44,7 +46,7 @@ pub(crate) fn run_post_delivery(
     state: Option<FinalizeState>,
     queue: &TelemetryQueue,
     settings: &Settings,
-    log_context: &str,
+    log_context: &dyn fmt::Display,
 ) {
     let client = HttpClient::with_client(FastlyOutboundClient::new()).with_proxy_marker(false);
     let clock = MonotonicClock::default();
@@ -65,7 +67,7 @@ async fn post_delivery_work(
     settings: &Settings,
     client: &HttpClient,
     clock: &MonotonicClock,
-    log_context: &str,
+    log_context: &dyn fmt::Display,
 ) {
     send_queued_batches(client, &settings.tinybird, queue, log_context).await;
     if let Some(state) = state {
@@ -79,7 +81,7 @@ async fn pull_sync(
     settings: &Settings,
     client: &HttpClient,
     clock: &MonotonicClock,
-    log_context: &str,
+    log_context: &dyn fmt::Display,
 ) {
     let FinalizeState {
         partner_registry,
@@ -115,7 +117,7 @@ async fn pull_sync(
 fn prepare_pull_sync_after_send<F>(
     context: Option<PullSyncContext>,
     graph_factory: F,
-    log_context: &str,
+    log_context: &dyn fmt::Display,
 ) -> Option<(PullSyncContext, KvIdentityGraph)>
 where
     F: FnOnce() -> Result<KvIdentityGraph, Report<TrustedServerError>>,
@@ -198,7 +200,7 @@ mod tests {
                 &settings,
                 &client.http_client(),
                 &clock.monotonic_clock(),
-                "",
+                &"",
             ));
         });
 
@@ -222,7 +224,7 @@ mod tests {
                 &settings,
                 &client.http_client(),
                 &clock.monotonic_clock(),
-                "",
+                &"",
             ));
         };
 
@@ -255,7 +257,7 @@ mod tests {
             &settings_with_tinybird(),
             &client.http_client(),
             &clock.monotonic_clock(),
-            "",
+            &"",
         ));
 
         let requests = client.requests();
@@ -278,7 +280,7 @@ mod tests {
                     message: "graph factory should not run".to_owned(),
                 }))
             },
-            "",
+            &"",
         );
         assert!(
             result.is_none(),
@@ -298,7 +300,7 @@ mod tests {
             &settings_with_tinybird(),
             &client.http_client(),
             &clock.monotonic_clock(),
-            "",
+            &"",
         ));
 
         client.assert_no_requests();
@@ -406,7 +408,7 @@ mod tests {
                     &settings,
                     &client.http_client(),
                     &clock.monotonic_clock(),
-                    "",
+                    &"",
                 ));
             },
         );
@@ -444,7 +446,7 @@ mod tests {
                     &settings,
                     &client.http_client(),
                     &clock.monotonic_clock(),
-                    "",
+                    &"",
                 ));
             },
         );

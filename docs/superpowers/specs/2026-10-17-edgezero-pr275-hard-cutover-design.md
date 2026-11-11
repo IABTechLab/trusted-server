@@ -1595,6 +1595,9 @@ Outbound:
     observe it (2.4). Today a snapshot after the deadline keeps it (#1433).
 23. Pull sync has a 15 s cutoff per group.
 24. Origin readthrough is unavailable (D9).
+
+Responses, continued:
+
 25. A streamed relay whose origin declares `Content-Length` keeps it instead of
     chunked framing (test 7).
 

@@ -55,8 +55,8 @@ use crate::middleware::{
 use crate::platform::{RequestGeo, client_info_from_request, resolve_client_ip};
 use crate::post_delivery::{FinalizeState, run_post_delivery};
 use crate::sandbox::{
-    RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDiagnostics, instance_id,
-    metrics_enabled, request_log_context,
+    LogContext, RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDiagnostics, instance_id,
+    metrics_enabled,
 };
 use crate::tinybird::TelemetryQueue;
 // Only the reuse path builds a serving loop, so the retirement snapshots have
@@ -257,11 +257,10 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
     // `initialize` retains only success and returns the error unchanged, so a
     // transient config-store failure answers this request and the next
     // callback retries assembly.
-    let log_context = request_log_context(ordinal, &request_id);
     let assembled = sandbox.initialize(|| {
         assemble_app(
             load_settings_from_config_store(&RuntimeStoreConfig::logical()),
-            &log_context,
+            &LogContext::new(ordinal, &request_id),
         )
     });
     let counters = SandboxCounters::capture(sandbox, ordinal, &request_id);
@@ -1094,7 +1093,7 @@ mod tests {
         // end serving nor drop the retained app.
         for request in 0..2 {
             sandbox
-                .initialize(|| assemble_app(Ok(test_settings()), ""))
+                .initialize(|| assemble_app(Ok(test_settings()), &""))
                 .expect("should assemble or reuse the app");
             let retained = retained_app(&sandbox).expect("should retain the app");
             let counters = SandboxCounters::capture(&sandbox, request + 1, "request-example");
