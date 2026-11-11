@@ -391,8 +391,11 @@ impl Running {
     fn rejected(&mut self, diagnostic: &str) {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
+            let listener_reachable =
+                TcpStream::connect_timeout(&self.address, Duration::from_millis(30))
+                    .is_ok_and(|stream| connected_to_listener(&stream));
             assert!(
-                TcpStream::connect_timeout(&self.address, Duration::from_millis(30)).is_err(),
+                !listener_reachable,
                 "should fail before opening listener: {}",
                 self.log()
             );
@@ -433,6 +436,53 @@ impl Drop for Running {
             self.log()
         );
     }
+}
+
+fn connected_to_listener(stream: &TcpStream) -> bool {
+    // Linux can self-connect when an ephemeral source port equals the target.
+    // That connection has no listener; a real listener has distinct endpoints.
+    stream.local_addr().expect("should read probe source")
+        != stream.peer_addr().expect("should read probe peer")
+}
+
+#[test]
+fn startup_probe_detects_a_real_listener() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .expect("should start a real listener for the positive control");
+    let address = listener.local_addr().expect("should read listener address");
+    let stream = TcpStream::connect_timeout(&address, Duration::from_millis(30))
+        .expect("should connect to the real listener");
+    assert!(
+        connected_to_listener(&stream),
+        "should not exempt a connection to a real listener"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn startup_probe_excludes_a_reflexive_connection_without_a_listener() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("should build the local probe runtime");
+    let socket = tokio::net::TcpSocket::new_v4().expect("should create probe socket");
+    socket
+        .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("should bind a source port without listening");
+    let address = socket.local_addr().expect("should read probe source port");
+    let stream = runtime
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), socket.connect(address))
+                .await
+                .expect("should bound the Linux self-connection")
+                .expect("should reproduce the Linux self-connection")
+        })
+        .into_std()
+        .expect("should inspect the self-connected socket");
+    assert!(
+        !connected_to_listener(&stream),
+        "should not mistake a reflexive connection for a listening server"
+    );
 }
 
 fn client(source: Option<IpAddr>) -> Client {
