@@ -717,6 +717,64 @@ mod tests {
         );
     }
 
+    /// Appends `?chained` so a test can see whether a replacement reached it.
+    struct AppendChainedRewriter;
+
+    impl IntegrationAttributeRewriter for AppendChainedRewriter {
+        fn integration_id(&self) -> &'static str {
+            "append_chained"
+        }
+
+        fn handles_attribute(&self, attribute: &str) -> bool {
+            attribute == "src"
+        }
+
+        fn rewrite(
+            &self,
+            _attr_name: &str,
+            attr_value: &str,
+            _ctx: &IntegrationAttributeContext<'_>,
+        ) -> AttributeRewriteAction {
+            AttributeRewriteAction::replace(format!("{attr_value}?chained"))
+        }
+    }
+
+    #[test]
+    fn js_asset_proxy_replacement_is_terminal_while_other_replacements_chain() {
+        let proxy: Arc<dyn IntegrationAttributeRewriter> =
+            JsAssetProxyIntegration::new(config_with_assets(vec![asset(
+                "/assets/vendor.js",
+                "https://cdn.example.com/vendor.js",
+                JsAssetProxyMode::Enabled,
+            )]));
+        let chained: Arc<dyn IntegrationAttributeRewriter> = Arc::new(AppendChainedRewriter);
+        let registry = IntegrationRegistry::from_rewriters(
+            vec![proxy, Arc::clone(&chained), chained],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            registry.rewrite_attribute(
+                "src",
+                "https://cdn.example.com/vendor.js",
+                &rewrite_context()
+            ),
+            crate::integrations::AttributeRewriteOutcome::Replaced("/assets/vendor.js".to_string()),
+            "later rewriters should not see the JS asset proxy replacement"
+        );
+        assert_eq!(
+            registry.rewrite_attribute(
+                "src",
+                "https://cdn.example.com/other.js",
+                &rewrite_context()
+            ),
+            crate::integrations::AttributeRewriteOutcome::Replaced(
+                "https://cdn.example.com/other.js?chained?chained".to_string()
+            ),
+            "other replacements should keep chaining"
+        );
+    }
+
     #[test]
     fn blocked_js_asset_proxy_entry_removes_prebid_script() {
         let processed = process_prebid_script_with_asset_mode("blocked");
