@@ -166,8 +166,24 @@ impl<'cookie> From<Option<Vec<ProviderEid<'cookie>>>> for CookieRead<'cookie> {
 
 /// The request's `Cookie` header, lent to providers that read their own
 /// first-party cookies.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// Its `Debug` output names the cookies but never prints their values.
+#[derive(Clone, Copy, Default)]
 pub struct RequestCookies<'a>(&'a str);
+
+impl core::fmt::Debug for RequestCookies<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_list()
+            .entries(
+                self.0
+                    .split(';')
+                    .filter_map(|pair| pair.split_once('='))
+                    .map(|(name, _)| name.trim()),
+            )
+            .finish()
+    }
+}
 
 impl<'a> RequestCookies<'a> {
     /// Wraps a `Cookie` header value (pairs separated by `;`).
@@ -840,6 +856,18 @@ mod tests {
             cookies.get("id"),
             Some("first"),
             "should get the first value"
+        );
+    }
+
+    #[test]
+    fn cookies_debug_prints_names_but_not_values() {
+        let cookies = RequestCookies::new("session=example-secret; vendor_id=v-1");
+
+        let printed = format!("{cookies:?}");
+
+        assert_eq!(
+            printed, r#"["session", "vendor_id"]"#,
+            "should print only cookie names"
         );
     }
 
