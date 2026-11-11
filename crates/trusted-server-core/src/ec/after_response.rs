@@ -7,7 +7,7 @@
 //! next page load. Browser ingest never runs here: it belongs to the
 //! navigation's own write.
 
-use super::coordinator::results::LookupResults;
+use super::coordinator::results::{LookupResults, LookupStatus, SkipReason};
 use super::eid_types::UnixSeconds;
 use super::kv::KvIdentityGraph;
 use super::page_load::{AfterResponseWrite, RowChange};
@@ -73,7 +73,14 @@ pub fn commit_after_response_lookups(
     ec_id: &str,
     lookups: &LookupResults,
 ) -> AfterResponseOutcome {
-    if lookups.is_empty() {
+    // Only found UIDs, cleared sources or an opt-out can change the row; a
+    // navigation whose lookups were all skipped or failed needs no re-read.
+    let can_change = lookups.iter().any(|lookup| {
+        !lookup.entries.is_empty()
+            || !lookup.cleared.is_empty()
+            || lookup.status == LookupStatus::Skipped(SkipReason::OptedOut)
+    });
+    if !can_change {
         return AfterResponseOutcome::Unchanged;
     }
     let snapshot = &graph.load_snapshot(ec_id);
@@ -126,7 +133,7 @@ pub fn commit_after_response_lookups(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec::coordinator::results::{DropCounts, LookupStatus, ProviderLookup};
+    use crate::ec::coordinator::results::{DropCounts, ProviderLookup};
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, SourceDomain, UidValue};
     use crate::ec::kv::TombstoneOutcome;
     use crate::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvUid};
@@ -485,6 +492,37 @@ mod tests {
             outcome,
             AfterResponseOutcome::Unchanged,
             "should make no write without results"
+        );
+    }
+
+    #[test]
+    fn skipped_results_need_no_re_read() {
+        // Arrange: no row, so a re-read would report `NoRow`.
+        let graph = KvIdentityGraph::in_memory("after-response");
+        let skipped = LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::Skipped(SkipReason::NotDue),
+                entries: Vec::new(),
+                cleared: Vec::new(),
+            }],
+        );
+
+        // Act
+        let outcome = commit_after_response_lookups(
+            &graph,
+            AfterResponseWrite::for_test(),
+            &registry(),
+            EC_ID,
+            &skipped,
+        );
+
+        // Assert
+        assert_eq!(
+            outcome,
+            AfterResponseOutcome::Unchanged,
+            "should return before reading the row"
         );
     }
 
