@@ -150,8 +150,12 @@ pub(crate) fn cookie_capabilities(
     Ok((capabilities, source.clone()))
 }
 
-/// Whether a cookie-carried ID is worth storing: not blank and not an
-/// opt-out placeholder such as `0` or an all-zero UUID.
+/// Whether a cookie-carried ID is worth storing: not blank and not a
+/// placeholder such as `0` or an all-zero UUID.
+///
+/// A placeholder reads as "no ID", not as an opt-out: no vendor read with
+/// this check documents it as its opt-out signal. Providers whose vendor
+/// does (ID5's `"0"`) check for it separately and report an opt-out.
 #[must_use]
 pub(crate) fn is_usable_id(id: &str) -> bool {
     let id = id.trim();

@@ -21,7 +21,7 @@
 - One EID for the single configured source, one UID with `atype = 3`.
 - From the identity cookie: `ProviderExpiry::At(identity_expires)`; the coordinator's validation drops an expired token.
 - From the raw token cookie: `bounded_expiry(None)`, the shared default TTL.
-- Refresh state `from = refresh_from`; the source becomes due then, and is refreshed only when the cookies no longer yield a usable token. A refresh is due only while the token is still live, so a failing refresh stops at its expiry; `rate_limit_per_hour` also bounds it. An `optout` reply removes the stored token.
+- Refresh state `from = refresh_from`; the source becomes due then, and is refreshed once due, also while the cookie repeats the stored token (a cookie repeating the held token is not rewritten, so a failed refresh keeps the held refresh state). A refresh is due only while the token is still live, so a failing refresh stops at its expiry; `rate_limit_per_hour` also bounds it. An `optout` reply removes the stored token.
 
 ## Lockr
 
@@ -31,7 +31,7 @@
 
 - Token generation (needs a hashed email; out of scope).
 
-Risk: a server refresh spends the SDK cookie's refresh token without rewriting `__uid_2`, so the browser SDK's own refresh of that identity may then fail. That is acceptable because server refresh runs only when the browser sends no usable token.
+Risk: a server refresh does not rewrite `__uid_2`. Refreshing does not invalidate the previous token or refresh token, so the server refresh and the browser SDK's own refresh both succeed and fork into two token chains. A later navigation whose cookie still carries the older token then replaces the refreshed row token; `rate_limit_per_hour` bounds the resulting refreshes.
 
 ## Tasks
 

@@ -16,7 +16,7 @@
 - The attribute-to-source table is fixed, as in the reference provider; `settings.resolve` picks attributes from it, and every picked attribute's source must be one of the provider's `sources`.
 - No page URL in `LookupInput`, so `pu` is the publisher origin.
 - EID-level fields are preserved. As in Prebid, every attribute other than `nonId` is a partner ID whose UID carries `ext` `{"provider":"liveintent.com"}`; the Trade Desk ID's UID also carries `rtiPartner: "TDID"` and its EID `matcher = "liveintent.com"`. The reply's `segments` become the `nonId` EID's `ext` (`{"segments": ...}`), which needs the PR A change letting a provider return an owned EID `ext`.
-- The `Expires` header becomes `ProviderExpiry::At`; the provider never reads the clock.
+- The `Expires` header becomes `ProviderExpiry::After(Expires - Date)`; the provider never reads the clock.
 
 ## Settings
 
@@ -37,7 +37,7 @@ No Lockr capability: Lockr AIM is not documented to deliver LiveIntent IDs, and 
 ## Response
 
 - `204 No Content` is `LookupOutcome::NoMatch`. LiveIntent answers `204` to anonymous `gdpr=1` lookups. On the `prebid` path it returns only `nonId`; with the publisher's own `distributor_id` (for example `did-0123`) and the `_lc2_fpi` first-party ID as `duid`, it also returns partner IDs without its third-party cookie, so a publisher wanting partner IDs must set `distributor_id`; another non-2xx status or a non-object body is `ProviderError::InvalidResponse`.
-- Each resolved attribute with a non-empty string value becomes one EID with `atype = 3`, borrowed from the body; `segments`, the TDID `matcher` and the UID `ext` values are added as above.
+- Each resolved attribute with a non-empty string value becomes one EID with `atype = 3` (the resolved TDID gets `atype = 1`, as in Prebid), borrowed from the body; `segments`, the TDID `matcher` and the UID `ext` values are added as above. Segments whose wrapped `ext` exceeds `MAX_EXT_BYTES` are left out so the `nonId` EID is kept.
 
 ## Tasks
 

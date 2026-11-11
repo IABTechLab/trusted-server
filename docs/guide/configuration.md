@@ -842,7 +842,7 @@ the EC row when the cookies hold none; no cookie is set.
 | `kind`                | String  | Yes      | Provider implementation; must be one this build includes                              |
 | `enabled`             | Boolean | No       | Whether the provider runs (default `true`)                                            |
 | `endpoint`            | String  | No       | HTTPS lookup URL, for kinds that make a lookup; its host must be in `allowed_domains` |
-| `allowed_domains`     | Array   | No       | Hosts the provider may call; needed with `endpoint`                                   |
+| `allowed_domains`     | Array   | No       | Hosts the provider may call; required with an `endpoint`                              |
 | `sources`             | Array   | Yes      | Source domains the provider owns; each needs an `[[ec.partners]]` entry               |
 | `tcf_vendor_id`       | Integer | No       | TCF vendor ID that must have vendor consent                                           |
 | `collect`             | String  | No       | `"page"` (default) or `"after_response"`; see below                                   |

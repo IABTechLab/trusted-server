@@ -150,7 +150,8 @@ pull_sync_concurrency = 3
 # ID5 (kind "id5"): anonymous lookup, no secrets. The first source receives
 # the legacy `universal_uid`. Use the endpoint and sources ID5 gives you.
 # Before any lookup it reads the first-party cookies in `cookie_names`, in
-# order (Prebid's ID5 module writes `id5id`).
+# order. Prebid's ID5 module writes the `id5id` cookie only with
+# `storage.type: 'cookie'`; with `html5` storage the lookup runs.
 #
 # Lockr capability (id5, liveramp and uid2 only): Lockr AIM writes other
 # vendors' IDs into first-party cookies under key names configured per
@@ -246,8 +247,11 @@ pull_sync_concurrency = 3
 #
 # UID2 (kind "uid2"): reads the advertising token from the UID2 SDK's
 # `__uid_2` cookie until its `identity_expires`, falling back to Prebid's raw
-# `__uid2_advertising_token` cookie. Takes exactly one source. `cookie_names`
-# lists the raw token cookies, read in order after `identity_cookie_name`.
+# `__uid2_advertising_token` cookie. Both clients keep the token in
+# localStorage by default, which the server never sees: set the SDK's
+# `useCookie: true` or Prebid's `params.storage: 'cookie'`. Takes exactly one
+# source. `cookie_names` lists the raw token cookies, read in order after
+# `identity_cookie_name`.
 # Supports the Lockr capability; Lockr cookies are read last, as raw tokens.
 # Optional server refresh: set `endpoint` to the UID2 operator's
 # `/v2/token/refresh` URL. The `__uid_2` cookie's refresh token and response
@@ -293,7 +297,8 @@ pull_sync_concurrency = 3
 #
 # Criteo (kind "criteo"): no lookup and no endpoint. Reads Criteo's bid ID
 # from the first-party `cto_bidid` cookie Prebid's Criteo module keeps and
-# stores it verbatim as a device-based (atype 1) ID. Takes exactly one source.
+# stores it percent-decoded, as Prebid sends it, as a device-based (atype 1)
+# ID. Takes exactly one source.
 # [[ec.identity_providers]]
 # id = "criteo"
 # kind = "criteo"

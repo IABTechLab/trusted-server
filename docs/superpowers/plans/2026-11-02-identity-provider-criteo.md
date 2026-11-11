@@ -12,8 +12,8 @@
 
 ## Cookie
 
-- Prebid's `criteoIdSystem` keeps Criteo's bid ID in the `cto_bidid` cookie (and local storage) and sends that value unchanged, still percent-encoded, as the `criteo.com` EID. `cto_bundle` is Criteo's own sync state and is not an ID.
-- Default `cookie_names = ["cto_bidid"]`, read in order. The value is stored verbatim, not decoded.
+- Prebid's `criteoIdSystem` keeps Criteo's bid ID in the `cto_bidid` cookie (and local storage) and sends the `decodeURIComponent`-decoded value as the `criteo.com` EID (unwrapping a `{"criteoId":…}` value). `cto_bundle` is Criteo's own sync state and is not an ID.
+- Default `cookie_names = ["cto_bidid"]`, read in order. The value is percent-decoded and stored as Prebid sends it.
 - A blank or opt-out value reads as no ID. Criteo does not set `cto_bidid` on every page view, so the ID arrives on a later request.
 
 No Lockr capability.
@@ -30,6 +30,6 @@ No Lockr capability.
 ## Tasks
 
 - [ ] Add `criteo.rs`; register the kind in `is_registered_kind` and `build`.
-- [ ] Unit tests: value stored verbatim, missing and blank cookies ignored.
+- [ ] Unit tests: value stored decoded, `criteoId` object unwrapped, missing and blank cookies ignored.
 - [ ] Add a commented `kind = "criteo"` example to `trusted-server.example.toml`.
 - [ ] Run `cargo test-fastly` and `cargo clippy-fastly`.
