@@ -401,7 +401,7 @@ async fn malformed_cursor_expiry_or_allocator_fails_closed() {
 }
 
 /// Run explicitly against disposable `DynamoDB` Local, never AWS:
-/// `TS_EC_DYNAMODB_LOCAL_ENDPOINT=http://127.0.0.1:PORT cargo test ... -- --ignored`
+/// `TS_EC_DYNAMODB_LOCAL_ENDPOINT=http://127.0.0.1:8000 cargo test ... -- --ignored`
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires explicitly selected disposable DynamoDB Local loopback endpoint"]
 async fn dynamodb_local_contract() {
