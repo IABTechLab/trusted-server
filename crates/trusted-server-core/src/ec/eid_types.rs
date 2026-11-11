@@ -17,6 +17,41 @@ use super::partner::normalize_partner_source_domain;
 /// Maximum serialized size of an `ext` object, in bytes.
 pub const MAX_EXT_BYTES: usize = 1024;
 
+/// Maximum nesting depth of an `ext` object.
+///
+/// Keeps every whole-row or whole-request parse that embeds the `ext` well
+/// under `serde_json`'s 128-level recursion limit.
+pub const MAX_EXT_DEPTH: usize = 32;
+
+/// Returns the deepest object or array nesting in JSON `text`.
+///
+/// Iterative, so it cannot overflow the stack on hostile input.
+fn json_depth(text: &str) -> usize {
+    let (mut depth, mut deepest) = (0_usize, 0_usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for byte in text.bytes() {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
 /// Maximum size of `inserter` and `matcher`, in bytes.
 pub const MAX_EID_FIELD_BYTES: usize = 255;
 
@@ -377,7 +412,10 @@ impl PartialEq for RawJson {
 impl RawJson {
     fn check(value: &RawValue) -> Result<(), EidValidationError> {
         let text = value.get();
-        if text.len() > MAX_EXT_BYTES || !text.trim_start().starts_with('{') {
+        if text.len() > MAX_EXT_BYTES
+            || !text.trim_start().starts_with('{')
+            || json_depth(text) > MAX_EXT_DEPTH
+        {
             return Err(EidValidationError::InvalidExt);
         }
         // `RawValue` skips nested values without serde_json's recursion limit,
@@ -554,6 +592,30 @@ mod tests {
         assert!(
             RawJson::try_from(raw).is_err(),
             "should reject an ext that cannot be parsed into a value"
+        );
+    }
+
+    #[test]
+    fn raw_json_bounds_ext_nesting_depth() {
+        let nested = |depth: usize| -> Box<RawValue> {
+            let text = format!("{}1{}", r#"{"a":"#.repeat(depth), "}".repeat(depth));
+            serde_json::from_str(&text).expect("should read JSON as a raw value")
+        };
+
+        assert!(
+            RawJson::try_from(nested(MAX_EXT_DEPTH)).is_ok(),
+            "should accept an ext at the depth limit"
+        );
+        assert!(
+            RawJson::try_from(nested(MAX_EXT_DEPTH + 1)).is_err(),
+            "should reject an ext past the depth limit"
+        );
+        let braces_in_string: Box<RawValue> =
+            serde_json::from_str(&format!(r#"{{"a":"{}\""}}"#, "{[".repeat(50)))
+                .expect("should read JSON as a raw value");
+        assert!(
+            RawJson::try_from(braces_in_string).is_ok(),
+            "should not count brackets inside strings"
         );
     }
 
