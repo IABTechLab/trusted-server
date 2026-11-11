@@ -668,7 +668,7 @@ pub struct ProviderSecrets {
 ///
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
 /// KV store names, and partner registry.
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Ec {
     /// Publisher passphrase used as HMAC key for EC generation.
@@ -742,6 +742,24 @@ pub struct Ec {
         deserialize_with = "vec_from_seq_or_map"
     )]
     pub identity_providers: Vec<IdentityProviderConfig>,
+}
+
+// Not derived: the identity budgets default to their serde defaults so a
+// default `Ec` passes validation and serializes no identity keys.
+impl Default for Ec {
+    fn default() -> Self {
+        Self {
+            passphrase: Redacted::default(),
+            ec_store: None,
+            pull_sync_concurrency: 0,
+            cluster_trust_threshold: 0,
+            cluster_recheck_secs: 0,
+            partners: Vec::new(),
+            identity_budget_ms: Self::default_identity_budget_ms(),
+            identity_after_response_budget_ms: Self::default_identity_after_response_budget_ms(),
+            identity_providers: Vec::new(),
+        }
+    }
 }
 
 impl Ec {
@@ -4361,6 +4379,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_ec_uses_the_identity_budget_defaults() {
+        let ec = Ec::default();
+
+        assert_eq!(
+            (ec.identity_budget_ms, ec.identity_after_response_budget_ms),
+            (
+                Ec::default_identity_budget_ms(),
+                Ec::default_identity_after_response_budget_ms()
+            ),
+            "should match the serde defaults"
+        );
+        let serialized = serde_json::to_value(&ec).expect("should serialize");
+        assert!(
+            serialized.get("identity_budget_ms").is_none()
+                && serialized
+                    .get("identity_after_response_budget_ms")
+                    .is_none(),
+            "should serialize no identity keys"
+        );
+    }
     use crate::auction::build_orchestrator;
     use crate::integrations::{
         IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
