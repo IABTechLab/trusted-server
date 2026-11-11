@@ -384,7 +384,7 @@ impl KvIdentityGraph {
     ///
     /// The `permit` is consumed, so a navigation cannot write twice. Consent
     /// withdrawals do not go through here: their tombstone is a privacy write
-    /// on any request ([`Self::tombstone_existing_from_snapshot`]).
+    /// on any request (`tombstone_existing_from_snapshot`).
     ///
     /// # Errors
     ///
@@ -558,8 +558,8 @@ impl KvIdentityGraph {
     /// Merges partner IDs using request-scoped persisted state as the first CAS input.
     ///
     /// A caller-supplied `Present` snapshot is *proof* that the row exists —
-    /// either an `Add`-confirmed create from [`generate_if_needed`] or an
-    /// earlier authoritative read in the same request. Partner-ID enrichment is
+    /// an earlier authoritative read or a confirmed write in the same
+    /// request. Partner-ID enrichment is
     /// best effort, so a refresh that reads absent or unreadable never
     /// downgrades that proof: the update is skipped and logged, and the proven
     /// snapshot is returned so cookie issuance continues from the confirmed
@@ -570,8 +570,6 @@ impl KvIdentityGraph {
     /// updates are dropped, because a point read on an eventually-consistent
     /// store cannot prove absence and routes without orphan recovery have no
     /// later chance to retry.
-    ///
-    /// [`generate_if_needed`]: super::generate_if_needed
     pub(crate) fn upsert_partner_ids_from_snapshot(
         &self,
         ec_id: &str,
@@ -1445,7 +1443,8 @@ impl KvIdentityGraph {
     /// Hard-deletes the entry and any withdrawal completion marker.
     ///
     /// Reserved for the IAB data deletion framework (deferred). Consent
-    /// withdrawal uses a page-load tombstone via [`Self::commit_page_load`] instead.
+    /// withdrawal writes a tombstone through `tombstone_existing_from_snapshot`
+    /// instead.
     ///
     /// # Errors
     ///

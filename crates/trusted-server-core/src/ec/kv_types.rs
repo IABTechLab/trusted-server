@@ -50,7 +50,7 @@ pub const MAX_UID_LENGTH: usize = 512;
 pub const MAX_STORED_UID_LENGTH: usize = 1024;
 
 /// How long a provider opt-out keeps that provider from being called again,
-/// in seconds. Matches the longest lifetime a provider UID may have.
+/// in seconds (30 days).
 pub const OPT_OUT_MEMORY_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 /// Full KV entry stored as the body of an EC identity graph record.

@@ -262,8 +262,9 @@ pub(super) fn select_until(
     }
     let expired_at_entry = Instant::now() >= deadline;
     if expired_at_entry {
-        // Take one nonblocking snapshot. Fully buffered results are cached;
-        // responses that would require a wait are abandoned, never retried.
+        // Take one final snapshot. Fully buffered results are cached; each
+        // body may wait once, at most `SNAPSHOT_SURFACE_TIMEOUT_MS`, for bytes
+        // that already arrived. Anything still pending is abandoned.
         for index in 0..pending.len() {
             let mut surfaced = false;
             loop {
@@ -307,7 +308,7 @@ pub(super) fn select_until(
         for index in 0..pending.len() {
             if !expired_at_entry && Instant::now() >= deadline {
                 // A timed host wait may wake with a ready event at the cutoff.
-                // Finish with the same nonblocking snapshot as expired entry.
+                // Finish with the same final snapshot as expired entry.
                 return select_until(
                     pending
                         .into_iter()
