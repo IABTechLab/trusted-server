@@ -8,5 +8,5 @@
 pub mod app;
 /// Request middleware (auth, response finalisation).
 pub mod middleware;
-/// Platform-trait implementations backed by env vars and `reqwest`.
+/// Platform services backed by environment values and the request's `EdgeZero` client.
 pub mod platform;

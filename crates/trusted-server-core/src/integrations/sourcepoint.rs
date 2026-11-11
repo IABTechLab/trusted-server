@@ -1183,7 +1183,7 @@ mod tests {
         ) -> Result<PlatformResponse, Report<PlatformError>> {
             let mut response = self.stub.send(request).await?;
             let body = std::mem::replace(response.response.body_mut(), EdgeBody::empty());
-            let EdgeBody::Once(bytes) = body else {
+            let Some(bytes) = body.into_bytes() else {
                 panic!("should receive a buffered stub body");
             };
             let reads = Arc::clone(&self.reads);
@@ -1308,7 +1308,7 @@ mod tests {
                             .expect("should pass through encoded responses regardless of size");
 
                         assert!(
-                            matches!(response.body(), EdgeBody::Stream(_)),
+                            response.body().is_stream(),
                             "should leave encoded response bodies streaming"
                         );
                         assert_eq!(
@@ -1542,7 +1542,7 @@ mod tests {
                     .expect("should pass through a declared oversized response");
 
                 assert!(
-                    matches!(response.body(), EdgeBody::Stream(_)),
+                    response.body().is_stream(),
                     "should retain the original stream"
                 );
                 assert_eq!(
@@ -1610,7 +1610,7 @@ mod tests {
                     .expect("should pass through an ineligible response");
 
                 assert!(
-                    matches!(response.body(), EdgeBody::Stream(_)),
+                    response.body().is_stream(),
                     "should leave ineligible bodies streaming"
                 );
                 assert_eq!(
@@ -2655,10 +2655,7 @@ mod tests {
     }
 
     fn take_body_bytes(resp: Response<EdgeBody>) -> Vec<u8> {
-        match resp.into_body() {
-            EdgeBody::Once(b) => b.to_vec(),
-            EdgeBody::Stream(_) => vec![],
-        }
+        resp.into_body().into_bytes().unwrap_or_default().to_vec()
     }
 
     #[test]

@@ -98,8 +98,10 @@ pub struct VerifySignatureResponse {
     pub error: Option<String>,
 }
 
-const VERIFY_MAX_BODY_BYTES: usize = 4096;
-const ADMIN_MAX_BODY_BYTES: usize = 4096;
+/// Maximum buffered signature-verification input.
+pub const VERIFY_MAX_BODY_BYTES: usize = 4096;
+/// Maximum buffered key-management input.
+pub const ADMIN_MAX_BODY_BYTES: usize = 4096;
 
 /// Will verify a signature given a payload and kid
 /// Useful for testing integration with signatures

@@ -5,9 +5,9 @@ use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
-use trusted_server_core::auth::enforce_basic_auth;
+use trusted_server_core::auth::enforce_basic_auth_parts;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
-use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
+use trusted_server_core::http_util::sanitize_trusted_client_ip_header_map;
 use trusted_server_core::settings::Settings;
 
 // ---------------------------------------------------------------------------
@@ -38,8 +38,8 @@ impl SanitizeRequestMiddleware {
 #[async_trait(?Send)]
 impl Middleware for SanitizeRequestMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        sanitize_trusted_client_ip_headers(
-            ctx.request_mut(),
+        sanitize_trusted_client_ip_header_map(
+            ctx.headers_mut(),
             self.settings.trusted_client_ip.as_ref(),
         );
         next.run(ctx).await
@@ -75,7 +75,6 @@ impl FinalizeResponseMiddleware {
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let geo_available = ctx
-            .request()
             .headers()
             .get("cf-ipcountry")
             .and_then(|v| v.to_str().ok())
@@ -113,7 +112,7 @@ impl AuthMiddleware {
 #[async_trait(?Send)]
 impl Middleware for AuthMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        match enforce_basic_auth(&self.settings, ctx.request_mut()) {
+        match enforce_basic_auth_parts(&self.settings, ctx.parts_mut()) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
             Err(report) => {
@@ -306,8 +305,8 @@ mod tests {
             let handler_observed = Arc::clone(&handler_observed);
             async move {
                 *handler_observed.lock().expect("should lock observation") = Some((
-                    ctx.request().headers().contains_key("x-reader-ip"),
-                    ctx.request().headers().contains_key("x-reader-ip-auth"),
+                    ctx.headers().contains_key("x-reader-ip"),
+                    ctx.headers().contains_key("x-reader-ip-auth"),
                 ));
                 Ok::<Response, EdgeError>(empty_response())
             }

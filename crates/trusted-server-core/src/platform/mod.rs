@@ -39,7 +39,7 @@ mod error;
 mod http;
 mod image_optimizer;
 mod kv;
-mod pending_response;
+mod outbound;
 mod template_assembly;
 mod template_cache;
 #[cfg(test)]
@@ -63,7 +63,7 @@ pub use image_optimizer::{
     PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
 };
 pub use kv::UnavailableKvStore;
-pub use pending_response::PlatformPendingResponse;
+pub use outbound::EdgeZeroHttpClient;
 pub use template_assembly::{
     PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
     contains_publisher_esi_directive,

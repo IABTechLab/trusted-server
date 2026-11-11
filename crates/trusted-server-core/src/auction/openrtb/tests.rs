@@ -13,7 +13,9 @@ use crate::auction::plan::{
     AuctionPlan, AuctionPlanConfig, BidderId, BidderRouteConfig, NotificationConfig,
     ProviderConfig, ProviderId, RoutingMode,
 };
-use crate::auction::provider::{GenericOpenRtbProvider, ProviderRequestOutcome};
+use crate::auction::provider::{
+    GenericOpenRtbProvider, ProviderRequestOutcome, RoutedProviderDispatch,
+};
 use crate::auction::routing::route_auction;
 use crate::auction::test_support::canonical_parity_auction_request;
 use crate::auction::types::{AdFormat, AdSlot, BidStatus, MediaType};
@@ -1525,11 +1527,13 @@ fn prebid_endpoint_normalization_reaches_generic_execution_and_preserves_custom_
                 .request_bids_routed(
                     &routed.inputs()[0],
                     &routed,
-                    321,
-                    321,
-                    None,
-                    &services,
-                    &mut reserved_backend_names,
+                    RoutedProviderDispatch {
+                        logical_budget_ms: 321,
+                        transport_timeout_ms: 321,
+                        signer: None,
+                        services: &services,
+                        reserved_backend_names: &mut reserved_backend_names,
+                    },
                 )
                 .await
                 .expect("should launch one Prebid Server request");

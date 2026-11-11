@@ -1,5 +1,12 @@
 #[cfg(test)]
 pub(crate) mod logging;
+pub mod named_route_inputs;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod native_outbound;
+#[cfg(test)]
+mod pre_dispatch;
+#[cfg(test)]
+pub(crate) use pre_dispatch::PreDispatchHookTestExt;
 
 #[cfg(test)]
 pub mod tests {

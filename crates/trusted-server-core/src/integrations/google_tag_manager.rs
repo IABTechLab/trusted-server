@@ -949,8 +949,9 @@ impl GoogleTagManagerIntegration {
         body: EdgeBody,
         max_size: usize,
     ) -> Result<Vec<u8>, PayloadSizeError> {
-        match body {
-            EdgeBody::Once(bytes) => {
+        match body.into_stream() {
+            Err(body) => {
+                let bytes = body.into_bytes().expect("should retain the buffered body");
                 if bytes.len() > max_size {
                     log::warn!(
                         "POST body size {} exceeds max {} (rejected before proxy)",
@@ -964,7 +965,7 @@ impl GoogleTagManagerIntegration {
                 }
                 Ok(bytes.to_vec())
             }
-            EdgeBody::Stream(mut stream) => {
+            Ok(mut stream) => {
                 let mut body_bytes = Vec::new();
                 while let Some(chunk_result) = stream.next().await {
                     let chunk = chunk_result.map_err(|error| {

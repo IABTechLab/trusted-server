@@ -61,9 +61,23 @@ pub fn sanitize_trusted_client_ip_headers(
     req: &mut Request<EdgeBody>,
     config: Option<&TrustedClientIpConfig>,
 ) {
+    sanitize_trusted_client_ip_header_map(req.headers_mut(), config);
+}
+
+/// Removes configured client-IP trust fields without acquiring the body.
+///
+/// # Examples
+///
+/// ```ignore
+/// sanitize_trusted_client_ip_header_map(context.headers_mut(), settings.trusted_client_ip.as_ref());
+/// ```
+pub fn sanitize_trusted_client_ip_header_map(
+    headers: &mut http::HeaderMap,
+    config: Option<&TrustedClientIpConfig>,
+) {
     if let Some(config) = config {
-        req.headers_mut().remove(config.ip_header.as_str());
-        req.headers_mut().remove(config.auth_header.as_str());
+        headers.remove(config.ip_header.as_str());
+        headers.remove(config.auth_header.as_str());
     }
 }
 
@@ -73,10 +87,21 @@ pub fn sanitize_trusted_client_ip_headers(
 /// `X-Forwarded-Host: evil.com` from hijacking all URL rewriting.
 /// See <https://github.com/IABTechLab/trusted-server/issues/409>.
 pub fn sanitize_forwarded_headers(req: &mut Request<EdgeBody>) {
+    sanitize_forwarded_header_map(req.headers_mut());
+}
+
+/// Removes spoofable forwarding fields without acquiring the input body.
+///
+/// # Examples
+///
+/// ```ignore
+/// sanitize_forwarded_header_map(context.headers_mut());
+/// ```
+pub fn sanitize_forwarded_header_map(headers: &mut http::HeaderMap) {
     for header in SPOOFABLE_FORWARDED_HEADERS {
-        if req.headers().contains_key(*header) {
+        if headers.contains_key(*header) {
             log::debug!("Stripped spoofable header: {header}");
-            req.headers_mut().remove(*header);
+            headers.remove(*header);
         }
     }
 }

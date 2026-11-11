@@ -1,10 +1,10 @@
 use std::borrow::Cow;
 
 use edgezero_core::body::Body as EdgeBody;
-use http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use http::{HeaderValue, Method, Response, StatusCode, header};
 use sha2::{Digest as _, Sha256};
 
-use crate::auth::{TraceAuthLogPolicy, enforce_basic_auth};
+use crate::auth::{TraceAuthLogPolicy, enforce_basic_auth_parts};
 use crate::integrations::gpt_diagnostics::{GPT_DIAGNOSTICS_INTEGRATION_ID, GptDiagnosticsConfig};
 use crate::response_privacy::enforce_terminal_private_cache_privacy;
 use crate::settings::Settings;
@@ -239,14 +239,17 @@ pub fn is_trace_path(path: &str) -> bool {
 /// }
 /// ```
 #[must_use]
-pub fn preflight(settings: &Settings, request: &mut Request<EdgeBody>) -> TracePreflight {
-    let classification = classify_path(request.uri().path());
+pub fn preflight(
+    settings: &Settings,
+    request: &mut edgezero_core::http::RequestParts,
+) -> TracePreflight {
+    let classification = classify_path(request.uri.path());
     if classification == Classification::NotTrace {
         return TracePreflight::NotTrace;
     }
-    let head = request.method() == Method::HEAD;
-    request.extensions_mut().insert(TraceAuthLogPolicy);
-    match enforce_basic_auth(settings, request) {
+    let head = request.method == Method::HEAD;
+    request.extensions.insert(TraceAuthLogPolicy);
+    match enforce_basic_auth_parts(settings, request) {
         Ok(Some(mut response)) => {
             *response.body_mut() = error_response(StatusCode::UNAUTHORIZED).into_body();
             return reject(response, head);
@@ -268,14 +271,14 @@ pub fn preflight(settings: &Settings, request: &mut Request<EdgeBody>) -> TraceP
         Classification::Rejected(status) => return reject(error_response(status), head),
         Classification::NotTrace => return TracePreflight::NotTrace,
     };
-    if !route.allows(request.method()) {
+    if !route.allows(&request.method) {
         let mut response = error_response(StatusCode::METHOD_NOT_ALLOWED);
         response
             .headers_mut()
             .insert(header::ALLOW, HeaderValue::from_static(route.allow()));
         return reject(response, head);
     }
-    let protected = match settings.handler_for_path(request.uri().path()) {
+    let protected = match settings.handler_for_path(request.uri.path()) {
         Ok(handler) => handler.is_some(),
         Err(_) => return reject(error_response(StatusCode::INTERNAL_SERVER_ERROR), head),
     };
@@ -404,15 +407,23 @@ mod tests {
     use super::*;
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use http::{HeaderValue, header};
+    use http::{HeaderValue, Request, header};
     use serde_json::json;
 
-    use crate::auth::EdgeTerminatedAuthorization;
+    use crate::auth::{EdgeTerminatedAuthorization, enforce_basic_auth};
     use crate::cache_policy::EDGE_CACHE_HEADER_NAMES;
     use crate::settings::Handler;
     use crate::test_support::logging::WarningCapture;
     use crate::test_support::tests::create_test_settings;
     use crate::trace::TraceTerminalResponse;
+
+    fn preflight(settings: &Settings, request: &mut Request<EdgeBody>) -> TracePreflight {
+        let original = std::mem::replace(request, Request::new(EdgeBody::empty()));
+        let (mut parts, body) = original.into_parts();
+        let outcome = super::preflight(settings, &mut parts);
+        *request = Request::from_parts(parts, body);
+        outcome
+    }
 
     fn handler(pattern: &str, username: &str, password: &str) -> Handler {
         serde_json::from_value(json!({"path": pattern, "username": username, "password": password}))

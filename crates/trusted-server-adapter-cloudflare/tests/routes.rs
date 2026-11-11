@@ -13,6 +13,16 @@ use trusted_server_core::settings::Settings;
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
 
+#[test]
+fn named_sign_route_buffers_guarded_streamed_json_under_its_existing_cap() {
+    let settings = trusted_server_core::test_support::named_route_inputs::sign_settings();
+    let router = TrustedServerApp::routes_with_settings(settings)
+        .expect("should build streamed-input routes");
+    futures::executor::block_on(
+        trusted_server_core::test_support::named_route_inputs::assert_sign_inputs(&router),
+    );
+}
+
 /// Build the full application router from explicit test settings.
 ///
 /// The settings baked into the binary contain placeholder secrets that

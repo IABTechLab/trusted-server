@@ -65,14 +65,35 @@ pub fn prepare_trusted_forwarder(request: &mut Request<Body>, settings: &Setting
         let prepared = ForwarderPreparation::capture(request.headers(), settings);
         request.extensions_mut().insert(prepared);
     }
-    request.headers_mut().remove(FORWARDER_AUTH_HEADER);
-    if let Some(config) = &settings.trusted_forwarder {
-        request.headers_mut().remove(config.auth_header.as_str());
+    // The decision is typed metadata; raw fields cannot escape downstream.
+    strip_forwarding_headers(request.headers_mut(), settings);
+}
+
+/// Captures and removes forwarding fields at the head-only admission boundary.
+///
+/// # Examples
+///
+/// ```ignore
+/// prepare_trusted_forwarder_parts(request.parts_mut(), &settings);
+/// ```
+pub fn prepare_trusted_forwarder_parts(
+    parts: &mut edgezero_core::http::RequestParts,
+    settings: &Settings,
+) {
+    if parts.extensions.get::<ForwarderPreparation>().is_none() {
+        let prepared = ForwarderPreparation::capture(&parts.headers, settings);
+        parts.extensions.insert(prepared);
     }
-    // The decision is now typed metadata. Raw forwarding fields must not
-    // influence later consumers or escape to publishers and vendors.
+    strip_forwarding_headers(&mut parts.headers, settings);
+}
+
+fn strip_forwarding_headers(headers: &mut HeaderMap, settings: &Settings) {
+    headers.remove(FORWARDER_AUTH_HEADER);
+    if let Some(config) = &settings.trusted_forwarder {
+        headers.remove(config.auth_header.as_str());
+    }
     for name in ["forwarded", "x-forwarded-host", "x-forwarded-proto"] {
-        request.headers_mut().remove(name);
+        headers.remove(name);
     }
 }
 
@@ -158,6 +179,15 @@ fn parse_public_origin(scheme: &str, authority: &str) -> Option<PublicOrigin> {
         scheme: scheme.to_owned(),
         authority: authority.to_owned(),
     })
+}
+
+pub(crate) fn public_origin_parts(
+    parts: &edgezero_core::http::RequestParts,
+) -> Option<&PublicOrigin> {
+    parts
+        .extensions
+        .get::<ForwarderPreparation>()
+        .and_then(|prepared| prepared.origin.as_ref())
 }
 
 pub(crate) fn public_origin<B>(request: &Request<B>) -> Option<&PublicOrigin> {

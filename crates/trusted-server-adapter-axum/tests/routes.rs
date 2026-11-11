@@ -1,12 +1,10 @@
 //! Integration tests for the Axum dev server.
 //!
-//! Uses `EdgeZeroAxumService` directly (no live TCP server) so tests remain fast
-//! and self-contained. Each test builds the full `TrustedServerApp` router and
-//! drives it through the Tower `Service` interface.
+//! These route tests drive the full `TrustedServerApp` router through Tower.
+//! They do not qualify native HTTP ingress, transport, or egress behavior.
 
-use axum::body::Body as AxumBody;
 use axum::http::Request;
-use edgezero_adapter_axum::service::EdgeZeroAxumService;
+use edgezero_core::body::Body as AxumBody;
 use std::sync::Arc;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
@@ -14,6 +12,16 @@ use trusted_server_core::test_support::nextjs_auction;
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
+
+#[test]
+fn named_sign_route_buffers_guarded_streamed_json_under_its_existing_cap() {
+    let settings = trusted_server_core::test_support::named_route_inputs::sign_settings();
+    let router = TrustedServerApp::routes_with_settings(settings)
+        .expect("should build streamed-input routes");
+    futures::executor::block_on(
+        trusted_server_core::test_support::named_route_inputs::assert_sign_inputs(&router),
+    );
+}
 
 /// Build the full application router from explicit test settings.
 ///
@@ -46,8 +54,8 @@ fn test_router() -> edgezero_core::router::RouterService {
         .expect("should build router from test settings")
 }
 
-fn make_service() -> EdgeZeroAxumService {
-    EdgeZeroAxumService::new(test_router())
+fn make_service() -> edgezero_core::router::RouterService {
+    test_router()
 }
 
 fn registered_routes() -> Vec<(String, String)> {
@@ -86,7 +94,7 @@ async fn aps_profile_serves_renderer_through_adapter_fallback() {
     );
     let router = TrustedServerApp::routes_with_settings(settings)
         .expect("should build router with APS profile");
-    let mut service = EdgeZeroAxumService::new(router);
+    let mut service = router;
     let request = Request::builder()
         .method("GET")
         .uri("/integrations/aps/renderer")
@@ -953,7 +961,7 @@ async fn nextjs_gtm_rejects_malformed_request_hosts() {
             nextjs_auction::services(origin),
         )
         .expect("should build script composition router");
-        let mut service = EdgeZeroAxumService::new(router);
+        let mut service = router;
         let hostile_host = "example.com</script><script>alert(1)</script>";
         let value = if header == "forwarded" {
             format!("host=\"{hostile_host}\"")
@@ -982,8 +990,9 @@ async fn nextjs_gtm_rejects_malformed_request_hosts() {
             expected_status,
             "should reject malformed Host and ignore unauthenticated {header}"
         );
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
+        let body = response
+            .into_body()
+            .into_bytes()
             .expect("should consume hostile host response");
         assert!(
             !String::from_utf8_lossy(&body).contains(hostile_host),
@@ -1011,7 +1020,7 @@ async fn nextjs_gtm_accepts_local_request_hosts_and_ports() {
             nextjs_auction::services(origin),
         )
         .expect("should build script composition router");
-        let mut service = EdgeZeroAxumService::new(router);
+        let mut service = router;
         let request = Request::builder()
             .uri("/script-composition")
             .header("host", host)
@@ -1029,8 +1038,9 @@ async fn nextjs_gtm_accepts_local_request_hosts_and_ports() {
             200,
             "should accept host: {host}"
         );
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
+        let body = response
+            .into_body()
+            .into_bytes()
             .expect("should consume local host response");
         let html = String::from_utf8(body.to_vec()).expect("should emit UTF-8 HTML");
         assert!(
@@ -1061,7 +1071,7 @@ async fn nextjs_gtm_html_response_is_complete() {
             nextjs_auction::services(origin),
         )
         .expect("should build mixed integration router");
-        let mut service = EdgeZeroAxumService::new(router);
+        let mut service = router;
         let request = Request::builder()
             .method("GET")
             .uri("/article")
@@ -1089,8 +1099,9 @@ async fn nextjs_gtm_html_response_is_complete() {
             gzip.then_some("gzip"),
             "should retain the requested response compression"
         );
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
+        let body = response
+            .into_body()
+            .into_bytes()
             .expect("should consume entire adapter body");
         nextjs_auction::assert_script_composition_response(&body, gzip);
     }

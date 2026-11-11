@@ -29,6 +29,9 @@ use super::log_id;
 use super::rate_limiter::RateLimiter;
 use super::registry::PartnerRegistry;
 
+/// Maximum buffered input for a server-to-server batch sync.
+pub const MAX_BODY_SIZE: usize = 2 * 1024 * 1024;
+
 const REASON_INVALID_EC_ID: &str = "invalid_ec_id";
 const REASON_INVALID_PARTNER_UID: &str = "invalid_partner_uid";
 const REASON_INELIGIBLE: &str = "ineligible";
@@ -143,7 +146,6 @@ async fn handle_batch_sync_with_writer(
     }
 
     // 3. Parse body (with size limit to prevent OOM before validation)
-    const MAX_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MB
     if content_length_exceeds_limit(&req, MAX_BODY_SIZE) {
         return Ok(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,

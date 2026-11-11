@@ -17,6 +17,7 @@ use super::openrtb::unused_bidder_params_count;
 use super::plan::AuctionPlan;
 use super::provider::{
     AuctionProvider, GenericOpenRtbProvider, ProviderParseState, ProviderRequestOutcome,
+    RoutedProviderDispatch,
 };
 #[cfg(test)]
 use super::routing::RoutedAuction;
@@ -500,11 +501,13 @@ impl AuctionOrchestratorHarness {
                 .request_bids_routed(
                     input,
                     routed,
-                    logical_budget_ms,
-                    transport_timeout_ms,
-                    signer,
-                    context.services,
-                    &mut reserved_backend_names,
+                    RoutedProviderDispatch {
+                        logical_budget_ms,
+                        transport_timeout_ms,
+                        signer,
+                        services: context.services,
+                        reserved_backend_names: &mut reserved_backend_names,
+                    },
                 )
                 .await
             {
@@ -1844,11 +1847,13 @@ impl AuctionOrchestrator {
                 .request_bids_routed(
                     input,
                     &routed,
-                    logical_budget_ms,
-                    transport_timeout_ms,
-                    signer.as_ref(),
-                    context.services,
-                    &mut reserved_backend_names,
+                    RoutedProviderDispatch {
+                        logical_budget_ms,
+                        transport_timeout_ms,
+                        signer: signer.as_ref(),
+                        services: context.services,
+                        reserved_backend_names: &mut reserved_backend_names,
+                    },
                 )
                 .await
             {

@@ -9,18 +9,9 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
-    BackendNamingPolicy, ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec,
-    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformKvStore,
-    PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
-};
-
-#[cfg(not(target_arch = "wasm32"))]
-use trusted_server_core::platform::UnavailableHttpClient;
-
-#[cfg(target_arch = "wasm32")]
-use trusted_server_core::platform::{
-    PlatformHttpRequest, PlatformPendingRequest, PlatformPendingResponse, PlatformResponse,
-    PlatformSelectResult,
+    AuctionTargetId, BackendNamingPolicy, ClientInfo, EdgeZeroHttpClient, GeoInfo, KvError,
+    PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo,
+    PlatformKvStore, PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -104,6 +95,7 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
             .ok_or_else(|| {
                 Report::new(PlatformError::ConfigStore).attach(format!("key not found: {key}"))
             })
+            .map(|value| value.as_str().to_owned())
     }
 
     fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
@@ -158,406 +150,6 @@ impl KvStore for KvHandleAdapter {
         limit: usize,
     ) -> Result<KvPage, KvError> {
         self.0.list_keys_page(prefix, cursor, limit).await
-    }
-}
-
-// ---------------------------------------------------------------------------
-// CloudflareHttpClient — WASM target only
-// ---------------------------------------------------------------------------
-
-/// [`worker::Fetch`]-backed HTTP client for the Cloudflare Workers runtime.
-///
-/// # Multi-provider auction limitation
-///
-/// Auction configuration supports one provider at a time, so
-/// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false`.
-/// Requests start in a runtime task at dispatch, overlapping publisher-origin work.
-/// Deadline selection bounds waiting for fetch and body collection and aborts
-/// the Workers fetch when its pending operation is dropped.
-#[cfg(target_arch = "wasm32")]
-pub struct CloudflareHttpClient;
-
-/// Maximum buffered upstream response body, mirroring the Fastly adapter's cap.
-///
-/// Cloudflare Workers isolates have a bounded memory budget (~128 MB), so a
-/// large or hostile upstream could OOM the isolate. `execute` buffers the whole
-/// body via `resp.bytes()`, so it caps both the declared Content-Length and the
-/// materialized byte count at this limit.
-#[cfg(target_arch = "wasm32")]
-const MAX_PLATFORM_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
-
-/// Collect the lowercased tokens listed in the upstream `Connection:` header(s).
-///
-/// Every header named here is hop-by-hop (RFC 7230 §6.1) and must not be
-/// forwarded downstream.
-#[cfg(target_arch = "wasm32")]
-fn response_connection_tokens(resp: &worker::Response) -> Vec<String> {
-    resp.headers()
-        .entries()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
-        .flat_map(|(_, value)| {
-            value
-                .split(',')
-                .map(|token| token.trim().to_ascii_lowercase())
-                .filter(|token| !token.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-/// Returns `true` for hop-by-hop response headers that must not be forwarded
-/// downstream (RFC 7230 §6.1), including any header named in the upstream
-/// `Connection:` token list. Mirrors the Axum adapter's
-/// `is_hop_by_hop_response_header`. `transfer-encoding` is stripped separately
-/// at the call site alongside the other auto-decoded framing headers.
-#[cfg(target_arch = "wasm32")]
-fn is_hop_by_hop_response_header(name: &str, connection_tokens: &[String]) -> bool {
-    const HOP_BY_HOP: [&str; 6] = [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "upgrade",
-    ];
-    let lower = name.to_ascii_lowercase();
-    HOP_BY_HOP.iter().any(|header| *header == lower) || connection_tokens.contains(&lower)
-}
-
-/// Cache policy for the outbound Workers `fetch` derived from
-/// [`PlatformHttpRequest::cache_intent`].
-///
-/// Workers subrequests are eligible for Cloudflare's cache by default, so an
-/// ad-stack navigation could otherwise be satisfied from cache (or revalidated
-/// into a bodyless 304) instead of receiving a complete origin body. Mapping
-/// the bypass flag to the runtime's `no-store` mode keeps the core contract's
-/// cache-bypass guarantee intact on this adapter.
-///
-/// Extracted as a free function over a target-independent enum so the mapping
-/// is testable on native targets, where the `#[cfg(target_arch = "wasm32")]`
-/// `execute` impl and its `worker` dependency are excluded from the test
-/// binary.
-#[cfg(any(target_arch = "wasm32", test))]
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum OutboundCacheMode {
-    /// Leave the Workers runtime's default cache behavior in place.
-    RuntimeDefault,
-    /// Maps to `worker::CacheMode::NoStore`.
-    NoStore,
-}
-
-#[cfg(any(target_arch = "wasm32", test))]
-fn outbound_cache_mode(
-    intent: &trusted_server_core::platform::PlatformCacheIntent,
-) -> OutboundCacheMode {
-    // Workers has no surrogate-key concept, so `Shared` falls in with `Default`: let the
-    // runtime apply its own behavior rather than pretending to honor a key it cannot use.
-    if intent.is_bypass() {
-        OutboundCacheMode::NoStore
-    } else {
-        OutboundCacheMode::RuntimeDefault
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn outbound_request_init(method: worker::Method, headers: worker::Headers) -> worker::RequestInit {
-    let mut init = worker::RequestInit::new();
-    init.with_method(method)
-        .with_headers(headers)
-        .with_redirect(worker::RequestRedirect::Manual);
-    init
-}
-
-#[cfg(target_arch = "wasm32")]
-struct AbortOnDrop(Option<worker::AbortController>);
-
-#[cfg(target_arch = "wasm32")]
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        if let Some(controller) = self.0.take() {
-            controller.abort();
-        }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl CloudflareHttpClient {
-    async fn execute(
-        request: PlatformHttpRequest,
-    ) -> Result<PlatformResponse, Report<PlatformError>> {
-        use worker::{CacheMode, Fetch, Headers, Method, Request};
-
-        // The Cloudflare fetch path cannot honor Fastly-style Image Optimizer
-        // metadata, and it always buffers the response body (see below). The
-        // `PlatformHttpRequest` contract requires adapters that cannot honor
-        // these to reject rather than silently drop the behavior, so surface a
-        // typed error instead of returning an untransformed or fully-buffered
-        // response. These fields are only set by asset routes, which are not
-        // routed to the Cloudflare adapter today; the guard keeps the contract
-        // honest if that changes.
-        if request.image_optimizer.is_some() {
-            return Err(Report::new(PlatformError::HttpClient)
-                .attach("Image Optimizer is not supported on the Cloudflare Workers runtime"));
-        }
-        if request.stream_response {
-            return Err(Report::new(PlatformError::HttpClient).attach(
-                "streaming response bodies are not supported on the Cloudflare Workers runtime",
-            ));
-        }
-
-        let cache_mode = outbound_cache_mode(&request.cache_intent);
-
-        let uri = request.request.uri().to_string();
-        // http::Method always stores uppercase; worker 0.7 implements From<String> only.
-        let method = Method::from(request.request.method().to_string());
-
-        let headers = Headers::new();
-        for (name, value) in request.request.headers() {
-            let value_str = std::str::from_utf8(value.as_bytes())
-                .change_context(PlatformError::HttpClient)
-                .attach_with(|| {
-                    format!("non-UTF-8 bytes in outbound header `{name}` — value dropped")
-                })?;
-            // `append` rather than `set`: a request carrying the same header
-            // name more than once must forward every value, matching the
-            // response path which appends via `edge_builder.header(...)`.
-            headers
-                .append(name.as_str(), value_str)
-                .change_context(PlatformError::HttpClient)?;
-        }
-
-        let (_, body) = request.request.into_parts();
-        let body_bytes = match body {
-            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            edgezero_core::body::Body::Stream(_) => {
-                return Err(Report::new(PlatformError::HttpClient)
-                    .attach("streaming request bodies are not supported on Cloudflare Workers"));
-            }
-        };
-
-        // Force manual redirect handling: the Workers runtime otherwise defaults
-        // to `RequestRedirect::Follow` and transparently chases 3xx responses to
-        // any host inside `Fetch::send()`. Core's `proxy_with_redirects` does its
-        // own per-hop redirect handling and validates each next hop against
-        // `allowed_domains`; auto-following here would bypass that allowlist
-        // (SSRF). `Manual` surfaces the 3xx + Location back to core unfollowed,
-        // matching the Axum adapter's `redirect::Policy::none()`.
-        let mut init = outbound_request_init(method, headers);
-        // Setting the `cache` field requires the `cache_option_enabled`
-        // compatibility flag, which is only on by default from compatibility
-        // date 2024-11-11. `wrangler.toml`/`wrangler.ci.toml` pin an earlier
-        // date and set the flag explicitly; without it the Workers runtime
-        // throws here rather than failing at deploy time.
-        match cache_mode {
-            OutboundCacheMode::NoStore => {
-                init.with_cache(CacheMode::NoStore);
-            }
-            OutboundCacheMode::RuntimeDefault => {}
-        }
-        if !body_bytes.is_empty() {
-            let uint8 = js_sys::Uint8Array::from(body_bytes.as_slice());
-            init.with_body(Some(uint8.into()));
-        }
-
-        let worker_req =
-            Request::new_with_init(&uri, &init).change_context(PlatformError::HttpClient)?;
-
-        let abort = AbortOnDrop(Some(worker::AbortController::default()));
-        let signal = abort
-            .0
-            .as_ref()
-            .expect("should retain abort controller")
-            .signal();
-        let mut resp = Fetch::Request(worker_req)
-            .send_with_signal(&signal)
-            .await
-            .change_context(PlatformError::HttpClient)
-            .attach_with(|| format!("outbound request to {uri} failed"))?;
-
-        let status = resp.status_code();
-
-        // Pre-flight: reject oversized responses before copying bytes into the
-        // isolate heap. Content-Length is advisory (and absent on chunked
-        // responses), so the post-buffer check below is the real guard; this
-        // just rejects honestly-declared large bodies cheaply. Mirrors the
-        // Fastly adapter's two-stage cap.
-        if let Some(claimed_len) = resp
-            .headers()
-            .get("content-length")
-            .ok()
-            .flatten()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            && claimed_len > MAX_PLATFORM_RESPONSE_BODY_BYTES
-        {
-            return Err(Report::new(PlatformError::HttpClient).attach(format!(
-                "origin Content-Length {claimed_len} exceeds \
-                 {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit"
-            )));
-        }
-
-        let connection_tokens = response_connection_tokens(&resp);
-        let mut edge_builder = edgezero_core::http::response_builder().status(status);
-        for (name, value) in resp.headers().entries() {
-            // The Workers runtime auto-decompresses gzip/br/deflate and handles
-            // chunked transfer — strip these headers so the proxy layer does not
-            // attempt a second decompression pass on the already-decoded body.
-            // Content-Length is stripped too: the origin value describes the
-            // compressed payload, not the decoded bytes returned by `bytes()`,
-            // and forwarding it stale would truncate pass-through responses.
-            // The accurate length is set from the decoded body below.
-            if name.eq_ignore_ascii_case("content-encoding")
-                || name.eq_ignore_ascii_case("transfer-encoding")
-                || name.eq_ignore_ascii_case("content-length")
-            {
-                continue;
-            }
-            // Strip hop-by-hop headers (and any header named in the upstream
-            // `Connection:` token list) so they are not forwarded downstream,
-            // matching the Axum adapter's `is_hop_by_hop_response_header`.
-            if is_hop_by_hop_response_header(&name, &connection_tokens) {
-                continue;
-            }
-            edge_builder = edge_builder.header(name.as_str(), value.as_bytes());
-        }
-        let body_bytes = resp
-            .bytes()
-            .await
-            .change_context(PlatformError::HttpClient)?;
-
-        // Belt-and-suspenders: catches chunked responses with no Content-Length.
-        if body_bytes.len() > MAX_PLATFORM_RESPONSE_BODY_BYTES {
-            return Err(Report::new(PlatformError::HttpClient).attach(format!(
-                "origin response body {} bytes exceeds \
-                 {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte limit",
-                body_bytes.len()
-            )));
-        }
-        edge_builder = edge_builder.header(
-            edgezero_core::http::header::CONTENT_LENGTH,
-            body_bytes.len(),
-        );
-        let edge_resp = edge_builder
-            .body(edgezero_core::body::Body::from(body_bytes))
-            .change_context(PlatformError::HttpClient)?;
-
-        Ok(PlatformResponse::new(edge_resp).with_backend_name(request.backend_name))
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-#[async_trait::async_trait(?Send)]
-impl PlatformHttpClient for CloudflareHttpClient {
-    async fn send(
-        &self,
-        request: PlatformHttpRequest,
-    ) -> Result<PlatformResponse, Report<PlatformError>> {
-        Self::execute(request).await
-    }
-
-    fn supports_concurrent_fanout(&self) -> bool {
-        // Requests start concurrently at dispatch, but `select` and
-        // `select_until` collect only one response, so multi-provider fan-out
-        // stays unsupported.
-        false
-    }
-
-    async fn send_async(
-        &self,
-        request: PlatformHttpRequest,
-    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-        let backend_name = request.backend_name.clone();
-        let pending = PlatformPendingResponse::start(
-            Self::execute(request),
-            worker::wasm_bindgen_futures::spawn_local,
-        );
-        Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
-    }
-
-    async fn select(
-        &self,
-        mut pending_requests: Vec<PlatformPendingRequest>,
-    ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-        if pending_requests.is_empty() {
-            return Err(Report::new(PlatformError::HttpClient)
-                .attach("select called with an empty pending_requests list"));
-        }
-
-        reject_multi_provider_fanout(pending_requests.len())?;
-
-        let ready_platform = pending_requests.remove(0);
-        let mut pending = ready_platform
-            .downcast::<PlatformPendingResponse<Result<PlatformResponse, Report<PlatformError>>>>()
-            .map_err(|_| {
-                Report::new(PlatformError::HttpClient)
-                    .attach("unexpected inner type in CloudflareHttpClient::select")
-            })?;
-
-        let ready = pending.wait().await.unwrap_or_else(|error| {
-            Err(Report::new(PlatformError::HttpClient)
-                .attach(format!("dispatched response task stopped: {error}")))
-        });
-        Ok(PlatformSelectResult {
-            ready,
-            remaining: pending_requests,
-            failed_backend_name: None,
-        })
-    }
-
-    async fn select_until(
-        &self,
-        mut pending_requests: Vec<PlatformPendingRequest>,
-        deadline: web_time::Instant,
-    ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
-        if pending_requests.is_empty() {
-            return Err(Report::new(PlatformError::HttpClient)
-                .attach("select_until called with an empty pending_requests list"));
-        }
-        if pending_requests.len() > 1 {
-            return Err(Report::new(PlatformError::HttpClient)
-                .attach("multi-provider fan-out is not supported on this adapter"));
-        }
-        let platform_pending = pending_requests.remove(0);
-        let backend_name = platform_pending.backend_name().map(str::to_owned);
-        let mut pending = platform_pending
-            .downcast::<PlatformPendingResponse<Result<PlatformResponse, Report<PlatformError>>>>()
-            .map_err(|_| {
-                Report::new(PlatformError::HttpClient)
-                    .attach("unexpected pending request type in deadline selection")
-            })?;
-        let result = pending
-            .complete_before_deadline(
-                async {
-                    // Workers timers use whole signed milliseconds. Recheck the
-                    // absolute deadline after each bounded timer interval.
-                    loop {
-                        let remaining =
-                            deadline.saturating_duration_since(web_time::Instant::now());
-                        if remaining.is_zero() {
-                            break;
-                        }
-                        worker::Delay::from(
-                            remaining
-                                .max(Duration::from_millis(1))
-                                .min(Duration::from_millis(i32::MAX as u64)),
-                        )
-                        .await;
-                    }
-                },
-                deadline,
-                web_time::Instant::now,
-            )
-            .await;
-        Ok(result.map(|result| {
-            let ready = result.unwrap_or_else(|error| {
-                Err(Report::new(PlatformError::HttpClient)
-                    .attach(format!("dispatched response task stopped: {error}")))
-            });
-            PlatformSelectResult {
-                failed_backend_name: ready.as_ref().err().and(backend_name),
-                ready,
-                remaining: pending_requests,
-            }
-        }))
     }
 }
 
@@ -627,11 +219,6 @@ impl PlatformSecretStore for CloudflareSecretStoreAdapter {
 pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
     let client_ip = extract_client_ip(ctx);
 
-    #[cfg(target_arch = "wasm32")]
-    let http_client: Arc<dyn PlatformHttpClient> = Arc::new(CloudflareHttpClient);
-    #[cfg(not(target_arch = "wasm32"))]
-    let http_client: Arc<dyn PlatformHttpClient> = Arc::new(UnavailableHttpClient);
-
     // Config: use the ConfigStoreHandle injected by run_app — no #[cfg] needed.
     let config_store: Arc<dyn PlatformConfigStore> = ctx
         .config_store_default()
@@ -646,14 +233,15 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
 
     // Secrets: still requires wasm32-specific env.secret() (async/sync mismatch).
     #[cfg(target_arch = "wasm32")]
-    let secret_store: Arc<dyn PlatformSecretStore> =
-        edgezero_adapter_cloudflare::context::CloudflareRequestContext::get(ctx.request())
-            .map(|cf_ctx| {
-                Arc::new(CloudflareSecretStoreAdapter {
-                    env: cf_ctx.env().clone(),
-                }) as Arc<dyn PlatformSecretStore>
-            })
-            .unwrap_or_else(|| Arc::new(NoopSecretStore));
+    let secret_store: Arc<dyn PlatformSecretStore> = ctx
+        .extensions()
+        .get::<edgezero_adapter_cloudflare::context::CloudflareRequestContext>()
+        .map(|cf_ctx| {
+            Arc::new(CloudflareSecretStoreAdapter {
+                env: cf_ctx.env().clone(),
+            }) as Arc<dyn PlatformSecretStore>
+        })
+        .unwrap_or_else(|| Arc::new(NoopSecretStore));
     #[cfg(not(target_arch = "wasm32"))]
     let secret_store: Arc<dyn PlatformSecretStore> = Arc::new(NoopSecretStore);
 
@@ -666,7 +254,10 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .secret_store(secret_store)
         .kv_store(kv_store)
         .backend(Arc::new(NoopBackend))
-        .http_client(http_client)
+        .http_client(EdgeZeroHttpClient::for_request(
+            ctx,
+            AuctionTargetId::Cloudflare,
+        ))
         .geo(Arc::new(geo))
         .client_info(ClientInfo {
             client_ip,
@@ -719,7 +310,7 @@ impl PlatformGeo for CloudflareGeo {
 }
 
 fn build_geo(ctx: &edgezero_core::context::RequestContext) -> CloudflareGeo {
-    let headers = ctx.request().headers();
+    let headers = ctx.headers();
     let country = headers
         .get("cf-ipcountry")
         .and_then(|v| v.to_str().ok())
@@ -756,37 +347,10 @@ fn build_geo(ctx: &edgezero_core::context::RequestContext) -> CloudflareGeo {
 }
 
 fn extract_client_ip(ctx: &edgezero_core::context::RequestContext) -> Option<IpAddr> {
-    ctx.request()
-        .headers()
+    ctx.headers()
         .get("cf-connecting-ip")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok())
-}
-
-/// Reject multi-provider auction fan-out at the Cloudflare adapter level.
-///
-/// Pending worker requests start in a runtime task at dispatch. Collection
-/// still selects one response future at a time, so the adapter retains its
-/// single-provider contract.
-///
-/// The primary guard lives in the auction orchestrator, which checks
-/// `supports_concurrent_fanout()` and rejects multi-provider configurations
-/// before any request launches. This `select`-time rejection is
-/// defense-in-depth for callers that bypass that check.
-///
-/// Extracted as a free function so the critical control-flow is testable on
-/// native targets where the `#[cfg(target_arch = "wasm32")]` `select` impl
-/// is excluded from the test binary.
-#[cfg(any(target_arch = "wasm32", test))]
-fn reject_multi_provider_fanout(len: usize) -> Result<(), Report<PlatformError>> {
-    if len >= 2 {
-        return Err(Report::new(PlatformError::HttpClient).attach(format!(
-            "CloudflareHttpClient: multi-provider fan-out is not supported \
-             ({len} providers submitted). Configure a single auction provider \
-             or use the Fastly adapter for parallel DSP fan-out."
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -908,13 +472,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_arch = "wasm32")]
-    #[test]
-    fn outbound_request_creation_sets_manual_redirect_mode() {
-        let init = outbound_request_init(worker::Method::Get, worker::Headers::new());
-        assert!(matches!(init.redirect, worker::RequestRedirect::Manual));
-    }
-
     #[test]
     fn auction_http_capabilities_are_explicit() {
         let capabilities = trusted_server_core::platform::AuctionTargetId::Cloudflare
@@ -1030,66 +587,6 @@ mod tests {
         assert!(
             (info.longitude - (-74.01)).abs() < 0.01,
             "should populate longitude"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // reject_multi_provider_fanout tests
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn reject_multi_provider_fanout_passes_empty() {
-        assert!(
-            reject_multi_provider_fanout(0).is_ok(),
-            "len=0 should pass (empty list caught separately in select)"
-        );
-    }
-
-    #[test]
-    fn reject_multi_provider_fanout_passes_single_provider() {
-        assert!(
-            reject_multi_provider_fanout(1).is_ok(),
-            "single provider should be allowed"
-        );
-    }
-
-    #[test]
-    fn reject_multi_provider_fanout_rejects_two_providers() {
-        assert!(
-            reject_multi_provider_fanout(2).is_err(),
-            "len=2 should be rejected"
-        );
-    }
-
-    #[test]
-    fn reject_multi_provider_fanout_rejects_five_providers() {
-        let err = reject_multi_provider_fanout(5).expect_err("should reject five providers");
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("5"),
-            "error message should include provider count"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // outbound_cache_mode tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn outbound_cache_mode_maps_bypass_to_no_store() {
-        assert_eq!(
-            outbound_cache_mode(&trusted_server_core::platform::PlatformCacheIntent::Bypass),
-            OutboundCacheMode::NoStore,
-            "a bypass intent should force the Workers `no-store` cache mode"
-        );
-    }
-
-    #[test]
-    fn outbound_cache_mode_leaves_default_when_not_bypassing() {
-        assert_eq!(
-            outbound_cache_mode(&trusted_server_core::platform::PlatformCacheIntent::Default),
-            OutboundCacheMode::RuntimeDefault,
-            "a default intent should keep the runtime default cache behavior"
         );
     }
 }
