@@ -102,7 +102,7 @@ Missing prerequisites fail instead of silently skipping this selected check. Fix
 
 ## Table and namespace ownership
 
-The [self-contained Terraform example](../../deploy/examples/native-ec-dynamodb/README.md) creates a retained table and attaches exact-table permissions to a supplied task role. It does not create or deploy an ECS service.
+The separate examples unit provides `deploy/examples/native-ec-dynamodb/`. This self-contained Terraform example creates a retained table and attaches exact-table permissions to a supplied task role. It does not create or deploy an ECS service.
 
 | Item                | Required layout or owner                                                                                                |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------- |
