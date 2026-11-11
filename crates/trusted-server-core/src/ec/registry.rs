@@ -255,6 +255,13 @@ impl PartnerRegistry {
                 registry.mark_provider_owned(source, provider.tcf_vendor_id);
             }
         }
+        // A disabled provider's stored UIDs stay behind its vendor consent,
+        // though its sources go back to browser ingest.
+        for provider in ec.identity_providers.iter().filter(|p| !p.enabled) {
+            for source in &provider.sources {
+                registry.keep_vendor_gate(source, provider.tcf_vendor_id);
+            }
+        }
         Ok(registry)
     }
 
@@ -302,6 +309,21 @@ impl PartnerRegistry {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Records a disabled provider's TCF vendor ID for `source` unless an
+    /// enabled provider already owns it, so egress still checks that vendor's
+    /// consent for the UIDs the provider stored.
+    fn keep_vendor_gate(&mut self, source: &str, tcf_vendor_id: Option<NonZeroU16>) {
+        let Ok(normalized) = normalize_partner_source_domain(source) else {
+            return;
+        };
+        if let Some(partner) = self.by_source_domain.get_mut(&normalized)
+            && !partner.provider_owned
+            && partner.owner_tcf_vendor_id.is_none()
+        {
+            partner.owner_tcf_vendor_id = tcf_vendor_id;
         }
     }
 
@@ -532,7 +554,7 @@ mod tests {
             )
             .expect("should parse enabled provider"),
             toml::from_str(
-                "id = \"b\"\nkind = \"k\"\nenabled = false\nendpoint = \"https://ids.example.com/\"\nsources = [\"other.example.com\"]",
+                "id = \"b\"\nkind = \"k\"\nenabled = false\ntcf_vendor_id = 42\nendpoint = \"https://ids.example.com/\"\nsources = [\"other.example.com\"]",
             )
             .expect("should parse disabled provider"),
         ];
@@ -547,6 +569,14 @@ mod tests {
         assert!(
             !registry.is_provider_owned("other.example.com"),
             "should not mark disabled provider source"
+        );
+        assert_eq!(
+            registry
+                .get("other.example.com")
+                .and_then(|partner| partner.owner_tcf_vendor_id)
+                .map(NonZeroU16::get),
+            Some(42),
+            "should keep the disabled provider's vendor consent gate"
         );
     }
 
