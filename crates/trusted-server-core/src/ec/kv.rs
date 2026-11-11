@@ -2519,6 +2519,49 @@ mod tests {
             }
         }
 
+        fn completed_with_root_check_failure(
+            operations: Arc<RecordedEcKvOperations>,
+            ec_id: &str,
+        ) -> Self {
+            let store = Self {
+                root_check_fails: true,
+                stale_lookups_remaining: std::sync::Mutex::new(u32::MAX),
+                ..Self::new(operations)
+            };
+            let tombstone = KvEntry::tombstone(current_timestamp());
+            let (body, metadata) =
+                KvIdentityGraph::serialize_entry(&tombstone, store.inner.store_name())
+                    .expect("should serialize tombstone");
+            store
+                .inner
+                .insert(
+                    ec_id,
+                    EcKvWrite {
+                        body: &body,
+                        metadata: &metadata,
+                        ttl: TOMBSTONE_TTL,
+                        mode: EcKvWriteMode::Add,
+                    },
+                )
+                .expect("should seed tombstone");
+            store
+                .inner
+                .insert(
+                    &KvIdentityGraph::withdrawal_marker_key(
+                        ec_id,
+                        tombstone.consent.updated + TOMBSTONE_TTL.as_secs(),
+                    ),
+                    EcKvWrite {
+                        body: "1",
+                        metadata: "{}",
+                        ttl: TOMBSTONE_TTL,
+                        mode: EcKvWriteMode::Add,
+                    },
+                )
+                .expect("should seed completion marker");
+            store
+        }
+
         fn with_marker_delete_failure(
             operations: Arc<RecordedEcKvOperations>,
             remove_before_error: bool,
@@ -3570,6 +3613,47 @@ mod tests {
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
             self.inner.delete(key)
         }
+    }
+
+    #[test]
+    fn tombstone_stale_miss_valid_marker_skips_root_check_and_writes() {
+        let ec_id = snapshot_ec_id();
+        let operations = Arc::new(RecordedEcKvOperations::default());
+        let graph = KvIdentityGraph::new(RecordingEcKv::completed_with_root_check_failure(
+            Arc::clone(&operations),
+            &ec_id,
+        ));
+
+        let outcome = graph.tombstone_existing_from_snapshot(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Missing { .. }),
+            "a completion marker should resolve a repeated stale miss"
+        );
+        assert_eq!(
+            operations.lookup_count(),
+            1,
+            "should retry the stale point read once"
+        );
+        assert_eq!(
+            operations.list_count(),
+            1,
+            "should strongly list completion markers once"
+        );
+        assert_eq!(
+            operations.exact_check_count(),
+            0,
+            "valid marker should bypass the failing root check"
+        );
+        assert!(
+            operations.inserts().is_empty(),
+            "valid marker should prevent redundant writes"
+        );
     }
 
     #[test]
