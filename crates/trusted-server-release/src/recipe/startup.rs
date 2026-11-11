@@ -623,7 +623,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires explicit ordinary CI CLI fixture and Linux Docker; starts only its own named container"]
+    #[ignore = "requires an explicit ordinary CLI fixture and Linux Docker; starts only its own named container; frozen #1262 producer test, no workflow runs it"]
     fn startup_timeout_removes_only_its_owned_container() {
         let root = PathBuf::from(
             std::env::var_os("TRUSTED_SERVER__RELEASE_CLI_FIXTURE_ROOT")

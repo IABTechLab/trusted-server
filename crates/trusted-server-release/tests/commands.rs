@@ -1194,6 +1194,11 @@ fn ordinary_compare_mismatch_writes_no_companion() {
         "should reach actual equality, not fail on fixture setup: {}",
         stderr(&result)
     );
+    assert!(
+        stderr(&result).starts_with("Ordinary Fastly rebuild bytes differ"),
+        "should name the reproducibility failure first: {}",
+        stderr(&result)
+    );
     let diagnostic: Value = serde_json::from_slice(
         &fs::read(root.join("ordinary-diagnostics/ordinary-comparison-diagnostic.json"))
             .expect("should retain the real comparator's structured failure evidence"),

@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** The tsjs bundle build (`crates/trusted-server-js/lib/build-all.mjs`, run by Cargo builds of `trusted-server-js` and by `npm run build`) now requires Node.js 24.2 or later; use the `.tool-versions` Node.
+- **Breaking:** The tsjs bundle build (`crates/trusted-server-js/lib/build-all.mjs`, run by Cargo builds of `trusted-server-js` and by `npm run build`) now requires a Node.js with `import.meta.main` (22.18 or later, or 24.2 or later) and fails on older versions; use the `.tool-versions` Node.
 - The release tool's `jsonschema` dependency re-resolves the shared `Cargo.lock`, moving crates compiled into the production Fastly wasm: `regex-automata` 0.4.14 → 0.4.18 (through `regex`) and `zmij` 1.0.21 → 1.0.23 (through `serde_json`). `num-bigint` also moves 0.4.6 → 0.4.8 outside the wasm.
 - **Breaking:** Cargo builds of `trusted-server-js` now fail whenever `TSJS_SKIP_BUILD` is set to any value, including empty or `0`; previously only `TSJS_SKIP_BUILD=1` was rejected. Remove it from shell profiles and `.env` files, and use `TSJS_PREBUILT_DIR` to embed prebuilt bundles instead.
 - The attested Fastly wasm reports `x-ts-version` as the full 40-character source commit; deploy-pipeline builds keep the tag, branch or short-commit value described below.

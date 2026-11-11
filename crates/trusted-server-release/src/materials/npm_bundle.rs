@@ -258,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicitly supplied current-lock original archives; no acquisition qualification"]
+    #[ignore = "requires explicitly supplied current-lock original archives; no acquisition qualification; frozen #1262 producer test, no workflow runs it"]
     fn actual_current_lock_npm_originals() {
         let inputs = std::env::var_os("TRUSTED_SERVER__RELEASE_NPM_ORIGINALS")
             .map(PathBuf::from)

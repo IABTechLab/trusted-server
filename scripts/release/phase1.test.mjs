@@ -241,6 +241,71 @@ test('ordinary archive retries request a fresh redirect for each attempt', async
   }
 })
 
+test('ordinary archive retries only transient API and blob statuses', async () => {
+  const bytes = Buffer.from('fictional archive bytes')
+  for (const [apiStatus, blobStatus, expected] of [
+    [503, 200, 3],
+    [404, 200, 1],
+    [302, 404, 2],
+  ]) {
+    const directory = fs.realpathSync(
+      mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+    )
+    let calls = 0
+    try {
+      const download = ordinaryDownload(
+        {
+          repository: 'example/release',
+          archive: {
+            id: 41,
+            size: bytes.length,
+            sha256: createHash('sha256').update(bytes).digest('hex'),
+            file: 'canonical.zip',
+          },
+          token: 'fictional-token',
+          directory,
+        },
+        async (url) => {
+          calls++
+          if (!url.endsWith('/zip'))
+            return new Response(blobStatus === 200 ? bytes : 'missing', {
+              status: blobStatus,
+            })
+          return calls === 1 && apiStatus !== 302
+            ? new Response('busy', { status: apiStatus })
+            : new Response(null, {
+                status: 302,
+                headers: { location: 'https://example.com/archive' },
+              })
+        },
+        async () => {}
+      )
+      if (apiStatus === 503) await download
+      else await assert.rejects(download)
+      assert.equal(calls, expected, `${apiStatus}/${blobStatus}`)
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  }
+})
+
+test('ordinary retry backoff stops at the shared deadline', async () => {
+  let calls = 0
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+      'fictional-token',
+      async () => {
+        calls++
+        return new Response('busy', { status: 503 })
+      },
+      AbortSignal.timeout(200)
+    ),
+    /deadline exhausted/
+  )
+  assert.equal(calls, 1, 'should not retry after the deadline ends the backoff')
+})
+
 test('ordinary transport downloads exact archive bytes without forwarding the API token', async () => {
   const directory = fs.realpathSync(
     mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
@@ -883,6 +948,8 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
           'bad-attempt',
           'oversized-binary',
           'oversized-companion',
+          'oversized-spdx',
+          'fractional-attempt',
         ]
       : ['success', 'extra']) {
       const root = mkdtempSync(join(tmpdir(), 'ordinary-sign-'))
@@ -931,6 +998,7 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
             receipt.reproduction.run_attempt = 1
           }
           if (mode === 'zero-attempt') receipt.canonical.run_attempt = 0
+          if (mode === 'fractional-attempt') receipt.canonical.run_attempt = 1.5
           if (mode === 'failed') receipt.outcome = 'mismatched'
           if (mode === 'profile') receipt.profile = 'controlled-recipe'
           if (mode === 'qualified') receipt.release_qualification = true
@@ -973,6 +1041,11 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
               join(root, 'comparison', `${asset}.rebuild-check.json`),
               32 * 1024 * 1024 + 1
             )
+          if (mode === 'oversized-spdx')
+            fs.truncateSync(
+              join(root, 'release-assets', `${asset}.spdx.json`),
+              32 * 1024 * 1024 + 1
+            )
         } else if (mode === 'extra')
           writeFileSync(join(root, 'release-assets', 'unexpected'), 'extra')
         const local = (path) => join(root, path)
@@ -1013,6 +1086,7 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
             'bad-attempt': /Invalid signing identity/,
             'oversized-binary': /Invalid signing input/,
             'oversized-companion': /Invalid signing input/,
+            'oversized-spdx': /Invalid signing input/,
           }[mode]
           assert.throws(execute, reason, `${asset}: ${mode}`)
           assert.equal(
@@ -2468,18 +2542,13 @@ test('failed comparison is proven by the Rust fixture and blocks the real sign a
   const build = readFileSync('.github/workflows/release-build.yml', 'utf8')
   const sign = job('sign', build)
   assert.match(sign, /needs: \[checks, build, fastly-comparison\]/)
-  // continue-on-error would turn a failed build or comparison into success.
-  for (const name of [
-    'fastly-canonical',
-    'fastly-reproduction',
-    'fastly-comparison',
-    'sign',
-  ])
-    assert.doesNotMatch(
-      job(name, build),
-      /continue-on-error/,
-      `${name} must fail closed`
-    )
+  // continue-on-error would turn a failed check, build or comparison into
+  // success and let signing run after it.
+  assert.doesNotMatch(
+    build,
+    /continue-on-error/,
+    'release jobs must fail closed'
+  )
   assert.doesNotMatch(
     jobCondition(sign),
     statusFunction,
@@ -2502,6 +2571,12 @@ test('release build keeps locked builds, pinned generators and final integrity c
   // set -e, and CI runs this suite on Linux, so each one must exit explicitly.
   for (const line of commands.filter((line) => line.startsWith('[[')))
     assert.match(line, /\]\] \|\| \{ .+; exit 1; \}$/, line)
+  // Each Fastly role builds with its own fresh Cargo home, exported before
+  // the producer seals the arguments that remap it.
+  assert.match(
+    script,
+    /export CARGO_HOME="\$RUNNER_TEMP\/ordinary-\$ordinary_role-cargo-home"\n\s*\[\[ ! -e "\$CARGO_HOME" \]\] \|\| \{[^\n]+\}\n\s*mkdir "\$CARGO_HOME"\n[\s\S]*ordinary-rustflags/
+  )
   const builds = commands.filter((line) =>
     /\bcargo (?:--config "\$ordinary_rustflags" )?build\b/.test(line)
   )

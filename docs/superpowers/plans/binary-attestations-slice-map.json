@@ -612,7 +612,7 @@
     "executables": 4,
     "phase1_release_files": 17,
     "requires_reviewed_schema_and_policy_amendment": true,
-    "full_graph_note": "The frozen full graph has 4 release-wide files plus 7 per executable: 32 for 4 executables, or 53 for 7. Phase 1 publishes only 4 per executable plus SHA256SUMS: 29.",
+    "full_graph_note": "The frozen full graph has 4 release-wide files plus 7 per executable: 32 for 4 executables, or 53 for 7. Phase 1 publishes only 4 per executable plus SHA256SUMS: 17, or 18 with the Phase 2 rebuild check.",
     "paths": {
       "crates/trusted-server-release/src/policy.rs": "Update for Axum: ReleaseTarget/ALL and producer FIXED_ARTIFACTS encode four identities; extend targets, server product and exact seven-entry cohort.",
       "crates/trusted-server-cli/src/release/policy.rs": "Update for Axum: Consumer FIXED_ARTIFACTS/validate_artifacts encode four identities; review seven-entry policy and new capability forms.",

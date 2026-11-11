@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{SourceIdentity, javascript_identity, real_root, source_file, source_identity};
 use crate::documents::{self, Role};
@@ -241,23 +241,33 @@ fn validate(request: &Request) -> Result<(), Report<ReleaseError>> {
     Ok(())
 }
 
-/// Requires every resolved package source to come from the checkout or the
-/// role's private Cargo home, proving Cargo used the remapped home.
+/// Requires every resolved package source, and every package the build
+/// itself compiled, to come from the checkout or the role's private Cargo
+/// home, proving Cargo used the remapped home.
 fn dependency_sources(
     checkout: &Path,
     cargo_home: &Path,
     metadata: &[u8],
+    messages: &[u8],
 ) -> Result<(), Report<ReleaseError>> {
+    let inside = |value: &Value| {
+        value.as_str().is_some_and(|path| {
+            let path = Path::new(path);
+            path.starts_with(checkout) || path.starts_with(cargo_home)
+        })
+    };
     let metadata =
         documents::parse_json(metadata, Role::CargoObservation).map_err(|_| rejected())?;
     let packages = metadata["packages"].as_array().ok_or_else(rejected)?;
+    let messages = crate::recipe::observed_cargo_messages(messages).map_err(|_| rejected())?;
     require(
-        packages.iter().all(|package| {
-            package["manifest_path"].as_str().is_some_and(|path| {
-                let path = Path::new(path);
-                path.starts_with(checkout) || path.starts_with(cargo_home)
-            })
-        }),
+        packages
+            .iter()
+            .all(|package| inside(&package["manifest_path"]))
+            && messages
+                .iter()
+                .filter(|message| message["reason"] == "compiler-artifact")
+                .all(|message| inside(&message["manifest_path"])),
         "ordinary package source is outside the checkout and private Cargo home",
     )
 }
@@ -340,6 +350,7 @@ fn finish(
         checkout,
         Path::new(&request.environment.cargo_home),
         &metadata.bytes,
+        &messages.bytes,
     )?;
     let binary = checkout.join("release-assets").join(ASSET);
     require(

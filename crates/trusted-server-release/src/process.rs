@@ -14,8 +14,9 @@
 //! the leader reaped (polling, bounded by the kill grace, never a blocking
 //! wait), and read-only `killpg(pgid, 0)` probes confirm disappearance.
 //!
-//! That pinning needs a waitable leader. An inherited ignored SIGCHLD or
-//! `SA_NOCLDWAIT` lets the kernel reap the leader at exit, so the binary
+//! That pinning needs a waitable leader. An inherited ignored SIGCHLD (or an
+//! `SA_NOCLDWAIT` set in this process; `exec` clears that flag) lets the
+//! kernel reap the leader at exit, so the binary
 //! restores the default SIGCHLD action at startup and every spawn fails with
 //! [`ProcessFailure::UnwaitableChildren`] while children would be reaped
 //! automatically.

@@ -137,7 +137,7 @@ pub(super) fn prepare(
     require(
         inherited
             .iter()
-            .any(|(name, value)| name == "CARGO_HOME" && Path::new(value) == home),
+            .any(|(name, value)| name == "CARGO_HOME" && value.as_os_str() == home.as_os_str()),
         "ordinary build must use its role's private Cargo home",
     )?;
     // SAFETY: geteuid only reads the process identity and has no memory preconditions.
@@ -304,7 +304,7 @@ pub(super) fn scan(bytes: &[u8], flags: &Flags) -> Result<(), Report<ReleaseErro
 
 /// Stable semantic policy, deliberately excluding physical runner paths.
 pub(super) fn policy() -> Value {
-    json!({"kind":"ordinary-rust-path-remap-v1","target":"wasm32-wasip1", "roles":["canonical","reproduction"],"source_prefix":recipe::REMAPPED_CHECKOUT,"target_prefix":recipe::REMAPPED_TARGET})
+    json!({"kind":"ordinary-rust-path-remap-v2","target":"wasm32-wasip1", "roles":["canonical","reproduction"],"source_prefix":recipe::REMAPPED_CHECKOUT,"target_prefix":recipe::REMAPPED_TARGET,"cargo_home_prefix":recipe::REMAPPED_CARGO_HOME})
 }
 
 #[cfg(test)]

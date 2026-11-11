@@ -745,7 +745,7 @@ fn independent_object_copy(input: &Path, output: &Path) {
 }
 
 #[test]
-#[ignore = "requires explicitly selected current-lock Git object data; no acquisition qualification"]
+#[ignore = "requires explicitly selected current-lock Git object data; no acquisition qualification; frozen #1262 producer test, no workflow runs it"]
 fn actual_current_lock_git_material_closure() {
     let input = std::env::var_os("TRUSTED_SERVER__RELEASE_CARGO_GIT_FIXTURE")
         .map(PathBuf::from)

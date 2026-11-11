@@ -416,7 +416,7 @@ and digests.
 The reviewed publication owner remains later work. There are no automatic
 mutation retries or draft-resume claims.
 
-The eight pre-creation `gh attestation verify` runs, the tag-reference read, the
+The nine pre-creation `gh attestation verify` runs, the tag-reference read, the
 release listing before creation and every create/upload/publish mutation remain
 single-shot. Each pre-creation verification times out after 60s. Every API read,
 including that listing, times out after at most 10s. Mutations have no
@@ -505,7 +505,9 @@ commands below only inspect settings; this workflow applies none of them.
   See [repository ruleset configuration](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository).
 - Before tagging, confirm that the release build checks passed on the `main` push
   of the commit you intend to tag: the `Binary attestations` workflow's
-  `build / checks` and four `build / Build <asset>` check runs, which the
+  `build / checks`, four `build / Build <asset>`,
+  `build / Reproduce trusted-server-fastly.wasm` and
+  `build / Compare ordinary Fastly release bytes` check runs, which the
   `check-runs` command below lists. Release builds run only on `main` pushes and
   `v*` tags, so commits on other branches have no such checks, and a
   tag-triggered check cannot pass before its own tag exists. Before authorizing

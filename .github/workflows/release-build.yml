@@ -107,7 +107,6 @@ jobs:
         run: |
           set -euo pipefail
           env -i PATH="$PATH" HOME="$HOME" \
-            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
             RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
             TMPDIR="${TMPDIR:-/tmp}" RUNNER_TEMP="$RUNNER_TEMP" \
             SOURCE_COMMIT="$SOURCE_COMMIT" \
@@ -248,7 +247,6 @@ jobs:
         run: |
           set -euo pipefail
           env -i PATH="$PATH" HOME="$HOME" \
-            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
             RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
             TMPDIR="${TMPDIR:-/tmp}" RUNNER_TEMP="$RUNNER_TEMP" \
             SOURCE_COMMIT="$SOURCE_COMMIT" \

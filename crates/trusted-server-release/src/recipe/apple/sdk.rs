@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the explicitly selected local Xcode SDK and a receipt destination; copies the SDK, never modifies Xcode"]
+    #[ignore = "requires the explicitly selected local Xcode SDK and a receipt destination; copies the SDK, never modifies Xcode; frozen #1262 producer test, no workflow runs it"]
     fn ordinary_ci_selected_sdk_detached_snapshot_smoke() {
         let destination = std::env::var_os("TRUSTED_SERVER__RELEASE_APPLE_SDK_SMOKE_RECEIPT")
             .map(PathBuf::from)
