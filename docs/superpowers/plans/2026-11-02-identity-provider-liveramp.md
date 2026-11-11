@@ -4,9 +4,9 @@
 
 **Status:** Implemented; checkboxes are not updated.
 
-**Goal:** Store the LiveRamp RampID envelope the browser already sends in LiveRamp's own first-party cookie, as an `[[ec.identity_providers]]` entry with `kind = "liveramp"`. No login and no server call.
+**Goal:** Store the LiveRamp RampID envelope the browser already sends in LiveRamp's own first-party cookie, as an `[[ec.identity_providers]]` entry with `kind = "liveramp"`. No login. With an `endpoint`, a visitor without an envelope cookie is also looked up server to server.
 
-**Architecture:** `crates/trusted-server-identity-providers/src/liveramp.rs` holds `LiveRamp` (a `ProviderKind`), `LiveRampSettings` and `LiveRampProvider`. The provider implements only `IdentityProvider::read_request_cookies`; `build_request` always fails, so the coordinator never sends a lookup. The coordinator reads cookies on every navigation (a cookie repeating the held UID is not rewritten) and applies consent, validation, expiry and persistence exactly as for lookup results.
+**Architecture:** `crates/trusted-server-identity-providers/src/liveramp.rs` holds `LiveRamp` (a `ProviderKind`), `LiveRampSettings` and `LiveRampProvider`. The provider reads the envelope cookies in `IdentityProvider::read_request_cookies`; without an `endpoint`, `build_request` fails, so no lookup is sent. The coordinator reads cookies on every navigation (a cookie repeating the held UID is not rewritten) and applies consent, validation, expiry and persistence exactly as for lookup results.
 
 **Spec:** `docs/superpowers/specs/2026-10-30-s2s-eid-collection-design.md`, section 7.
 
@@ -21,7 +21,7 @@
 
 - One EID for the single configured source, one UID with `atype = 3`.
 - Expiry `ProviderExpiry::After(15 days)` through `bounded_expiry`.
-- Optional server lookup (with `endpoint`): `GET /api/identity/v2/envelope` with `pid` (`placement_id`), `it=15`, `iv=<custom_id_namespace>:<stable EC ID>`, `atype=2`, consent as `ct`/`cv` (TCF `4`, else US Privacy `3`), `gpp` and `gpp_sid`; headers `Origin` (publisher) and `X-Forwarded-For` (routable visitor IP, else no lookup). `200 {"envelope"}` is stored like the cookie; `204` is an opt-out; a blank envelope is no match; other statuses fail. Without `endpoint`, no server call. LiveRamp must enable Custom ID for the placement and approve the origin.
+- Optional server lookup (with `endpoint`): `GET /api/identity/v2/envelope` with `pid` (`placement_id`), `it=15`, `iv=<custom_id_namespace>:<stable EC ID>`, `atype=3` (server to server; `2` is the ATS API), consent as `ct`/`cv` (TCF `4`, else US Privacy `3`), `gpp` and `gpp_sid` (the first section ID only); headers `Origin` (publisher) and `X-Forwarded-For` (routable visitor IP, else no lookup). `200 {"envelopes":[{"type":19,"value":…}]}`: the `RampID` entry (`type` 19) is stored like the cookie, and a reply without one is no match; `204` is an opt-out; a blank envelope is no match; other statuses fail. Without `endpoint`, no server call. LiveRamp must enable Custom ID for the placement and approve the origin.
 
 ## Lockr
 

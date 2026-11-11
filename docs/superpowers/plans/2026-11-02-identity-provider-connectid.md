@@ -22,11 +22,11 @@ No Lockr capability: Lockr AIM is not documented to deliver ConnectID, so a `[se
 ## Stored ID
 
 - One EID for the single configured source, one UID with `atype = 3`.
-- Expiry `ProviderExpiry::At(lastSynced + min(ttl, 14 days))`; a missing `ttl` uses the shared default TTL. The provider reads no clock: the coordinator's validation drops the ID once that time has passed.
+- Expiry `ProviderExpiry::At(lastSynced + min(ttl, 14 days))`; as in Prebid, a missing or zero `ttl` means 14 days, a missing `lastSynced` is stored as `ProviderExpiry::After(14 days)`, and a lowercase `connectid` key is accepted. The provider checks expiry with the clock so an expired cookie does not hide a later live one; the coordinator's validation also drops the ID once that time has passed.
 
 ## Not ported from the reference provider
 
-- The reference calls Yahoo's sync endpoint, which needs a hashed email on every call. The logged-in experience is out of scope, so nothing is ported; this provider reads the `connectId` cookie only.
+- The reference calls Yahoo's sync endpoint, which needs only `pixelId` (`he` is optional), but its useful matches come from the hashed email. The logged-in experience is out of scope, so nothing is ported; this provider reads the `connectId` cookie only.
 
 ## Tasks
 
