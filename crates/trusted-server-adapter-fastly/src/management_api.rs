@@ -331,14 +331,23 @@ impl FastlyManagementApiClient {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use edgezero_core::error::EdgeError;
+    use edgezero_core::key_value_store::NoopKvStore;
     use edgezero_core::outbound::{OutboundCachePolicy, ResponseMode};
     use futures::executor::block_on;
+    use trusted_server_core::platform::{
+        ClientInfo, PlatformConfigStore, PlatformSecretStore, RuntimeServices, StoreId,
+        UnavailableHttpClient,
+    };
+    use trusted_server_core::request_signing::{KeyRotationManager, KeyRotationResult};
     use trusted_server_core::test_support::scripted_client::{
-        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
+        ExpectedTransport, RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
     };
 
     use super::*;
+    use crate::platform::{FastlyPlatformBackend, FastlyPlatformGeo};
 
     const BASE_URL: &str = "https://management.example.com";
     const API_KEY: &str = "example-api-key";
@@ -407,18 +416,126 @@ mod tests {
         assert_eq!(truncated, "a".repeat(200), "should trim before truncating");
     }
 
+    /// Config and secret stores whose writes go through the management client
+    /// over a scripted outbound client.
+    ///
+    /// Reads fail, as they do for a store with no entries, so a rotation starts
+    /// with no current or active kid.
+    struct ScriptedManagementStores {
+        management: FastlyManagementApiClient,
+        client: HttpClient,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformConfigStore for ScriptedManagementStores {
+        fn get(
+            &self,
+            _store_name: &StoreName,
+            _key: &str,
+        ) -> Result<String, Report<PlatformError>> {
+            Err(Report::new(PlatformError::ConfigStore))
+        }
+
+        async fn put(
+            &self,
+            store_id: &StoreId,
+            key: &str,
+            value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            self.management
+                .update_config_item(&self.client, store_id.as_ref(), key, value)
+                .await
+        }
+
+        async fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
+            self.management
+                .delete_config_item(&self.client, store_id.as_ref(), key)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformSecretStore for ScriptedManagementStores {
+        fn get_bytes(
+            &self,
+            _store_name: &StoreName,
+            _key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            Err(Report::new(PlatformError::SecretStore))
+        }
+
+        async fn create(
+            &self,
+            store_id: &StoreId,
+            name: &str,
+            value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            self.management
+                .create_secret(&self.client, store_id.as_ref(), name, value)
+                .await
+        }
+
+        async fn delete(
+            &self,
+            store_id: &StoreId,
+            name: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            self.management
+                .delete_secret(&self.client, store_id.as_ref(), name)
+                .await
+        }
+    }
+
+    /// Runtime services whose config and secret store writes go to `upstream`.
+    fn rotation_services(upstream: &ScriptedHttpClient, clock: &TestClock) -> RuntimeServices {
+        let stores = Arc::new(ScriptedManagementStores {
+            management: test_management_client(),
+            client: upstream.http_client(),
+        });
+        RuntimeServices::builder()
+            .config_store(Arc::clone(&stores) as Arc<dyn PlatformConfigStore>)
+            .secret_store(stores)
+            .kv_store(Arc::new(NoopKvStore))
+            .backend(Arc::new(FastlyPlatformBackend))
+            .http_client(Arc::new(UnavailableHttpClient))
+            .outbound_client(upstream.http_client())
+            .clock(clock.monotonic_clock())
+            .geo(Arc::new(FastlyPlatformGeo))
+            .client_info(ClientInfo::default())
+            .build()
+    }
+
+    fn rotate_example_kid(
+        services: &RuntimeServices,
+    ) -> Result<KeyRotationResult, Report<TrustedServerError>> {
+        block_on(
+            KeyRotationManager::new("config-store-id", "secret-store-id")
+                .rotate_key(services, Some("example-kid".to_owned())),
+        )
+    }
+
+    fn secrets_uri() -> String {
+        format!("{BASE_URL}/resources/stores/secret/secret-store-id/secrets")
+    }
+
+    fn item_uri(key: &str) -> String {
+        format!("{BASE_URL}/resources/stores/config/config-store-id/item/{key}")
+    }
+
+    fn methods_and_uris(requests: &[RecordedRequest]) -> Vec<(Method, String)> {
+        requests
+            .iter()
+            .map(|request| (request.method.clone(), request.uri.to_string()))
+            .collect()
+    }
+
     #[test]
     fn rotation_sends_expected_method_headers_and_body() {
-        // A key rotation writes the private key, then the public JWK, then
-        // active-kids, and flips current-kid last.
         let clock = TestClock::new();
         let upstream = ScriptedHttpClient::new(&clock);
-        let secrets_uri = format!("{BASE_URL}/resources/stores/secret/secret-store-id/secrets");
-        let item_uri =
-            |key: &str| format!("{BASE_URL}/resources/stores/config/config-store-id/item/{key}");
         upstream.respond_to(
             Method::POST,
-            &secrets_uri,
+            &secrets_uri(),
             ScriptedReply::status(StatusCode::OK),
         );
         for key in ["example-kid", "active-kids", "current-kid"] {
@@ -428,49 +545,30 @@ mod tests {
                 ScriptedReply::status(StatusCode::OK),
             );
         }
-        let client = upstream.http_client();
-        let management = test_management_client();
-        let jwk = serde_json::json!({ "kid": "example-kid" }).to_string();
 
-        block_on(async {
-            management
-                .create_secret(
-                    &client,
-                    "secret-store-id",
-                    "example-kid",
-                    "ZXhhbXBsZS1rZXk=",
-                )
-                .await?;
-            management
-                .update_config_item(&client, "config-store-id", "example-kid", &jwk)
-                .await?;
-            management
-                .update_config_item(
-                    &client,
-                    "config-store-id",
-                    "active-kids",
-                    "kid-a,example-kid",
-                )
-                .await?;
-            management
-                .update_config_item(&client, "config-store-id", "current-kid", "example-kid")
-                .await
-        })
-        .expect("should complete every rotation write");
+        let rotation = rotate_example_kid(&rotation_services(&upstream, &clock))
+            .expect("should rotate through the management API");
 
+        assert_eq!(rotation.new_kid, "example-kid", "should use the given kid");
+        assert!(
+            rotation.previous_kid.is_none(),
+            "should find no previous kid in an empty store"
+        );
+        assert_eq!(
+            rotation.active_kids,
+            vec!["example-kid".to_owned()],
+            "should activate only the new kid"
+        );
         let requests = upstream.requests();
         assert_eq!(
-            requests
-                .iter()
-                .map(|request| (request.method.clone(), request.uri.to_string()))
-                .collect::<Vec<_>>(),
+            methods_and_uris(&requests),
             vec![
-                (Method::POST, secrets_uri),
+                (Method::POST, secrets_uri()),
                 (Method::PUT, item_uri("example-kid")),
                 (Method::PUT, item_uri("active-kids")),
                 (Method::PUT, item_uri("current-kid")),
             ],
-            "should send the rotation writes in order"
+            "should write the private key, the JWK, active-kids, then current-kid"
         );
         for request in &requests {
             request.assert_transport(management_transport());
@@ -482,21 +580,35 @@ mod tests {
             ("accept", "application/json"),
             ("content-type", "application/json"),
         ]);
+        let upsert: serde_json::Value =
+            serde_json::from_slice(&secret.body).expect("should send the secret upsert as JSON");
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&secret.body)
-                .expect("should send the secret upsert as JSON"),
-            serde_json::json!({
-                "name": "example-kid",
-                "secret": general_purpose::STANDARD.encode("ZXhhbXBsZS1rZXk="),
-                "method": "create_or_recreate",
-            }),
-            "should send the base64 secret with upsert semantics"
+            (&upsert["name"], &upsert["method"]),
+            (
+                &serde_json::json!("example-kid"),
+                &serde_json::json!("create_or_recreate")
+            ),
+            "should upsert the secret under the new kid"
+        );
+        let stored_key = upsert["secret"]
+            .as_str()
+            .and_then(|secret| general_purpose::STANDARD.decode(secret).ok())
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .expect("should send the secret as base64 of a text value");
+        let signing_key = general_purpose::STANDARD
+            .decode(stored_key)
+            .expect("should store the signing key as base64 text");
+        assert_eq!(
+            signing_key.len(),
+            32,
+            "should store a 32-byte Ed25519 signing key"
         );
 
+        let jwk = serde_json::to_string(&rotation.jwk).expect("should serialize the rotated JWK");
         let item_bodies = [
-            "item_value=%7B%22kid%22%3A%22example-kid%22%7D",
-            "item_value=kid-a%2Cexample-kid",
-            "item_value=example-kid",
+            format!("item_value={}", urlencoding::encode(&jwk)),
+            "item_value=example-kid".to_owned(),
+            "item_value=example-kid".to_owned(),
         ];
         for (request, body) in requests[1..].iter().zip(item_bodies) {
             request.assert_headers(&[
@@ -507,7 +619,73 @@ mod tests {
             assert_eq!(
                 request.body.as_ref(),
                 body.as_bytes(),
-                "should send the config item value as a URL-encoded form"
+                "should send {} {} its config item value as a URL-encoded form",
+                request.method,
+                request.uri
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_rolls_back_jwk_and_private_key_when_active_kids_write_fails() {
+        let clock = TestClock::new();
+        let upstream = ScriptedHttpClient::new(&clock);
+        let secret_uri = format!("{}/example-kid", secrets_uri());
+        upstream
+            .respond_to(
+                Method::POST,
+                &secrets_uri(),
+                ScriptedReply::status(StatusCode::OK),
+            )
+            .respond_to(
+                Method::PUT,
+                &item_uri("example-kid"),
+                ScriptedReply::status(StatusCode::OK),
+            )
+            .respond_to(
+                Method::PUT,
+                &item_uri("active-kids"),
+                ScriptedReply::status(StatusCode::INTERNAL_SERVER_ERROR),
+            )
+            .respond_to(
+                Method::DELETE,
+                &item_uri("example-kid"),
+                ScriptedReply::status(StatusCode::OK),
+            )
+            .respond_to(
+                Method::DELETE,
+                &secret_uri,
+                ScriptedReply::status(StatusCode::OK),
+            );
+
+        let error = rotate_example_kid(&rotation_services(&upstream, &clock))
+            .expect_err("should fail when the active-kids write fails");
+
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::Configuration { message } if message == "failed to update active-kids"
+            ),
+            "should report the failed active-kids write"
+        );
+        let requests = upstream.requests();
+        assert_eq!(
+            methods_and_uris(&requests),
+            vec![
+                (Method::POST, secrets_uri()),
+                (Method::PUT, item_uri("example-kid")),
+                (Method::PUT, item_uri("active-kids")),
+                (Method::DELETE, item_uri("example-kid")),
+                (Method::DELETE, secret_uri),
+            ],
+            "should roll back the JWK, then the private key, and never flip current-kid"
+        );
+        for rollback in &requests[3..] {
+            rollback.assert_transport(management_transport());
+            rollback.assert_headers(&[("fastly-key", API_KEY), ("accept", "application/json")]);
+            assert!(
+                rollback.body.is_empty(),
+                "should send a rollback DELETE with no body"
             );
         }
     }

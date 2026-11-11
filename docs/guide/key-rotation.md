@@ -305,18 +305,21 @@ curl -X POST https://your-domain/_ts/admin/keys/rotate \
 ```rust
 use trusted_server_core::request_signing::KeyRotationManager;
 
-// Initialize rotation manager
-let manager = KeyRotationManager::new("jwks_store", "signing_keys")?;
+// `services` is the request's `&RuntimeServices`. The two arguments are the
+// management API IDs of the JWKS config store and the signing secret store.
+let manager = KeyRotationManager::new("example-config-store-id", "example-secret-store-id");
 
 // Rotate with automatic kid
-let result = manager.rotate_key(None)?;
+let result = manager.rotate_key(services, None).await?;
 
 println!("New key: {}", result.new_kid);
 println!("Previous key: {:?}", result.previous_kid);
 println!("Active keys: {:?}", result.active_kids);
 
 // Or rotate with custom kid
-let custom_result = manager.rotate_key(Some("my-custom-key".to_string()))?;
+let custom_result = manager
+    .rotate_key(services, Some("my-custom-key".to_string()))
+    .await?;
 ```
 
 ## Managing Active Keys
@@ -326,8 +329,8 @@ let custom_result = manager.rotate_key(Some("my-custom-key".to_string()))?;
 **Rust API**:
 
 ```rust
-let manager = KeyRotationManager::new("jwks_store", "signing_keys")?;
-let active_keys = manager.list_active_keys()?;
+let manager = KeyRotationManager::new("example-config-store-id", "example-secret-store-id");
+let active_keys = manager.list_active_keys(services)?;
 
 for kid in active_keys {
     println!("Active key: {}", kid);
@@ -417,13 +420,13 @@ curl -X POST https://your-domain/_ts/admin/keys/deactivate \
 ### Using the Rust API
 
 ```rust
-let manager = KeyRotationManager::new("jwks_store", "signing_keys")?;
+let manager = KeyRotationManager::new("example-config-store-id", "example-secret-store-id");
 
 // Deactivate (keep in storage)
-manager.deactivate_key("ts-2024-01-15")?;
+manager.deactivate_key(services, "ts-2024-01-15").await?;
 
 // Delete completely
-manager.delete_key("ts-2024-01-15")?;
+manager.delete_key(services, "ts-2024-01-15").await?;
 ```
 
 ### Safety Checks

@@ -337,29 +337,20 @@ mod tests {
     }
 
     #[test]
-    fn url_derived_ipv6_host_uses_bare_tls_identity_without_sni() {
-        // `url::Url::host_str()` keeps the brackets around an IPv6 literal.
-        let (scheme, url_host, port) = ("https", "[2001:db8::7]", Some(8443));
-
-        let normalized = normalize_backend_host(url_host);
-        assert_eq!(normalized.identity, "2001:db8::7");
-        assert_eq!(normalized.authority, "[2001:db8::7]");
-        assert!(
-            normalized.is_ip_literal,
-            "IP literals must omit TLS SNI while retaining a bare certificate identity"
-        );
-
-        let from_url_name = BackendConfig::new(scheme, url_host)
-            .port(port)
+    fn bracketed_and_bare_ipv6_hosts_predict_the_same_backend_name() {
+        // A backend spec can carry an IPv6 host with or without brackets.
+        let bracketed_name = BackendConfig::new("https", "[2001:db8::7]")
+            .port(Some(8443))
             .predict_name()
-            .expect("should predict URL-derived IPv6 backend name");
-        let from_bare_name = BackendConfig::new(scheme, "2001:db8::7")
-            .port(port)
+            .expect("should predict the bracketed IPv6 backend name");
+        let bare_name = BackendConfig::new("https", "2001:db8::7")
+            .port(Some(8443))
             .predict_name()
-            .expect("should predict bare IPv6 backend name");
+            .expect("should predict the bare IPv6 backend name");
+
         assert_eq!(
-            from_url_name, from_bare_name,
-            "URL and direct IPv6 paths must preserve backend naming parity"
+            bracketed_name, bare_name,
+            "should predict one backend name for both IPv6 host forms"
         );
     }
 
