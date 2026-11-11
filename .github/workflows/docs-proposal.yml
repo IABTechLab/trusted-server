@@ -24,8 +24,8 @@ on:
 permissions: {}
 
 # Runs are proposed one at a time, in order. The default queue keeps only one
-# pending run and cancels older ones, so keep them all. Every
-# job has a timeout so a hung run cannot hold the queue for hours.
+# pending run and cancels older ones, so keep them all. Every job has a
+# timeout so a hung run cannot hold the queue for hours.
 concurrency:
   group: docs-proposal
   cancel-in-progress: false
