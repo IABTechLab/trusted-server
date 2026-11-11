@@ -158,7 +158,8 @@ jobs:
   browser-tests:
     name: browser integration tests
     needs: prepare-artifacts
-    runs-on: ubuntu-latest
+    # The pinned Playwright 1.58 does not support Ubuntu 26.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
