@@ -16,14 +16,16 @@ use crate::commands::pbs::{self, PbsArgs};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
 // Labels the fields so the package version is not read as the release tag.
-static VERSION_TEXT: LazyLock<String> = LazyLock::new(|| {
+static VERSION_TEXT: LazyLock<String> = LazyLock::new(|| version_text(TS_GIT_VERSION));
+
+fn version_text(source: Option<&str>) -> String {
     format!(
         "package={} source={} target={} variant=default",
         env!("CARGO_PKG_VERSION"),
-        TS_GIT_VERSION.unwrap_or("unknown"),
+        source.unwrap_or("unknown"),
         env!("TRUSTED_SERVER__BUILD_TARGET"),
     )
-});
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "ts", version = VERSION_TEXT.as_str(), about = "Trusted Server CLI")]
@@ -205,6 +207,14 @@ mod tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::try_parse_from(args).expect("should parse args")
+    }
+
+    #[test]
+    fn version_text_reports_unknown_source() {
+        assert!(
+            version_text(None).contains(" source=unknown "),
+            "should label a missing source as unknown"
+        );
     }
 
     #[test]

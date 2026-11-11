@@ -2,7 +2,7 @@
 
 **Issue:** [#1235 — Publish attested release binaries with build provenance and SBOMs](https://github.com/IABTechLab/trusted-server/issues/1235)
 
-**Date:** 2026-10-09. **Phase 1 revision:** 2026-11-05.
+**Date:** 2026-10-09. **Phase 1 revision:** 2026-11-11.
 
 **Status:** Draft for maintainer review. PR #1435 carries this specification
 and its implementation. Official release enablement additionally requires the
@@ -249,7 +249,7 @@ and `shellcheck scripts/release/phase1-build.sh` cover:
   matrix and the publisher's sparse checkout;
 - the publisher against a fixture GitHub API and GitHub CLI, including the exact
   create and publish bodies, signing-bundle verification, every refusal before
-  creation, and the post-publish deadlines.
+  creation, and the post-publish retry window.
 
 The CLI's `release_build_facts` test checks the embedded facts in the real
 binary, and CI checks that core's build script refuses a branch name in release

@@ -220,12 +220,6 @@ export function mergeSboms(cargo, npm, binary, name) {
         // The root's nested components are listed once, below.
         components: undefined,
         name,
-        hashes: [
-          {
-            alg: 'SHA-256',
-            content: createHash('sha256').update(binary).digest('hex'),
-          },
-        ],
       },
       properties: [
         {

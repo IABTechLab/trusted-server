@@ -322,9 +322,11 @@ at publication. An API read times out after at most 10s and a verification after
 at most 30s, and neither runs past the window. `Connection: close` remains
 enabled for API calls.
 
-Any failed read is retried. GitHub CLI 2.102.0 reports a record that is not yet
-listed and a bundle-fetch or network failure as `no attestations for tag …`,
-and a trusted-root failure the same way as a failed signature, so the publisher
+Any failed read is retried. GitHub CLI 2.102.0 reports any failure to fetch the
+attestations, including a record that is not yet listed, as
+`no attestations for tag …`; when the commit already has another tag's record,
+a record not yet listed reads `no attestations found for release …`. It reports
+a trusted-root failure the same way as a failed signature, so the publisher
 does not classify its errors. A returned result that fails a check stops at
 once: the release must have the created ID and expected release type, be
 published and be immutable, and the verified release attestation must name this
@@ -411,11 +413,12 @@ commands below only inspect settings; this workflow applies none of them.
   returned HTTP 403 for such a commit. The check reads the branches when the job
   runs, so after that refusal push the commit to a branch and re-run the failed
   jobs; nothing was built or signed. A release job that fails before creating a
-  draft (handoff or signing-bundle verification, or the tag reference), or whose
-  draft creation returns HTTP 403 (for example, because the branch was deleted
-  after the check), also creates nothing. If the release listing then shows no
-  release or draft for the tag, re-run only the failed release job within the
-  7-day artifact retention, after pushing the commit to a branch again for a 403.
+  draft (handoff or signing-bundle verification, the tag reference or the
+  release listing read), or whose draft creation returns HTTP 403 (for example,
+  because the branch was deleted after the check), also creates nothing. If the
+  release listing then shows no release or draft for the tag, re-run only the
+  failed release job within the 7-day artifact retention, after pushing the
+  commit to a branch again for a 403.
   This rerun is the approved recovery for those failures only; other failed
   mutations follow the recovery rules above. An annotated tag is refused before
   building.
