@@ -29,7 +29,7 @@ use http::header::{DATE, EXPIRES, ORIGIN};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use trusted_server_core::ec::eid_types::SourceDomain;
+use trusted_server_core::ec::eid_types::{MAX_EXT_BYTES, SourceDomain};
 use trusted_server_core::ec::provider::{
     EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities,
     ProviderCommon, ProviderConfigError, ProviderEid, ProviderError, ProviderExpiry, ProviderKind,
@@ -37,7 +37,7 @@ use trusted_server_core::ec::provider::{
 };
 use url::Url;
 
-use crate::common::{bounded_expiry, is_routable_ip, join_section_ids};
+use crate::common::{DEVICE_ATYPE, bounded_expiry, is_routable_ip, join_section_ids};
 
 /// Each attribute `LiveIntent` resolves and the source it carries.
 pub const ATTRIBUTE_SOURCES: &[(&str, &str)] = &[
@@ -343,6 +343,17 @@ impl IdentityProvider for LiveIntentProvider {
             })
             .and_then(|segments| {
                 RawValue::from_string(format!(r#"{{"segments":{}}}"#, segments.get())).ok()
+            })
+            // An oversized EID `ext` would drop the whole `nonId` EID, so the
+            // segments are left out rather than the ID.
+            .filter(|ext| {
+                let fits = ext.get().len() <= MAX_EXT_BYTES;
+                if !fits {
+                    log::debug!(
+                        "LiveIntent: omitting segments over {MAX_EXT_BYTES} bytes from the nonId EID"
+                    );
+                }
+                fits
             });
         let eids: Vec<ProviderEid<'body>> = self
             .attributes
@@ -352,14 +363,22 @@ impl IdentityProvider for LiveIntentProvider {
                 let id = Cow::<'body, str>::deserialize(*raw)
                     .ok()
                     .filter(|id| !id.is_empty())?;
-                let (matcher, eid_ext, uid_ext) = match attribute.as_str() {
-                    NON_ID_ATTRIBUTE => (None, segments.clone().map(Cow::Owned), None),
+                // Prebid sends the Trade Desk ID LiveIntent resolved as a
+                // device-based ID (atype 1), like Unified ID's TDID.
+                let (matcher, eid_ext, uid_ext, atype) = match attribute.as_str() {
+                    NON_ID_ATTRIBUTE => (
+                        None,
+                        segments.clone().map(Cow::Owned),
+                        None,
+                        LIVEINTENT_ATYPE,
+                    ),
                     TDID_ATTRIBUTE => (
                         Some(Cow::Borrowed(TDID_MATCHER)),
                         None,
                         Some(self.tdid_uid_ext),
+                        DEVICE_ATYPE,
                     ),
-                    _ => (None, None, Some(self.partner_uid_ext)),
+                    _ => (None, None, Some(self.partner_uid_ext), LIVEINTENT_ATYPE),
                 };
                 Some(ProviderEid {
                     source: Cow::Owned(source.as_str().to_owned()),
@@ -369,7 +388,7 @@ impl IdentityProvider for LiveIntentProvider {
                     ext: eid_ext,
                     uids: vec![ProviderUid {
                         id,
-                        atype: Some(LIVEINTENT_ATYPE),
+                        atype: Some(atype),
                         ext: uid_ext.map(Cow::Borrowed),
                         expiry,
                         refresh: None,
@@ -585,6 +604,34 @@ mod tests {
     }
 
     #[test]
+    fn omits_oversized_segments_but_keeps_the_non_id() {
+        let provider = provider();
+        let headers = HeaderMap::new();
+        let segments: Vec<String> = (0..120).map(|n| format!("seg{n:04}")).collect();
+        let body = json!({ "nonId": "li-example", "segments": segments })
+            .to_string()
+            .into_bytes();
+
+        let outcome = provider
+            .parse_response(ProviderResponse {
+                status: StatusCode::OK,
+                headers: &headers,
+                body: &body,
+                context: None,
+            })
+            .expect("should parse response");
+        let LookupOutcome::Found(eids) = outcome else {
+            panic!("should find the nonId EID");
+        };
+
+        assert_eq!(eids[0].uids[0].id, "li-example", "should keep the ID");
+        assert!(
+            eids[0].ext.is_none(),
+            "should omit segments that exceed the ext limit"
+        );
+    }
+
+    #[test]
     fn maps_returned_attributes_to_sources_with_the_expires_header() {
         let provider = provider();
         let mut headers = HeaderMap::new();
@@ -643,6 +690,11 @@ mod tests {
             "should keep nonId without matcher"
         );
         assert_eq!(eids[1].source, "adserver.org", "should map the TDID");
+        assert_eq!(
+            eids[1].uids[0].atype,
+            Some(1),
+            "should send the TDID as device-based, as Prebid does"
+        );
         assert_eq!(
             eids[1].matcher.as_deref(),
             Some("liveintent.com"),
