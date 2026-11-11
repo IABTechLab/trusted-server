@@ -192,9 +192,10 @@ impl RequestInfo {
     ///
     /// Host selection order:
     /// 1. Authenticated trusted-forwarder public origin
-    /// 2. Immutable ingress origin, then adapter runtime origin
-    /// 3. Nonempty `Host` header
-    /// 4. Request URI authority (host and port only, excluding userinfo)
+    /// 2. Prepared native public-URL metadata
+    /// 3. Immutable ingress origin, then adapter runtime origin
+    /// 4. Nonempty `Host` header
+    /// 5. Request URI authority (host and port only, excluding userinfo)
     ///
     /// Every selected host except the authenticated forwarder origin, which is
     /// validated more strictly when it is parsed, must be an ASCII hostname
@@ -223,6 +224,14 @@ impl RequestInfo {
                 host: origin.authority.clone(),
                 scheme: origin.scheme.clone(),
             });
+        }
+        if let Some(info) = req.extensions().get::<Self>() {
+            if !is_valid_request_host(&info.host)
+                || !matches!(info.scheme.as_str(), "http" | "https")
+            {
+                return Err(invalid_request_host());
+            }
+            return Ok(info.clone());
         }
         let runtime_origin = req
             .extensions()

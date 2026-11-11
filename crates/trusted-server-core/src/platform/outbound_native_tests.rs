@@ -447,8 +447,8 @@ async fn collection_capabilities_and_invalid_handle_correlation_remain_explicit(
         );
         assert_eq!(
             client.supports_streaming_responses(),
-            target == AuctionTargetId::Fastly,
-            "should preserve all three non-Fastly buffered-only contracts"
+            matches!(target, AuctionTargetId::Fastly | AuctionTargetId::Axum),
+            "should expose native SDK streaming while CF and Spin stay buffered-only"
         );
         assert_eq!(
             client.supports_pending_streaming_responses(),

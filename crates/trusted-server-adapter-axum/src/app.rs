@@ -1,20 +1,25 @@
 use core::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use async_trait::async_trait;
 use edgezero_adapter_axum::context::AxumRequestContext;
-use edgezero_core::app::Hooks;
+use edgezero_adapter_axum::diagnostics::NativeIngressMetadata;
+use edgezero_core::PreDispatchRequest;
+use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
 };
-use edgezero_core::router::RouterService;
+use edgezero_core::middleware::{Middleware, Next};
+use edgezero_core::router::{PreDispatchHook, RouterService};
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
@@ -34,15 +39,12 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, get_settings_from_config_store,
-};
 
 use trusted_server_core::platform::{ClientInfo, RuntimeServices};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
-use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
+use crate::platform::{apply_native_ingress, build_runtime_services};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -50,29 +52,10 @@ use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_ru
 
 /// Application state built once at startup and shared across all requests.
 pub struct AppState {
-    settings: Arc<Settings>,
+    pub(crate) settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
     services: Option<RuntimeServices>,
-}
-
-/// Build the application state, loading settings and constructing all per-application components.
-///
-/// # Errors
-///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
-fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
-    let settings = get_settings_from_config_store(
-        &AxumPlatformConfigStore,
-        &AxumPlatformSecretStore,
-        &store_name,
-        &config_key,
-        &trusted_server_core::settings_data::default_secret_store_name(),
-    )?;
-    build_state_with_settings(settings)
 }
 
 /// Build the application state from explicit settings.
@@ -81,7 +64,7 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 ///
 /// Returns an error when the auction orchestrator or the integration
 /// registry fail to initialise.
-fn build_state_with_settings(
+pub(crate) fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     build_state_with_services(settings, None)
@@ -105,10 +88,20 @@ fn build_state_with_services(
 }
 
 impl AppState {
-    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
-        self.services
-            .clone()
-            .unwrap_or_else(|| build_runtime_services(ctx))
+    pub(crate) fn from_request(ctx: &RequestContext) -> Result<Arc<Self>, EdgeError> {
+        ctx.extensions().get::<Arc<Self>>().cloned().ok_or_else(|| {
+            EdgeError::service_unavailable("Trusted Server application state is not initialized")
+        })
+    }
+
+    fn services_for_request(&self, ctx: &RequestContext) -> Result<RuntimeServices, EdgeError> {
+        if let Some(services) = &self.services {
+            return Ok(services.clone());
+        }
+        build_runtime_services(ctx).map_err(|error| {
+            log::error!("native runtime services unavailable: {error:?}");
+            EdgeError::service_unavailable("initialized native runtime services are unavailable")
+        })
     }
 }
 
@@ -153,7 +146,6 @@ fn legacy_admin_alias_denied() -> Response {
 // ---------------------------------------------------------------------------
 
 async fn execute_handler<F, Fut>(
-    state: Arc<AppState>,
     ctx: RequestContext,
     body_limit: Option<usize>,
     handler: F,
@@ -162,13 +154,15 @@ where
     F: FnOnce(Arc<AppState>, RuntimeServices, Request) -> Fut,
     Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
 {
-    let services = state.services_for_request(&ctx);
+    let state = AppState::from_request(&ctx)?;
+    let services = state.services_for_request(&ctx)?;
     if ctx.method() == Method::POST
         && let Some(limit) = body_limit
     {
         ctx.body_bytes(limit).await?;
     }
     let mut req = ctx.into_request()?;
+    apply_native_ingress(&mut req)?;
     if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
         &state.settings,
         &mut req,
@@ -282,13 +276,9 @@ async fn dispatch_fallback(
     .await
 }
 
-fn fallback_handler(
-    state: Arc<AppState>,
-) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
+fn fallback_handler() -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
     move |ctx: RequestContext| {
-        let state = Arc::clone(&state);
         Box::pin(execute_handler(
-            state,
             ctx,
             None,
             |state, services, req| async move { dispatch_fallback(&state, &services, req).await },
@@ -452,13 +442,10 @@ fn named_routes() -> [NamedRoute; 17] {
 }
 
 fn named_route_handler(
-    state: Arc<AppState>,
     handler: NamedRouteHandler,
 ) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
     move |ctx: RequestContext| {
-        let state = Arc::clone(&state);
         Box::pin(execute_handler(
-            state,
             ctx,
             match handler {
                 NamedRouteHandler::VerifySignature => {
@@ -500,9 +487,8 @@ fn named_route_handler(
                         Ok(resp)
                     }
                     NamedRouteHandler::AdminNotSupported => {
-                        // Config/secret-store writes are backed by read-only env vars on the
-                        // Axum dev server. Returning 501 is clearer than failing on the first
-                        // store write.
+                        // Native snapshots are immutable. Returning 501 is clearer
+                        // than failing on the first management write.
                         let body = edgezero_core::body::Body::from(
                             "Admin key management is not supported on the Axum dev server.\n\
                              Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
@@ -601,32 +587,16 @@ fn publisher_fallback_methods() -> [Method; 7] {
     ]
 }
 
-/// Returns a [`RouterService`] that responds to every route with the startup error.
-fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    let message = Arc::new(format!("{}\n", e.current_context().user_message()));
-    let status = e.current_context().status_code();
+/// Only explicit-settings test routers capture state. Production state is
+/// inserted into the framework App by the prepared-store initializer.
+struct ExplicitStateMiddleware(Arc<AppState>);
 
-    let make_handler = |msg: Arc<String>| {
-        move |_ctx: RequestContext| {
-            let body = edgezero_core::body::Body::from((*msg).clone());
-            let mut resp = Response::new(body);
-            *resp.status_mut() = status;
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            async move { Ok::<Response, EdgeError>(resp) }
-        }
-    };
-
-    let mut router = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
-        Arc::new(Settings::default()),
-    ));
-    for method in publisher_fallback_methods() {
-        router = router.route("/", method.clone(), make_handler(Arc::clone(&message)));
-        router = router.route("/{*rest}", method, make_handler(Arc::clone(&message)));
+#[async_trait(?Send)]
+impl Middleware for ExplicitStateMiddleware {
+    async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        ctx.extensions_mut().insert(Arc::clone(&self.0));
+        next.run(ctx).await
     }
-    router.build()
 }
 
 // ---------------------------------------------------------------------------
@@ -636,30 +606,76 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 /// `EdgeZero` [`Hooks`] implementation for the Trusted Server application.
 pub struct TrustedServerApp;
 
+type TraceBinding = Arc<OnceLock<TracePreDispatchHook>>;
+
+struct NativeTraceHook(TraceBinding);
+
+#[async_trait(?Send)]
+impl PreDispatchHook for NativeTraceHook {
+    async fn handle(
+        &self,
+        request: &mut PreDispatchRequest,
+    ) -> Result<Option<Response>, EdgeError> {
+        let hook = self.0.get().ok_or_else(|| {
+            EdgeError::service_unavailable("native trace settings are not initialized")
+        })?;
+        hook.handle(request).await
+    }
+}
+
+fn configured_trace(state: &Arc<AppState>) -> TracePreDispatchHook {
+    let metadata_state = Arc::clone(state);
+    TracePreDispatchHook::new(
+        Arc::clone(&state.settings),
+        Arc::new(move |request| trace_metadata(&metadata_state, request)),
+    )
+}
+
+pub(crate) fn install_native_state(app: &mut App, state: Arc<AppState>) -> Result<(), EdgeError> {
+    let binding = app.state::<TraceBinding>().ok_or_else(|| {
+        EdgeError::validation("native trace binding is missing from the application router")
+    })?;
+    binding
+        .set(configured_trace(&state))
+        .map_err(|_| EdgeError::validation("native trace settings are already initialized"))?;
+    app.insert_state(state);
+    Ok(())
+}
+
 impl Hooks for TrustedServerApp {
     fn name() -> &'static str {
         "TrustedServer"
     }
 
     fn routes() -> Result<RouterService, EdgeError> {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return Ok(startup_error_router(e));
-            }
-        };
+        Ok(build_router(None, None))
+    }
 
-        Ok(build_router(&state))
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: Some(StoreMetadata {
+                default: DEFAULT_CONFIG_STORE_ID,
+                ids: &[DEFAULT_CONFIG_STORE_ID],
+            }),
+            secrets: Some(StoreMetadata {
+                default: DEFAULT_SECRET_STORE_ID,
+                ids: &[DEFAULT_SECRET_STORE_ID],
+            }),
+            kv: None,
+        }
+    }
+
+    fn owns_logging() -> bool {
+        true
     }
 }
 
 impl TrustedServerApp {
     /// Build the full application router from explicit settings.
     ///
-    /// Testing seam: integration tests use this to drive the router with
-    /// known-good settings instead of the baked `get_settings()` result,
-    /// whose embedded placeholder secrets fail validation by design.
+    /// Testing seam with unavailable network/store dependencies. Tests needing
+    /// those dependencies must use [`Self::routes_with_settings_and_services`].
+    /// This does not load prepared stores or read legacy environment settings.
     ///
     /// # Errors
     ///
@@ -668,8 +684,13 @@ impl TrustedServerApp {
     pub fn routes_with_settings(
         settings: Settings,
     ) -> Result<RouterService, Report<TrustedServerError>> {
-        let state = build_state_with_settings(settings)?;
-        Ok(build_router(&state))
+        let state = build_state_with_services(
+            settings,
+            Some(crate::startup::explicit_settings_services()),
+        )?;
+        let trace =
+            TracePreDispatchHook::new(Arc::clone(&state.settings), Arc::new(native_trace_metadata));
+        Ok(build_router(Some(state), Some(trace)))
     }
 
     /// Build the full router with explicit settings and runtime services.
@@ -693,26 +714,31 @@ impl TrustedServerApp {
         services: RuntimeServices,
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_services(settings, Some(services))?;
-        Ok(build_router(&state))
+        let trace = configured_trace(&state);
+        Ok(build_router(Some(state), Some(trace)))
     }
 }
 
-fn build_router(state: &Arc<AppState>) -> RouterService {
-    let fallback = fallback_handler(Arc::clone(state));
-    let trace_state = Arc::clone(state);
-
-    let mut router = RouterService::builder()
-        .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
-            Arc::clone(&state.settings),
-            Arc::new(move |request| trace_metadata(&trace_state, request)),
-        )))
-        // Outermost middleware: strips the configured trusted-client-IP
-        // headers before anything else sees the request. Must stay first —
-        // any middleware registered ahead of it would observe the
-        // shared-secret authentication header.
-        .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
-        .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-        .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
+fn build_router(
+    state: Option<Arc<AppState>>,
+    trace_hook: Option<TracePreDispatchHook>,
+) -> RouterService {
+    let fallback = fallback_handler();
+    let trace = Arc::new(match trace_hook {
+        Some(hook) => OnceLock::from(hook),
+        None => OnceLock::new(),
+    });
+    let mut router =
+        RouterService::builder().pre_dispatch_hook(NativeTraceHook(Arc::clone(&trace)));
+    if let Some(state) = state {
+        router = router.middleware(ExplicitStateMiddleware(state));
+    }
+    // The test-only injector observes no headers. Sanitation remains the first
+    // request-processing middleware so trust credentials cannot leak inward.
+    router = router
+        .middleware(SanitizeRequestMiddleware::from_request())
+        .middleware(FinalizeResponseMiddleware::from_request())
+        .middleware(AuthMiddleware::from_request());
 
     router = router.route("/health", Method::GET, |_ctx: RequestContext| async {
         Ok::<Response, EdgeError>(
@@ -729,7 +755,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             router = router.route(
                 route.path,
                 method.clone(),
-                named_route_handler(Arc::clone(state), route.handler),
+                named_route_handler(route.handler),
             );
         }
         for method in publisher_fallback_methods() {
@@ -744,7 +770,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         router = router.route("/{*rest}", method, fallback.clone());
     }
 
-    router.build()
+    router.with_state(trace).build()
 }
 
 fn trace_metadata(state: &AppState, request: &edgezero_core::http::RequestParts) -> TraceMetadata {
@@ -758,13 +784,24 @@ fn trace_metadata(state: &AppState, request: &edgezero_core::http::RequestParts)
         });
         return TraceMetadata { client_info, geo };
     }
-    TraceMetadata {
-        client_info: ClientInfo {
-            client_ip: request
+    native_trace_metadata(request)
+}
+
+fn native_trace_metadata(request: &edgezero_core::http::RequestParts) -> TraceMetadata {
+    let client_ip = request
+        .extensions
+        .get::<NativeIngressMetadata>()
+        .map(NativeIngressMetadata::effective_client)
+        .unwrap_or_else(|| {
+            request
                 .extensions
                 .get::<AxumRequestContext>()
                 .and_then(|context| context.remote_addr)
-                .map(|peer| peer.ip()),
+                .map(|peer| peer.ip())
+        });
+    TraceMetadata {
+        client_info: ClientInfo {
+            client_ip,
             ..ClientInfo::default()
         },
         geo: None,

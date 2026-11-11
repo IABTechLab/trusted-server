@@ -7240,6 +7240,14 @@ source_domain = "partner.example.com"
     }
 
     #[test]
+    fn legacy_settings_loader_ignores_compiled_git_metadata() {
+        temp_env::with_var("TRUSTED_SERVER__GIT_VERSION", Some("fixture-build"), || {
+            Settings::from_toml_and_env(&crate_test_settings_str())
+                .expect("should ignore build metadata in the test-only legacy settings loader");
+        });
+    }
+
+    #[test]
     fn test_set_env() {
         temp_env::with_var(
             format!(

@@ -32,6 +32,7 @@ pub struct EdgeZeroHttpClient {
     client: HttpClient,
     time: OutboundTime,
     target: AuctionTargetId,
+    response_decoding: Option<ResponseDecoding>,
 }
 
 impl EdgeZeroHttpClient {
@@ -49,7 +50,24 @@ impl EdgeZeroHttpClient {
             client,
             time,
             target,
+            response_decoding: None,
         }
+    }
+
+    /// Select the existing SDK decoding policy for an explicit adapter profile.
+    ///
+    /// This changes no transport, executor, body owner or deadline source.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let client = EdgeZeroHttpClient::new(request_client, AuctionTargetId::Axum)
+    ///     .response_decoding(ResponseDecoding::Decode);
+    /// ```
+    #[must_use]
+    pub fn response_decoding(mut self, policy: ResponseDecoding) -> Self {
+        self.response_decoding = Some(policy);
+        self
     }
 
     /// Uses only the incoming request's transport, with no process-wide fallback.
@@ -143,12 +161,12 @@ impl EdgeZeroHttpClient {
                 }
             }
         };
-        outbound = outbound
-            .cache_policy(cache_policy)
-            .response_decoding(match self.target {
+        outbound = outbound.cache_policy(cache_policy).response_decoding(
+            self.response_decoding.unwrap_or(match self.target {
                 AuctionTargetId::Fastly | AuctionTargetId::Axum => ResponseDecoding::Original,
                 AuctionTargetId::Cloudflare | AuctionTargetId::Spin => ResponseDecoding::Decode,
-            });
+            }),
+        );
         if let Some(options) = request.image_optimizer {
             outbound = outbound.image_optimizer(image_options(options)?);
         }
@@ -385,7 +403,7 @@ impl PlatformHttpClient for EdgeZeroHttpClient {
     }
 
     fn supports_streaming_responses(&self) -> bool {
-        self.target == AuctionTargetId::Fastly
+        matches!(self.target, AuctionTargetId::Fastly | AuctionTargetId::Axum)
     }
 
     fn supports_pending_streaming_responses(&self) -> bool {
