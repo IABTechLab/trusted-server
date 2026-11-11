@@ -52,6 +52,15 @@ impl ServerFixture {
     }
 
     fn spawn(&mut self, missing_secret: bool, short_passphrase: bool) {
+        self.spawn_configured(missing_secret, short_passphrase, None);
+    }
+
+    fn spawn_configured(
+        &mut self,
+        missing_secret: bool,
+        short_passphrase: bool,
+        profile: Option<&str>,
+    ) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"));
         command
             .env_clear()
@@ -78,6 +87,11 @@ impl ServerFixture {
             )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(profile) = profile {
+            let path = self.root.join("native-geo.toml");
+            fs::write(&path, profile).expect("should write synthetic Geo profile");
+            command.env("TS_NATIVE_GEO_PROFILE_FILE", path);
+        }
         if !missing_secret {
             command.env(
                 "EDGEZERO__SECRETS__EC_KEY",
@@ -190,11 +204,15 @@ impl ServerFixture {
     }
 
     fn get(&self, path: &str) -> std::io::Result<String> {
+        self.get_with_headers(path, "")
+    }
+
+    fn get_with_headers(&self, path: &str, headers: &str) -> std::io::Result<String> {
         let mut stream = TcpStream::connect_timeout(&self.addr, Duration::from_millis(100))?;
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         write!(
             stream,
-            "GET {path} HTTP/1.1\r\nHost: publisher.example.com\r\nConnection: close\r\n\r\n"
+            "GET {path} HTTP/1.1\r\nHost: publisher.example.com\r\nConnection: close\r\n{headers}\r\n"
         )?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
@@ -272,6 +290,151 @@ fn valid_prepared_inputs_serve_real_routes_and_ignore_changed_config_until_resta
             .expect("should retain initialized state")
             .starts_with("HTTP/1.1 200")
     );
+}
+
+const GEO_PROFILE: &str = r#"version = 1
+[geo]
+provider = "cloudfront"
+alb_peer_cidrs = ["127.0.0.1/32"]
+origin_credential_header_name = "x-origin-test-removal"
+"#;
+
+#[test]
+fn invalid_geo_profile_fails_before_store_preparation_and_listen() {
+    let mut server = ServerFixture::new(None);
+    server.spawn_configured(false, false, Some("version = 999\n[geo]\nprovider = 'off'"));
+    server.assert_failed_before_listen("native Geo profile is invalid");
+}
+
+#[test]
+#[cfg(not(feature = "geo-cloudfront"))]
+fn compiled_out_geo_selection_fails_before_store_preparation_and_listen() {
+    let mut server = ServerFixture::new(None);
+    server.spawn_configured(false, false, Some(GEO_PROFILE));
+    server.assert_failed_before_listen("cloudfront implementation unavailable");
+}
+
+#[test]
+#[cfg(feature = "geo-cloudfront")]
+fn managed_geo_is_partial_immutable_per_request_and_finalized_on_auth_errors() {
+    let mut server = ServerFixture::new(Some(ENVELOPE));
+    server.spawn_configured(false, false, Some(GEO_PROFILE));
+    let health = server.wait_ready();
+    assert!(
+        health
+            .to_ascii_lowercase()
+            .contains("x-geo-info-available: false")
+    );
+    let headers = "CloudFront-Viewer-Country: us\r\nCloudFront-Viewer-Country-Region: ca\r\nx-origin-test-removal: fixture-origin-credential\r\n";
+    for (path, status) in [
+        ("/health", "200"),
+        ("/_ts/admin/ec", "401"),
+        ("/static/tsjs=0000000000000000", "404"),
+    ] {
+        let response = server
+            .get_with_headers(path, headers)
+            .expect("should reach managed native route");
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "should preserve route status: {response}"
+        );
+        assert!(lower.contains("x-geo-info-available: true"));
+        assert!(lower.contains("x-geo-country: us"));
+        assert!(lower.contains("x-geo-region: ca"));
+        for absent in [
+            "x-geo-coordinates:",
+            "x-geo-city:",
+            "x-geo-continent:",
+            "x-geo-metro-code:",
+            "x-origin-test-removal",
+            "fixture-origin-credential",
+        ] {
+            assert!(
+                !lower.contains(absent),
+                "should not export unknown detail or credential"
+            );
+        }
+    }
+    let gb = server
+        .get_with_headers("/health", "CloudFront-Viewer-Country: GB\r\n")
+        .expect("should process another country");
+    assert!(gb.to_ascii_lowercase().contains("x-geo-country: gb"));
+    assert!(!gb.to_ascii_lowercase().contains("x-geo-region:"));
+    for headers in [
+        "",
+        "CloudFront-Viewer-Country: UK\r\n",
+        "CloudFront-Viewer-Country: US\r\nCloudFront-Viewer-Country: US\r\n",
+        "CloudFront-Viewer-Country-Region: CA\r\n",
+    ] {
+        let response = server
+            .get_with_headers("/health", headers)
+            .expect("should preserve health with unavailable geography");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("x-geo-info-available: false")
+        );
+        assert!(!response.to_ascii_lowercase().contains("x-geo-country:"));
+    }
+}
+
+#[test]
+#[cfg(feature = "geo-cloudfront")]
+fn admitted_body_error_keeps_managed_geo_without_losing_framework_status() {
+    let mut server = ServerFixture::new(Some(ENVELOPE));
+    server.spawn_configured(false, false, Some(GEO_PROFILE));
+    server.wait_ready();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("should create local fixture client");
+    let response = client
+        .post(format!("http://{}/auction", server.addr))
+        .header("host", "publisher.example.com")
+        .header("content-type", "application/json")
+        .header("cloudfront-viewer-country", "US")
+        .header("cloudfront-viewer-country-region", "CA")
+        .header("x-origin-test-removal", "fixture-error-credential")
+        .body(vec![
+            b' ';
+            trusted_server_core::auction::endpoints::MAX_AUCTION_BODY_SIZE
+                + 1
+        ])
+        .send()
+        .expect("should receive managed oversized-body response");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "should retain framework payload limit status"
+    );
+    assert_eq!(response.headers()["x-geo-info-available"], "true");
+    assert_eq!(response.headers()["x-geo-country"], "US");
+    assert_eq!(response.headers()["x-geo-region"], "CA");
+    assert!(!response.headers().contains_key("x-origin-test-removal"));
+    let body = response.text().expect("should read framework error");
+    assert!(!body.contains("fixture-error-credential"));
+    assert!(!body.contains("x-origin-test-removal"));
+}
+
+#[test]
+#[cfg(feature = "geo-cloudfront")]
+fn nonmatching_real_socket_peer_cannot_supply_geo() {
+    let mut server = ServerFixture::new(Some(ENVELOPE));
+    server.spawn_configured(
+        false,
+        false,
+        Some(&GEO_PROFILE.replace("127.0.0.1/32", "192.0.2.1/32")),
+    );
+    server.wait_ready();
+    let response = server.get_with_headers("/health", "CloudFront-Viewer-Country: US\r\nCloudFront-Viewer-Country-Region: CA\r\nX-Forwarded-For: 192.0.2.1\r\n")
+        .expect("should reach health without trusting forged peer");
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("x-geo-info-available: false")
+    );
+    assert!(!response.to_ascii_lowercase().contains("x-geo-country:"));
 }
 
 #[test]

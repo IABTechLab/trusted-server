@@ -442,7 +442,7 @@ impl KvGeo {
     pub fn from_geo_info(geo: Option<&GeoInfo>) -> Self {
         match geo {
             Some(info) => {
-                let dma = (info.metro_code > 0).then_some(info.metro_code);
+                let dma = info.metro_code.filter(|code| *code > 0);
                 Self {
                     country: info.country.clone(),
                     region: info.region.clone(),
@@ -474,12 +474,14 @@ mod tests {
 
     fn sample_geo_info() -> GeoInfo {
         GeoInfo {
-            city: "San Francisco".to_owned(),
+            city: Some("San Francisco".to_owned()),
             country: "US".to_owned(),
-            continent: "NorthAmerica".to_owned(),
-            latitude: 37.7749,
-            longitude: -122.4194,
-            metro_code: 807,
+            continent: Some("NorthAmerica".to_owned()),
+            coordinates: Some(crate::platform::GeoCoordinates {
+                latitude: 37.7749,
+                longitude: -122.4194,
+            }),
+            metro_code: Some(807),
             region: Some("CA".to_owned()),
             asn: Some(7922),
         }

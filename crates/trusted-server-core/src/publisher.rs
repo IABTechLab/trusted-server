@@ -12831,12 +12831,14 @@ mod tests {
                 _client_ip: Option<std::net::IpAddr>,
             ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
                 Ok(Some(GeoInfo {
-                    city: self.0.to_string(),
+                    city: Some(self.0.to_string()),
                     country: self.0.to_string(),
-                    continent: self.0.to_string(),
-                    latitude: 1.0,
-                    longitude: 2.0,
-                    metro_code: 3,
+                    continent: Some(self.0.to_string()),
+                    coordinates: Some(crate::platform::GeoCoordinates {
+                        latitude: 1.0,
+                        longitude: 2.0,
+                    }),
+                    metro_code: Some(3),
                     region: Some(self.0.to_string()),
                     asn: Some(4),
                 }))

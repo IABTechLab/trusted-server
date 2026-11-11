@@ -21,7 +21,8 @@ use trusted_server_core::platform::{
 use trusted_server_core::settings::Settings;
 
 use crate::app::build_state_with_settings;
-use crate::platform::{AxumPlatformBackend, AxumPlatformGeo};
+use crate::middleware::apply_finalize_headers;
+use crate::platform::{AxumPlatformBackend, AxumPlatformGeo, geo_from_outcome};
 
 /// Immutable inputs shared by per-request native runtime services.
 ///
@@ -106,7 +107,7 @@ pub(crate) fn explicit_settings_services() -> RuntimeServices {
         .kv_store(Arc::new(UnavailableKvStore))
         .backend(Arc::new(AxumPlatformBackend))
         .http_client(Arc::new(UnavailableHttpClient))
-        .geo(Arc::new(AxumPlatformGeo))
+        .geo(Arc::new(AxumPlatformGeo::default()))
         .client_info(Default::default())
         .build()
 }
@@ -268,6 +269,11 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
             envelope: envelope.to_string(),
         }),
         secret_store,
+    });
+    let finalize_settings = Arc::clone(&state.settings);
+    app.set_admitted_error_response_finalizer(move |outcome, response| {
+        let geo = geo_from_outcome(outcome);
+        apply_finalize_headers(&finalize_settings, geo.as_ref(), response);
     });
     app.insert_state(snapshot);
     app.insert_state(state);

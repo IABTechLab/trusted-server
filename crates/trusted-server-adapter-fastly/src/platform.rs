@@ -662,12 +662,14 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
 /// that field mapping is never duplicated.
 fn geo_from_fastly(geo: &Geo) -> GeoInfo {
     GeoInfo {
-        city: geo.city().to_string(),
+        city: Some(geo.city().to_string()),
         country: geo.country_code().to_string(),
-        continent: format!("{:?}", geo.continent()),
-        latitude: geo.latitude(),
-        longitude: geo.longitude(),
-        metro_code: geo.metro_code(),
+        continent: Some(format!("{:?}", geo.continent())),
+        coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+            latitude: geo.latitude(),
+            longitude: geo.longitude(),
+        }),
+        metro_code: Some(geo.metro_code()),
         region: geo.region().map(str::to_string),
         asn: None,
     }

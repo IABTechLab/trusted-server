@@ -1,6 +1,9 @@
-use edgezero_adapter_axum::dev_server::run_production_app_with_initializer;
+use edgezero_adapter_axum::dev_server::{
+    AxumRunOptions, run_production_app_with_options_and_initializer,
+};
 use log::LevelFilter;
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_adapter_axum::native_geo::load_selection;
 use trusted_server_adapter_axum::startup::initialize_native;
 
 /// Environment variable that sets the maximum log level.
@@ -26,18 +29,40 @@ fn main() {
         eprintln!("warning: logger init failed: {e}");
     }
 
-    if let Err(err) = run_production_app_with_initializer::<TrustedServerApp, _>(|app, stores| {
-        Box::pin(async move {
-            initialize_native(app, stores).await.inspect_err(|error| {
-                // RC classifies callback errors without their details. This safe
-                // application diagnostic tells operators which input to fix.
-                log::error!("Trusted Server initialization failed: {error}");
+    let options = match native_options() {
+        Ok(options) => options,
+        Err(error) => {
+            log::error!("Trusted Server native hosting configuration failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(err) = run_production_app_with_options_and_initializer::<TrustedServerApp, _>(
+        options,
+        |app, stores| {
+            Box::pin(async move {
+                initialize_native(app, stores).await.inspect_err(|error| {
+                    // RC classifies callback errors without their details. This safe
+                    // application diagnostic tells operators which input to fix.
+                    log::error!("Trusted Server initialization failed: {error}");
+                })
             })
-        })
-    }) {
+        },
+    ) {
         log::error!("trusted-server-adapter-axum failed: {err}");
         std::process::exit(1);
     }
+}
+
+/// Capture hosting inputs and validate the final provider selection before startup.
+fn native_options() -> Result<AxumRunOptions, String> {
+    let selection = load_selection().map_err(|error| error.to_string())?;
+    let options = AxumRunOptions::from_env()
+        .map_err(|_| "native hosting environment is invalid".to_owned())?
+        .with_geo(selection);
+    options
+        .geo_capability()
+        .map_err(|error| error.to_string())?;
+    Ok(options)
 }
 
 /// Parses an optional `RUST_LOG` value into the logger's maximum level.
