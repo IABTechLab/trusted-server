@@ -104,6 +104,10 @@ pub struct HtmlProcessorConfig {
     pub origin_host: String,
     pub request_host: String,
     pub request_scheme: String,
+    /// Effective configured browser-facing origin, independent of the request origin.
+    ///
+    /// Use [`Self::from_settings`] to resolve the normalized setting or domain fallback.
+    pub public_origin: String,
     pub integrations: IntegrationRegistry,
     /// Pre-computed `<script>(window.tsjs=window.tsjs||{}).adSlots=...;</script>`.
     /// Injected at `<head>` open. `None` when no slots matched.
@@ -147,6 +151,7 @@ impl HtmlProcessorConfig {
             origin_host: origin_host.to_owned(),
             request_host: request_host.to_owned(),
             request_scheme: request_scheme.to_owned(),
+            public_origin: settings.publisher.effective_public_origin(),
             integrations: integrations.clone(),
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -352,6 +357,7 @@ pub(crate) fn create_html_processor_with_document_state(
             let ad_slots_script = ad_slots_script.clone();
             let gpt_diagnostics = gpt_diagnostics.clone();
             let trace_bootstrap = trace_bootstrap.clone();
+            let public_origin = config.public_origin.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
@@ -382,9 +388,10 @@ pub(crate) fn create_html_processor_with_document_state(
                     // Main bundle: core + non-deferred integrations (synchronous).
                     let immediate_ids = integrations.js_module_ids_immediate();
                     let script_attributes = integrations.tsjs_script_tag_attributes();
-                    snippet.push_str(&tsjs::tsjs_script_tag_with_attributes(
-                        &immediate_ids,
+                    snippet.push_str(&tsjs::tsjs_script_tag_with_public_origin(
+                        &tsjs::tsjs_script_src(&immediate_ids),
                         &script_attributes,
+                        &public_origin,
                     ));
                     // Active diagnostics loads synchronously after core so its
                     // GPT listeners precede publisher scripts in the origin head.
@@ -826,6 +833,7 @@ mod tests {
 
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
+            public_origin: "https://publisher.example.com".to_string(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_owned(),
@@ -1817,6 +1825,7 @@ mod tests {
     #[test]
     fn injects_ad_slots_at_head_open() {
         let config = HtmlProcessorConfig {
+            public_origin: "https://publisher.example.com".to_string(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
@@ -1853,6 +1862,58 @@ mod tests {
             !html.contains("__ts_request_id"),
             "must NOT inject request_id"
         );
+    }
+
+    #[test]
+    fn publisher_runtime_stamps_normalized_configured_origin_without_changing_bundle() {
+        for (configured, expected) in [
+            (
+                Some("HTTPS://ADS.PUBLISHER.EXAMPLE:443"),
+                "https://ads.publisher.example",
+            ),
+            (
+                Some("https://ads.publisher.example:8443"),
+                "https://ads.publisher.example:8443",
+            ),
+            (None, "https://publisher.example.com"),
+        ] {
+            let mut settings = create_test_settings();
+            settings.publisher.domain = "publisher.example.com".to_string();
+            settings.publisher.public_origin = configured.map(str::to_owned);
+            settings
+                .publisher
+                .normalize()
+                .expect("should normalize publisher settings");
+            let integrations = IntegrationRegistry::empty_for_tests();
+            let config = HtmlProcessorConfig::from_settings(
+                &settings,
+                &integrations,
+                "upstream.example.com",
+                "www.publisher.example.com",
+                "https",
+            );
+            assert_eq!(
+                config.public_origin, expected,
+                "should resolve the configured origin once"
+            );
+            let mut processor = create_html_processor(config);
+            let output = processor
+                .process_chunk(b"<head></head><body></body>", true)
+                .expect("should process publisher HTML");
+            let output = String::from_utf8(output).expect("should return UTF-8");
+            let src = tsjs::tsjs_script_src(&integrations.js_module_ids_immediate());
+            assert!(
+                output.contains(&format!("src=\"{src}\"")),
+                "should preserve the root-relative source and exact module hash"
+            );
+            assert_eq!(
+                output
+                    .matches(&format!("data-ts-public-origin=\"{expected}\""))
+                    .count(),
+                1,
+                "should stamp the effective setting rather than request or upstream origin"
+            );
+        }
     }
 
     #[test]
@@ -1896,6 +1957,7 @@ mod tests {
         let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
+            public_origin: "https://publisher.example.com".to_string(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
@@ -1936,6 +1998,7 @@ mod tests {
         let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
+            public_origin: "https://publisher.example.com".to_string(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
@@ -1977,6 +2040,7 @@ mod tests {
 
         let request_host = "proxy.test-publisher.example.com";
         let config = HtmlProcessorConfig {
+            public_origin: "https://publisher.example.com".to_string(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.test-publisher.example.com".to_string(),
@@ -2032,6 +2096,7 @@ mod tests {
         // (state is None) — e.g. auction timed out with zero bids. Fallback to {}.
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
+            public_origin: "https://publisher.example.com".to_string(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
@@ -2065,6 +2130,7 @@ mod tests {
         // unmodified (spec §8: "Existing client-side Prebid/GPT flow runs unmodified").
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
+            public_origin: "https://publisher.example.com".to_string(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
@@ -2091,6 +2157,7 @@ mod tests {
 
     fn marker_mode_config(marker: &str, observer: Option<Arc<AtomicBool>>) -> HtmlProcessorConfig {
         HtmlProcessorConfig {
+            public_origin: "https://publisher.example.com".to_string(),
             csp_nonce_observed: observer,
             body_close: BodyCloseInjection::Marker(marker.to_string()),
             origin_host: "origin.example.com".to_string(),
@@ -2353,6 +2420,7 @@ mod tests {
     fn bodyless_marker_mode_emits_an_owned_terminal_seam_even_after_source_bytes() {
         const MARKER: &str = "<!--reserved-template-cache-seam-->";
         let config = HtmlProcessorConfig {
+            public_origin: "https://publisher.example.com".to_string(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::Marker(MARKER.to_string()),
             origin_host: "origin.example.com".to_string(),

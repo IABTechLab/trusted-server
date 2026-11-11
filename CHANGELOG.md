@@ -7,8 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add Phase 1 attested release binaries: the Fastly wasm and the `ts` CLI for Linux x86-64 and macOS (ARM64 and x86-64), with SPDX 2.3 inventories, provenance/SBOM bundles, immutable verification and a GNU glibc 2.34 startup check. Reproducibility, other adapters and the custom verifier remain later work; production publication requires maintainer settings.
+
 ### Changed
 
+- The attested Fastly wasm reports `x-ts-version` as the full 40-character source commit; deploy-pipeline builds keep the tag, branch or short-commit value described below.
+- **Breaking:** `ts --version` now prints `ts package=<version> source=<source> target=<triple> variant=default` instead of `ts <version>`. `source` is the full commit in attested release binaries, and otherwise the development ref, short commit or `unknown`. Update scripts that parse the old output.
+- **Breaking:** Creative rewrite proxy, click, CSS, `srcset`, sign-response, rebuild-response, and injected creative TSJS URLs are now absolute on `publisher.public_origin`. Review the [default authority, cookie scope, and coordinated upgrade/rollback warning for `public_origin`](docs/guide/configuration.md#publisher-configuration) before deployment. Existing root-relative signed proxy and click inputs remain accepted. TSJS bundle selection and hash calculation are unchanged.
 - The Lockr browser module no longer polls for private SDK state or mutates its API host, removing the "Lockr SDK not detected" timeout warning (#1247). Root-relative Lockr XHR API requests and rewritten SDK URLs now stay on the page origin even with an external `<base href>`. Custom or unreplaced legacy SDKs that relied on the removed host rewrite must route their own API calls through `/integrations/lockr/api`; `rewrite_sdk = false` leaves static SDK tags unchanged but does not disable dynamic interception. See the [Lockr migration guide](docs/guide/integrations/lockr.md#migration-from-the-sdk-host-shim).
 - Auction response collection now bounds network waiting by `[auction].timeout_ms`
   measured from dispatch, including delayed headers and trickling bodies on all

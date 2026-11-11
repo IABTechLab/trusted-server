@@ -24,6 +24,7 @@ ACTUAL_WRANGLER=$(wrangler --version | sed -nE 's/^([0-9]+\.[0-9]+\.[0-9]+)$/\1/
 WORKSPACE=$(smoke_make_workspace cloudflare)
 ORIGIN_PORT=${CLOUDFLARE_SMOKE_ORIGIN_PORT:-19089}
 BASE_PORT=${CLOUDFLARE_SMOKE_PORT:-19080}
+POSITIVE_PORT=$((BASE_PORT + 4))
 ORIGIN_PID=""
 APP_PID=""
 
@@ -44,7 +45,8 @@ fi
 
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
 ORIGIN_PID=$SMOKE_ORIGIN_PID
-smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT"
+# The positive case uses the final listener in the case sequence.
+smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT" "$POSITIVE_PORT"
 
 CLOUDFLARE_WORK="$WORKSPACE/cloudflare"
 mkdir -p "$CLOUDFLARE_WORK"
@@ -187,6 +189,6 @@ run_case missing-proxy "$((BASE_PORT + 2))" "$CONFIG_JSON" publisher_proxy_secre
 run_case missing-ec "$((BASE_PORT + 3))" "$CONFIG_JSON" ec_passphrase 500 \
     'env.ec_passphrase' \
     "failed to resolve secret reference at \`ec.passphrase\` from secret store \`trusted_server_secrets\`"
-run_case positive "$((BASE_PORT + 4))" "$CONFIG_JSON" "" 200 "" ""
+run_case positive "$POSITIVE_PORT" "$CONFIG_JSON" "" 200 "" ""
 
 echo "Cloudflare first-success smoke passed"
