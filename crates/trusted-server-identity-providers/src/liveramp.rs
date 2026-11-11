@@ -13,16 +13,19 @@
 //! `/api/identity/v2/envelope`), a visitor without an envelope cookie is looked up server side by Custom ID (`it=15`): the
 //! stable part of the EC ID, sent as `iv=<custom_id_namespace>:<id>` with
 //! the placement ID, consent strings, the publisher `Origin` and the
-//! visitor's IP in `X-Forwarded-For`. `LiveRamp` must enable Custom ID for
-//! the placement. A `204` reply reports an opt-out. Without an `endpoint`
-//! no server call is made.
+//! visitor's IP in `X-Forwarded-For`, as a server-to-server call
+//! (`atype=3`). `LiveRamp` must enable Custom ID for the placement. A `200`
+//! reply lists `envelopes`; the `RampID` entry (`type` 19) is stored. A
+//! `204` reply reports an opt-out. Without an `endpoint` no server call is
+//! made.
 //!
 //! With the Lockr capability enabled (`[settings.lockr]`), the cookies Lockr
 //! AIM writes the envelope into (default key `_lr_env`) are read after the
 //! own cookies, with the same parser.
 //!
 //! Parsing is lenient: a value outside the base64 alphabet, a JSON body
-//! without a string `envelope`, or a blank or opt-out envelope reads as no ID.
+//! without a string `envelope`, or a blank or placeholder (`0`) envelope reads
+//! as no ID.
 
 use std::borrow::Cow;
 use std::time::Duration;
@@ -45,13 +48,15 @@ use trusted_server_core::ec::provider::{
 
 use crate::common::{
     CookieReader, LockrSettings, ReadsLockr, bounded_expiry, cookie_capabilities, cookie_eid,
-    is_routable_ip, is_usable_id, join_section_ids, percent_decoded,
+    is_routable_ip, is_usable_id, percent_decoded,
 };
 
 /// `it` value of a Custom ID lookup.
 const CUSTOM_ID_TYPE: &str = "15";
-/// `atype` value of an ATS API integration.
-const ATS_API: &str = "2";
+/// `atype` value of a server-to-server integration (`2` is the ATS API).
+const SERVER_TO_SERVER: &str = "3";
+/// `type` of the `RampID` envelope in a v2 reply's `envelopes`.
+const RAMPID_ENVELOPE_TYPE: u32 = 19;
 /// `ct` value of a TCF v2 consent string.
 const TCF_CONSENT: &str = "4";
 /// `ct` value of a US Privacy consent string.
@@ -160,6 +165,22 @@ struct EnvelopeCookie {
     envelope: String,
 }
 
+/// A v2 envelope API reply: `{"envelopes":[{"type":19,"value":…}]}`.
+#[derive(Deserialize)]
+struct EnvelopeReply {
+    #[serde(default)]
+    envelopes: Vec<ReplyEnvelope>,
+}
+
+/// One entry of [`EnvelopeReply::envelopes`].
+#[derive(Deserialize)]
+struct ReplyEnvelope {
+    #[serde(rename = "type")]
+    kind: u32,
+    #[serde(default)]
+    value: Option<String>,
+}
+
 /// Decodes one cookie value into its envelope.
 ///
 /// A value whose base64 decodes to JSON must carry a usable `envelope`
@@ -222,7 +243,7 @@ impl IdentityProvider for LiveRampProvider {
                     "iv",
                     &format!("{}:{stable_id}", envelope_lookup.custom_id_namespace),
                 )
-                .append_pair("atype", ATS_API);
+                .append_pair("atype", SERVER_TO_SERVER);
             if let Some(tc_string) = &consent.raw_tc_string {
                 query
                     .append_pair("ct", TCF_CONSENT)
@@ -235,8 +256,10 @@ impl IdentityProvider for LiveRampProvider {
             if let Some(gpp) = &consent.raw_gpp_string {
                 query.append_pair("gpp", gpp);
             }
-            if let Some(section_ids) = &consent.gpp_section_ids {
-                query.append_pair("gpp_sid", &join_section_ids(section_ids));
+            // `gpp_sid` is a single section ID; Prebid also sends only the
+            // first applicable section.
+            if let Some(section_id) = consent.gpp_section_ids.as_deref().and_then(<[u16]>::first) {
+                query.append_pair("gpp_sid", &section_id.to_string());
             }
         }
         let mut headers = HeaderMap::new();
@@ -269,14 +292,20 @@ impl IdentityProvider for LiveRampProvider {
             return Err(Report::new(ProviderError::InvalidResponse)
                 .attach(format!("liveramp returned status {}", response.status)));
         }
-        let reply: EnvelopeCookie =
+        let reply: EnvelopeReply =
             serde_json::from_slice(response.body).change_context(ProviderError::InvalidResponse)?;
-        if !is_usable_id(&reply.envelope) {
+        let Some(envelope) = reply
+            .envelopes
+            .into_iter()
+            .find(|envelope| envelope.kind == RAMPID_ENVELOPE_TYPE)
+            .and_then(|envelope| envelope.value)
+            .filter(|envelope| is_usable_id(envelope))
+        else {
             return Ok(LookupOutcome::NoMatch);
-        }
+        };
         Ok(LookupOutcome::Found(vec![cookie_eid(
             &self.source,
-            Cow::Owned(reply.envelope),
+            Cow::Owned(envelope),
             bounded_expiry(Some(ENVELOPE_TTL)),
         )]))
     }
@@ -617,11 +646,11 @@ mod tests {
                 ("pid", "14"),
                 ("it", "15"),
                 ("iv", "ana-example:abc123"),
-                ("atype", "2"),
+                ("atype", "3"),
                 ("ct", "4"),
                 ("cv", "CP_example"),
                 ("gpp", "DBA_example"),
-                ("gpp_sid", "2,7"),
+                ("gpp_sid", "2"),
             ]),
             "should send the stable EC ID as the Custom ID with consent"
         );
@@ -685,7 +714,11 @@ mod tests {
 
     #[test]
     fn stores_the_returned_envelope() {
-        let body = json!({"envelope": "AhIdEnvelope"}).to_string();
+        let body = json!({"envelopes": [
+            {"type": 25, "source": "pairIds", "value": "pair-example", "err": null},
+            {"type": 19, "source": "envelopeLiveramp", "value": "AhIdEnvelope", "err": null},
+        ]})
+        .to_string();
 
         let outcome = reply(StatusCode::OK, body.as_bytes()).expect("should parse reply");
 
@@ -709,8 +742,16 @@ mod tests {
 
     #[test]
     fn maps_no_content_to_an_opt_out_and_a_blank_envelope_to_no_match() {
-        let blank = json!({"envelope": ""}).to_string();
+        let blank = json!({"envelopes": [{"type": 19, "value": "", "err": null}]}).to_string();
+        let other = json!({"envelopes": [{"type": 25, "value": "pair-example"}]}).to_string();
 
+        assert!(
+            matches!(
+                reply(StatusCode::OK, other.as_bytes()),
+                Ok(LookupOutcome::NoMatch)
+            ),
+            "should report no match without a RampID envelope"
+        );
         assert!(
             matches!(
                 reply(StatusCode::NO_CONTENT, b""),
