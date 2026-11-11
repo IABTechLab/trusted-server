@@ -1319,7 +1319,7 @@ mod tests {
     use super::*;
     use crate::ec::checked_current_timestamp;
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue, UnixSeconds};
-    use crate::ec::kv_backend::test_support::InMemoryEcKv;
+    use crate::ec::kv_backend::test_support::{InMemoryEcKv, WriteFailingEcKv};
     use crate::ec::kv_types::{KvEid, KvUid};
 
     fn snapshot_ec_id() -> String {

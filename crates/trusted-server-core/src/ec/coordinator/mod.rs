@@ -1571,7 +1571,7 @@ mod tests {
         let coordinator = pull_sync_pair(NonZeroUsize::new(1));
         let transport = CannedTransport::new(not_found_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &granting());
 
         assert_eq!(transport.sent.borrow().len(), 1, "should send one lookup");
         let statuses: Vec<LookupStatus> = results.iter().map(|lookup| lookup.status).collect();
@@ -1654,7 +1654,7 @@ mod tests {
             })
         });
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &granting());
 
         let lookup = results.iter().next().expect("should report the provider");
         assert_eq!(
@@ -1670,7 +1670,7 @@ mod tests {
         let coordinator = pull_sync_pair(None);
         let transport = CannedTransport::new(not_found_reply);
 
-        run(&coordinator, &transport, &missing(), &granting());
+        run(&coordinator, &transport, &live_row(), &granting());
 
         assert_eq!(transport.sent.borrow().len(), 2, "should send both lookups");
     }
@@ -2000,7 +2000,7 @@ mod tests {
         let results = run_with(
             &coordinator,
             &transport,
-            &missing(),
+            &live_row(),
             &granting(),
             &FailingLimiter,
         );
