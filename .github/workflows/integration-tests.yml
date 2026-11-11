@@ -202,7 +202,9 @@ jobs:
         working-directory: crates/trusted-server-integration-tests/browser
         run: |
           npm ci
-          npx playwright install --with-deps chromium
+          # ubuntu-24.04 already supplies Chromium's shared libraries.
+          # Avoid APT mirror outages; still install the locked browser build.
+          npx playwright install chromium
 
       - name: Test initial render fixture escaping
         working-directory: crates/trusted-server-integration-tests/browser
