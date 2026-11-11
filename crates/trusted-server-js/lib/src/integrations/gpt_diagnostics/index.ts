@@ -10,6 +10,7 @@ import { GptDiagnosticsBindingManager } from './binding';
 import { GptDiagnosticsObserver } from './observer';
 import type { GptObserverWindow } from './observer';
 import { GptDiagnosticsOverlay } from './overlay';
+import { GptDiagnosticsPrebidRecorder } from './prebid';
 import { GptDiagnosticsSlotSizeObserver } from './slot_size_observer';
 import { GptDiagnosticsStore } from './store';
 
@@ -51,6 +52,7 @@ export function installGptDiagnosticsRuntime(
   let slotSizeObserver: GptDiagnosticsSlotSizeObserver | undefined;
   let apiController: GptDiagnosticsApiController | undefined;
   let traceHandoff: TraceHandoff | undefined;
+  let prebidRecorder: GptDiagnosticsPrebidRecorder | undefined;
 
   try {
     if (!target.tsjs) throw new Error('TSJS core API unavailable');
@@ -71,6 +73,8 @@ export function installGptDiagnosticsRuntime(
     badges = new GptDiagnosticsBadgeManager(store, bindings, {
       window: target,
       document: target.document,
+      onActivate: (runtimeSlotNumber, requestNumber) =>
+        overlay?.selectRequest(runtimeSlotNumber, requestNumber),
     });
     slotSizeObserver = new GptDiagnosticsSlotSizeObserver(store, bindings, { window: target });
     overlay = new GptDiagnosticsOverlay(store, bindings, {
@@ -93,6 +97,8 @@ export function installGptDiagnosticsRuntime(
     observer.install();
     const api = apiController.api;
     const recorder = apiController.recorder;
+    prebidRecorder = new GptDiagnosticsPrebidRecorder(target, recorder);
+    recorder.recordCompletedPrebidAuction = prebidRecorder.recordCompletedPrebidAuction;
     const runtime: GptDiagnosticsRuntime = {
       api,
       destroy: () => {
@@ -102,6 +108,7 @@ export function installGptDiagnosticsRuntime(
         if (target.tsjs?.gptDiagnosticsRecorder === recorder) {
           delete target.tsjs.gptDiagnosticsRecorder;
         }
+        prebidRecorder?.destroy();
         apiController?.destroy();
         overlay?.destroy();
         badges?.destroy();
@@ -123,6 +130,7 @@ export function installGptDiagnosticsRuntime(
   } catch (error) {
     traceHandoff?.destroy();
     traceHandoff = undefined;
+    prebidRecorder?.destroy();
     apiController?.destroy();
     overlay?.destroy();
     badges?.destroy();

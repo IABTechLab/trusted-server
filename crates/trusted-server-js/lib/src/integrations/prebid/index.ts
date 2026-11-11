@@ -2882,11 +2882,10 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       // slots, and a late callback cannot issue a second GAM request.
       let completed = false;
       let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
-      function completeRefresh(applyTargeting: boolean): void {
+      function completeRefresh(applyTargeting: boolean, completedAuctionId?: string): void {
         if (completed) return;
         completed = true;
         if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
-
         // The publisher refresh itself started before this asynchronous auction.
         // Reconcile its per-slot token only when the callback is ready to issue
         // GPT: TS may have won an already-overlapping first impression while the
@@ -2921,15 +2920,32 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         const completedAdUnitCodes = refreshAdUnitCodes.filter(
           (_code, index) => !callbackFilteredSlots.has(auctionSlots[index])
         );
-        if (applyTargeting) {
+        const completedAuctionSlots = auctionSlots.filter(
+          (slot) => !callbackFilteredSlots.has(slot)
+        );
+        let targetingApplied = false;
+        if (applyTargeting && typeof pbjs.setTargetingForGPTAsync === 'function') {
           try {
-            pbjs.setTargetingForGPTAsync?.(completedAdUnitCodes);
+            pbjs.setTargetingForGPTAsync(completedAdUnitCodes);
+            targetingApplied = true;
           } catch (error) {
             log.error('[tsjs-prebid] refresh targeting failed', error);
           }
         }
         completedSlots.forEach(consumeGptPublisherRefreshSuppression);
         recordPrebidRefreshForDiagnostics(completedSlots);
+        if (targetingApplied) {
+          try {
+            window.tsjs?.gptDiagnosticsRecorder?.recordCompletedPrebidAuction?.(
+              pbjs,
+              completedAuctionId,
+              completedAuctionSlots,
+              completedAdUnitCodes
+            );
+          } catch {
+            // Auction diagnostics must not suppress the publisher's GAM refresh.
+          }
+        }
         // Preserve the publisher's original refresh form unless one losing
         // first-impression slot was filtered. A delayed bare call must also
         // become explicit so slots added after the auction snapshot cannot join.
@@ -2941,7 +2957,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       try {
         pbjs.requestBids({
           adUnits,
-          bidsBackHandler: () => completeRefresh(true),
+          bidsBackHandler: (_bids, _timedOut, auctionId) => completeRefresh(true, auctionId),
           timeout: timeoutMs,
         });
         // A one-shot watchdog completes the GAM request even if Prebid never

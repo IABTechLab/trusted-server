@@ -86,7 +86,17 @@ function cycleProjection(value: unknown, omissions: { value: number }): Record<s
   const source = sourceObject(
     value,
     ['requestNumber', 'durations', 'incompleteSequence'],
-    [...TRACE_CYCLE_KEYS, 'adManager', 'previousCreativeId']
+    // These Console-only auction facts are not part of the v1 public trace schema.
+    [
+      ...TRACE_CYCLE_KEYS,
+      'adManager',
+      'previousCreativeId',
+      'auctionType',
+      'auctionWinner',
+      'prebidAuction',
+      'serverAuctionTimings',
+      'serverAuctionTimingOrigin',
+    ]
   );
   const output: Record<string, unknown> = {
     requestNumber: data(source, 'requestNumber'),

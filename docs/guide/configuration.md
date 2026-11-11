@@ -62,6 +62,7 @@ publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
 - `handlers[*].password`
 - `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
+- `tinybird.access_token_secret`, when Tinybird access telemetry is enabled
 - `integrations.datadome.server_side_key_secret_name`, when protection is enabled
 - `integrations.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
 - `proxy.asset_routes[*].auth.access_key_id`, `secret_access_key`, and optional `session_token`
@@ -71,11 +72,8 @@ resolved only while an instance builds runtime settings. An adapter can map the
 logical ID to a different physical name. For example, Fastly commonly maps
 `trusted_server_secrets` to physical store `ts_secrets`.
 
-One accepted secret-shaped field is deliberately different:
-
-- `tinybird.access_token_secret` is deprecated input. It is accepted for
-  migration, then discarded and omitted from serialized config; use
-  `tinybird.auction_token_secret` as the store key name instead.
+Both Tinybird token fields are active secret-store key references when their
+respective sinks are enabled.
 
 The four deprecated `secret_store` selectors under Tinybird, DataDome, its
 protection-test bypass, and S3 route authentication are also accepted and
@@ -91,26 +89,26 @@ diff; it does not move inline values to a secret store.
 The following table records the independent lifecycle, key-identity,
 serialization, runtime, and secret axes for every exceptional field:
 
-| Path                                                         | Lifecycle  | Key identity                        | Serialization | Runtime              | Secret handling          |
-| ------------------------------------------------------------ | ---------- | ----------------------------------- | ------------- | -------------------- | ------------------------ |
-| `AssetOriginAuth.s3_sig_v4`                                  | deprecated | alias of `AssetOriginAuth.s3_sigv4` | skipped       | deserialization only | none                     |
-| `DataDomeConfig.server_side_key_secret_name`                 | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `DataDomeConfig.server_side_key_secret_store`                | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `Handler.password`                                           | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.secret_store`                             | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `S3SigV4AuthConfig.session_token`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `TinybirdSettings.access_token_secret`                       | deprecated | canonical                           | skipped       | normalized away      | accepted, then discarded |
-| `TinybirdSettings.auction_token_secret`                      | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `TinybirdSettings.secret_store`                              | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical                           | serialized    | active               | store resolved           |
+| Path                                                         | Lifecycle  | Key identity                        | Serialization           | Runtime              | Secret handling |
+| ------------------------------------------------------------ | ---------- | ----------------------------------- | ----------------------- | -------------------- | --------------- |
+| `AssetOriginAuth.s3_sig_v4`                                  | deprecated | alias of `AssetOriginAuth.s3_sigv4` | skipped                 | deserialization only | none            |
+| `DataDomeConfig.server_side_key_secret_name`                 | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `DataDomeConfig.server_side_key_secret_store`                | deprecated | canonical                           | skipped                 | normalized away      | none            |
+| `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | skipped                 | normalized away      | none            |
+| `Ec.passphrase`                                              | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `EcPartner.api_token`                                        | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `Handler.password`                                           | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `S3SigV4AuthConfig.secret_store`                             | deprecated | canonical                           | skipped                 | normalized away      | none            |
+| `S3SigV4AuthConfig.session_token`                            | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `TinybirdSettings.access_token_secret`                       | canonical  | canonical                           | serialized when present | active sink only     | store resolved  |
+| `TinybirdSettings.auction_token_secret`                      | canonical  | canonical                           | serialized              | active               | store resolved  |
+| `TinybirdSettings.secret_store`                              | deprecated | canonical                           | skipped                 | normalized away      | none            |
+| `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical                           | serialized              | active               | store resolved  |
 
 Prepare an initial reference-based deployment in this order:
 
@@ -164,6 +162,7 @@ auction_token_secret = "tinybird_auction_append_token"
 Store the APPEND token value under `tinybird_auction_append_token` in the
 physical store mapped from `trusted_server_secrets`. The token is resolved once
 at startup. Disabled Tinybird telemetry does not require or resolve the token.
+`access_token_secret` follows the same path when `access_enabled` is on.
 The legacy `tinybird.secret_store` field is accepted for one migration release,
 but it is ignored and omitted from newly pushed config.
 
@@ -203,13 +202,14 @@ fail and the service will return its startup-error response.
 | `[[handlers]]`             | Ordered HTTP Basic-auth rules                                           |
 | `[image_optimizer]`        | Reusable Fastly Image Optimizer profiles                                |
 | `[integrations.*]`         | Typed partner and browser integration settings                          |
+| `[observability]`          | Server-Timing header emission and bounded publisher route sections      |
 | `[proxy]`                  | Proxy allowlist, TLS policy, and asset routes                           |
 | `[publisher]`              | Publisher domain, origin, and proxy signing key                         |
 | `[request_signing]`        | Outbound Ed25519 request signing and management-store IDs               |
 | `[response_headers]`       | Headers added to Trusted Server responses                               |
 | `[rewrite]`                | First-party URL rewrite exclusions                                      |
 | `[tester_cookie]`          | Optional tester-cookie endpoints                                        |
-| `[tinybird]`               | Direct Tinybird auction telemetry                                       |
+| `[tinybird]`               | Direct Tinybird auction and access telemetry                            |
 | `[trusted_forwarder]`      | Authenticated browser-facing host and scheme forwarding                 |
 | `[trusted_client_ip]`      | Authenticated front-door client-IP forwarding                           |
 
@@ -1627,26 +1627,30 @@ See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and I
 
 ## Tinybird Configuration
 
-`[tinybird]` sends auction events directly to the Tinybird Events API. The
-emitter is active only when `enabled = true`; access-log emission is not wired.
+`[tinybird]` sends auction events and sampled access rows directly to the
+Tinybird Events API. Fastly wires both emitters; each sink requires
+`enabled = true` and its own enable flag. Other adapters do not emit Tinybird
+rows. See [Telemetry](/guide/telemetry) for sampling, privacy, and retention.
 
 ### `[tinybird]`
 
-| Field                  | Type           | Default                | Contract                                                           |
-| ---------------------- | -------------- | ---------------------- | ------------------------------------------------------------------ |
-| `enabled`              | Boolean        | `false`                | Enable auction telemetry                                           |
-| `api_host`             | String         | `""`                   | Required when enabled; regional host without scheme, port, or path |
-| `auction_dataset`      | String         | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                                |
-| `auction_token_secret` | String or null | `null`                 | Store key required when enabled; resolved value must be nonempty   |
-| `access_enabled`       | Boolean        | `false`                | Reserved; `true` fails startup because no emitter is wired         |
-| `access_dataset`       | String         | `"access_logs_raw"`    | Reserved access-log dataset name                                   |
-| `access_sample_rate`   | Number         | `0.0`                  | `0.0..=1.0`; reserved while access emission is disabled            |
-| `max_body_bytes`       | Integer        | `1048576`              | At least `1024` bytes                                              |
+| Field                  | Type           | Default                | Contract                                                                          |
+| ---------------------- | -------------- | ---------------------- | --------------------------------------------------------------------------------- |
+| `enabled`              | Boolean        | `false`                | Master switch for Tinybird telemetry                                              |
+| `auction_enabled`      | Boolean        | `true`                 | Enable auction telemetry when the master switch is on                             |
+| `api_host`             | String         | `""`                   | Required when enabled; regional host without scheme, port, or path                |
+| `auction_dataset`      | String         | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                                               |
+| `auction_token_secret` | String or null | `null`                 | Required for an active auction sink; resolves through the default secret store    |
+| `access_enabled`       | Boolean        | `false`                | Enable sampled post-delivery access telemetry                                     |
+| `access_dataset`       | String         | `"access_logs_v2"`     | Versioned access datasource; `access_logs_raw` is rejected when access is enabled |
+| `access_token_secret`  | String or null | `null`                 | Required for an active access sink; resolves through the default secret store     |
+| `access_sample_rate`   | Number         | `0.0`                  | `0.0..=1.0`; must be positive when access telemetry is enabled                    |
+| `max_body_bytes`       | Integer        | `1048576`              | At least `1024` bytes                                                             |
 
-`secret_store` and `access_token_secret` are deprecated compatibility inputs.
-Both are removed during normalization; neither reaches runtime or serialized
-output. New configurations use only `auction_token_secret`, whose value is
-resolved through `trusted_server_secrets`.
+`secret_store` is a deprecated compatibility input. It is ignored and omitted
+from newly pushed config. Both sink tokens resolve through
+`trusted_server_secrets`. Disabled sinks neither require nor resolve their token
+references, even when stale keys remain in a stored config.
 
 The complete enabled example appears in
 [Tinybird auction telemetry](#tinybird-auction-telemetry).
@@ -3236,6 +3240,183 @@ contains their key references.
 Rollback to the legacy entry point is no longer controlled by runtime config
 keys. Use the normal deployment rollback path to restore a pre-cleanup service
 version if that is required.
+
+## Observability and Access Telemetry Configuration
+
+Settings for the `Server-Timing` response header and the sampled
+access-telemetry sink. Both are off by default and are independent switches:
+enabling one does not enable the other.
+
+### `[observability]`
+
+| Field                   | Type     | Required | Default | Description                                                                                               |
+| ----------------------- | -------- | -------- | ------- | --------------------------------------------------------------------------------------------------------- |
+| `server_timing_enabled` | Boolean  | No       | `false` | Append request-phase timings to the `Server-Timing` response header                                       |
+| `route_sections`        | String[] | No       | `[]`    | Section names kept as publisher route templates (`/{section}/*`) in access telemetry; empty collapses all |
+
+Route sections are matched ASCII-case-insensitively against the first path segment,
+with at least one further segment required. Leading and trailing non-control
+whitespace is trimmed; tabs, newlines, and other control characters are rejected,
+not trimmed. Names are limited to 32 entries of at most 128 UTF-8 bytes each and
+must be nonempty with no slash or control characters. For example,
+`route_sections = [" news "]` normalizes to `["news"]`, preserving `/news/*` but not
+`/news`. Matching uses the raw path without percent-decoding, so literal non-ASCII
+section names do not match their percent-encoded URLs. Use ASCII section names.
+The name `other`, in any case, shares the fallback `/other/*` bucket rather than
+creating a distinct section. Configure this array in TOML, for example
+`route_sections = ["news"]`; the environment overlay cannot set arrays.
+
+**Purpose**: Surfaces per-phase request timing (`ts-total` plus recorded
+phases such as `ts-appbuild`, `ts-filter`, `ts-geo`, `ts-kv`, `ts-origin`, and
+`ts-template-cache`) as a standard `Server-Timing` header, in milliseconds
+with one decimal place. An unrecorded phase is omitted from the header
+rather than rendered as zero. When origin dispatch overlaps auction dispatch or
+EC preload, `ts-origin` measures the remaining origin wait after overlap, not full
+origin latency. Fastly `ts-appbuild` measures per-request setup and includes application
+construction only on cold requests; a non-null warm value is not a cold-start signal.
+Axum builds state at startup and has no per-request app-build phase.
+
+**Emission is conservative**: the header is appended only on responses that
+are conclusively private, meaning `Cache-Control` contains a bare `private` or
+`no-store` directive and no recognized CDN/surrogate cache-control header is present.
+A field-qualified directive such as `private="Set-Cookie"` does not qualify.
+An edge-cache header suppresses timing even alongside private/no-store, since
+shared-cache overrides can replay request-specific timings. A response that is
+heuristically cacheable, carries a bare
+`max-age`, or has no cache header at all never receives the header, because a
+shared-cache object would otherwise replay one request's timings for its
+entire stored lifetime. The long-lived, shared-cacheable `tsjs` asset route is
+the concrete case this excludes. The header is appended, never inserted, so
+an origin-supplied `Server-Timing` value and any entries the fronting
+delivery layer adds are preserved alongside the TS entries.
+
+The Axum adapter applies the same private-response rule at its own terminal
+point before serializing the response, and emits the header only; it does not
+send access-telemetry rows. Cloudflare and Spin collect timing for GPT diagnostics
+only; neither emits `Server-Timing` or access rows, so these emission flags have
+no effect there.
+
+**Example**:
+
+```toml
+[observability]
+server_timing_enabled = true
+```
+
+::: tip The Axum dev server reads this flag once at startup
+The Axum dev server bakes `server_timing_enabled` into its service when it starts.
+Flipping the flag there requires a restart to take effect.
+:::
+
+::: warning Client-visible latency disclosure
+The `Server-Timing` header is sent to every client on eligible responses,
+not only to operators: browsers expose the values to same-origin JavaScript
+via `PerformanceResourceTiming.serverTiming`, and any caller can read the
+raw header. Enabling it publishes measured per-phase server latency,
+including KV read timing on the public identity endpoints (`ts-kv`) and
+origin/cache behaviour on publisher pages (`ts-origin`,
+`ts-template-cache`). This is standard `Server-Timing` practice and the
+values are durations only, but treat the flag as a diagnostic aid to enable
+deliberately, not a general always-on toggle, unless disclosing those
+timings to all clients is acceptable for the deployment.
+:::
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__OBSERVABILITY__SERVER_TIMING_ENABLED=true
+```
+
+::: tip Present-but-false by default
+`server_timing_enabled` ships as `false` in the base operator config rather
+than being left out, even though `false` is also its default. The
+environment-variable overlay can only override a leaf that already exists in
+the parsed TOML; it cannot create a missing one. Keeping the leaf present lets
+`TRUSTED_SERVER__OBSERVABILITY__SERVER_TIMING_ENABLED` take effect without an
+extra edit to add the table first.
+:::
+
+### `[tinybird]` access telemetry keys
+
+The authoritative field reference is [Tinybird Configuration](#tinybird).
+The examples below cover access-sink enablement and rollout.
+
+**Purpose**: `access_enabled` and `auction_enabled` gate the two Tinybird
+sinks separately so that turning on one does not silently turn on (or leave
+off) the other; a settings test locks this decoupling in both directions.
+Setting `access_enabled = true` with `access_sample_rate = 0.0` is rejected at
+config load as an armed-but-silent configuration; use `access_enabled` itself
+to turn the sink off, not the sample rate. Enabling `access_enabled` also
+requires the shared transport fields (`enabled`, non-empty `api_host`,
+`access_dataset`, a resolvable `access_token_secret`, and a
+`max_body_bytes` of at least 1024) to already be set.
+
+**Example**:
+
+```toml
+[tinybird]
+enabled = true
+api_host = "api.tinybird.example.com"
+auction_enabled = false
+
+# Access-only telemetry: no auction APPEND token is required.
+access_enabled = true
+access_dataset = "access_logs_v2"
+access_token_secret = "tinybird_access_append_token"
+access_sample_rate = 0.05
+max_body_bytes = 1048576
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__TINYBIRD__ACCESS_ENABLED=true
+TRUSTED_SERVER__TINYBIRD__ACCESS_SAMPLE_RATE=0.05
+TRUSTED_SERVER__TINYBIRD__AUCTION_ENABLED=false
+```
+
+These overrides require the corresponding leaves to exist in the parsed TOML.
+The example's Tinybird block is commented out; uncomment and configure it first.
+Keep `access_sample_rate` as a TOML float, such as `0.05` or `0.0`, since overlay
+coercion uses the existing leaf's type.
+
+A sampled request dispatches one access-telemetry row to `access_dataset` after
+client delivery. Fastly starts the host-owned request and drops its pending handle,
+without awaiting the ingest reply or retrying. Local serialization/setup/start
+failures are logged; later transport errors, non-2xx responses and ingestion
+acceptance are not observed. The row records the configured sample rate and has a
+30-day TTL. See [Telemetry](/guide/telemetry#access-data-path) for limits, the
+collection-time and delivery-result contracts, and privacy.
+
+### Deploy and rollback ordering
+
+::: warning Push a compatibility config before rolling back
+The compatibility boundary is uneven. The top-level `Settings` schema uses
+`deny_unknown_fields`, so an older binary rejects a config carrying the
+`[observability]` table. The nested `[tinybird]` table does not: an older
+binary accepts unknown keys there, rejects `access_enabled = true` through
+validation, ignores `auction_enabled` entirely, and reads `enabled = true`
+as "auction telemetry on".
+
+**Deploying**: create the versioned `access_logs_v2` datasource and its scoped
+`ts_access_v2_ingest` APPEND token before deploying the emitting binary. Preserve
+`access_logs_raw`; it is the legacy reserved schema, not the target for these
+rows. Upgrade every serving binary before pushing a config containing the new
+fields. An existing explicit `access_dataset = "access_logs_raw"` must be changed
+to `access_logs_v2`, with the matching token key. When access is enabled,
+validation rejects exactly the normalized legacy name `access_logs_raw`; custom
+dataset names remain allowed and disabled legacy configurations remain accepted.
+Follow the workspace cutover in
+[`tinybird/README.md`](https://github.com/IABTechLab/trusted-server/blob/main/tinybird/README.md).
+
+**Rolling back**: push a compatibility config first, then roll the binary
+back. The compatibility config removes the `[observability]` table, sets
+`access_enabled = false`, and, for a deployment that only used the access
+sink, sets `enabled = false` as well. Otherwise the older binary tries to enable
+auction telemetry, or fails startup if no auction token is present. Keep both
+Tinybird datasources during rollback. Do not redeploy an older Tinybird project
+that omits `access_logs_v2`; inspect the deployment dry-run for proposed removals.
+:::
 
 ## Validation
 
