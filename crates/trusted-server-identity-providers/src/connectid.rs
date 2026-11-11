@@ -5,8 +5,10 @@
 //! (optionally percent-encoded) with `connectId`, `lastSynced` and `ttl`,
 //! both in milliseconds. The ID is stored with agent type 3 until
 //! `lastSynced + ttl`, with the TTL capped at [`MAX_TTL`]; the coordinator
-//! drops it once that time has passed. A missing `ttl` uses the shared
-//! default TTL. No server call is made.
+//! drops it once that time has passed. As in Prebid's `connectIdSystem`, a
+//! missing or zero `ttl` means [`MAX_TTL`], a missing `lastSynced` means
+//! the ID is fresh (stored for [`MAX_TTL`]), and the key may also be spelled
+//! `connectid`. No server call is made.
 //!
 //! Yahoo's opt-out (`connectIdOptOut` = `1`) is kept in local storage, which
 //! a server never sees, so it is not honoured here: a `ConnectID` cookie left
@@ -17,7 +19,7 @@
 //!
 //! The cookie's `he` and `puid` fields are never read, so they are never
 //! stored. Parsing is lenient: an undecodable cookie, a missing
-//! `connectId` or `lastSynced`, or a blank or opt-out ID reads as no ID.
+//! `connectId`, or a blank or placeholder (`0`) ID reads as no ID.
 
 use std::borrow::Cow;
 use std::time::Duration;
@@ -32,8 +34,7 @@ use trusted_server_core::ec::provider::{
 };
 
 use crate::common::{
-    CookieReader, DEFAULT_TTL, cookie_capabilities, cookie_eid, is_expired, is_usable_id,
-    percent_decoded,
+    CookieReader, cookie_capabilities, cookie_eid, is_expired, is_usable_id, percent_decoded,
 };
 
 /// Longest time a `ConnectID` is kept after its last sync.
@@ -91,10 +92,10 @@ impl ProviderKind for ConnectId {
 /// The fields of the `connectId` cookie this provider reads.
 #[derive(Deserialize)]
 struct ConnectIdCookie {
-    #[serde(rename = "connectId")]
+    #[serde(rename = "connectId", alias = "connectid")]
     connect_id: String,
-    #[serde(rename = "lastSynced")]
-    last_synced_ms: f64,
+    #[serde(rename = "lastSynced", default)]
+    last_synced_ms: Option<f64>,
     #[serde(default)]
     ttl: Option<f64>,
 }
@@ -111,8 +112,15 @@ fn connect_id(value: &str) -> Option<(String, ProviderExpiry)> {
     if !is_usable_id(&cookie.connect_id) {
         return None;
     }
-    let ttl = cookie.ttl.map_or(DEFAULT_TTL, from_millis).min(MAX_TTL);
-    let expires = from_millis(cookie.last_synced_ms).saturating_add(ttl);
+    let Some(last_synced_ms) = cookie.last_synced_ms else {
+        return Some((cookie.connect_id, ProviderExpiry::After(MAX_TTL)));
+    };
+    let ttl = cookie
+        .ttl
+        .filter(|ttl| *ttl > 0.0)
+        .map_or(MAX_TTL, from_millis)
+        .min(MAX_TTL);
+    let expires = from_millis(last_synced_ms).saturating_add(ttl);
     let expiry = ProviderExpiry::At(UnixSeconds::new(expires.as_secs()));
     // An expired cookie never hides a later live one.
     (!is_expired(&expiry)).then_some((cookie.connect_id, expiry))
@@ -214,21 +222,40 @@ mod tests {
     }
 
     #[test]
-    fn caps_the_ttl_and_defaults_a_missing_one() {
+    fn caps_the_ttl_and_defaults_a_missing_or_zero_one() {
         // A far-future sync keeps the cookie live whatever today's date is.
         let synced_secs = 4_700_000_000_u64;
         let long = json!({ "connectId": "cid", "lastSynced": synced_secs * 1000, "ttl": 1e15 });
         let missing = json!({ "connectId": "cid", "lastSynced": synced_secs * 1000 });
+        let zero = json!({ "connectId": "cid", "lastSynced": synced_secs * 1000, "ttl": 0 });
 
         assert_eq!(
             expires_at(read(&long)),
             synced_secs + MAX_TTL.as_secs(),
             "should cap at 14 days"
         );
+        for cookie in [missing, zero] {
+            assert_eq!(
+                expires_at(read(&cookie)),
+                synced_secs + MAX_TTL.as_secs(),
+                "should use Prebid's 14 days for {cookie}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_a_lowercase_key_and_a_missing_last_sync_as_fresh() {
+        let lowercase = json!({ "connectid": "cid", "lastSynced": 4_700_000_000_000_u64 });
+        let unsynced = json!({ "connectId": "cid" });
+
         assert_eq!(
-            expires_at(read(&missing)),
-            synced_secs + DEFAULT_TTL.as_secs(),
-            "should use the default"
+            read(&lowercase).map(|(id, _)| id).as_deref(),
+            Some("cid"),
+            "should accept the lowercase key"
+        );
+        assert!(
+            matches!(read(&unsynced), Some((_, ProviderExpiry::After(ttl))) if ttl == MAX_TTL),
+            "should store an unsynced ID for 14 days"
         );
     }
 
@@ -257,7 +284,6 @@ mod tests {
     fn ignores_missing_malformed_and_opt_out_cookies() {
         for cookie in [
             json!({}),
-            json!({ "connectId": "cid" }),
             json!({ "connectId": "", "lastSynced": 1 }),
             json!({ "connectId": "0", "lastSynced": 1 }),
             json!({ "connectId": 5, "lastSynced": 1 }),
