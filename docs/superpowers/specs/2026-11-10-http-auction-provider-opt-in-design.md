@@ -56,6 +56,17 @@ The focused existing command is `cargo test --locked -p trusted-server-core auct
 
 No global HTTP policy, automatic TLS fallback, alternate transport, credentials-in-URL support, new provider profile, network allowlist, production security approval or deployment workflow.
 
+## Review log
+
+The implementation existed before these independent read-only reviews. They are not retroactive preimplementation approval or deployment authorization.
+
+| Date       | Round          | Frozen target                                                                                                           | Result                                                                                                                        |
+| ---------- | -------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| 2026-11-10 | 1              | Contract SHA256 `e4ad3f9a8743fd332bd12b239cab94a6e6aa538428b6404fc0d14be5635c186e`; implementation `dd2ca144..2c79ea59` | No blocking or nonblocking findings. Provider-local permission, URL validation, serialization and consumer changes inspected. |
+| 2026-11-10 | 2, independent | Same frozen contract and complete 17-file implementation delta                                                          | No findings or requested changes. No tests or builds executed by the reviewer.                                                |
+
+The formatted contract retained the same meaning. This extraction replays the HTTP unit without relay ancestry onto current main; the review log records its original reviewed inputs, not a whole-tree review of later changes. Current target-matched checks remain required before readiness.
+
 ## Related
 
 - [Auction orchestration guide](../../guide/auction-orchestration.md)
