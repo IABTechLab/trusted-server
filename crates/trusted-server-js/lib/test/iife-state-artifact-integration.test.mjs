@@ -43,9 +43,13 @@ function createPage({
   logLevel,
   debug = false,
   storedDebug = false,
+  origin = 'https://publisher.example.com',
+  scriptSrc,
+  publicOrigin,
+  stampOrigin,
 } = {}) {
   dom = new JSDOM('<!doctype html><head></head><body><div id="slot1"></div></body>', {
-    url: `https://publisher.example.com/${debug ? '?tsdebug=1' : ''}`,
+    url: `${origin}/${debug ? '?tsdebug=1' : ''}`,
     runScripts: 'outside-only',
   });
   const { window } = dom;
@@ -68,6 +72,13 @@ function createPage({
   }));
   if (logLevel) {
     window.tsjs = { que: [() => window.tsjs.setConfig({ logLevel })] };
+  }
+  if (stampOrigin) window.__tsCreativeOrigin = stampOrigin;
+  if (scriptSrc) {
+    const script = window.document.createElement('script');
+    script.src = scriptSrc;
+    if (publicOrigin !== undefined) script.setAttribute('data-ts-public-origin', publicOrigin);
+    Object.defineProperty(window.document, 'currentScript', { configurable: true, value: script });
   }
   // Match bundle.rs: core first and independent IIFEs joined into one script.
   window.eval(modules.map((name) => bundles.get(name)).join(';\n'));
@@ -101,6 +112,119 @@ function requestContext(window) {
 }
 
 describe('shared state across production IIFEs', () => {
+  it('recognizes the configured proxy origin across independent core and creative IIFEs without retargeting endpoints', async () => {
+    const scriptOrigin = 'https://www.publisher.example';
+    const proxyOrigin = 'https://ads.publisher.example:8443';
+    const { window } = createPage({
+      modules: ['core', 'creative'],
+      origin: scriptOrigin,
+      scriptSrc: `${scriptOrigin}/static/tsjs=tsjs-unified.min.js?v=hash`,
+      publicOrigin: proxyOrigin,
+    });
+    window.tscreative.setConfig({ renderGuard: true });
+    const script = window.document.currentScript;
+    script.setAttribute('data-ts-public-origin', 'https://changed.example');
+    Object.defineProperty(window.document, 'currentScript', { configurable: true, value: null });
+    const proxy = `${proxyOrigin}/first-party/proxy?tsurl=https%3A%2F%2Fresource.example%2Fasset&tstoken=signed`;
+    const image = new window.Image();
+    const iframe = window.document.createElement('iframe');
+    image.src = proxy;
+    iframe.src = proxy;
+    window.document.body.append(image, iframe);
+    const container = window.document.createElement('div');
+    container.innerHTML = `<img src="${proxy}"><iframe src="${proxy}"></iframe>`;
+    window.document.body.appendChild(container);
+    await new Promise((resolve) => window.setTimeout(resolve, 10));
+    for (const element of window.document.querySelectorAll('img, iframe')) {
+      expect(element.getAttribute('src')).toBe(proxy);
+      element.setAttribute('src', `${proxy}&version=2`);
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 10));
+    for (const element of window.document.querySelectorAll('img, iframe')) {
+      expect(element.getAttribute('src')).toBe(`${proxy}&version=2`);
+    }
+    expect(window.fetch).not.toHaveBeenCalled();
+
+    window.fetch.mockResolvedValue({ ok: true, json: async () => ({ href: proxy }) });
+    for (const external of [
+      `${proxyOrigin}/first-party/proxy-extra`,
+      'https://ads.publisher.example/first-party/proxy',
+      'https://foreign.example/first-party/proxy',
+      'https://changed.example/first-party/proxy',
+    ]) {
+      const externalImage = new window.Image();
+      externalImage.src = external;
+    }
+    await vi.waitFor(() => expect(window.fetch).toHaveBeenCalledTimes(4));
+    for (const [url, init] of window.fetch.mock.calls) {
+      expect(url).toBe(`${scriptOrigin}/first-party/sign`);
+      expect(init.credentials).toBe('same-origin');
+    }
+  });
+
+  it('keeps the captured creative endpoint and repaired click authority across independent IIFEs', async () => {
+    const endpoint = 'https://ads.example.com:8443';
+    const original = `${endpoint}/first-party/click?tsurl=https%3A%2F%2Fexample.com%2Flanding&foo=1&tstoken=original`;
+    const rebuilt = `${endpoint}/first-party/click?tsurl=https%3A%2F%2Fexample.com%2Flanding&bar=2&tstoken=rebuilt`;
+    const rebuiltAgain = rebuilt
+      .replace('bar=2', 'baz=3')
+      .replace('tstoken=rebuilt', 'tstoken=again');
+    const { window } = createPage({
+      modules: ['core', 'creative'],
+      origin: 'https://foreign.example',
+      scriptSrc: `${endpoint}/static/tsjs=tsjs-unified.min.js?v=hash`,
+      publicOrigin: 'https://configured.example:9443',
+      stampOrigin: 'https://publisher.example',
+    });
+    Object.defineProperty(window.document, 'currentScript', { configurable: true, value: null });
+    dom.reconfigure({ url: 'https://later-foreign.example/creative' });
+    window.__tsCreativeOrigin = 'https://later-publisher.example';
+    window.fetch = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ href: rebuilt }) })
+      .mockResolvedValue({ ok: true, json: async () => ({ href: rebuiltAgain }) });
+    window.open = vi.fn();
+    const anchor = window.document.createElement('a');
+    anchor.setAttribute('data-tsclick', original);
+    anchor.setAttribute('href', original);
+    anchor.target = '_blank';
+    window.document.body.appendChild(anchor);
+
+    anchor.setAttribute('href', 'https://example.com/landing?bar=2');
+    await vi.waitFor(() => {
+      expect(anchor.getAttribute('href')).toBe(rebuilt);
+      expect(anchor.getAttribute('data-tsclick')).toBe(rebuilt);
+    });
+    expect(window.fetch).toHaveBeenCalledTimes(1);
+    expect(window.fetch.mock.calls[0][0]).toBe(`${endpoint}/first-party/proxy-rebuild`);
+    expect(JSON.parse(window.fetch.mock.calls[0][1].body)).toEqual({
+      tsclick: original,
+      add: { bar: '2' },
+      del: ['foo'],
+    });
+    anchor.click();
+    await vi.waitFor(() =>
+      expect(window.open).toHaveBeenLastCalledWith(rebuilt, '_blank', 'noopener,noreferrer')
+    );
+    expect(window.fetch).toHaveBeenCalledTimes(1);
+
+    anchor.setAttribute('href', 'https://example.com/landing?baz=3');
+    await vi.waitFor(() => expect(anchor.getAttribute('data-tsclick')).toBe(rebuiltAgain));
+    expect(window.fetch).toHaveBeenCalledTimes(2);
+    expect(window.fetch.mock.calls[1][0]).toBe(`${endpoint}/first-party/proxy-rebuild`);
+    expect(JSON.parse(window.fetch.mock.calls[1][1].body)).toEqual({
+      tsclick: rebuilt,
+      add: { baz: '3' },
+      del: ['bar'],
+    });
+    anchor.click();
+    await vi.waitFor(() =>
+      expect(window.open).toHaveBeenLastCalledWith(rebuiltAgain, '_blank', 'noopener,noreferrer')
+    );
+    expect(anchor.getAttribute('href')).toBe(rebuiltAgain);
+    expect(window.fetch).toHaveBeenCalledTimes(2);
+  });
+
   it('sends Permutive context from an integration bundle through core requestAds', () => {
     const { window } = createPage();
     expect(requestContext(window)).toEqual({ permutive_segments: ['111', '222'] });

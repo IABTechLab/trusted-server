@@ -19,6 +19,7 @@ use validator::Validate;
 
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
+use crate::integrations::sdk_url::parse_sdk_network_url;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
@@ -99,10 +100,15 @@ impl LockrIntegration {
 
     /// Check if a URL is a Lockr SDK URL.
     fn is_lockr_sdk_url(&self, url: &str) -> bool {
-        let lower = url.to_ascii_lowercase();
-        (lower.contains("aim.loc.kr") || lower.contains("identity.loc.kr"))
-            && lower.contains("identity-lockr")
-            && lower.ends_with(".js")
+        // Keep browser/Rust cases in crates/trusted-server-js/lib/test/fixtures/sdk-url-ownership.json aligned.
+        let Some(parsed) = parse_sdk_network_url(url) else {
+            return false;
+        };
+        let host = parsed.host_str().unwrap_or_default();
+        let path = parsed.path().to_ascii_lowercase();
+        matches!(host, "aim.loc.kr" | "identity.loc.kr")
+            && path.contains("identity-lockr")
+            && path.ends_with(".js")
     }
 
     /// Handle SDK serving — fetch from Lockr CDN and serve through first-party domain.
@@ -389,19 +395,18 @@ impl IntegrationAttributeRewriter for LockrIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
+        ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         if !self.config.rewrite_sdk {
             return AttributeRewriteAction::Keep;
         }
 
         if self.is_lockr_sdk_url(attr_value) {
-            // Root-relative so the browser resolves it against the page host.
-            // Note: a page-level `<base href>` participates in this resolution,
-            // so on pages that set an external base URL these resolve against
-            // that base rather than the address-bar origin — an accepted
-            // tradeoff, matching GTM/Didomi/Testlight which are also relative.
-            let replacement = "/integrations/lockr/sdk".to_string();
+            // Anchor SDK scripts and preloads to the page origin, not an external base URL.
+            let replacement = format!(
+                "{}://{}/integrations/lockr/sdk",
+                ctx.request_scheme, ctx.request_host
+            );
             log::debug!("Rewriting Lockr SDK URL to {}", replacement);
             AttributeRewriteAction::Replace(replacement)
         } else {
@@ -438,6 +443,9 @@ mod tests {
     use edgezero_core::http::Method as HttpMethod;
     use serde_json::json;
 
+    use crate::integrations::sdk_url_test_support::{
+        assert_sdk_html_attribute_rewrite, assert_sdk_url_rewrite, sdk_url_cases,
+    };
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::test_support::tests::create_test_settings;
 
@@ -465,6 +473,33 @@ mod tests {
     }
 
     #[test]
+    fn sdk_url_ownership_matches_shared_corpus() {
+        let integration = LockrIntegration::new(test_config());
+
+        for case in sdk_url_cases() {
+            let matches = case.owner.as_deref() == Some(LOCKR_INTEGRATION_ID);
+            assert_eq!(
+                integration.is_lockr_sdk_url(&case.url),
+                matches,
+                "should match expected lockr ownership for {}: {}",
+                case.name,
+                case.url
+            );
+
+            assert_sdk_url_rewrite(
+                integration.as_ref(),
+                &case,
+                "https://edge.example.com/integrations/lockr/sdk",
+            );
+            assert_sdk_html_attribute_rewrite(
+                integration.as_ref(),
+                &case,
+                "https://edge.example.com/integrations/lockr/sdk",
+            );
+        }
+    }
+
+    #[test]
     fn test_lockr_sdk_url_detection() {
         let integration = LockrIntegration::new(test_config());
 
@@ -472,6 +507,16 @@ mod tests {
         assert!(integration.is_lockr_sdk_url("https://aim.loc.kr/identity-lockr-v1.0.js"));
         assert!(integration.is_lockr_sdk_url("https://aim.loc.kr/identity-lockr-trust-server.js"));
         assert!(integration.is_lockr_sdk_url("https://identity.loc.kr/identity-lockr-v2.0.js"));
+
+        // Hosts that only end with a Lockr SDK host are different hosts.
+        assert!(
+            !integration.is_lockr_sdk_url("https://notaim.loc.kr/identity-lockr.js"), // allow-domain: notaim.loc.kr
+            "should require an exact aim.loc.kr hostname"
+        );
+        assert!(
+            !integration.is_lockr_sdk_url("https://notidentity.loc.kr/identity-lockr.js"), // allow-domain: notidentity.loc.kr
+            "should require an exact identity.loc.kr hostname"
+        );
 
         // Should not match non-SDK resources on Lockr domains
         assert!(
@@ -512,9 +557,55 @@ mod tests {
 
         assert_eq!(
             result,
-            AttributeRewriteAction::Replace("/integrations/lockr/sdk".to_string()),
-            "should rewrite Lockr SDK URL to root-relative first-party proxy"
+            AttributeRewriteAction::Replace(
+                "https://edge.example.com/integrations/lockr/sdk".to_string()
+            ),
+            "should rewrite Lockr SDK URL to absolute first-party proxy"
         );
+    }
+
+    #[test]
+    fn test_attribute_rewriter_ignores_external_base_and_preserves_request_origin() {
+        let integration = LockrIntegration::new(test_config());
+        let external_base = url::Url::parse("https://external-base.example/assets/")
+            .expect("should parse external base URL");
+
+        for (scheme, host) in [
+            ("https", "edge.example.com"),
+            ("http", "edge.example.com:8080"),
+            ("https", "[2001:db8::1]:8443"),
+        ] {
+            for (element_name, attribute_name) in [("script", "src"), ("link", "href")] {
+                let ctx = IntegrationAttributeContext {
+                    attribute_name,
+                    element_name,
+                    request_host: host,
+                    request_scheme: scheme,
+                    ..test_context()
+                };
+                assert!(
+                    integration.handles_attribute(attribute_name),
+                    "should handle SDK script and preload attributes"
+                );
+                let AttributeRewriteAction::Replace(replacement) = integration.rewrite(
+                    attribute_name,
+                    "https://aim.loc.kr/identity-lockr-trust-server.js",
+                    &ctx,
+                ) else {
+                    panic!("should rewrite SDK URL");
+                };
+
+                let expected = format!("{scheme}://{host}/integrations/lockr/sdk");
+                assert_eq!(
+                    external_base
+                        .join(&replacement)
+                        .expect("should resolve rewritten SDK URL")
+                        .as_str(),
+                    expected,
+                    "should preserve page scheme, host and port despite external base"
+                );
+            }
+        }
     }
 
     #[test]
