@@ -733,10 +733,15 @@ fn pushed_envelope_sha_is_stable_for_one_context_key_allowlist() {
 #[test]
 fn config_validate_and_push_reject_unknown_integration_ids_and_fields() {
     let cases = [
-        ("prebdi", "enabled", true, "prebdi"),
-        ("gpt", "rewrite_scripts", false, "rewrite_scripts"),
-        ("gpt", "enable", false, "enable"),
-        ("osano", "made_up_key", false, "made_up_key"),
+        ("prebdi", "enabled", true, "Unknown integration IDs: prebdi"),
+        (
+            "gpt",
+            "rewrite_scripts",
+            false,
+            "unknown field `rewrite_scripts`",
+        ),
+        ("gpt", "enable", false, "unknown field `enable`"),
+        ("osano", "made_up_key", false, "unknown field `made_up_key`"),
     ];
     for (id, field, field_value, expected) in cases {
         for command in ["validate", "push"] {

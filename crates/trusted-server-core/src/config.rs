@@ -33,7 +33,7 @@ use crate::integrations::{
     sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
-use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
+use crate::settings::{AssetOriginAuth, IntegrationConfig, IntegrationSettings, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
@@ -376,13 +376,8 @@ fn validate_gpt_diagnostics_config(settings: &Settings) -> Result<(), Report<Tru
     };
     // Validate this dependency even when the normal integration lookup skips
     // disabled integrations, including the default when enabled is omitted.
-    let config: GptDiagnosticsConfig = serde_json::from_value(raw_config.clone()).map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "integration startup failed for `{GPT_DIAGNOSTICS_INTEGRATION_ID}`: configuration could not be parsed: {error}"
-            ),
-        })
-    })?;
+    let config: GptDiagnosticsConfig = serde_json::from_value(raw_config.clone())
+        .map_err(|error| IntegrationSettings::parse_error(GPT_DIAGNOSTICS_INTEGRATION_ID, error))?;
     config.validate().map_err(|error| {
         Report::new(TrustedServerError::Configuration {
             message: format!(
@@ -397,13 +392,8 @@ fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<Trus
         return Ok(());
     };
 
-    let config: JsAssetProxyConfig = serde_json::from_value(raw_config.clone()).map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "integration startup failed for `{JS_ASSET_PROXY_INTEGRATION_ID}`: configuration could not be parsed: {error}"
-            ),
-        })
-    })?;
+    let config: JsAssetProxyConfig = serde_json::from_value(raw_config.clone())
+        .map_err(|error| IntegrationSettings::parse_error(JS_ASSET_PROXY_INTEGRATION_ID, error))?;
     config.validate().map_err(|error| {
         Report::new(TrustedServerError::Configuration {
             message: format!(
@@ -1869,6 +1859,66 @@ password = "production-admin-password-32-bytes"
             rendered.contains("endpoint"),
             "should identify the retired APS field: {rendered}"
         );
+    }
+
+    #[test]
+    fn prepass_integration_parse_errors_hide_invalid_values() {
+        for (id, config) in [
+            (
+                GPT_DIAGNOSTICS_INTEGRATION_ID,
+                serde_json::json!({ "enabled": "fictional-private-value" }),
+            ),
+            (
+                JS_ASSET_PROXY_INTEGRATION_ID,
+                serde_json::json!({
+                    "enabled": true,
+                    "cache_ttl_seconds": "fictional-private-value"
+                }),
+            ),
+        ] {
+            for validate in [validate_settings_for_deploy, validate_settings_for_runtime] {
+                let mut settings = valid_settings();
+                settings.integrations.insert(id.to_owned(), config.clone());
+
+                let message = validate(&settings)
+                    .expect_err("should reject an invalid pre-pass integration value")
+                    .to_string();
+                assert!(
+                    message.contains(&format!(
+                        "Integration '{id}' configuration could not be parsed"
+                    )),
+                    "should name the integration: {message}"
+                );
+                assert!(
+                    !message.contains("fictional-private-value"),
+                    "should not echo invalid values in the outer error message: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepass_integration_parse_errors_name_unknown_fields() {
+        for id in [
+            GPT_DIAGNOSTICS_INTEGRATION_ID,
+            JS_ASSET_PROXY_INTEGRATION_ID,
+        ] {
+            let mut settings = valid_settings();
+            settings.integrations.insert(
+                id.to_owned(),
+                serde_json::json!({ "enabled": false, "made_up_key": true }),
+            );
+
+            let message = validate_settings_for_deploy(&settings)
+                .expect_err("should reject an unknown pre-pass integration field")
+                .to_string();
+            assert!(
+                message.contains(&format!(
+                    "Integration '{id}' configuration could not be parsed: unknown field `made_up_key`"
+                )),
+                "should name the integration and the unknown field: {message}"
+            );
+        }
     }
 
     #[test]

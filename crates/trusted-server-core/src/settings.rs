@@ -347,7 +347,11 @@ pub trait IntegrationConfig: DeserializeOwned + Validate {
 }
 
 impl IntegrationSettings {
-    fn parse_error(integration_id: &str, error: serde_json::Error) -> Report<TrustedServerError> {
+    /// Builds the redacted parse error shared by every integration config parser.
+    pub(crate) fn parse_error(
+        integration_id: &str,
+        error: serde_json::Error,
+    ) -> Report<TrustedServerError> {
         let detail = error.to_string();
         let mut message =
             format!("Integration '{integration_id}' configuration could not be parsed");

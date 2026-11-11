@@ -185,6 +185,12 @@ field. `[tester_cookie]` and `[tinybird]` also reject unknown fields. Payload ma
 such as Prebid managed-user-ID `params` and Adserver Mock `context_query_params`
 remain open for application-defined keys.
 
+A disabled block may omit fields that are required only when the integration is
+enabled. One limit applies: if a disabled block contains an incomplete nested
+entry, such as a Prebid managed user ID without `name`, parsing stops at that
+entry and unknown keys that follow it are not reported until the block is
+completed or enabled.
+
 Runtime startup rejects unknown fields in known tables. For compatibility with
 previously stored configurations, an unknown integration ID only logs a warning
 and its table is ignored at runtime.
