@@ -3,6 +3,7 @@
 
 use std::convert::Infallible;
 
+use edgezero_adapter_fastly::context::FastlyOutboundObservation;
 use edgezero_adapter_fastly::request::{
     send_assembly_error, send_request_with_registries_and_hooks,
 };
@@ -165,7 +166,8 @@ fn serve_loop(_limits: crate::sandbox::SandboxLimits, _startup: StartupDiagnosti
 ///
 /// Native short-circuits answer first. Every other request is assembled into
 /// the sandbox's retained app and sent through `EdgeZero`, which owns the
-/// response; [`handle_delivery`] then decides whether anything is left to do.
+/// response; [`handle_delivery`] then decides whether anything is left to do,
+/// and [`log_outbound_observation`] logs the request's backend registrations.
 ///
 /// Every non-panicking path through this function must answer exactly once.
 /// In a reused sandbox the SDK refuses to wait for the next request until the
@@ -275,6 +277,26 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
             &counters,
             |()| {},
         ),
+    }
+    log_outbound_observation();
+}
+
+/// Logs this callback's backend registration counts at info.
+///
+/// Runs after delivery and post-delivery work, so pull-sync and telemetry
+/// registrations count. Hosted Fastly logs at info, so every request that
+/// reached `EdgeZero` leaves one line.
+fn log_outbound_observation() {
+    if let Some(observation) = FastlyOutboundObservation::current() {
+        let stats = observation.snapshot();
+        log::info!(
+            target: "trusted_server::outbound_observation",
+            "configurations={} registrations={} total_registration_us={} max_registration_us={}",
+            stats.configuration_count(),
+            stats.registration_count(),
+            stats.total_registration_duration().as_micros(),
+            stats.max_registration_duration().as_micros()
+        );
     }
 }
 

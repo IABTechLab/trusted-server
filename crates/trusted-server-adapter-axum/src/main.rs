@@ -1,6 +1,8 @@
 use edgezero_adapter_axum::AXUM_PLATFORM;
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
+use edgezero_adapter_axum::ingress_config::AxumIngressConfig;
 use edgezero_core::app::App;
+use edgezero_core::env_config::EnvConfig;
 use log::LevelFilter;
 use trusted_server_adapter_axum::app::TrustedServerApp;
 
@@ -27,16 +29,29 @@ fn main() {
         eprintln!("warning: logger init failed: {e}");
     }
 
+    // `EDGEZERO__ADAPTER__INGRESS__*` sets the listener limits. An invalid
+    // value stops startup instead of falling back to a default.
+    let ingress = match AxumIngressConfig::from_env(&EnvConfig::from_env()) {
+        Ok(ingress) => ingress,
+        Err(error) => {
+            log::error!("trusted-server-adapter-axum failed to start: {error}");
+            std::process::exit(1);
+        }
+    };
+
     let config = match port_from_env() {
         // When PORT is set, bind to a specific address so integration tests
         // can allocate a fresh OS port each run and avoid TIME_WAIT flakiness.
         Some(port) => AxumDevServerConfig {
             addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             enable_ctrl_c: true,
-            ..AxumDevServerConfig::default()
+            ingress,
         },
         // Normal development path: read bind address from axum.toml.
-        None => AxumDevServerConfig::default(),
+        None => AxumDevServerConfig {
+            ingress,
+            ..AxumDevServerConfig::default()
+        },
     };
 
     // A settings failure stops startup before the listener binds. `routes`

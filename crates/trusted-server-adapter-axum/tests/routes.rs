@@ -1147,6 +1147,67 @@ async fn health_reports_git_version() {
 }
 
 // ---------------------------------------------------------------------------
+// Operator response headers that egress framing owns
+// ---------------------------------------------------------------------------
+
+/// The route test settings with `headers` as the operator's `response_headers`.
+fn settings_with_response_headers(headers: &[(&str, &str)]) -> Settings {
+    let mut settings = test_settings();
+    settings.response_headers = headers
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect();
+    settings
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_skips_malformed_connection_entry_and_serves_real_status() {
+    // A live config that predates validation can hold any of these. `x example`
+    // is not a field name, so egress would refuse it with a framing 500.
+    for value in ["keep-alive,", "", "x example"] {
+        let server =
+            TestServer::start(settings_with_response_headers(&[("connection", value)])).await;
+
+        let response = send(server.request("GET", "/health")).await;
+
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "should skip the operator `connection: {value}` entry and serve the real status"
+        );
+        server.assert_no_outbound_requests();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_skip_of_connection_x_example_serves_x_example() {
+    let server = TestServer::start(settings_with_response_headers(&[
+        ("connection", "x-example"),
+        ("x-example", "example-value"),
+    ]))
+    .await;
+
+    let response = send(server.request("GET", "/health")).await;
+
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "should serve the real status"
+    );
+    // Skipping the `connection` entry also drops its nomination, so egress no
+    // longer removes the field it named.
+    assert_eq!(
+        response
+            .headers()
+            .get("x-example")
+            .and_then(|value| value.to_str().ok()),
+        Some("example-value"),
+        "should serve x-example once the connection entry naming it is skipped"
+    );
+    server.assert_no_outbound_requests();
+}
+
+// ---------------------------------------------------------------------------
 // Synthesized headers on EdgeZero's canonical responses
 // ---------------------------------------------------------------------------
 

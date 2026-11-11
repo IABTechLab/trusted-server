@@ -3036,43 +3036,37 @@ fn apply_datadome_client_tag_cache_privacy(
 
 /// Drop a bodiless response's body and correct its framing headers.
 ///
-/// The response keeps no body, and its `Content-Length` is corrected where the
-/// origin's value would be invalid for the now-empty message:
+/// The response keeps no body and never keeps `Trailer`: response egress
+/// refuses to send a response that declares one. Its `Content-Length` is
+/// corrected where the origin's value would be invalid for the now-empty
+/// message:
 /// - **204 No Content**: RFC 9110 §8.6 forbids `Content-Length`; remove it.
 /// - **205 Reset Content**: the reset response carries nothing, so a nonzero
 ///   origin length is wrong (RFC 9110 §15.4.6); normalize it to `0`.
 /// - **HEAD and 304 Not Modified**: `Content-Length` legitimately advertises
 ///   the `GET` representation length, so it is preserved untouched.
 ///
-/// The normalized 204/205 responses also drop chunked-framing metadata the
-/// adapters would otherwise copy verbatim: RFC 9112 §6.1 forbids
-/// `Transfer-Encoding` on a 204, and keeping it on a 205 alongside the
+/// The normalized 204/205 responses also drop `Transfer-Encoding`: RFC 9112
+/// §6.1 forbids it on a 204, and keeping it on a 205 alongside the
 /// `Content-Length: 0` inserted above would advertise two conflicting framings.
-/// `Trailer` describes fields that only a chunked body can carry, so it goes
-/// with it. `HEAD` and 304 keep both for the same reason they keep
-/// `Content-Length`: the fields describe the `GET` representation, not this
-/// message.
+/// `HEAD` and 304 keep it for the same reason they keep `Content-Length`: it
+/// describes the `GET` representation, not this message.
 fn make_response_bodiless(response: &mut Response<EdgeBody>) {
     *response.body_mut() = EdgeBody::empty();
+    response.headers_mut().remove(header::TRAILER);
     match response.status() {
         StatusCode::NO_CONTENT => {
             response.headers_mut().remove(header::CONTENT_LENGTH);
-            remove_chunked_framing_headers(response.headers_mut());
+            response.headers_mut().remove(header::TRANSFER_ENCODING);
         }
         StatusCode::RESET_CONTENT => {
             response
                 .headers_mut()
                 .insert(header::CONTENT_LENGTH, HeaderValue::from(0_u64));
-            remove_chunked_framing_headers(response.headers_mut());
+            response.headers_mut().remove(header::TRANSFER_ENCODING);
         }
         _ => {}
     }
-}
-
-/// Remove the framing fields that only apply to a message with a chunked body.
-fn remove_chunked_framing_headers(headers: &mut header::HeaderMap) {
-    headers.remove(header::TRANSFER_ENCODING);
-    headers.remove(header::TRAILER);
 }
 
 /// A [`Write`] sink that buffers into a `Vec<u8>` but fails once the configured
@@ -25720,11 +25714,11 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
     // (method, status, expected Content-Length, expected Transfer-Encoding)
     // after bodiless normalization. 204 forbids Content-Length (removed); 205
     // must advertise a zero-length body; HEAD and 304 legitimately advertise the
-    // GET representation length. Chunked framing is stripped from 204 (forbidden
-    // by RFC 9112 §6.1) and 205 (would conflict with the inserted
+    // GET representation length. `Transfer-Encoding` is stripped from 204
+    // (forbidden by RFC 9112 §6.1) and 205 (would conflict with the inserted
     // `Content-Length: 0`), but preserved for HEAD and 304, whose message length
     // is fixed by the header section regardless of framing fields
-    // (RFC 9112 §6.3, rule 1).
+    // (RFC 9112 §6.3, rule 1). `Trailer` goes in every case.
     const BODILESS_FRAMING_CASES: [(Method, StatusCode, Option<&str>, Option<&str>); 4] = [
         (Method::HEAD, StatusCode::OK, Some("42"), Some("chunked")),
         (Method::GET, StatusCode::NO_CONTENT, None, None),
@@ -25763,12 +25757,41 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             "bodiless {method} {status} must carry the corrected Transfer-Encoding"
         );
         assert_eq!(
-            header_value(header::TRAILER).as_deref(),
-            // `Trailer` only describes fields a chunked body can carry, so it
-            // survives exactly where chunked framing does.
-            expected_transfer_encoding.map(|_| "expires"),
-            "bodiless {method} {status} must drop Trailer with its chunked framing"
+            header_value(header::TRAILER),
+            None,
+            "bodiless {method} {status} must not carry Trailer"
         );
+    }
+
+    #[test]
+    fn make_response_bodiless_removes_trailer_for_head_and_304() {
+        // A HEAD answer keeps its origin status, so 200 stands for HEAD here.
+        for status in [StatusCode::OK, StatusCode::NOT_MODIFIED] {
+            let mut response = Response::builder()
+                .status(status)
+                .header(header::CONTENT_LENGTH, "42")
+                .header(header::TRANSFER_ENCODING, "chunked")
+                .header(header::TRAILER, "expires")
+                .body(EdgeBody::from(b"origin body".to_vec()))
+                .expect("should build response");
+
+            make_response_bodiless(&mut response);
+
+            assert_eq!(
+                response.headers().get(header::TRAILER),
+                None,
+                "{status} must lose Trailer, which egress would refuse to send"
+            );
+            assert_eq!(
+                response.headers().get(header::CONTENT_LENGTH),
+                Some(&HeaderValue::from_static("42")),
+                "{status} must keep the GET representation length"
+            );
+            assert!(
+                response.body().as_bytes().is_some_and(<[u8]>::is_empty),
+                "{status} must carry no body"
+            );
+        }
     }
 
     #[test]
