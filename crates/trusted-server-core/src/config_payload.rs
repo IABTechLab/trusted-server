@@ -98,6 +98,28 @@ fn remove_inactive_secret_references(data: &mut serde_json::Value) {
         }
     }
 
+    if let Some(providers) = data
+        .pointer_mut("/ec/identity_providers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for provider in providers {
+            let Some(provider) = provider.as_object_mut() else {
+                continue;
+            };
+            // `enabled` defaults to true, so only an explicit false disables.
+            let disabled = provider
+                .get("enabled")
+                .is_some_and(|enabled| !json_bool_or_string_is_true(Some(enabled)));
+            if disabled
+                && let Some(secrets) = provider
+                    .get_mut("secrets")
+                    .and_then(serde_json::Value::as_object_mut)
+            {
+                secrets.remove("token");
+            }
+        }
+    }
+
     let Some(datadome) = data
         .pointer_mut("/integrations/datadome")
         .and_then(serde_json::Value::as_object_mut)
@@ -742,6 +764,12 @@ mod tests {
             .ec
             .partners
             .push(partner_with_pull_sync(false, "unused-partner-pull-token"));
+        original.ec.identity_providers.push(
+            toml::from_str(
+                "id = \"example-provider\"\nkind = \"example-kind\"\nenabled = false\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]\nsecrets = { token = \"unused-provider-token\" }",
+            )
+            .expect("should parse disabled provider"),
+        );
 
         let reconstructed = settings_from_config_blob(
             &envelope_json(&original),
@@ -750,6 +778,13 @@ mod tests {
         )
         .expect("should skip inactive optional feature references");
 
+        assert!(
+            reconstructed.ec.identity_providers[0]
+                .secrets
+                .token
+                .is_none(),
+            "should not resolve a disabled provider's token"
+        );
         assert!(reconstructed.tinybird.auction_token_secret.is_none());
         assert!(reconstructed.ec.partners[0].ts_pull_token.is_none());
         let datadome = reconstructed
