@@ -1,9 +1,9 @@
 # Server-to-Server EID Collection — Design Spec
 
 **Date:** 2026-10-30
-**Status:** Draft for Tech Lead review
-**Source of intent:** `S2S_EID_Collection_Requirements.md` (sections referenced
-as "R§n")
+**Status:** Implemented by PR A (#1487); reviewed (see the review log)
+**Source of intent:** the S2S EID collection requirements document, kept
+outside this repository (sections referenced as "R§n")
 
 ## 1. Purpose
 
@@ -226,8 +226,8 @@ browser             TS (navigation)                          providers   KV
 - Cost: the instance stays busy after the response for up to the
   after-response budget, which lowers per-instance throughput when sandboxes
   are reused. Keep the budget no larger than the slowest provider needs.
-- Only the Fastly adapter runs this phase (§2.2). Other adapters do not yet
-  run it, so their `after_response` providers make no lookups.
+- Only the Fastly adapter runs identity providers (§2.2). Other adapters
+  refuse to start with an enabled provider.
 - Cookie reads and generated IDs of an after-response provider also land only
   in the follow-up write, so cookie-only providers should stay `page`.
 
@@ -237,7 +237,7 @@ Exactly one of these, chosen from the request snapshot:
 
 | Situation                               | Write                                                                         |
 | --------------------------------------- | ----------------------------------------------------------------------------- |
-| Consent withdrawn, live row             | Tombstone. No lookups, no ingest. EC cookie and mirror expired.               |
+| Consent withdrawn, live row             | No page-load write; the tombstone follows §3.1. No lookups, no ingest.        |
 | Row tombstoned, no fresh consent        | None. No lookups. Nothing served.                                             |
 | New EC (or orphaned EC being recovered) | Create the row with browser ingest + valid provider results.                  |
 | Returning EC, something changed         | CAS update with browser ingest + valid provider results; expired UIDs pruned. |
@@ -480,14 +480,20 @@ bodies with `// ...`; implementations follow the documentation rules in
 ### 6.3 Stored row
 
 All additions are optional `serde` fields on schema `v: 1`. Rows written before
-this change read unchanged; rows written after it stay readable by older code
-through the retained `uid` field.
+this change read unchanged. Rows written after it stay readable by older code
+through the retained `uid` field, unless that `uid` (the first live provider
+UID) is over 512 bytes: older code rejects such a row whole.
+
+The row also gains `opt_outs`, a map from provider ID to the Unix time until
+which that provider's opt-out is remembered (30 days, §8.3).
 
 `uid` is rewritten on every write to the first live UID of `eids`, and new code
 ignores it when `eids` is non-empty. A known limitation of staying on `v: 1`
 (D12): during a rollout or rollback, older code reads only `uid`, so it can
 serve that UID after its `exp`, and an older writer that re-saves the row drops
-`eids`. Both end at the next write by new code. Stored values are built only by validation
+`eids` and `opt_outs`. A UID served past its `exp` and dropped `eids` end at the
+next write by new code; a dropped opt-out is lost, so that provider is called
+again. Stored values are built only by validation
 (§8.2) or by deserializing rows TS wrote, so their fields are private to the
 `ec` module and exposed through accessors.
 
@@ -739,9 +745,10 @@ pub struct ProviderRequest {
 `(&str, &KvEid)` pairs, keyed by the row's source strings. Provider secrets and settings are not in the
 input: they are given to the provider once, when it is built (§7.3).
 
-`LookupInput` also lends the provider the request's cookies (`cookies`), which
-`IdentityProvider::read_request_cookies` reads into a `CookieRead`. These
-predate this work and are unchanged.
+PR3 ships `LookupInput` without the request's cookies. F1 (#1488) adds
+`LookupInput::cookies` and `IdentityProvider::read_request_cookies`, which
+returns a `CookieRead`; the cookie-first refresh (§5.6), cookie opt-outs (§8.3)
+and scenarios 24 and 26 depend on it.
 
 Response and parsed output:
 
@@ -908,8 +915,9 @@ digest with no constructor reachable from request data in V1.
 
 The coordinator owns, for every provider:
 
-1. **Eligibility.** Provider enabled; EC present or being created; row not
-   tombstoned; at least one due source; sources needing `HashedEmail` removed.
+1. **Eligibility.** Provider enabled; the EC's row exists and is not
+   tombstoned (an EC minted on this navigation, or a cookie EC with no row, is
+   not sent to vendors); at least one due source; sources needing `HashedEmail` removed.
 2. **Consent.** The existing EID-persistence check passes, and the provider's
    `tcf_vendor_id`, when configured, has vendor consent in the effective TCF
    string. A failure skips that provider only, before any request is built.
@@ -1045,12 +1053,6 @@ pub trait IdentityCoordinator {
         pending: PendingLookups<T::Pending>,
     ) -> LookupResults;
 
-    /// Merges browser ingest and lookup results into the navigation's single
-    /// row change.
-    ///
-    /// Returns `None` when the row would not change, so no write is made.
-    fn plan_write(&self, input: &WritePlanInput<'_>) -> Option<RowChange>;
-
     /// Builds the mirror cookie from the row as it stands after this
     /// navigation: the committed row, or the snapshot when no write landed.
     fn mirror(&self, row: Option<&KvEntry>, consent: &ConsentContext, now: UnixSeconds) -> MirrorCookie;
@@ -1106,6 +1108,7 @@ pub enum LookupStatus {
     HttpError(http::StatusCode),
     TransportFailed,
     InvalidResponse,
+    RequestFailed,
     Skipped(SkipReason),
 }
 
@@ -1122,7 +1125,6 @@ pub struct DropCounts {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
-    Disabled,
     Consent,
     NotDue,
     Input,
@@ -1131,7 +1133,8 @@ pub enum SkipReason {
     OptedOut,
 }
 
-/// Inputs to [`IdentityCoordinator::plan_write`].
+/// Inputs to the free function `write_plan::plan_write`, the navigation's
+/// planner (it is not a coordinator method).
 ///
 /// `PartnerIdUpdate` (today `pub(crate)` in `ec::kv`) becomes `pub` so this
 /// public trait input does not leak a private type.
@@ -1214,7 +1217,7 @@ where
     let mut row = ec.snapshot_entry();
     let change = permit
         .confirm(response.status())
-        .zip(coordinator.plan_write(&ec.write_plan(&lookups)));
+        .zip(write_plan::plan_write(&ec.write_plan(&lookups)));
     if let Some((permit, change)) = change {
         // One attempt, never retried (§9.2).
         match graph.commit_page_load(permit, ec.id(), change) {
@@ -1257,7 +1260,11 @@ For each provider with a `Found` outcome and each source in its response:
 - Sources the provider claims but did not return stay unchanged.
 - `NoMatch`, failures, timeouts and skipped providers leave the row unchanged.
 - `OptedOut` (a cookie or a refresh reply) clears every source the provider
-  claims; generated and cookie IDs merge like `Found`.
+  claims and records the opt-out in the row's `opt_outs` map for 30 days. Until
+  it lapses the provider is skipped as `skipped_opted_out` and not called, and
+  a result from a lookup dispatched before the opt-out was recorded is
+  discarded rather than written over it. Generated and cookie IDs merge like
+  `Found`.
 
 Browser ingest (§8.4) is applied in the same in-memory merge, before provider
 results, so the write order never lets browser data overwrite provider data.
@@ -1266,9 +1273,10 @@ results, so the write order never lets browser data overwrite provider data.
 
 Unchanged rules: registered sources only; one UID per source, the first valid
 UID of the last matching entry, with `sharedId` applied last; no EID-level
-fields; fill missing sources only, where a source holding only expired UIDs
-counts as holding UIDs until a write prunes them. New rule: a provider-owned
-source is skipped entirely.
+fields; fill missing sources only; UIDs at most `MAX_UID_LENGTH` (512) bytes.
+The planner prunes expired UIDs first, so a source holding only expired UIDs
+can be filled by the same write. New rule: a provider-owned source is skipped
+entirely.
 
 ### 8.5 Batch sync
 
@@ -1305,7 +1313,7 @@ impl NavigationPermit {
     ///
     /// Called once per request, by the router only.
     #[must_use]
-    pub(crate) fn classify(request: &http::Request<EdgeBody>) -> Option<Self>;
+    pub fn classify(request: &http::Request<EdgeBody>) -> Option<Self>;
 
     /// Confirms the permit once the final response status is known.
     ///
@@ -1381,7 +1389,7 @@ PR5 removes it.
 | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | CAS conflict or store error                         | No retry. Row unchanged. Mirror built from the unchanged row. New EC cookie not set. Counted.                              |
 | Tombstone write fails                               | Bounded CAS retry first. Mirror expired and no IDs served (consent gating). EC cookie kept so the next request retries it. |
-| EC-ID collision on create                           | Same as above; the next navigation generates a new EC.                                                                     |
+| EC-ID collision on create                           | Same as a CAS conflict; the next navigation generates a new EC.                                                            |
 | Provider timeout/outage/invalid                     | That provider's results are dropped; the write proceeds with everything else that is valid.                                |
 | All providers fail                                  | The write proceeds if browser ingest changed anything; otherwise no write.                                                 |
 | Coordinator budget exceeded                         | Late responses dropped; the response is never held past the budget.                                                        |
@@ -1462,7 +1470,7 @@ sources = ["ids.example.com"]
 tcf_vendor_id = 9999
 # Optional: "page" (default) or "after_response" (§5.2.1).
 collect = "page"
-# Optional: most lookups per EC per hour (§8.1); unset means unlimited.
+# Optional: most lookups per EC hash per hour (§8.1); unset means unlimited.
 rate_limit_per_hour = 4
 
 # Secret Store key names, resolved like other secret references.
@@ -1478,10 +1486,18 @@ entry; a source outside the kind's capabilities; a source claimed by two
 enabled providers; an `endpoint` host outside `allowed_domains`; placeholder
 secrets in deploy validation.
 
-The operator CLI's config checks (`ts config validate`, `push` and `diff`)
-also build every enabled provider of a registered kind, as the adapter does
-per navigation, so kind-specific setting errors fail before deploy. Core's
-own validation cannot do this because provider kinds live outside core.
+Validation also rejects an empty or duplicate provider `id`, an empty
+`sources` list, a non-HTTPS `endpoint`, and identity budgets outside 1–1000 ms
+(page) and 1–5000 ms (after-response).
+
+PR3 registers no provider kind, so deploy validation (`ts config validate`,
+`push` and `diff`) rejects every enabled provider; a push therefore cannot
+take a running service down. F1 replaces that rule: the CLI builds every
+enabled provider of a registered kind, as the adapter does at startup, and
+rejects enabled providers for a target adapter that does not run them, so
+kind-specific setting errors fail before deploy. Core's own validation cannot
+do this because provider kinds live outside core. A disabled provider's
+`secrets.token` is not resolved.
 
 Secrets are Secret Store key references, resolved at startup into
 `Redacted<String>` values through the existing secret path. They are never written to cookies or logs, and source-controlled
@@ -1490,7 +1506,7 @@ examples use placeholders.
 ### 12.2 Logs and metrics
 
 Per provider and navigation, one outcome: `found`, `no_match`, `timeout`,
-`http_error`, `transport_error`, `invalid_response`, `skipped_disabled`, `skipped_consent`,
+`http_error`, `transport_error`, `request_error`, `invalid_response`, `skipped_consent`,
 `skipped_not_due`, `skipped_input`, `skipped_rate_limited`, `skipped_opted_out`,
 `destination_rejected`; plus counts of
 entries and UIDs kept and dropped by reason. Per navigation, one write outcome:
@@ -1507,13 +1523,15 @@ truncated form. Raw UIDs, EID values and encrypted envelopes are never logged.
 
 The work below is delivered as two pull requests:
 
-- **PR A** — the work units PR1, PR2 and PR3, stacked on the open platform PR
-  #1433, which provides the deadline-bounded `select_until` that
-  `PlatformLookupTransport` uses.
+- **PR A** — the work units PR1, PR2 and PR3, plus the PR4 batch-sync
+  `provider_owned` rejection, on top of the merged platform PR #1433, which
+  provides the deadline-bounded `select_until` that `PlatformLookupTransport`
+  uses.
 - **PR B** — the work units PR4, PR5 and PR6, stacked on PR A.
 
-PR A and PR B ship in the same release, because PR A alone leaves the old
-post-send pull-sync write as a second write per page load. Within each pull
+PR A alone keeps the old post-send pull-sync write as a separate channel
+(§9), as it is on main; PR A registers no provider kind, so no provider write
+adds to it. PR B removes it. Within each pull
 request the units are separate, ordered commits so they stay reviewable.
 
 | PR  | Title                                    | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Depends on      |
@@ -1528,13 +1546,13 @@ request the units are separate, ordered commits so they stay reviewable.
 
 ### 13.2 Optional and future (Tech Lead decision)
 
-| ID  | Task                              | Notes                                                                                                                                                                     | Depends on |
-| --- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| O1  | tsjs reads the mirror (D6b)       | Reads the mirror, drops expired UIDs, strips `exp`, passes entries to Prebid user IDs. Separate PR.                                                                       | PR6        |
-| F1  | Concrete provider implementations | R§5.1. One spec and one PR per vendor named in R§6, each a module and `build` arm in the provider crate.                                                                  | PR3        |
-| F2  | Provider lookup traffic controls  | R§5.2. Best-effort dedup per EC and provider, bounded no-match caching kept distinct from failures, refresh jitter. Strict cross-instance dedup is a separate decision.   | PR3        |
-| F3  | Per-provider cooldown             | R§5.3. Pause after repeated failures, then probe for recovery.                                                                                                            | PR3        |
-| F4  | Provider debug mode               | R§5.4. A mock `LookupTransport` runs real providers and the real coordinator against configurable responses; no real provider calls, no production KV or cookie mutation. | PR3        |
+| ID  | Task                              | Notes                                                                                                                                                                                                                                                          | Depends on |
+| --- | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| O1  | tsjs reads the mirror (D6b)       | Reads the mirror, drops expired UIDs, strips `exp`, passes entries to Prebid user IDs. Separate PR.                                                                                                                                                            | PR6        |
+| F1  | Concrete provider implementations | R§5.1. One spec and one PR per vendor named in R§6, each a module and `build` arm in the provider crate. Also adds cookie reads to the core coordinator (`LookupInput::cookies`, `read_request_cookies`) and the kind- and adapter-aware deploy check (§12.1). | PR3        |
+| F2  | Provider lookup traffic controls  | R§5.2. Best-effort dedup per EC and provider, bounded no-match caching kept distinct from failures, refresh jitter. Strict cross-instance dedup is a separate decision.                                                                                        | PR3        |
+| F3  | Per-provider cooldown             | R§5.3. Pause after repeated failures, then probe for recovery.                                                                                                                                                                                                 | PR3        |
+| F4  | Provider debug mode               | R§5.4. A mock `LookupTransport` runs real providers and the real coordinator against configurable responses; no real provider calls, no production KV or cookie mutation.                                                                                      | PR3        |
 
 ## 14. Acceptance scenarios
 
@@ -1620,3 +1638,34 @@ request the units are separate, ordered commits so they stay reviewable.
 27. **Refresh state is never served.** A row holds a UID with refresh state.
     → `/auction`, the mirror cookie and `x-ts-eids` carry the UID's `id`,
     `atype` and `ext` only.
+
+## Review log
+
+### Round 1 (2026-11-09, PR #1487)
+
+Reviewer findings and resolutions:
+
+- Withdrawal outside permitted navigations: tombstone moved outside the
+  permit with bounded CAS retry (§3.1).
+- Stored provider UIDs served after vendor consent withdrawal: egress gated on
+  the owning provider's TCF vendor ID.
+- Config blob and 1024-byte UIDs breaking rollback: identity defaults left
+  out of the blob; non-provider writers stay at 512 bytes.
+- Unknown kinds skipped silently, duplicate provider IDs, deeply nested `ext`,
+  batch sync aborting on a full row, minted ECs sent to vendors: fixed.
+- Negative caching, a maximum provider UID lifetime, after-response retry,
+  lenient readers and client EIDs after an opt-out: deferred to follow-up
+  issues.
+
+### Round 2 (2026-11-10/11, PR #1487 at 889159cd6)
+
+- Opt-out race on after-response and confirmation-read adoption: results of
+  an opted-out provider are discarded (§8.3).
+- Size cap: trimming alone plans no write; this navigation's browser UIDs are
+  dropped before any stored record.
+- Lookups only for an EC with an existing consented row (§8.1).
+- Deploy validation rejects enabled providers while no kind is registered;
+  disabled providers' secrets are not resolved (§12.1).
+- Disabled providers keep their vendor-consent gate on stored UIDs; `ext`
+  nesting bounded to 32 levels; raw client IP passed to providers.
+- Spec drift corrected (§5.3, §6.3, §7, §8.4, §9.2, §12, §13).
