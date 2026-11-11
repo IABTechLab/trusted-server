@@ -644,7 +644,7 @@ test('rejects every planted operator value, including inside binary data', () =>
   )
   assert.throws(() => checkBinary(Buffer.alloc(0)), /empty/)
 })
-test('merges independent graphs without colliding references and binds binary bytes', () => {
+test('merges independent inventories without colliding references', () => {
   const bom = (name) => ({
     bomFormat: 'CycloneDX',
     specVersion: '1.5',
@@ -680,8 +680,6 @@ test('merges independent graphs without colliding references and binds binary by
   assert.equal(output.metadata.component.version, '1.2.3')
   // The root's nested components are listed once, at the top level.
   assert.equal(output.metadata.component.components, undefined)
-  assert.equal(output.metadata.component.hashes[0].alg, 'SHA-256')
-  assert.equal(output.metadata.component.hashes[0].content.length, 64)
   assert.equal(output.dependencies, undefined)
   assert.equal(
     new Set(output.components.map((c) => c['bom-ref'])).size,
@@ -703,6 +701,13 @@ test('merges independent graphs without colliding references and binds binary by
     names(output.components).sort(),
     ['cargo-dependency', 'cargo-nested', 'npm', 'npm-dependency', 'npm-nested'],
     'should keep every Cargo and npm component'
+  )
+  assert.match(
+    output.metadata.properties.find(
+      (entry) => entry.name === 'trusted-server:coverage'
+    )?.value ?? '',
+    /Complete composition is Phase 2\./,
+    'should carry the conservative coverage statement'
   )
 })
 test('workflow signs only tags, separates privileged jobs, and never checks out in signing', () => {
@@ -1182,6 +1187,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'identity-never',
     'large-sbom-output',
     'publication-disabled',
+    'invalid-repository',
+    'invalid-source',
     'prerelease-mismatch',
     'draft',
     'draft-page-2',
@@ -1242,6 +1249,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         ? { fixture: asset, padding: 'x'.repeat(2 * 1024 * 1024) }
         : { fixture: asset }
     const waits = [],
+      warnings = [],
       logs = [],
       // Retried reads catch every error, so a failed stub assertion is also
       // recorded here.
@@ -1614,16 +1622,17 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           ]),
           'should verify only the current tag within the post-publish window'
         )
-        // The failed verification runs until its command timeout.
+        // The failed verification ends 2s before the window closes, so the
+        // next 2s wait would reach the deadline.
         if (mode === 'attestation-past-deadline') {
-          now += args[2].timeout
-          throw Error('no attestations for tag')
+          now += args[2].timeout - 2000
+          throw Error('no attestations for tag\n')
         }
         if (
           mode === 'attestation-never' ||
           (mode === 'attestation-late' && verifies <= 2)
         )
-          throw Error('no attestations for tag')
+          throw Error('no attestations for tag\n')
         if (mode === 'attestation-malformed') return Buffer.from('{}')
         return Buffer.from(
           JSON.stringify({ verificationResult: { statement: statement() } })
@@ -1632,12 +1641,13 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       const execute = () =>
         publish({
           env: {
-            GH_REPO: 'example/project',
+            GH_REPO:
+              mode === 'invalid-repository' ? 'example' : 'example/project',
             GH_TOKEN: 'fixture-token',
             RELEASE_TAG: tag,
             RELEASE_PUBLICATION_ENABLED:
               mode === 'publication-disabled' ? 'false' : 'true',
-            SOURCE_COMMIT: 'a'.repeat(40),
+            SOURCE_COMMIT: 'a'.repeat(mode === 'invalid-source' ? 39 : 40),
           },
           root,
           fetch,
@@ -1648,7 +1658,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             now += delay
           },
           log: (...args) => logs.push(args.join(' ')),
-          warn: () => {},
+          warn: (...args) => warnings.push(args.join(' ')),
         })
       const successful = [
         'success',
@@ -1665,6 +1675,10 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         cause.test(error.cause?.message)
       const expectedError = {
         'non-semver-tag': /Invalid repository or tag/,
+        'invalid-repository': /Invalid repository or tag/,
+        'invalid-source': /Invalid source commit/,
+        'empty-bundle': /Invalid file/,
+        'upload-error': /Asset upload failed/,
         'build-metadata-tag': /Invalid repository or tag/,
         'leading-zero-tag': /Invalid repository or tag/,
         'upload-size': /Upload mismatch/,
@@ -1694,18 +1708,18 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           'Release attestation verification',
           /no attestations/
         ),
-        'attestation-malformed': /Malformed release attestation statement/,
-        'attestation-wrong-tag-shape':
-          /Malformed release attestation statement/,
+        'attestation-malformed': /Release attestation statement mismatch/,
+        'attestation-wrong-tag-shape': /Release attestation statement mismatch/,
         'attestation-wrong-repository':
-          /Malformed release attestation statement/,
-        'attestation-wrong-source': /Invalid release attestation subjects/,
-        'attestation-duplicate-subject': /Invalid release attestation subjects/,
-        'attestation-wrong-tag': /identity or assets mismatch/,
-        'attestation-wrong-id': /identity or assets mismatch/,
-        'attestation-wrong-assets': /identity or assets mismatch/,
-        'attestation-missing-asset': /identity or assets mismatch/,
-        'attestation-extra-asset': /identity or assets mismatch/,
+          /Release attestation statement mismatch/,
+        'attestation-wrong-source': /Release attestation statement mismatch/,
+        'attestation-duplicate-subject':
+          /Release attestation statement mismatch/,
+        'attestation-wrong-tag': /Release attestation statement mismatch/,
+        'attestation-wrong-id': /Release attestation statement mismatch/,
+        'attestation-wrong-assets': /Release attestation statement mismatch/,
+        'attestation-missing-asset': /Release attestation statement mismatch/,
+        'attestation-extra-asset': /Release attestation statement mismatch/,
       }[mode]
       if (successful) await execute()
       else await assert.rejects(execute, expectedError, mode)
@@ -1722,6 +1736,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           'missing-tag',
           'malformed-tag',
           'publication-disabled',
+          'invalid-repository',
+          'invalid-source',
           'api-error',
           'missing',
           'extra',
@@ -1784,6 +1800,15 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           'attestation-late': [2000, 5000],
           'attestation-never': [2000, 5000, 10000, 20000],
         }[mode] ?? [],
+        mode
+      )
+      // The job log records every wait.
+      assert.deepEqual(
+        warnings.map((line) => {
+          assert.doesNotMatch(line, /\n/, 'should log each wait on one line')
+          return Number(/retry in (\d+)ms$/.exec(line)?.[1])
+        }),
+        waits,
         mode
       )
       assert.equal(
@@ -1932,9 +1957,19 @@ test('SPDX rejects lost or ambiguous package identities', () => {
     (d) => {
       d.spdxVersion = 'SPDX-2.2'
     },
+    (d) => {
+      d.SPDXID = 'SPDXRef-Other'
+    },
+    (d) => {
+      d.packages[0].name = 'other-package'
+    },
+    // Two inventory components cannot share one SPDX package.
+    (d, o) => {
+      o.components.push({ ...o.components[0] })
+    },
   ]) {
     const { document, original } = spdxFixture()
-    mutate(document)
+    mutate(document, original)
     assert.throws(
       () => completeSpdx(document, binary, original),
       /SPDX (2\.3 document|package identity|package identifier|lost component)/
@@ -2031,6 +2066,21 @@ test('release command line checks binaries, final bytes and SPDX output', () => 
     const rescanned = run('validate-spdx', spdx, planted, inventory)
     assert.equal(rescanned.status, 1, 'should rescan the final binary')
     assert.match(rescanned.stderr, /planted operator configuration/)
+    write('sbom.spdx.json', JSON.stringify(document))
+    const uncovered = write(
+      'uncovered.cdx.json',
+      JSON.stringify(spdxFixture().original)
+    )
+    const refusedCoverage = run('validate-spdx', spdx, clean, uncovered)
+    assert.equal(
+      refusedCoverage.status,
+      1,
+      'should refuse an inventory without coverage'
+    )
+    assert.match(
+      refusedCoverage.stderr,
+      /Missing conservative inventory coverage/
+    )
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -2186,6 +2236,50 @@ test('rejects non-Mach-O, wrong CPU and newer or absent macOS floor', () => {
       () => checkReleaseFormat(b, 'aarch64-apple-darwin'),
       /Mach-O|macOS/
     )
+  // Each LC_BUILD_VERSION guard fails closed, as does a binary that carries
+  // only LC_VERSION_MIN_MACOSX, even one naming 13.0.
+  const variant = (length, change) => {
+    const b = Buffer.alloc(length)
+    macho().copy(b)
+    change(b)
+    return b
+  }
+  for (const [name, b] of [
+    ['iOS platform', variant(56, (b) => b.writeUInt32LE(2, 40))],
+    [
+      '16-byte LC_BUILD_VERSION',
+      variant(56, (b) => {
+        b.writeUInt32LE(16, 20)
+        b.writeUInt32LE(16, 36)
+      }),
+    ],
+    [
+      'LC_VERSION_MIN_MACOSX only',
+      variant(56, (b) => {
+        b.writeUInt32LE(16, 20)
+        b.writeUInt32LE(0x24, 32)
+        b.writeUInt32LE(16, 36)
+        b.writeUInt32LE(0x000d0000, 40)
+      }),
+    ],
+    [
+      'duplicate LC_BUILD_VERSION',
+      variant(80, (b) => {
+        b.writeUInt32LE(2, 16)
+        b.writeUInt32LE(48, 20)
+        b.copy(b, 56, 32, 56)
+      }),
+    ],
+    [
+      'sizeofcmds past the last command',
+      variant(64, (b) => b.writeUInt32LE(32, 20)),
+    ],
+  ])
+    assert.throws(
+      () => checkReleaseFormat(b, 'aarch64-apple-darwin'),
+      /macOS/,
+      `should refuse ${name}`
+    )
 })
 test('workflows build, sign and publish exactly the release assets and restrict their jobs', () => {
   const names = [...releaseAssets].sort()
@@ -2279,7 +2373,8 @@ test('workflows build, sign and publish exactly the release assets and restrict 
   )
   assert.match(clean, /^env -i PATH="\$PATH" /m)
   assert.deepEqual(
-    [...clean.matchAll(/\b([A-Z_]+)="/g)].map((match) => match[1]),
+    // Any assignment, quoted or not.
+    [...clean.matchAll(/(?:^|\s)(\w+)=/gm)].map((match) => match[1]),
     [
       'PATH',
       'HOME',
@@ -2295,6 +2390,11 @@ test('workflows build, sign and publish exactly the release assets and restrict 
   assert.match(
     sign,
     /subject-path: \$\{\{ steps\.inputs\.outputs\.subjects \}\}\n/
+  )
+  // The SBOM attestation binds the SPDX document to the binary.
+  assert.match(
+    sign,
+    /subject-path: release-assets\/\$\{\{ matrix\.asset \}\}\n {10}sbom-path: release-assets\/\$\{\{ matrix\.asset \}\}\.spdx\.json\n/
   )
   // The branch check needs every branch's history.
   assert.match(
