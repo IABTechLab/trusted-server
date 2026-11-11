@@ -87,7 +87,18 @@ pub(crate) fn post_admin_json(
             .body(body)
             .send()
             .await
-            .map_err(|error| format!("could not reach {endpoint}: {error}"))?;
+            .map_err(|error| {
+                if error.is_connect() {
+                    format!("could not reach {endpoint}: {error}")
+                } else {
+                    // The request may have been delivered: a key rotation is not idempotent, so
+                    // the operator must check before retrying rather than assume nothing ran.
+                    format!(
+                        "sent the request to {endpoint} but got no response ({error}); the \
+                         service may have applied it, so check its state before retrying"
+                    )
+                }
+            })?;
         let status = response.status();
         let body = response
             .text()

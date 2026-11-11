@@ -457,3 +457,72 @@ fn an_empty_remaining_list_reads_as_unknown() {
         "should not claim that no keys remain: {rendered}"
     );
 }
+
+#[test]
+fn service_text_in_a_failure_cannot_drive_the_terminal() {
+    let forged = "\u{1b}[2K\rkey deletion succeeded";
+    for (status, body, kept) in [
+        (
+            500u16,
+            serde_json::json!({"success": false, "error": forged}).to_string(),
+            "key deletion succeeded",
+        ),
+        (
+            502,
+            format!("upstream error{forged}\nsecond line"),
+            "\nsecond line",
+        ),
+    ] {
+        let server = FixtureServer::start(move |_request| {
+            FixtureResponse::html(body.clone()).with_status(status)
+        });
+
+        let (outcome, _) = run_with(
+            rotate(&server, None),
+            &mut ScriptedConfirm::new(false, false),
+        );
+
+        let error = outcome.expect_err("should exit non-zero on a failure");
+        assert!(
+            !error.contains('\u{1b}') && !error.contains('\r'),
+            "should escape control characters from the service: {error:?}"
+        );
+        assert!(
+            error.contains(kept),
+            "should still show the service's text and line breaks: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn kids_from_the_service_cannot_drive_the_terminal() {
+    let forged = "ts-2024-02-01\u{1b}[2K\rforged";
+    let server = FixtureServer::start(move |request| {
+        let body = if request.path == "/_ts/admin/keys/rotate" {
+            serde_json::json!({
+                "success": true,
+                "new_kid": forged,
+                "previous_kid": forged,
+                "active_kids": [forged],
+            })
+        } else {
+            serde_json::json!({
+                "success": true,
+                "deactivated_kid": forged,
+                "deleted": false,
+                "remaining_active_kids": [forged],
+            })
+        };
+        FixtureResponse::html(body.to_string())
+    });
+
+    for command in [rotate(&server, None), deactivate(&server, false, false)] {
+        let (outcome, rendered) = run_with(command, &mut ScriptedConfirm::new(false, false));
+
+        outcome.expect("should succeed");
+        assert!(
+            !rendered.contains('\u{1b}') && !rendered.contains('\r'),
+            "should escape control characters in kids from the service: {rendered:?}"
+        );
+    }
+}

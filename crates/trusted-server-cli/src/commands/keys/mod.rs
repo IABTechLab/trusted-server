@@ -10,6 +10,7 @@ use std::io::{BufRead, IsTerminal as _, Write};
 use clap::Subcommand;
 use serde::Deserialize;
 
+use crate::ad_templates::output::escape_terminal_text;
 use crate::admin_client::{AdminResponse, UNAUTHORIZED_HINT, admin_password, post_admin_json};
 use crate::error::{CliResult, cli_error};
 
@@ -175,9 +176,9 @@ fn run_rotate(args: &RotateArgs, out: &mut impl Write) -> CliResult<()> {
     writeln!(
         out,
         "new kid: {}\nprevious kid: {}\nactive kids: {}",
-        parsed.new_kid,
-        parsed.previous_kid.as_deref().unwrap_or("(none)"),
-        join_kids(&parsed.active_kids),
+        escape_terminal_text(&parsed.new_kid),
+        escape_terminal_text(parsed.previous_kid.as_deref().unwrap_or("(none)")),
+        escape_terminal_text(&join_kids(&parsed.active_kids)),
     )
     .map_err(|error| format!("failed to write the rotation result: {error}"))
 }
@@ -194,8 +195,8 @@ fn run_deactivate(
         admin_password()?;
         if !confirm.is_interactive() {
             return cli_error(
-                "--delete removes the key from storage permanently; pass --yes to confirm \
-                 a non-interactive delete",
+                "--delete removes the key from storage permanently; stdin or stderr is not a \
+                 terminal, so pass --yes to confirm the delete",
             );
         }
         let question = format!(
@@ -229,9 +230,10 @@ fn run_deactivate(
     };
     writeln!(
         out,
-        "deactivated kid: {}\ndeleted: {}\nremaining active kids: {remaining}",
-        parsed.deactivated_kid,
+        "deactivated kid: {}\ndeleted: {}\nremaining active kids: {}",
+        escape_terminal_text(&parsed.deactivated_kid),
         if parsed.deleted { "yes" } else { "no" },
+        escape_terminal_text(&remaining),
     )
     .map_err(|error| format!("failed to write the deactivation result: {error}"))
 }
@@ -272,6 +274,14 @@ where
         .ok()
         .and_then(|failure| failure.error.or(failure.message))
         .unwrap_or_else(|| response.body.trim().to_owned());
+    // The service, or anything in front of it, chooses these bytes, and JSON can carry a
+    // control character as `\u001b`. Escape after decoding so control sequences print as
+    // text, line by line so a multi-line body (such as an adapter's 501) keeps its breaks.
+    let detail = detail
+        .lines()
+        .map(|line| escape_terminal_text(line).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
     if detail.is_empty() {
         cli_error(format!("{operation} failed: {status}{hint}"))
     } else {
