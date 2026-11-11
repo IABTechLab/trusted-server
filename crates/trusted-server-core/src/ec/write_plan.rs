@@ -8,6 +8,8 @@
 //! source the provider cleared on an opt-out is never refilled from the
 //! browser's `ts-eids` cookie.
 
+use std::collections::btree_map;
+
 use super::EcKvSnapshot;
 use super::coordinator::results::{LookupResults, LookupStatus, SkipReason};
 use super::eid_types::{SourceDomain, UnixSeconds};
@@ -71,7 +73,7 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
     let pruned = entry.clone();
 
     let lookups_apply = input.lookups.is_for(input.ec_id);
-    apply_browser_ingest(&mut entry, input.browser_ingest, input.registry);
+    let ingested = apply_browser_ingest(&mut entry, input.browser_ingest, input.registry);
     let written = if lookups_apply {
         apply_lookups(&mut entry, input.lookups, input.now)
     } else {
@@ -83,9 +85,10 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
         }
         Vec::new()
     };
-    enforce_size_cap(&mut entry, &written);
-    // Compared after the cap, which may trim the only real change away.
-    let changed = entry != pruned;
+    let had_change = entry != pruned;
+    enforce_size_cap(&mut entry, &written, &ingested);
+    // The cap may trim the only real change away; trimming alone never writes.
+    let changed = had_change && entry != pruned;
 
     match expected {
         None => Some(RowChange::Create(entry)),
@@ -95,11 +98,14 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
 }
 
 /// Fills missing sources from the browser, skipping provider-owned ones.
+///
+/// Returns the sources it inserted, in insertion order.
 fn apply_browser_ingest(
     entry: &mut KvEntry,
     updates: &[PartnerIdUpdate],
     registry: &PartnerRegistry,
-) {
+) -> Vec<String> {
+    let mut ingested = Vec::new();
     for update in updates {
         if registry.is_provider_owned(&update.partner_id) {
             log::trace!(
@@ -108,11 +114,12 @@ fn apply_browser_ingest(
             );
             continue;
         }
-        entry
-            .ids
-            .entry(update.partner_id.clone())
-            .or_insert_with(|| KvPartnerId::single(update.uid.clone()));
+        if let btree_map::Entry::Vacant(slot) = entry.ids.entry(update.partner_id.clone()) {
+            slot.insert(KvPartnerId::single(update.uid.clone()));
+            ingested.push(update.partner_id.clone());
+        }
     }
+    ingested
 }
 
 fn apply_lookups(
@@ -122,6 +129,17 @@ fn apply_lookups(
 ) -> Vec<SourceDomain> {
     let mut written = Vec::new();
     for lookup in lookups.iter() {
+        // A newer request may have recorded this provider's opt-out after
+        // the lookup was dispatched; never restore its UIDs over it.
+        if entry.opted_out(&lookup.provider, now)
+            && lookup.status != LookupStatus::Skipped(SkipReason::OptedOut)
+        {
+            log::info!(
+                "EC write planner: discarding results of opted-out provider '{}'",
+                lookup.provider
+            );
+            continue;
+        }
         for (source, eids) in &lookup.entries {
             if let Some(record) = KvPartnerId::from_eids(eids.clone(), now) {
                 entry.ids.insert(source.as_str().to_owned(), record);
@@ -162,7 +180,7 @@ fn member_len(source: &str, record: &KvPartnerId) -> usize {
 /// Tracks the row size by the bytes each drop removes and serializes the
 /// whole row again only when that estimate reaches the cap, so the cost is
 /// linear in the number of dropped UIDs and records.
-fn enforce_size_cap(entry: &mut KvEntry, written: &[SourceDomain]) {
+fn enforce_size_cap(entry: &mut KvEntry, written: &[SourceDomain], ingested: &[String]) {
     let mut size = serialized_len(entry);
     // Drop this navigation's provider UIDs first, newest source last-in first.
     while size > MAX_ENTRY_BYTES {
@@ -191,11 +209,28 @@ fn enforce_size_cap(entry: &mut KvEntry, written: &[SourceDomain]) {
             size = serialized_len(entry);
         }
     }
+    // Then this navigation's browser UIDs, newest first: the browser offers
+    // them again, while a stored record would be lost.
+    for source in ingested.iter().rev() {
+        if size <= MAX_ENTRY_BYTES {
+            break;
+        }
+        if let Some(record) = entry.ids.remove(source) {
+            log::info!(
+                "EC write planner: dropping browser UID for '{source}' to fit the row size cap"
+            );
+            size = size.saturating_sub(member_len(source, &record));
+            if size <= MAX_ENTRY_BYTES {
+                size = serialized_len(entry);
+            }
+        }
+    }
     if size <= MAX_ENTRY_BYTES {
         return;
     }
-    // No provider UIDs from this navigation are left: drop whole records,
-    // largest first, so every later write still fits the cap.
+    // Only a row that was already over the cap (written before the cap
+    // existed) gets here: drop whole records, largest first, so every later
+    // write still fits the cap.
     let mut by_size: Vec<(usize, String)> = entry
         .ids
         .iter()
@@ -853,5 +888,102 @@ mod tests {
         let record = &entry.ids["ids.example.com"];
         assert_eq!(record.uid, "p-1", "should replace the fallback");
         assert!(record.is_provider_written(), "should store provider eids");
+    }
+
+    fn over_cap_legacy_entry() -> KvEntry {
+        let mut entry = live_entry();
+        for i in 0..40 {
+            entry.ids.insert(
+                format!("source{i:02}.example.com"),
+                KvPartnerId::single(format!("{i:03}{}", "x".repeat(500))),
+            );
+        }
+        entry
+    }
+
+    #[test]
+    fn over_cap_row_with_no_change_plans_no_write() {
+        // Arrange: a row written before the cap existed.
+        let registry = registry(&[]);
+        let entry = over_cap_legacy_entry();
+        assert!(
+            serde_json::to_vec(&entry).expect("should serialize").len() > MAX_ENTRY_BYTES,
+            "should start over the cap"
+        );
+        let lookups = LookupResults::default();
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: EC_ID.to_owned(),
+            entry: Box::new(entry),
+            generation: Some(1),
+        };
+
+        // Act
+        let change = plan_write(&input(&snapshot, None, &[], &lookups, &registry));
+
+        // Assert
+        assert!(
+            change.is_none(),
+            "should not write when only the cap would trim"
+        );
+    }
+
+    #[test]
+    fn browser_ingest_never_evicts_a_stored_record_to_fit() {
+        // Arrange: a stored provider record plus fillers, just under the cap.
+        let registry = registry(&["ids.example.com"]);
+        let big: Vec<String> = (0..18)
+            .map(|i| format!("{i:03}{}", "x".repeat(500)))
+            .collect();
+        let ids: Vec<&str> = big.iter().map(String::as_str).collect();
+        let mut entry = provider_entry(&ids);
+        let mut filler = 0;
+        loop {
+            let mut candidate = entry.clone();
+            candidate.ids.insert(
+                format!("filler{filler:03}.example.com"),
+                KvPartnerId::single("f".repeat(100)),
+            );
+            if serde_json::to_vec(&candidate)
+                .expect("should serialize")
+                .len()
+                > MAX_ENTRY_BYTES - 200
+            {
+                break;
+            }
+            entry = candidate;
+            filler += 1;
+        }
+        let ingest = [PartnerIdUpdate::new("browser.example.com", "b".repeat(500))];
+        let lookups = LookupResults::default();
+
+        // Act
+        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+
+        // Assert: the browser UID is dropped, so nothing changes.
+        assert!(
+            change.is_none(),
+            "should drop the new browser UID rather than evict a stored record"
+        );
+    }
+
+    #[test]
+    fn found_result_never_restores_uids_over_a_newer_opt_out() {
+        // Arrange: another request recorded the opt-out after this lookup ran.
+        let registry = registry(&["ids.example.com"]);
+        let mut entry = live_entry();
+        entry.opt_outs.insert(
+            ProviderId::new("example-provider"),
+            2000 + OPT_OUT_MEMORY_SECONDS,
+        );
+        let lookups = found("ids.example.com", &["p-restored"]);
+
+        // Act
+        let change = plan_write(&input(&present(&entry), None, &[], &lookups, &registry));
+
+        // Assert
+        assert!(
+            change.is_none(),
+            "should not write the opted-out provider's older result"
+        );
     }
 }

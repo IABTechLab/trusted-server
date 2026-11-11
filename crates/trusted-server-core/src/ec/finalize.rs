@@ -250,14 +250,20 @@ fn commit_returning(
 
 /// Writes the planned update for a returning EC whose row snapshot is held.
 ///
-/// Returns `false` only when a planned write failed.
+/// Returns `false` when a planned write failed, or when there was nothing to
+/// write because the row is withdrawn.
 fn update_returning(
     commit: &PageLoadCommit<'_>,
     ec_context: &mut EcContext,
     permit: PageLoadWrite,
 ) -> bool {
     let Some(change) = commit.plan(ec_context, commit.ec_id, ec_context.kv_snapshot(), None) else {
-        return true;
+        // Nothing to write. A withdrawn row is not live and must not unlock
+        // the follow-up write.
+        return ec_context
+            .kv_snapshot()
+            .entry_for(commit.ec_id)
+            .is_none_or(|entry| entry.consent.ok);
     };
     match commit.graph.commit_page_load(permit, commit.ec_id, change) {
         Ok(committed) => {
@@ -797,9 +803,9 @@ mod tests {
 
     #[test]
     fn withdrawal_keeps_the_cookie_when_the_tombstone_write_fails() {
-        // A failed tombstone write is not retried. The EC cookie is kept so the
-        // next navigation can still write the tombstone; clearing it would
-        // orphan a live row (spec §9.2).
+        // A tombstone write that still fails after its bounded CAS retries
+        // keeps the EC cookie, so the next request that carries it retries;
+        // clearing it would orphan a live row (spec §9.2).
         let settings = create_test_settings();
         let ec_id = sample_ec_id("dead01");
         let consent = ConsentContext {
@@ -2896,6 +2902,101 @@ mod tests {
         assert!(
             ec_context.take_after_response_permit().is_none(),
             "should not allow after-response lookups when the page phase failed"
+        );
+    }
+
+    #[test]
+    fn finalize_withholds_after_response_lookups_on_a_tombstoned_row() {
+        // Arrange: a consented navigation reads a withdrawn row.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("after4");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        graph
+            .create(&ec_id, &KvEntry::tombstone(1000))
+            .expect("should seed the tombstone");
+        let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), true);
+        let mut response = empty_response();
+
+        // Act
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        // Assert
+        assert!(
+            ec_context.take_after_response_permit().is_none(),
+            "should not allow after-response lookups for a withdrawn row"
+        );
+    }
+
+    #[test]
+    fn finalize_adopted_row_keeps_a_concurrent_provider_opt_out() {
+        // Arrange: the preload missed the row; meanwhile another request
+        // recorded provider P's opt-out on it, and P's lookup found a UID.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("optout");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let provider = ProviderId::new("example-provider");
+        let mut live = live_entry();
+        live.opt_outs
+            .insert(provider.clone(), current_timestamp() + 86_400);
+        graph.create(&ec_id, &live).expect("should seed the row");
+        let mut ec_context = returning_user_context(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+            true,
+        );
+        let uid = KvUid::new(
+            UidValue::try_from("p-restored").expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(provider.clone()),
+            Expiry::Never,
+        );
+        ec_context.set_lookup_results(LookupResults::new(
+            &ec_id,
+            vec![ProviderLookup {
+                provider,
+                status: LookupStatus::Found {
+                    kept: 1,
+                    dropped: DropCounts::default(),
+                },
+                entries: vec![(
+                    SourceDomain::try_from("provider.example.com").expect("should build source"),
+                    vec![KvEid::new(EidFields::default(), vec![uid])],
+                )],
+                cleared: Vec::new(),
+            }],
+        ));
+        let mut response = empty_response();
+
+        // Act
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry_for("provider.example.com"),
+            None,
+            None,
+            &mut response,
+        );
+
+        // Assert
+        let (entry, _) = graph
+            .get(&ec_id)
+            .expect("should read row")
+            .expect("should keep row");
+        assert!(
+            !entry.ids.contains_key("provider.example.com"),
+            "should not restore the opted-out provider's UID"
         );
     }
 }
