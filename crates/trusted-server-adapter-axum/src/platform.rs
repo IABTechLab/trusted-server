@@ -58,6 +58,7 @@ fn secret_env_var(store_name: &str, key: &str) -> String {
 /// Write operations are unsupported in local development.
 pub struct AxumPlatformConfigStore;
 
+#[async_trait(?Send)]
 impl PlatformConfigStore for AxumPlatformConfigStore {
     fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
         let var_name = config_env_var(store_name.as_ref(), key);
@@ -68,7 +69,7 @@ impl PlatformConfigStore for AxumPlatformConfigStore {
         })
     }
 
-    fn put(
+    async fn put(
         &self,
         store_id: &StoreId,
         key: &str,
@@ -84,7 +85,7 @@ impl PlatformConfigStore for AxumPlatformConfigStore {
             .attach("config store writes are not supported on the Axum dev server"))
     }
 
-    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
         log::warn!(
             "AxumPlatformConfigStore: delete from store '{}' key '{}' ignored \
              (config store deletes are not supported on the Axum dev server)",
@@ -106,6 +107,7 @@ impl PlatformConfigStore for AxumPlatformConfigStore {
 /// Write operations are unsupported in local development.
 pub struct AxumPlatformSecretStore;
 
+#[async_trait(?Send)]
 impl PlatformSecretStore for AxumPlatformSecretStore {
     fn get_bytes(
         &self,
@@ -122,7 +124,7 @@ impl PlatformSecretStore for AxumPlatformSecretStore {
             })
     }
 
-    fn create(
+    async fn create(
         &self,
         store_id: &StoreId,
         name: &str,
@@ -138,7 +140,7 @@ impl PlatformSecretStore for AxumPlatformSecretStore {
             .attach("secret store writes are not supported on the Axum dev server"))
     }
 
-    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
         log::warn!(
             "AxumPlatformSecretStore: delete '{}' from store '{}' ignored \
              (secret store deletes are not supported on the Axum dev server)",

@@ -308,7 +308,10 @@ pub async fn handle_rotate_key(
     } else {
         Ok(())
     };
-    let result = validation_result.and_then(|()| manager.rotate_key(services, rotate_req.kid));
+    let result = match validation_result {
+        Ok(()) => manager.rotate_key(services, rotate_req.kid).await,
+        Err(error) => Err(error),
+    };
 
     match result {
         Ok(result) => {
@@ -425,13 +428,11 @@ pub async fn handle_deactivate_key(
     // validation rules (e.g. digit- or uppercase-leading) can still be
     // deactivated or deleted. The stricter validate_kid only gates new key
     // creation/rotation.
-    let result = validate_kid_format(&deactivate_req.kid).and_then(|()| {
-        if deactivate_req.delete {
-            manager.delete_key(services, &deactivate_req.kid)
-        } else {
-            manager.deactivate_key(services, &deactivate_req.kid)
-        }
-    });
+    let result = match validate_kid_format(&deactivate_req.kid) {
+        Ok(()) if deactivate_req.delete => manager.delete_key(services, &deactivate_req.kid).await,
+        Ok(()) => manager.deactivate_key(services, &deactivate_req.kid).await,
+        Err(error) => Err(error),
+    };
 
     match result {
         Ok(()) => {
@@ -553,6 +554,7 @@ mod tests {
     /// Config store stub that returns a minimal JWKS with one Ed25519 key.
     struct StubJwksConfigStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for StubJwksConfigStore {
         fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
             match key {
@@ -565,11 +567,11 @@ mod tests {
             }
         }
 
-        fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+        async fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
     }

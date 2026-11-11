@@ -675,6 +675,7 @@ pub mod nextjs_auction {
 
     struct FixtureStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for FixtureStore {
         fn get(
             &self,
@@ -684,7 +685,7 @@ pub mod nextjs_auction {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn put(
+        async fn put(
             &self,
             _store_id: &StoreId,
             _key: &str,
@@ -693,11 +694,16 @@ pub mod nextjs_auction {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for FixtureStore {
         fn get_bytes(
             &self,
@@ -707,7 +713,7 @@ pub mod nextjs_auction {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -716,7 +722,11 @@ pub mod nextjs_auction {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
     }

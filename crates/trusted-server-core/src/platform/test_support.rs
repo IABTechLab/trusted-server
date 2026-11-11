@@ -19,12 +19,13 @@ use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
 
 pub(crate) struct NoopConfigStore;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformConfigStore for NoopConfigStore {
     fn get(&self, _store_name: &StoreName, _key: &str) -> Result<String, Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
     }
 
-    fn put(
+    async fn put(
         &self,
         _store_id: &StoreId,
         _key: &str,
@@ -33,13 +34,14 @@ impl PlatformConfigStore for NoopConfigStore {
         Err(Report::new(PlatformError::Unsupported))
     }
 
-    fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
     }
 }
 
 pub(crate) struct NoopSecretStore;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformSecretStore for NoopSecretStore {
     fn get_bytes(
         &self,
@@ -49,7 +51,7 @@ impl PlatformSecretStore for NoopSecretStore {
         Err(Report::new(PlatformError::Unsupported))
     }
 
-    fn create(
+    async fn create(
         &self,
         _store_id: &StoreId,
         _name: &str,
@@ -58,7 +60,7 @@ impl PlatformSecretStore for NoopSecretStore {
         Err(Report::new(PlatformError::Unsupported))
     }
 
-    fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
     }
 }
@@ -73,6 +75,7 @@ impl HashMapConfigStore {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl PlatformConfigStore for HashMapConfigStore {
     fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
         self.data
@@ -81,7 +84,7 @@ impl PlatformConfigStore for HashMapConfigStore {
             .ok_or_else(|| Report::new(PlatformError::ConfigStore))
     }
 
-    fn put(
+    async fn put(
         &self,
         _store_id: &StoreId,
         _key: &str,
@@ -90,7 +93,7 @@ impl PlatformConfigStore for HashMapConfigStore {
         Err(Report::new(PlatformError::Unsupported))
     }
 
-    fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
     }
 }
@@ -105,6 +108,7 @@ impl HashMapSecretStore {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl PlatformSecretStore for HashMapSecretStore {
     fn get_bytes(
         &self,
@@ -117,7 +121,7 @@ impl PlatformSecretStore for HashMapSecretStore {
             .ok_or_else(|| Report::new(PlatformError::SecretStore))
     }
 
-    fn create(
+    async fn create(
         &self,
         _store_id: &StoreId,
         _name: &str,
@@ -126,7 +130,7 @@ impl PlatformSecretStore for HashMapSecretStore {
         Err(Report::new(PlatformError::Unsupported))
     }
 
-    fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
     }
 }

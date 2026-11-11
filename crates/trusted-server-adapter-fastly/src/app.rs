@@ -216,8 +216,8 @@ pub(crate) fn load_settings_from_config_store(
     stores: &RuntimeStoreConfig,
 ) -> Result<Settings, Report<TrustedServerError>> {
     get_settings_from_config_store(
-        &FastlyPlatformConfigStore,
-        &FastlyPlatformSecretStore,
+        &FastlyPlatformConfigStore::read_only(),
+        &FastlyPlatformSecretStore::read_only(),
         &stores.config_store_name,
         &stores.config_key,
         &stores.secret_store_name,
@@ -262,6 +262,7 @@ pub(crate) fn build_state_from_settings(
 ///
 /// The outbound client is the one `EdgeZero`'s Fastly request conversion
 /// installs in the request context, with the proxy marker turned off. The
+/// config and secret stores make their management API writes through it. The
 /// clock is the context's monotonic clock.
 ///
 /// # Errors
@@ -293,8 +294,12 @@ fn build_per_request_services(
         .with_proxy_marker(false);
 
     Ok(RuntimeServices::builder()
-        .config_store(Arc::new(FastlyPlatformConfigStore))
-        .secret_store(Arc::new(FastlyPlatformSecretStore))
+        .config_store(Arc::new(FastlyPlatformConfigStore::with_outbound_client(
+            outbound_client.clone(),
+        )))
+        .secret_store(Arc::new(FastlyPlatformSecretStore::with_outbound_client(
+            outbound_client.clone(),
+        )))
         .kv_store(Arc::clone(&state.default_kv_store))
         // Constructed unconditionally, but only read when the assembly mode is a
         // shared-template one — which defaults to Inline, so this is inert until an
@@ -3118,8 +3123,16 @@ mod tests {
         clock: &TestClock,
     ) -> RuntimeServices {
         RuntimeServices::builder()
-            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
-            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .config_store(Arc::new(
+                crate::platform::FastlyPlatformConfigStore::with_outbound_client(
+                    upstream.http_client(),
+                ),
+            ))
+            .secret_store(Arc::new(
+                crate::platform::FastlyPlatformSecretStore::with_outbound_client(
+                    upstream.http_client(),
+                ),
+            ))
             .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
             .backend(Arc::new(FixedBackend))
             .http_client(Arc::new(UnavailableHttpClient))
@@ -3286,8 +3299,16 @@ mod tests {
             );
         }
         let services = RuntimeServices::builder()
-            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
-            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .config_store(Arc::new(
+                crate::platform::FastlyPlatformConfigStore::with_outbound_client(
+                    origin.http_client(),
+                ),
+            ))
+            .secret_store(Arc::new(
+                crate::platform::FastlyPlatformSecretStore::with_outbound_client(
+                    origin.http_client(),
+                ),
+            ))
             .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
             .template_cache(Arc::clone(&cache) as Arc<dyn PlatformTemplateCache>)
             .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))

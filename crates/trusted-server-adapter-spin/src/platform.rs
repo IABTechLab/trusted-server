@@ -79,16 +79,17 @@ const SPIN_VARIABLE_HEX: &[u8; 16] = b"0123456789abcdef";
 
 struct NoopConfigStore;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformConfigStore for NoopConfigStore {
     fn get(&self, _: &StoreName, _: &str) -> Result<String, Report<PlatformError>> {
         Err(Report::new(PlatformError::ConfigStore).attach("config store not available"))
     }
 
-    fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::ConfigStore).attach("config store writes are not supported"))
     }
 
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::ConfigStore).attach("config store writes are not supported"))
     }
 }
@@ -97,16 +98,17 @@ impl PlatformConfigStore for NoopConfigStore {
 struct NoopSecretStore;
 
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
+#[async_trait::async_trait(?Send)]
 impl PlatformSecretStore for NoopSecretStore {
     fn get_bytes(&self, _: &StoreName, _: &str) -> Result<Vec<u8>, Report<PlatformError>> {
         Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
     }
 
-    fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
     }
 
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
     }
 }
@@ -141,6 +143,7 @@ impl PlatformBackend for NoopBackend {
 /// typed errors.
 pub(crate) struct ConfigStoreHandleAdapter(pub(crate) ConfigStoreHandle);
 
+#[async_trait::async_trait(?Send)]
 impl PlatformConfigStore for ConfigStoreHandleAdapter {
     fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
         futures::executor::block_on(self.0.get(key))
@@ -156,12 +159,12 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
             })
     }
 
-    fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::ConfigStore)
             .attach("config store writes are not supported on Spin"))
     }
 
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::ConfigStore)
             .attach("config store writes are not supported on Spin"))
     }
@@ -700,6 +703,7 @@ fn into_spin_method(method: &edgezero_core::http::Method) -> spin_sdk::http::Met
 pub(crate) struct SpinSecretStoreAdapter;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[async_trait::async_trait(?Send)]
 impl PlatformSecretStore for SpinSecretStoreAdapter {
     fn get_bytes(
         &self,
@@ -715,12 +719,12 @@ impl PlatformSecretStore for SpinSecretStoreAdapter {
         }
     }
 
-    fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::SecretStore)
             .attach("secret store writes are not supported on Spin"))
     }
 
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::SecretStore)
             .attach("secret store deletes are not supported on Spin"))
     }

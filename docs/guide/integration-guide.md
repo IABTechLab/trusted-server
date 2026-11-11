@@ -48,6 +48,7 @@ use trusted_server_core::platform::{
 
 struct ReadOnlyStore;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformConfigStore for ReadOnlyStore {
     fn get(
         &self,
@@ -57,7 +58,7 @@ impl PlatformConfigStore for ReadOnlyStore {
         Err(Report::new(PlatformError::Unsupported))
     }
 
-    fn put(
+    async fn put(
         &self,
         _store: &StoreId,
         _key: &str,
@@ -66,7 +67,7 @@ impl PlatformConfigStore for ReadOnlyStore {
         Err(Report::new(PlatformError::Unsupported))
     }
 
-    fn delete(
+    async fn delete(
         &self,
         _store: &StoreId,
         _key: &str,
@@ -75,6 +76,7 @@ impl PlatformConfigStore for ReadOnlyStore {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl PlatformSecretStore for ReadOnlyStore {
     fn get_bytes(
         &self,
@@ -84,7 +86,7 @@ impl PlatformSecretStore for ReadOnlyStore {
         Err(Report::new(PlatformError::Unsupported))
     }
 
-    fn create(
+    async fn create(
         &self,
         _store: &StoreId,
         _key: &str,
@@ -93,7 +95,7 @@ impl PlatformSecretStore for ReadOnlyStore {
         Err(Report::new(PlatformError::Unsupported))
     }
 
-    fn delete(
+    async fn delete(
         &self,
         _store: &StoreId,
         _key: &str,

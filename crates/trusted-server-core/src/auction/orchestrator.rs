@@ -3224,6 +3224,7 @@ mod tests {
         reads: AtomicUsize,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for FailingCountingConfigStore {
         fn get(
             &self,
@@ -3234,7 +3235,7 @@ mod tests {
             Err(Report::new(PlatformError::ConfigStore))
         }
 
-        fn put(
+        async fn put(
             &self,
             _store_id: &StoreId,
             _key: &str,
@@ -3243,7 +3244,11 @@ mod tests {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
     }
@@ -3255,6 +3260,7 @@ mod tests {
         admission_delay: Option<(TestClock, Duration)>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for CountingConfigStore {
         fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
             self.reads.fetch_add(1, Ordering::Relaxed);
@@ -3266,7 +3272,7 @@ mod tests {
                 .ok_or_else(|| Report::new(PlatformError::ConfigStore))
         }
 
-        fn put(
+        async fn put(
             &self,
             _store_id: &StoreId,
             _key: &str,
@@ -3275,7 +3281,11 @@ mod tests {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
     }
@@ -3285,6 +3295,7 @@ mod tests {
         key: Vec<u8>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for CountingSecretStore {
         fn get_bytes(
             &self,
@@ -3295,7 +3306,7 @@ mod tests {
             Ok(self.key.clone())
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -3304,13 +3315,18 @@ mod tests {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
     }
 
     struct UnusedSecretStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for UnusedSecretStore {
         fn get_bytes(
             &self,
@@ -3320,7 +3336,7 @@ mod tests {
             panic!("signing key should not be read after current-kid failure")
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -3329,7 +3345,11 @@ mod tests {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
     }

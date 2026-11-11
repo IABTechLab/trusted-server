@@ -2200,6 +2200,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for CountingSecretStore {
         fn get_bytes(
             &self,
@@ -2216,7 +2217,7 @@ mod tests {
                 .ok_or_else(|| Report::new(PlatformError::SecretStore))
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -2225,7 +2226,11 @@ mod tests {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
     }

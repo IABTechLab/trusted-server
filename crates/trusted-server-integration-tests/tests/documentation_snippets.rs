@@ -14,6 +14,20 @@ fn integration_guide_html_eof_fixture_compiles() {
     check_guide_snippet("html-eof");
 }
 
+/// Returns the version requirement the workspace manifest gives `dependency`.
+fn workspace_requirement(workspace_manifest: &str, dependency: &str) -> String {
+    workspace_manifest
+        .lines()
+        .find_map(|line| {
+            let assignment = line.trim().strip_prefix(dependency)?.trim_start();
+            let value = assignment.strip_prefix('=')?;
+            let start = value.find('"')? + 1;
+            let end = start + value[start..].find('"')?;
+            Some(value[start..end].to_owned())
+        })
+        .expect("should find the workspace dependency requirement")
+}
+
 fn check_guide_snippet(name: &str) {
     let start = format!("<!-- documentation-snippet:{name}:start -->");
     let end = format!("<!-- documentation-snippet:{name}:end -->");
@@ -47,18 +61,10 @@ fn check_guide_snippet(name: &str) {
     let core_path = repository_root.join("crates/trusted-server-core");
     let workspace_manifest = fs::read_to_string(repository_root.join("Cargo.toml"))
         .expect("should read the workspace manifest");
-    let error_stack_requirement = workspace_manifest
-        .lines()
-        .find_map(|line| {
-            let assignment = line.trim().strip_prefix("error-stack")?.trim_start();
-            let value = assignment.strip_prefix('=')?;
-            let start = value.find('"')? + 1;
-            let end = start + value[start..].find('"')?;
-            Some(value[start..end].to_owned())
-        })
-        .expect("should find the workspace error-stack requirement");
+    let async_trait_requirement = workspace_requirement(&workspace_manifest, "async-trait");
+    let error_stack_requirement = workspace_requirement(&workspace_manifest, "error-stack");
     let manifest = format!(
-        "[package]\nname = \"documentation-snippet\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\nerror-stack = \"{error_stack_requirement}\"\nfutures = \"0.3\"\ntrusted-server-core = {{ path = {:?} }}\n",
+        "[package]\nname = \"documentation-snippet\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\nasync-trait = \"{async_trait_requirement}\"\nerror-stack = \"{error_stack_requirement}\"\nfutures = \"0.3\"\ntrusted-server-core = {{ path = {:?} }}\n",
         core_path
     );
     fs::write(fixture_root.join("Cargo.toml"), manifest)

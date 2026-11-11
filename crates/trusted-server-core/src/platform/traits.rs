@@ -4,11 +4,14 @@ use error_stack::Report;
 
 use super::{BackendNamingPolicy, GeoInfo, PlatformBackendSpec, PlatformError, StoreId, StoreName};
 
-/// Synchronous, object-safe access to a key-value config store.
+/// Object-safe access to a key-value config store.
 ///
-/// Reads use the edge-visible store name. Writes use the platform management
-/// store identifier because Fastly separates the runtime store name from the
+/// Reads are synchronous and use the edge-visible store name. Writes are async,
+/// because a platform can make them through its management API over the
+/// request's outbound client, and they use the platform management store
+/// identifier, because Fastly separates the runtime store name from the
 /// management API store ID.
+#[async_trait::async_trait(?Send)]
 pub trait PlatformConfigStore: Send + Sync {
     /// Retrieve a string value from `store_name` by `key`.
     ///
@@ -24,7 +27,12 @@ pub trait PlatformConfigStore: Send + Sync {
     ///
     /// Returns [`PlatformError::ConfigStore`] when the write fails or the
     /// platform management API is unreachable.
-    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>>;
+    async fn put(
+        &self,
+        store_id: &StoreId,
+        key: &str,
+        value: &str,
+    ) -> Result<(), Report<PlatformError>>;
 
     /// Delete a key from the management store identified by `store_id`.
     ///
@@ -32,13 +40,15 @@ pub trait PlatformConfigStore: Send + Sync {
     ///
     /// Returns [`PlatformError::ConfigStore`] when the delete fails or the
     /// platform management API is unreachable.
-    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>>;
+    async fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>>;
 }
 
-/// Synchronous, object-safe access to a secret store.
+/// Object-safe access to a secret store.
 ///
-/// Reads use the edge-visible store name. Writes use the platform management
-/// store identifier.
+/// Reads are synchronous and use the edge-visible store name. Writes are async,
+/// for the reason [`PlatformConfigStore`] gives, and use the platform
+/// management store identifier.
+#[async_trait::async_trait(?Send)]
 pub trait PlatformSecretStore: Send + Sync {
     /// Retrieve a secret value as raw bytes from `store_name` by `key`.
     ///
@@ -76,7 +86,7 @@ pub trait PlatformSecretStore: Send + Sync {
     ///
     /// Returns [`PlatformError::SecretStore`] when the create fails or the
     /// platform management API is unreachable.
-    fn create(
+    async fn create(
         &self,
         store_id: &StoreId,
         name: &str,
@@ -89,7 +99,7 @@ pub trait PlatformSecretStore: Send + Sync {
     ///
     /// Returns [`PlatformError::SecretStore`] when the delete fails or the
     /// platform management API is unreachable.
-    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>>;
+    async fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>>;
 }
 
 /// Synchronous, object-safe dynamic backend management.

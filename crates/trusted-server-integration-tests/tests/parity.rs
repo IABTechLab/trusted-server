@@ -1610,11 +1610,12 @@ mod trace_parity {
         }
     }
 
+    #[async_trait(?Send)]
     impl PlatformConfigStore for ForbiddenLifecycle {
         fn get(&self, _store: &StoreName, _key: &str) -> Result<String, Report<PlatformError>> {
             panic!("should not read trace config per request");
         }
-        fn put(
+        async fn put(
             &self,
             _store: &StoreId,
             _key: &str,
@@ -1622,10 +1623,11 @@ mod trace_parity {
         ) -> Result<(), Report<PlatformError>> {
             panic!("should not write trace config");
         }
-        fn delete(&self, _store: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(&self, _store: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
             panic!("should not delete trace config");
         }
     }
+    #[async_trait(?Send)]
     impl PlatformSecretStore for ForbiddenLifecycle {
         fn get_bytes(
             &self,
@@ -1634,7 +1636,7 @@ mod trace_parity {
         ) -> Result<Vec<u8>, Report<PlatformError>> {
             panic!("should not read trace secrets");
         }
-        fn create(
+        async fn create(
             &self,
             _store: &StoreId,
             _key: &str,
@@ -1642,7 +1644,7 @@ mod trace_parity {
         ) -> Result<(), Report<PlatformError>> {
             panic!("should not write trace secrets");
         }
-        fn delete(&self, _store: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(&self, _store: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
             panic!("should not delete trace secrets");
         }
     }

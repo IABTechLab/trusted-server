@@ -223,6 +223,7 @@ mod tests {
 
     struct NoopConfigStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for NoopConfigStore {
         fn get(
             &self,
@@ -232,7 +233,7 @@ mod tests {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn put(
+        async fn put(
             &self,
             _store_id: &StoreId,
             _key: &str,
@@ -241,13 +242,18 @@ mod tests {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
     }
 
     struct MapSecretStore(HashMap<String, Vec<u8>>);
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for MapSecretStore {
         fn get_bytes(
             &self,
@@ -260,7 +266,7 @@ mod tests {
                 .ok_or_else(|| Report::new(PlatformError::SecretStore))
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -269,7 +275,11 @@ mod tests {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
     }

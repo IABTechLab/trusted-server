@@ -11,11 +11,12 @@ use std::io::Read as _;
 use std::net::IpAddr;
 
 use crate::backend::BackendConfig;
+use crate::management_api::FastlyManagementApiClient;
 use edgezero_core::body::BodyPayload;
 use trusted_server_core::http_util::into_body_payload;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
-    BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
+    BackendNamingPolicy, ClientInfo, GeoInfo, HttpClient, PlatformBackend, PlatformBackendSpec,
     PlatformCacheIntent, PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient,
     PlatformHttpRequest, PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode,
     PlatformImageOptimizerOptions, PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
@@ -43,19 +44,41 @@ fn unwrap_pending(
 
 /// Fastly [`ConfigStore`]-backed implementation of [`PlatformConfigStore`].
 ///
-/// Stateless — the store name is supplied per call, matching the trait
-/// signature. This replaces the store-name-at-construction pattern of
-/// the legacy `FastlyConfigStore` (removed).
+/// The store name is supplied per call, matching the trait signature.
 ///
-/// # Write cost
+/// # Writes
 ///
-/// `put` and `delete` each perform a synchronous outbound HTTPS request to the
-/// Fastly management API (`api.fastly.com`). Callers that issue many writes in
-/// one request pay one round-trip per call. The `"api-keys"` secret store is
-/// opened per call to read the management token; the Fastly Compute SDK caches
-/// the open handle so that cost is negligible.
-pub struct FastlyPlatformConfigStore;
+/// `put` and `delete` each send one buffered HTTPS request to the Fastly
+/// management API (`api.fastly.com`) through the request's outbound
+/// [`HttpClient`]. Callers that issue many writes in one request pay one
+/// round trip per call. The `"api-keys"` secret store is opened per call to
+/// read the management token; the Fastly Compute SDK caches the open handle so
+/// that cost is negligible. A store built with
+/// [`FastlyPlatformConfigStore::read_only`], as settings load uses outside a
+/// request, has no client and rejects writes.
+pub struct FastlyPlatformConfigStore {
+    outbound_client: Option<HttpClient>,
+}
 
+impl FastlyPlatformConfigStore {
+    /// Builds a store whose writes go through `client`, the request's outbound client.
+    #[must_use]
+    pub fn with_outbound_client(client: HttpClient) -> Self {
+        Self {
+            outbound_client: Some(client),
+        }
+    }
+
+    /// Builds a store that only reads, for settings load outside a request.
+    #[must_use]
+    pub fn read_only() -> Self {
+        Self {
+            outbound_client: None,
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
 impl PlatformConfigStore for FastlyPlatformConfigStore {
     fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
         let name = store_name.as_ref();
@@ -76,14 +99,23 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
             })
     }
 
-    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
-        let client = crate::management_api::FastlyManagementApiClient::new()?;
-        client.update_config_item(store_id.as_ref(), key, value)
+    async fn put(
+        &self,
+        store_id: &StoreId,
+        key: &str,
+        value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        let client = write_client(self.outbound_client.as_ref(), PlatformError::ConfigStore)?;
+        FastlyManagementApiClient::new()?
+            .update_config_item(client, store_id.as_ref(), key, value)
+            .await
     }
 
-    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
-        let client = crate::management_api::FastlyManagementApiClient::new()?;
-        client.delete_config_item(store_id.as_ref(), key)
+    async fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
+        let client = write_client(self.outbound_client.as_ref(), PlatformError::ConfigStore)?;
+        FastlyManagementApiClient::new()?
+            .delete_config_item(client, store_id.as_ref(), key)
+            .await
     }
 }
 
@@ -93,17 +125,37 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
 
 /// Fastly [`SecretStore`]-backed implementation of [`PlatformSecretStore`].
 ///
-/// Stateless — the store name is supplied per call. This replaces the
-/// store-name-at-construction pattern of the legacy `FastlySecretStore`
-/// (removed).
+/// The store name is supplied per call.
 ///
-/// # Write cost
+/// # Writes
 ///
 /// `create` and `delete` have the same per-call
-/// [`crate::management_api::FastlyManagementApiClient`] cost described on
-/// [`FastlyPlatformConfigStore`].
-pub struct FastlyPlatformSecretStore;
+/// [`crate::management_api::FastlyManagementApiClient`] cost, and the same
+/// read-only rule, described on [`FastlyPlatformConfigStore`].
+pub struct FastlyPlatformSecretStore {
+    outbound_client: Option<HttpClient>,
+}
 
+impl FastlyPlatformSecretStore {
+    /// Builds a store whose writes go through `client`, the request's outbound client.
+    #[must_use]
+    pub fn with_outbound_client(client: HttpClient) -> Self {
+        Self {
+            outbound_client: Some(client),
+        }
+    }
+
+    /// Builds a store that only reads, as settings load and the management
+    /// token read use.
+    #[must_use]
+    pub fn read_only() -> Self {
+        Self {
+            outbound_client: None,
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
 impl PlatformSecretStore for FastlyPlatformSecretStore {
     fn get_bytes(
         &self,
@@ -137,20 +189,39 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
             })
     }
 
-    fn create(
+    async fn create(
         &self,
         store_id: &StoreId,
         name: &str,
         value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        let client = crate::management_api::FastlyManagementApiClient::new()?;
-        client.create_secret(store_id.as_ref(), name, value)
+        let client = write_client(self.outbound_client.as_ref(), PlatformError::SecretStore)?;
+        FastlyManagementApiClient::new()?
+            .create_secret(client, store_id.as_ref(), name, value)
+            .await
     }
 
-    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
-        let client = crate::management_api::FastlyManagementApiClient::new()?;
-        client.delete_secret(store_id.as_ref(), name)
+    async fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
+        let client = write_client(self.outbound_client.as_ref(), PlatformError::SecretStore)?;
+        FastlyManagementApiClient::new()?
+            .delete_secret(client, store_id.as_ref(), name)
+            .await
     }
+}
+
+/// Returns the outbound client a store write goes through.
+///
+/// # Errors
+///
+/// Returns `error` when the store was built read-only and so has no client.
+fn write_client(
+    client: Option<&HttpClient>,
+    error: PlatformError,
+) -> Result<&HttpClient, Report<PlatformError>> {
+    client.ok_or_else(|| {
+        Report::new(error)
+            .attach("a read-only store cannot write; build it with the request's outbound client")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -809,6 +880,45 @@ mod tests {
         );
         req.set_header("fastly-client-ip", ip.as_ref());
         req
+    }
+
+    #[test]
+    fn read_only_stores_reject_writes() {
+        let config = FastlyPlatformConfigStore::read_only();
+        let secrets = FastlyPlatformSecretStore::read_only();
+        let store_id = StoreId::from("example-store-id");
+
+        let errors = futures::executor::block_on(async {
+            [
+                (
+                    config.put(&store_id, "example-key", "example-value").await,
+                    PlatformError::ConfigStore,
+                ),
+                (
+                    config.delete(&store_id, "example-key").await,
+                    PlatformError::ConfigStore,
+                ),
+                (
+                    secrets
+                        .create(&store_id, "example-name", "example-value")
+                        .await,
+                    PlatformError::SecretStore,
+                ),
+                (
+                    secrets.delete(&store_id, "example-name").await,
+                    PlatformError::SecretStore,
+                ),
+            ]
+        });
+
+        for (result, expected) in errors {
+            let error = result.expect_err("should reject a write without an outbound client");
+            assert_eq!(
+                error.current_context().to_string(),
+                expected.to_string(),
+                "should report the write against its own store kind"
+            );
+        }
     }
 
     #[test]

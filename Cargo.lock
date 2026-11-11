@@ -6635,7 +6635,6 @@ dependencies = [
  "serde_json",
  "toml",
  "trusted-server-core",
- "url",
  "urlencoding",
  "web-time",
 ]

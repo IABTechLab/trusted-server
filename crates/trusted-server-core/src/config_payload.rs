@@ -156,6 +156,7 @@ mod tests {
 
     struct EchoSecretStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for EchoSecretStore {
         fn get_bytes(
             &self,
@@ -170,7 +171,7 @@ mod tests {
             Ok(value.as_bytes().to_vec())
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -179,13 +180,18 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
     }
 
     struct UnifiedSecretStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for UnifiedSecretStore {
         fn get_bytes(
             &self,
@@ -212,7 +218,7 @@ mod tests {
             Ok(value.as_bytes().to_vec())
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -221,7 +227,11 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
     }

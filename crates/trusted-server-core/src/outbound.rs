@@ -47,7 +47,18 @@ pub const PUBLISHER_UPLOAD_BYTES: u64 = 16 * 1024 * 1024;
 ///
 /// Returns [`EdgeError::BadRequest`] when `target` is not an absolute HTTP or
 /// HTTPS URI.
-pub(crate) fn outbound_request(method: Method, target: &str) -> Result<OutboundRequest, EdgeError> {
+///
+/// # Examples
+///
+/// ```
+/// use edgezero_core::http::Method;
+/// use trusted_server_core::outbound::outbound_request;
+///
+/// let request = outbound_request(Method::DELETE, "https://example.com/items/1")
+///     .expect("should build a DELETE request");
+/// assert_eq!(request.method(), &Method::DELETE);
+/// ```
+pub fn outbound_request(method: Method, target: &str) -> Result<OutboundRequest, EdgeError> {
     let uri = target
         .parse::<Uri>()
         .map_err(|_| EdgeError::bad_request("outbound target is not a valid URI"))?;
