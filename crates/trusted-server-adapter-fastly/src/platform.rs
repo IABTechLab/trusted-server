@@ -918,7 +918,9 @@ mod tests {
     #[test]
     fn request_geo_answers_only_the_ip_it_resolved() {
         let resolved_ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7));
-        let other_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 44));
+        // Viceroy's default geo data answers loopback, so a restored host
+        // lookup for this IP would return data and fail the test.
+        let other_ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         let request_geo = RequestGeo::new(
             Some(resolved_ip),
             Some(GeoInfo {
