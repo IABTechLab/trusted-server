@@ -147,8 +147,7 @@ use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, version_synthesized_headers};
 use crate::platform::{
-    FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformHttpClient,
-    FastlyPlatformSecretStore, RequestGeo, UnavailableKvStore,
+    FastlyPlatformConfigStore, FastlyPlatformSecretStore, RequestGeo, UnavailableKvStore,
 };
 use crate::sandbox::RetainedApp;
 use crate::tinybird::{QueueingTelemetrySink, TelemetryQueue};
@@ -312,8 +311,6 @@ fn build_per_request_services(
         // operator opts in.
         .template_cache(Arc::new(crate::template_cache::FastlyTemplateCache::new()))
         .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
-        .backend(Arc::new(FastlyPlatformBackend))
-        .http_client(Arc::new(FastlyPlatformHttpClient))
         .outbound_client(outbound_client)
         .clock(ctx.monotonic_clock())
         .geo(Arc::new(request_geo))
@@ -1470,10 +1467,10 @@ mod tests {
         RequestFilterEffects, RequestFilterInput,
     };
     use trusted_server_core::platform::{
-        ClientInfo, GeoInfo, HttpClient, PlatformBackend, PlatformBackendSpec, PlatformError,
-        PlatformKvStore, PlatformTemplateCache, PlatformTemplateCacheReservation, RuntimeServices,
-        TemplateCacheError, TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss,
-        TemplateCacheReservation, TemplateEntry, TemplateMetadata, UnavailableHttpClient,
+        ClientInfo, GeoInfo, HttpClient, PlatformKvStore, PlatformTemplateCache,
+        PlatformTemplateCacheReservation, RuntimeServices, TemplateCacheError, TemplateCacheKey,
+        TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation, TemplateEntry,
+        TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
     use trusted_server_core::test_support::scripted_client::{
@@ -3341,25 +3338,6 @@ mod tests {
         );
     }
 
-    struct FixedBackend;
-
-    impl PlatformBackend for FixedBackend {
-        fn naming_policy(&self) -> trusted_server_core::platform::BackendNamingPolicy {
-            trusted_server_core::platform::BackendNamingPolicy::Fastly
-        }
-
-        fn predict_name(
-            &self,
-            spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<PlatformError>> {
-            Ok(format!("{}-{}", spec.scheme, spec.host))
-        }
-
-        fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            self.predict_name(spec)
-        }
-    }
-
     /// Streaming runtime services whose `EdgeZero` outbound requests go to `upstream`.
     fn runtime_services_with_upstream(
         upstream: &ScriptedHttpClient,
@@ -3377,8 +3355,6 @@ mod tests {
                 ),
             ))
             .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
-            .backend(Arc::new(FixedBackend))
-            .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(upstream.http_client())
             .clock(clock.monotonic_clock())
             .geo(Arc::new(RequestGeo::default()))
@@ -3555,8 +3531,6 @@ mod tests {
             .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
             .template_cache(Arc::clone(&cache) as Arc<dyn PlatformTemplateCache>)
             .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
-            .backend(Arc::new(FixedBackend))
-            .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(origin.http_client())
             .clock(clock.monotonic_clock())
             .geo(Arc::new(RequestGeo::default()))

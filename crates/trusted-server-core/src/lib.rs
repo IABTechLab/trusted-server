@@ -20,6 +20,8 @@
 //! - [`test_support`]: Testing utilities and mocks
 //! - [`tester_cookie`]: Optional tester-cookie endpoint helpers
 
+// Unit tests may buffer bodies with `Body::into_bytes`; production code must not.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 #![cfg_attr(
     test,
     allow(

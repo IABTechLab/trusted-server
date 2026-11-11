@@ -24,7 +24,8 @@ namespaced and bounded; do not introduce a general outbound proxy.
 ## Compiling core-neutral fixture
 
 The fixture below registers an attribute rewriter and constructs every
-required `RuntimeServices` service without an adapter dependency. The
+required `RuntimeServices` service without an adapter dependency. The adapter
+supplies the request's outbound client and monotonic clock. The
 documentation test extracts this exact fence and compiles it as an isolated
 crate.
 
@@ -40,10 +41,9 @@ use trusted_server_core::integrations::{
     IntegrationAttributeRewriter, IntegrationRegistration,
 };
 use trusted_server_core::platform::{
-    BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend,
-    PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo,
-    PlatformSecretStore, RuntimeServices, StoreId, StoreName,
-    UnavailableHttpClient, UnavailableKvStore,
+    ClientInfo, GeoInfo, HttpClient, MonotonicClock, PlatformConfigStore,
+    PlatformError, PlatformGeo, PlatformSecretStore, RuntimeServices, StoreId,
+    StoreName, UnavailableKvStore,
 };
 
 struct ReadOnlyStore;
@@ -104,32 +104,6 @@ impl PlatformSecretStore for ReadOnlyStore {
     }
 }
 
-struct FixtureBackend;
-
-impl PlatformBackend for FixtureBackend {
-    fn naming_policy(&self) -> BackendNamingPolicy {
-        BackendNamingPolicy::Axum
-    }
-
-    fn predict_name(
-        &self,
-        spec: &PlatformBackendSpec,
-    ) -> Result<String, Report<PlatformError>> {
-        if spec.host.is_empty() {
-            Err(Report::new(PlatformError::Backend))
-        } else {
-            Ok("fixture-origin".to_owned())
-        }
-    }
-
-    fn ensure(
-        &self,
-        spec: &PlatformBackendSpec,
-    ) -> Result<String, Report<PlatformError>> {
-        self.predict_name(spec)
-    }
-}
-
 struct FixtureGeo;
 
 impl PlatformGeo for FixtureGeo {
@@ -171,14 +145,21 @@ pub fn registration() -> IntegrationRegistration {
         .build()
 }
 
-pub fn runtime_services() -> RuntimeServices {
+/// Builds request services around the adapter's outbound client and clock.
+///
+/// Every outbound request goes through `outbound_client`, with the proxy
+/// marker off, and outbound deadlines read `clock`.
+pub fn runtime_services(
+    outbound_client: HttpClient,
+    clock: MonotonicClock,
+) -> RuntimeServices {
     let store = Arc::new(ReadOnlyStore);
     RuntimeServices::builder()
         .config_store(store.clone())
         .secret_store(store)
         .kv_store(Arc::new(UnavailableKvStore))
-        .backend(Arc::new(FixtureBackend))
-        .http_client(Arc::new(UnavailableHttpClient))
+        .outbound_client(outbound_client.with_proxy_marker(false))
+        .clock(clock)
         .geo(Arc::new(FixtureGeo))
         .client_info(ClientInfo::default())
         .build()

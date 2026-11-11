@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::body::{Body as EdgeBody, BodyPayload};
 use error_stack::{Report, ResultExt};
 use http::Response;
 use http::header::{self, HeaderValue};
@@ -11,7 +11,7 @@ use validator::Validate;
 
 use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
-use crate::http_util::read_request_body;
+use crate::http_util::{into_body_payload, read_request_body};
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
@@ -215,12 +215,12 @@ impl IntegrationProxy for TestlightIntegration {
         let (parts, body) = response.into_parts();
 
         // `proxy_request` buffers the answer under the Testlight response cap.
-        let response_body = body
-            .into_bytes()
-            .ok_or_else(|| {
-                Report::new(Self::error("Testlight upstream response was not buffered"))
-            })?
-            .to_vec();
+        let BodyPayload::Once(response_body) = into_body_payload(body) else {
+            return Err(Report::new(Self::error(
+                "Testlight upstream response was not buffered",
+            )));
+        };
+        let response_body = response_body.to_vec();
 
         // Attempt to parse response into structured form for logging/future transforms.
         match serde_json::from_slice::<TestlightResponseBody>(&response_body) {

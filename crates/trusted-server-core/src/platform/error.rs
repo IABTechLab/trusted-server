@@ -14,15 +14,6 @@ pub enum PlatformError {
     /// Secret store access failed.
     #[display("secret store error")]
     SecretStore,
-    /// Backend registration or name computation failed.
-    #[display("backend error")]
-    Backend,
-    /// HTTP client request failed.
-    #[display("http client error")]
-    HttpClient,
-    /// The absolute HTTP collection deadline elapsed.
-    #[display("http collection deadline exceeded")]
-    DeadlineExceeded,
     /// Geo lookup failed.
     #[display("geo lookup error")]
     Geo,

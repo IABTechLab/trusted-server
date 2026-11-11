@@ -77,29 +77,32 @@ pub fn sanitize_trusted_client_ip_headers(
 /// A buffered body becomes [`BodyPayload::Once`] and releases its owner,
 /// because its bytes no longer depend on the scope. A streaming body is never
 /// returned as empty bytes, unlike [`EdgeBody::into_bytes`].
-///
-/// # Examples
-///
-/// ```
-/// use edgezero_core::body::{Body, BodyPayload};
-/// use trusted_server_core::http_util::into_body_payload;
-///
-/// let BodyPayload::Once(bytes) = into_body_payload(Body::from("example")) else {
-///     panic!("should keep a buffered body buffered");
-/// };
-/// assert_eq!(bytes.as_ref(), b"example");
-///
-/// let streamed = Body::stream(futures::stream::iter([bytes::Bytes::from_static(b"example")]));
-/// assert!(
-///     matches!(into_body_payload(streamed), BodyPayload::Stream(_)),
-///     "should keep a streamed body streamed"
-/// );
-/// ```
 #[must_use]
-pub fn into_body_payload(body: EdgeBody) -> BodyPayload {
+pub(crate) fn into_body_payload(body: EdgeBody) -> BodyPayload {
     match body.into_stream() {
         Ok(stream) => BodyPayload::Stream(stream),
         Err(buffered) => buffered.into_parts().0,
+    }
+}
+
+/// Wraps a buffered body for a synchronous rewrite pipeline.
+///
+/// Callers buffer the responses they rewrite, so a streamed body here is a
+/// bug. It fails instead of reading as empty. `pipeline` names the caller's
+/// pipeline in the error, such as `"proxy"` or `"publisher"`.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Proxy`] for a streamed body.
+pub(crate) fn body_as_reader(
+    body: EdgeBody,
+    pipeline: &str,
+) -> Result<std::io::Cursor<Bytes>, Report<TrustedServerError>> {
+    match into_body_payload(body) {
+        BodyPayload::Once(bytes) => Ok(std::io::Cursor::new(bytes)),
+        BodyPayload::Stream(_) => Err(Report::new(TrustedServerError::Proxy {
+            message: format!("streaming body cannot be processed by the sync {pipeline} pipeline"),
+        })),
     }
 }
 
@@ -646,6 +649,52 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::settings::TrustedClientIpConfig;
     use http::{HeaderName, HeaderValue, Method};
+
+    #[test]
+    fn into_body_payload_keeps_buffered_and_streamed_bodies_apart() {
+        let BodyPayload::Once(bytes) = into_body_payload(EdgeBody::from("example")) else {
+            panic!("should keep a buffered body buffered");
+        };
+        let streamed = EdgeBody::stream(futures::stream::iter([bytes::Bytes::from_static(
+            b"example",
+        )]));
+
+        assert_eq!(
+            bytes.as_ref(),
+            b"example",
+            "should return the buffered bytes"
+        );
+        assert!(
+            matches!(into_body_payload(streamed), BodyPayload::Stream(_)),
+            "should keep a streamed body streamed"
+        );
+    }
+
+    #[test]
+    fn body_as_reader_rejects_a_streamed_body() {
+        let buffered = body_as_reader(EdgeBody::from("example"), "proxy")
+            .expect("should read a buffered body")
+            .into_inner();
+        let streamed = EdgeBody::stream(futures::stream::iter([bytes::Bytes::from_static(
+            b"example",
+        )]));
+
+        let error =
+            body_as_reader(streamed, "publisher").expect_err("should reject a streamed body");
+
+        assert_eq!(
+            buffered.as_ref(),
+            b"example",
+            "should keep the buffered bytes"
+        );
+        let TrustedServerError::Proxy { message } = error.current_context() else {
+            panic!("should fail with the proxy context instead of reading as empty, got {error:?}");
+        };
+        assert_eq!(
+            message, "streaming body cannot be processed by the sync publisher pipeline",
+            "should name the caller's pipeline"
+        );
+    }
 
     fn build_request(method: Method, uri: &str) -> Request<EdgeBody> {
         Request::builder()

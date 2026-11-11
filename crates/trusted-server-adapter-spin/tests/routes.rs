@@ -6,6 +6,9 @@
 //! that depends on external stores assert routing only; deterministic auth and
 //! method gates assert exact status codes.
 
+// Test crates may buffer bodies with `Body::into_bytes`.
+#![allow(clippy::disallowed_methods)]
+
 use edgezero_adapter_spin::SPIN_PLATFORM;
 use edgezero_core::app::{App, Hooks as _};
 use edgezero_core::body::Body;

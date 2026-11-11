@@ -135,7 +135,7 @@ impl KeyRotationManager {
         }
 
         // Step 4: flip current-kid last. A failure here leaves the old kid still
-        // active and the new kid visible in JWKS but unused — a recoverable state.
+        // active and the new kid visible in JWKS but unused, which is recoverable.
         self.update_current_kid(services, &new_kid).await?;
 
         Ok(KeyRotationResult {

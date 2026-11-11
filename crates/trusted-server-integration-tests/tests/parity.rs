@@ -14,6 +14,9 @@
 //!
 //! Fastly parity is verified via cargo test-fastly + Viceroy in CI.
 
+// Test crates may buffer bodies with `Body::into_bytes`.
+#![allow(clippy::disallowed_methods)]
+
 // All three adapters define `TrustedServerApp`, so alias each to avoid name collisions.
 // reqwest and axum::http re-export the `http` crate, so HeaderMap types are identical.
 use std::net::SocketAddr;
@@ -1672,9 +1675,9 @@ mod trace_parity {
     use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::platform::{
-        BackendNamingPolicy, ClientInfo, GeoInfo, HttpClient, PlatformBackend, PlatformBackendSpec,
-        PlatformConfigStore, PlatformError, PlatformGeo, PlatformKvStore, PlatformSecretStore,
-        RuntimeServices, StoreId, StoreName, UnavailableHttpClient, UnavailableKvStore,
+        ClientInfo, GeoInfo, HttpClient, PlatformConfigStore, PlatformError, PlatformGeo,
+        PlatformKvStore, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
+        UnavailableKvStore,
     };
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedForwarderConfig;
@@ -1744,20 +1747,6 @@ mod trace_parity {
         }
         async fn delete(&self, _store: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
             panic!("should not delete trace secrets");
-        }
-    }
-    impl PlatformBackend for ForbiddenLifecycle {
-        fn naming_policy(&self) -> BackendNamingPolicy {
-            panic!("should not resolve trace backends");
-        }
-        fn predict_name(
-            &self,
-            _spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<PlatformError>> {
-            panic!("should not predict trace backends");
-        }
-        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            panic!("should not register trace backends");
         }
     }
     #[async_trait(?Send)]
@@ -1871,8 +1860,6 @@ mod trace_parity {
             .config_store(forbidden.clone())
             .secret_store(forbidden.clone())
             .kv_store(forbidden.clone())
-            .backend(forbidden.clone())
-            .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(forbidden.outbound_client())
             .clock(TestClock::new().monotonic_clock())
             .auction_telemetry_sink(forbidden)
@@ -2245,8 +2232,6 @@ mod trace_parity {
             .config_store(forbidden.clone())
             .secret_store(forbidden.clone())
             .kv_store(forbidden.clone())
-            .backend(forbidden.clone())
-            .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(forbidden.outbound_client())
             .clock(TestClock::new().monotonic_clock())
             .auction_telemetry_sink(forbidden)
@@ -2586,10 +2571,8 @@ mod trace_parity {
         };
         let services = RuntimeServices::builder()
             .config_store(forbidden.clone())
-            .secret_store(forbidden.clone())
+            .secret_store(forbidden)
             .kv_store(Arc::new(UnavailableKvStore))
-            .backend(forbidden)
-            .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(upstream.http_client())
             .clock(clock.monotonic_clock())
             .geo(Arc::new(NoGeo))

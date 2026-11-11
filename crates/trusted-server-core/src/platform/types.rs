@@ -1,7 +1,6 @@
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use edgezero_core::outbound::HttpClient;
 use edgezero_core::time::MonotonicClock;
@@ -9,8 +8,7 @@ use edgezero_core::time::MonotonicClock;
 use crate::auction::telemetry::{AuctionTelemetrySink, NoopAuctionTelemetrySink};
 
 use super::{
-    PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
-    PlatformSecretStore, PlatformTimer,
+    PlatformConfigStore, PlatformGeo, PlatformKvStore, PlatformSecretStore, PlatformTimer,
 };
 
 /// Geographic information extracted from a request.
@@ -126,38 +124,6 @@ impl AsRef<str> for StoreId {
     }
 }
 
-/// Input specification for a dynamic backend.
-///
-/// Passed to [`PlatformBackend::predict_name`] and [`PlatformBackend::ensure`]
-/// to deterministically name and register upstream origins.
-#[derive(Debug, Clone)]
-pub struct PlatformBackendSpec {
-    /// URL scheme.
-    pub scheme: String,
-    /// Hostname of the backend origin.
-    pub host: String,
-    /// Explicit port, or `None` to use the scheme default.
-    pub port: Option<u16>,
-    /// Optional outbound `Host` header override for backend registration.
-    pub host_header_override: Option<String>,
-    /// Whether to verify the TLS certificate.
-    pub certificate_check: bool,
-    /// Maximum time to wait for the first response byte.
-    pub first_byte_timeout: Duration,
-    /// Maximum time to wait between response body bytes.
-    pub between_bytes_timeout: Duration,
-    /// Optional stable discriminator folded into the backend name.
-    ///
-    /// Two callers can target the same origin (scheme, host, port, TLS) with
-    /// the same transport timeout yet need distinct dynamic backends — for
-    /// example two auction providers behind one gateway host. Because the
-    /// auction orchestrator correlates responses back to providers by backend
-    /// name, a shared name would let one provider's response be parsed as
-    /// another's. Setting this to a per-provider/integration identifier keeps
-    /// their names distinct while remaining stable across requests.
-    pub discriminator: Option<String>,
-}
-
 /// Cloneable container of platform services for a single request.
 #[derive(Clone)]
 pub struct RuntimeServices {
@@ -181,10 +147,6 @@ pub struct RuntimeServices {
     /// Defaults to [`super::UnavailableTemplateAssembler`]. Core retains a portable
     /// byte-seam fallback when this service is unavailable or rejects a document.
     pub(crate) template_assembler: Arc<dyn super::PlatformTemplateAssembler>,
-    /// Dynamic backend registration and name prediction.
-    pub(crate) backend: Arc<dyn PlatformBackend>,
-    /// Outbound HTTP client abstraction.
-    pub(crate) http_client: Arc<dyn PlatformHttpClient>,
     /// `EdgeZero` outbound HTTP client for this request, with the proxy marker off.
     pub(crate) outbound_client: HttpClient,
     /// Monotonic clock paired with this request's admitted ingress lifetime.
@@ -216,8 +178,6 @@ impl RuntimeServices {
     ///     .config_store(Arc::new(MyConfigStore))
     ///     .secret_store(Arc::new(MySecretStore))
     ///     .kv_store(kv_store)
-    ///     .backend(Arc::new(MyBackend))
-    ///     .http_client(Arc::new(MyHttpClient))
     ///     .outbound_client(outbound_client.with_proxy_marker(false))
     ///     .clock(ctx.monotonic_clock())
     ///     .geo(Arc::new(MyGeo))
@@ -263,18 +223,6 @@ impl RuntimeServices {
     #[must_use]
     pub fn template_assembler(&self) -> &dyn super::PlatformTemplateAssembler {
         &*self.template_assembler
-    }
-
-    /// Returns the dynamic backend service.
-    #[must_use]
-    pub fn backend(&self) -> &dyn PlatformBackend {
-        &*self.backend
-    }
-
-    /// Returns the outbound HTTP client service.
-    #[must_use]
-    pub fn http_client(&self) -> &dyn PlatformHttpClient {
-        &*self.http_client
     }
 
     /// Returns the request's `EdgeZero` outbound HTTP client.
@@ -367,8 +315,6 @@ pub struct RuntimeServicesBuilder {
     kv_store: Option<Arc<dyn PlatformKvStore>>,
     template_cache: Option<Arc<dyn super::PlatformTemplateCache>>,
     template_assembler: Option<Arc<dyn super::PlatformTemplateAssembler>>,
-    backend: Option<Arc<dyn PlatformBackend>>,
-    http_client: Option<Arc<dyn PlatformHttpClient>>,
     outbound_client: Option<HttpClient>,
     clock: Option<MonotonicClock>,
     geo: Option<Arc<dyn PlatformGeo>>,
@@ -385,8 +331,6 @@ impl RuntimeServicesBuilder {
             kv_store: None,
             template_cache: None,
             template_assembler: None,
-            backend: None,
-            http_client: None,
             outbound_client: None,
             clock: None,
             geo: None,
@@ -438,20 +382,6 @@ impl RuntimeServicesBuilder {
     #[must_use]
     pub fn kv_store(mut self, kv_store: Arc<dyn PlatformKvStore>) -> Self {
         self.kv_store = Some(kv_store);
-        self
-    }
-
-    /// Set the backend implementation.
-    #[must_use]
-    pub fn backend(mut self, backend: Arc<dyn PlatformBackend>) -> Self {
-        self.backend = Some(backend);
-        self
-    }
-
-    /// Set the HTTP client implementation.
-    #[must_use]
-    pub fn http_client(mut self, http_client: Arc<dyn PlatformHttpClient>) -> Self {
-        self.http_client = Some(http_client);
         self
     }
 
@@ -522,12 +452,6 @@ impl RuntimeServicesBuilder {
             template_assembler: self
                 .template_assembler
                 .unwrap_or_else(|| Arc::new(super::UnavailableTemplateAssembler)),
-            backend: self
-                .backend
-                .expect("should set backend before building RuntimeServices"),
-            http_client: self
-                .http_client
-                .expect("should set http_client before building RuntimeServices"),
             outbound_client: self
                 .outbound_client
                 .expect("should set outbound_client before building RuntimeServices"),

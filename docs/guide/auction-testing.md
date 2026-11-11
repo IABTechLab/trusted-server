@@ -73,20 +73,22 @@ response details.
 
 Core tests cover split dispatch/collection and synchronous execution, pending
 provider attribution, preserved on-time bids, late collection after an origin
-wait, and exhausted-budget mediation. Axum loopback tests separately delay
-headers and trickle bodies, and verify outstanding task cancellation. Worker
-adapter tests use controlled futures and timers. CI also runs the actual worker
-HTTP clients under local workerd and Spin 4.1, covering eager dispatch, buffered
-bids after a slow origin, delayed headers, and trickling bodies. Run
+wait, and exhausted-budget mediation. The integration suite loads a navigation
+on Fastly, Axum, Cloudflare, and Spin whose 500 ms auction races bidders at 180,
+320, and 600 ms behind a 700 ms origin, and checks that the first two bids are
+injected and the third is dropped. CI also runs the actual worker HTTP clients
+under local workerd and Spin 4.1, covering eager dispatch, buffered bids after a
+slow origin, delayed headers, and trickling bodies. Run
 `node scripts/test-worker-auction-deadlines.mjs --help` for the same local fixtures.
-Fastly also has Viceroy network fixtures for stalled headers, trickling bodies,
-bodyless responses, and competing bidders. Its local origin harness builds the
+Fastly also has Viceroy network fixtures for stalled headers, trickling bodies, a
+HEAD response's declared length, a fast bid beside a trickling one, and replies
+that land before or after the cutoff. Its local origin harness builds the
 adapter test binary itself:
 
 ```bash
 node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"
 ```
 
-The harness binds a local ephemeral port and runs the five network tests
+The harness binds a local ephemeral port and runs the six network tests
 excluded from the standard suite; CI runs the same command. To reuse a prebuilt
 test artifact, pass its `.wasm` path as a second argument.

@@ -1,4 +1,6 @@
-use crate::http_util::{RequestInfo, compute_encrypted_sha256_token, ct_str_eq, read_request_body};
+use crate::http_util::{
+    RequestInfo, body_as_reader, compute_encrypted_sha256_token, ct_str_eq, read_request_body,
+};
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::error::EdgeError;
 use edgezero_core::outbound::{
@@ -9,7 +11,6 @@ use edgezero_core::outbound::{
 use error_stack::{Report, ResultExt};
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
-use std::io::Cursor;
 use std::time::Duration;
 use web_time::{SystemTime, UNIX_EPOCH};
 
@@ -44,10 +45,6 @@ const IMAGE_FALLBACK_CONTENT_TYPE: &str = "application/octet-stream";
 
 const SIGN_MAX_BODY_BYTES: usize = 65536;
 const REBUILD_MAX_BODY_BYTES: usize = 65536;
-
-fn body_as_reader(body: EdgeBody) -> Cursor<bytes::Bytes> {
-    Cursor::new(body.into_bytes().unwrap_or_default())
-}
 
 /// Headers copied from the original client request to the upstream proxy request
 /// when `copy_request_headers` is enabled.
@@ -389,7 +386,7 @@ fn process_response_with_pipeline<P: StreamProcessor>(
     let mut output = Vec::new();
     let mut pipeline = StreamingPipeline::new(config, processor);
     pipeline
-        .process(body_as_reader(body), &mut output)
+        .process(body_as_reader(body, "proxy")?, &mut output)
         .change_context(TrustedServerError::Proxy {
             message: error_context.to_string(),
         })?;

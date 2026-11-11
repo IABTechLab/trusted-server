@@ -183,7 +183,7 @@ pub(crate) mod tests {
     use edgezero_core::http::StatusCode;
     use edgezero_core::outbound::ResponseMode;
     use trusted_server_core::auction::telemetry::AuctionEventRow;
-    use trusted_server_core::platform::{ClientInfo, UnavailableHttpClient};
+    use trusted_server_core::platform::ClientInfo;
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::test_support::scripted_client::{
         ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
@@ -191,8 +191,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::platform::{
-        FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformSecretStore, RequestGeo,
-        UnavailableKvStore,
+        FastlyPlatformConfigStore, FastlyPlatformSecretStore, RequestGeo, UnavailableKvStore,
     };
 
     const TEST_USER_AGENT: &str =
@@ -261,8 +260,6 @@ pub(crate) mod tests {
             .config_store(Arc::new(FastlyPlatformConfigStore::read_only()))
             .secret_store(Arc::new(FastlyPlatformSecretStore::read_only()))
             .kv_store(Arc::new(UnavailableKvStore))
-            .backend(Arc::new(FastlyPlatformBackend))
-            .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(ScriptedHttpClient::forbidding().http_client())
             .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(RequestGeo::default()))

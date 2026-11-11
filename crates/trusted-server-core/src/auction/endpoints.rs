@@ -707,8 +707,8 @@ mod tests {
     use crate::openrtb::Uid;
     use crate::platform::ClientInfo;
     use crate::platform::test_support::{
-        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore,
-        build_services_with_outbound_client, noop_services,
+        NoopConfigStore, NoopGeo, NoopSecretStore, build_services_with_outbound_client,
+        noop_services,
     };
     use crate::test_support::body_read::body_read_failure_cases;
     use crate::test_support::scripted_client::{ScriptedHttpClient, ScriptedReply, TestClock};
@@ -749,8 +749,6 @@ mod tests {
             .config_store(Arc::new(NoopConfigStore))
             .secret_store(Arc::new(NoopSecretStore))
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(NoopBackend))
-            .http_client(Arc::new(NoopHttpClient))
             .outbound_client(ScriptedHttpClient::forbidding().http_client())
             .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(NoopGeo))

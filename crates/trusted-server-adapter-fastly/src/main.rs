@@ -1,3 +1,6 @@
+// Unit tests may buffer bodies with `Body::into_bytes`; production code must not.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 use std::convert::Infallible;
 
 use edgezero_adapter_fastly::request::{
@@ -27,8 +30,9 @@ use trusted_server_core::trace::{TraceTerminalResponse, is_trace_path};
 use trusted_server_core::version_header::git_version_header_value;
 
 mod app;
-mod backend;
 mod compat;
+#[cfg(test)]
+mod deadline_network;
 mod delivery;
 mod ec_kv;
 mod esi_assembly;

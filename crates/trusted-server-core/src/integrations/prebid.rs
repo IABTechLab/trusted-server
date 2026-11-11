@@ -3727,8 +3727,7 @@ mod tests {
     };
     use crate::platform::test_support::build_services_with_outbound_client;
     use crate::platform::test_support::{
-        HashMapConfigStore, HashMapSecretStore, NoopHttpClient,
-        build_services_with_config_secret_and_http_client,
+        HashMapConfigStore, HashMapSecretStore, build_services_with_config_and_secret,
     };
 
     use crate::settings::Settings;
@@ -10271,10 +10270,9 @@ set = { networkId = 42 }
                 .encode([7_u8; 32])
                 .into_bytes(),
         );
-        let signing_services = build_services_with_config_secret_and_http_client(
+        let signing_services = build_services_with_config_and_secret(
             HashMapConfigStore::new(config_data),
             HashMapSecretStore::new(secret_data),
-            Arc::new(NoopHttpClient),
         );
         let signer = RequestSigner::from_services(&signing_services)
             .expect("should load deterministic test signer");

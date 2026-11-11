@@ -4,11 +4,15 @@
 //! `TrustedServerApp::routes()` builds without panicking. Does not exercise
 //! the platform layer or outbound network calls.
 
+// Test crates may buffer bodies with `Body::into_bytes`.
+#![allow(clippy::disallowed_methods)]
+
 use edgezero_adapter_cloudflare::CLOUDFLARE_PLATFORM;
 use edgezero_core::app::{App, Hooks as _};
 use edgezero_core::body::Body;
 use edgezero_core::http::{Method, Request, Response, StatusCode, header, request_builder};
 use edgezero_core::ingress::{IngressDispatchOutcome, IngressFraming, IngressHeadAccounting};
+use edgezero_core::outbound::{ResponseDecoding, ResponseMode};
 use edgezero_core::response_egress_framing::ResponseEgressFramingMode;
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp;
@@ -1044,5 +1048,36 @@ async fn gzip_origin_raw_body_reaches_a_client_without_accept_encoding_as_identi
         ),
         (StatusCode::OK, None, bytes.as_slice()),
         "should relay the raw body decoded, as identity"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publisher_origin_streams_its_decoded_response_under_the_input_cap_cloudflare() {
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+    origin.respond_to(
+        Method::GET,
+        &format!("{ORIGIN}/page"),
+        origin_reply("text/html", &html_document(64), OriginCoding::Gzip),
+    );
+
+    let response = route_to_origin(test_router(), publisher_get("/page"), &origin).await;
+
+    assert_eq!(response.status(), StatusCode::OK, "should serve the page");
+    let requests = origin.requests();
+    let [forwarded] = requests.as_slice() else {
+        panic!("should send one origin request, got {requests:?}");
+    };
+    assert_eq!(
+        (
+            forwarded.response_mode,
+            forwarded.response_decoding,
+            forwarded.max_encoded_response_bytes,
+        ),
+        (
+            ResponseMode::Streamed,
+            ResponseDecoding::Decode,
+            Some(u64::try_from(CLOUDFLARE_INPUT_CAP).expect("should fit the cap in u64")),
+        ),
+        "should stream the decoded origin response and cap its encoded bytes"
     );
 }

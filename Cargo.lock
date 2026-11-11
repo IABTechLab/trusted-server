@@ -338,7 +338,7 @@ dependencies = [
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
- "tower 0.5.3",
+ "tower",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -1570,7 +1570,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "walkdir",
 ]
@@ -5173,7 +5173,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
- "tower 0.5.3",
+ "tower",
  "tower-http",
  "tower-service",
  "url",
@@ -5213,7 +5213,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
- "tower 0.5.3",
+ "tower",
  "tower-http",
  "tower-service",
  "url",
@@ -6451,7 +6451,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-stream",
- "tower 0.5.3",
+ "tower",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -6466,21 +6466,6 @@ dependencies = [
  "bytes",
  "prost 0.14.4",
  "tonic",
-]
-
-[[package]]
-name = "tower"
-version = "0.4.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8fa9be0de6cf49e536ce1851f987bd21a43b771b09473c3549a6c853db37c1c"
-dependencies = [
- "futures-core",
- "futures-util",
- "pin-project",
- "pin-project-lite",
- "tower-layer",
- "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -6519,7 +6504,7 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tokio-util",
- "tower 0.5.3",
+ "tower",
  "tower-layer",
  "tower-service",
  "url",
@@ -6574,7 +6559,6 @@ name = "trusted-server-adapter-axum"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "axum",
  "base64",
  "edgezero-adapter-axum",
  "edgezero-core",
@@ -6585,9 +6569,7 @@ dependencies = [
  "simple_logger",
  "temp-env",
  "tokio",
- "tower 0.4.13",
  "trusted-server-core",
- "web-time",
 ]
 
 [[package]]
@@ -6602,7 +6584,6 @@ dependencies = [
  "edgezero-core",
  "error-stack",
  "futures",
- "js-sys",
  "log",
  "serde_json",
  "tokio",
@@ -6626,7 +6607,6 @@ dependencies = [
  "error-stack",
  "esi",
  "fastly",
- "fastly-sys",
  "fern",
  "futures",
  "log",
@@ -6636,7 +6616,6 @@ dependencies = [
  "toml",
  "trusted-server-core",
  "urlencoding",
- "web-time",
 ]
 
 [[package]]
@@ -6646,14 +6625,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
- "brotli",
  "bytes",
  "edgezero-adapter-spin",
  "edgezero-core",
  "error-stack",
- "flate2",
  "futures",
- "http-body-util",
  "log",
  "spin-sdk",
  "tokio",

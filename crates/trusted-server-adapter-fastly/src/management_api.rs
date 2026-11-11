@@ -339,7 +339,6 @@ mod tests {
     use futures::executor::block_on;
     use trusted_server_core::platform::{
         ClientInfo, PlatformConfigStore, PlatformSecretStore, RuntimeServices, StoreId,
-        UnavailableHttpClient,
     };
     use trusted_server_core::request_signing::{KeyRotationManager, KeyRotationResult};
     use trusted_server_core::test_support::scripted_client::{
@@ -347,7 +346,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::platform::{FastlyPlatformBackend, RequestGeo};
+    use crate::platform::RequestGeo;
 
     const BASE_URL: &str = "https://management.example.com";
     const API_KEY: &str = "example-api-key";
@@ -496,8 +495,6 @@ mod tests {
             .config_store(Arc::clone(&stores) as Arc<dyn PlatformConfigStore>)
             .secret_store(stores)
             .kv_store(Arc::new(NoopKvStore))
-            .backend(Arc::new(FastlyPlatformBackend))
-            .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(upstream.http_client())
             .clock(clock.monotonic_clock())
             .geo(Arc::new(RequestGeo::default()))

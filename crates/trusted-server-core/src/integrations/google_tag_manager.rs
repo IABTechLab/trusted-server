@@ -15,7 +15,7 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::body::{Body as EdgeBody, BodyPayload};
 use error_stack::{Report, ResultExt};
 use http::{Method, Request, Response, StatusCode, header};
 use regex::Regex;
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError};
 
 use crate::error::{IntoHttpResponse as _, TrustedServerError};
-use crate::http_util::read_request_body;
+use crate::http_util::{into_body_payload, read_request_body};
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, IntegrationScriptContext,
@@ -794,10 +794,11 @@ impl GoogleTagManagerIntegration {
         log::debug!("Rewriting GTM/gtag script content");
         let status = response.status();
         // `proxy_request` buffers the script under its response cap.
-        let body_bytes = response
-            .into_body()
-            .into_bytes()
-            .ok_or_else(|| Report::new(Self::error("GTM script response was not buffered")))?;
+        let BodyPayload::Once(body_bytes) = into_body_payload(response.into_body()) else {
+            return Err(Report::new(Self::error(
+                "GTM script response was not buffered",
+            )));
+        };
         let body_str = String::from_utf8_lossy(&body_bytes);
         let rewritten_body = Self::rewrite_gtm_urls(&body_str);
 

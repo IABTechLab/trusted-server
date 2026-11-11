@@ -17,6 +17,10 @@
 //! arrival, which is more eager than Fastly's, where a check reports only what an earlier
 //! `EdgeZero` poll recorded.
 
+// This module builds under the `test-utils` feature, which the crate-root
+// `cfg(test)` allow does not cover, and it buffers scripted bodies.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;

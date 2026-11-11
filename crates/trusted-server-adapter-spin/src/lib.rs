@@ -1,5 +1,8 @@
 //! Fermyon Spin adapter for Trusted Server.
 
+// Unit tests may buffer bodies with `Body::into_bytes`; production code must not.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod app;
 pub mod middleware;
 pub mod platform;

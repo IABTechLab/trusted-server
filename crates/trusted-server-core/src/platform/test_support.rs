@@ -8,9 +8,8 @@ use error_stack::Report;
 use rand::rngs::OsRng;
 
 use super::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    ClientInfo, GeoInfo, PlatformConfigStore, PlatformError, PlatformGeo, PlatformSecretStore,
+    RuntimeServices, StoreId, StoreName,
 };
 use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
@@ -133,72 +132,6 @@ impl PlatformSecretStore for HashMapSecretStore {
     }
 }
 
-pub(crate) struct NoopBackend;
-
-impl PlatformBackend for NoopBackend {
-    fn naming_policy(&self) -> super::BackendNamingPolicy {
-        super::BackendNamingPolicy::Axum
-    }
-
-    fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
-    }
-
-    fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
-    }
-}
-
-pub(crate) struct NoopHttpClient;
-
-// ?Send matches PlatformHttpClient. Body wraps LocalBoxStream which is !Send
-// by design; see http.rs for the full rationale.
-#[async_trait::async_trait(?Send)]
-impl PlatformHttpClient for NoopHttpClient {
-    async fn send(
-        &self,
-        _request: PlatformHttpRequest,
-    ) -> Result<PlatformResponse, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
-    }
-
-    async fn send_async(
-        &self,
-        _request: PlatformHttpRequest,
-    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
-    }
-
-    async fn select(
-        &self,
-        _pending_requests: Vec<PlatformPendingRequest>,
-    ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// StubBackend
-// ---------------------------------------------------------------------------
-
-/// Test stub for [`PlatformBackend`] that returns `"stub-backend"` for any
-/// spec, allowing callers to proceed past backend registration.
-pub(crate) struct StubBackend;
-
-impl PlatformBackend for StubBackend {
-    fn naming_policy(&self) -> super::BackendNamingPolicy {
-        super::BackendNamingPolicy::Axum
-    }
-
-    fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        Ok("stub-backend".to_owned())
-    }
-
-    fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        Ok("stub-backend".to_owned())
-    }
-}
-
 pub(crate) struct NoopGeo;
 
 impl PlatformGeo for NoopGeo {
@@ -219,8 +152,6 @@ pub(crate) fn build_services_with_config_and_secret(
         .config_store(Arc::new(config_store))
         .secret_store(Arc::new(secret_store))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-        .backend(Arc::new(NoopBackend))
-        .http_client(Arc::new(NoopHttpClient))
         .outbound_client(ScriptedHttpClient::forbidding().http_client())
         .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
@@ -237,8 +168,6 @@ pub(crate) fn build_services_with_config_and_secret_and_client_ip(
         .config_store(Arc::new(config_store))
         .secret_store(Arc::new(secret_store))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-        .backend(Arc::new(NoopBackend))
-        .http_client(Arc::new(NoopHttpClient))
         .outbound_client(ScriptedHttpClient::forbidding().http_client())
         .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
@@ -276,8 +205,6 @@ pub(crate) fn build_services_with_config(
         .config_store(Arc::new(config_store))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-        .backend(Arc::new(NoopBackend))
-        .http_client(Arc::new(NoopHttpClient))
         .outbound_client(ScriptedHttpClient::forbidding().http_client())
         .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
@@ -293,7 +220,7 @@ pub(crate) fn noop_services() -> RuntimeServices {
 ///
 /// The services clock reads `clock`, so a test that scripts time shares one
 /// clock between the scripted replies and the code under test. Every other
-/// service is a no-op, so a request through the old platform client fails.
+/// service is a no-op.
 pub(crate) fn build_services_with_outbound_client(
     client: &ScriptedHttpClient,
     clock: &TestClock,
@@ -315,8 +242,6 @@ pub(crate) fn noop_services_with_telemetry_sink(
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-        .backend(Arc::new(NoopBackend))
-        .http_client(Arc::new(NoopHttpClient))
         .outbound_client(ScriptedHttpClient::forbidding().http_client())
         .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
@@ -330,8 +255,6 @@ pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-        .backend(Arc::new(NoopBackend))
-        .http_client(Arc::new(NoopHttpClient))
         .outbound_client(ScriptedHttpClient::forbidding().http_client())
         .clock(TestClock::new().monotonic_clock())
         .geo(Arc::new(NoopGeo))
@@ -342,45 +265,9 @@ pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
         .build()
 }
 
-/// Build a [`RuntimeServices`] with a custom secret store, [`StubBackend`], and HTTP client.
-pub(crate) fn build_services_with_config_secret_and_http_client(
-    config_store: impl PlatformConfigStore + 'static,
-    secret_store: impl PlatformSecretStore + 'static,
-    http_client: Arc<dyn PlatformHttpClient>,
-) -> RuntimeServices {
-    RuntimeServices::builder()
-        .config_store(Arc::new(config_store))
-        .secret_store(Arc::new(secret_store))
-        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-        .backend(Arc::new(StubBackend))
-        .http_client(http_client)
-        .outbound_client(ScriptedHttpClient::forbidding().http_client())
-        .clock(TestClock::new().monotonic_clock())
-        .geo(Arc::new(NoopGeo))
-        .client_info(ClientInfo::default())
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stub_backend_returns_fixed_name() {
-        let stub = StubBackend;
-        let spec = PlatformBackendSpec {
-            scheme: "https".to_owned(),
-            host: "example.com".to_owned(),
-            port: None,
-            host_header_override: None,
-            certificate_check: true,
-            first_byte_timeout: std::time::Duration::from_secs(15),
-            between_bytes_timeout: std::time::Duration::from_secs(15),
-            discriminator: None,
-        };
-        let name = stub.ensure(&spec).expect("should return a backend name");
-        assert_eq!(name, "stub-backend", "should return fixed name");
-    }
 
     #[test]
     fn build_services_with_config_and_secret_uses_provided_stores() {

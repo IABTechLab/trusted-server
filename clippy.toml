@@ -14,3 +14,11 @@ allow-unwrap-in-tests = true
 # Keep current Trusted Server thresholds while strict lint cleanup is underway.
 cognitive-complexity-threshold = 30
 too-many-lines-threshold = 200
+
+# `Body::into_bytes` returns `None` for a streamed body, so a caller that
+# treats `None` as empty silently drops the body. Production code reads bodies
+# through the bounded readers instead. Unit tests may buffer freely: crate
+# roots allow the lint under `cfg(test)`.
+disallowed-methods = [
+    { path = "edgezero_core::body::Body::into_bytes", reason = "returns None for a stream; read inbound bodies with `trusted_server_core::http_util::read_request_body` and outbound responses with `OutboundResponse::into_bytes_bounded`" },
+]

@@ -80,7 +80,7 @@ use crate::html_processor::{
     BodyCloseInjection, HtmlProcessorConfig, create_html_processor_with_document_state,
 };
 use crate::http_util::{
-    RequestInfo, into_body_payload, is_navigation_request, serve_static_with_etag,
+    RequestInfo, body_as_reader, into_body_payload, is_navigation_request, serve_static_with_etag,
 };
 use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
 use crate::outbound::{
@@ -178,17 +178,6 @@ fn set_assembly_response_state(response: &mut Response<EdgeBody>, state: Assembl
         HEADER_X_TS_ASSEMBLY,
         HeaderValue::from_static(state.as_str()),
     );
-}
-
-fn body_as_reader(
-    body: EdgeBody,
-) -> Result<std::io::Cursor<bytes::Bytes>, Report<TrustedServerError>> {
-    let bytes = body.into_bytes().ok_or_else(|| {
-        Report::new(TrustedServerError::Proxy {
-            message: "streaming body cannot be processed by sync publisher pipeline".to_string(),
-        })
-    })?;
-    Ok(std::io::Cursor::new(bytes))
 }
 
 /// Carries a publisher origin body read error inside a processing report.
@@ -811,7 +800,7 @@ fn process_response_streaming<W: Write>(
         })?;
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
-            .process(body_as_reader(body)?, output)?;
+            .process(body_as_reader(body, "publisher")?, output)?;
     } else if is_rsc_flight {
         // RSC Flight responses are length-prefixed (T rows). A naive string replacement will
         // corrupt the stream by changing byte lengths without updating the prefixes.
@@ -823,7 +812,7 @@ fn process_response_streaming<W: Write>(
         );
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
-            .process(body_as_reader(body)?, output)?;
+            .process(body_as_reader(body, "publisher")?, output)?;
     } else {
         let replacer = create_url_replacer(
             params.origin_host,
@@ -833,7 +822,7 @@ fn process_response_streaming<W: Write>(
         );
         StreamingPipeline::new(config, replacer)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
-            .process(body_as_reader(body)?, output)?;
+            .process(body_as_reader(body, "publisher")?, output)?;
     }
 
     Ok(())
@@ -1874,8 +1863,8 @@ enum TemplateStoreOutcome {
 /// statuses (204, 304) carry no body but may advertise the `GET` representation's
 /// length, so they skip the buffer and length rewrite.
 ///
-/// Buffered adapters (Axum, Cloudflare, Spin, and non-streaming fallbacks) call
-/// this: it drives
+/// Axum, Cloudflare, and Spin call this for every publisher response, and
+/// Fastly calls it on a template-cache miss. It drives
 /// [`stream_publisher_body_async`], which awaits
 /// [`AuctionOrchestrator::collect_dispatched_auction`], writes the winning bids
 /// into `ad_bids_state`, and injects them before `</body>`.
@@ -1909,8 +1898,8 @@ pub async fn buffer_publisher_response_async(
     }
     match publisher_response {
         PublisherResponse::Buffered(mut response) => {
-            // A buffered-unmodified response can carry an origin body (a stream
-            // on streaming-capable adapters). A bodiless response (HEAD, 204,
+            // A buffered-unmodified response can carry an origin body, which
+            // arrives as a stream. A bodiless response (HEAD, 204,
             // 205, 304) must stay bodiless, so drop the body and correct its
             // framing (204/205 Content-Length; HEAD/304 preserved), matching
             // the streaming finalizer.
@@ -3165,7 +3154,7 @@ pub fn stream_publisher_body<W: Write>(
         && is_html_content_type(&params.content_type)
         && integration_registry.has_async_html_finish()
     {
-        let mut input = body_as_reader(body)?;
+        let mut input = body_as_reader(body, "publisher")?;
         std::io::copy(&mut input, output).change_context(TrustedServerError::Proxy {
             message: "Failed to copy range-associated HTML".to_string(),
         })?;
@@ -4122,7 +4111,7 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     }
 
     // The gzip decode budget is the same input cap the streaming arm above uses.
-    let body = body_as_reader(body)?;
+    let body = body_as_reader(body, "publisher")?;
     if output_compression == Compression::None {
         return match input_compression {
             Compression::None => {
@@ -4935,10 +4924,11 @@ fn host_override_differs(override_authority: &str, origin: &url::Url) -> bool {
 /// Builds the publisher origin request from the reader's request.
 ///
 /// The request keeps the inbound body and its read deadline and uploads at most
-/// [`PUBLISHER_UPLOAD_BYTES`]. With [`ResponseDecoding::Original`] it streams
-/// the response in its original coding. With [`ResponseDecoding::Decode`] it
-/// decodes the response, and an adapter that collects it buffers it under
-/// `input_cap`. Either way the encoded response is capped at `input_cap`.
+/// [`PUBLISHER_UPLOAD_BYTES`]. It streams the response, in its original coding
+/// with [`ResponseDecoding::Original`] or decoded with
+/// [`ResponseDecoding::Decode`], and caps the encoded response at `input_cap`.
+/// Where the adapter collects the response, Trusted Server bounds the decoded
+/// bytes at `input_cap` too.
 ///
 /// # Errors
 ///
@@ -4969,9 +4959,6 @@ fn publisher_origin_request(
     .response_decoding(origin.response_decoding);
     if let Some(cap) = origin.input_cap {
         request = request.max_encoded_response_bytes(cap);
-        if origin.response_decoding == ResponseDecoding::Decode {
-            request = request.max_response_bytes(cap);
-        }
     }
     if let Some(authority) = host_authority_override {
         request = request
@@ -20169,8 +20156,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
                 let stub = PublisherUpstream::new();
 
-                // `send_async` consumes the first response before the publisher
-                // origin request consumes the second response.
                 let mut origin_headers = vec![
                     ("cache-control", "public, max-age=300"),
                     ("etag", ORIGIN_ETAG),

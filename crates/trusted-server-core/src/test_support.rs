@@ -306,9 +306,8 @@ pub mod nextjs_auction {
 
     use crate::geo::GeoInfo;
     use crate::platform::{
-        BackendNamingPolicy, ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-        PlatformError, PlatformGeo, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
-        UnavailableHttpClient, UnavailableKvStore,
+        ClientInfo, PlatformConfigStore, PlatformError, PlatformGeo, PlatformSecretStore,
+        RuntimeServices, StoreId, StoreName, UnavailableKvStore,
     };
     use crate::settings::Settings;
     use crate::test_support::scripted_client::{ScriptedHttpClient, ScriptedReply, TestClock};
@@ -731,23 +730,6 @@ pub mod nextjs_auction {
         }
     }
 
-    impl PlatformBackend for FixtureStore {
-        fn naming_policy(&self) -> BackendNamingPolicy {
-            BackendNamingPolicy::Axum
-        }
-
-        fn predict_name(
-            &self,
-            _spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<PlatformError>> {
-            Ok("fixture-backend".to_owned())
-        }
-
-        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            Ok("fixture-backend".to_owned())
-        }
-    }
-
     /// Runtime services wired to `client`, with its scripted origin and bidder as the
     /// outbound client and every other platform capability stubbed out.
     #[must_use]
@@ -765,8 +747,6 @@ pub mod nextjs_auction {
             .config_store(Arc::new(FixtureStore))
             .secret_store(Arc::new(FixtureStore))
             .kv_store(Arc::new(UnavailableKvStore))
-            .backend(Arc::new(FixtureStore))
-            .http_client(Arc::new(UnavailableHttpClient))
             .outbound_client(client.http_client())
             .clock(clock.monotonic_clock())
             .geo(Arc::new(FixtureGeo))

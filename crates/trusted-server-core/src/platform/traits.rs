@@ -2,7 +2,7 @@ use std::net::IpAddr;
 
 use error_stack::Report;
 
-use super::{BackendNamingPolicy, GeoInfo, PlatformBackendSpec, PlatformError, StoreId, StoreName};
+use super::{GeoInfo, PlatformError, StoreId, StoreName};
 
 /// Object-safe access to a key-value config store.
 ///
@@ -100,29 +100,6 @@ pub trait PlatformSecretStore: Send + Sync {
     /// Returns [`PlatformError::SecretStore`] when the delete fails or the
     /// platform management API is unreachable.
     async fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>>;
-}
-
-/// Synchronous, object-safe dynamic backend management.
-pub trait PlatformBackend: Send + Sync {
-    /// Return this adapter's pure backend naming and transport timer policy.
-    fn naming_policy(&self) -> BackendNamingPolicy;
-
-    /// Compute the deterministic backend name for the given spec without
-    /// registering anything.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError::Backend`] when the spec is invalid or the
-    /// name cannot be computed.
-    fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>>;
-
-    /// Ensure a dynamic backend exists for the given spec and return its name.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError::Backend`] when the backend cannot be
-    /// registered on the platform.
-    fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>>;
 }
 
 /// Synchronous, object-safe geo lookup.
