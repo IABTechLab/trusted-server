@@ -85,6 +85,19 @@ Single-page apps often insert CMP scripts after the initial HTML response. The `
 
 ## Cookie Forwarding and Caching
 
+On HTTPS publisher pages, the browser integration also listens to Sourcepoint's
+TCF API. When the CMP has a settled GDPR decision and has not supplied
+`euconsent-v2`, it mirrors the original TC string into the host-only session
+cookie `__Host-ts-tcf`. Trusted Server prefers `euconsent-v2` when present and
+otherwise decodes the mirror through its existing TCF consent rules. The
+mirror is independent of GPP and does not create or change consent.
+
+A grant can permit Edge Cookie issuance on the next eligible page navigation.
+A later denial replaces the grant so subsequent requests can reconcile
+withdrawal. The browser integration neither reloads the page nor issues an Edge
+Cookie itself. In Prebid cookie forwarding modes, the selected TCF signal is
+sent as `euconsent-v2` rather than using the bridge cookie name.
+
 Trusted Server forwards only Sourcepoint's documented cookie names upstream, plus the optional `auth_cookie_name` when configured. Unrelated publisher cookies are deliberately excluded so first-party application state is not leaked to Sourcepoint.
 
 Responses that include `Set-Cookie` are forced to `Cache-Control: private, no-store` so cookie-bearing Sourcepoint traffic is never marked as publicly cacheable content by the proxy.
