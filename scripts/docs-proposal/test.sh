@@ -440,7 +440,7 @@ assert_contains "$(cat "$STUB_LOG")" "pr list --head docs/auto/${release_hash:0:
 publish_range() {
   rm -rf "$tmp/proposal" && mkdir -p "$tmp/proposal"
   git reset -q --hard "$second_sha" && git clean -qfd
-  printf 'proposed\n' >> docs/guide/cli.md
+  printf 'proposed for %s\n' "$1" >> docs/guide/cli.md
   git add -A && git diff --cached --binary "$second_sha" > "$tmp/proposal/proposal.patch"
   git reset -q --hard "$second_sha"
   printf -- '- docs/guide/cli.md: example rationale.\n' > "$tmp/proposal/rationale.md"
