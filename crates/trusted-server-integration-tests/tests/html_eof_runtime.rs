@@ -509,6 +509,71 @@ fn capture_body(reader: &mut impl std::io::Read) -> CapturedBody {
     }
 }
 
+/// Operator response header the fixture config adds, which synthesized sets carry.
+const OPERATOR_HEADER: (&str, &str) = ("x-example-operator", "fixture");
+
+/// Route the test-utils fixture answers with a `Trailer` field.
+const FRAMING_TRAILER_PATH: &str = "/integrations/html_finalization_fixture/framing-trailer";
+
+/// Checks that `EdgeZero`'s detached and fallback responses carry the request's synthesized headers.
+///
+/// A target of 8193 bytes gets 414, about 72 KiB of headers in 60 lines get
+/// 431, and the fixture's `Trailer` route gets the framing 500. Each carries the
+/// `x-ts-version` and `x-ts-fastly-version` the `routed` page carried, a geo
+/// header, and the operator header. Viceroy answers 101 header lines with its
+/// own 431 before the guest runs, so the case stays at 60.
+fn head_limit_414_431_and_framing_500_carry_synthesized_headers(
+    client: &Client,
+    base_url: &str,
+    routed: &reqwest::header::HeaderMap,
+) -> HarnessResult<()> {
+    let long_target = format!("{base_url}/{}", "a".repeat(8192));
+    let mut large_head = client.get(format!("{base_url}/article"));
+    for index in 0..60 {
+        large_head = large_head.header(format!("x-example-{index:02}"), "a".repeat(1200));
+    }
+    for (label, request, status) in [
+        ("head-limit 414", client.get(long_target), 414),
+        ("head-limit 431", large_head, 431),
+        (
+            "framing 500",
+            client.get(format!("{base_url}{FRAMING_TRAILER_PATH}")),
+            500,
+        ),
+    ] {
+        let response = request.send().change_context(HarnessError::Http)?;
+        let headers = response.headers();
+        assert_eq!(
+            response.status().as_u16(),
+            status,
+            "should answer the {label}"
+        );
+        for name in ["x-ts-version", "x-ts-fastly-version"] {
+            assert_eq!(
+                headers.get(name),
+                routed.get(name),
+                "should carry the routed {name} on the {label}"
+            );
+        }
+        assert!(
+            headers.contains_key("x-geo-info-available"),
+            "should carry the geo headers on the {label}"
+        );
+        assert_eq!(
+            headers
+                .get(OPERATOR_HEADER.0)
+                .and_then(|value| value.to_str().ok()),
+            Some(OPERATOR_HEADER.1),
+            "should carry the operator header on the {label}"
+        );
+        assert!(
+            !headers.contains_key("trailer"),
+            "should never send a Trailer field on the {label}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn truncated_response_preserves_received_bytes() {
     struct TruncatedResponse(usize);
@@ -737,6 +802,12 @@ fn actual_runtime() -> HarnessResult<()> {
                 headers["cache-control"], "no-store, private",
                 "should prohibit shared caching"
             );
+        }
+        // Spec test 11's Viceroy legs need the fixture's test-utils route.
+        if adapter == "fastly" && case == "success" {
+            head_limit_414_431_and_framing_500_carry_synthesized_headers(
+                &client, &base_url, &headers,
+            )?;
         }
         let events = origin.events();
         let lookup = origin::lookup_for_request(&events, started, completed, case != "disabled")?;

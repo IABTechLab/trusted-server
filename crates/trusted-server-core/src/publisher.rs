@@ -2559,8 +2559,8 @@ async fn store_template_if_authorized(
 /// bodies where possible.
 ///
 /// Buffered adapters should keep using [`buffer_publisher_response_async`].
-/// Fastly uses this helper before the entry point commits headers, allowing the
-/// response body to be pulled lazily by `stream_to_client()`.
+/// Fastly uses this helper before `EdgeZero`'s delivery commits headers,
+/// allowing the response body to be pulled lazily as it streams to the client.
 ///
 /// # Errors
 ///
@@ -2624,8 +2624,8 @@ pub async fn publisher_response_into_streaming_response(
             // Fastly requests the origin body as a stream before the response is
             // classified, so a buffered-unmodified response can still hold an
             // `EdgeBody::Stream`. A bodiless response (HEAD, 204, 205, 304) must
-            // stay bodiless — `send_edgezero_response` streams any
-            // `EdgeBody::Stream` to the client — so drop the body and correct
+            // stay bodiless, because delivery streams any `EdgeBody::Stream`
+            // to the client, so drop the body and correct
             // its framing (204/205 Content-Length; HEAD/304 preserved).
             if !response_carries_body(method, response.status()) {
                 make_response_bodiless(&mut response);
@@ -3134,10 +3134,10 @@ impl Write for BoundedWriter {
 
 /// Stream the publisher response body through the processing pipeline.
 ///
-/// Called by the adapter after `stream_to_client()` has committed the response
-/// headers. Runs synchronously against an already-materialised body; the async
-/// I/O happened upstream in [`handle_publisher_request`]. Writes processed
-/// chunks directly to `output`.
+/// Called by an adapter after its response headers are committed. Runs
+/// synchronously against an already-materialised body; the async I/O happened
+/// upstream in [`handle_publisher_request`]. Writes processed chunks directly
+/// to `output`.
 ///
 /// This helper performs synchronous transformations only. Registered HTML
 /// finalizers require [`stream_publisher_body_async`],

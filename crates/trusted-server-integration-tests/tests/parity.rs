@@ -25,6 +25,7 @@ use trusted_server_core::platform::HttpClient;
 
 use axum::body::Body as AxumBody;
 use axum::http::Request as AxumRequest;
+use base64::Engine as _;
 use edgezero_adapter_axum::AXUM_PLATFORM;
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
 use edgezero_adapter_axum::outbound::AxumOutboundClient;
@@ -1556,6 +1557,103 @@ async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
 }
 
 #[allow(clippy::panic)]
+/// A TCF v2 `euconsent-v2` cookie that grants Purpose 1.
+///
+/// The test server has no geo source, so the jurisdiction is unknown and the
+/// server-side auction needs Purpose 1. The construction matches the
+/// integration suite's consent cookie, which lives in another test binary.
+fn tcf_purpose_one_cookie() -> String {
+    let mut bits = [0_u8; 29];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("should have a current fixture clock")
+        .as_millis()
+        / 100;
+    for (offset, width, value) in [
+        (0, 6, 2),
+        (6, 36, now),
+        (42, 36, now),
+        (108, 6, 4),
+        (114, 6, 13),
+        (152, 1, 1),
+    ] {
+        for index in 0..width {
+            if value & (1 << (width - index - 1)) != 0 {
+                bits[(offset + index) / 8] |= 1 << (7 - (offset + index) % 8);
+            }
+        }
+    }
+    format!(
+        "euconsent-v2={}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bits)
+    )
+}
+
+/// Only Fastly sends Tinybird telemetry: the other adapters keep the no-op
+/// sink, so an auction with Tinybird enabled makes no Events API request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn axum_cloudflare_and_spin_send_no_telemetry() {
+    let mut settings = nextjs_auction::settings();
+    settings.tinybird.enabled = true;
+    settings.tinybird.api_host = "api.tinybird.example.com".to_owned();
+    settings.tinybird.auction_token_secret = Some(trusted_server_core::redacted::Redacted::new(
+        "example-append-token".to_owned(),
+    ));
+
+    for (name, adapter) in [
+        ("Axum", Adapter::Axum),
+        ("Cloudflare", Adapter::Cloudflare),
+        ("Spin", Adapter::Spin),
+    ] {
+        let scripted = ScriptedHttpClient::new(&TestClock::new());
+        let server = serve(adapter.app(settings.clone(), scripted.http_client())).await;
+
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("should build the test HTTP client")
+            .post(format!("http://{}/auction", server.address()))
+            .header("cookie", tcf_purpose_one_cookie())
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "adUnits": [{
+                        "code": "fixture-slot",
+                        "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                    }]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("should answer the auction");
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .expect("should answer with the auction's JSON");
+        server
+            .shutdown()
+            .await
+            .expect("should stop the Axum test server");
+
+        assert_eq!(status, 200, "{name} should complete the auction");
+        assert_eq!(
+            body["ext"]["orchestrator"]["providers"], 1,
+            "{name} should run the auction, which emits its telemetry rows: {body}"
+        );
+        let requested: Vec<String> = scripted
+            .requests()
+            .iter()
+            .map(|request| request.uri.to_string())
+            .collect();
+        assert!(
+            !requested.iter().any(|uri| uri.contains("tinybird")),
+            "{name} should send no Tinybird request: {requested:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod trace_parity {
     use std::net::IpAddr;

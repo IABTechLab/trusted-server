@@ -21,9 +21,16 @@
 //
 //   { "head-root": { "header content-length": 7 } }
 //
-// A difference is "status", "body", or "header <lower-case name>". The diff
-// exits 1 when a difference is not listed, and also when a listed difference
-// does not occur. It exits 2 on bad input or when a server cannot be reached.
+// A difference is "status", "body", or "header <lower-case name>". An entry
+// can also pin the value head must show, as { "item": <n>, "head": <value> }:
+// a number for "status", the sorted list of normalized values for a header
+// ([] when head drops it), and "sha256 <hex> (<n> bytes)" for "body":
+//
+//   { "trace-method": { "status": { "item": 5, "head": 405 } } }
+//
+// The diff exits 1 when a difference is not listed, when head shows another
+// value than a pinned one, and also when a listed difference does not occur.
+// It exits 2 on bad input or when a server cannot be reached.
 //
 // Each entry in requests.json has an "id", a "method", optional "headers",
 // and an optional "body" string or "json" value. It names either a "path" or
@@ -42,6 +49,8 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 
 const USAGE = `Usage:
@@ -96,7 +105,7 @@ const ORIGIN_ROUTES = new Map([
   ],
 ])
 
-class InputError extends Error {}
+export class InputError extends Error {}
 
 function fail(message) {
   throw new InputError(message)
@@ -206,41 +215,82 @@ function loadRequests(path) {
   return requests
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
 function loadExpected(path, requests) {
-  const expected = readJson(path)
-  if (
-    expected === null ||
-    typeof expected !== 'object' ||
-    Array.isArray(expected)
-  ) {
-    fail(`${path} must hold an object`)
+  return parseExpected(readJson(path), requests, path)
+}
+
+// Validates expected.json's `expected` against `requests` and returns it with
+// every difference as { item, pinned, head }, where `pinned` says whether the
+// entry fixed head's value.
+export function parseExpected(expected, requests, label) {
+  if (!isPlainObject(expected)) {
+    fail(`${label} must hold an object`)
   }
   const ids = new Set(requests.map((request) => request.id))
+  const parsed = {}
   for (const [id, differences] of Object.entries(expected)) {
     if (!ids.has(id)) {
-      fail(`${path} names unknown request ${JSON.stringify(id)}`)
+      fail(`${label} names unknown request ${JSON.stringify(id)}`)
     }
-    if (
-      differences === null ||
-      typeof differences !== 'object' ||
-      Array.isArray(differences)
-    ) {
-      fail(`${path} entry ${JSON.stringify(id)} must map differences to items`)
+    if (!isPlainObject(differences)) {
+      fail(`${label} entry ${JSON.stringify(id)} must map differences to items`)
     }
-    for (const [key, item] of Object.entries(differences)) {
+    parsed[id] = {}
+    for (const [key, entry] of Object.entries(differences)) {
+      const where = `${label} entry ${JSON.stringify(id)} difference ${JSON.stringify(key)}`
       if (!DIFFERENCE_KEY.test(key)) {
         fail(
-          `${path} entry ${JSON.stringify(id)} has malformed difference ${JSON.stringify(key)}`
+          `${label} entry ${JSON.stringify(id)} has malformed difference ${JSON.stringify(key)}`
         )
       }
+      const pinned = isPlainObject(entry)
+      const item = pinned ? entry.item : entry
       if (!Number.isInteger(item) || item < 1) {
-        fail(
-          `${path} entry ${JSON.stringify(id)} difference ${JSON.stringify(key)} must name a Fastly differences item number`
-        )
+        fail(`${where} must name a Fastly differences item number`)
       }
+      if (pinned) {
+        const fields = Object.keys(entry).sort()
+        if (JSON.stringify(fields) !== JSON.stringify(['head', 'item'])) {
+          fail(`${where} must hold exactly "item" and "head"`)
+        }
+      }
+      parsed[id][key] = { item, pinned, head: pinned ? entry.head : undefined }
     }
   }
-  return expected
+  return parsed
+}
+
+// Sorts one request's `differences` against its `listed` expectations.
+//
+// Returns one { kind, key, item, base, head } per difference and per listed
+// difference that did not occur. `kind` is "expected", "unexpected",
+// "mismatched" (listed, but head shows another value than the pinned one),
+// or "missing".
+export function classifyDifferences(differences, listed) {
+  const results = []
+  for (const [key, { base, head }] of differences) {
+    const expectation = listed[key]
+    let kind = 'expected'
+    if (expectation === undefined) {
+      kind = 'unexpected'
+    } else if (
+      expectation.pinned &&
+      JSON.stringify(expectation.head) !== JSON.stringify(head)
+    ) {
+      kind = 'mismatched'
+    }
+    results.push({ kind, key, item: expectation?.item, base, head })
+  }
+  for (const [key, expectation] of Object.entries(listed)) {
+    if (!differences.has(key)) {
+      results.push({ kind: 'missing', key, item: expectation.item })
+    }
+  }
+  return results
 }
 
 function substitute(text, placeholders) {
@@ -471,23 +521,28 @@ async function runDiff(values, positionals) {
     if (differences.size === 0 && Object.keys(listed).length === 0) {
       console.log(`same        ${request.id}`)
     }
-    for (const [key, { base: before, head: after }] of differences) {
-      if (Object.hasOwn(listed, key)) {
-        console.log(`expected    ${request.id}: ${key} (item ${listed[key]})`)
-      } else {
-        unexpected += 1
-        console.log(`unexpected  ${request.id}: ${key}`)
-      }
-      console.log(`              base: ${describe(before)}`)
-      console.log(`              head: ${describe(after)}`)
-    }
-    for (const [key, item] of Object.entries(listed)) {
-      if (!differences.has(key)) {
+    for (const result of classifyDifferences(differences, listed)) {
+      const { kind, key, item } = result
+      if (kind === 'missing') {
         missing += 1
         console.log(
           `missing     ${request.id}: ${key} (item ${item}) did not differ`
         )
+        continue
       }
+      if (kind === 'expected') {
+        console.log(`expected    ${request.id}: ${key} (item ${item})`)
+      } else if (kind === 'mismatched') {
+        unexpected += 1
+        console.log(
+          `mismatched  ${request.id}: ${key} (item ${item}) head differs from the pinned ${describe(listed[key].head)}`
+        )
+      } else {
+        unexpected += 1
+        console.log(`unexpected  ${request.id}: ${key}`)
+      }
+      console.log(`              base: ${describe(result.base)}`)
+      console.log(`              head: ${describe(result.head)}`)
     }
   }
 
@@ -528,15 +583,21 @@ async function main() {
   return runDiff(values, positionals)
 }
 
-try {
-  const code = await main()
-  if (code !== undefined) {
-    process.exitCode = code
+// Run only as a command, so the test file can import the compare logic.
+if (
+  process.argv[1] !== undefined &&
+  fileURLToPath(import.meta.url) === resolve(process.argv[1])
+) {
+  try {
+    const code = await main()
+    if (code !== undefined) {
+      process.exitCode = code
+    }
+  } catch (error) {
+    if (!(error instanceof InputError)) {
+      throw error
+    }
+    console.error(`fastly-response-diff: ${error.message}`)
+    process.exitCode = 2
   }
-} catch (error) {
-  if (!(error instanceof InputError)) {
-    throw error
-  }
-  console.error(`fastly-response-diff: ${error.message}`)
-  process.exitCode = 2
 }

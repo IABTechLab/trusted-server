@@ -616,19 +616,6 @@ pub(crate) fn noop_services_with_telemetry_sink(
         .build()
 }
 
-/// Build a [`RuntimeServices`] with a caller-supplied HTTP client and a [`StubBackend`].
-///
-/// Uses [`StubBackend`] (always returns `Ok("stub-backend")`) rather than
-/// [`NoopBackend`] (always returns `Err(Unsupported)`) so that handlers which
-/// both make HTTP calls and resolve backends don't need two separate service
-/// setups.  If your test must verify that a missing backend returns an error,
-/// use [`noop_services`] directly.
-pub(crate) fn build_services_with_http_client(
-    http_client: Arc<dyn PlatformHttpClient>,
-) -> RuntimeServices {
-    build_services_with_config_secret_and_http_client(NoopConfigStore, NoopSecretStore, http_client)
-}
-
 pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(NoopConfigStore))
@@ -667,7 +654,6 @@ pub(crate) fn build_services_with_config_secret_and_http_client(
 
 #[cfg(test)]
 mod tests {
-    use crate::platform::DEFAULT_FIRST_BYTE_TIMEOUT;
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
 
@@ -920,8 +906,8 @@ mod tests {
             port: None,
             host_header_override: None,
             certificate_check: true,
-            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
-            between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            first_byte_timeout: std::time::Duration::from_secs(15),
+            between_bytes_timeout: std::time::Duration::from_secs(15),
             discriminator: None,
         };
         let name = stub.ensure(&spec).expect("should return a backend name");

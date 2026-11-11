@@ -2521,3 +2521,199 @@ fn origin_records_identity_accept_encoding_when_none_was_set_fastly() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// Head limits fit realistic traffic (spec test 11)
+// ---------------------------------------------------------------------------
+
+/// Bytes of the creative URL the realistic first-party proxy case wraps.
+const REALISTIC_CREATIVE_URL_BYTES: usize = 4096;
+
+/// Request headers the realistic first-party proxy case sends, each of [`REALISTIC_HEADER_BYTES`].
+const REALISTIC_HEADER_COUNT: usize = 40;
+
+/// Bytes of each request header value the realistic first-party proxy case sends.
+const REALISTIC_HEADER_BYTES: usize = 1024;
+
+/// Fetches a signed first-party proxy URL that wraps a 4 KiB creative URL, with 40 headers of 1 KiB each.
+///
+/// `EdgeZero`'s default head limits must admit it, so it reaches `creative_origin`.
+fn realistic_first_party_proxy_request_is_admitted(
+    base_url: &str,
+    creative_origin: &RecordingOrigin,
+) {
+    let client = raw_client();
+    let prefix = format!("http://127.0.0.1:{}/creative?ctx=", creative_origin.port);
+    let creative_url = format!(
+        "{prefix}{}",
+        "a".repeat(REALISTIC_CREATIVE_URL_BYTES - prefix.len())
+    );
+    let signed: serde_json::Value = client
+        .get(format!("{base_url}/first-party/sign"))
+        .query(&[("url", creative_url.as_str())])
+        .send()
+        .expect("should send the sign request")
+        .error_for_status()
+        .expect("should sign the creative URL")
+        .json()
+        .expect("should return the signed proxy URL");
+    let href = signed["href"]
+        .as_str()
+        .expect("should return the first-party proxy href");
+    let mut request = client.get(format!("{base_url}{href}"));
+    for index in 0..REALISTIC_HEADER_COUNT {
+        request = request.header(
+            format!("x-example-{index:02}"),
+            "b".repeat(REALISTIC_HEADER_BYTES),
+        );
+    }
+
+    let response = request
+        .send()
+        .expect("should send the realistic first-party proxy request");
+
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "should admit and serve the realistic first-party proxy request"
+    );
+    assert!(
+        creative_origin
+            .requests()
+            .iter()
+            .any(|forwarded| origin_request_path(forwarded) == "/creative"),
+        "should reach the creative origin"
+    );
+}
+
+/// Starts a creative origin and the proxy allowlist app config for the realistic case.
+fn realistic_creative_origin() -> (RecordingOrigin, String) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("should bind the creative origin");
+    let origin = RecordingOrigin::serve(
+        listener,
+        Arc::new(|request| html_response(200, request.method == "HEAD")),
+    );
+    let envelope =
+        common::config::proxy_allowlist_app_config_envelope(origin_port(), &["127.0.0.1"])
+            .expect("should build the proxy allowlist app config");
+    (origin, envelope)
+}
+
+#[test]
+#[ignore = "requires Viceroy and the release Fastly WASM"]
+fn realistic_first_party_proxy_request_is_admitted_fastly() {
+    init_logger();
+    let (origin, envelope) = realistic_creative_origin();
+    common::trace_boundary::with_trace_runtime(
+        common::trace_boundary::TraceRuntime::Fastly,
+        &envelope,
+        None,
+        |base_url| realistic_first_party_proxy_request_is_admitted(base_url, &origin),
+    );
+}
+
+#[test]
+#[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
+fn realistic_first_party_proxy_request_is_admitted_cloudflare() {
+    init_logger();
+    let (origin, envelope) = realistic_creative_origin();
+    common::trace_boundary::with_trace_runtime(
+        common::trace_boundary::TraceRuntime::Cloudflare,
+        &envelope,
+        None,
+        |base_url| realistic_first_party_proxy_request_is_admitted(base_url, &origin),
+    );
+}
+
+#[test]
+#[ignore = "requires the pre-built trusted-server-axum binary"]
+fn realistic_first_party_proxy_request_is_admitted_axum() {
+    init_logger();
+    let (origin, envelope) = realistic_creative_origin();
+    let process = environments::axum::AxumDevServer
+        .spawn_with_app_config(&envelope)
+        .expect("should start the Axum dev server");
+    realistic_first_party_proxy_request_is_admitted(&process.base_url, &origin);
+}
+
+// ---------------------------------------------------------------------------
+// Response write deadline (spec test 17)
+// ---------------------------------------------------------------------------
+
+/// How long the slow publisher origin streams its page.
+const SLOW_PAGE_STREAM: Duration = Duration::from_secs(35);
+
+/// Marker the slow publisher page ends with.
+const SLOW_PAGE_END: &str = "<p>example slow page end</p>";
+
+/// Serves one chunked HTML page on `listener` whose body takes [`SLOW_PAGE_STREAM`] to arrive.
+fn serve_slow_streaming_page(listener: TcpListener) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let Ok((mut stream, _addr)) = listener.accept() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let Some(_request) = read_origin_request(&mut stream) else {
+            return;
+        };
+        let write_chunk = |stream: &mut TcpStream, chunk: &str| {
+            stream
+                .write_all(format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes())
+                .and_then(|()| stream.flush())
+        };
+        if stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+            .is_err()
+            || write_chunk(&mut stream, "<html><head><title>Example</title></head><body>").is_err()
+        {
+            return;
+        }
+        let started = std::time::Instant::now();
+        while started.elapsed() < SLOW_PAGE_STREAM {
+            thread::sleep(Duration::from_secs(1));
+            if write_chunk(&mut stream, "<p>example slow chunk</p>").is_err() {
+                return;
+            }
+        }
+        let _ = write_chunk(&mut stream, &format!("{SLOW_PAGE_END}</body></html>"))
+            .and_then(|()| stream.write_all(b"0\r\n\r\n"))
+            .and_then(|()| stream.flush());
+    })
+}
+
+#[test]
+#[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
+fn publisher_page_streaming_35_seconds_completes() {
+    init_logger();
+    let _port = lock_origin_port();
+    let listener =
+        TcpListener::bind(("127.0.0.1", origin_port())).expect("should bind the origin port");
+    let origin = serve_slow_streaming_page(listener);
+    let process = IngressRuntime::Fastly.spawn();
+    let started = std::time::Instant::now();
+
+    let response = reqwest::blocking::Client::builder()
+        .no_gzip()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .expect("should build a client that waits for the slow page")
+        .get(format!("{}/slow-page", process.base_url))
+        .header("accept", "text/html")
+        .header("accept-encoding", "identity")
+        .send()
+        .expect("should start the slow page");
+    let status = response.status().as_u16();
+    let body = response.text().expect("should read the whole slow page");
+
+    assert_eq!(status, 200, "should serve the slow page");
+    assert!(
+        started.elapsed() >= SLOW_PAGE_STREAM,
+        "should stream for the origin's full {SLOW_PAGE_STREAM:?}"
+    );
+    assert!(
+        body.contains(SLOW_PAGE_END),
+        "should deliver the page past EdgeZero's 30 s default write deadline"
+    );
+    drop(process);
+    let _ = origin.join();
+}

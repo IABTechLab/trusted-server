@@ -1,13 +1,12 @@
 //! Full `EdgeZero` application wiring for Trusted Server.
 //!
 //! Registers all routes for Trusted Server into a
-//! [`RouterService`]. On successful startup, attaches [`FinalizeResponseMiddleware`]
-//! (outermost) and [`AuthMiddleware`] (inner). When startup fails,
-//! [`startup_error_router`] returns a bare router without middleware.
-//! Builds the [`AppState`] once per Wasm instance.
+//! [`RouterService`], with [`FinalizeResponseMiddleware`] (outermost) and
+//! [`AuthMiddleware`] (inner). [`assemble_app`] builds the [`AppState`] and
+//! the [`App`] once per sandbox through [`App::from_router`].
 //!
 //! `EdgeZero`'s current Fastly request context exposes client IP but not TLS
-//! protocol or cipher metadata. `edgezero_main` injects a trusted `fastly-ssl`
+//! protocol or cipher metadata. The entry point injects a trusted `fastly-ssl`
 //! header after stripping client-spoofable headers, so [`detect_request_scheme`]
 //! in `http_util` can still derive the correct scheme for HTTPS traffic.
 //! It also captures the full [`ClientInfo`] (TLS, JA4, H2 fingerprint, server
@@ -43,8 +42,8 @@
 //!
 //! > **Note:** Methods not in the list above (e.g. `TRACE`, `CONNECT`, WebDAV verbs) return a
 //! > router-level 405. Legacy routing proxied *every* method through to the publisher origin.
-//! > This is a known intentional restriction of the EdgeZero router; the entry-point
-//! > `apply_finalize_headers` call in `main.rs` still adds TS headers to those 405 responses.
+//! > This is a known intentional restriction of the EdgeZero router; the entry point's
+//! > `finalize` step still adds TS headers to those 405 responses.
 //!
 //! # EC identity lifecycle
 //!
@@ -60,8 +59,8 @@
 //!   [`EcContext`], [`KvIdentityGraph`], and [`PartnerRegistry`] inputs as
 //!   legacy; the publisher fallback generates EC IDs for browser navigations.
 //! - Handlers attach an [`EcFinalizeState`] to the response via extensions;
-//!   `edgezero_main` pops it and runs `ec_finalize_response` plus the
-//!   pull-sync hook on the converted fastly response before sending.
+//!   the entry point's `finalize` step pops it and runs `ec_finalize_response`,
+//!   and post-delivery work runs pull sync once the response is delivered.
 //!
 //! ## Intentional deviations from legacy
 //!
@@ -79,19 +78,16 @@
 //!
 //! # Startup error handling
 //!
-//! [`Hooks::routes`] returns the startup error as an [`EdgeError`] from
-//! [`startup_error`]. The entry point builds its app with
-//! `TrustedServerApp::build_app_with_state` instead. There, when [`build_state`]
-//! fails, [`startup_error_router`] returns a minimal router
-//! that responds to all routes with the startup error. This router does **not**
-//! attach middleware. Startup-error responses may still receive entry-point
-//! finalization (geo and TS headers) when settings can be reloaded via
-//! [`load_settings_from_config_store`]; if settings loading itself fails, they
-//! are returned without geo or TS headers.
+//! [`assemble_app`] and [`Hooks::routes`] return a settings or state failure
+//! as the [`EdgeError`] from [`startup_error`], and [`App::from_router`]
+//! returns a `configure` failure. The entry point answers either with
+//! `EdgeZero`'s assembly-error response, which carries no TS headers, and
+//! retains nothing, so the next request retries.
 
 use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
+use edgezero_adapter_fastly::FASTLY_PLATFORM;
 use edgezero_adapter_fastly::context::FastlyRequestContext;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
@@ -102,7 +98,6 @@ use edgezero_core::http::{
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::RouterService;
 use error_stack::Report;
-use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::plan::validate_fastly_backend_bound;
 use trusted_server_core::auction::{
@@ -110,9 +105,7 @@ use trusted_server_core::auction::{
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
-use trusted_server_core::constants::{
-    COOKIE_SHAREDID, COOKIE_TS_EIDS, ENV_FASTLY_SERVICE_VERSION, HEADER_X_TS_FASTLY_VERSION,
-};
+use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, ENV_FASTLY_SERVICE_VERSION};
 use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
@@ -123,7 +116,7 @@ use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
-use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
+use trusted_server_core::edge_app::install_edge_policies;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError, startup_error};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
@@ -151,11 +144,13 @@ use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_f
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, fastly_version_header_value};
+use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, version_synthesized_headers};
 use crate::platform::{
     FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
     FastlyPlatformSecretStore, UnavailableKvStore,
 };
+use crate::sandbox::RetainedApp;
+use crate::tinybird::{QueueingTelemetrySink, TelemetryQueue};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -197,19 +192,6 @@ pub(crate) struct AppState {
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
-    pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
-}
-
-/// Build the application state, loading settings and constructing all per-application components.
-///
-/// # Errors
-///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
-pub(crate) fn build_state(
-    stores: &RuntimeStoreConfig,
-) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_from_settings(load_settings_from_config_store(stores)?)
 }
 
 pub(crate) fn load_settings_from_config_store(
@@ -232,7 +214,6 @@ pub(crate) fn build_state_from_settings(
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
-    let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
     Ok(Arc::new(AppState {
@@ -240,7 +221,6 @@ pub(crate) fn build_state_from_settings(
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         default_kv_store,
-        auction_telemetry_sink,
     }))
 }
 
@@ -250,25 +230,29 @@ pub(crate) fn build_state_from_settings(
 
 /// Construct per-request [`RuntimeServices`] from the `EdgeZero` request context.
 ///
-/// Prefers the full [`ClientInfo`] captured by `edgezero_main` from the original
+/// Prefers the full [`ClientInfo`] captured by the entry point from the original
 /// `FastlyRequest` (TLS protocol/cipher, JA4, H2 fingerprint, and server
 /// hostname/region) and stored in the request extensions — the metadata
 /// integration bot protection (e.g. `DataDome`) serializes, which the
 /// reconstructed `EdgeZero` request cannot expose. Falls back to the client IP
 /// from the dispatch-inserted [`FastlyRequestContext`] when the extension is
 /// absent (e.g. tests that dispatch without the entry point). Scheme detection
-/// continues to rely on the trusted `fastly-ssl` header injected by
-/// `edgezero_main` after sanitization.
+/// continues to rely on the trusted `fastly-ssl` header injected by the entry
+/// point after sanitization.
 ///
 /// The outbound client is the one `EdgeZero`'s Fastly request conversion
 /// installs in the request context, with the proxy marker turned off. The
 /// config and secret stores make their management API writes through it. The
 /// clock is the context's monotonic clock.
 ///
+/// With Tinybird enabled, the auction telemetry sink queues NDJSON on the
+/// request's [`TelemetryQueue`], which the entry point inserts and sends after
+/// delivery. Otherwise the sink is the no-op default.
+///
 /// # Errors
 ///
 /// Returns an internal [`EdgeError`] when the request carries no outbound
-/// client.
+/// client, or no telemetry queue while Tinybird is enabled.
 fn build_per_request_services(
     state: &AppState,
     ctx: &RequestContext,
@@ -293,7 +277,22 @@ fn build_per_request_services(
         })?
         .with_proxy_marker(false);
 
-    Ok(RuntimeServices::builder()
+    let mut services = RuntimeServices::builder();
+    if state.settings.tinybird.enabled {
+        let queue = ctx
+            .extensions()
+            .get::<TelemetryQueue>()
+            .cloned()
+            .ok_or_else(|| {
+                EdgeError::internal(std::io::Error::other("request has no telemetry queue"))
+            })?;
+        services = services.auction_telemetry_sink(Arc::new(QueueingTelemetrySink::new(
+            &state.settings.tinybird,
+            queue,
+        )));
+    }
+
+    Ok(services
         .config_store(Arc::new(FastlyPlatformConfigStore::with_outbound_client(
             outbound_client.clone(),
         )))
@@ -311,7 +310,6 @@ fn build_per_request_services(
         .outbound_client(outbound_client)
         .clock(ctx.monotonic_clock())
         .geo(Arc::new(FastlyPlatformGeo))
-        .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
         .build())
 }
@@ -339,24 +337,21 @@ fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
 /// EC state threaded from route handlers to the `main.rs` entry point via
 /// response extensions.
 ///
-/// `edgezero_main` pops this from the response after dispatch and runs
-/// [`trusted_server_core::ec::finalize::ec_finalize_response`] plus the
-/// pull-sync hook on the converted fastly response — the same EC response
-/// lifecycle the legacy path drives through `RouteResult`.
+/// The entry point's `finalize` step pops this from the routed response and
+/// runs [`trusted_server_core::ec::finalize::ec_finalize_response`], and
+/// post-delivery work runs pull sync from it, the same EC response lifecycle
+/// the legacy path drives through `RouteResult`.
 #[derive(Clone)]
 pub(crate) struct EcFinalizeState {
     pub(crate) ec_context: EcContext,
     /// Whether EC finalization may write to the KV identity graph.
     /// `KvIdentityGraph` wraps a non-`Sync` `dyn EcKvStore` and cannot ride
-    /// in response extensions, so `edgezero_main` rebuilds the graph from
+    /// in response extensions, so the entry point rebuilds the graph from
     /// settings when this is set.
     pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid_cookie: Option<String>,
     pub(crate) is_real_browser: bool,
-    /// Per-request services carried to the entry point so the pull-sync
-    /// dispatcher can reuse the same platform HTTP client.
-    pub(crate) services: RuntimeServices,
 }
 
 /// Per-request EC identity state built before dispatch, mirroring the
@@ -370,7 +365,6 @@ struct EcRequestState {
     eids_cookie: Option<String>,
     sharedid_cookie: Option<String>,
     is_real_browser: bool,
-    services: RuntimeServices,
     /// Geo lookup result reused by the pre-route request-filter step so it does
     /// not repeat the lookup the legacy path also shares between EC setup and
     /// filtering.
@@ -390,7 +384,6 @@ impl EcRequestState {
             eids_cookie: self.eids_cookie,
             sharedid_cookie: self.sharedid_cookie,
             is_real_browser: self.is_real_browser,
-            services: self.services,
         }
     }
 }
@@ -413,7 +406,7 @@ fn derive_request_device_signals(req: &Request) -> DeviceSignals {
 
 /// Returns the device signals for an `EdgeZero` request.
 ///
-/// `edgezero_main` derives [`DeviceSignals`] from the original `FastlyRequest`
+/// The entry point derives [`DeviceSignals`] from the original `FastlyRequest`
 /// — the only place Fastly's TLS JA4 and HTTP/2 fingerprint accessors return
 /// real values — and stores them in the request extensions. Reading them back
 /// here preserves the bot gate's browser classification, which the `EdgeZero`
@@ -492,7 +485,6 @@ fn build_ec_request_state(
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
-        services: services.clone(),
         geo_info,
         setup_error,
     }
@@ -553,8 +545,9 @@ async fn run_pre_route_filters(
 }
 
 /// Attaches the EC finalize state and any non-empty request-filter response
-/// effects to a dispatched response via extensions, so `edgezero_main` can run
-/// EC finalization and apply the filter effects after it (legacy ordering).
+/// effects to a dispatched response via extensions, so the entry point's
+/// `finalize` step can run EC finalization and apply the filter effects after it
+/// (legacy ordering).
 fn attach_dispatch_extensions(
     mut response: Response,
     ec: EcRequestState,
@@ -580,7 +573,7 @@ async fn execute_named(
     // legacy route_request. Batch-sync also skips request filters, matching
     // legacy, which returns before the filter step for this route.
     if matches!(handler, NamedRouteHandler::BatchSync) {
-        return Ok(run_batch_sync(&state, &services, req).await);
+        return Ok(run_batch_sync(&state, req).await);
     }
 
     // An operator cache purge is not a reader request: running the EC lifecycle would
@@ -765,7 +758,7 @@ async fn run_named_route(
 /// Handles `POST /_ts/api/v1/batch-sync`, mirroring the legacy arm: identity
 /// graph + partner registry + rate limiter, with a default EC context for
 /// response finalization.
-async fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
+async fn run_batch_sync(state: &AppState, req: Request) -> Response {
     let device_signals = device_signals_for(&req);
     let is_real_browser = device_signals.looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
@@ -788,7 +781,6 @@ async fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Reque
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
-        services: services.clone(),
     });
     response
 }
@@ -927,8 +919,8 @@ async fn dispatch_fallback(
                         // identity.
                         ec.ec_context.set_recovery_eligible(is_publisher_navigation);
                         // The owner keeps the auction batch and the origin body
-                        // alive until the client body ends: delivery converts
-                        // the attached body with `into_stream()`.
+                        // alive until the client body ends: `EdgeZero`'s
+                        // delivery takes it from the body and holds it to the end.
                         publisher_response_into_streaming_response(
                             pub_response,
                             &method,
@@ -968,16 +960,15 @@ fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
 /// `route_request` asset branch.
 ///
 /// Proxies the request to the configured asset origin and threads the
-/// [`AssetProxyCachePolicy`] out via response extensions so `edgezero_main`
-/// can reapply protected cache directives after finalization. EC finalization
-/// is intentionally skipped: no [`EcFinalizeState`] is attached, matching the
-/// legacy `should_finalize_ec = false` behavior for asset responses.
+/// [`AssetProxyCachePolicy`] out via response extensions so the entry point's
+/// `finalize` step can reapply protected cache directives after finalization.
+/// EC finalization is intentionally skipped: no [`EcFinalizeState`] is
+/// attached, matching the legacy `should_finalize_ec = false` behavior for
+/// asset responses.
 ///
 /// Like legacy `route_request`, asset bodies are streamed straight to the client
-/// with no cap: the origin stream is attached to the response and `edgezero_main`
-/// commits the headers, then pipes the body chunk-by-chunk via
-/// [`fastly::Response::stream_to_client`] and
-/// [`stream_asset_body`](trusted_server_core::proxy::stream_asset_body). The
+/// with no cap: the origin stream is attached to the response, and `EdgeZero`'s
+/// response delivery commits the headers and pumps the body chunk by chunk. The
 /// origin stream is left untouched here, so large images never materialize in
 /// the Wasm heap.
 async fn dispatch_asset_fallback(
@@ -996,7 +987,7 @@ async fn dispatch_asset_fallback(
             let cache_policy = asset_response.cache_policy();
             let (mut response, stream_body) = asset_response.into_response_and_body();
 
-            // Attach the origin stream so `edgezero_main` streams it to the
+            // Attach the origin stream so delivery streams it to the
             // client. HEAD and bodiless statuses (204, 304) advertise the origin
             // Content-Length but carry no body, so their stream is dropped to
             // preserve that header and avoid a length/body mismatch.
@@ -1071,39 +1062,6 @@ fn legacy_admin_alias_denied() -> Response {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
-}
-
-// ---------------------------------------------------------------------------
-// Startup error fallback
-// ---------------------------------------------------------------------------
-
-/// Returns a [`RouterService`] that responds to every registered route with the startup error.
-///
-/// Called when [`build_state`] fails so that request handling degrades to a
-/// structured HTTP error response rather than an unrecoverable panic.
-fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    let message = Arc::new(format!("{}\n", e.current_context().user_message()));
-    let status = e.current_context().status_code();
-
-    let make = move |msg: Arc<String>| {
-        move |_ctx: RequestContext| {
-            let body = edgezero_core::body::Body::from((*msg).clone());
-            let mut resp = Response::new(body);
-            *resp.status_mut() = status;
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            async move { Ok::<Response, EdgeError>(resp) }
-        }
-    };
-
-    let mut router = RouterService::builder();
-    for method in publisher_fallback_methods() {
-        router = router.route("/", method.clone(), make(Arc::clone(&message)));
-        router = router.route("/{*rest}", method, make(Arc::clone(&message)));
-    }
-    router.build()
 }
 
 // ---------------------------------------------------------------------------
@@ -1313,32 +1271,46 @@ fn fallback_route_handler(
 /// `EdgeZero` [`Hooks`] implementation for the Trusted Server application.
 pub struct TrustedServerApp;
 
+/// Assembles the application from the settings `load` returns.
+///
+/// Builds the [`AppState`] and its routes, then [`App::from_router`], which
+/// applies the name, [`Hooks::configure`], and the platform check exactly once.
+/// The entry point retains the result in its sandbox only on success.
+///
+/// # Errors
+///
+/// Returns the [`EdgeError`] from [`startup_error`] when settings or state
+/// fail, or the `configure` error, either of which the entry point answers
+/// with `EdgeZero`'s assembly-error response.
+pub(crate) fn assemble_app(
+    load: impl FnOnce() -> Result<Settings, Report<TrustedServerError>>,
+) -> Result<RetainedApp, EdgeError> {
+    let state = startup_state(load)?;
+    let app = App::from_router::<TrustedServerApp>(
+        TrustedServerApp::routes_for_state(&state),
+        FASTLY_PLATFORM,
+    )?;
+    Ok(RetainedApp { app, state })
+}
+
+/// Builds the [`AppState`] from the settings `load` returns.
+///
+/// # Errors
+///
+/// Returns the [`EdgeError`] from [`startup_error`] after logging the full
+/// report.
+fn startup_state(
+    load: impl FnOnce() -> Result<Settings, Report<TrustedServerError>>,
+) -> Result<Arc<AppState>, EdgeError> {
+    load()
+        .and_then(build_state_from_settings)
+        .map_err(|report| {
+            log::error!("failed to build application state: {report:?}");
+            startup_error(&report)
+        })
+}
+
 impl TrustedServerApp {
-    pub(crate) fn build_app_with_state(
-        stores: &RuntimeStoreConfig,
-    ) -> (App, Option<Arc<AppState>>) {
-        let (router, state) = Self::router_with_state(stores);
-        let mut app = App::with_name(router, Self::name());
-        // A `configure` error is logged, not fatal: the app serves without the
-        // policy that failed to install.
-        if let Err(error) = Self::configure(&mut app) {
-            log::error!("failed to configure the application: {error:?}");
-        }
-        (app, state)
-    }
-
-    fn router_with_state(stores: &RuntimeStoreConfig) -> (RouterService, Option<Arc<AppState>>) {
-        let state = match build_state(stores) {
-            Ok(state) => state,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return (startup_error_router(e), None);
-            }
-        };
-
-        (Self::routes_for_state(&state), Some(state))
-    }
-
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
         let mut router = RouterService::builder()
             .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
@@ -1408,23 +1380,18 @@ fn trace_metadata(request: &RequestParts) -> TraceMetadata {
 }
 
 impl Hooks for TrustedServerApp {
-    /// Installs the edge policies, adding `x-ts-fastly-version` to the
-    /// synthesized set when `FASTLY_SERVICE_VERSION` holds a valid value.
+    /// Installs the edge policies with the version headers as the synthesized set.
     ///
-    /// The service version is read as the finalize middleware reads it. It is
-    /// fixed for the life of the sandbox, so reading it once here matches the
-    /// per-response value.
+    /// The set is [`version_synthesized_headers`] for `FASTLY_SERVICE_VERSION`,
+    /// read as the finalize middleware reads it. The entry point replaces the
+    /// set for each request with the finalize headers that do not depend on
+    /// the response.
     fn configure(app: &mut App) -> Result<(), EdgeError> {
         install_edge_policies(app)?;
-        let Some(service_version) =
-            fastly_version_header_value(std::env::var(ENV_FASTLY_SERVICE_VERSION).ok().as_deref())
-        else {
-            return Ok(());
-        };
-        let mut fields = synthesized_response_headers();
-        fields.insert(HEADER_X_TS_FASTLY_VERSION, service_version);
-        app.set_synthesized_response_headers(fields)
-            .map_err(EdgeError::internal)
+        app.set_synthesized_response_headers(version_synthesized_headers(
+            std::env::var(ENV_FASTLY_SERVICE_VERSION).ok().as_deref(),
+        ))
+        .map_err(EdgeError::internal)
     }
 
     fn name() -> &'static str {
@@ -1432,11 +1399,8 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> Result<RouterService, EdgeError> {
-        let stores = RuntimeStoreConfig::logical();
-        let state = build_state(&stores).map_err(|report| {
-            log::error!("{report:?}");
-            startup_error(&report)
-        })?;
+        let state =
+            startup_state(|| load_settings_from_config_store(&RuntimeStoreConfig::logical()))?;
         Ok(Self::routes_for_state(&state))
     }
 
@@ -1466,12 +1430,12 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, EidSyncSource, HandlerFuture,
-        NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
-        PublisherOriginOptions, RuntimeStoreConfig, TrustedServerApp, build_orchestrator_with_plan,
-        build_per_request_services, build_state_from_settings, compile_auction_plan,
-        handle_publisher_request, publisher_owner_error,
-        publisher_response_into_streaming_response, startup_error_router,
+        App, AppState, AuctionDispatch, EcContext, EdgeCacheHeader, EidSyncSource, FASTLY_PLATFORM,
+        HandlerFuture, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
+        PublisherOriginOptions, RuntimeStoreConfig, TrustedServerApp, assemble_app,
+        build_orchestrator_with_plan, build_per_request_services, build_state_from_settings,
+        compile_auction_plan, handle_publisher_request, load_settings_from_config_store,
+        publisher_owner_error, publisher_response_into_streaming_response,
     };
     use base64::Engine as _;
     use bytes::Bytes;
@@ -1490,6 +1454,7 @@ mod tests {
     use error_stack::Report;
     use futures::StreamExt as _;
     use futures::executor::block_on;
+    use trusted_server_core::auction::AuctionEventBatch;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::error::TrustedServerError;
@@ -1508,6 +1473,8 @@ mod tests {
         ScriptedHttpClient, ScriptedReply, TestClock,
     };
     use trusted_server_core::test_support::{insert_outbound_client, nextjs_auction};
+
+    use crate::tinybird::TelemetryQueue;
 
     #[test]
     fn hooks_store_metadata_matches_edgezero_manifest() {
@@ -1690,6 +1657,72 @@ mod tests {
     }
 
     #[test]
+    fn per_request_services_queue_telemetry_when_tinybird_is_enabled() {
+        let mut settings = test_settings();
+        settings.tinybird = crate::tinybird::tests::enabled_config();
+        let state = build_state_from_settings(settings).expect("should build test state");
+        let queue = TelemetryQueue::default();
+        let mut request = empty_request(Method::GET, "/article");
+        request.extensions_mut().insert(Arc::clone(&queue));
+        let context = context_with_client(request, ScriptedHttpClient::forbidding().http_client());
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+        block_on(services.auction_telemetry_sink().emit_auction_events(
+            &services,
+            AuctionEventBatch::new(vec![crate::tinybird::tests::test_row()]),
+        ))
+        .expect("should queue the batch");
+
+        assert!(
+            services.auction_telemetry_sink().is_enabled(),
+            "should enable the telemetry sink"
+        );
+        assert_eq!(
+            queue.lock().expect("should read the queue").len(),
+            1,
+            "should queue the batch on the request's queue instead of sending it"
+        );
+    }
+
+    #[test]
+    fn per_request_services_reject_tinybird_without_a_telemetry_queue() {
+        let mut settings = test_settings();
+        settings.tinybird = crate::tinybird::tests::enabled_config();
+        let state = build_state_from_settings(settings).expect("should build test state");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            ScriptedHttpClient::forbidding().http_client(),
+        );
+
+        let error = build_per_request_services(&state, &context)
+            .expect_err("should reject a request with no telemetry queue");
+
+        assert_eq!(
+            error.to_string(),
+            "internal error: request has no telemetry queue",
+            "should name the missing queue"
+        );
+    }
+
+    #[test]
+    fn per_request_services_send_no_telemetry_when_tinybird_is_disabled() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            ScriptedHttpClient::forbidding().http_client(),
+        );
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services without a queue");
+
+        assert!(
+            !services.auction_telemetry_sink().is_enabled(),
+            "should keep the no-op sink"
+        );
+    }
+
+    #[test]
     fn per_request_services_register_the_fastly_template_assembler() {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         let context = context_with_client(
@@ -1738,9 +1771,6 @@ mod tests {
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
         let state = Arc::new(super::AppState {
-            auction_telemetry_sink: Arc::new(
-                trusted_server_core::auction::NoopAuctionTelemetrySink,
-            ),
             settings: Arc::new(settings),
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
@@ -1846,24 +1876,6 @@ mod tests {
         }
     }
 
-    struct TraceCountingTelemetry(Arc<AtomicUsize>);
-
-    #[async_trait::async_trait(?Send)]
-    impl trusted_server_core::auction::AuctionTelemetrySink for TraceCountingTelemetry {
-        fn is_enabled(&self) -> bool {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            true
-        }
-        async fn emit_auction_events(
-            &self,
-            _services: &RuntimeServices,
-            _batch: trusted_server_core::auction::AuctionEventBatch,
-        ) -> Result<(), Report<TrustedServerError>> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
     #[test]
     fn trace_dispatch_bypasses_fastly_identity_filters_and_telemetry() {
         let mut settings = test_settings();
@@ -1874,14 +1886,14 @@ mod tests {
                 &serde_json::json!({"enabled":true,"trace_page_enabled":true}),
             )
             .expect("should configure trace");
+        settings.tinybird = crate::tinybird::tests::enabled_config();
         let mut state = build_state_from_settings(settings).expect("should build trace state");
         let kv = Arc::new(AtomicUsize::new(0));
-        let telemetry = Arc::new(AtomicUsize::new(0));
+        let telemetry = TelemetryQueue::default();
         let filter = Arc::new(Mutex::new(None));
         let mutable = Arc::get_mut(&mut state)
             .expect("should retain unique test state before router construction");
         mutable.default_kv_store = Arc::new(TraceCountingKv(Arc::clone(&kv)));
-        mutable.auction_telemetry_sink = Arc::new(TraceCountingTelemetry(Arc::clone(&telemetry)));
         mutable.registry = Arc::new(IntegrationRegistry::from_request_filters(vec![Arc::new(
             ClientInfoCapturingFilter(Arc::clone(&filter)),
         )]));
@@ -1893,7 +1905,9 @@ mod tests {
             (Method::POST, "/_ts/trace/enable", StatusCode::FORBIDDEN),
             (Method::PATCH, "/_ts/trace", StatusCode::METHOD_NOT_ALLOWED),
         ] {
-            let response = route(&router, empty_request(method, path));
+            let mut request = empty_request(method, path);
+            request.extensions_mut().insert(Arc::clone(&telemetry));
+            let response = route(&router, request);
             assert_eq!(
                 response.status(),
                 status,
@@ -1919,10 +1933,12 @@ mod tests {
             0,
             "should never touch identity KV for trace"
         );
-        assert_eq!(
-            telemetry.load(Ordering::SeqCst),
-            0,
-            "should never inspect or emit auction telemetry for trace"
+        assert!(
+            telemetry
+                .lock()
+                .expect("should inspect the telemetry queue")
+                .is_empty(),
+            "should never queue auction telemetry for trace"
         );
         assert!(
             filter
@@ -2020,40 +2036,110 @@ mod tests {
     }
 
     #[test]
-    fn startup_error_router_handles_head_and_options() {
-        let report = Report::new(TrustedServerError::BadRequest {
-            message: "startup failed".to_string(),
-        });
-        let router = startup_error_router(&report);
-
-        let head_response = route(&router, empty_request(Method::HEAD, "/"));
-        let options_response = route(&router, empty_request(Method::OPTIONS, "/any"));
+    fn hooks_routes_report_a_missing_config_blob_as_the_startup_error() {
+        // The test runtime links an empty `trusted_server_config` store, so the
+        // app config blob is missing.
+        let Err(error) = TrustedServerApp::routes() else {
+            panic!("should fail route building without an app config blob");
+        };
 
         assert_eq!(
-            head_response.status(),
-            StatusCode::BAD_REQUEST,
-            "HEAD should use the degraded startup-error response"
+            error.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should keep today's configuration-failure status"
         );
-        assert_eq!(
-            options_response.status(),
-            StatusCode::BAD_REQUEST,
-            "OPTIONS should use the degraded startup-error response"
+    }
+
+    /// Completes `envelope` and returns the response the client would receive.
+    fn delivered_response(envelope: edgezero_core::ResponseEgressEnvelope) -> Response {
+        let Ok((prepared, _policy, mut attempt, clock)) = envelope.begin(
+            edgezero_core::response_egress_framing::ResponseEgressFramingMode::HostAutomatic,
+        ) else {
+            panic!("should begin response egress");
+        };
+        assert!(attempt.begin_writing(), "should start writing");
+        assert!(attempt.complete(clock.now()), "should complete the body");
+        prepared.into_response()
+    }
+
+    #[test]
+    fn missing_config_blob_gets_500_then_recovers_in_same_sandbox() {
+        let mut sandbox = crate::sandbox::Sandbox::default();
+
+        // Request 1: the linked store has no app config blob.
+        let error = sandbox
+            .initialize(|| {
+                assemble_app(|| load_settings_from_config_store(&RuntimeStoreConfig::logical()))
+            })
+            .expect_err("should fail assembly without an app config blob");
+        assert!(
+            sandbox.state().is_none(),
+            "should retain nothing after a failed assembly"
         );
+        let first = crate::sandbox::SandboxCounters::capture(&sandbox, 1, "request-1");
+        let clock = edgezero_core::time::MonotonicClock::default();
+        let response = delivered_response(App::assembly_error_egress(
+            error,
+            Method::GET,
+            clock.now(),
+            clock,
+        ));
         assert_eq!(
-            head_response
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer with today's configuration-failure status"
+        );
+        assert!(
+            response
                 .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("text/plain; charset=utf-8"),
-            "startup errors should stay plain-text for HEAD requests"
+                .get(trusted_server_core::constants::HEADER_X_TS_VERSION)
+                .is_none(),
+            "should carry no configured headers on an assembly error"
+        );
+        let body = block_on(response.into_body().into_bytes_bounded(4096))
+            .expect("should read the assembly error body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("should answer with EdgeZero's JSON error");
+        assert!(
+            json["error"].is_object(),
+            "should render EdgeZero's error body: {json}"
+        );
+
+        // Request 2: the blob is restored.
+        sandbox
+            .initialize(|| assemble_app(|| Ok(test_settings())))
+            .expect("should assemble once the blob is restored");
+        let second = crate::sandbox::SandboxCounters::capture(&sandbox, 2, "request-2");
+
+        assert!(
+            sandbox.state().is_some(),
+            "should retain the recovered application"
         );
         assert_eq!(
-            options_response
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("text/plain; charset=utf-8"),
-            "startup errors should stay plain-text for OPTIONS requests"
+            second.builds,
+            first.builds + 1,
+            "should count one more build in the same sandbox"
+        );
+        assert_eq!(
+            second.log_context().split(' ').nth(1),
+            first.log_context().split(' ').nth(1),
+            "should keep serving from the same sandbox instance"
+        );
+    }
+
+    #[test]
+    fn assembly_runs_configure_once_with_the_edge_policies() {
+        let retained = assemble_app(|| Ok(test_settings())).expect("should assemble the app");
+
+        assert_eq!(
+            retained.app.platform(),
+            FASTLY_PLATFORM,
+            "should assemble under Fastly's platform metadata"
+        );
+        assert_eq!(
+            retained.app.name(),
+            TrustedServerApp::name(),
+            "should name the app after its hooks"
         );
     }
 
@@ -2645,7 +2731,8 @@ mod tests {
     fn dispatch_fallback_attaches_ec_finalize_state() {
         // The publisher fallback must thread EC finalize state to the entry
         // point via response extensions — even on error responses — so that
-        // edgezero_main can run ec_finalize_response and pull sync.
+        // its `finalize` step can run ec_finalize_response and post-delivery
+        // work can run pull sync.
         let router = test_router();
         let response = route(&router, empty_request(Method::GET, "/some-page"));
 
@@ -2749,7 +2836,7 @@ mod tests {
 
     #[test]
     fn browser_device_signals_from_extension_reach_ec_finalize_state() {
-        // Regression guard for the EdgeZero JA4/H2 signal loss: `edgezero_main`
+        // Regression guard for the EdgeZero JA4/H2 signal loss: the entry point
         // derives DeviceSignals from the original FastlyRequest (the only place
         // get_tls_ja4/get_client_h2_fingerprint return real values) and stores
         // them in the request extensions. A browser-shaped signal must survive
@@ -2798,7 +2885,7 @@ mod tests {
     #[test]
     fn entry_point_client_info_reaches_request_filters() {
         // Regression guard for the EdgeZero bot-protection metadata loss:
-        // `edgezero_main` captures the full ClientInfo (TLS protocol/cipher, JA4,
+        // the entry point captures the full ClientInfo (TLS protocol/cipher, JA4,
         // H2 fingerprint, server hostname/region) from the original FastlyRequest
         // and stores it in the request extensions. It must survive dispatch so
         // integration request filters (e.g. DataDome) serialize the same signals
@@ -3435,10 +3522,10 @@ mod tests {
     #[test]
     fn dispatch_asset_fallback_streams_origin_body_without_buffering() {
         // Regression guard for the EdgeZero asset streaming cutover: a successful
-        // asset proxy must hand `edgezero_main` a streaming body (`Body::Stream`)
+        // asset proxy must hand the entry point a streaming body (`Body::Stream`)
         // rather than draining the origin into a buffered `Body::Once`. A scripted
         // upstream with a chunked body lets us assert the body type the entry point
-        // will pipe straight to the client via `stream_to_client`.
+        // hands to `EdgeZero`'s delivery to pump straight to the client.
         let settings = Settings::from_toml(
             r#"
             [[handlers]]
@@ -3561,7 +3648,7 @@ mod tests {
     #[test]
     fn dispatch_fallback_streams_publisher_body_without_buffering() {
         // Regression guard for the publisher streaming cutover (#849): a
-        // successful publisher origin fetch must hand `edgezero_main` a lazy
+        // successful publisher origin fetch must hand the entry point a lazy
         // streaming body (`Body::Stream`) so headers commit at origin first
         // byte, rather than draining the processed page into a buffered
         // `Body::Once`. Core tests cover the rewrite pipeline itself; this

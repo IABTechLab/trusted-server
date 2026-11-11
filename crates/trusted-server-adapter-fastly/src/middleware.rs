@@ -13,17 +13,21 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use edgezero_adapter_fastly::context::FastlyRequestContext;
+use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Response, StatusCode};
+use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use edgezero_core::middleware::{Middleware, Next};
 use edgezero_core::response::IntoResponse;
-use std::net::IpAddr;
+use edgezero_core::response_headers::{
+    SynthesizedResponseHeaders, SynthesizedResponseHeadersError,
+};
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_FASTLY_VERSION,
 };
+use trusted_server_core::edge_app::synthesized_response_headers;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::platform::{ClientInfo, PlatformGeo};
 use trusted_server_core::settings::Settings;
@@ -87,8 +91,8 @@ impl Middleware for FinalizeResponseMiddleware {
             }
         };
 
-        let geo_info = resolve_geo_for_response(&response, client_ip, |ip| {
-            self.geo.lookup(ip).unwrap_or_else(|e| {
+        let geo_info = resolve_geo_for_response(&response, || {
+            self.geo.lookup(client_ip).unwrap_or_else(|e| {
                 log::warn!("geo lookup failed: {e}");
                 None
             })
@@ -158,8 +162,8 @@ impl Middleware for AuthMiddleware {
 /// to avoid unnecessary work and exposing geo data to unauthenticated callers.
 /// All other responses call `lookup_geo` and return its result.
 ///
-/// Used by both [`FinalizeResponseMiddleware`] and the entry-point finalization
-/// in `main.rs` so the 401-skip rule is defined in one place.
+/// Used by both [`FinalizeResponseMiddleware`] and the entry point's `finalize`
+/// step in `main.rs` so the 401-skip rule is defined in one place.
 ///
 /// # Parity note
 ///
@@ -169,18 +173,14 @@ impl Middleware for AuthMiddleware {
 /// is intentionally more conservative: geo data is not sent to any
 /// unauthenticated caller regardless of whether the 401 originated from this
 /// server or the upstream origin.
-pub(crate) fn resolve_geo_for_response<F>(
-    response: &Response,
-    client_ip: Option<IpAddr>,
-    lookup_geo: F,
-) -> Option<GeoInfo>
+pub(crate) fn resolve_geo_for_response<F>(response: &Response, lookup_geo: F) -> Option<GeoInfo>
 where
-    F: FnOnce(Option<IpAddr>) -> Option<GeoInfo>,
+    F: FnOnce() -> Option<GeoInfo>,
 {
     if response.status() == StatusCode::UNAUTHORIZED {
         None
     } else {
-        lookup_geo(client_ip)
+        lookup_geo()
     }
 }
 
@@ -251,8 +251,76 @@ pub(crate) use trusted_server_core::response_privacy::{
 };
 
 // ---------------------------------------------------------------------------
-// Tests
+// Synthesized response headers
 // ---------------------------------------------------------------------------
+
+/// The app-level synthesized set: `x-ts-version` and the service version.
+///
+/// `x-ts-fastly-version` is added only when `service_version` is a portable
+/// synthesized value. A value `EdgeZero` would reject, such as one with a
+/// leading or trailing space, is left out with a warning, so the base set
+/// still installs.
+pub(crate) fn version_synthesized_headers(service_version: Option<&str>) -> HeaderMap {
+    let mut fields = synthesized_response_headers();
+    if let Some(value) = fastly_version_header_value(service_version)
+        && is_synthesizable(&HEADER_X_TS_FASTLY_VERSION, &value)
+    {
+        fields.insert(HEADER_X_TS_FASTLY_VERSION, value);
+    }
+    fields
+}
+
+/// This request's synthesized set: the finalize headers that do not depend on the response.
+///
+/// `EdgeZero` adds it, where a field is absent, to the responses it generates
+/// for the request, such as head-limit errors, framing rejections, and
+/// fallbacks. It holds what [`apply_finalize_headers`] sets on a response
+/// without headers: `x-ts-version`, `x-ts-fastly-version`, `x-ts-env` on
+/// staging, the geo headers or `x-geo-info-available: false`, and the
+/// operator's `response_headers`. A field `EdgeZero` forbids, or whose value is
+/// not portable, such as a geo city with accents, is left out with a warning.
+/// When the rest still exceeds the set's bounds, only
+/// [`version_synthesized_headers`] remain, and the bound is logged.
+pub(crate) fn per_request_synthesized_headers(
+    settings: &Settings,
+    geo: Option<&GeoInfo>,
+) -> SynthesizedResponseHeaders {
+    let mut finalized = Response::new(Body::empty());
+    apply_finalize_headers(settings, geo, &mut finalized);
+    let mut fields = HeaderMap::new();
+    for (name, value) in finalized.headers() {
+        if is_synthesizable(name, value) {
+            fields.append(name.clone(), value.clone());
+        }
+    }
+
+    SynthesizedResponseHeaders::new(fields).unwrap_or_else(|error| {
+        log::warn!("Keeping only the version headers in the synthesized response headers: {error}");
+        let service_version = std::env::var(ENV_FASTLY_SERVICE_VERSION).ok();
+        SynthesizedResponseHeaders::new(version_synthesized_headers(service_version.as_deref()))
+            .unwrap_or_else(|error| {
+                log::warn!("Synthesizing no response headers: {error}");
+                SynthesizedResponseHeaders::default()
+            })
+    })
+}
+
+/// Whether `name: value` may join a synthesized set, warning when it may not.
+///
+/// A single field never exceeds the set's field count, and its byte bound is
+/// checked with the whole set, so only a forbidden name or an unportable value
+/// leaves it out here.
+fn is_synthesizable(name: &HeaderName, value: &HeaderValue) -> bool {
+    let mut field = HeaderMap::new();
+    field.insert(name.clone(), value.clone());
+    match SynthesizedResponseHeaders::new(field) {
+        Ok(_) | Err(SynthesizedResponseHeadersError::TooManyBytes) => true,
+        Err(error) => {
+            log::warn!("Leaving `{name}` out of the synthesized response headers: {error}");
+            false
+        }
+    }
+}
 
 /// Converts `service_version` to the `X-TS-Fastly-Version` value.
 ///
@@ -279,6 +347,10 @@ fn apply_fastly_version_header(service_version: Option<&str>, response: &mut Res
         response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -877,5 +949,172 @@ mod tests {
                 "should remove an inherited x-ts-fastly-version for {service_version:?}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Synthesized response header tests
+    // ---------------------------------------------------------------------------
+
+    /// The fields `set` adds to a response without headers.
+    fn synthesized_fields(set: &SynthesizedResponseHeaders) -> HeaderMap {
+        let mut fields = HeaderMap::new();
+        set.apply(&mut fields);
+        fields
+    }
+
+    fn sample_geo(city: &str) -> GeoInfo {
+        GeoInfo {
+            city: city.to_owned(),
+            country: "US".to_owned(),
+            continent: "NorthAmerica".to_owned(),
+            latitude: 37.7749,
+            longitude: -122.4194,
+            metro_code: 807,
+            region: Some("CA".to_owned()),
+            asn: None,
+        }
+    }
+
+    #[test]
+    fn version_synthesized_headers_skip_a_service_version_with_surrounding_space() {
+        for service_version in [" 42", "42 ", "\t42"] {
+            let fields = version_synthesized_headers(Some(service_version));
+
+            assert!(
+                fields.get(HEADER_X_TS_FASTLY_VERSION).is_none(),
+                "should leave out the unportable service version {service_version:?}"
+            );
+            assert_eq!(
+                fields.get(trusted_server_core::constants::HEADER_X_TS_VERSION),
+                synthesized_response_headers()
+                    .get(trusted_server_core::constants::HEADER_X_TS_VERSION),
+                "should keep the base set for {service_version:?}"
+            );
+            SynthesizedResponseHeaders::new(fields).expect("should keep a set EdgeZero installs");
+        }
+    }
+
+    #[test]
+    fn version_synthesized_headers_add_a_portable_service_version() {
+        let fields = version_synthesized_headers(Some("42"));
+
+        assert_eq!(
+            fields
+                .get(HEADER_X_TS_FASTLY_VERSION)
+                .and_then(|value| value.to_str().ok()),
+            Some("42"),
+            "should add the service version to the base set"
+        );
+        assert!(
+            version_synthesized_headers(None)
+                .get(HEADER_X_TS_FASTLY_VERSION)
+                .is_none(),
+            "should add nothing when the service version is unset"
+        );
+    }
+
+    #[test]
+    fn per_request_synthesized_headers_carry_geo_version_and_operator_headers() {
+        let settings = settings_with_response_headers(vec![("x-operator", "kept")]);
+
+        let fields = synthesized_fields(&per_request_synthesized_headers(
+            &settings,
+            Some(&sample_geo("San Francisco")),
+        ));
+
+        for (name, value) in [
+            ("x-geo-city", "San Francisco"),
+            ("x-geo-country", "US"),
+            ("x-geo-info-available", "true"),
+            ("x-operator", "kept"),
+        ] {
+            assert_eq!(
+                fields.get(name).and_then(|value| value.to_str().ok()),
+                Some(value),
+                "should synthesize {name}"
+            );
+        }
+        assert_eq!(
+            fields.get(trusted_server_core::constants::HEADER_X_TS_VERSION),
+            synthesized_response_headers().get(trusted_server_core::constants::HEADER_X_TS_VERSION),
+            "should synthesize the git version"
+        );
+    }
+
+    #[test]
+    fn per_request_synthesized_headers_report_unavailable_geo() {
+        let fields = synthesized_fields(&per_request_synthesized_headers(
+            &settings_with_response_headers(vec![]),
+            None,
+        ));
+
+        assert_eq!(
+            fields
+                .get(HEADER_X_GEO_INFO_AVAILABLE)
+                .and_then(|value| value.to_str().ok()),
+            Some("false"),
+            "should synthesize x-geo-info-available: false without geo"
+        );
+    }
+
+    #[test]
+    fn per_request_synthesized_headers_leave_out_unportable_and_forbidden_values() {
+        let settings = settings_with_response_headers(vec![
+            ("content-type", "text/plain"),
+            ("x-operator", " padded"),
+            ("x-kept", "kept"),
+        ]);
+
+        let fields = synthesized_fields(&per_request_synthesized_headers(
+            &settings,
+            Some(&sample_geo("Zürich")),
+        ));
+
+        assert!(
+            fields.get("x-geo-city").is_none(),
+            "should leave out a geo city with accents"
+        );
+        assert_eq!(
+            fields
+                .get("x-geo-country")
+                .and_then(|value| value.to_str().ok()),
+            Some("US"),
+            "should keep the other geo headers"
+        );
+        assert!(
+            fields.get("content-type").is_none(),
+            "should leave out an operator field EdgeZero forbids"
+        );
+        assert!(
+            fields.get("x-operator").is_none(),
+            "should leave out an operator value with a leading space"
+        );
+        assert_eq!(
+            fields.get("x-kept").and_then(|value| value.to_str().ok()),
+            Some("kept"),
+            "should keep the portable operator fields"
+        );
+    }
+
+    #[test]
+    fn per_request_synthesized_headers_fall_back_to_version_headers_over_bounds() {
+        let operator: Vec<(String, String)> = (0..40)
+            .map(|index| (format!("x-operator-{index}"), "value".to_owned()))
+            .collect();
+        let settings = settings_with_response_headers(
+            operator
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect(),
+        );
+
+        let fields = synthesized_fields(&per_request_synthesized_headers(&settings, None));
+
+        let service_version = std::env::var(ENV_FASTLY_SERVICE_VERSION).ok();
+        assert_eq!(
+            fields,
+            version_synthesized_headers(service_version.as_deref()),
+            "should keep only the version headers when the set exceeds 32 fields"
+        );
     }
 }

@@ -1,13 +1,20 @@
 //! Fictional terminal HTTP consumer, available only with `test-utils`.
+//!
+//! It also answers [`FRAMING_TRAILER_PATH`] with a `Trailer` field, which
+//! `EdgeZero`'s response framing rejects, so the runtime checks can reach a
+//! framing fallback that Trusted Server itself never produces.
 
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::error::EdgeError;
 use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding};
 use error_stack::{Report, ResultExt as _};
 use futures::future::LocalBoxFuture;
+use http::{HeaderValue, Request, Response, header};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -15,14 +22,19 @@ use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory, IntegrationRegistration,
+    IntegrationEndpoint, IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory,
+    IntegrationProxy, IntegrationRegistration,
 };
 use crate::outbound::{buffered, outbound_request};
+use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 use crate::streaming_processor::StreamProcessor;
 use crate::streaming_processor::finish::{StreamFinish, StreamFinishError, StreamFinishInput};
 
 pub(crate) const ID: &str = "html_finalization_fixture";
+/// Path the fixture answers with a `Trailer` field.
+pub(crate) const FRAMING_TRAILER_PATH: &str =
+    "/integrations/html_finalization_fixture/framing-trailer";
 const EOF_SENTINEL: &[u8] = b"<!--example-document-eof-->";
 const ORIGINAL: &[u8] = b"EXAMPLE_UNSIGNED";
 const REPLACEMENT: &[u8] = b"EXAMPLE_FINALIZED";
@@ -67,6 +79,7 @@ pub(crate) fn register(
         IntegrationRegistration::builder(ID)
             .without_js()
             .with_html_stream_processor(Arc::new(FixtureFactory(config)))
+            .with_proxy(Arc::new(FramingTrailerProxy))
             .build(),
     ))
 }
@@ -201,6 +214,36 @@ impl StreamProcessor for FixtureSession {
     }
 }
 
+/// Answers [`FRAMING_TRAILER_PATH`] with a `Trailer` field.
+///
+/// `EdgeZero` rejects any `Trailer` before commit and delivers its framing
+/// fallback 500 in place of this response.
+struct FramingTrailerProxy;
+
+#[async_trait(?Send)]
+impl IntegrationProxy for FramingTrailerProxy {
+    fn integration_name(&self) -> &'static str {
+        ID
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        vec![IntegrationEndpoint::get(FRAMING_TRAILER_PATH)]
+    }
+
+    async fn handle(
+        &self,
+        _settings: &Settings,
+        _services: &RuntimeServices,
+        _req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        let mut response = Response::new(EdgeBody::from("example body with a trailer"));
+        response
+            .headers_mut()
+            .insert(header::TRAILER, HeaderValue::from_static("x-example"));
+        Ok(response)
+    }
+}
+
 /// Reports an outbound failure as `context`, carrying the `EdgeError` for diagnosis.
 fn fixture_error(error: EdgeError, context: StreamFinishError) -> Report<StreamFinishError> {
     Report::new(context).attach_opaque(error)
@@ -231,6 +274,27 @@ mod tests {
                 !registry.js_module_ids().contains(&ID),
                 "should never add a fictional browser bundle"
             );
+            assert_eq!(
+                registry.has_route(&http::Method::GET, FRAMING_TRAILER_PATH),
+                enabled,
+                "should route the framing fixture only when enabled"
+            );
         }
+    }
+
+    #[test]
+    fn framing_route_answers_with_a_trailer_field() {
+        let response = futures::executor::block_on(FramingTrailerProxy.handle(
+            &create_test_settings(),
+            &crate::platform::test_support::noop_services(),
+            Request::new(EdgeBody::empty()),
+        ))
+        .expect("should answer the framing route");
+
+        assert_eq!(
+            response.headers().get(header::TRAILER),
+            Some(&HeaderValue::from_static("x-example")),
+            "should carry the Trailer field EdgeZero rejects"
+        );
     }
 }
