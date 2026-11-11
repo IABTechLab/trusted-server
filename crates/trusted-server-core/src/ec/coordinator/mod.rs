@@ -463,14 +463,15 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             return pending;
         }
         let entry = lookup.snapshot.entry_for(lookup.ec_id);
-        // Missing EC or EID consent, a withdrawal tombstone, or an unreadable
-        // row (which may hide a tombstone) skips every provider: a lookup
-        // discloses the EC ID before finalize could decline it.
+        // Missing EC or EID consent, a withdrawal tombstone, an unreadable
+        // row (which may hide a tombstone) or no row at all skips every
+        // provider: a lookup discloses the EC ID before finalize could
+        // decline it, and an EC without a row may never be issued.
         let readable = !matches!(lookup.snapshot, EcKvSnapshot::Failed { .. });
         let consented = readable
             && ec_consent_granted(lookup.consent)
             && allows_eid_persistence(lookup.consent)
-            && entry.is_none_or(|entry| entry.consent.ok);
+            && entry.is_some_and(|entry| entry.consent.ok);
         let deadline = Deadline::after(self.budget);
         pending.deadline = Some(deadline);
         for (index, registered) in self.providers.iter().enumerate() {
@@ -844,6 +845,17 @@ mod tests {
         }
     }
 
+    /// A consented row with no IDs yet.
+    fn live_row() -> EcKvSnapshot {
+        let mut entry = crate::ec::kv_types::KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        EcKvSnapshot::Present {
+            ec_id: EC_ID.to_owned(),
+            entry: Box::new(entry),
+            generation: Some(1),
+        }
+    }
+
     fn run_with<P: IdentityProvider>(
         coordinator: &ProviderCoordinator<P>,
         transport: &CannedTransport,
@@ -897,7 +909,7 @@ mod tests {
         let coordinator = coordinator("");
         let transport = CannedTransport::new(ok_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &granting());
 
         let lookup = results.iter().next().expect("should report the provider");
         assert!(
@@ -912,6 +924,28 @@ mod tests {
             "should record the owner"
         );
         assert_eq!(transport.sent.borrow().len(), 1, "should send one request");
+    }
+
+    #[test]
+    fn ec_without_a_row_is_not_sent_to_vendors() {
+        // Arrange: a well-formed `ts-ec` cookie whose row does not exist.
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run(&coordinator, &transport, &missing(), &granting());
+
+        // Assert
+        assert_eq!(
+            results
+                .iter()
+                .next()
+                .expect("should report the provider")
+                .status,
+            LookupStatus::Skipped(SkipReason::Consent),
+            "should skip a provider for an EC with no row"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
     }
 
     fn provider_record(id: &str) -> KvPartnerId {
@@ -1072,7 +1106,7 @@ mod tests {
         let coordinator = coordinator("tcf_vendor_id = 9999");
         let transport = CannedTransport::new(ok_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &granting());
 
         assert!(
             !matches!(only_status(&results), LookupStatus::Skipped(_)),
@@ -1113,7 +1147,7 @@ mod tests {
         let coordinator = coordinator("tcf_vendor_id = 9999");
         let transport = CannedTransport::new(ok_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &tcf_consent(vec![1]));
+        let results = run(&coordinator, &transport, &live_row(), &tcf_consent(vec![1]));
 
         assert_eq!(
             only_status(&results),
@@ -1131,7 +1165,7 @@ mod tests {
         let results = run(
             &coordinator,
             &transport,
-            &missing(),
+            &live_row(),
             &tcf_consent(vec![9999]),
         );
 
@@ -1149,7 +1183,7 @@ mod tests {
         ));
         let transport = CannedTransport::new(ok_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &granting());
 
         assert_eq!(
             only_status(&results),
@@ -1169,7 +1203,7 @@ mod tests {
         let results = run_with(
             &coordinator,
             &transport,
-            &missing(),
+            &live_row(),
             &granting(),
             &Limiter(true),
         );
@@ -1201,7 +1235,7 @@ mod tests {
         };
         let transport = CannedTransport::new(ok_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &granting());
 
         assert_eq!(
             only_status(&results),
@@ -1226,7 +1260,7 @@ mod tests {
             let coordinator = coordinator("");
             let transport = CannedTransport::new(reply);
 
-            let results = run(&coordinator, &transport, &missing(), &granting());
+            let results = run(&coordinator, &transport, &live_row(), &granting());
 
             let lookup = results.iter().next().expect("should report");
             assert_eq!(lookup.status, expected, "should map the outcome");
@@ -1436,7 +1470,7 @@ mod tests {
         let coordinator = coordinator("");
         let transport = CannedTransport::new(optout_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &granting());
 
         let lookup = results.iter().next().expect("should report the provider");
         assert_eq!(
@@ -1487,7 +1521,7 @@ mod tests {
         .expect("should build coordinator");
         let transport = CannedTransport::new(ok_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &granting());
 
         assert_eq!(
             only_status(&results),
@@ -1558,7 +1592,7 @@ mod tests {
         let coordinator = generating_coordinator();
         let transport = CannedTransport::new(ok_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &granting());
 
         let lookup = results.iter().next().expect("should report the provider");
         assert!(
@@ -1578,7 +1612,7 @@ mod tests {
         let coordinator = generating_coordinator_for("IDS.example.com");
         let transport = CannedTransport::new(ok_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &granting());
 
         let lookup = results.iter().next().expect("should report the provider");
         assert!(
