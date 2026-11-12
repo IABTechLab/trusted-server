@@ -18,10 +18,10 @@ Quick reference for all Trusted Server HTTP endpoints.
 
 | Adapter      | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
 | ------------ | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | -------------------------------- |
-| `axum`       | development    | real       | `500`          | no             | multiple         | outermost sanitize             | none                             |
-| `cloudflare` | development    | absent     | `500`          | no             | single           | outermost sanitize             | none                             |
+| `axum`       | development    | real       | exit 1         | no             | multiple         | outermost sanitize             | none                             |
+| `cloudflare` | development    | absent     | `500`          | no             | multiple         | outermost sanitize             | none                             |
 | `fastly`     | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
-| `spin`       | experimental   | real       | `503`          | yes            | single           | outermost sanitize             | innermost Spin-header derivation |
+| `spin`       | experimental   | real       | `503`          | no             | multiple         | outermost sanitize             | innermost Spin-header derivation |
 
 `trusted client IP handling` describes the optional
 `[trusted_client_ip]` configuration. Fastly resolves the authenticated header
@@ -62,14 +62,16 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
 | normal  | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
 | normal  | `<proxy.asset_routes[].prefix>{*rest}` | `GET`, `HEAD`                                              | config derived | `settings.proxy.asset_routes[]`       | real                  | —                     | —                     | —                     |
-| startup | `/health`                              | `GET`                                                      | literal        | `startup_error`                       | real                  | —                     | —                     | real                  |
-| startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
-| startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
+| startup | `/health`                              | `GET`                                                      | literal        | `startup_error`                       | real                  | exits with status `1` | startup error (`500`) | startup error (`503`) |
+| startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`500`) | exits with status `1` | startup error (`500`) | startup error (`503`) |
+| startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`500`) | exits with status `1` | startup error (`500`) | startup error (`503`) |
 
-`real`, `unsupported`, `guarded`, `publisher fallback`, and `startup error` are
-distinct observable dispositions. An em dash means that the adapter has no
-local route; the publisher fallback can therefore receive that path. The
-startup rows are a separate degraded router, not additional normal routes.
+`real`, `unsupported`, `guarded`, `publisher fallback`, `startup error`, and
+`exits with status 1` are distinct observable dispositions. An em dash means
+that the adapter has no local route; the publisher fallback can therefore
+receive that path. The startup rows show what each path answers when app assembly fails,
+in place of every normal route. Fastly answers `/health` before it assembles
+the app, and Axum exits with status 1 before it listens.
 
 ## Contract conventions
 
@@ -86,8 +88,14 @@ that is not a blanket CORS grant.
 
 There is no repository-wide error body schema. Some handlers return structured
 JSON, some return an empty body, and shared adapter errors are plain text with
-safe client-facing messages. Treat the status and body documented for each
-endpoint as authoritative.
+safe client-facing messages. EdgeZero's own errors, such as a canonical 404 or
+405, a 414 or 431 head-limit rejection, a 400 for ambiguous request framing, or
+a startup failure, are JSON with redacted text. Treat the status and body
+documented for each endpoint as authoritative.
+
+An endpoint that reads a request body returns `413` when the declared or
+received length passes its cap, and `408` when the body is still unread 30 s
+after the request arrived.
 
 ## Utility Endpoints
 
@@ -998,10 +1006,15 @@ effects. CORS is therefore the sanitized publisher-origin policy, not a global
 Trusted Server policy. There is no built-in endpoint rate limiter. Example:
 `curl -i https://edge.example.com/article`.
 
-When startup fails, the degraded router replaces normal routing: Fastly,
-Axum, and Cloudflare return `500` for both fallback shapes and all seven
-methods; Spin returns a generic `503`. Only the health behavior shown in the
-table survives.
+The request body streams to the origin under a 16 MiB cap, and a larger upload
+returns `413`. A `GET` or `HEAD` that carries body bytes returns `400`, and so
+does a forward the origin request cannot carry, such as a target with a
+fragment or a backslash, or a malformed `Connection` header.
+
+When startup fails, Fastly and Cloudflare answer both fallback shapes and all
+seven methods with EdgeZero's JSON error at the startup failure's status,
+normally `500`; Spin answers a generic `503`; Axum exits at startup and serves
+nothing. Only the health behavior shown in the table survives.
 
 ---
 
@@ -1128,7 +1141,7 @@ available when a deployment needs either.
 | DataDome signals  | `GET` or `POST /integrations/datadome/js/` and `/js/*`; method, query, bounded POST body, and selected browser headers forwarded to `api_origin`                       | Upstream status/body/headers preserved; transport or size failures use shared integration errors; no added cache/CORS policy                                                                  | Browser SDK traffic; manual payload is upstream-schema-specific                                                                           |
 | Didomi consent    | `GET` or `POST` under the configured prefix (default `/integrations/didomi/consent/*`); path selects SDK or API origin; query and bounded POST body forwarded          | Upstream status/body preserved; SDK responses receive the integration's CORS headers; API responses retain selected upstream headers; no local cache policy                                   | `curl -i https://edge.example.com/integrations/didomi/consent/loader.js`                                                                  |
 | GTM/gtag scripts  | `GET` the generated `gtm.js`, `gtag.js`, or `gtag/js` paths; query forwarded or configured container ID supplied; successful script is rewritten                       | Non-success upstream status preserved; rewritten scripts use `cache_max_age`; oversized rewritten upstream bodies use shared integration errors                                               | `curl -i 'https://edge.example.com/integrations/google_tag_manager/gtm.js?id=GTM-XXXX'`                                                   |
-| Google collect    | `GET` or `POST` the generated `collect` or `g/collect` paths; query, selected headers, and bounded body proxy to the configured Google origin                          | Malformed `Content-Length` returns `400`; body over `max_beacon_body_size` returns `413`; stream-read failure returns `502`; upstream response otherwise preserved                            | Browser beacon; body schema belongs to Google Analytics                                                                                   |
+| Google collect    | `GET` or `POST` the generated `collect` or `g/collect` paths; query, selected headers, and bounded body proxy to the configured Google origin                          | Malformed `Content-Length` returns `400`; body over `max_beacon_body_size` returns `413`; body unread at 30 s returns `408`; failed read returns `502`; upstream response otherwise preserved | Browser beacon; body schema belongs to Google Analytics                                                                                   |
 | JS asset proxy    | `GET` each configured `[[integrations.js_asset_proxy.assets]]` path whose `proxy = "enabled"`; the exact `origin_url` is fetched and served first-party                | Upstream failures use shared integration errors; successful responses honor the per-asset or integration `cache_ttl_seconds`; `blocked` assets register no route and strip matching tags      | Path is operator-configured, for example `curl -i https://edge.example.com/js/vendor-tag.js`                                              |
 | GPT               | `GET` `/script`, `/pagead/*`, or `/tag/*`; path/query proxy to the configured GPT origins and script content can be rewritten                                          | Upstream status is preserved; successful scripts/assets apply integration cache rules; selected upstream CORS is preserved                                                                    | `curl -i https://edge.example.com/integrations/gpt/script`                                                                                |
 | Lockr SDK         | `GET /integrations/lockr/sdk`; no body; fetches and returns the configured SDK as JavaScript                                                                           | Successful SDK uses `cache_ttl_seconds`; upstream/transport failures follow integration mapping; no added CORS policy                                                                         | `curl -i https://edge.example.com/integrations/lockr/sdk`                                                                                 |

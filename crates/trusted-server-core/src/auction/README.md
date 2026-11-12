@@ -1,8 +1,8 @@
 # Auction orchestration
 
 The auction module compiles operator configuration into one immutable plan,
-routes browser demand to providers, runs provider requests concurrently where
-the adapter permits it, and returns normalized OpenRTB bids.
+routes browser demand to providers, sends provider requests concurrently as
+one EdgeZero request batch, and returns normalized OpenRTB bids.
 
 The maintained operator guide is
 [`docs/guide/auction-orchestration.md`](../../../../docs/guide/auction-orchestration.md).
@@ -51,12 +51,13 @@ startup and operator validation. It validates:
 - mediator and request-signing references;
 - bounded configuration values.
 
-Adapters then call `AuctionPlan::validate_for_target` for backend naming,
-fan-out support, and target resource limits.
+The Fastly state builder then calls `plan::validate_fastly_backend_bound`,
+which rejects an enabled plan that could need more than 160 Fastly backend
+configurations. The other adapters add no plan check.
 
 A plan-backed orchestrator contains generic OpenRTB providers compiled from the
-plan. `AuctionOrchestrator::register_provider` and the old concrete Prebid
-provider remain test-only parity code. They are not extension APIs.
+plan. The `cfg(test)` `AuctionProvider` impls on the concrete Prebid and APS
+providers remain test-only parity code. They are not extension APIs.
 
 ## Routing
 
@@ -81,10 +82,13 @@ bidders remain browser demand.
 `standard`, `prebid-server`, and `aps` profiles. Profiles receive routed and
 privacy-approved facts, not the raw inbound request.
 
-The orchestrator launches all eligible providers before collecting responses.
-It uses adapter `PlatformHttpClient` handles and predicted backend names for
-correlation. Provider launch, transport, HTTP, parse, and admission failures are
-provider-local when another provider can continue.
+The orchestrator builds and signs every routed provider's request, then sends
+them together with `HttpClient::start_batch_until`, whose cutoff is the auction
+deadline. Batch results are positional, so each result maps back to its
+provider. A bid that has not arrived by the cutoff becomes a provider timeout,
+and dropping the batch cancels the requests still in flight. Provider launch,
+transport, HTTP, parse, and admission failures are provider-local when another
+provider can continue.
 
 When no mediator is configured, the orchestrator selects the highest decoded
 CPM per slot and applies floors locally. When a mediator is configured, it sends
@@ -152,14 +156,15 @@ routing = "all_eligible"
 profile_config = { account_id = "example-account" }
 ```
 
-Provider endpoints must be absolute HTTPS URLs. Replace all example values
-before enabling an auction.
+Provider endpoints must be absolute HTTPS URLs. Plain HTTP is accepted only
+for `127.0.0.1` and `[::1]`, which local test bidders use. Replace all example
+values before enabling an auction.
 
 ## Code map
 
 - `mod.rs` compiles plans and builds the shared orchestrator.
 - `endpoints.rs` handles `POST /auction` and converts the browser request.
-- `plan.rs` owns plan validation and target capability checks.
+- `plan.rs` owns plan validation and the Fastly backend bound.
 - `profile.rs` owns typed OpenRTB profile configuration.
 - `routing.rs` assigns slots and bidder params to providers.
 - `openrtb.rs` builds shared requests and parses standard responses.
@@ -173,7 +178,9 @@ before enabling an auction.
 Use `compile_auction_plan` in tests, then construct the orchestrator and
 integration registry from the same `Arc<AuctionPlan>`. Profile tests should
 cover typed configuration, exact request output, response admission, routing,
-provider-local failures, and target validation.
+provider-local failures, and the Fastly backend bound. Send bidder requests
+through the scripted client in `test_support::scripted_client`, which records
+each request and answers from a script.
 
 Run target-matched aliases rather than bare workspace tests:
 

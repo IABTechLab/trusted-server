@@ -47,11 +47,9 @@ Adding a field means changing three things together: the struct in
 Reports whether a request's origin response **would be** eligible to share between readers.
 
 **It is a predicate, not an outcome.** It records whether a request _would_ be eligible,
-not whether anything was cached. A row with `1` still forced an origin fetch unless the
-operator had set `creative_opportunities.origin_readthrough_enabled` (default `false`), and
-even then the platform stores nothing if the origin's own `Cache-Control` refuses. So it
-answers "how much traffic would the gate admit", and only in combination with that setting
-does it bound "how much did it admit".
+not whether anything was cached. Origin readthrough is unavailable, so a row with `1` still
+forced an origin fetch. It answers "how much traffic would the gate admit", never "how much
+did it admit".
 
 Three caveats, each of which silently produces wrong numbers if a query ignores it.
 
@@ -64,9 +62,7 @@ bots, prefetches, consent-denied readers, and requests with auctions disabled ca
 traffic with creative opportunities disabled produces no publisher summary.
 
 The query below therefore measures shareability among matching-slot candidates, including
-skipped summaries. It is neither an ad-serving-pageview rate nor a site-wide rate. The
-readthrough gate also governs origin fetches outside this telemetry population; measure
-those separately before estimating whole-site impact.
+skipped summaries. It is neither an ad-serving-pageview rate nor a site-wide rate.
 
 ### `NULL` is "not measured", not "false"
 

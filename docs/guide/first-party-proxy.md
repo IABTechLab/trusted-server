@@ -358,11 +358,22 @@ The proxy automatically follows HTTP redirects:
 
 **Behavior**:
 
-1. Follow up to **4 redirect hops**
-2. Re-apply `ts-ec` on each hop
-3. Switch to `GET` after `303` response
-4. Log when redirect limit reached
-5. Preserve request headers across hops
+1. Follow up to **4 redirect hops** through EdgeZero's redirect follower.
+2. Check each redirect target before it is followed. A non-HTTPS target on a
+   route that requires HTTPS fails with `403`, a target without a host fails
+   with `502`, and a host outside `proxy.allowed_domains` fails with `403`. A
+   target whose scheme is neither `http` nor `https` is not followed, and its
+   redirect response is returned.
+3. Send `301`, `302`, and `303` hops as a bodiless `GET` (a `HEAD` stays
+   `HEAD`); `307` and `308` keep the method and body. A `301` or `302` that
+   answers a method other than `GET`, `HEAD`, or `POST` is returned, not
+   followed.
+4. Give each hop the request's own timeout, 15 s for a buffered response or 60 s
+   for a streamed one, and the whole chain a 60 s deadline.
+5. Strip `Authorization` and `Cookie` on a hop to another origin.
+6. Fail a `Location` that carries userinfo with `502 Bad Gateway`.
+7. Log each hop at `debug` without its query, and log a warning when a redirect
+   response is returned instead of followed.
 
 **Example Flow**:
 
@@ -397,19 +408,9 @@ Proxied backend request:
 
 ### Redirect Propagation
 
-EC IDs are re-applied on **every redirect hop**:
-
-```
-/first-party/proxy?tsurl=https://redirect1.com&tstoken=sig
-  → https://redirect1.com?ts-ec=user123
-  → 302 to https://redirect2.com
-  → https://redirect2.com?ts-ec=user123
-  → 302 to https://final.com
-  → https://final.com?ts-ec=user123
-  → 200 response
-```
-
-This ensures downstream endpoints receive consistent IDs even through redirect chains.
+The `ts-ec` parameter goes on the first target only. A redirect hop requests the
+`Location` the upstream returned, so a later endpoint receives the EC ID only
+when the redirecting server carries it into that `Location`.
 
 ### Click ID Forwarding
 
@@ -656,10 +657,10 @@ Missing required parameter: tsurl
 When redirect limit (4 hops) is reached:
 
 ```
-Log: proxy: redirect limit reached for url=https://...
+Log: returning an unfollowed redirect response: LimitReached
 ```
 
-Response: Returns last redirect response (302/307/308) without following.
+Response: Returns the last redirect response (302/307/308) without following.
 
 **Solutions**:
 

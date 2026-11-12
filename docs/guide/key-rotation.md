@@ -602,7 +602,11 @@ Test rotation in staging first:
 
 ### Rotation Failed
 
-**Error**: `Failed to create KeyRotationManager`
+**Error**: the rotate endpoint answers 500 with `"message": "Key rotation failed"`
+and `"error": "Configuration error: failed to store private key '<kid>'"`.
+
+The first store write failed, so nothing was rotated. The usual causes are a
+missing Fastly API token and a Fastly API call that the API refused.
 
 **Solutions**:
 

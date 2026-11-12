@@ -10,13 +10,14 @@ loaded by a separate tag.
 
 | Adapter      | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
 | ------------ | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | -------------------------------- |
-| `axum`       | development    | real       | `500`          | no             | multiple         | outermost sanitize             | none                             |
-| `cloudflare` | development    | absent     | `500`          | no             | single           | outermost sanitize             | none                             |
+| `axum`       | development    | real       | exit 1         | no             | multiple         | outermost sanitize             | none                             |
+| `cloudflare` | development    | absent     | `500`          | no             | multiple         | outermost sanitize             | none                             |
 | `fastly`     | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
-| `spin`       | experimental   | real       | `503`          | yes            | single           | outermost sanitize             | innermost Spin-header derivation |
+| `spin`       | experimental   | real       | `503`          | no             | multiple         | outermost sanitize             | innermost Spin-header derivation |
 
-This table summarizes the adapter implementations. “Startup health” means the
-degraded startup router still serves `/health`; it does not
+This table summarizes the adapter implementations. “Startup health” means
+`/health` still answers 200 when startup fails. Only Fastly does, because it
+answers `/health` before it builds the application, so that answer does not
 mean configuration loaded. “Provider fan-out” describes whether the adapter
 can dispatch one auction to multiple configured providers. See the individual
 [Fastly](/guide/fastly), [Axum](/guide/axum-dev),

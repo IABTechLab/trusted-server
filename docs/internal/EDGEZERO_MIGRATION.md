@@ -9,8 +9,10 @@ epic [#480](https://github.com/IABTechLab/trusted-server/issues/480)).
 ## Current Status
 
 The Fastly legacy cleanup has removed `legacy_main()` and the runtime canary
-flag plumbing. The Fastly entry point now always dispatches through
-`edgezero_main()`.
+flag plumbing. The Fastly entry point serves every request through EdgeZero's
+canonical Fastly lifecycle: `handle_request` assembles the app once per
+sandbox, and `serve` sends each request through
+`send_request_with_registries_and_hooks`.
 
 The historical canary keys are no longer read:
 
@@ -25,17 +27,21 @@ Do not use those keys for rollout or rollback after the legacy cleanup.
 
 Config store name: **`trusted_server_config`** (Fastly service config store)
 
-The store must exist because the Fastly entry point opens it before EdgeZero
-dispatch and passes the handle to EdgeZero-backed platform services. The store
-may be empty unless another feature adds keys to it.
+App assembly loads settings from the app-config entry in this store, under the
+`trusted_server_config` key. A missing store or entry fails settings load,
+which surfaces as an app assembly error.
 
-| Condition                         | Effective behaviour                          |
-| --------------------------------- | -------------------------------------------- |
-| `trusted_server_config` exists    | Request dispatches through `edgezero_main()` |
-| `trusted_server_config` is absent | Request returns `500 Internal Server Error`  |
+| Condition                                    | Effective behaviour                                                                               |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `trusted_server_config` holds the app config | The app assembles, and requests run through EdgeZero's lifecycle                                  |
+| The store or its entry is absent             | Each request answers `500` with EdgeZero's redacted JSON error; the next request retries assembly |
 
-Local Viceroy templates must define an inline `trusted_server_config` store even
-when no keys are present.
+`/health` answers 200 in both cases, because the entry point serves it before it
+assembles the app.
+
+Local Viceroy configurations must define an inline `trusted_server_config`
+store; `ts config push --adapter fastly --local` writes the app-config entry
+into it.
 
 ---
 
