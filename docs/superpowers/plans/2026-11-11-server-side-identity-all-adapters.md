@@ -719,10 +719,13 @@ Expected: one comment URL per PR.
 
 Same steps as Task 6, against IABTechLab/edgezero (`gh pr view <N> --repo
 IABTechLab/edgezero` and `gh pr comment <N> --repo IABTechLab/edgezero`), for
-the EdgeZero items in Part C. Link #406 to EZI-1, #463 to EZI-2b, #469 to
-IABTechLab/edgezero#283, #439 to IABTechLab/edgezero#432 and EZI-4a, and #275,
-#460 and the other chain fixes to R1. #389, #401, #444, #466 and #464 get their
-Part C item with no ticket.
+the EdgeZero items in Part C. Link IABTechLab/edgezero#406 to EZI-1,
+IABTechLab/edgezero#463 to EZI-2b, IABTechLab/edgezero#469 to IABTechLab/edgezero#283,
+IABTechLab/edgezero#439 to IABTechLab/edgezero#432 and EZI-4a, and
+IABTechLab/edgezero#275, IABTechLab/edgezero#460, IABTechLab/edgezero#407 and
+IABTechLab/edgezero#414 to R1. IABTechLab/edgezero#389,
+IABTechLab/edgezero#401, IABTechLab/edgezero#444, IABTechLab/edgezero#466 and
+IABTechLab/edgezero#464 get their Part C item with no ticket.
 
 ### Task 8: Verify coverage
 
