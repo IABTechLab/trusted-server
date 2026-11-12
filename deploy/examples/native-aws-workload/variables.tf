@@ -123,7 +123,6 @@ variable "geo_front_door" {
     origin_credential_value       = string
     cloudfront_ipv4_cidrs         = set(string)
   })
-  default   = null
   sensitive = true
   validation {
     condition = var.geo_front_door == null ? true : (
@@ -163,6 +162,21 @@ variable "agent_image" {
 variable "config_envelope_file" {
   description = "Reviewed reference-only TS CLI publication-envelope JSON file. Never the outer local map or a config containing resolved secret values. Content enters Terraform state."
   type        = string
+}
+
+variable "ec_storage" {
+  description = "Exact retained ec_storage output, also published as ec.storage in the CLI envelope. The workload owns only scoped task access, never the table."
+  type = object({
+    provider  = string
+    region    = string
+    table     = string
+    namespace = string
+  })
+  nullable = false
+  validation {
+    condition     = var.ec_storage.provider == "dynamodb" && var.ec_storage.region == var.aws_region && can(regex("^[A-Za-z0-9_.-]{3,255}$", var.ec_storage.table))
+    error_message = "ec_storage must select DynamoDB in the workload region and a 3-255-character table name containing only ASCII letters, digits, underscores, periods or hyphens."
+  }
 }
 
 variable "application_secrets" {

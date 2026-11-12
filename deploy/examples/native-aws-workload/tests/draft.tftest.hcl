@@ -26,6 +26,13 @@ variables {
   application_image    = "000000000000.dkr.ecr.eu-west-2.amazonaws.com/review-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   agent_image          = "public.ecr.aws/example/agent@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   config_envelope_file = "example-envelope.json"
+  geo_front_door       = null
+  ec_storage = {
+    provider  = "dynamodb"
+    region    = "eu-west-2"
+    table     = "example-retained-ec"
+    namespace = "example-staging"
+  }
   application_secrets = {
     handler_password = {
       arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-handler-AbCdEf"

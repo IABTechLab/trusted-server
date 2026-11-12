@@ -75,6 +75,20 @@ try {
       locals.includes(JSON.stringify(blocker)),
       `required deployment blocker: ${blocker}`,
     );
+  const variables = fs.readFileSync(path.join(root, "variables.tf"), "utf8");
+  const geoVariable = variables
+    .split('variable "geo_front_door" {')[1]
+    .split('variable "application_image" {')[0];
+  assert.doesNotMatch(
+    geoVariable,
+    /\bdefault\s*=/,
+    "Geo must require an explicit profile or null, never silently select Off",
+  );
+  assert.doesNotMatch(
+    fs.readFileSync(path.join(root, "ecs.tf"), "utf8"),
+    /^moved\s*\{/m,
+    "The new public root has no historical service address to migrate",
+  );
   let resources = 0;
   for (const file of sourceFiles) {
     const text = fs.readFileSync(path.join(root, file), "utf8");
@@ -413,10 +427,38 @@ try {
         ${check('local.geo_phase == "staged" && !aws_cloudfront_distribution.geo[0].enabled && issensitive(var.geo_front_door) && issensitive(local.native_geo_profile)', "Omitted phase must stage with no traffic, and private inputs/profile must stay sensitive.")}
       }\n`;
       for (const preservePublisher of [false, true]) {
-        contract += `\nrun "default_off_unchanged_${preservePublisher ? "publisher" : "demo_default"}" {
+        contract += `\nrun "explicit_off_unchanged_${preservePublisher ? "publisher" : "demo_default"}" {
           command = plan
           variables { ${preservePublisher ? "preserve_publisher_hostname = true" : ""} }
-          ${check(`var.preserve_publisher_hostname == ${preservePublisher} && length(aws_cloudfront_distribution.geo) == 0 && length(aws_ecs_service.geo) == 0 && length(aws_ecs_service.review) == 1 && aws_ecs_service.review[0].desired_count == 1 && one(aws_lb_listener_rule.publisher.action).type == "forward" && !contains(keys(local.application_environment), "TS_NATIVE_GEO_PROFILE_TOML") && local.trusted_proxy_cidrs == local.alb_subnet_cidrs`, "Absent profile must preserve the old Off topology and runtime regardless of browser identity.")}
+          ${check(`var.preserve_publisher_hostname == ${preservePublisher} && length(aws_cloudfront_distribution.geo) == 0 && length(aws_ecs_service.geo) == 0 && length(aws_ecs_service.review) == 1 && aws_ecs_service.review[0].desired_count == 1 && one(aws_lb_listener_rule.publisher.action).type == "forward" && !contains(keys(local.application_environment), "TS_NATIVE_GEO_PROFILE_TOML") && local.trusted_proxy_cidrs == local.alb_subnet_cidrs`, "Explicit null must preserve the old Off topology and runtime regardless of browser identity.")}
+        }\n`;
+      }
+      for (const [name, table] of [
+        ["too_short", "ab"],
+        ["too_long", "a".repeat(256)],
+        ["wildcard", "example-*"],
+        ["question_mark", "example-?"],
+        ["path", "example/table"],
+        ["unicode", "example-\u00e9"],
+      ]) {
+        const envelope = JSON.parse(
+          fs.readFileSync(path.join(root, "example-envelope.json"), "utf8"),
+        );
+        envelope.data.ec.storage.table = table;
+        const file = `invalid-table-${name}.json`;
+        fs.writeFileSync(path.join(fixture, file), JSON.stringify(envelope));
+        contract += `\nrun "ec_storage_reject_${name}" {
+          command = plan
+          variables {
+            ec_storage = {
+              provider = "dynamodb"
+              region = "eu-west-2"
+              table = ${JSON.stringify(table)}
+              namespace = "example-staging"
+            }
+            config_envelope_file = "${file}"
+          }
+          expect_failures = [var.ec_storage]
         }\n`;
       }
       for (const [name, overrides] of [
@@ -518,6 +560,24 @@ try {
         }\n`;
       }
       for (const [name, change] of [
+        ...["provider", "region", "table", "namespace"].map((field) => [
+          `storage_mismatch_${field}`,
+          (envelope) => {
+            envelope.data.ec.storage[field] = "different";
+          },
+        ]),
+        [
+          "storage_missing",
+          (envelope) => {
+            delete envelope.data.ec.storage;
+          },
+        ],
+        [
+          "storage_extra_field",
+          (envelope) => {
+            envelope.data.ec.storage.extra = "unexpected";
+          },
+        ],
         [
           "wrong_version",
           (envelope) => {
@@ -548,6 +608,16 @@ try {
         }\n`;
       }
     }
+    // Exercise the committed operator-facing defaults, not a parallel list of
+    // fictional values that can drift away from terraform.tfvars.example.
+    contract += `\nrun "committed_example_cloudfront" {
+      command = plan
+      variables {
+        ${fs.readFileSync(path.join(root, "terraform.tfvars.example"), "utf8")}
+      }
+      ${qualified ? "" : "expect_failures = [terraform_data.draft_gate]"}
+      ${qualified ? check('local.geo_enabled && local.geo_phase == "dns-cutover" && aws_cloudfront_distribution.geo[0].enabled && length(aws_ecs_service.review) == 0 && length(aws_ecs_service.geo) == 1 && one(aws_route53_record.review.alias).name == aws_cloudfront_distribution.geo[0].domain_name && local.envelope_valid', "Committed example inputs must select protected CloudFront and its DNS alias, never silently default Off.") : ""}
+    }\n`;
     fs.writeFileSync(path.join(fixture, "tests/contract.tftest.hcl"), contract);
     // This source change exists ONLY in the disposable mock-provider copy.
     if (qualified)
@@ -573,6 +643,67 @@ try {
     run(["validate", "-no-color"], fixture, fixtureEnv);
     run(["test", "-no-color"], fixture, fixtureEnv);
   }
+  // Validate only allowlisted public retained sources in a fresh directory.
+  // No retained state, credentials or operator tfvars are read.
+  const retainedRoot = path.join(root, "retained");
+  const retained = path.join(temporary, "retained");
+  fs.mkdirSync(path.join(retained, "tests"), { recursive: true });
+  const retainedSources = [
+    "main.tf",
+    "outputs.tf",
+    "terraform.tf",
+    "variables.tf",
+  ];
+  assert.deepEqual(
+    fs
+      .readdirSync(retainedRoot)
+      .filter((name) => name.endsWith(".tf") || name.endsWith(".tf.json"))
+      .sort(),
+    retainedSources,
+    "retained mock checks accept only reviewed public Terraform sources",
+  );
+  const retainedSource = retainedSources
+    .map((file) => fs.readFileSync(path.join(retainedRoot, file), "utf8"))
+    .join("\n");
+  assert.deepEqual(
+    [...retainedSource.matchAll(/^resource "([^"]+)" "([^"]+)"/gm)].map(
+      (match) => [match[1], match[2]],
+    ),
+    [["aws_dynamodb_table", "ec"]],
+    "retained state owns only the DynamoDB table, never IAM attachments or seed rows",
+  );
+  assert.doesNotMatch(
+    retainedSource,
+    /task_role|aws_iam|terraform_remote_state/,
+  );
+  assert.match(retainedSource, /prevent_destroy\s*=\s*true/);
+  for (const file of [...retainedSources, ".terraform.lock.hcl"])
+    fs.copyFileSync(path.join(retainedRoot, file), path.join(retained, file));
+  fs.copyFileSync(
+    path.join(retainedRoot, "tests/retained.tftest.hcl"),
+    path.join(retained, "tests/retained.tftest.hcl"),
+  );
+  const retainedEnv = {
+    TF_DATA_DIR: path.join(retained, ".terraform"),
+    TF_CLI_CONFIG_FILE: cliConfig,
+  };
+  run(
+    [
+      "init",
+      "-backend=false",
+      "-input=false",
+      "-lockfile=readonly",
+      "-no-color",
+    ],
+    retained,
+    retainedEnv,
+  );
+  run(["validate", "-no-color"], retained, retainedEnv);
+  run(["test", "-no-color"], retained, retainedEnv);
+  console.log(
+    "PASS retained table-only layout, protected lifetime and storage outputs",
+  );
+
   // Prove Terraform's actual destroy semantics without applying anything.
   // The fictional checkpoint contains only the built-in gate resource. Its
   // exact production preconditions remain closed throughout this test.

@@ -108,11 +108,6 @@ resource "aws_ecs_task_definition" "review" {
 // Retire the old service before its final listener association is removed.
 // Keeping a zero-desired service would still require that association for every
 // ECS UpdateService, including the scale-down itself.
-moved {
-  from = aws_ecs_service.review
-  to   = aws_ecs_service.review[0]
-}
-
 resource "aws_ecs_service" "review" {
   count                              = local.geo_enabled ? 0 : 1
   name                               = var.run_id

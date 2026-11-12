@@ -3,11 +3,6 @@ output "table_arn" {
   value       = aws_dynamodb_table.ec.arn
 }
 
-output "task_policy_json" {
-  description = "Task allow document. Merge equivalent constrained allows into the reviewed boundary separately."
-  value       = jsonencode(local.task_policy)
-}
-
 output "ec_storage" {
   description = "Non-secret ec.storage object to publish in the existing Trusted Server app-config envelope. No credential or execution-role changes."
   value = {

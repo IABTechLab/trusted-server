@@ -1,4 +1,4 @@
-name: Native AWS workload example
+name: Native AWS deployment example
 
 on:
   pull_request:
@@ -55,5 +55,8 @@ jobs:
         run: |
           terraform -chdir=deploy/examples/native-aws-workload fmt -check -recursive
           terraform -chdir=deploy/examples/native-aws-workload init -backend=false -input=false -lockfile=readonly
+          terraform -chdir=deploy/examples/native-aws-workload validate
+          terraform -chdir=deploy/examples/native-aws-workload/retained init -backend=false -input=false -lockfile=readonly
+          terraform -chdir=deploy/examples/native-aws-workload/retained validate
           env -u NODE_OPTIONS -u NODE_PATH node deploy/examples/native-aws-workload/test-draft.mjs
-          git diff --exit-code -- deploy/examples/native-aws-workload/.terraform.lock.hcl
+          git diff --exit-code -- deploy/examples/native-aws-workload/.terraform.lock.hcl deploy/examples/native-aws-workload/retained/.terraform.lock.hcl

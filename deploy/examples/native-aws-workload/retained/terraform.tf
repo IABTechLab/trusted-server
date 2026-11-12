@@ -8,8 +8,9 @@ terraform {
     }
   }
 
-  # Supply a retained bucket, unique key and region at init. The bucket and its
-  # access policy are owned separately from this example and the ECS workload.
+  # Supply a retained bucket, installation-specific key and region at init.
+  # Never reuse the workload state key. The bucket and its access policy are
+  # owned separately from this example and the ECS workload.
   backend "s3" {
     encrypt      = true
     use_lockfile = true
