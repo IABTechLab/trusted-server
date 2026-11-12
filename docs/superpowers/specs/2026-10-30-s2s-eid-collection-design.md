@@ -1743,3 +1743,22 @@ Reviewer findings and resolutions:
   over consent; and that no caller still needed orphan retargeting.
 - §5.2.1 now states that the after-response phase skips its read when no
   result can change the row.
+
+### Round 5 (2026-11-12, PR #1487 at 7a291be23, Claude Code (Opus 5.5) review agent)
+
+Angle: data flow and edge cases end to end, from dispatch through
+validation, the write planner, the page-load and after-response commits, to
+egress.
+
+- Blocking, fixed: a disabled provider's `tcf_vendor_id` was dropped from the
+  egress gate when an enabled provider claimed the same source, so its stored
+  UIDs were served under the new owner's vendor consent only, or with none
+  when the new owner sets no vendor ID. This broke §8.6. Each partner now
+  keeps the vendor IDs of every configured provider claiming its source and
+  is withheld unless all have consent, in the bidstream, identify and the
+  client-EID filter.
+- Non-blocking, no change: a live UID written by a provider that no longer
+  claims the source keeps the source not due for its new owner until the UID
+  expires (§5.6, §8.6 "keep serving until `exp`"). This is the intended
+  behaviour, already pinned by a test; the §4 "due source" entry reads
+  "owned UIDs" as UIDs on a provider-owned source.
