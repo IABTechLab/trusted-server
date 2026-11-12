@@ -9,10 +9,11 @@ Fastly development server:
 fastly compute serve
 ```
 
-Provider endpoints must use HTTPS. Fastly and Viceroy also need a backend that
-matches the provider host and TLS settings. For a deterministic local bidder,
-use `scripts/template-cache-local-test.sh`, which creates a temporary CA and
-registers the matching backend.
+Provider endpoints must use HTTPS, except plain HTTP to `127.0.0.1` or `[::1]`,
+which local test bidders use. EdgeZero registers each provider's Fastly backend
+at request time, so Viceroy needs no static backend for it. For a deterministic
+local bidder, use `scripts/template-cache-local-test.sh`, which serves a stub
+bidder over plain HTTP on `127.0.0.1`.
 
 ## Example configuration
 
@@ -97,18 +98,17 @@ Building plan-backed auction orchestrator
 Auction orchestrator built with 2 bidder providers
 ```
 
-A launched request logs the configured provider ID, predicted backend, and
-budget. Collection logs the pending and immediate response counts:
+All bidder requests leave together as one batch. Collection logs how many are
+in flight and the remaining auction budget, then the winner count:
 
 ```text
-Dispatching bid request to 'pbs-main' (backend: ..., budget: ...ms)
-Dispatching bid request to 'aps-main' (backend: ..., budget: ...ms)
-Dispatched 2 SSP request(s) with 0 immediate response(s) (timeout: ...ms)
+Collecting 2 in-flight SSP responses (...ms of the auction budget remaining)
+Selected ... winning bids
 ```
 
-Exact backend names and budgets depend on the adapter and remaining auction
-deadline. Provider failures are isolated and appear in response metadata under
-the configured provider ID.
+The remaining budget depends on the adapter and how long the requests took to
+build. Provider failures are isolated and appear in response metadata under the
+configured provider ID.
 
 ## Disabled auction
 
@@ -145,9 +145,9 @@ cd crates/trusted-server-js/lib
 npx vitest run
 ```
 
-The template-cache harness exercises plan compilation, HTTPS backend naming,
-provider dispatch, local highest-bid winner selection, and both ESI and inline
-delivery modes:
+The template-cache harness exercises plan compilation, a plain HTTP loopback
+bidder, provider dispatch, local highest-bid winner selection, and both ESI and
+inline delivery modes:
 
 ```bash
 ./scripts/template-cache-local-test.sh esi

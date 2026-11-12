@@ -8,8 +8,12 @@ on an edge SDK, Tokio runtime, filesystem, socket, or host-only process API.
 
 - `settings` and `settings_data` define typed application configuration,
   validation, secret references, and runtime normalization.
-- `platform` defines the HTTP, backend, store, geo, client-info, and telemetry
-  service boundary adapters implement.
+- `platform` defines the store, geo, client-info, template, and telemetry
+  service boundary adapters implement, and carries each request's EdgeZero
+  `HttpClient` and `MonotonicClock`.
+- `outbound` sets the connect timeout, constant timeouts, and response caps
+  every outbound request carries, and maps client failures to Trusted Server
+  errors.
 - `publisher`, `router`, `handlers`, and `response` dispatch publisher and
   administrative requests through platform-neutral request/response types.
 - `auction` builds plans, invokes providers and mediators, selects bids, and
