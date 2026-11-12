@@ -11,43 +11,115 @@ use super::{
     PlatformConfigStore, PlatformGeo, PlatformKvStore, PlatformSecretStore, PlatformTimer,
 };
 
-/// Geographic information extracted from a request.
-///
-/// Serde derives are required because `GeoInfo` is embedded in
-/// `AuctionRequest`, which is serialised for bid-request payloads.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GeoInfo {
-    /// City name.
-    pub city: String,
-    /// Two-letter country code.
-    pub country: String,
-    /// Continent name.
-    pub continent: String,
+/// A supplied latitude/longitude pair. Neither coordinate implies a default.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GeoCoordinates {
     /// Latitude coordinate.
     pub latitude: f64,
     /// Longitude coordinate.
     pub longitude: f64,
-    /// DMA (Designated Market Area) / metro code.
-    pub metro_code: i64,
-    /// Region code.
+}
+
+/// Geographic information extracted from a request.
+///
+/// Country-only results do not imply city or coordinate precision. Populated
+/// coordinates retain the flat `latitude`/`longitude` JSON fields used in
+/// serialised `AuctionRequest` payloads.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct GeoInfo {
+    /// City name, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    /// Two-letter country code.
+    pub country: String,
+    /// Continent name, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continent: Option<String>,
+    /// Coordinates, available only as a complete pair.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub coordinates: Option<GeoCoordinates>,
+    /// DMA (Designated Market Area) / metro code, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metro_code: Option<i64>,
+    /// Region code, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     /// Autonomous System Number (e.g. `7922` = Comcast).
     /// Used to distinguish home ISP vs. corporate VPN.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub asn: Option<u32>,
 }
 
+impl<'de> serde::Deserialize<'de> for GeoInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Deserialising a flattened Option<GeoCoordinates> directly would
+        // silently discard an incomplete pair as None. Reject that input.
+        #[derive(serde::Deserialize)]
+        struct Fields {
+            city: Option<String>,
+            country: String,
+            continent: Option<String>,
+            latitude: Option<f64>,
+            longitude: Option<f64>,
+            metro_code: Option<i64>,
+            region: Option<String>,
+            asn: Option<u32>,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        let coordinates = match (fields.latitude, fields.longitude) {
+            (Some(latitude), Some(longitude)) => Some(GeoCoordinates {
+                latitude,
+                longitude,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "latitude and longitude must be supplied together",
+                ));
+            }
+        };
+        Ok(Self {
+            city: fields.city,
+            country: fields.country,
+            continent: fields.continent,
+            coordinates,
+            metro_code: fields.metro_code,
+            region: fields.region,
+            asn: fields.asn,
+        })
+    }
+}
+
 impl GeoInfo {
-    /// Returns coordinates as a formatted string `"latitude,longitude"`.
+    /// Construct country and optional region data without inventing detail.
     #[must_use]
-    pub fn coordinates_string(&self) -> String {
-        format!("{},{}", self.latitude, self.longitude)
+    pub fn country_region(country: impl Into<String>, region: Option<String>) -> Self {
+        Self {
+            city: None,
+            country: country.into(),
+            continent: None,
+            coordinates: None,
+            metro_code: None,
+            region,
+            asn: None,
+        }
+    }
+
+    /// Returns supplied coordinates as `"latitude,longitude"`.
+    #[must_use]
+    pub fn coordinates_string(&self) -> Option<String> {
+        self.coordinates
+            .map(|coordinates| format!("{},{}", coordinates.latitude, coordinates.longitude))
     }
 
     /// Checks if a valid metro code is available.
     #[must_use]
     pub fn has_metro_code(&self) -> bool {
-        self.metro_code > 0
+        self.metro_code.is_some_and(|code| code > 0)
     }
 }
 

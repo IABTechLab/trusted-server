@@ -1673,12 +1673,14 @@ mod tests {
             ..protection_config()
         };
         let geo_info = GeoInfo {
-            city: String::new(),
+            city: None,
             country: String::new(),
-            continent: String::new(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 0,
+            continent: None,
+            coordinates: Some(crate::platform::GeoCoordinates {
+                latitude: 0.0,
+                longitude: 0.0,
+            }),
+            metro_code: Some(0),
             region: None,
             asn: Some(64500),
         };
