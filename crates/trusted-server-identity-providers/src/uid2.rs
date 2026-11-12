@@ -42,7 +42,7 @@
 
 use std::borrow::Cow;
 
-use aes_gcm::aead::{Aead as _, KeyInit as _, OsRng};
+use aes_gcm::aead::{Aead as _, KeyInit as _};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -874,9 +874,8 @@ mod tests {
         );
     }
 
-    fn encrypted_reply(reply: &serde_json::Value) -> (String, String) {
-        let key = Aes256Gcm::generate_key(&mut OsRng);
-        let cipher = Aes256Gcm::new(&key);
+    fn encrypted_reply(reply: &serde_json::Value) -> String {
+        let cipher = Aes256Gcm::new_from_slice(&[7_u8; 32]).expect("should build cipher");
         let iv = [1_u8; IV_BYTES];
         let ciphertext = cipher
             .encrypt(
@@ -884,10 +883,7 @@ mod tests {
                 reply.to_string().as_bytes(),
             )
             .expect("should encrypt");
-        (
-            BASE64.encode([&iv[..], &ciphertext].concat()),
-            BASE64.encode(key.as_slice()),
-        )
+        BASE64.encode([&iv[..], &ciphertext].concat())
     }
 
     fn reply<'a>(body: &'a str, key: &'a str, headers: &'a HeaderMap) -> ProviderResponse<'a> {
