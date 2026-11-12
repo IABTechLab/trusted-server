@@ -83,7 +83,7 @@ See [Configuration](/guide/configuration) for the field contract, the
 behavior.
 
 Canonical Fastly release consumption has a separate
-[manual verified-byte procedure](/guide/release-verification#deploy-the-verified-fastly-wasm).
+[manual verified-byte procedure](/guide/release-verification#deploy-the-verified-fastly-package).
 Integrated attested deployment with preactivation checks and staging isolation
 remains separate work; the managed source/application-release path is not proof
 those guarantees exist.
