@@ -418,10 +418,9 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 return self.lookup(provider, status, Vec::new());
             }
         };
-        if matches!(
-            response.status,
-            http::StatusCode::NOT_FOUND | http::StatusCode::NO_CONTENT
-        ) {
+        // Only 404 is a match-free reply for every provider; a 204 reaches
+        // the provider, because some vendors use it to report an opt-out.
+        if response.status == http::StatusCode::NOT_FOUND {
             return self.lookup(provider, LookupStatus::NoMatch, Vec::new());
         }
         if !response.status.is_success() {
@@ -962,6 +961,10 @@ mod tests {
         ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
             if response.context != Some(ECHO_CONTEXT) {
                 return Err(Report::new(ProviderError::InvalidResponse));
+            }
+            // Like LiveRamp, the echo vendor reports an opt-out with a 204.
+            if response.status == http::StatusCode::NO_CONTENT {
+                return Ok(LookupOutcome::OptedOut);
             }
             let id = std::str::from_utf8(response.body)
                 .map_err(|_| Report::new(ProviderError::InvalidResponse))?;
@@ -2193,6 +2196,44 @@ mod tests {
             lookup.cleared,
             [SourceDomain::try_from("ids.example.com").expect("should parse")],
             "should clear the provider's sources"
+        );
+    }
+
+    fn no_content_reply() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::NO_CONTENT, b""))
+    }
+
+    #[test]
+    fn a_204_reply_reaches_the_provider() {
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(no_content_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert_eq!(
+            lookup.status,
+            LookupStatus::Skipped(SkipReason::OptedOut),
+            "should report the opt-out the provider reads from a 204"
+        );
+        assert_eq!(
+            lookup.cleared,
+            [SourceDomain::try_from("ids.example.com").expect("should parse")],
+            "should clear the provider's sources"
+        );
+    }
+
+    #[test]
+    fn a_404_reply_is_no_match_without_parsing() {
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(not_found_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::NoMatch,
+            "should report a 404 as no match"
         );
     }
 

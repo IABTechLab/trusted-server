@@ -319,6 +319,9 @@ impl IdentityProvider for Uid2Provider {
         &self,
         response: ProviderResponse<'body>,
     ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+        if response.status == http::StatusCode::NO_CONTENT {
+            return Ok(LookupOutcome::NoMatch);
+        }
         let key = response.context.ok_or_else(|| {
             Report::new(ProviderError::InvalidResponse).attach("no uid2 response key")
         })?;
