@@ -603,6 +603,23 @@ mod tests {
     }
 
     #[test]
+    fn validate_providers_rejects_an_enabled_unregistered_kind() {
+        let mut settings = settings_with_cookie_providers("page", "page");
+        settings.ec.identity_providers.push(
+            toml::from_str("id = \"missing\"\nkind = \"missing\"\nsources = [\"criteo.com\"]")
+                .expect("should parse provider"),
+        );
+
+        let error = validate_providers(&settings)
+            .expect_err("should refuse an enabled provider whose kind is not registered");
+
+        assert!(
+            format!("{error:?}").contains("which this build does not include"),
+            "should name the unregistered kind: {error:?}"
+        );
+    }
+
+    #[test]
     fn validate_providers_accepts_partner_tokens_that_are_still_key_names() {
         let mut settings = settings_with_cookie_providers("page", "page");
         settings.ec.partners[0] = toml::from_str(
