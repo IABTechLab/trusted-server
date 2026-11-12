@@ -9,18 +9,22 @@ use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
 };
 use edgezero_core::router::RouterService;
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
-use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::coordinator::ProviderCoordinator;
+use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
@@ -40,7 +44,15 @@ use trusted_server_core::settings_data::{
 
 use trusted_server_core::platform::{ClientInfo, RuntimeServices};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
+use trusted_server_identity_providers::{
+    build_after_response_coordinator, build_coordinator_with, partner_registry,
+};
 
+use crate::ec_kv::{LocalEcKvStore, LocalRateLimiter};
+use crate::identity::{
+    build_ec_request_state, device_signals_for, dispatch_page_lookups, finalize_navigation,
+    looks_like_browser, prepare_after_response_lookups, spawn_after_response_lookups,
+};
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
 
@@ -54,14 +66,24 @@ pub struct AppState {
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
     services: Option<RuntimeServices>,
+    /// Partner registry, with the sources of enabled providers marked.
+    partner_registry: Arc<PartnerRegistry>,
+    /// Coordinator for providers collected before the response, if any.
+    page_identity: Option<Arc<ProviderCoordinator>>,
+    /// Coordinator for providers collected after the response, if any.
+    after_response_identity: Option<Arc<ProviderCoordinator>>,
+    /// Process-local EC identity store, present when `ec.ec_store` is set.
+    ec_store: Option<LocalEcKvStore>,
+    rate_limiter: LocalRateLimiter,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
 ///
 /// # Errors
 ///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
+/// Returns an error when settings, the auction orchestrator, the integration
+/// registry, the partner registry or an enabled identity provider fail to
+/// initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let store_name = default_config_store_name();
     let config_key = default_config_key();
@@ -87,25 +109,89 @@ fn build_state_with_settings(
     build_state_with_services(settings, None)
 }
 
-fn build_state_with_services(
+pub(crate) fn build_state_with_services(
     settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Axum")?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+
+    // A provider that cannot run must stop startup: skipping it would quietly
+    // hand its sources back to browser ingest.
+    let partner_registry = Arc::new(partner_registry(&settings.ec)?);
+    let page_identity = build_coordinator_with(&settings, Arc::clone(&partner_registry))
+        .change_context(TrustedServerError::Configuration {
+            message: "identity provider configuration is invalid".to_owned(),
+        })?
+        .map(Arc::new);
+    let after_response_identity =
+        build_after_response_coordinator(&settings, Arc::clone(&partner_registry))
+            .change_context(TrustedServerError::Configuration {
+                message: "identity provider configuration is invalid".to_owned(),
+            })?
+            .map(Arc::new);
+    let ec_store = settings.ec.ec_store.as_deref().map(|store_name| {
+        log::warn!(
+            "Axum dev server: EC identity store `{store_name}` is process-local and is lost on exit"
+        );
+        LocalEcKvStore::new(store_name)
+    });
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         services,
+        partner_registry,
+        page_identity,
+        after_response_identity,
+        ec_store,
+        rate_limiter: LocalRateLimiter::default(),
     }))
 }
 
 impl AppState {
+    pub(crate) fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    pub(crate) fn partner_registry(&self) -> &PartnerRegistry {
+        &self.partner_registry
+    }
+
+    pub(crate) fn page_identity(&self) -> Option<&Arc<ProviderCoordinator>> {
+        self.page_identity.as_ref()
+    }
+
+    pub(crate) fn after_response_identity(&self) -> Option<&Arc<ProviderCoordinator>> {
+        self.after_response_identity.as_ref()
+    }
+
+    pub(crate) fn rate_limiter(&self) -> &LocalRateLimiter {
+        &self.rate_limiter
+    }
+
+    /// Builds an identity graph over the shared process-local store.
+    pub(crate) fn identity_graph(&self) -> Option<KvIdentityGraph> {
+        self.ec_store.clone().map(KvIdentityGraph::new)
+    }
+
+    /// Identity graph for read-only auction enrichment from a browser.
+    fn auction_identity_graph(&self, req: &Request) -> Option<KvIdentityGraph> {
+        if looks_like_browser(&device_signals_for(req)) {
+            self.identity_graph()
+        } else {
+            None
+        }
+    }
+
+    /// Partner registry for auction EID enrichment, `None` when empty.
+    fn auction_partner_registry(&self) -> Option<&PartnerRegistry> {
+        (!self.partner_registry.is_empty()).then_some(&*self.partner_registry)
+    }
+
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
         self.services
             .clone()
@@ -208,7 +294,7 @@ fn build_ec_context(state: &AppState, services: &RuntimeServices, req: &Request)
 // ---------------------------------------------------------------------------
 
 async fn dispatch_fallback(
-    state: &AppState,
+    state: &Arc<AppState>,
     services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
@@ -242,36 +328,93 @@ async fn dispatch_fallback(
             });
     }
 
+    let mut ec = build_ec_request_state(state, services, &req);
+
+    // Mint and look up only on document navigations by recognised browsers;
+    // subresource requests may lack consent signals such as Sec-GPC.
+    let is_navigation = is_navigation_request(&req);
+    let mut has_permit = false;
+    if is_navigation {
+        ec.ec_context.set_eid_sync_source(EidSyncSource::Navigation);
+        // The page-load write permit uses the stricter Fetch Metadata test;
+        // requests without it never write KV.
+        if let Some(permit) = NavigationPermit::classify(&req) {
+            ec.ec_context.set_navigation_permit(permit);
+            has_permit = true;
+        }
+    }
+    let is_publisher_navigation = ec.is_real_browser && is_navigation && has_permit;
+    // A new EC is minted only when this request may also write its row.
+    if is_publisher_navigation
+        && let Err(err) = ec
+            .ec_context
+            .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
+    {
+        log::warn!("EC generation failed for publisher proxy: {err:?}");
+    }
+
+    // Page-phase lookups start before the origin fetch so they overlap it.
+    let page_lookups = if is_publisher_navigation {
+        dispatch_page_lookups(state, services, &req, &mut ec).await
+    } else {
+        None
+    };
+    let after_response = if is_publisher_navigation {
+        prepare_after_response_lookups(state, services, &req, &ec)
+    } else {
+        None
+    };
+
     // Run the server-side auction with the configured creative-opportunity
     // slots; `handle_publisher_request` matches them against the request path.
-    let mut ec_context = build_ec_context(state, services, &req);
     let auction = AuctionDispatch {
         integration_registry: &state.registry,
         orchestrator: &state.orchestrator,
         slots: state.settings.creative_opportunity_slots(),
-        registry: None,
+        registry: state.auction_partner_registry(),
     };
-    let publisher_response = handle_publisher_request(
+    let result = match handle_publisher_request(
         &state.settings,
         services,
-        None,
-        &mut ec_context,
+        ec.kv_graph.as_ref(),
+        &mut ec.ec_context,
         auction,
         req,
         EdgeCacheHeader::SMaxageFallback,
     )
-    .await?;
-    // Async finalize so the dispatched auction is collected and its bids are
-    // injected before `</body>` (the sync buffer path would drop them).
-    buffer_publisher_response_async(
-        publisher_response,
-        &method,
-        &state.settings,
-        &state.registry,
-        &state.orchestrator,
-        services,
-    )
     .await
+    {
+        Ok(publisher_response) => {
+            // Origin start succeeded: authorize orphan recovery only for
+            // real-browser document navigations.
+            ec.ec_context
+                .set_recovery_eligible(ec.is_real_browser && is_navigation);
+            // Async finalize so the dispatched auction is collected and its
+            // bids are injected before `</body>` (the sync buffer path would
+            // drop them).
+            buffer_publisher_response_async(
+                publisher_response,
+                &method,
+                &state.settings,
+                &state.registry,
+                &state.orchestrator,
+                services,
+            )
+            .await
+        }
+        Err(report) => Err(report),
+    };
+
+    let mut response = result.unwrap_or_else(|report| http_error(&report));
+    finalize_navigation(state, services, &mut ec, page_lookups, &mut response).await;
+    // The task runs to completion on its own; its handle is not awaited.
+    drop(spawn_after_response_lookups(
+        Arc::clone(state),
+        services.clone(),
+        &mut ec,
+        after_response,
+    ));
+    Ok(response)
 }
 
 fn fallback_handler(
@@ -497,8 +640,7 @@ fn named_route_handler(
                         Ok(admin_ec_lookup_not_supported())
                     }
                     NamedRouteHandler::AdminEidsLookup => {
-                        let partner_registry = PartnerRegistry::from_ec(&state.settings.ec)?;
-                        handle_admin_eids_lookup(&partner_registry, &req)
+                        handle_admin_eids_lookup(&state.partner_registry, &req)
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::Auction => {
@@ -506,11 +648,13 @@ fn named_route_handler(
                         // gate sees the caller's jurisdiction — `EcContext::default()`
                         // fails it closed for consented users.
                         let mut ec_context = build_ec_context(&state, &services, &req);
+                        ec_context.set_eid_sync_source(EidSyncSource::Auction);
+                        let kv_graph = state.auction_identity_graph(&req);
                         handle_auction(
                             &state.settings,
                             &state.orchestrator,
-                            None,
-                            None,
+                            kv_graph.as_ref(),
+                            state.auction_partner_registry(),
                             &mut ec_context,
                             &services,
                             req,
@@ -529,12 +673,13 @@ fn named_route_handler(
                                 integration_registry: &state.registry,
                                 orchestrator: &state.orchestrator,
                                 slots: state.settings.creative_opportunity_slots(),
-                                registry: None,
+                                registry: state.auction_partner_registry(),
                             };
+                            let kv_graph = state.auction_identity_graph(&req);
                             handle_page_bids(
                                 &state.settings,
                                 &services,
-                                None,
+                                kv_graph.as_ref(),
                                 auction,
                                 &mut ec_context,
                                 req,
@@ -672,7 +817,7 @@ impl TrustedServerApp {
     }
 }
 
-fn build_router(state: &Arc<AppState>) -> RouterService {
+pub(crate) fn build_router(state: &Arc<AppState>) -> RouterService {
     let fallback = fallback_handler(Arc::clone(state));
     let trace_state = Arc::clone(state);
 
@@ -754,19 +899,19 @@ mod trace_dispatch_tests {
     use trusted_server_core::trace::TraceTerminalResponse;
 
     #[test]
-    fn enabled_identity_provider_fails_startup() {
+    fn unregistered_identity_provider_kind_fails_startup() {
         let mut settings = trace_settings(false);
         settings.ec.identity_providers =
             vec![trusted_server_core::test_support::fixtures::enabled_identity_provider()];
 
         let Err(error) = build_state_with_settings(settings) else {
-            panic!("should refuse to start with an enabled identity provider");
+            panic!("should refuse to start with an unregistered provider kind");
         };
 
         let message = format!("{error:?}");
         assert!(
-            message.contains("example-provider") && message.contains("Axum"),
-            "should name the provider and the adapter: {message}"
+            message.contains("example-provider") && message.contains("example-kind"),
+            "should name the provider and its kind: {message}"
         );
     }
 
