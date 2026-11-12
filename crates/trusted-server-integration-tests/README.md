@@ -5,11 +5,14 @@ end-to-end publisher behavior. It is not linked into an adapter artifact.
 
 ## Test surfaces
 
-- `tests/parity.rs` calls Axum, Cloudflare, and Spin routers in process and
-  compares their shared route behavior.
+- `tests/parity.rs` serves the Axum, Cloudflare, and Spin apps on EdgeZero's
+  `AxumTestServer`, a loopback listener that applies each app's production
+  policies, and compares their shared route behavior. A scripted outbound
+  client in router state answers their upstream calls.
 - `tests/documentation_snippets.rs` extracts the checked integration-guide
   fixture and compiles it in an isolated offline crate.
-- `tests/integration.rs` exercises the Fastly/Viceroy and Axum paths against the
+- `tests/integration.rs` exercises the Fastly (Viceroy), Axum, Cloudflare
+  (workerd), and Spin runtimes against local origins, loopback bidders, and the
   WordPress and Next.js fixture containers.
 - `browser/` uses Playwright and Chromium to verify script loading, navigation,
   rewriting, APS rendering, and GPT diagnostics in real pages.

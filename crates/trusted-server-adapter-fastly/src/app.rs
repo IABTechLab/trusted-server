@@ -1038,11 +1038,10 @@ fn attach_request_filter_effects(response: &mut Response, effects: &RequestFilte
 // Error helper
 // ---------------------------------------------------------------------------
 
-/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`],
-/// mirroring [`crate::http_error_response`] exactly.
+/// Convert a [`Report<TrustedServerError>`] into a plain-text HTTP [`Response`].
 ///
-/// The near-identical function in `main.rs` is intentional: the legacy path
-/// uses fastly HTTP types while this path uses `edgezero_core` types.
+/// Logs the whole report at error, then answers with the root error's status
+/// and its client-safe user message.
 pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let root_error = report.current_context();
     log::error!("Error occurred: {:?}", report);

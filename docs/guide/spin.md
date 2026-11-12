@@ -8,12 +8,12 @@ through Spin variables.
 
 | Adapter | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization            |
 | ------- | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | -------------------------------- |
-| `spin`  | experimental   | real   | `503`          | yes            | single           | outermost sanitize         | innermost Spin-header derivation |
+| `spin`  | experimental   | real   | `503`          | no             | multiple         | outermost sanitize         | innermost Spin-header derivation |
 
-This row is the canonical status summary. Spin supports one enabled
-auction provider. When startup fails, its hardened router preserves `/health`
-but answers publisher routes with 503; neither response proves successful
-configuration.
+This row is the canonical status summary. Spin supports multiple auction
+providers. When startup fails, every route, `/health` included, answers 503
+with a generic `Service Unavailable` error, and the full report goes only to
+the log.
 
 ## Prerequisites
 
