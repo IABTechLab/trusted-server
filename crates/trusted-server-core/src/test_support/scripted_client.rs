@@ -1215,6 +1215,8 @@ mod tests {
             .expect("should buffer the response body")
     }
 
+    // Inspecting panic payloads requires unwinding; WASI test guests abort instead.
+    #[cfg(panic = "unwind")]
     #[test]
     fn header_assertions_compare_exactly_without_disclosing_values() {
         let clock = TestClock::new();
