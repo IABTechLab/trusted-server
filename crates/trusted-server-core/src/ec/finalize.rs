@@ -566,7 +566,7 @@ mod tests {
     use crate::consent::types::{ConsentContext, ConsentSource};
     use crate::ec::EidSyncSource;
     use crate::ec::coordinator::results::{
-        DropCounts, LookupResults, LookupStatus, ProviderLookup,
+        DropCounts, LookupResults, LookupStatus, OptOutMemory, ProviderLookup,
     };
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, SourceDomain, UidValue};
     use crate::ec::kv_types::{KvEid, KvUid};
@@ -2905,6 +2905,7 @@ mod tests {
                     vec![KvEid::new(EidFields::default(), vec![uid])],
                 )],
                 cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
             }],
         ));
         let mut response = empty_response();

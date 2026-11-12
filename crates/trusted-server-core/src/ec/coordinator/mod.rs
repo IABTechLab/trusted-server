@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use error_stack::Report;
 
-use self::results::{LookupResults, LookupStatus, ProviderLookup, SkipReason};
+use self::results::{LookupResults, LookupStatus, OptOutMemory, ProviderLookup, SkipReason};
 use self::transport::{
     Deadline, LookupTransport, ProviderIndex, Tagged, TransportError, TransportResponse,
 };
@@ -391,6 +391,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
             status,
             entries,
             cleared,
+            opt_out: OptOutMemory::Unchanged,
         }
     }
 
@@ -442,11 +443,17 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 return self.lookup(provider, LookupStatus::NoMatch, Vec::new());
             }
             Ok(LookupOutcome::OptedOut) => {
-                return self.lookup(
-                    provider,
-                    LookupStatus::Skipped(SkipReason::OptedOut),
-                    Vec::new(),
-                );
+                // Only an opt-out the vendor's server reports is remembered:
+                // it spares the vendor further calls. Cookie opt-outs are
+                // re-read on every navigation instead.
+                return ProviderLookup {
+                    opt_out: OptOutMemory::Remember,
+                    ..self.lookup(
+                        provider,
+                        LookupStatus::Skipped(SkipReason::OptedOut),
+                        Vec::new(),
+                    )
+                };
             }
             Err(report) => {
                 log::debug!(
@@ -548,27 +555,9 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                     value: excluded.clone(),
                 });
             }
-            // A remembered opt-out keeps the provider from being called until
-            // it lapses. It clears only sources the row still stores, so once
-            // they are gone the after-response path skips its re-read.
-            if let Some(entry) = entry.filter(|entry| entry.opted_out(&registered.id, lookup.now)) {
-                pending.generated.push(Tagged {
-                    provider,
-                    value: ProviderLookup {
-                        provider: registered.id.clone(),
-                        status: LookupStatus::Skipped(SkipReason::OptedOut),
-                        entries: Vec::new(),
-                        cleared: registered
-                            .policy
-                            .sources
-                            .iter()
-                            .filter(|source| entry.ids.contains_key(source.as_str()))
-                            .cloned()
-                            .collect(),
-                    },
-                });
-                continue;
-            }
+            let remembered_opt_out =
+                entry.filter(|entry| entry.opted_out(&registered.id, lookup.now));
+            let mut opted_back_in = false;
             let (mut due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
             due.retain(|source| !excluded.contains(source));
             // The vendor's own first-party cookies are read on every
@@ -597,6 +586,13 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                         recount_found(&mut found);
                     }
                     if matches!(found.status, LookupStatus::Found { .. }) {
+                        // An ID in the vendor's cookies means the visitor
+                        // opted back in, so a remembered opt-out is
+                        // forgotten.
+                        if remembered_opt_out.is_some() {
+                            opted_back_in = true;
+                            found.opt_out = OptOutMemory::Forget;
+                        }
                         // Only the sources the cookies filled are spared a
                         // lookup; the provider's other due sources are
                         // still looked up.
@@ -622,7 +618,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                             !holds_same_uids_for(entry, source, eids, lookup.now)
                         });
                         recount_found(&mut found);
-                        if !found.entries.is_empty() {
+                        if !found.entries.is_empty() || opted_back_in {
                             pending.from_cookies.push(Tagged {
                                 provider,
                                 value: found,
@@ -634,6 +630,29 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                     }
                 }
                 CookieRead::Absent => {}
+            }
+            // A remembered opt-out keeps the provider from being called until
+            // it lapses, unless its cookies hold an ID again. It clears only
+            // sources the row still stores, so once they are gone the
+            // after-response path skips its re-read.
+            if let Some(entry) = remembered_opt_out.filter(|_| !opted_back_in) {
+                pending.generated.push(Tagged {
+                    provider,
+                    value: ProviderLookup {
+                        provider: registered.id.clone(),
+                        status: LookupStatus::Skipped(SkipReason::OptedOut),
+                        entries: Vec::new(),
+                        cleared: registered
+                            .policy
+                            .sources
+                            .iter()
+                            .filter(|source| entry.ids.contains_key(source.as_str()))
+                            .cloned()
+                            .collect(),
+                        opt_out: OptOutMemory::Unchanged,
+                    },
+                });
+                continue;
             }
             if due.is_empty() {
                 pending.early.push(skip(if input_blocked {
@@ -805,6 +824,21 @@ fn exclude_sources(lookup: &mut ProviderLookup, sources: Vec<SourceDomain>) {
 /// An opt-out wins; otherwise the found entries of both are kept, and a
 /// later result that found nothing leaves the cookie result.
 fn merge_lookups(earlier: ProviderLookup, later: ProviderLookup) -> ProviderLookup {
+    // A server opt-out is remembered over anything; otherwise the cookies'
+    // opt-back-in is kept.
+    let opt_out = match (earlier.opt_out, later.opt_out) {
+        (_, OptOutMemory::Remember) => OptOutMemory::Remember,
+        (OptOutMemory::Forget, _) => OptOutMemory::Forget,
+        (_, memory) => memory,
+    };
+    ProviderLookup {
+        opt_out,
+        ..merge_entries(earlier, later)
+    }
+}
+
+/// Merges the statuses and entries of [`merge_lookups`].
+fn merge_entries(earlier: ProviderLookup, later: ProviderLookup) -> ProviderLookup {
     let LookupStatus::Found { dropped, .. } = later.status else {
         return if later.status == LookupStatus::Skipped(SkipReason::OptedOut)
             || !matches!(earlier.status, LookupStatus::Found { .. })
@@ -2040,6 +2074,7 @@ mod tests {
                 vec![KvEid::new(EidFields::default(), vec![uid])],
             )],
             cleared: Vec::new(),
+            opt_out: OptOutMemory::Unchanged,
         }
     }
 
@@ -2049,6 +2084,7 @@ mod tests {
             status,
             entries: Vec::new(),
             cleared: Vec::new(),
+            opt_out: OptOutMemory::Unchanged,
         }
     }
 
@@ -2109,6 +2145,80 @@ mod tests {
             "should not refresh before the refresh time"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn a_cookie_id_clears_a_remembered_opt_out() {
+        // Arrange: the opt-out is remembered for 29 more days, and the
+        // vendor's cookie holds an ID again.
+        let coordinator = cookie_coordinator();
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.opt_outs.insert(
+            ProviderId::new("example-provider"),
+            1000 + 29 * 24 * 60 * 60,
+        );
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+            &Limiter(false),
+            "vendor_id=c-1",
+        );
+
+        // Assert
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            matches!(lookup.status, LookupStatus::Found { kept: 1, .. }),
+            "should store the cookie ID despite the remembered opt-out"
+        );
+        assert_eq!(
+            lookup.opt_out,
+            OptOutMemory::Forget,
+            "should forget the remembered opt-out"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn only_a_vendor_server_opt_out_is_remembered() {
+        let cookie_only = cookie_coordinator();
+        let cookie = run_with_cookies(
+            &cookie_only,
+            &CannedTransport::new(ok_reply),
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "vendor_id=optout",
+        );
+        let server = run(
+            &coordinator(""),
+            &CannedTransport::new(optout_reply),
+            &live_row(),
+            &granting(),
+        );
+
+        let memory = |results: &LookupResults| {
+            results
+                .iter()
+                .next()
+                .expect("should report the provider")
+                .opt_out
+        };
+        assert_eq!(
+            memory(&cookie),
+            OptOutMemory::Unchanged,
+            "should not remember a cookie opt-out"
+        );
+        assert_eq!(
+            memory(&server),
+            OptOutMemory::Remember,
+            "should remember a vendor server's opt-out"
+        );
     }
 
     #[test]

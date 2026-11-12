@@ -1267,12 +1267,15 @@ For each provider with a `Found` outcome and each source in its response:
   unowned ones (D8). Each written UID records `owner` and `exp`.
 - Sources the provider claims but did not return stay unchanged.
 - `NoMatch`, failures, timeouts and skipped providers leave the row unchanged.
-- `OptedOut` (a cookie or a refresh reply) clears every source the provider
-  claims and records the opt-out in the row's `opt_outs` map for 30 days. Until
-  it lapses the provider is skipped as `skipped_opted_out` and not called, and
-  a result from a lookup dispatched before the opt-out was recorded is
-  discarded rather than written over it. Generated and cookie IDs merge like
-  `Found`.
+- `OptedOut` (a cookie or a vendor server's reply) clears every source the
+  provider claims. Only an opt-out a vendor server reports is recorded in the
+  row's `opt_outs` map for 30 days: a cookie opt-out is re-read on every
+  navigation, so it needs no memory. Until a recorded opt-out lapses the
+  provider is skipped as `skipped_opted_out` and not called, and a result from
+  a lookup dispatched before the opt-out was recorded is discarded rather than
+  written over it. The vendor's cookies are read before the recorded opt-out
+  is checked: an ID in them means the visitor opted back in, so the opt-out is
+  forgotten and the ID stored. Generated and cookie IDs merge like `Found`.
 
 Browser ingest (§8.4) is applied in the same in-memory merge, before provider
 results, so the write order never lets browser data overwrite provider data.

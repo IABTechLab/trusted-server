@@ -706,6 +706,11 @@ impl KvEntry {
         );
     }
 
+    /// Forgets the opt-out remembered for `provider`, if any.
+    pub fn forget_opt_out(&mut self, provider: &ProviderId) {
+        self.opt_outs.remove(provider);
+    }
+
     /// Forgets opt-outs whose time has passed.
     pub fn prune_opt_outs(&mut self, now: UnixSeconds) {
         self.opt_outs.retain(|_, until| *until > now.get());

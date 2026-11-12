@@ -121,6 +121,20 @@ impl LookupStatus {
     }
 }
 
+/// What a lookup does to the provider's remembered opt-out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OptOutMemory {
+    /// Leaves it as it is.
+    #[default]
+    Unchanged,
+    /// Remembers an opt-out the vendor's server reported, so the vendor is
+    /// not called again for the memory period.
+    Remember,
+    /// Forgets it: the vendor's cookies hold an ID again, so the visitor
+    /// opted back in.
+    Forget,
+}
+
 /// One provider's outcome and validated entries.
 #[derive(Debug, Clone)]
 pub struct ProviderLookup {
@@ -133,6 +147,8 @@ pub struct ProviderLookup {
     /// Sources whose stored records are removed, because the user opted
     /// out of the provider; empty unless `Skipped(OptedOut)`.
     pub cleared: Vec<SourceDomain>,
+    /// What this lookup does to the provider's remembered opt-out.
+    pub opt_out: OptOutMemory,
 }
 
 /// Validated results of one navigation's lookups.

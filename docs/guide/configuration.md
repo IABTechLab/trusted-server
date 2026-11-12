@@ -826,9 +826,12 @@ them, and batch sync rejects them and pull sync skips them. Browser-resolved IDs
 (`ts-eids`, `sharedId`) are never stored for an owned source, so a source a
 provider cleared on an opt-out is not refilled from the browser.
 
-When a provider reports an opt-out, its sources are cleared and the row
-remembers the opt-out for 30 days. The provider is not called for that EC
-again until the 30 days pass.
+When a provider reports an opt-out, its sources are cleared. An opt-out the
+vendor's server reports is also remembered in the row for 30 days, and the
+provider is not called for that EC again until the 30 days pass, unless the
+vendor's cookies hold an ID again: that means the visitor opted back in, so the
+opt-out is forgotten. An opt-out read from the vendor's cookies is not
+remembered, because the cookies are read again on every navigation.
 
 Some kinds keep private refresh state with a UID, such as a vendor refresh
 token, and refresh it server side once it is due, while the UID is still live.
