@@ -118,14 +118,14 @@ Identity runs on an adapter only where the record contract and geo are
 supported. Elsewhere, startup rejects identity configuration (ID-2). Delivery
 follows DEC-4: Fastly, Axum, Cloudflare, Spin.
 
-| Capability                                                                    | Fastly                                                                               | Axum                                                       | Cloudflare                                                                                                                                                                                    | Spin                                                                                                                                                                                                                                                         |
-| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Record contract (generation read, create-if-absent, CAS, strong exists, list) | Supported. Fastly KV generations through EZI-2a, or DynamoDB or celld through EZI-2b | Supported. DynamoDB or celld through EZI-2b                | DynamoDB or celld through EZI-2b and EZI-2c. Workers KV is eventually consistent with no CAS, and EdgeZero has no Durable Objects or D1 store on main, IABTechLab/edgezero#275 or the RC tags | DynamoDB or celld through EZI-2b and EZI-2s. Spin's own `spin-sdk` 7.0.0 `key_value` has get, set, delete, exists and get_keys only, with no prefix listing; its bundled `wasi:keyvalue/atomics` interface defines a CAS resource that the SDK does not wrap |
-| After-response work                                                           | Supported (after send)                                                               | EZI-1, drained on SIGTERM                                  | EZI-1 over `waitUntil`                                                                                                                                                                        | Unsupported. DEC-14 picks before-response or skip                                                                                                                                                                                                            |
-| Rate limiter                                                                  | Supported (Edge Rate Limiting)                                                       | None in the MVP; the load balancer limits (DEC-11, DEC-15) | EZI-5, backend per DEC-15                                                                                                                                                                     | EZI-5, backend per DEC-15                                                                                                                                                                                                                                    |
-| Geo with region                                                               | Supported                                                                            | CloudFront headers (A4, IABTechLab/edgezero#439)           | Country only today; region needs EZI-4                                                                                                                                                        | None; needs EZI-4                                                                                                                                                                                                                                            |
-| TLS fingerprint (JA4)                                                         | Supported (Fastly SDK); EZI-3 accessor                                               | EZI-3 from a trusted CloudFront hop                        | EZI-3 accessor, or absent                                                                                                                                                                     | EZI-3 accessor, or absent                                                                                                                                                                                                                                    |
-| Trusted client IP                                                             | Supported                                                                            | IABTechLab/edgezero#409                                    | `cf-connecting-ip`; EZI-3 accessor                                                                                                                                                            | TCP peer; EZI-3 accessor                                                                                                                                                                                                                                     |
+| Capability                                                                    | Fastly                                                                               | Axum                                                                 | Cloudflare                                                                                                                                                                                    | Spin                                                                                                                                                                                                                                                         |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Record contract (generation read, create-if-absent, CAS, strong exists, list) | Supported. Fastly KV generations through EZI-2a, or DynamoDB or celld through EZI-2b | Supported. DynamoDB or celld through EZI-2b                          | DynamoDB or celld through EZI-2b and EZI-2c. Workers KV is eventually consistent with no CAS, and EdgeZero has no Durable Objects or D1 store on main, IABTechLab/edgezero#275 or the RC tags | DynamoDB or celld through EZI-2b and EZI-2s. Spin's own `spin-sdk` 7.0.0 `key_value` has get, set, delete, exists and get_keys only, with no prefix listing; its bundled `wasi:keyvalue/atomics` interface defines a CAS resource that the SDK does not wrap |
+| After-response work                                                           | Supported (after send)                                                               | EZI-1, drained on SIGTERM                                            | EZI-1 over `waitUntil`                                                                                                                                                                        | Unsupported. DEC-14 picks before-response or skip                                                                                                                                                                                                            |
+| Rate limiter                                                                  | Supported (Edge Rate Limiting)                                                       | None in the MVP; the load balancer limits (DEC-11, DEC-15)           | EZI-5, backend per DEC-15                                                                                                                                                                     | EZI-5, backend per DEC-15                                                                                                                                                                                                                                    |
+| Geo with region                                                               | Supported                                                                            | CloudFront headers (A4, IABTechLab/edgezero#439)                     | Country only today; region needs EZI-4                                                                                                                                                        | None; needs EZI-4                                                                                                                                                                                                                                            |
+| TLS fingerprint (JA4)                                                         | Runtime TLS through EdgeZero's `ctx.ja4()` (EZI-3)                                   | `ctx.ja4()` from a trusted proxy header such as CloudFront's (EZI-3) | `ctx.ja4()` from Bot Management, otherwise absent                                                                                                                                             | Absent (`NotExposed`)                                                                                                                                                                                                                                        |
+| Trusted client IP                                                             | Supported                                                                            | IABTechLab/edgezero#409                                              | `cf-connecting-ip`; EZI-3 accessor                                                                                                                                                            | TCP peer; EZI-3 accessor                                                                                                                                                                                                                                     |
 
 Cloudflare and Spin move to Supported only when EZI-2 and EZI-4 deliver for
 them (DEC-8). Until then their startup rejects identity configuration, and
@@ -246,14 +246,20 @@ marks the record contract and geo as supported.
   limit. State: Fastly Edge Rate Limiting is the only limiter; record creation
   is limited nowhere; #1487 keys lookups on the IP-derived EC prefix, so
   everyone behind one IPv4 address or IPv6 /64 shares a budget.
-- **ID-7 Abuse resistance.** Record creation is refused for clients that are
-  not browsers, on every supported adapter. Accept: a scripted client with a
-  browser User-Agent and no browser TLS fingerprint creates no record. State:
+- **ID-7 Abuse resistance.** Where a trusted JA4 is available, record creation
+  is refused for clients whose JA4 and User-Agent are not a browser's; where
+  none is available, record creation is not blocked on its account (DEC-18).
+  JA4 comes only from EdgeZero's `ctx.ja4()` (EZI-3). Accept: on each supported
+  adapter a scripted client with a browser User-Agent and a non-browser JA4
+  creates no record, and a request with no trusted JA4 is not refused for
+  lacking one. State:
   Fastly checks only that a JA4 exists plus a browser User-Agent platform; the
   RC's Axum checks only the User-Agent, with request filters, because it has
   no trusted JA4 (EZI-3); Cloudflare and Spin create no records yet. CloudFront
   sends JA4 to the origin only in the `CloudFront-Viewer-JA4-Fingerprint`
-  header, which an origin request policy must forward.
+  header, which an origin request policy must forward. IABTechLab/edgezero#469's
+  draft design reports Axum as `NotExposed` and leaves the trusted proxy header
+  to its section 13.1.
 - **ID-8 Body EIDs keep being saved.** EIDs sent in the `/auction` body are
   saved to the record. Accept: on each supported adapter a body EID is in the
   record after the request. State: main saves them on Fastly; the provider
@@ -453,10 +459,13 @@ part.
   startup.
 - **EZI-3 Trusted client metadata.** One accessor returns the trusted client
   IP, and one the JA4 fingerprint where a trusted provider supplies it
-  (IABTechLab/edgezero#283), on every adapter, Fastly and Axum first. Axum
-  reads JA4 only from a trusted CloudFront hop. Accept: the same accessors work
-  on each adapter as its part lands, and a JA4 header from an untrusted peer
-  reads as absent.
+  (IABTechLab/edgezero#283), on every adapter, Fastly and Axum first. JA4 is an EdgeZero abstraction, `ctx.ja4()`, that each adapter fills
+  from its own source: Fastly from runtime TLS, Cloudflare from Bot Management,
+  Axum from a trusted proxy header such as CloudFront's
+  `CloudFront-Viewer-JA4-Fingerprint` set by a hop EdgeZero's checked ingress
+  trusts, and Spin never (`NotExposed`). Trusted Server reads JA4 only through
+  it. Accept: the same accessors work on each adapter as its part lands, and a
+  JA4 header from an untrusted peer reads as absent.
 - **EZI-4 Geo with region on Cloudflare and Spin.** `ctx.geo()` gives country
   and region there, or a capability error. Fastly keeps its existing geo and
   Axum uses CloudFront geo from IABTechLab/edgezero#439, bound from EdgeZero's
@@ -580,8 +589,11 @@ Decided:
   #1529. The image and Terraform units (#1539, #1538, #1540) restack on #1543,
   which publishes the image. #1536 and #1537 are not restacked: their
   Axum-only stores, store selection and wiring give way to EZI-2b, T6 and
-  T21, and their tests move into A2, A8 and T5. #1535 goes into the EC route
-  (T19, T20), and #1533 and #1534 close as copies of #1525 and #1526.
+  T21, and their tests move into A2, A8 and T5. #1535 goes into the EC route (T19, T20), and #1533 and #1534 close as copies of #1525 and #1526.
+- **DEC-18 JA4 when available** (user, 2026-11-12). ID-7 relies on a trusted
+  JA4 where the adapter supplies one; without one, record creation is not
+  blocked. JA4 is EdgeZero's abstraction (EZI-3), never read by Trusted
+  Server from a header or a platform SDK.
 - **DEC-10 Mirror partners** (user, 2026-11-12). ID5 and LiveRamp, the
   important identity providers, get `mirror_enabled`, and the MVP's provider
   and mirror checks (T11, A10) use them.
@@ -712,3 +724,8 @@ The user then decided DEC-6. Rechecking the restack against DEC-3 and DEC-16
 showed that #1536 and #1537 are mostly Axum-only stores and wiring, so A2 is a
 new pull request on T21 and T6 that takes their tests, and that the image unit
 belongs on #1543, with which it shares `.dockerignore`.
+
+The user then decided DEC-18: ID-7 relies on a trusted JA4 where one exists and
+otherwise does not block, and JA4 is an EdgeZero abstraction. Axum's JA4
+therefore needs the trusted proxy header that IABTechLab/edgezero#469's draft
+defers to its section 13.1, which the plan asks to ship in R2.
