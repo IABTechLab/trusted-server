@@ -423,6 +423,8 @@ impl Uid2Provider {
 
 #[cfg(test)]
 mod tests {
+    use aes_gcm::Key;
+    use aes_gcm::aead::Generate as _;
     use serde_json::json;
     use trusted_server_core::ec::provider::build_kind;
     use trusted_server_core::settings::{IdentityProviderConfig, ProviderSecrets};
@@ -874,8 +876,16 @@ mod tests {
         );
     }
 
-    fn encrypted_reply(reply: &serde_json::Value) -> String {
-        let cipher = Aes256Gcm::new_from_slice(&[7_u8; 32]).expect("should build cipher");
+    fn random_key() -> String {
+        BASE64.encode(Key::<Aes256Gcm>::generate())
+    }
+
+    /// Encrypts `reply` under a freshly generated key.
+    ///
+    /// Returns the base64 body and the base64 key that decrypts it.
+    fn encrypted_reply(reply: &serde_json::Value) -> (String, String) {
+        let key = Key::<Aes256Gcm>::generate();
+        let cipher = Aes256Gcm::new(&key);
         let iv = [1_u8; IV_BYTES];
         let ciphertext = cipher
             .encrypt(
@@ -883,7 +893,10 @@ mod tests {
                 reply.to_string().as_bytes(),
             )
             .expect("should encrypt");
-        BASE64.encode([&iv[..], &ciphertext].concat())
+        (
+            BASE64.encode([&iv[..], &ciphertext].concat()),
+            BASE64.encode(key),
+        )
     }
 
     fn reply<'a>(body: &'a str, key: &'a str, headers: &'a HeaderMap) -> ProviderResponse<'a> {
@@ -897,7 +910,7 @@ mod tests {
 
     #[test]
     fn decrypts_a_refreshed_identity() {
-        let body = encrypted_reply(&json!({
+        let (body, key) = encrypted_reply(&json!({
             "status": "success",
             "body": {
                 "advertising_token": "AgAAAArefreshedtoken",
@@ -909,7 +922,7 @@ mod tests {
             },
         }));
 
-        let (key, headers) = (BASE64.encode([7_u8; 32]), HeaderMap::new());
+        let headers = HeaderMap::new();
 
         let outcome = refreshing_provider()
             .parse_response(reply(&body, &key, &headers))
@@ -943,9 +956,9 @@ mod tests {
 
     #[test]
     fn reports_an_opt_out_from_the_refresh() {
-        let body = encrypted_reply(&json!({ "status": "optout" }));
+        let (body, key) = encrypted_reply(&json!({ "status": "optout" }));
 
-        let (key, headers) = (BASE64.encode([7_u8; 32]), HeaderMap::new());
+        let headers = HeaderMap::new();
 
         let outcome = refreshing_provider()
             .parse_response(reply(&body, &key, &headers))
@@ -959,9 +972,9 @@ mod tests {
 
     #[test]
     fn rejects_a_reply_under_another_key() {
-        let body = encrypted_reply(&json!({ "status": "optout" }));
+        let (body, _) = encrypted_reply(&json!({ "status": "optout" }));
 
-        let (key, headers) = (BASE64.encode([8_u8; 32]), HeaderMap::new());
+        let (key, headers) = (random_key(), HeaderMap::new());
 
         assert!(
             refreshing_provider()

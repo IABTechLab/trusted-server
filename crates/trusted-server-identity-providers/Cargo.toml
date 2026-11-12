@@ -30,4 +30,6 @@ urlencoding = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# Test-only key generation from the system RNG.
+aes-gcm = { workspace = true, features = ["getrandom"] }
 toml = { workspace = true }
