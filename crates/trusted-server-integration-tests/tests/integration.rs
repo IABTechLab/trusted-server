@@ -329,7 +329,7 @@ fn test_ec_lifecycle_fastly() {
 
     // Verify the post-cutover router is active before route-level scenarios.
     common::ec::assert_edgezero_entry_point(&process.base_url)
-        .expect("EdgeZero entry-point canary failed: TRACE did not return a router-level 405");
+        .expect("should answer TRACE with a router-level 405 carrying the version headers");
 
     for scenario in EcScenario::all() {
         log::info!("  Running EC scenario: {scenario:?}");

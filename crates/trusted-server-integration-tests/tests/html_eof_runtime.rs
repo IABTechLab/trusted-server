@@ -529,6 +529,14 @@ fn head_limit_414_431_and_framing_500_carry_synthesized_headers(
     base_url: &str,
     routed: &reqwest::header::HeaderMap,
 ) -> HarnessResult<()> {
+    // Both version headers must be on the routed page, so the comparisons below
+    // cannot pass on a header that is absent everywhere.
+    for name in ["x-ts-version", "x-ts-fastly-version"] {
+        assert!(
+            routed.get(name).is_some_and(|value| !value.is_empty()),
+            "should carry {name} on the routed page"
+        );
+    }
     let long_target = format!("{base_url}/{}", "a".repeat(8192));
     let mut large_head = client.get(format!("{base_url}/article"));
     for index in 0..60 {
