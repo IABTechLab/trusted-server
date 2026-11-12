@@ -387,6 +387,9 @@ impl IdentityProvider for Id5Provider {
         &self,
         response: ProviderResponse<'body>,
     ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+        if response.status == http::StatusCode::NO_CONTENT {
+            return Ok(LookupOutcome::NoMatch);
+        }
         if !response.status.is_success() {
             return Err(Report::new(ProviderError::InvalidResponse)
                 .attach(format!("ID5 returned status {}", response.status)));

@@ -50,6 +50,10 @@ pub trait IdentityProvider: Send + Sync {
 
     /// Parses a provider response, borrowing from its body.
     ///
+    /// A `404` is reported as no match before this is called; every other
+    /// status, `204` included, is handed to the provider, which decides
+    /// whether it means no match, an opt-out or an error.
+    ///
     /// # Errors
     ///
     /// Returns [`ProviderError::InvalidResponse`] when the body cannot be
