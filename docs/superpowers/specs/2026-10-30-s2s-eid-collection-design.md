@@ -1833,3 +1833,40 @@ clock edges and privacy leaks.
 - Non-blocking, no change: a UID2 refresh that keeps failing is retried on
   every navigation until the token expires unless `rate_limit_per_hour` is
   set. The fix for overdue UID2 refresh state (834af2591) chose this bound.
+
+### Round 9 (2026-11-12, PR #1489 at 4b11d05a1, Claude Code (Opus 5.5) review agent)
+
+Angle: data flow end to end, from partner config and the registry through
+pull sync dispatch, the after-response write and bidstream egress, to the
+mirror cookie and its vendor-consent expiry, on the tree restacked onto PR
+#1488.
+
+- Blocking, fixed (9638d7184): pull sync, now a provider, stored UIDs up to
+  1024 bytes. It runs for existing deployments with no config change, so a
+  row holding a longer pull-sync UID broke rollback, which older builds
+  reject whole (§6.3, §12.3). Pull-sync UIDs over 512 bytes are ignored, as
+  legacy pull sync did.
+- Restack: the mirror's vendor gate now uses the per-source vendor set from
+  PR #1487 round 5, so a disabled provider's denied vendor withholds the
+  source from the mirror and expires a carried mirror holding it, as in the
+  bidstream. Tested; §10, the guide and the changelog no longer name a single
+  owning vendor.
+- Non-blocking, fixed: stale comments on pull-sync ownership and on when a
+  provider claiming a pull-sync source fails.
+
+### Round 10 (2026-11-12, PR #1489 at 9638d7184, Claude Code (Opus 5.5) review agent)
+
+Angle: adversarial. Malformed mirror cookies and pull-sync replies, config
+combinations, adapter differences and privacy leaks.
+
+- No blocking findings. Re-checked forged, undecodable and oversized mirror
+  values (an undecodable one is expired whenever a mirrored vendor is denied;
+  one naming unknown sources is never trusted over KV); non-string, blank and
+  oversized pull-sync UIDs; zero rate limits and tokens that cannot form a
+  header (rejected at startup); `mirror_enabled` without
+  `bidstream_enabled`, and a configured provider or `kind = "pull-sync"`
+  claiming a pull-sync source (rejected); withdrawal and missing EID consent
+  expiring the mirror on every response; and the bot gate on pull sync.
+- Non-blocking, no change: pull sync and provider-written mirror contents
+  exist only on Fastly; other adapters build the mirror from rows without
+  provider UIDs, so it stays unset there (§12.3 "On Fastly").
