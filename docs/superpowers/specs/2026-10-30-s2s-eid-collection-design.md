@@ -1785,3 +1785,37 @@ combinations and adapter differences, on the tree after round 5's fix.
 - Non-blocking, no change: only the Fastly adapter builds the registry with
   provider ownership and vendor gates (§12.3 "On Fastly"); per-adapter deploy
   validation stays with #1552.
+
+### Round 7 (2026-11-12, PR #1488 at 5d22274c1, Claude Code (Opus 5.5) review agent)
+
+Angle: data flow and edge cases end to end per provider (UID2, ID5,
+LiveRamp, ConnectID, LiveIntent, SharedID, Criteo, Lockr): cookie parsing,
+request building, reply parsing, opt-out, 204 and 404 handling, refresh,
+expiry, and consent and region gating.
+
+- No blocking findings.
+- Non-blocking, fixed in 371e0ccba: LiveIntent kept a blank or `0` ID from
+  the reply; it now uses the shared usable-ID check. A LiveRamp envelope
+  entry without `type` failed the whole reply; it is now skipped.
+- Non-blocking, no change: Lockr's storage format was checked against
+  Prebid's `lockrAIMIdSystem`. It writes only the raw `advertising_token`
+  under `key_name` to a cookie, with no `inserter` and no revoke marker, so
+  neither can be read from cookies.
+- Known, open: LiveIntent partner UIDs carry `ext.provider` of
+  `liveintent.com` rather than the page domain, and a reply's `m` is not
+  copied into the `nonId` EID's `ext`.
+
+### Round 8 (2026-11-12, PR #1488 at 371e0ccba, Claude Code (Opus 5.5) review agent)
+
+Angle: adversarial. Malformed cookies and replies, config combinations,
+clock edges and privacy leaks.
+
+- No blocking findings. Re-checked non-integer, negative, huge and NaN
+  expiry and TTL values (rejected, clamped to 30 days in validation, or
+  read as expired); empty and duplicate cookies, a stale opt-out cookie
+  beside a live ID (the opt-out wins); Lockr names equal to own names, Lockr
+  with empty own cookies, and Lockr under GDPR; and that no cookie value or
+  token is logged.
+- Non-blocking, no change: a UID2 refresh that keeps failing is retried on
+  every navigation until the token expires unless `rate_limit_per_hour` is
+  set, as round 2 of #1488's review accepted.
