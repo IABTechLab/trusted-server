@@ -1847,6 +1847,118 @@ mod tests {
         }
     }
 
+    struct EidSourceCapturingProvider {
+        sources: Arc<std::sync::Mutex<Option<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for EidSourceCapturingProvider {
+        fn provider_name(&self) -> &str {
+            "eid_capturing_provider"
+        }
+
+        async fn request_bids(
+            &self,
+            request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            *self.sources.lock().expect("should lock captured sources") = Some(
+                request
+                    .user
+                    .eids
+                    .iter()
+                    .flatten()
+                    .map(|eid| eid.source.clone())
+                    .collect(),
+            );
+            Err(Report::new(TrustedServerError::Auction {
+                message: "capture only".to_string(),
+            }))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("parse_response must not run when the launch fails");
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+            Some("capture-backend".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn auction_drops_vendor_denied_body_eids() {
+        // Arrange: a provider with vendor 42 owns one source, consent denies it.
+        let settings = create_test_settings();
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        let sources = Arc::new(std::sync::Mutex::new(None));
+        orchestrator.register_provider(Arc::new(EidSourceCapturingProvider {
+            sources: Arc::clone(&sources),
+        }));
+        let mut registry = partner_registry(&["ids.example.com", "other.example.com"]);
+        assert!(
+            registry.mark_provider_owned("ids.example.com", std::num::NonZeroU16::new(42)),
+            "should mark the provider source"
+        );
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.vndbdy", "a".repeat(64));
+        let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+        live.consent.ok = true;
+        graph.create(&ec_id, &live).expect("should seed live row");
+        let mut ec_context = EcContext::new_for_test(Some(ec_id), vendor_denied_consent());
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://publisher.example.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({
+                    "adUnits": [
+                        {
+                            "code": "div-gpt-ad-1",
+                            "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                        }
+                    ],
+                    "eids": [
+                        {"source": "ids.example.com", "uids": [{"id": "owned-uid", "atype": 1}]},
+                        {"source": "other.example.com", "uids": [{"id": "other-uid", "atype": 1}]}
+                    ]
+                }))
+                .expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        // Act
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+
+        // Assert
+        assert_eq!(
+            *sources.lock().expect("should lock captured sources"),
+            Some(vec!["other.example.com".to_owned()]),
+            "should drop the body EID of the vendor-denied provider source"
+        );
+    }
+
     #[tokio::test]
     async fn auction_strips_client_eids_when_ec_identity_denied() {
         // US-state opt-out via GPC: the server-side auction consent gate still

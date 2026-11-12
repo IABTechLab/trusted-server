@@ -8085,6 +8085,8 @@ mod tests {
     use flate2::read::GzDecoder;
     use flate2::write::GzEncoder;
 
+    use base64::Engine as _;
+
     use super::*;
     use crate::auction::orchestrator::OrchestrationResult;
     use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
@@ -10061,6 +10063,96 @@ mod tests {
             site: None,
             context: Default::default(),
         }
+    }
+
+    fn vendor_42_denied_consent() -> ConsentContext {
+        let mut purposes = vec![false; 24];
+        purposes[0] = true;
+        purposes[3] = true;
+        ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            tcf: Some(crate::consent::types::TcfConsent {
+                version: 2,
+                cmp_id: 1,
+                cmp_version: 1,
+                consent_screen: 0,
+                consent_language: "EN".to_owned(),
+                vendor_list_version: 1,
+                tcf_policy_version: 4,
+                created_ds: 0,
+                last_updated_ds: 0,
+                purpose_consents: purposes,
+                purpose_legitimate_interests: vec![false; 24],
+                vendor_consents: Vec::new(),
+                vendor_legitimate_interests: Vec::new(),
+                special_feature_opt_ins: vec![false; 12],
+            }),
+            ..ConsentContext::default()
+        }
+    }
+
+    #[test]
+    fn navigation_auction_drops_vendor_denied_cookie_eids() {
+        // Arrange: a provider with vendor 42 owns one source, consent denies it.
+        let partners: Vec<crate::settings::EcPartner> = ["ids.example.com", "other.example.com"]
+            .iter()
+            .map(|source| {
+                serde_json::from_value(serde_json::json!({
+                    "name": source, "source_domain": source, "bidstream_enabled": true
+                }))
+                .expect("should build partner")
+            })
+            .collect();
+        let mut registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        assert!(
+            registry.mark_provider_owned("ids.example.com", std::num::NonZeroU16::new(42)),
+            "should mark the provider source"
+        );
+        let cookie_eids = serde_json::json!([
+            {"source": "ids.example.com", "id": "owned-uid", "atype": 1},
+            {"source": "other.example.com", "id": "other-uid", "atype": 1}
+        ]);
+        let mut jar = CookieJar::new();
+        jar.add_original(cookie::Cookie::new(
+            COOKIE_TS_EIDS,
+            base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&cookie_eids).expect("should serialize")),
+        ));
+        let ec_id = format!("{}.navvnd", "a".repeat(64));
+        let ec_context = EcContext::new_for_test(Some(ec_id.clone()), vendor_42_denied_consent());
+        let services = noop_services();
+        let mut auction_request = test_auction_request();
+
+        // Act
+        apply_auction_eids_and_device(
+            &mut auction_request,
+            &AuctionEidTargeting {
+                cookie_jar: Some(&jar),
+                ec_id: Some(&ec_id),
+                kv_snapshot: &crate::ec::EcKvSnapshot::NotRead,
+                partner_registry: Some(&registry),
+                ec_context: &ec_context,
+                services: &services,
+                geo: None,
+                path_label: "Server-side",
+            },
+        );
+
+        // Assert
+        let sources: Vec<&str> = auction_request
+            .user
+            .eids
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|eid| eid.source.as_str())
+            .collect();
+        assert_eq!(
+            sources,
+            vec!["other.example.com"],
+            "should drop the cookie EID of the vendor-denied provider source"
+        );
     }
 
     fn build_request(method: Method, uri: &str) -> HttpRequest<EdgeBody> {
