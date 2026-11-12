@@ -91,6 +91,12 @@ pub trait EcKvStore {
     ///
     /// A completed issuance must be visible even when [`Self::lookup`] lags.
     /// Prefix matches are insufficient and an inconclusive check is an error.
+    /// Logical expiry alone does not prove absence when a previously authorized
+    /// conditional write can still commit against the expired row. Such backends
+    /// must include physically held expired rows in this check for withdrawal
+    /// and orphan protection, even when lookup and listing hide logical expiry.
+    /// Returning `false` must establish that an old generation cannot still
+    /// update the apparently absent row.
     ///
     /// # Implementing this method
     ///

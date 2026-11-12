@@ -7707,8 +7707,8 @@ fn normalize_page_bids_path(raw: &str) -> String {
 /// Called by the client-side SPA navigation hook after `pushState` / `popstate`.
 ///
 /// `kv` enriches the bid request with server-side EIDs from the EC identity
-/// graph. Only the Fastly adapter has a KV identity store, so Axum, Cloudflare,
-/// and Spin pass `None`; client cookie EIDs are still resolved and consent-gated
+/// graph. Fastly and selected native EC providers supply an identity store.
+/// Cloudflare and Spin pass `None`; client cookie EIDs are still resolved and consent-gated
 /// on every adapter, so no adapter forwards unconsented EIDs.
 ///
 /// # Errors
