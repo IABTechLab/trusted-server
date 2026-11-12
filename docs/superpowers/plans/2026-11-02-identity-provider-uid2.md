@@ -31,7 +31,13 @@
 
 - Token generation (needs a hashed email; out of scope).
 
-Risk: a server refresh does not rewrite `__uid_2`. Refreshing does not invalidate the previous token or refresh token, so the server refresh and the browser SDK's own refresh both succeed and fork into two token chains. A later navigation whose cookie still carries the older token then replaces the refreshed row token; `rate_limit_per_hour` bounds the resulting refreshes.
+Risk: a server refresh does not rewrite `__uid_2`. Refreshing does not invalidate the previous token or refresh token, so the server refresh and the browser SDK's own refresh both succeed and fork into two token chains. Mitigations:
+
+- The provider sets `keeps_fresher_stored_uids`: a cookie token whose `identity_expires` is earlier than the live stored token's is ignored, so an older cookie never rolls a refreshed token back, and the refreshed token's own `refresh_from` decides the next server refresh.
+- Once the SDK refreshes, its cookie token outlives the stored one and replaces it with its refresh state, so the row follows the SDK's chain again; the two chains do not alternate on every navigation.
+- A failed refresh keeps the held token and refresh state, and due state is kept even past `refresh_from`; `rate_limit_per_hour` bounds the retries.
+
+Remaining risk: while the SDK has not refreshed, the server refresh keeps a second chain alive, one refresh per `refresh_from` interval. Operators running the SDK with `useCookie: true` can leave `endpoint` unset to rely on the SDK alone.
 
 ## Tasks
 

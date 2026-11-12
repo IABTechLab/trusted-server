@@ -222,7 +222,10 @@ pull_sync_concurrency = 3
 # cookie is looked up by Custom ID: the stable part of the EC ID, sent as
 # `<custom_id_namespace>:<id>` with the visitor IP and consent. LiveRamp must
 # enable Custom ID for `placement_id` and approve the publisher origin; both
-# settings are required with an endpoint. No login or hashed email is used.
+# settings are required with an endpoint. LiveRamp resolves a Custom ID only
+# through a mapping file the publisher sends it, tying each ID to a hashed
+# email; without one the lookup finds nothing. Trusted Server itself sends no
+# login or hashed email.
 # [[ec.identity_providers]]
 # id = "liveramp"
 # kind = "liveramp"

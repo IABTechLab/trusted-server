@@ -14,7 +14,10 @@
 //! stable part of the EC ID, sent as `iv=<custom_id_namespace>:<id>` with
 //! the placement ID, consent strings, the publisher `Origin` and the
 //! visitor's IP in `X-Forwarded-For`, as a server-to-server call
-//! (`atype=3`). `LiveRamp` must enable Custom ID for the placement. A `200`
+//! (`atype=3`). `LiveRamp` must enable Custom ID for the placement, and it
+//! resolves a Custom ID only through a mapping file the publisher sends it,
+//! tying each Custom ID to a hashed email; without one the lookup finds
+//! nothing. A `200`
 //! reply lists `envelopes`; the `RampID` entry (`type` 19) is stored. A
 //! `204` reply reports an opt-out. Without an `endpoint` no server call is
 //! made.
