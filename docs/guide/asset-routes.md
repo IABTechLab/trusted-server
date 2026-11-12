@@ -16,7 +16,7 @@ For a matching `GET` or `HEAD` request, Trusted Server runs this sequence:
 6. Send the request to the resolved backend origin.
 7. Return the origin status, body, and safe headers.
 
-The origin query policy runs before S3 signing, so the signature covers the exact URL sent to S3. Image Optimizer metadata stays separate from the origin URL and is translated by the Fastly adapter.
+The origin query policy runs before S3 signing, so the signature covers the exact URL sent to S3. Image Optimizer options stay separate from the origin URL. They go on the final `GET` or `HEAD` as EdgeZero Image Optimizer options, never on the S3 preflight `HEAD`. EdgeZero's Fastly client applies them; the Axum, Cloudflare, and Spin clients reject them before sending.
 
 ## Basic route
 
@@ -196,7 +196,7 @@ The asset route still matches. Path rewrite, origin query policy, and S3 signing
 
 ## Local testing notes
 
-Viceroy does not perform real Fastly Image Optimizer transformations. Local tests can verify routing, query stripping, SigV4 headers, and metadata attachment. End-to-end image transformation verification requires a deployed Fastly Compute service with Image Optimizer enabled.
+Viceroy does not perform Fastly Image Optimizer transformations. When the host cannot run Image Optimizer, EdgeZero's Fastly client fails the request and the asset proxy answers 502. Local tests verify routing, query stripping, SigV4 headers, and the options the request carries, read back through the scripted client. End-to-end image transformation verification requires a deployed Fastly Compute service with Image Optimizer enabled.
 
 ## Security checklist
 
