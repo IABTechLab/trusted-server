@@ -9,11 +9,11 @@ config that `ts config push` writes into KV to the nested
 
 | Adapter      | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization |
 | ------------ | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | --------------------- |
-| `cloudflare` | development    | absent | `500`          | no             | single           | outermost sanitize         | none                  |
+| `cloudflare` | development    | absent | `500`          | no             | multiple         | outermost sanitize         | none                  |
 
 This row is the canonical status summary. Cloudflare has no
-`/health` route, supports one enabled auction provider, and returns 500 on
-every route when startup fails.
+`/health` route and supports multiple auction providers. When startup fails,
+every route answers 500 with EdgeZero's JSON error body.
 
 ## Verify the complete local handoff
 

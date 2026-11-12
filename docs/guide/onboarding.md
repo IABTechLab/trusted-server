@@ -28,17 +28,19 @@ The adapters share the core publisher handler, but their entry points and
 streaming capabilities differ. This trace uses Fastly to show the streaming
 path. Navigate by function name; line numbers change.
 
-| Step | Function or area                                     | Responsibility                                                                                            |
-| ---- | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| 1    | `adapter-fastly/src/main.rs` — `main`                | Answer `/health` immediately; otherwise initialize logging and call `edgezero_main`                       |
-| 2    | `main.rs` — `edgezero_main`                          | Load runtime configuration, sanitize forwarded client data, capture TLS/device signals, and dispatch      |
-| 3    | EdgeZero router                                      | Select a named Trusted Server route or the fallback handler                                               |
-| 4    | `adapter-fastly/src/app.rs` — `dispatch_fallback`    | Build EC request state, run pre-route integration filters, and distinguish asset/integration traffic      |
-| 5    | `dispatch_fallback`                                  | For an eligible publisher navigation, generate an EC ID when needed and call the shared publisher handler |
-| 6    | `core/src/publisher.rs` — `handle_publisher_request` | Use the consent context, match configured slots, and evaluate the server-side ad-stack gate               |
-| 7    | `handle_publisher_request`                           | Dispatch eligible bidder requests before sending the request to the publisher origin                      |
-| 8    | Publisher response pipeline                          | Classify the origin response, then rewrite or inject into eligible HTML                                   |
-| 9    | Fastly entry point                                   | Apply final EC and filter effects, then send the buffered or streaming response                           |
+| Step | Function or area                                    | Responsibility                                                                                                                                           |
+| ---- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | `adapter-fastly/src/main.rs`: `main`                | Hand the request to EdgeZero's Fastly lifecycle (`run_custom`, or the bounded `serve_custom` loop with `reusable-sandbox`), which calls `handle_request` |
+| 2    | `main.rs`: `handle_request`                         | Answer `/health` immediately; otherwise initialize logging, assemble the app once per sandbox from runtime configuration, and serve                      |
+| 3    | `main.rs`: `serve`                                  | Sanitize forwarded client data, capture TLS/device signals and geo, and send the request through EdgeZero's canonical lifecycle                          |
+| 4    | EdgeZero router                                     | Select a named Trusted Server route or the fallback handler                                                                                              |
+| 5    | `adapter-fastly/src/app.rs`: `dispatch_fallback`    | Build EC request state, run pre-route integration filters, and distinguish asset/integration traffic                                                     |
+| 6    | `dispatch_fallback`                                 | For an eligible publisher navigation, generate an EC ID when needed and call the shared publisher handler                                                |
+| 7    | `core/src/publisher.rs`: `handle_publisher_request` | Use the consent context, match configured slots, and evaluate the server-side ad-stack gate                                                              |
+| 8    | `handle_publisher_request`                          | Dispatch eligible bidder requests before sending the request to the publisher origin                                                                     |
+| 9    | Publisher response pipeline                         | Classify the origin response, then rewrite or inject into eligible HTML                                                                                  |
+| 10   | `main.rs`: `finalize_response`                      | Apply final EC and filter effects in EdgeZero's `finalize` hook; EdgeZero then delivers the response                                                     |
+| 11   | `adapter-fastly/src/delivery.rs`: `handle_delivery` | After a committed delivery, send queued auction telemetry and run EC pull sync                                                                           |
 
 Two ordering details matter when debugging:
 
