@@ -178,8 +178,8 @@ struct EnvelopeReply {
 /// One entry of [`EnvelopeReply::envelopes`].
 #[derive(Deserialize)]
 struct ReplyEnvelope {
-    #[serde(rename = "type")]
-    kind: u32,
+    #[serde(rename = "type", default)]
+    kind: Option<u32>,
     #[serde(default)]
     value: Option<String>,
 }
@@ -300,7 +300,7 @@ impl IdentityProvider for LiveRampProvider {
         let Some(envelope) = reply
             .envelopes
             .into_iter()
-            .find(|envelope| envelope.kind == RAMPID_ENVELOPE_TYPE)
+            .find(|envelope| envelope.kind == Some(RAMPID_ENVELOPE_TYPE))
             .and_then(|envelope| envelope.value)
             .filter(|envelope| is_usable_id(envelope))
         else {
@@ -749,6 +749,19 @@ mod tests {
     fn maps_no_content_to_an_opt_out_and_a_blank_envelope_to_no_match() {
         let blank = json!({"envelopes": [{"type": 19, "value": "", "err": null}]}).to_string();
         let other = json!({"envelopes": [{"type": 25, "value": "pair-example"}]}).to_string();
+        let untyped = json!({"envelopes": [
+            {"value": "untyped-example"},
+            {"type": 19, "value": "rampid-example"},
+        ]})
+        .to_string();
+
+        assert!(
+            matches!(
+                reply(StatusCode::OK, untyped.as_bytes()),
+                Ok(LookupOutcome::Found(eids)) if eids[0].uids[0].id == "rampid-example"
+            ),
+            "should skip an untyped entry and keep the RampID envelope"
+        );
 
         assert!(
             matches!(

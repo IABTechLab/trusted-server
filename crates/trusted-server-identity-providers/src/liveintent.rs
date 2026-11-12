@@ -37,7 +37,7 @@ use trusted_server_core::ec::provider::{
 };
 use url::Url;
 
-use crate::common::{DEVICE_ATYPE, bounded_expiry, is_routable_ip, join_section_ids};
+use crate::common::{DEVICE_ATYPE, bounded_expiry, is_routable_ip, is_usable_id, join_section_ids};
 
 /// Each attribute `LiveIntent` resolves and the source it carries.
 pub const ATTRIBUTE_SOURCES: &[(&str, &str)] = &[
@@ -362,7 +362,7 @@ impl IdentityProvider for LiveIntentProvider {
                 let raw = reply.get(attribute.as_str())?;
                 let id = Cow::<'body, str>::deserialize(*raw)
                     .ok()
-                    .filter(|id| !id.is_empty())?;
+                    .filter(|id| is_usable_id(id))?;
                 // Prebid sends the Trade Desk ID LiveIntent resolved as a
                 // device-based ID (atype 1), like Unified ID's TDID.
                 let (matcher, eid_ext, uid_ext, atype) = match attribute.as_str() {
@@ -807,9 +807,13 @@ mod tests {
         let headers = HeaderMap::new();
 
         let empty_id = serde_json::to_vec(&json!({ "nonId": "" })).expect("should encode body");
+        let blank_id = serde_json::to_vec(&json!({ "nonId": "  " })).expect("should encode body");
+        let zero_id = serde_json::to_vec(&json!({ "nonId": "0" })).expect("should encode body");
         for (status, body) in [
             (StatusCode::NO_CONTENT, &b""[..]),
             (StatusCode::OK, &empty_id[..]),
+            (StatusCode::OK, &blank_id[..]),
+            (StatusCode::OK, &zero_id[..]),
         ] {
             let outcome = provider
                 .parse_response(ProviderResponse {
