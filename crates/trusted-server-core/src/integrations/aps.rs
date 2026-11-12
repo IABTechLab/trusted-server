@@ -1939,6 +1939,7 @@ pub fn register(
             providers: BTreeMap::from([(
                 "aps".parse().expect("should parse APS provider ID"),
                 ProviderConfig {
+                    allow_insecure_http: false,
                     protocol: "openrtb-2.6".to_string(),
                     profile: "aps".to_string(),
                     endpoint: default_endpoint(),
@@ -3077,6 +3078,7 @@ mod tests {
             providers: BTreeMap::from([(
                 "aps".parse().expect("should parse APS provider ID"),
                 ProviderConfig {
+                    allow_insecure_http: false,
                     protocol: "openrtb-2.6".to_string(),
                     profile: "aps".to_string(),
                     endpoint: default_endpoint(),

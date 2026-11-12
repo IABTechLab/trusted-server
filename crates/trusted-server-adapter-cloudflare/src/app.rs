@@ -847,6 +847,7 @@ mod tests {
         settings.auction.providers.insert(
             "aps-main".parse().expect("should parse APS provider ID"),
             trusted_server_core::auction::ProviderConfig {
+                allow_insecure_http: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: "aps".to_string(),
                 endpoint: "https://aps.example/e/pb/bid".to_string(),
@@ -913,6 +914,7 @@ mod tests {
                     (
                         id.parse().expect("should parse provider ID"),
                         trusted_server_core::auction::ProviderConfig {
+                            allow_insecure_http: false,
                             protocol: "openrtb-2.6".to_string(),
                             profile: "standard".to_string(),
                             endpoint: format!("https://{id}.example/openrtb"),
@@ -957,6 +959,7 @@ mod tests {
                     (
                         id.parse().expect("should parse provider ID"),
                         trusted_server_core::auction::ProviderConfig {
+                            allow_insecure_http: false,
                             protocol: "openrtb-2.6".to_string(),
                             profile: "standard".to_string(),
                             endpoint: format!("https://{id}.example/openrtb"),
