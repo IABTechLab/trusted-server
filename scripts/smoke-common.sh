@@ -183,8 +183,22 @@ smoke_initialize_config() {
     local workspace="$2"
     local origin_port="$3"
     local listener_port="$4"
+    local adapter="$5"
     SMOKE_APP_CONFIG="$workspace/trusted-server.toml"
     "$SMOKE_TS_BIN" config init --app-config "$SMOKE_APP_CONFIG"
+    if [ "$adapter" != "fastly" ]; then
+        smoke_require_command node
+        # The general template selects Fastly storage. Other runtime smokes
+        # need no EC provider. Remove only that known template placeholder.
+        node --input-type=module - "$SMOKE_APP_CONFIG" <<'JS'
+import { readFileSync, writeFileSync } from 'node:fs'
+const file = process.argv[2]
+const source = readFileSync(file, 'utf8')
+const fastlyStorage = '[ec.storage]\nstore = "ec_identity_store"\n'
+if (!source.includes(fastlyStorage)) throw new Error('Expected the Fastly storage template block')
+writeFileSync(file, source.replace(fastlyStorage, ''))
+JS
+    fi
     export TRUSTED_SERVER__PUBLISHER__DOMAIN="127.0.0.1"
     export TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN="127.0.0.1"
     export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$origin_port"
