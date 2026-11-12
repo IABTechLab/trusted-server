@@ -13,9 +13,9 @@ use crate::ec::registry::PartnerRegistry;
 
 /// Largest private refresh state a provider may keep with one UID.
 const MAX_REFRESH_STATE_BYTES: usize = 2048;
-/// Longest a provider-stated absolute expiry may lie after the request:
-/// 30 days. Cookie- and vendor-supplied timestamps are clamped to it.
-const MAX_ABSOLUTE_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
+/// Longest a provider-stated expiry, absolute or relative, may lie after the
+/// request: 30 days. Cookie- and vendor-supplied times are clamped to it.
+const MAX_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// Policy one response is validated against.
 pub(crate) struct ValidationPolicy<'a> {
@@ -169,8 +169,10 @@ fn stored_uid(
 fn resolve_expiry(expiry: ProviderExpiry, now: UnixSeconds) -> Option<UnixSeconds> {
     match expiry {
         ProviderExpiry::Unspecified => None,
-        ProviderExpiry::At(at) => Some(at.min(now.saturating_add_secs(MAX_ABSOLUTE_EXPIRY_SECS))),
-        ProviderExpiry::After(after) => Some(now.saturating_add_secs(after.as_secs())),
+        ProviderExpiry::At(at) => Some(at.min(now.saturating_add_secs(MAX_EXPIRY_SECS))),
+        ProviderExpiry::After(after) => {
+            Some(now.saturating_add_secs(after.as_secs().min(MAX_EXPIRY_SECS)))
+        }
     }
 }
 
@@ -322,6 +324,27 @@ mod tests {
     }
 
     #[test]
+    fn clamps_relative_expiry_to_thirty_days() {
+        let partners = registry();
+        let provider = ProviderId::new("example-provider");
+        let claimed = claimed();
+        let mut far = uid("u-far");
+        far.expiry = ProviderExpiry::After(Duration::from_secs(u64::MAX));
+
+        let (entries, dropped) = validate(
+            vec![eid("ids.example.com", vec![far])],
+            &policy(&provider, &claimed, &partners),
+        );
+
+        assert_eq!(dropped, DropCounts::default(), "should drop nothing");
+        assert_eq!(
+            entries[0].1[0].uids()[0].expiry(),
+            Expiry::At(UnixSeconds::new(1000 + MAX_EXPIRY_SECS)),
+            "should clamp a far relative expiry to now plus 30 days"
+        );
+    }
+
+    #[test]
     fn clamps_absolute_expiry_to_thirty_days() {
         let partners = registry();
         let provider = ProviderId::new("example-provider");
@@ -340,7 +363,7 @@ mod tests {
         let uids = entries[0].1[0].uids();
         assert_eq!(
             uids[0].expiry(),
-            Expiry::At(UnixSeconds::new(1000 + MAX_ABSOLUTE_EXPIRY_SECS)),
+            Expiry::At(UnixSeconds::new(1000 + MAX_EXPIRY_SECS)),
             "should clamp a far expiry to now plus 30 days"
         );
         assert_eq!(
