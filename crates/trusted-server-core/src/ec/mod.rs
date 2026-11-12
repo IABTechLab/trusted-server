@@ -34,6 +34,7 @@ mod auth;
 pub mod admin;
 pub mod batch_sync;
 pub mod consent;
+pub mod consent_update;
 pub mod cookies;
 pub mod device;
 pub mod eids;
