@@ -182,12 +182,8 @@ pub(crate) fn with_trace_runtime(
                 .expect("should read baseline Wrangler template");
             let binding = serde_json::to_string(&serde_json::json!({CONFIG_BLOB_KEY:envelope}))
                 .expect("should serialize trace binding");
-            let config = template.replace(
-                "TRUSTED_SERVER_CONFIG = \"{}\"",
-                &format!("TRUSTED_SERVER_CONFIG = '''{binding}'''"),
-            );
-            fs::write(fixture.0.join("wrangler.toml"), config)
-                .expect("should write isolated Wrangler config");
+            fs::write(fixture.0.join("wrangler.ci.toml"), template)
+                .expect("should write isolated Wrangler template");
             temp_env::with_vars(
                 [
                     ("CLOUDFLARE_WRANGLER_DIR", Some(fixture.0.as_os_str())),
@@ -195,7 +191,10 @@ pub(crate) fn with_trace_runtime(
                 ],
                 || {
                     let process = CloudflareWorkers
-                        .spawn_with_readiness(wait_for_trace_fixture_ready)
+                        .spawn_with_config_json_and_readiness(
+                            &binding,
+                            wait_for_trace_fixture_ready,
+                        )
                         .expect("should spawn isolated Cloudflare trace runtime");
                     check(&process.base_url);
                 },
