@@ -175,16 +175,24 @@ is omitted, so adapter startup must construct the complete service graph.
 ## Proxy implementation rules
 
 An `IntegrationProxy::handle` implementation receives the complete runtime
-service graph. Register or predict backends through `services.backend()`,
-send through `services.http_client()`, bound request and response bodies, and
-return `Report<TrustedServerError>` with integration context. The registry
-strips internal identity headers before dispatch; an integration must opt into
-any explicit forwarding behavior.
+service graph. Send every outbound request through
+`services.outbound_client()`, EdgeZero's `HttpClient`, and take deadlines from
+`services.clock()`. Build each request with a helper from
+`trusted_server_core::outbound`: `buffered` sets a response cap and the
+response decoding, and `streamed` streams the response in the coding the
+upstream sent. Both set a 1 s connect timeout and a constant total timeout.
+Never compute a timeout from a remaining budget; use a request deadline for
+that, so Fastly backend identity stays stable. Pass client failures to
+`outbound_error`, which keeps the integration's own error and its 502.
 
-Streaming support is an adapter capability. Request
-`PlatformHttpRequest::with_stream_response()` only when the caller has
-checked `supports_streaming_responses()`; unsupported adapters must reject
-the request instead of silently buffering it.
+Read an inbound body with `http_util::read_request_body` and a cap. It answers
+413 when the body is over the cap and 408 when the read passes EdgeZero's 30 s
+inbound read deadline. Return `Report<TrustedServerError>` with integration
+context. The registry strips internal identity headers before dispatch; an
+integration must opt into any explicit forwarding behavior.
+
+Every adapter streams responses and runs request batches, so an integration
+checks no adapter capability.
 
 ## Asynchronous HTML processor completion
 
@@ -207,8 +215,9 @@ A non-retaining session can make a KV lookup at EOF and append a fixed footer.
 The generic KV interface has no hard timeout, and Fastly installs no cooperative
 timer, so an unbounded KV call can hold the response indefinitely. The example
 skips the lookup when `input.deadline.has_cooperative_timer()` is false. On
-Fastly, use an HTTP lookup whose transport timeouts are capped with
-`input.deadline.remaining()` instead.
+Fastly, use an HTTP lookup instead. Give it a constant `timeout` and a request
+deadline at
+`input.services.clock().deadline_after(input.deadline.remaining())`.
 :::
 
 <!-- documentation-snippet:html-eof:start -->
@@ -287,9 +296,9 @@ their entire lifetimes. Their capabilities must match; a mismatch fails the requ
 Leave `buffer_output_until_eof()` at its default `false` for this append
 operation. KV must be available on the runtime; unavailable lookup falls back to
 the synchronous tail. Fastly consumers must use host operations with independently
-bounded latency and cap configurable transport timeouts with `input.deadline.remaining()`;
-this generic KV interface does not provide a hard timeout. Checking the remaining
-budget alone cannot interrupt a blocking KV call.
+bounded latency. An HTTP lookup keeps a constant `timeout` and adds a request deadline
+at the remaining budget; this generic KV interface does not provide a hard timeout.
+Checking the remaining budget alone cannot interrupt a blocking KV call.
 
 Operators must explicitly accept the possible delivery cost:
 
@@ -337,7 +346,8 @@ sink errors remain fatal. Callback panics propagate. Cancellation does not undo 
 writes or guarantee that transport work is cancelled.
 
 Axum, Workers and Spin provide cooperative timers. Fastly has none because its host
-calls block; bound those calls with `deadline.remaining()` and transport timeouts.
+calls block; bound an HTTP call there with a request deadline at the remaining budget,
+beside its constant `timeout`.
 A timer cannot preempt CPU work or blocking host calls. Avoid logging HTML, lookup URLs
 or external response contents.
 
@@ -362,7 +372,7 @@ paths that can await emit abandonment telemetry.
 
 Opted-in HTML bypasses shared-template reads/reservations/stores and receives
 `Cache-Control: no-store, private`, including unchanged, failed and overflow-bypassed
-work. Raw-origin readthrough remains independent. Cacheable asynchronous output needs
+work. Cacheable asynchronous output needs
 separate rules for output identity, external-data freshness, expiry, invalidation,
 failure caching and callback execution on hits; this is tracked in
 [#1397](https://github.com/IABTechLab/trusted-server/issues/1397).
@@ -403,6 +413,9 @@ untouched. See [Trusted Server JavaScript](/guide/tsjs) and
    integration is intentionally universal.
 2. Register the exact capability predicates and route methods.
 3. Add source and behavior parity records.
-4. Add positive, negative, body-bound, header, and adapter-capability tests.
+4. Add positive, negative, body-bound, header, and outbound request readback
+   tests. The scripted client in
+   `trusted_server_core::test_support::scripted_client`, behind the
+   `test-utils` feature, records each request the integration sends.
 5. Document configuration, failure behavior, and runtime limitations.
 6. Run the target aliases from [Testing](/guide/testing).

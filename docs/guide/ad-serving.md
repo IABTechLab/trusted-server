@@ -14,7 +14,7 @@ publisher proxy path.
 
 `POST /auction` accepts the documented auction request shape. When
 `[auction].enabled = true`, the compiled `AuctionPlan` selects configured
-providers, routes bidder codes, executes supported provider fan-out, applies an
+providers, routes bidder codes, sends every provider request in one batch, applies an
 optional mediator, and returns the winning bids. When auctions are disabled,
 the endpoint returns a no-bid response without contacting a provider.
 
@@ -45,8 +45,8 @@ routing = "explicit"
 provider = "pbs-main"
 ```
 
-Deploy validation compiles this configuration before publication. Adapter
-startup adds target-specific provider-count and backend-name checks; see
+Deploy validation compiles this configuration before publication. Fastly
+startup adds its bound of 160 provider backends; see
 [Auction orchestration](/guide/auction-orchestration) for the complete schema
 and adapter limits.
 
@@ -68,10 +68,11 @@ assets at runtime.
   end-to-end checks.
 - Confirm provider authorization and test inventory with each upstream before
   enabling traffic.
-- Collection stops network waiting at the auction deadline measured from dispatch.
-  Complete responses already available remain eligible; unfinished providers time
-  out and mediation is skipped when no budget remains. Fastly abandons unfinished
-  requests; other adapters cancel owned request tasks. See
+- Bidder requests leave together as one batch whose cutoff is the auction
+  deadline, measured from auction start. A bid that has not arrived by the
+  cutoff becomes a provider timeout, and mediation is skipped when no budget
+  remains. Dropping the batch cancels in-flight requests on every adapter;
+  Fastly host cancellation is best effort. See
   [Timeout behavior](/guide/auction-orchestration#timeout-behavior).
 
 See also [Creative processing](/guide/creative-processing) and the

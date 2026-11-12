@@ -228,9 +228,14 @@ adapter flags directly need the `--` added. Trusted Server declares Config, KV,
 and Secret Stores, so EdgeZero treats every Fastly deploy as managed and
 requires a verified application release root via `--application-release`; a
 bare `ts deploy --adapter fastly` without a release is accepted only for
-store-free applications. The CLI loads `edgezero.toml` from the working
-directory unless `EDGEZERO_MANIFEST` names another file, and it rejects a
-manifest outside the release root, so select the release's own manifest.
+store-free applications.
+
+`ts build`, `ts serve`, and `ts deploy` find the manifest in this order: the
+file `EDGEZERO_MANIFEST` names, the nearest `edgezero.toml` in the working
+directory or one of its parents, and then the nearest `edgezero.toml` under
+the workspace root. Two manifests equally near the working directory are an
+error. A managed deploy rejects a manifest outside the release root, so set
+`EDGEZERO_MANIFEST` to the release's own manifest.
 
 Managed deployment also requires a nonempty `FASTLY_API_TOKEN` in the process
 environment; signing in with `ts auth login` or a Fastly CLI profile alone
