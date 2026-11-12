@@ -1647,7 +1647,7 @@ mod tests {
     use trusted_server_core::ec::provider::{
         EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
         ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry, ProviderRequest,
-        ProviderResponse, ProviderUid, SourceCapability, SourceInput,
+        ProviderResponse, ProviderUid, RequestCookies, SourceCapability, SourceInput,
     };
     use trusted_server_core::ec::registry::PartnerRegistry;
     use trusted_server_core::error::TrustedServerError;
@@ -2828,6 +2828,29 @@ mod tests {
             .headers_mut()
             .insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
         request
+    }
+
+    #[test]
+    fn provider_cookies_join_every_cookie_header() {
+        // Arrange: HTTP/2 clients may split cookies across headers.
+        let mut request = navigation_request("/article");
+        let headers = request.headers_mut();
+        headers.append(header::COOKIE, HeaderValue::from_static("a=1; b=2"));
+        headers.append(header::COOKIE, HeaderValue::from_static("vendor_id=c-1"));
+
+        // Act
+        let joined = super::joined_cookie_header(&request);
+
+        // Assert
+        assert_eq!(
+            joined, "a=1; b=2; vendor_id=c-1",
+            "should join every Cookie header"
+        );
+        assert_eq!(
+            RequestCookies::new(&joined).get("vendor_id"),
+            Some("c-1"),
+            "should let providers read a cookie from a later header"
+        );
     }
 
     fn take_finalize_state(response: &mut Response) -> super::EcFinalizeState {
