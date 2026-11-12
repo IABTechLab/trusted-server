@@ -30,6 +30,9 @@ export function packageReference(owner, tag, asset) {
 
 /**
  * Lists the files one binary's artifact carries, with their media types.
+ *
+ * The Fastly artifact also carries `trusted-server-fastly.tar.gz`, the
+ * package operators deploy; the wasm's provenance and SBOM bundles cover it.
  */
 export function packageFiles(asset) {
   const files = [
@@ -39,6 +42,14 @@ export function packageFiles(asset) {
         ? 'application/wasm'
         : 'application/octet-stream',
     },
+    ...(asset === 'trusted-server-fastly.wasm'
+      ? [
+          {
+            name: 'trusted-server-fastly.tar.gz',
+            mediaType: 'application/gzip',
+          },
+        ]
+      : []),
     { name: `${asset}.spdx.json`, mediaType: 'application/spdx+json' },
     { name: `${asset}.provenance.sigstore.json`, mediaType: sigstoreBundle },
     { name: `${asset}.sbom.sigstore.json`, mediaType: sigstoreBundle },
@@ -80,7 +91,9 @@ export function packagePlan(repo, tag, commit) {
  * Checks a downloaded release directory against its SHA256SUMS.
  *
  * The directory must hold exactly the files SHA256SUMS lists plus SHA256SUMS
- * itself, and every planned file must be listed. Returns name → sha256.
+ * itself, every planned file must be listed, and every listed file must be
+ * planned, so a new release asset cannot be left out of the packages
+ * unnoticed. Returns name → sha256.
  */
 export function checkDownload(directory, plan) {
   const lines = fs
@@ -104,9 +117,13 @@ export function checkDownload(directory, plan) {
     if (hash(fs.readFileSync(join(directory, name))) !== digest)
       throw Error(`Digest mismatch: ${name}`)
   }
-  for (const { files } of plan)
-    for (const { name } of files)
-      if (!sums.has(name)) throw Error(`Release lacks ${name}`)
+  const planned = new Set(
+    plan.flatMap(({ files }) => files.map(({ name }) => name))
+  )
+  for (const name of planned)
+    if (!sums.has(name)) throw Error(`Release lacks ${name}`)
+  for (const name of sums.keys())
+    if (!planned.has(name)) throw Error(`No package carries ${name}`)
   return sums
 }
 

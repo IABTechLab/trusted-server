@@ -308,11 +308,11 @@ When a maintainer enables package publication, each release also appears in
 the repository's **Packages** list. These packages copy the release; they add no
 new trust. Verify the files you pull exactly as you verify release downloads.
 
-| Package                 | Tag              | Contents                                                            |
-| ----------------------- | ---------------- | ------------------------------------------------------------------- |
-| `trusted-server-cli`    | `<tag>-<target>` | `ts-<target>`, its SPDX SBOM and both Sigstore bundles              |
-| `trusted-server-fastly` | `<tag>`          | `trusted-server-fastly.wasm`, its SBOM, both bundles, rebuild check |
-| `trusted-server-axum`   | `<tag>`          | Axum server container image for `linux/amd64` (development status)  |
+| Package                 | Tag              | Contents                                                           |
+| ----------------------- | ---------------- | ------------------------------------------------------------------ |
+| `trusted-server-cli`    | `<tag>-<target>` | `ts-<target>`, its SPDX SBOM and both Sigstore bundles             |
+| `trusted-server-fastly` | `<tag>`          | the wasm, its `.tar.gz` package, SBOM, both bundles, rebuild check |
+| `trusted-server-axum`   | `<tag>`          | Axum server container image for `linux/amd64` (development status) |
 
 Pulling the CLI and Fastly packages needs ORAS 1.2 or
 later; the image needs Docker with Buildx. Neither tool is trusted: the
@@ -347,6 +347,13 @@ The final command confirms the pulled bytes are the published release asset. To
 check the SBOM too, run the per-asset loop from
 [Download and verify](#download-and-verify) in the `pulled` directory. `oras
 pull` needs no login for a public package.
+
+The Fastly package carries `trusted-server-fastly.tar.gz`, the archive that
+[Deploy the verified Fastly package](#deploy-the-verified-fastly-package)
+deploys. The wasm's provenance and SBOM bundles cover it. Pull
+`trusted-server-fastly:$TAG` the same way, then complete that section's checks
+on the pulled files, including `gh release verify-asset` for the archive, before
+deployment.
 
 The Axum image is an ordinary build of the tagged source, and Axum itself is
 still development status. The image is outside the reproducible release cohort:

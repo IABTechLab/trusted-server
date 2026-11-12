@@ -10,7 +10,7 @@
 
 ## Problem
 
-A rehearsal release publishes 18 assets, and each run also lists 12 internal
+A rehearsal release publishes 19 assets, and each run also lists 12 internal
 workflow artifacts. Operators could not tell which files to use. There was also
 no way to run the Axum server as a container: it only listened on loopback, and
 no image existed.
@@ -19,9 +19,11 @@ no image existed.
 
 - Mirror each published release into GHCR as `trusted-server-cli` (tag
   `<tag>-<target>`) and `trusted-server-fastly` (tag `<tag>`). Each package
-  holds one binary with its SPDX SBOM and Sigstore bundles, and the Fastly
-  package also holds the rebuild check. Every file is one OCI layer whose digest
-  is its `SHA256SUMS` entry.
+  holds one binary with its SPDX SBOM and Sigstore bundles. The Fastly package
+  also holds `trusted-server-fastly.tar.gz`, the package operators deploy, which
+  the wasm's bundles cover, and the rebuild check. Every release file except
+  `SHA256SUMS` is in exactly one package, and every file is one OCI layer whose
+  digest is its `SHA256SUMS` entry.
 - Publish the Axum server as `trusted-server-axum:<tag>`, a container image with
   GitHub build provenance, built to the image contract proposed in #1236.
 - Link each package to the source repository.
@@ -70,7 +72,9 @@ chooses another recipe, the `axum-image` job is the one place to change.
 - `packages.mjs`:
   - refuses drafts;
   - authenticates `SHA256SUMS` with `gh release verify-asset`;
-  - requires the download to equal `SHA256SUMS` exactly.
+  - requires the download to equal `SHA256SUMS` exactly;
+  - refuses a release file that no package carries, so a new release asset
+    stops the job instead of being left out.
 - **Existing tags.**
   - Only the registry's `<reference>: not found` answer means a tag is
     absent. Any other
@@ -235,3 +239,11 @@ findings were applied:
 
 Not changed: when a wait times out, the smoke does not print the container log.
 The existing native cases behave the same way.
+
+### Base update (2026-11-12)
+
+Phase 2 added `trusted-server-fastly.tar.gz` to the release and made it the
+documented Fastly deploy path. The Fastly package now carries it, and
+`checkDownload` refuses any release file that no package carries. Before this,
+the plan omitted the archive and the tests could not notice, because their
+fixture release was built from the plan itself.

@@ -82,12 +82,18 @@ test('plans every release binary with its evidence files', () => {
     wasm.files.map(({ name }) => name),
     [
       'trusted-server-fastly.wasm',
+      'trusted-server-fastly.tar.gz',
       'trusted-server-fastly.wasm.spdx.json',
       'trusted-server-fastly.wasm.provenance.sigstore.json',
       'trusted-server-fastly.wasm.sbom.sigstore.json',
       'trusted-server-fastly.wasm.rebuild-check.json',
     ],
-    'should carry the rebuild check with the Fastly wasm'
+    'should carry the deployable package and rebuild check with the Fastly wasm'
+  )
+  assert.equal(
+    wasm.files.find(({ name }) => name.endsWith('.tar.gz')).mediaType,
+    'application/gzip',
+    'should type the Fastly package archive as gzip'
   )
   assert.equal(
     wasm.annotations['org.opencontainers.image.source'],
@@ -109,7 +115,7 @@ test('plans every release binary with its evidence files', () => {
 test('accepts a release that matches its SHA256SUMS exactly', () => {
   const directory = releaseDirectory()
   const sums = checkDownload(directory, packagePlan(repo, tag, commit))
-  assert.equal(sums.size, 17, 'should list every non-checksum release file')
+  assert.equal(sums.size, 18, 'should list every non-checksum release file')
 })
 
 test('rejects changed, extra and missing release files', () => {
@@ -139,6 +145,17 @@ test('rejects changed, extra and missing release files', () => {
     () => checkDownload(missing, plan),
     /Release lacks ts-x86_64-apple-darwin\.spdx\.json/,
     'should require every planned evidence file'
+  )
+  const unplanned = releaseDirectory()
+  fs.writeFileSync(join(unplanned, 'new-asset.bin'), 'new')
+  fs.appendFileSync(
+    join(unplanned, 'SHA256SUMS'),
+    `${hash('new')}  new-asset.bin\n`
+  )
+  assert.throws(
+    () => checkDownload(unplanned, plan),
+    /No package carries new-asset\.bin/,
+    'should refuse a release file that no package would publish'
   )
 })
 
