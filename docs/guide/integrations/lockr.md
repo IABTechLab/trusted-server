@@ -25,6 +25,9 @@ The integration is off when the section is absent. When the section exists, `ena
 | `rewrite_sdk_host`  | Unset                                               | Deprecated and ignored, including when set to `true`                            |
 | `origin_override`   | Unset                                               | Override the `Origin` header sent to the upstream API                           |
 
+Unknown fields are rejected, including the `organization_id` and `project_id`
+fields that earlier versions of this guide listed. Remove them and set `app_id`.
+
 `cache_ttl_seconds` controls downstream HTTP caching. The integration does not maintain a KV cache of SDK contents or identity mappings.
 
 ## SDK and API routing
@@ -46,6 +49,16 @@ flowchart TD
 For example, `/integrations/lockr/api/example?mode=test` forwards to `https://identity.loc.kr/example?mode=test` with the default API endpoint. The proxy forwards POST bodies without changing them. It strips publisher `Authorization` and `Cookie` headers rather than leaking them upstream. `origin_override` replaces the incoming `Origin` header when configured.
 
 ### SDK URL rewriting
+
+Server-side attribute rewriting and the browser script guard recognize only
+`aim.loc.kr` and `identity.loc.kr` URLs whose pathname contains
+`identity-lockr` and ends in `.js`, case-insensitively. Absolute HTTP(S) and
+protocol-relative URLs are supported. Other scripts on those hosts, lookalike
+hosts, and vendor names embedded in another URL's path or query are not claimed.
+
+Query strings and fragments do not prevent SDK recognition. Matching URLs use
+`/integrations/lockr/sdk`, which serves the configured `sdk_url`; the original
+query and fragment are not forwarded to upstream.
 
 With `rewrite_sdk = true`, the server rewrites matching Lockr SDK URLs in HTML to an absolute first-party URL ending in `/integrations/lockr/sdk`, using the request scheme and request host. An external `<base href>` does not redirect the rewritten SDK load to another origin.
 
