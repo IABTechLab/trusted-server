@@ -526,3 +526,104 @@ fn kids_from_the_service_cannot_drive_the_terminal() {
         );
     }
 }
+
+#[test]
+fn a_dropped_reply_warns_that_the_service_may_have_applied_the_request() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("should bind a listener");
+    let service = format!(
+        "http://{}",
+        listener.local_addr().expect("should read the address")
+    );
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("should accept the request");
+        let mut request = [0_u8; 4096];
+        // Read the request, then close the connection without answering.
+        let _ = std::io::Read::read(&mut stream, &mut request);
+    });
+
+    let (outcome, _) = run_with(
+        KeysCommand::Rotate(RotateArgs {
+            service: ServiceArgs {
+                service,
+                username: "admin".to_owned(),
+            },
+            kid: None,
+        }),
+        &mut ScriptedConfirm::new(false, false),
+    );
+    worker.join().expect("should finish the fixture");
+
+    let error = outcome.expect_err("should fail when no reply comes back");
+    assert!(
+        error.contains("may have applied it"),
+        "should warn that the rotation may have run: {error}"
+    );
+}
+
+#[test]
+fn a_refused_connection_says_the_service_was_not_reached() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("should bind a listener");
+    let service = format!(
+        "http://{}",
+        listener.local_addr().expect("should read the address")
+    );
+    drop(listener);
+
+    let (outcome, _) = run_with(
+        KeysCommand::Rotate(RotateArgs {
+            service: ServiceArgs {
+                service,
+                username: "admin".to_owned(),
+            },
+            kid: None,
+        }),
+        &mut ScriptedConfirm::new(false, false),
+    );
+
+    let error = outcome.expect_err("should fail when nothing listens");
+    assert!(
+        error.contains("could not reach"),
+        "should say the service was not reached: {error}"
+    );
+    assert!(
+        !error.contains("error sending request"),
+        "should name the cause rather than reqwest's generic text: {error}"
+    );
+}
+
+#[test]
+fn a_truncated_reply_warns_that_the_service_may_have_applied_the_request() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("should bind a listener");
+    let service = format!(
+        "http://{}",
+        listener.local_addr().expect("should read the address")
+    );
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("should accept the request");
+        let mut request = [0_u8; 4096];
+        let _ = std::io::Read::read(&mut stream, &mut request);
+        // Answer 200, promise more body than is sent, then close.
+        let _ = std::io::Write::write_all(
+            &mut stream,
+            b"HTTP/1.1 200 OK\r\ncontent-length: 400\r\n\r\n{\"success\":true",
+        );
+    });
+
+    let (outcome, _) = run_with(
+        KeysCommand::Rotate(RotateArgs {
+            service: ServiceArgs {
+                service,
+                username: "admin".to_owned(),
+            },
+            kid: None,
+        }),
+        &mut ScriptedConfirm::new(false, false),
+    );
+    worker.join().expect("should finish the fixture");
+
+    let error = outcome.expect_err("should fail when the body is cut off");
+    assert!(
+        error.contains("200 OK") && error.contains("may have applied the request"),
+        "should say the service answered and may have applied it: {error}"
+    );
+}
