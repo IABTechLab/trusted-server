@@ -52,6 +52,9 @@ enum Command {
     Config(ConfigCommand),
     /// Deploy the project through a target adapter.
     Deploy(DeployArgs),
+    /// Edge Cookie identity diagnostics through a deployed service's admin routes.
+    #[command(subcommand)]
+    Ec(crate::commands::ec::EcCommand),
     /// Probe a deployed version until it reports healthy.
     Healthcheck(HealthcheckArgs),
     /// Trusted Server Prebid commands.
@@ -188,6 +191,11 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             crate::commands::cache::run(command, &mut out).map(|()| RunOutcome::Success)
+        }
+        Command::Ec(command) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::commands::ec::run(command, &mut out).map(|()| RunOutcome::Success)
         }
         Command::Origin(command) => {
             let stdout = std::io::stdout();

@@ -867,6 +867,18 @@ These endpoints expose sensitive identity and cookie data and require HTTP Basic
 The diagnostic handlers have no CORS grant or in-process rate limiter. Apply an
 edge policy if operator access also needs request-rate enforcement.
 
+The `ts ec` commands call these routes without putting the admin password on the
+command line. They read it from `TRUSTED_SERVER_ADMIN_PASSWORD`, take the admin
+username from `--username` (default `admin`), and require an HTTPS `--service`
+URL (plain HTTP only for `localhost`, `127.0.0.1`, or `::1`). They print the
+response to standard output and write nothing to disk or to the CLI log. The
+responses carry raw consent strings and partner UIDs, so treat the output as
+sensitive. `curl` remains a fallback.
+
+Human-readable summaries and refusal messages escape control characters in response
+values, so decoded identifiers cannot change terminal state or insert extra report lines.
+`--json` preserves the service's JSON encoding and formatting.
+
 The examples below use fictional IDs and values only.
 
 ### GET /\_ts/admin/ec
@@ -899,6 +911,22 @@ The auction preview validates the stored record and partner configuration, but c
 | `405`  | Method other than `GET` (`Allow: GET`)                      |
 | `501`  | EC identity graph unavailable on this adapter or deployment |
 | `5xx`  | Unexpected configuration or KV failure (plaintext)          |
+
+`ts ec show` checks the EC ID format before sending anything, then prints the
+tombstone state, the auction EIDs, and each skipped partner ID with its reason.
+`--json` prints the full response unchanged. A `404` is reported as no record for
+the EC ID, and a `501` as a deployment without an identity graph. The bare
+`/_ts/admin/ec` route has no command; pass the `ts-ec` cookie's value to
+`ts ec show` instead.
+
+```bash
+# Prompts without echoing, so the password stays out of shell history.
+read -rs TRUSTED_SERVER_ADMIN_PASSWORD && export TRUSTED_SERVER_ADMIN_PASSWORD
+ts ec show --service https://edge.example.com \
+  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123
+```
+
+With `curl`:
 
 ```bash
 curl -u 'admin:<resolved-admin-password>' \
@@ -938,6 +966,21 @@ partners, but not on the EC KV store.
   }
 }
 ```
+
+`ts ec eids` sends the values you pass as the request's `ts-eids` and `sharedId`
+cookies and prints the matched and unmatched partner IDs with their reasons. It
+requires at least one of `--ts-eids` and `--shared-id`. Copy each value from the
+browser's cookie storage; a value containing `;` or whitespace is refused. `--json`
+prints the full response unchanged.
+
+```bash
+# Prompts without echoing, so the password stays out of shell history.
+read -rs TRUSTED_SERVER_ADMIN_PASSWORD && export TRUSTED_SERVER_ADMIN_PASSWORD
+ts ec eids --service https://edge.example.com \
+  --ts-eids '<ts-eids-cookie-value>' --shared-id '<sharedId-cookie-value>'
+```
+
+With `curl`:
 
 ```bash
 curl -u 'admin:<resolved-admin-password>' \
