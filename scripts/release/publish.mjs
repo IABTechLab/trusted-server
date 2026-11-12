@@ -93,7 +93,13 @@ export async function publish({
   for (const name of releaseAssets) {
     const build = path('build', name)
     const signed = path('signed', name)
-    const inputs = [name, `${name}.spdx.json`]
+    const inputs = [
+      name,
+      `${name}.spdx.json`,
+      ...(name === 'trusted-server-fastly.wasm'
+        ? ['trusted-server-fastly.tar.gz']
+        : []),
+    ]
     const bundles = [
       `${name}.provenance.sigstore.json`,
       `${name}.sbom.sigstore.json`,
@@ -143,6 +149,18 @@ export async function publish({
             `${name}.rebuild-check.json`,
             'provenance',
             'https://slsa.dev/provenance/v1',
+          ],
+          [
+            name,
+            'trusted-server-fastly.tar.gz',
+            'provenance',
+            'https://slsa.dev/provenance/v1',
+          ],
+          [
+            name,
+            'trusted-server-fastly.tar.gz',
+            'sbom',
+            'https://spdx.dev/Document/v2.3',
           ],
         ]
       : []),

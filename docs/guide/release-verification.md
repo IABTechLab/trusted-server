@@ -1,7 +1,7 @@
 # Verify release binaries
 
 Each release publishes four binaries, four SPDX 2.3 SBOMs, eight Sigstore
-bundles, the Fastly rebuild check and `SHA256SUMS`: **18 immutable release
+bundles, the Fastly deployment package, rebuild check and `SHA256SUMS`: **19 immutable release
 assets**. Each binary has SLSA build provenance and an SBOM attestation. Verify
 the downloaded bytes before execution or deployment. Fastly's ordinary A/B
 equality gate is described below; controlled reproducibility qualification,
@@ -102,6 +102,16 @@ gh attestation verify "$CHECK" --repo "$REPO" --bundle trusted-server-fastly.was
   --deny-self-hosted-runners --predicate-type https://slsa.dev/provenance/v1 --signer-workflow "$WORKFLOW"
 binary_sha=$(shasum -a 256 trusted-server-fastly.wasm | awk '{print $1}')
 jq -e --arg source "$COMMIT" --arg digest "$binary_sha" '.version == 1 and .profile == "ordinary-release-fastly-byte-equality-v1" and .release_qualification == false and .outcome == "matched" and .source_commit == $source and .asset == "trusted-server-fastly.wasm" and .canonical_sha256 == $digest and .reproduction_sha256 == $digest' "$CHECK"
+PACKAGE=trusted-server-fastly.tar.gz
+gh release verify-asset "$TAG" "$PACKAGE" --repo "$REPO"
+for kind in provenance sbom; do
+  predicate=https://slsa.dev/provenance/v1; if [[ "$kind" == sbom ]]; then predicate=https://spdx.dev/Document/v2.3; fi
+  gh attestation verify "$PACKAGE" --repo "$REPO" --bundle "trusted-server-fastly.wasm.$kind.sigstore.json" \
+    --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" --signer-digest "$COMMIT" \
+    --deny-self-hosted-runners --predicate-type "$predicate" --signer-workflow "$WORKFLOW"
+done
+package_sha=$(shasum -a 256 "$PACKAGE" | awk '{print $1}')
+jq -e --arg digest "$package_sha" --argjson size "$(wc -c < "$PACKAGE" | tr -d ' ')" '.package.asset == "trusted-server-fastly.tar.gz" and .package.size == $size and .package.canonical_sha256 == $digest and .package.reproduction_sha256 == $digest' "$CHECK"
 gh release verify-asset "$TAG" SHA256SUMS --repo "$REPO"
 shasum -a 256 --check SHA256SUMS
 ```
@@ -109,12 +119,12 @@ shasum -a 256 --check SHA256SUMS
 <!-- release-verification:end -->
 
 Provenance covers the binary and its SPDX document, plus the rebuild check for
-Fastly; the SBOM attestation covers the binary. The verified SBOM predicate must equal the shipped SPDX document.
+Fastly. Fastly provenance also covers `trusted-server-fastly.tar.gz`; its SBOM attestation covers both the wasm and package. Other SBOM attestations cover their binary. The verified SBOM predicate must equal the shipped SPDX document.
 `--signer-workflow` pins the reusable signer; with the source ref and both
 digests pinned to the reviewed tag and commit, it identifies the exact signing
 workflow run's source.
 
-The checksums cover the other 17 assets, never `SHA256SUMS` itself. Immutable
+The checksums cover the other 18 assets, never `SHA256SUMS` itself. Immutable
 release verification establishes membership; provenance establishes the
 reviewed signer and source. Both are required.
 
@@ -230,7 +240,7 @@ gh attestation trusted-root > trusted_root.jsonl
 shasum -a 256 trusted_root.jsonl
 ```
 
-Transfer the binaries, their bundles, published SPDX documents, approved source
+Transfer the binaries, Fastly package and rebuild check, their bundles, published SPDX documents, approved source
 pins and trusted roots to the offline machine. Shell variables do not transfer:
 set `REPO`, `TAG`, `COMMIT`, `ASSETS` and `WORKFLOW` again on the offline
 machine, from the same independently reviewed values. Supplying both the bundle
@@ -239,7 +249,7 @@ and custom roots avoids network acquisition; there is no `--offline` flag.
 Before disconnecting, obtain an independent trusted SHA-256 pin for each binary
 (for example from a separately authenticated release verification record).
 Do not treat SHA256SUMS delivered with the same untrusted download as that pin.
-Transfer that approved pin file as `APPROVED_BINARY_SHA256SUMS`.
+Transfer that approved pin file as `APPROVED_BINARY_SHA256SUMS`, and independently approved package and companion pins as `APPROVED_FASTLY_SHA256SUMS`.
 
 ```bash
 set -euo pipefail
@@ -261,6 +271,20 @@ for asset in "${ASSETS[@]}"; do
     fi
   done
 done
+shasum -a 256 --check APPROVED_FASTLY_SHA256SUMS
+CHECK=trusted-server-fastly.wasm.rebuild-check.json
+PACKAGE=trusted-server-fastly.tar.gz
+for subject in "$CHECK" "$PACKAGE"; do
+  gh attestation verify "$subject" --repo "$REPO" --bundle trusted-server-fastly.wasm.provenance.sigstore.json \
+    --custom-trusted-root trusted_root.jsonl --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" \
+    --signer-digest "$COMMIT" --deny-self-hosted-runners --predicate-type https://slsa.dev/provenance/v1 \
+    --signer-workflow "$WORKFLOW"
+done
+gh attestation verify "$PACKAGE" --repo "$REPO" --bundle trusted-server-fastly.wasm.sbom.sigstore.json \
+  --custom-trusted-root trusted_root.jsonl --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" \
+  --signer-digest "$COMMIT" --deny-self-hosted-runners --predicate-type https://spdx.dev/Document/v2.3 \
+  --signer-workflow "$WORKFLOW" --format json > package.offline-sbom-verification.json
+jq -e --slurpfile document trusted-server-fastly.wasm.spdx.json 'length == 1 and .[0].verificationResult.statement.predicate == $document[0]' package.offline-sbom-verification.json
 ```
 
 Offline success establishes signed build evidence for those retained bytes.
@@ -278,7 +302,23 @@ copy that verified file into a directory on their `PATH` as `ts` and make it
 executable. Verify before first execution. Individual commands may still require
 a source checkout and provider tools; see [CLI](./cli.md).
 
-## Deploy the verified Fastly wasm
+## Deploy the verified Fastly package
+
+Download `trusted-server-fastly.tar.gz` with the other release assets and complete the provenance, SPDX, release-membership and checksum checks above before deployment. Both build jobs package their own wasm with the tracked `scripts/release/fastly.toml`: exactly `manifest_version = 3` and `name = "trusted-server-fastly"`. It contains no service ID, configuration, build hooks or credentials. The release gate compares the complete normalized tar/gzip bytes as well as the wasm; signing and publication refuse either mismatch. Owner/group, timestamp, paths, member order and permissions are fixed independently of the packing host.
+
+Use the pinned Fastly CLI 16.0.0. Select and review the destination service, integer base version and Config/Secret Store links first, as described below. In a fresh private directory containing only verified downloads:
+
+```bash
+fastly compute validate --package ./trusted-server-fastly.tar.gz
+tar -xOzf ./trusted-server-fastly.tar.gz trusted-server-fastly/bin/main.wasm > packaged.wasm
+cmp trusted-server-fastly.wasm packaged.wasm
+fastly compute deploy --package ./trusted-server-fastly.tar.gz \
+  --service-id '99999' --version '7' --no-default-domain
+```
+
+Deploy the downloaded archive unchanged. The explicit service/version arguments keep operator selection outside the package. This command can activate production; retain the package digest, verified source, previous active version and observed result. The checks above establish signed build evidence and ordinary byte equality, not authorization to deploy or controlled-recipe qualification.
+
+### Repack verified wasm only as a fallback
 
 Keep the verified download unchanged. The ordinary source-build route does not
 establish equality with this release, and Phase 1 adds no `ts deploy --release`
@@ -303,7 +343,7 @@ and actual configuration are runtime resources. This manual route does not
 create links, push configuration, implement staging, or supply recovery
 guarantees.
 
-The canonical Fastly CI job also exercises this route on its freshly built wasm,
+The canonical Fastly CI job validates and inspects the generated release package and also exercises this fallback route on its freshly built wasm,
 using the `.tool-versions` CLI version and a source-pinned archive checksum.
 After downloading the CLI, it clears inherited credentials and runs in a
 network namespace with no active interfaces or retained capabilities. CLI
@@ -416,7 +456,7 @@ and digests.
 The reviewed publication owner remains later work. There are no automatic
 mutation retries or draft-resume claims.
 
-The nine pre-creation `gh attestation verify` runs, the tag-reference read, the
+The eleven pre-creation `gh attestation verify` runs, the tag-reference read, the
 release listing before creation and every create/upload/publish mutation remain
 single-shot. Each pre-creation verification times out after 60s. Every API read,
 including that listing, times out after at most 10s. Mutations have no

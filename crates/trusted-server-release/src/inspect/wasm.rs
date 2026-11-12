@@ -45,26 +45,23 @@ const FEATURES: WasmFeatures = WasmFeatures::WASM2;
 /// # Errors
 ///
 /// Returns [`ReleaseError::Inspect`] with a [`Violation`] when the bytes are
-/// a component or not a core module ([`Violation::WasmEncoding`]), fail
-/// validation under [`WasmFeatures::WASM2`] ([`Violation::WasmValidation`]),
+/// a component or not a core module ([`Violation::Encoding`]), fail
+/// validation under [`WasmFeatures::WASM2`] ([`Violation::Validation`]),
 /// or import a non-function item or from a module outside
-/// [`FASTLY_IMPORT_MODULES`] ([`Violation::WasmImport`]).
+/// [`FASTLY_IMPORT_MODULES`] ([`Violation::Import`]).
 pub(crate) fn inspect_wasm(bytes: &[u8]) -> Result<WasmFacts, Report<ReleaseError>> {
     if Parser::is_component(bytes) {
         return Err(rejected(
-            Violation::WasmEncoding,
+            Violation::Encoding,
             "component, not a core module",
         ));
     }
     if !Parser::is_core_wasm(bytes) {
-        return Err(rejected(
-            Violation::WasmEncoding,
-            "missing core module header",
-        ));
+        return Err(rejected(Violation::Encoding, "missing core module header"));
     }
     let types = Validator::new_with_features(FEATURES)
         .validate_all(bytes)
-        .map_err(|error| rejected(Violation::WasmValidation, error))?;
+        .map_err(|error| rejected(Violation::Validation, error))?;
     let exports = exports(&types)?;
     let (import_modules, function_imports) = imports(bytes)?;
     if let Some(module) = import_modules
@@ -72,7 +69,7 @@ pub(crate) fn inspect_wasm(bytes: &[u8]) -> Result<WasmFacts, Report<ReleaseErro
         .find(|module| !FASTLY_IMPORT_MODULES.contains(&module.as_str()))
     {
         return Err(rejected(
-            Violation::WasmImport,
+            Violation::Import,
             format!("import module {module:?}"),
         ));
     }
@@ -90,7 +87,7 @@ fn exports(types: &Types) -> Result<Vec<WasmExport>, Report<ReleaseError>> {
     let types = types.as_ref();
     let Some(exports) = types.core_exports() else {
         return Err(rejected(
-            Violation::WasmEncoding,
+            Violation::Encoding,
             "validated types describe a component",
         ));
     };
@@ -123,7 +120,7 @@ fn exports(types: &Types) -> Result<Vec<WasmExport>, Report<ReleaseError>> {
 fn custom_sections(bytes: &[u8]) -> Result<Vec<WasmCustomSection>, Report<ReleaseError>> {
     let mut sections = Vec::new();
     for payload in Parser::new(0).parse_all(bytes) {
-        let payload = payload.map_err(|error| rejected(Violation::WasmValidation, error))?;
+        let payload = payload.map_err(|error| rejected(Violation::Validation, error))?;
         if let Payload::CustomSection(reader) = payload {
             sections.push(WasmCustomSection {
                 name: reader.name().to_owned(),
@@ -136,7 +133,7 @@ fn custom_sections(bytes: &[u8]) -> Result<Vec<WasmCustomSection>, Report<Releas
 
 /// Returns the distinct import modules and the function import count.
 fn imports(bytes: &[u8]) -> Result<(BTreeSet<String>, usize), Report<ReleaseError>> {
-    let parse_error = |error| rejected(Violation::WasmValidation, error);
+    let parse_error = |error| rejected(Violation::Validation, error);
     let mut modules = BTreeSet::new();
     let mut functions = 0;
     for payload in Parser::new(0).parse_all(bytes) {
@@ -147,7 +144,7 @@ fn imports(bytes: &[u8]) -> Result<(BTreeSet<String>, usize), Report<ReleaseErro
             let import = import.map_err(parse_error)?;
             if !matches!(import.ty, TypeRef::Func(_)) {
                 return Err(rejected(
-                    Violation::WasmImport,
+                    Violation::Import,
                     format!("non-function import {}::{}", import.module, import.name),
                 ));
             }

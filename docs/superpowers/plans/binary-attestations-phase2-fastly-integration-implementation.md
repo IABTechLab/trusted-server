@@ -1,5 +1,13 @@
 # Ordinary Fastly release gate implementation plan
 
+## Current review amendment (2026-11-12)
+
+The [Phase 2 package amendment](../specs/2026-10-28-1235-binary-attestations-phase2-design.md#reproducible-deployment-package-amendment) supersedes the earlier producer-port and wasm-only asset/subject assignments below. Phase 2 retains only its live ordinary release path and Fastly packaging/inspection; unused controlled modules, tests, schemas and fixtures move to their enabling phase. `jsonschema` is removed and shipped dependency versions stay at `main`'s versions. Phase 3 #1463 must restore the deferred foundations it consumes; #1543 must reconcile the package artifact before landing. These branches are not changed here.
+
+The release now adds `trusted-server-fastly.tar.gz`, built reproducibly in both Fastly roles and compared alongside the wasm. Provenance covers wasm, SPDX, package and rebuild check; the SPDX attestation covers wasm and package. Existing binary/bundle names and the permanent companion remain stable. The set becomes **19 files**, with 18 checksum entries. Historical 18/30-file contracts, producer inventories and rehearsal results below describe their named revisions, not this amendment's candidate. Fresh current-input CI and signed-publication rehearsal are required; `.39` is historical evidence only.
+
+Implementation order: retain/extract live helpers and restore the lock; add deterministic package production and regression tests; extend observation, transfer and comparison; expand signer/publisher exact sets and operator verification; run local gates and internal review before signed publication; then qualify the actual new release inputs. A package-only mismatch fails closed. No deployment, production setting or controlled qualification is enabled.
+
 **Phase 2 spec:** [ordinary Fastly release equality](../specs/2026-10-28-1235-binary-attestations-phase2-design.md), with its own source-checked review rounds. Tracking issue: #1235.
 
 **Current state (2026-11-10):** this is the completed implementation record, implemented in #1449, which is open for review. Since approval, Phase 1 narrowed the release to four binaries and 18 files and removed the publisher's post-publish byte comparison, and release CI runs the gate on every push to `main` and every `v*` tag. Checked tasks and rehearsal sections below, including seven-binary and 30-file counts, are dated history for the source they name; the latest rehearsal before the fourth review round is `.30` at `44557229a`, and current rehearsal status lives in #1449 comments and #1235.

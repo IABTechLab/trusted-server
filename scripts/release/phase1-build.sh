@@ -134,6 +134,10 @@ else
   fi
 fi
 cp "$CARGO_TARGET_DIR/$build_target/release/$executable" "release-assets/$release_asset"
+if [[ "$build_target" == wasm32-wasip1 ]]; then
+  "$ORDINARY_RELEASE_PRODUCER" pack-fastly-package --wasm "release-assets/$release_asset" \
+    --output release-assets/trusted-server-fastly.tar.gz
+fi
 shasum -a 256 "release-assets/$release_asset" > "$RUNNER_TEMP/binary.sha256"
 node scripts/release/phase1.mjs check "release-assets/$release_asset"
 node scripts/release/phase1.mjs smoke "release-assets/$release_asset" "$build_target"

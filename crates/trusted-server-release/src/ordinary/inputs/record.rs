@@ -259,7 +259,7 @@ fn dependency_sources(
     let metadata =
         documents::parse_json(metadata, Role::CargoObservation).map_err(|_| rejected())?;
     let packages = metadata["packages"].as_array().ok_or_else(rejected)?;
-    let messages = crate::recipe::observed_cargo_messages(messages).map_err(|_| rejected())?;
+    let messages = crate::ordinary::cargo::successful_messages(messages).map_err(|_| rejected())?;
     require(
         packages
             .iter()
@@ -358,6 +358,10 @@ fn finish(
         "ordinary final binary path is missing or aliased",
     )?;
     let binary = documents::read_bounded(&binary, Role::Executable)?;
+    let package = documents::read_bounded(
+        &checkout.join("release-assets").join(super::super::PACKAGE),
+        Role::ArtifactArchive,
+    )?;
     let flags = normalization::plan(checkout, target, &request.role)?;
     let retained = documents::read_bounded(&request.rustflags, Role::Metadata)?;
     require(
@@ -379,7 +383,8 @@ fn finish(
         "source_commit":request.source_commit,"asset":ASSET,"target":"wasm32-wasip1","variant":"default","role":request.role,
         "recipe_sha256":source.recipe_sha256,"cargo_lock_sha256":source.cargo_lock_sha256,"npm_lock_sha256":source.npm_lock_sha256,
         "js_inventory_sha256":js,"rustflags_sha256":retained.sha256,"tools":tools,"environment":request.environment,
-        "artifact":{"size":binary.bytes.len(),"sha256":binary.sha256},"gaps":GAPS,
+        "artifact":{"size":binary.bytes.len(),"sha256":binary.sha256},
+        "package":{"size":package.bytes.len(),"sha256":package.sha256},"gaps":GAPS,
     });
     observation(&documents::canonical_json(&value, Role::Metadata)?)
 }

@@ -22,6 +22,7 @@ impl Fixture {
         fs::create_dir_all(&target).expect("should create target root");
         for file in [
             "scripts/release/phase1-build.sh",
+            "scripts/release/fastly.toml",
             ".cargo/config.toml",
             "Cargo.toml",
             "rust-toolchain.toml",

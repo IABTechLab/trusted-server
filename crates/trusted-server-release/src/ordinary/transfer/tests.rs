@@ -7,6 +7,65 @@ use crate::ordinary::{ASSET, run, tests};
 
 const WASM: &[u8] = crate::ordinary::normalization::TEST_WASM;
 
+#[test]
+fn matched_receipt_binds_the_deployment_package() {
+    let fixture = Fixture::new();
+    let checked = fixture
+        .checked()
+        .expect("should compare complete build inputs");
+    assert_eq!(
+        checked.receipt()["package"]["asset"],
+        "trusted-server-fastly.tar.gz",
+        "should bind the deployable package as well as the wasm"
+    );
+}
+
+#[test]
+fn rejects_changed_and_different_packages_even_when_wasm_matches() {
+    for observed_change in [false, true] {
+        let mut fixture = Fixture::new();
+        let changed = b"different package";
+        fixture.archives[2] = zip(
+            &[
+                (ASSET, WASM),
+                (&format!("{ASSET}.spdx.json"), b"{}"),
+                (crate::ordinary::PACKAGE, changed),
+            ],
+            false,
+        );
+        if observed_change {
+            let mut observed = reproduction_observation();
+            observed["package"] =
+                json!({"size":changed.len(),"sha256":hex::encode(Sha256::digest(changed))});
+            fixture.archives[3] = zip(&[("fastly-observation.json", &encoded(&observed))], false);
+        }
+        fixture.refresh();
+        let error = fixture.error();
+        assert!(
+            error.contains(if observed_change {
+                "deployment package final-byte mismatch"
+            } else {
+                "deployment package changed after observation"
+            }),
+            "should reject the package at its own guard: {error}"
+        );
+    }
+}
+
+#[test]
+fn rejects_a_missing_deployment_package() {
+    let mut fixture = Fixture::new();
+    fixture.archives[2] = zip(
+        &[(ASSET, WASM), (&format!("{ASSET}.spdx.json"), b"{}")],
+        false,
+    );
+    fixture.refresh();
+    assert!(
+        fixture.error().contains("exact member count"),
+        "should require the package in both authenticated builds"
+    );
+}
+
 fn canonical_observation() -> Value {
     with_artifact(tests::fixture())
 }
@@ -34,7 +93,11 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let build = zip(
-            &[(ASSET, WASM), (&format!("{ASSET}.spdx.json"), b"{}")],
+            &[
+                (ASSET, WASM),
+                (crate::ordinary::PACKAGE, b"package"),
+                (&format!("{ASSET}.spdx.json"), b"{}"),
+            ],
             false,
         );
         let mut fixture = Self {
@@ -277,7 +340,11 @@ fn rejects_equal_transferred_bytes_that_retain_a_physical_root() {
     ];
     let bytes = [WASM, &section, b"raw", root].concat();
     let build = zip(
-        &[(ASSET, &bytes), (&format!("{ASSET}.spdx.json"), b"{}")],
+        &[
+            (ASSET, &bytes),
+            (crate::ordinary::PACKAGE, b"package"),
+            (&format!("{ASSET}.spdx.json"), b"{}"),
+        ],
         false,
     );
     let mut fixture = Fixture::new();
@@ -307,6 +374,7 @@ fn rejects_binary_mutation_after_observation() {
     fixture.archives[2] = zip(
         &[
             (ASSET, b"different"),
+            (crate::ordinary::PACKAGE, b"package"),
             (&format!("{ASSET}.spdx.json"), b"{}"),
         ],
         false,
@@ -325,7 +393,11 @@ fn rejects_real_mismatch_even_when_both_observations_are_accurate() {
     let mut fixture = Fixture::new();
     let bytes = [WASM, b"\0\x02\x01x"].concat();
     fixture.archives[2] = zip(
-        &[(ASSET, &bytes), (&format!("{ASSET}.spdx.json"), b"{}")],
+        &[
+            (ASSET, &bytes),
+            (crate::ordinary::PACKAGE, b"package"),
+            (&format!("{ASSET}.spdx.json"), b"{}"),
+        ],
         false,
     );
     let mut observation = reproduction_observation();

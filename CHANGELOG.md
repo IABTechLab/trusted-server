@@ -9,13 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Publish a reproducible, provenance- and SBOM-attested `trusted-server-fastly.tar.gz` alongside the Fastly wasm. Both ordinary builds use the same fixed service-neutral manifest and normalized archive metadata; the gate compares both complete files before signing. Operators can verify and deploy the downloaded package unchanged.
+
 - Add an ordinary Fastly release byte-equality gate and a real provenance-attested `trusted-server-fastly.wasm.rebuild-check.json`. Release CI now builds the Fastly wasm a second time on every push to `main` and every `v*` tag and requires both complete files to match byte for byte; a mismatch prevents signing and publication. The ordinary profile remains unqualified, native reproduction is not a release gate, and the four binary names and signer identity stay unchanged.
 - Add Phase 1 attested release binaries: the Fastly wasm and the `ts` CLI for Linux x86-64 and macOS (ARM64 and x86-64), with SPDX 2.3 inventories, provenance/SBOM bundles, immutable verification and a GNU glibc 2.34 startup check. Reproducibility, other adapters and the custom verifier remain later work; production publication requires maintainer settings.
 
 ### Changed
 
 - **Breaking:** The tsjs bundle build (`crates/trusted-server-js/lib/build-all.mjs`, run by Cargo builds of `trusted-server-js` and by `npm run build`) now requires a Node.js with `import.meta.main` (22.18 or later, or 24.2 or later) and fails on older versions; use the `.tool-versions` Node.
-- The release tool's `jsonschema` dependency re-resolves the shared `Cargo.lock`, moving crates compiled into the production Fastly wasm: `regex-automata` 0.4.14 → 0.4.18 (through `regex`) and `zmij` 1.0.21 → 1.0.23 (through `serde_json`). `num-bigint` also moves 0.4.6 → 0.4.8 outside the wasm.
 - **Breaking:** Cargo builds of `trusted-server-js` now fail whenever `TSJS_SKIP_BUILD` is set to any value, including empty or `0`; previously only `TSJS_SKIP_BUILD=1` was rejected. Remove it from shell profiles and `.env` files, and use `TSJS_PREBUILT_DIR` to embed prebuilt bundles instead.
 - The attested Fastly wasm reports `x-ts-version` as the full 40-character source commit; deploy-pipeline builds keep the tag, branch or short-commit value described below.
 - **Breaking:** `ts --version` now prints `ts package=<version> source=<source> target=<triple> variant=default` instead of `ts <version>`. `source` is the full commit in attested release binaries, and otherwise the development ref, short commit or `unknown`. Update scripts that parse the old output.

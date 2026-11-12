@@ -11,10 +11,10 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use wasmparser::{Parser, Payload};
 
+use super::cargo as recipe;
 use super::{require, root};
 use crate::documents::{self, Role};
 use crate::error::ReleaseError;
-use crate::recipe;
 
 /// Closed six-map argument plan; it constructs no qualified recipe.
 pub(super) struct Flags {

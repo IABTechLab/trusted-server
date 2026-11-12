@@ -16,6 +16,7 @@ use crate::documents::{self, Role};
 use crate::error::ReleaseError;
 
 mod archive;
+mod cargo;
 mod commands;
 mod diagnostic;
 mod inputs;
@@ -28,6 +29,7 @@ pub(crate) use commands::{compare_transfers, measure_build, prepare_rustflags, t
 
 const PROFILE: &str = "ordinary-release-fastly-byte-equality-v1";
 const ASSET: &str = "trusted-server-fastly.wasm";
+const PACKAGE: &str = "trusted-server-fastly.tar.gz";
 const GAPS: [&str; 4] = [
     "alternate-user-unqualified",
     "boundary-unqualified",
@@ -229,6 +231,7 @@ struct Facts {
     tools: Tools,
     environment: Environment,
     artifact: Artifact,
+    package: Artifact,
     gaps: Vec<String>,
 }
 
@@ -331,6 +334,7 @@ pub(crate) fn observation(bytes: &[u8]) -> Result<Observation, Report<ReleaseErr
                 &facts.js_inventory_sha256,
                 &facts.rustflags_sha256,
                 &facts.artifact.sha256,
+                &facts.package.sha256,
                 &facts.tools.rustc.sha256,
                 &facts.tools.node.sha256,
             ]
@@ -369,7 +373,10 @@ pub(crate) fn observation(bytes: &[u8]) -> Result<Observation, Report<ReleaseErr
         "ordinary Cargo home is not the role's private home",
     )?;
     require(
-        facts.artifact.size > 0 && facts.artifact.size <= Role::Executable.limit(),
+        facts.artifact.size > 0
+            && facts.artifact.size <= Role::Executable.limit()
+            && facts.package.size > 0
+            && facts.package.size <= Role::ArtifactArchive.limit(),
         "ordinary artifact size rejected",
     )?;
     require(facts.gaps == GAPS, "ordinary assurance gaps rejected")?;

@@ -45,6 +45,7 @@ impl Code {
 #[derive(Clone, Debug)]
 pub(super) struct Failure {
     code: Code,
+    asset: &'static str,
     artifact_ids: Option<[u64; 4]>,
     binaries: Option<[(u64, String); 2]>,
     difference: Option<(u64, [String; 2])>,
@@ -55,10 +56,17 @@ impl Failure {
     pub(super) fn new(code: Code) -> Self {
         Self {
             code,
+            asset: super::ASSET,
             artifact_ids: None,
             binaries: None,
             difference: None,
         }
+    }
+
+    /// Identifies measured deployment-package facts without relabeling the wasm.
+    pub(super) fn package(mut self) -> Self {
+        self.asset = super::PACKAGE;
+        self
     }
 
     /// Measures only the two retained binary byte slices.
@@ -103,6 +111,7 @@ impl Failure {
         };
         json!({
             "kind":"ordinary-comparison-diagnostic", "version":1,
+            "asset":self.asset,
             "outcome":outcome, "stage":stage, "code":code,
             "facts":{
                 "canonical_artifact_id":id(0), "canonical_observation_artifact_id":id(1),
@@ -145,7 +154,7 @@ pub(super) fn tag_equal(
     if report.contains::<Failure>() {
         report
     } else {
-        let (binary, _) = checked.inputs();
+        let (binary, _, _) = checked.inputs();
         report.attach(Failure::new(code).binaries(binary, binary))
     }
 }

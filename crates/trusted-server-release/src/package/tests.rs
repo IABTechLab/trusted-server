@@ -11,6 +11,68 @@ use super::*;
 const MANIFEST: &[u8] = b"manifest_version = 3\nname = \"example-package\"\n";
 const WASM: &[u8] = b"\0asm\x01\0\0\0";
 
+#[test]
+fn release_archive_has_only_fixed_paths_bytes_and_metadata() {
+    let bytes = release_bytes(WASM).expect("should build normalized archive");
+    let decoded = flate2::read::GzDecoder::new(bytes.as_slice());
+    let mut archive = tar::Archive::new(decoded);
+    let expected = [
+        "trusted-server-fastly/",
+        "trusted-server-fastly/bin/",
+        "trusted-server-fastly/bin/main.wasm",
+        "trusted-server-fastly/fastly.toml",
+    ];
+    let mut count = 0;
+    for (index, entry) in archive
+        .entries()
+        .expect("should read tar entries")
+        .enumerate()
+    {
+        let mut entry = entry.expect("should decode entry");
+        assert_eq!(
+            entry.path_bytes(),
+            expected[index].as_bytes(),
+            "should fix member order and path"
+        );
+        let header = entry.header();
+        assert_eq!(
+            header.uid().expect("should read uid"),
+            0,
+            "should normalize owner"
+        );
+        assert_eq!(
+            header.gid().expect("should read gid"),
+            0,
+            "should normalize group"
+        );
+        assert_eq!(
+            header.mtime().expect("should read time"),
+            0,
+            "should normalize timestamp"
+        );
+        assert_eq!(
+            header.mode().expect("should read mode"),
+            if index < 2 { 0o755 } else { 0o644 },
+            "should normalize permissions"
+        );
+        let mut body = Vec::new();
+        entry
+            .read_to_end(&mut body)
+            .expect("should read member bytes");
+        assert_eq!(
+            body,
+            match index {
+                2 => WASM,
+                3 => RELEASE_MANIFEST,
+                _ => b"",
+            },
+            "should retain only fixed manifest and exact wasm"
+        );
+        count += 1;
+    }
+    assert_eq!(count, 4, "should contain exactly four members");
+}
+
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }

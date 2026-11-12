@@ -899,7 +899,7 @@ const assets = releaseAssets
 const realExecFileSync = execFileSync
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex')
 
-test('isolated signing accepts only bound 3/2 input sets and retains exact provenance subjects', () => {
+test('isolated signing accepts only bound 4/2 input sets and retains exact provenance subjects', () => {
   const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
   const match = workflow.match(
     /          \/\/ BEGIN SIGNING INPUTS\n([\s\S]*?)          \/\/ END SIGNING INPUTS/
@@ -955,6 +955,13 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
           'oversized-companion',
           'oversized-spdx',
           'fractional-attempt',
+          'missing-package',
+          'changed-package',
+          'package-size',
+          'package-digest',
+          'package-reproduction',
+          'package-manifest',
+          'build-package',
         ]
       : ['success', 'extra']) {
       const root = mkdtempSync(join(tmpdir(), 'ordinary-sign-'))
@@ -965,6 +972,11 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
         writeFileSync(join(root, 'release-assets', asset), binary)
         writeFileSync(join(root, 'release-assets', `${asset}.spdx.json`), spdx)
         if (asset === 'trusted-server-fastly.wasm') {
+          const packageBytes = Buffer.from('fixture deployable package')
+          writeFileSync(
+            join(root, 'release-assets', 'trusted-server-fastly.tar.gz'),
+            packageBytes
+          )
           mkdirSync(join(root, 'comparison'))
           const receipt = {
             version: 1,
@@ -975,6 +987,17 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
             target: 'wasm32-wasip1',
             variant: 'default',
             outcome: 'matched',
+            package: {
+              asset: 'trusted-server-fastly.tar.gz',
+              size: packageBytes.length,
+              canonical_sha256: hash(packageBytes),
+              reproduction_sha256: hash(packageBytes),
+              manifest_sha256: hash(
+                Buffer.from(
+                  'manifest_version = 3\nname = "trusted-server-fastly"\n'
+                )
+              ),
+            },
             canonical_sha256: hash(binary),
             reproduction_sha256: hash(binary),
             canonical: {
@@ -984,15 +1007,41 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
               size: binary.length,
               sha256: hash(binary),
               spdx_sha256: hash(spdx),
+              package: {
+                size: packageBytes.length,
+                sha256: hash(packageBytes),
+              },
             },
             reproduction: {
               run_id: 17,
               run_attempt: 2,
               job_id: 102,
+              package: {
+                size: packageBytes.length,
+                sha256: hash(packageBytes),
+              },
               size: binary.length,
               sha256: hash(binary),
             },
           }
+          if (mode === 'missing-package')
+            fs.unlinkSync(
+              join(root, 'release-assets', 'trusted-server-fastly.tar.gz')
+            )
+          if (mode === 'changed-package')
+            writeFileSync(
+              join(root, 'release-assets', 'trusted-server-fastly.tar.gz'),
+              'changed'
+            )
+          if (mode === 'package-size') receipt.package.size++
+          if (mode === 'package-digest')
+            receipt.package.canonical_sha256 = '0'.repeat(64)
+          if (mode === 'package-reproduction')
+            receipt.package.reproduction_sha256 = '0'.repeat(64)
+          if (mode === 'package-manifest')
+            receipt.package.manifest_sha256 = '0'.repeat(64)
+          if (mode === 'build-package')
+            receipt.reproduction.package.sha256 = '0'.repeat(64)
           if (mode === 'source') receipt.source_commit = 'b'.repeat(40)
           if (mode === 'run') receipt.canonical.run_id = 18
           // A later attempt cannot have sealed this run's receipt; an earlier
@@ -1106,7 +1155,7 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
           asset,
           `${asset}.spdx.json`,
           ...(asset === 'trusted-server-fastly.wasm'
-            ? [`${asset}.rebuild-check.json`]
+            ? ['trusted-server-fastly.tar.gz', `${asset}.rebuild-check.json`]
             : []),
         ]
         assert.equal(
@@ -1119,6 +1168,13 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
             .join('')
         )
         const output = readFileSync(join(root, 'outputs'), 'utf8')
+        assert.equal(
+          output.match(
+            /sbom_subjects<<SBOM_SUBJECTS\n([\s\S]*?)SBOM_SUBJECTS\n/
+          )?.[1],
+          `release-assets/${asset}\n${asset === 'trusted-server-fastly.wasm' ? 'release-assets/trusted-server-fastly.tar.gz\n' : ''}`,
+          'should attest exactly the deployable files with SPDX'
+        )
         for (const file of files)
           assert.ok(
             output.includes(`release-assets/${file}\n`),
@@ -1180,6 +1236,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'missing-tag',
     'malformed-tag',
     'bundle-verification-failure',
+    'package-provenance-failure',
+    'package-sbom-failure',
     'bundle-sbom-mismatch',
     'bundle-sbom-duplicate',
     'identity-late',
@@ -1201,6 +1259,9 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'changed-companion',
     'extra-companion',
     'unsigned-companion',
+    'changed-package',
+    'missing-package',
+    'unsigned-package',
     'symlink-input',
     'signed-extra',
     'created-wrong-tag',
@@ -1288,11 +1349,29 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           entries.push(`${hash(bytes)}  ${asset}${suffix}\n`)
         }
         if (asset === 'trusted-server-fastly.wasm') {
+          const packageBytes = Buffer.from('fixture deployable package')
+          writeFileSync(
+            join(build, 'trusted-server-fastly.tar.gz'),
+            packageBytes
+          )
+          if (mode !== 'unsigned-package')
+            entries.splice(
+              2,
+              0,
+              `${hash(packageBytes)}  trusted-server-fastly.tar.gz\n`
+            )
+          if (mode === 'changed-package')
+            writeFileSync(
+              join(build, 'trusted-server-fastly.tar.gz'),
+              'changed'
+            )
+          if (mode === 'missing-package')
+            fs.unlinkSync(join(build, 'trusted-server-fastly.tar.gz'))
           const companion = `${asset}.rebuild-check.json`,
             bytes = Buffer.from('fixture signed ordinary rebuild check')
           writeFileSync(join(signed, companion), bytes)
           if (mode !== 'unsigned-companion')
-            entries.splice(2, 0, `${hash(bytes)}  ${companion}\n`)
+            entries.splice(3, 0, `${hash(bytes)}  ${companion}\n`)
           if (mode === 'changed-companion')
             writeFileSync(join(signed, companion), 'changed')
           if (mode === 'missing-companion')
@@ -1528,7 +1607,11 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             [asset, asset, 'provenance'],
             [asset, asset, 'sbom'],
             ...(asset === 'trusted-server-fastly.wasm'
-              ? [[asset, `${asset}.rebuild-check.json`, 'provenance']]
+              ? [
+                  [asset, `${asset}.rebuild-check.json`, 'provenance'],
+                  [asset, 'trusted-server-fastly.tar.gz', 'provenance'],
+                  [asset, 'trusted-server-fastly.tar.gz', 'sbom'],
+                ]
               : []),
           ])[index]
           assert.deepEqual(
@@ -1572,6 +1655,11 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             'should verify signing bundles before any API call'
           )
           if (mode === 'bundle-verification-failure' && index === 3)
+            throw Error('Signature verification failed')
+          if (
+            subject === 'trusted-server-fastly.tar.gz' &&
+            mode === `package-${kind}-failure`
+          )
             throw Error('Signature verification failed')
           // A provenance result carries an SLSA predicate, never the SPDX.
           const result = {
@@ -1677,6 +1765,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'non-semver-tag': /Invalid repository or tag/,
         'invalid-repository': /Invalid repository or tag/,
         'invalid-source': /Invalid source commit/,
+        'package-provenance-failure': /Signature verification failed/,
+        'package-sbom-failure': /Signature verification failed/,
         'empty-bundle': /Invalid file/,
         'upload-error': /Asset upload failed/,
         'build-metadata-tag': /Invalid repository or tag/,
@@ -1747,9 +1837,14 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           'changed-companion',
           'extra-companion',
           'unsigned-companion',
+          'changed-package',
+          'missing-package',
+          'unsigned-package',
           'symlink-input',
           'signed-extra',
           'bundle-verification-failure',
+          'package-provenance-failure',
+          'package-sbom-failure',
           'bundle-sbom-mismatch',
           'bundle-sbom-duplicate',
         ].includes(mode)
@@ -1771,7 +1866,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           'should read the second release page'
         )
       // Two predicates per binary, plus the Fastly rebuild check.
-      const bundleChecks = releaseAssets.length * 2 + 1
+      const bundleChecks = releaseAssets.length * 2 + 3
       if (mode === 'api-error' || mode === 'upload-error')
         assert.equal(
           calls.length,
@@ -1819,7 +1914,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       )
       if (successful) {
         // Four files per binary, the Fastly rebuild check and SHA256SUMS.
-        assert.equal(uploaded.length, assets.length * 4 + 2)
+        assert.equal(uploaded.length, assets.length * 4 + 3)
         // Two-space lines are what `shasum -a 256 --check` accepts.
         assert.equal(
           uploaded.find((item) => item.name === 'SHA256SUMS').bytes.toString(),
@@ -2394,7 +2489,7 @@ test('workflows build, sign and publish exactly the release assets and restrict 
   // The SBOM attestation binds the SPDX document to the binary.
   assert.match(
     sign,
-    /subject-path: release-assets\/\$\{\{ matrix\.asset \}\}\n {10}sbom-path: release-assets\/\$\{\{ matrix\.asset \}\}\.spdx\.json\n/
+    /subject-path: \$\{\{ steps\.inputs\.outputs\.sbom_subjects \}\}\n {10}sbom-path: release-assets\/\$\{\{ matrix\.asset \}\}\.spdx\.json\n/
   )
   // The branch check needs every branch's history.
   assert.match(
@@ -2502,10 +2597,26 @@ test('canonical Fastly route verifies the pinned tool offline without credential
   const canonical = workflow
     .split('\n  fastly-canonical:')[1]
     .split('\n  fastly-reproduction:')[0]
-  const route = canonical
-    .split('- name: Verify the pinned manual Fastly route offline')[1]
-    ?.split('      - name: Upload canonical release artifact')[0]
-  assert.ok(route, 'should check the actual canonical binary before upload')
+  const route = readFileSync(
+    'scripts/release/validate-fastly-package.sh',
+    'utf8'
+  )
+  for (const [role, job] of [
+    ['canonical', canonical],
+    [
+      'reproduction',
+      workflow
+        .split('\n  fastly-reproduction:')[1]
+        .split('\n  fastly-comparison:')[0],
+    ],
+  ]) {
+    assert.ok(
+      job.indexOf('bash scripts/release/validate-fastly-package.sh') > 0 &&
+        job.indexOf('bash scripts/release/validate-fastly-package.sh') <
+          job.indexOf(`- name: Upload ${role} release artifact`),
+      'should validate each actual package before upload'
+    )
+  }
   assert.match(route, /\.tool-versions/)
   assert.match(route, /test "\$fastly_version" = 16\.0\.0/)
   assert.match(
@@ -2535,6 +2646,7 @@ test('canonical Fastly route verifies the pinned tool offline without credential
     'cmp trusted-server-fastly.wasm packaged.wasm',
     'cmp fastly.toml packaged.toml',
     'inspect-fastly-package',
+    'fastly compute validate --package ./trusted-server-fastly.tar.gz',
   ])
     assert.ok(route.includes(command), `should execute ${command}`)
   assert.match(route, /set -euxo pipefail/)
@@ -2546,15 +2658,15 @@ test('canonical Fastly route verifies the pinned tool offline without credential
 })
 
 test('Fastly route diagnostics preserve literal directory headers and reject malformed size fields', () => {
-  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const workflow = readFileSync(
+    'scripts/release/validate-fastly-package.sh',
+    'utf8'
+  )
   const match = workflow.match(
-    /          timeout 15 "\$6" --input-type=commonjs <<'HEADERS'\n([\s\S]*?)          HEADERS/
+    /timeout 15 "\$6" --input-type=commonjs <<'HEADERS'\n([\s\S]*?)HEADERS/
   )
   assert.ok(match, 'should inspect the actual bounded diagnostic program')
   const script = match[1]
-    .split('\n')
-    .map((line) => line.slice(10))
-    .join('\n')
   const bytes = Buffer.alloc(3 * 512)
   for (const [index, path] of ['example-app', 'example-app/bin'].entries()) {
     const header = bytes.subarray(index * 512, (index + 1) * 512)
@@ -2610,7 +2722,9 @@ test('Fastly route diagnostics preserve literal directory headers and reject mal
   )
   assert.ok(
     workflow.indexOf('Fastly raw TAR header:') <
-      workflow.indexOf('timeout 30 "$2" inspect-fastly-package'),
+      workflow.indexOf(
+        'timeout 30 "$2" inspect-fastly-package --package-dir ./pkg'
+      ),
     'should log literal headers before the unchanged strict inspector'
   )
 })

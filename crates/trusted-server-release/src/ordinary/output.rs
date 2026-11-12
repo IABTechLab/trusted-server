@@ -62,13 +62,15 @@ pub(super) fn companion(
     directory: &Path,
 ) -> Result<PathBuf, Report<ReleaseError>> {
     let value = checked.receipt();
-    let (binary, spdx) = checked.inputs();
+    let (binary, spdx, package) = checked.inputs();
     require(
         value["outcome"] == "matched"
             && value["release_qualification"] == false
             && value["canonical_sha256"] == hex::encode(Sha256::digest(binary))
             && value["canonical"]["size"].as_u64() == Some(binary.len() as u64)
-            && value["canonical"]["spdx_sha256"] == hex::encode(Sha256::digest(spdx)),
+            && value["canonical"]["spdx_sha256"] == hex::encode(Sha256::digest(spdx))
+            && value["package"]["canonical_sha256"] == hex::encode(Sha256::digest(package))
+            && value["package"]["size"].as_u64() == Some(package.len() as u64),
         "ordinary retained canonical inputs changed before companion handoff",
     )?;
     persist(directory, COMPANION, &value, Role::Companion)

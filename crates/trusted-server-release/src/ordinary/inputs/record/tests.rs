@@ -116,6 +116,13 @@ impl CaptureFixture {
             crate::ordinary::normalization::TEST_WASM,
         )
         .expect("should write final artifact");
+        fs::write(
+            files
+                .checkout
+                .join("release-assets/trusted-server-fastly.tar.gz"),
+            b"package",
+        )
+        .expect("should write package");
         let cargo_metadata = files.target.join("metadata.json");
         let cargo_messages = files.target.join("messages.jsonl");
         fs::write(

@@ -1,79 +1,18 @@
-// Closed producer stages have no production caller yet. `expect` in the binary
-// build reports a module once it becomes live; tests exercise these modules
-// directly, so the test build only allows them.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by Task 7 preparation and Task 9 recipes"
-    )
-)]
-#[cfg_attr(test, allow(dead_code))]
-mod boundary;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Task 10 composition capture is being integrated")
-)]
-#[cfg_attr(test, allow(dead_code))]
-mod composition;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "atomic output and schema helpers are consumed by later producer stages"
-    )
-)]
-#[cfg_attr(test, allow(dead_code))]
+//! Ordinary release measurement, equality and Fastly package inspection.
+
 mod documents;
 mod error;
-mod git_objects;
-#[cfg_attr(not(test), expect(dead_code, reason = "consumed by Task 9 recipes"))]
-#[cfg_attr(test, allow(dead_code))]
 mod inspect;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "production JS tool qualification remains closed")
-)]
-#[cfg_attr(test, allow(dead_code))]
-mod javascript;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by Task 7 material preparation")
-)]
-#[cfg_attr(test, allow(dead_code))]
-mod materials;
 mod ordinary;
 mod package;
-mod policy;
-mod preflight;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "production JS tool qualification remains closed")
-)]
-#[cfg_attr(test, allow(dead_code))]
-mod preparation;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by Task 7 boundary and preparation")
-)]
-#[cfg_attr(test, allow(dead_code))]
-mod process;
 #[cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "Task 9 slice 1 recipe layer has no production caller yet"
+        reason = "bounded process APIs are exercised by safety tests"
     )
 )]
-#[cfg_attr(test, allow(dead_code))]
-mod recipe;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "only preflight uses source identity today")
-)]
-#[cfg_attr(test, allow(dead_code))]
-mod source;
-mod tool_tree;
+mod process;
 
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -84,10 +23,6 @@ use clap::{Parser, Subcommand};
 use error::ReleaseError;
 use error_stack::Report;
 use error_stack::fmt::ColorMode;
-use source::CommitId;
-
-/// Exit status of `audit-inputs` when any input is incomplete.
-const INCOMPLETE_STATUS: u8 = 3;
 
 #[derive(Parser)]
 #[command(
@@ -103,17 +38,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Fail-closed release preflight over the current-directory source root.
-    Preflight {
+    /// Package the exact Wasm with the fixed service-neutral release manifest.
+    PackFastlyPackage {
         #[arg(long)]
-        cohort: PathBuf,
-        #[arg(long = "source-commit")]
-        source_commit: String,
-        #[arg(long = "require-qualified")]
-        require_qualified: bool,
+        wasm: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
-    /// Diagnostic report of pending inputs; constructs no authorization.
-    AuditInputs,
     /// Seal fixed target-scoped remapping arguments before an ordinary build.
     OrdinaryRustflags {
         #[arg(long)]
@@ -159,22 +90,6 @@ enum Command {
         #[arg(long)]
         expected_wasm_sha256: String,
     },
-    /// Private fixed in-image GNU tool measurement; supplies no authority.
-    #[command(hide = true)]
-    GnuImageMeasurement,
-    /// Network-denial socket probe used by the boundary controls.
-    BoundaryProbe {
-        #[command(subcommand)]
-        probe: ProbeCommand,
-    },
-}
-
-#[derive(Subcommand)]
-enum ProbeCommand {
-    /// Attempts one TCP connect to a literal loopback `IP:PORT`, prints
-    /// `connected` (exit 0) or `denied errno=<n>` (exit 3), and does nothing
-    /// else.
-    Connect { address: String },
 }
 
 /// Writes one human-readable diagnostic line to stderr.
@@ -210,16 +125,10 @@ fn run(
         Report::new(ReleaseError::Usage).attach(format!("invalid invocation: {}", error.kind()))
     })?;
     match cli.command {
-        Command::Preflight {
-            cohort,
-            source_commit,
-            require_qualified,
-        } => {
-            let commit = CommitId::parse(&source_commit)?;
-            preflight::run_preflight(inherited, &cohort, &commit, require_qualified)?;
+        Command::PackFastlyPackage { wasm, output } => {
+            package::build_package(&wasm, &output)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::AuditInputs => audit_inputs(),
         Command::OrdinaryRustflags {
             checkout,
             target,
@@ -273,50 +182,5 @@ fn run(
             })?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::GnuImageMeasurement => {
-            let bytes = recipe::gnu::helper_measurement()?;
-            std::io::stdout().write_all(&bytes).map_err(|error| {
-                Report::new(ReleaseError::Recipe)
-                    .attach(format!("cannot write GNU measurement: {error}"))
-            })?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::BoundaryProbe {
-            probe: ProbeCommand::Connect { address },
-        } => boundary_probe(&address),
     }
-}
-
-/// Runs the single-connect probe and reports its real outcome.
-fn boundary_probe(address: &str) -> Result<ExitCode, Report<ReleaseError>> {
-    let address = boundary::parse_loopback(address)?;
-    let report = boundary::connect_probe(address)?;
-    std::io::stdout()
-        .write_all(format!("{report}\n").as_bytes())
-        .map_err(|error| {
-            Report::new(ReleaseError::Boundary)
-                .attach(format!("cannot write probe report: {error}"))
-        })?;
-    Ok(match report {
-        boundary::ProbeReport::Connected => ExitCode::SUCCESS,
-        boundary::ProbeReport::Denied { .. } => ExitCode::from(boundary::DENIED_STATUS),
-    })
-}
-
-fn audit_inputs() -> Result<ExitCode, Report<ReleaseError>> {
-    let root = preflight::source_root()?;
-    let inputs = policy::load_inputs(&root)?;
-    let audit = policy::audit_inputs(&inputs);
-    let bytes = documents::canonical_json(&audit.to_json(), documents::Role::Metadata)?;
-    std::io::stdout().write_all(&bytes).map_err(|error| {
-        Report::new(ReleaseError::Incomplete).attach(format!("cannot write audit report: {error}"))
-    })?;
-    if audit.is_complete() {
-        return Ok(ExitCode::SUCCESS);
-    }
-    notice(format_args!(
-        "{}: release inputs are incomplete; this diagnostic authorizes nothing",
-        ReleaseError::Incomplete
-    ));
-    Ok(ExitCode::from(INCOMPLETE_STATUS))
 }

@@ -8,7 +8,9 @@ use std::path::Path;
 
 use super::archive::{self, Profile};
 use super::run::{Archive, Bindings, Build};
-use super::{ASSET, Equality, Observation, compare, diagnostic, observation, require, require_as};
+use super::{
+    ASSET, Equality, Observation, PACKAGE, compare, diagnostic, observation, require, require_as,
+};
 use crate::error::ReleaseError;
 
 /// Four exact-ID downloads in canonical build/observation, reproduction order.
@@ -19,6 +21,7 @@ pub(super) struct Checked {
     bindings: Bindings,
     equality: Equality,
     binary: Vec<u8>,
+    package: Vec<u8>,
     spdx: Vec<u8>,
     reproduction_spdx_sha256: String,
 }
@@ -43,6 +46,7 @@ impl Checked {
             "js_inventory_sha256": observed["js_inventory_sha256"],
             "tools": observed["tools"],
             "outcome": "matched",
+            "package": {"asset": PACKAGE,"size":self.package.len(),"canonical_sha256":hex::encode(Sha256::digest(&self.package)),"reproduction_sha256":hex::encode(Sha256::digest(&self.package)),"manifest_sha256":hex::encode(Sha256::digest(crate::package::RELEASE_MANIFEST))},
             "canonical_sha256": self.equality.sha256(),
             "reproduction_sha256": self.equality.sha256(),
             "canonical": self.build_record(canonical, &self.equality.canonical, &hex::encode(Sha256::digest(&self.spdx))),
@@ -69,12 +73,13 @@ impl Checked {
             "size": self.equality.size(),
             "sha256": observation.facts.artifact.sha256,
             "spdx_sha256": spdx,
+            "package": {"size":observation.facts.package.size,"sha256":observation.facts.package.sha256},
         })
     }
 
     /// Exact canonical inputs retained from the checked build archive.
-    pub(super) fn inputs(&self) -> (&[u8], &[u8]) {
-        (&self.binary, &self.spdx)
+    pub(super) fn inputs(&self) -> (&[u8], &[u8], &[u8]) {
+        (&self.binary, &self.spdx, &self.package)
     }
 }
 
@@ -161,6 +166,39 @@ pub(super) fn check(
             )
         })?;
     }
+    for (observed, bytes) in [
+        (&equality.canonical, &left[PACKAGE]),
+        (&equality.reproduction, &right[PACKAGE]),
+    ] {
+        require_as(
+            ReleaseError::RebuildMismatch,
+            observed.facts.package.size == bytes.len() as u64
+                && observed.facts.package.sha256 == hex::encode(Sha256::digest(bytes)),
+            "ordinary deployment package changed after observation",
+        )
+        .map_err(|report| {
+            report.attach(
+                diagnostic::Failure::new(diagnostic::Code::DigestMismatch)
+                    .binaries(&left[PACKAGE], &right[PACKAGE])
+                    .package(),
+            )
+        })?;
+    }
+    if left[PACKAGE] != right[PACKAGE] {
+        let offset = left[PACKAGE]
+            .iter()
+            .zip(&right[PACKAGE])
+            .position(|(left, right)| left != right)
+            .unwrap_or(left[PACKAGE].len().min(right[PACKAGE].len()));
+        return Err(Report::new(ReleaseError::RebuildMismatch)
+            .attach("ordinary deployment package final-byte mismatch")
+            .attach(
+                diagnostic::Failure::mismatch(&left[PACKAGE], &right[PACKAGE], offset).package(),
+            ));
+    }
+    let package = left
+        .remove(PACKAGE)
+        .ok_or_else(|| Report::new(ReleaseError::Document))?;
     let spdx_name = format!("{ASSET}.spdx.json");
     let reproduction_spdx_sha256 = hex::encode(Sha256::digest(&right[&spdx_name]));
     // Exact ZIP membership is already checked. SPDX semantics remain enforced
@@ -175,6 +213,7 @@ pub(super) fn check(
         bindings,
         equality,
         binary,
+        package,
         spdx,
         reproduction_spdx_sha256,
     })
