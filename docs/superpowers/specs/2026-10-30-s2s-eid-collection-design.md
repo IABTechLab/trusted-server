@@ -1506,7 +1506,7 @@ examples use placeholders.
 ### 12.2 Logs and metrics
 
 Per provider and navigation, one outcome: `found`, `no_match`, `timeout`,
-`http_error`, `transport_error`, `request_error`, `invalid_response`, `skipped_consent`,
+`http_error`, `transport_error`, `request_error`, `invalid_response`, `skipped_no_row`, `skipped_consent`,
 `skipped_not_due`, `skipped_input`, `skipped_rate_limited`, `skipped_opted_out`,
 `destination_rejected`; plus counts of
 entries and UIDs kept and dropped by reason. The page-load write emits no

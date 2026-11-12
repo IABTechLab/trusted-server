@@ -467,9 +467,8 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         // row (which may hide a tombstone) or no row at all skips every
         // provider: a lookup discloses the EC ID before finalize could
         // decline it, and an EC without a row may never be issued.
-        let readable = !matches!(lookup.snapshot, EcKvSnapshot::Failed { .. });
-        let consented = readable
-            && ec_consent_granted(lookup.consent)
+        let has_row = !matches!(lookup.snapshot, EcKvSnapshot::Failed { .. }) && entry.is_some();
+        let consented = ec_consent_granted(lookup.consent)
             && allows_eid_persistence(lookup.consent)
             && entry.is_some_and(|entry| entry.consent.ok);
         let deadline = Deadline::after(self.budget);
@@ -484,6 +483,10 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 .policy
                 .tcf_vendor_id
                 .is_some_and(|vendor| tcf_vendor_consent_denied(lookup.consent, vendor));
+            if !has_row {
+                pending.early.push(skip(SkipReason::NoRow));
+                continue;
+            }
             if !consented || vendor_denied {
                 pending.early.push(skip(SkipReason::Consent));
                 continue;
@@ -957,7 +960,7 @@ mod tests {
                 .next()
                 .expect("should report the provider")
                 .status,
-            LookupStatus::Skipped(SkipReason::Consent),
+            LookupStatus::Skipped(SkipReason::NoRow),
             "should skip a provider for an EC with no row"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
@@ -1110,7 +1113,7 @@ mod tests {
 
         assert_eq!(
             only_status(&results),
-            LookupStatus::Skipped(SkipReason::Consent),
+            LookupStatus::Skipped(SkipReason::NoRow),
             "should skip when the row could not be read"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");

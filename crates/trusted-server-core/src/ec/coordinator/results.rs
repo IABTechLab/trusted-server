@@ -51,6 +51,8 @@ impl DropCounts {
 /// Why a provider was not called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
+    /// The EC has no readable row yet, so it may never be issued.
+    NoRow,
     /// Consent does not permit this provider.
     Consent,
     /// None of its sources is due.
@@ -104,6 +106,7 @@ impl LookupStatus {
             Self::RequestFailed => "request_error",
             Self::TransportFailed => "transport_error",
             Self::InvalidResponse => "invalid_response",
+            Self::Skipped(SkipReason::NoRow) => "skipped_no_row",
             Self::Skipped(SkipReason::Consent) => "skipped_consent",
             Self::Skipped(SkipReason::NotDue) => "skipped_not_due",
             Self::Skipped(SkipReason::Input) => "skipped_input",
