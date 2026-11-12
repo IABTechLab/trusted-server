@@ -103,6 +103,19 @@ pub trait IdentityProvider: Send + Sync {
         let _ = source;
         false
     }
+
+    /// Whether a stored UID that outlives the one a cookie carries is kept
+    /// over the cookie's.
+    ///
+    /// For a provider that refreshes its IDs server side, a refresh updates
+    /// the row but not the browser's cookie, so the next navigation's older
+    /// cookie would otherwise roll the refreshed UID back. When this returns
+    /// `true`, a cookie UID whose absolute expiry is earlier than a live
+    /// stored UID's is ignored; a cookie opt-out still wins. The default
+    /// always takes the cookie.
+    fn keeps_fresher_stored_uids(&self) -> bool {
+        false
+    }
 }
 
 impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
@@ -137,6 +150,10 @@ impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
 
     fn excluded_where_gdpr_applies(&self, source: &SourceDomain) -> bool {
         (**self).excluded_where_gdpr_applies(source)
+    }
+
+    fn keeps_fresher_stored_uids(&self) -> bool {
+        (**self).keeps_fresher_stored_uids()
     }
 }
 
