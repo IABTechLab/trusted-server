@@ -701,8 +701,9 @@ Post one `CREATOR:` comment per PR with its Part C item and its ticket, with
 `gh pr comment <N> --repo IABTechLab/trusted-server --body-file <file>`. Use
 `Part of #<ticket>` for #1532 to #1529, #1526 to #1522, #1506 to #1507, #1531
 to A1, #1536, #1537 and #1566 to A2, #1535 to T19 and T20, #1539 and #1538 to
-A6, and #1540 to A7. Use `Blocks #<ticket>` for the provider stack: #1487
-blocks T11, #1488 blocks T3, T13 and T22, and #1489 blocks T15, T19 and A10.
+A6, and #1540 to A7. Use `Blocks #<ticket>` for the provider stack, as
+Part B's Blocked by cells say: #1487 blocks T11, #1246, #1549 and #1553;
+#1488 blocks T3, T13, T22 and #1555; and #1489 blocks T2, T15, T21 and #1551.
 #1525 and #1541 get their Part C item with no ticket; #1503 has no item. For
 proposed closures, ask the author; do not close another author's PR.
 Expected: one comment URL per PR.
