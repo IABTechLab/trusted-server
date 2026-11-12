@@ -10113,11 +10113,15 @@ mod tests {
             {"source": "other.example.com", "id": "other-uid", "atype": 1}
         ]);
         let mut jar = CookieJar::new();
-        jar.add_original(cookie::Cookie::new(
-            COOKIE_TS_EIDS,
-            base64::engine::general_purpose::STANDARD
-                .encode(serde_json::to_vec(&cookie_eids).expect("should serialize")),
-        ));
+        jar.add_original(
+            cookie::Cookie::build((
+                COOKIE_TS_EIDS,
+                base64::engine::general_purpose::STANDARD
+                    .encode(serde_json::to_vec(&cookie_eids).expect("should serialize")),
+            ))
+            .secure(true)
+            .build(),
+        );
         let ec_id = format!("{}.navvnd", "a".repeat(64));
         let ec_context = EcContext::new_for_test(Some(ec_id.clone()), vendor_42_denied_consent());
         let services = noop_services();
