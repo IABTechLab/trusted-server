@@ -930,13 +930,15 @@ stored UIDs may still be live. Without `tcf_vendor_id`, a provider is gated by
 the EID-persistence purposes alone, so set it for any provider that has a TCF
 vendor ID.
 
-Identity providers run only on Fastly. `ts config validate`, `push` and `diff`
-build every enabled provider and reject one whose `kind` or `settings` is
-invalid. They do not know the target adapter: the Axum, Cloudflare and Spin
-adapters refuse to start when an enabled provider is configured, so do not push
-an enabled provider to those services. On Fastly, an enabled
-provider whose `kind` this build does not include, or whose `settings` its kind
-rejects, also fails startup. Lookups always verify the provider's TLS
+Identity providers run on Fastly and on the Axum dev server. `ts config
+validate`, `push` and `diff` build every enabled provider and reject one whose
+`kind` or `settings` is invalid. `validate` does not know the target adapter;
+`push` and `diff` reject an enabled provider for `--adapter cloudflare` or
+`spin`, because those adapters refuse to start with one. On Fastly and
+Axum, an enabled provider whose `kind` this build does not include, or whose
+`settings` its kind rejects, also fails startup. The Axum dev server keeps the
+identity graph named by `ec.ec_store` in process memory, so stored IDs are lost
+when it exits. Lookups always verify the provider's TLS
 certificate, whatever `proxy.certificate_check` says.
 
 A provider owns its `sources`: its results replace whatever the row holds for
@@ -1002,14 +1004,15 @@ navigation; a row recovered from an orphaned cookie gets a newly minted EC, so
 its lookups wait for the next navigation. They also run behind an error
 response, including a `502` that Trusted Server generates when the origin is
 unreachable. Their results reach the row in a follow-up write. Providers run
-only on Fastly.
+on Fastly and on the Axum dev server.
 
 ::: warning Rate limit granularity
 `rate_limit_per_hour` is counted per EC hash, which is derived from the client
-IP, so ECs behind one IP (a NAT or carrier gateway) share the budget. On
-Fastly it is enforced as a per-minute budget rounded up to at least one lookup
-per minute, so any value below 60 behaves like 60 per hour. Values of 60 and
-above are enforced as `ceil(value / 60)` per minute.
+IP, so ECs behind one IP (a NAT or carrier gateway) share the budget. It is
+enforced as a per-minute budget rounded up to at least one lookup per minute,
+so any value below 60 behaves like 60 per hour. Values of 60 and above are
+enforced as `ceil(value / 60)` per minute. On the Axum dev server every local
+client usually shares the loopback IP, and so one budget.
 :::
 
 **Validation**: configuration validation fails when an enabled provider's

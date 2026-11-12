@@ -121,7 +121,7 @@ pull_sync_concurrency = 3
 # batch_rate_limit = 60      # max batch-sync requests/min (default 60)
 # pull_sync_enabled = false  # default false
 
-# Optional server-side identity providers (Fastly only), looked up on publisher
+# Optional server-side identity providers (Fastly and Axum), looked up on publisher
 # navigations before the origin fetch. Their budgets are set in [ec] above.
 #
 # [[ec.identity_providers]]
