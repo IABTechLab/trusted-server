@@ -541,7 +541,10 @@ Decided:
 - **DEC-2 MVP** (user, 2026-11-12). Fastly and Axum are the MVP: plan waves 0
   to 9. Cloudflare, Spin and the decision-gated work follow it.
 - **DEC-3 Shared record store** (user, 2026-11-11). The EC record runs on one
-  `EcKvStore` over EdgeZero's `KvStore`, with no per-adapter backends.
+  `EcKvStore` over EdgeZero's `KvStore`, with no per-adapter backends. The
+  user reaffirmed it on 2026-11-12: Axum's record uses EdgeZero's pluggable
+  `KvStore` adapters (DynamoDB and celld through EZI-2b), never an Axum-only
+  store such as #1536's.
 - **DEC-4 Platform order** (user, 2026-11-12). Fastly, then Axum, then
   Cloudflare, then Spin. Fastly and Axum (the MVP, DEC-2) must ship complete
   without any Cloudflare or Spin work, so every ticket and release is split by
@@ -575,10 +578,10 @@ Decided:
 
 Proposed and assumed by the plan until confirmed:
 
-- **DEC-6 Base and store path for Axum.** Forward-port the RC line to main and
-  wait for EZI-2b (proposed), rather than back-port the provider stack to the
-  RC line or port #1536's adapter-local store first. Applying each provider
-  stack to the RC tag from its main fork point conflicts in 13 to 23 files.
+- **DEC-6 Base for the Axum line.** Forward-port the RC line to main by
+  restacking its units on #1506 (proposed), rather than back-port the provider
+  stack to the RC line. Applying each provider stack to the RC tag from its
+  main fork point conflicts in 13 to 23 files. The store path follows DEC-3.
   Blocks A1, A2, A4, A6, A7.
 
 Open:
@@ -588,7 +591,8 @@ Open:
   EZI-2s, R3, T8 and T9.
 - **DEC-9 LiveRamp Custom ID.** The current value is the IP-derived EC prefix,
   shared by everyone behind one IP. Blocks enabling LiveRamp in #1488, and
-  #1245. LiveRamp is in the MVP (DEC-10), so this is needed before launch.
+  #1245. LiveRamp is in the MVP (DEC-10), so this is needed before launch;
+  the user is getting a LiveRamp test setup to settle it.
 - **DEC-12 EC EID source.** Which source name the EC uses, and whether it keeps
   going out as `user.id`. Blocks #1549; no other ticket until decided.
 - **DEC-13 `ts-ec` refresh** for returning readers. Blocks T16.
@@ -685,3 +689,7 @@ mirrored providers (DEC-10), which makes DEC-9 a launch need, and required
 #1535's Sourcepoint consent sync. ID-9's route now also takes later consent
 changes, so #1535's separate per-adapter `/_ts/consent` route folds into it
 (T19, T20).
+
+The user then reaffirmed DEC-3 for Axum: the record uses EdgeZero's pluggable
+`KvStore` adapters. DEC-6 now covers only the base, restacking the RC units on
+#1506, and DEC-9 waits on a LiveRamp test setup.
