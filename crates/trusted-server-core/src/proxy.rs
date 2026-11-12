@@ -6266,6 +6266,60 @@ mod tests {
     }
 
     #[test]
+    fn handle_asset_proxy_request_keeps_io_for_signed_optimized_head() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, Vec::new());
+            stub.push_response(200, Vec::new());
+            let services = build_services_with_secret_and_http_client(
+                HashMapSecretStore::new(test_s3_secrets()),
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            );
+            let mut settings = create_test_settings();
+            settings.image_optimizer = ImageOptimizerSettings {
+                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
+            };
+
+            handle_asset_proxy_request(
+                &settings,
+                &services,
+                build_http_request(
+                    Method::HEAD,
+                    "https://www.example.com/.images/foo.jpg?profile=medium",
+                ),
+                &test_s3_image_optimizer_route(),
+            )
+            .await
+            .expect("should proxy the optimized HEAD");
+
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["HEAD", "HEAD"],
+                "optimized HEAD should preflight before the IO request"
+            );
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Bypass, PlatformCacheIntent::Default],
+                "optimized HEAD must not use pass, which disables IO on Fastly"
+            );
+            let options = stub.recorded_image_optimizer_options();
+            assert_eq!(
+                options.len(),
+                2,
+                "optimized HEAD should send the preflight and final IO request"
+            );
+            assert!(
+                options[0].is_none(),
+                "preflight should not attach IO metadata"
+            );
+            assert!(
+                options[1].is_some(),
+                "final optimized HEAD should attach IO metadata"
+            );
+        });
+    }
+
+    #[test]
     fn handle_asset_proxy_request_returns_s3_head_errors_without_cache_or_io() {
         futures::executor::block_on(async {
             for status in [403, 404] {
