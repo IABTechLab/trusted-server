@@ -9,10 +9,7 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{
-    ConsentContext, consent_allows_server_side_auction, gate_eids_by_consent,
-    tcf_vendor_consent_denied,
-};
+use crate::consent::{ConsentContext, consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
@@ -658,8 +655,7 @@ pub(crate) fn drop_vendor_denied_client_eids(
     eids.retain(|eid| {
         !registry
             .get(&eid.source)
-            .and_then(|partner| partner.owner_tcf_vendor_id)
-            .is_some_and(|vendor| tcf_vendor_consent_denied(consent, vendor))
+            .is_some_and(|partner| partner.owner_vendor_consent_denied(consent))
     });
     Some(eids)
 }

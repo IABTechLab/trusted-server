@@ -561,7 +561,7 @@ mod tests {
             pull_sync_rate_limit: 20,
             ts_pull_token: Some(Redacted::new("token".to_owned())),
             provider_owned: false,
-            owner_tcf_vendor_id: None,
+            owner_tcf_vendor_ids: Vec::new(),
         }
     }
 

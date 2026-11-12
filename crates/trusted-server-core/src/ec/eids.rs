@@ -7,7 +7,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use error_stack::{Report, ResultExt as _};
 
-use crate::consent::{ConsentContext, tcf_vendor_consent_denied};
+use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 
@@ -114,10 +114,7 @@ impl KvEntry {
     ) -> impl Iterator<Item = EidView<'row>> + 'row {
         self.ids.iter().flat_map(move |(source, record)| {
             let partner = registry.get(source).filter(|partner| {
-                partner.bidstream_enabled
-                    && !partner
-                        .owner_tcf_vendor_id
-                        .is_some_and(|vendor| tcf_vendor_consent_denied(consent, vendor))
+                partner.bidstream_enabled && !partner.owner_vendor_consent_denied(consent)
             });
             partner
                 .into_iter()

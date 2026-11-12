@@ -9,6 +9,7 @@ use std::num::NonZeroU16;
 
 use error_stack::{Report, ResultExt as _};
 
+use crate::consent::{ConsentContext, tcf_vendor_consent_denied};
 use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
 use crate::settings::{Ec, EcPartner};
@@ -51,9 +52,21 @@ pub struct PartnerConfig {
     /// Whether an enabled identity provider claims this source. Browser
     /// ingest skips it and batch sync rejects it.
     pub provider_owned: bool,
-    /// TCF vendor ID of the provider that owns this source, when configured.
-    /// Its UIDs leave the server only while that vendor has consent.
-    pub owner_tcf_vendor_id: Option<NonZeroU16>,
+    /// TCF vendor IDs of the configured providers, enabled or disabled, that
+    /// claim this source. Its UIDs leave the server only while every one of
+    /// these vendors has consent.
+    pub owner_tcf_vendor_ids: Vec<NonZeroU16>,
+}
+
+impl PartnerConfig {
+    /// Whether the effective TCF consent denies any vendor that gates this
+    /// source.
+    #[must_use]
+    pub fn owner_vendor_consent_denied(&self, consent: &ConsentContext) -> bool {
+        self.owner_tcf_vendor_ids
+            .iter()
+            .any(|vendor| tcf_vendor_consent_denied(consent, *vendor))
+    }
 }
 
 /// In-memory partner registry with O(1) lookups by source domain and API key hash.
@@ -305,25 +318,22 @@ impl PartnerRegistry {
         match self.by_source_domain.get_mut(&normalized) {
             Some(partner) => {
                 partner.provider_owned = true;
-                partner.owner_tcf_vendor_id = tcf_vendor_id;
+                partner.owner_tcf_vendor_ids.extend(tcf_vendor_id);
                 true
             }
             None => false,
         }
     }
 
-    /// Records a disabled provider's TCF vendor ID for `source` unless an
-    /// enabled provider already owns it, so egress still checks that vendor's
-    /// consent for the UIDs the provider stored.
+    /// Adds a disabled provider's TCF vendor ID to the gate for `source`, even
+    /// when an enabled provider now owns it, so egress still checks that
+    /// vendor's consent for the UIDs the disabled provider stored.
     fn keep_vendor_gate(&mut self, source: &str, tcf_vendor_id: Option<NonZeroU16>) {
         let Ok(normalized) = normalize_partner_source_domain(source) else {
             return;
         };
-        if let Some(partner) = self.by_source_domain.get_mut(&normalized)
-            && !partner.provider_owned
-            && partner.owner_tcf_vendor_id.is_none()
-        {
-            partner.owner_tcf_vendor_id = tcf_vendor_id;
+        if let Some(partner) = self.by_source_domain.get_mut(&normalized) {
+            partner.owner_tcf_vendor_ids.extend(tcf_vendor_id);
         }
     }
 
@@ -410,7 +420,7 @@ fn build_partner_config(
         pull_sync_rate_limit: partner.pull_sync_rate_limit,
         ts_pull_token: partner.ts_pull_token.clone(),
         provider_owned: false,
-        owner_tcf_vendor_id: None,
+        owner_tcf_vendor_ids: Vec::new(),
     }
 }
 
@@ -573,10 +583,67 @@ mod tests {
         assert_eq!(
             registry
                 .get("other.example.com")
-                .and_then(|partner| partner.owner_tcf_vendor_id)
-                .map(NonZeroU16::get),
-            Some(42),
+                .map(|partner| partner.owner_tcf_vendor_ids.clone()),
+            Some(vec![NonZeroU16::new(42).expect("should be non-zero")]),
             "should keep the disabled provider's vendor consent gate"
+        );
+    }
+
+    #[test]
+    fn from_ec_with_kinds_keeps_a_disabled_providers_gate_on_a_reassigned_source() {
+        // Arrange: provider `old` (vendor 42) is disabled and its source is now
+        // claimed by enabled provider `new` (vendor 7, consented).
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        ec.partners = vec![make_partner(
+            "ids.example.com",
+            &valid_api_token("ids-partner"),
+        )];
+        ec.identity_providers = vec![
+            toml::from_str(
+                "id = \"new\"\nkind = \"k\"\ntcf_vendor_id = 7\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse enabled provider"),
+            toml::from_str(
+                "id = \"old\"\nkind = \"k\"\nenabled = false\ntcf_vendor_id = 42\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse disabled provider"),
+        ];
+        let consent = ConsentContext {
+            gdpr_applies: true,
+            tcf: Some(crate::consent::types::TcfConsent {
+                version: 2,
+                cmp_id: 1,
+                cmp_version: 1,
+                consent_screen: 0,
+                consent_language: "EN".to_owned(),
+                vendor_list_version: 1,
+                tcf_policy_version: 4,
+                created_ds: 0,
+                last_updated_ds: 0,
+                purpose_consents: vec![true; 24],
+                purpose_legitimate_interests: vec![false; 24],
+                vendor_consents: vec![7],
+                vendor_legitimate_interests: Vec::new(),
+                special_feature_opt_ins: vec![false; 12],
+            }),
+            ..ConsentContext::default()
+        };
+
+        // Act
+        let registry = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
+            .expect("should build registry");
+        let partner = registry
+            .get("ids.example.com")
+            .expect("should find the partner");
+
+        // Assert
+        assert!(
+            partner.provider_owned,
+            "should stay owned by the enabled provider"
+        );
+        assert!(
+            partner.owner_vendor_consent_denied(&consent),
+            "should withhold the source while the disabled provider's vendor lacks consent"
         );
     }
 

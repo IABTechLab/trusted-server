@@ -11,7 +11,6 @@ use url::Url;
 
 use super::auth::authenticate_bearer;
 use super::consent::ec_consent_granted;
-use crate::consent::tcf_vendor_consent_denied;
 use crate::error::TrustedServerError;
 use crate::openrtb::Eid;
 use crate::settings::Settings;
@@ -102,9 +101,7 @@ pub fn handle_identify(
                 // provider-owned source is withheld while its owner lacks TCF
                 // vendor consent, as in the bidstream.
                 let now = UnixSeconds::new(current_timestamp());
-                let vendor_denied = partner
-                    .owner_tcf_vendor_id
-                    .is_some_and(|vendor| tcf_vendor_consent_denied(ec_context.consent(), vendor));
+                let vendor_denied = partner.owner_vendor_consent_denied(ec_context.consent());
                 eid = entry
                     .ids
                     .get(&partner.source_domain)
