@@ -1818,4 +1818,4 @@ clock edges and privacy leaks.
   token is logged.
 - Non-blocking, no change: a UID2 refresh that keeps failing is retried on
   every navigation until the token expires unless `rate_limit_per_hour` is
-  set, as round 2 of #1488's review accepted.
+  set. The fix for overdue UID2 refresh state (834af2591) chose this bound.
