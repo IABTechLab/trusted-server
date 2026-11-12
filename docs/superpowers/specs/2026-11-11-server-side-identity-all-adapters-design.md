@@ -288,39 +288,40 @@ marks the record contract and geo as supported.
 - **ID-9 EC route.** A same-origin route, `/_ts/api/v1/ec` by default, lets the
   script Trusted Server injects into proxied pages report consent and receive
   identity, so a reader who consents after the page loads gets an EC on that
-  page view instead of the next navigation. A `POST` whose `Origin` matches
-  the page mints the EC when the reader has none and consent allows, creates
-  the record, runs the providers as a navigation does, and sets `ts-ec`, the
+  page view instead of the next navigation. A `POST` whose `Origin` matches the
+  page mints the EC when the reader has none and consent allows, creates the
+  record, runs the providers as a navigation does, and sets `ts-ec`, the
   SharedID cookie and the mirror cookie on its own response. It carries the
-  consent strings the script reads from the CMP, the TCF string from
-  `__tcfapi` and the GPP string from `__gpp` (Sourcepoint's capture from #1535
-  where present), which replace the consent cookies for that request; a
-  withdrawal expires `ts-ec`, the SharedID cookie and the mirror cookie and
-  tombstones the record in that response. The `POST` answers with JSON holding
-  exactly what WB-4 would put in the mirror cookie for that request, and the
-  SharedID only under SID-2 and SID-6; the script merges it into Prebid, and
-  nothing else in the record reaches the page. A plain `GET` answers Prebid's
-  SharedID `pixelUrl` with an empty 204: it never mints, calls a provider or
-  changes consent, and only re-sets an existing SharedID cookie from the record
-  (WB-3). The script keeps at most one call in flight and sends the latest
-  consent after it settles, so a withdrawal always lands after any grant in
-  progress. Every response carries `Cache-Control: no-store`; a rate limit on
-  the route waits with ID-6 (DEC-15). The route is served from the page's own
-  host, which WebKit's cap on cookies from non-document responses exempts when
-  the IP matches the page's (read from WebKit's source; the Accept tests it).
-  Accept: on Fastly and Axum, a consented same-origin `POST` with no `ts-ec`
-  creates the record and sets `ts-ec` and the SharedID cookie in that
-  response; its JSON omits a non-mirrored partner's ID, an ID whose vendor's
-  TCF consent is denied and an expired ID; a withdrawal issued while a grant
-  call with no EC and delayed providers is in flight leaves no identity cookie
-  and no live record; a cross-site `Origin`, a `GET` and a client ID-7
-  refuses mint nothing and call no provider; an unchanged returning reader gets
-  no `Set-Cookie`; and in Safari, `ts-ec` and the SharedID cookie set by the
-  route keep their one-year `Max-Age` on Fastly and on Axum behind CloudFront.
-  State: on main only a real-browser navigation through the publisher proxy
-  mints an EC, and no such route exists. #1535 (RC line) posts Sourcepoint's
-  GPP string to a separate, non-minting `/_ts/consent` route, wired into each
-  adapter's router.
+  consent strings the script reads from the CMP, the TCF string from `__tcfapi`
+  and the GPP string from `__gpp` (Sourcepoint's capture from #1535 where
+  present), which replace the consent cookies for that request; a withdrawal
+  expires `ts-ec`, the SharedID cookie and the mirror cookie and tombstones the
+  record in that response. The `POST` answers with JSON holding exactly what
+  WB-4 would put in the mirror cookie for that request, and the SharedID only
+  under SID-2 and SID-6; the script merges it into Prebid, and nothing else in
+  the record reaches the page. A plain `GET` answers Prebid's SharedID
+  `pixelUrl` with an empty 204: it never mints, calls a provider or changes
+  consent, and only re-sets an existing SharedID cookie from the record (WB-3).
+  The script keeps at most one call in flight and sends the latest consent after
+  it settles, so a withdrawal always lands after any grant in progress; it
+  discards a result that arrives while a newer consent change is waiting, and a
+  withdrawal removes the IDs it merged into Prebid. Every response carries
+  `Cache-Control: no-store`; a rate limit on the route waits with ID-6 (DEC-15).
+  The route is served from the page's own host, which WebKit's cap on cookies
+  from non-document responses exempts when the IP matches the page's (read from
+  WebKit's source; the Accept tests it). Accept: on Fastly and Axum, a consented
+  same-origin `POST` with no `ts-ec` creates the record and sets `ts-ec` and the
+  SharedID cookie in that response; its JSON omits a non-mirrored partner's ID,
+  an ID whose vendor's TCF consent is denied and an expired ID; a withdrawal
+  issued while a grant call with no EC and delayed providers is in flight leaves
+  no identity cookie, no live record and no ID in Prebid; a cross-site `Origin`,
+  a `GET` and a client ID-7 refuses mint nothing and call no provider; an
+  unchanged returning reader gets no `Set-Cookie`; and in Safari, `ts-ec` and
+  the SharedID cookie set by the route keep their one-year `Max-Age` on Fastly
+  and on Axum behind CloudFront. State: on main only a real-browser navigation
+  through the publisher proxy mints an EC, and no such route exists. #1535 (RC
+  line) posts Sourcepoint's GPP string to a separate, non-minting `/_ts/consent`
+  route, wired into each adapter's router.
 
 ### SH: Shared state passed the right way
 
@@ -816,8 +817,10 @@ Reviews 5881124556 and 5881450878 at `c4417b7f8` reviewed those decisions and
 opened 66 threads; four of the second duplicate the first (the LiveRamp gate,
 Fastly's limiter under T21, withdrawal ordering and the EC route's JSON). Three
 were blocking: LiveRamp had no MVP ticket (T22 now checks it, gated by DEC-9),
-the record contract asked DynamoDB for strong listing across partitions
-(EZI-2a now lists strongly within a partition, and AX-4 partitions by listing
-prefix), and the EC route's JSON exposed every EID (it now carries only the
-mirror's view). The revision after it addresses every open thread, including
-thread 37; each thread holds its disposition.
+the record contract asked DynamoDB for strong listing across partitions (EZI-2a
+now lists strongly within a partition, and AX-4 partitions by listing prefix),
+and the EC route's JSON exposed every EID (it now carries only the mirror's
+view). EZI-2b now covers Axum only, with the portable providers in EZI-2p after
+the MVP, and R2 splits so providers no longer wait on JA4 (R2b). The revision
+after it addresses every open thread, including thread 37; each thread holds its
+disposition.
