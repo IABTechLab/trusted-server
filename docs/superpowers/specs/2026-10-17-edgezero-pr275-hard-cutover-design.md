@@ -3,9 +3,10 @@
 **Date:** 2026-10-17, rewritten 2026-11-05, updated 2026-11-06, 2026-11-07,
 2026-11-08 and 2026-11-11
 
-**Status:** Draft. Five agent review rounds, then a 2026-11-06 update against
-PR 275 head `9b31a697` and its review, and the 2026-11-07 fixes for GitHub
-reviews 5810751514 and 5815168335. The maintainer answered Q1 to Q7 on
+**Status:** Approved at `85f5ca3d9`, with the corrections the implementation
+found folded in since. Five agent review rounds, then a 2026-11-06 update
+against PR 275 head `9b31a697` and its review, and the 2026-11-07 fixes for
+GitHub reviews 5810751514 and 5815168335. The maintainer answered Q1 to Q7 on
 2026-11-08 ([Maintainer answers](#maintainer-answers)).
 
 **EdgeZero target:** `IABTechLab/edgezero` PR 275 (branch
@@ -308,9 +309,10 @@ Tests that drive a router with `oneshot` have no adapter to insert a client.
 `ctx.http_client()` reads only request extensions (`context.rs:568-572`), and
 `oneshot` adds none (`edgezero:crates/edgezero-core/src/router.rs:662-668`).
 H's Cloudflare and Spin clients are wasm-only, so native tests have no default
-either. `test_support.rs` gains a helper that inserts a scripted `HttpClient`
-into a request's extensions. Unless a test passes a script, that client fails
-every request. Every `oneshot` route helper uses it: the Fastly `route` helper
+either. `test_support.rs` gains `insert_outbound_client`, which inserts any
+`HttpClient` the test passes into a request's extensions. The route helpers
+pass a scripted client, which fails every request the test did not script.
+Every `oneshot` route helper uses it: the Fastly `route` helper
 (`crates/trusted-server-adapter-fastly/src/app.rs:1497-1510`) and the Cloudflare
 and Spin `route` helpers in `tests/routes.rs`. The parity `cf_*` and `spin_*`
 helpers (`crates/trusted-server-integration-tests/tests/parity.rs:132-315`) and
@@ -439,7 +441,9 @@ cache make no HTTP calls.
   On Fastly the call is synchronous and must hand every slot to the SDK before
   it returns (EZ-6.7). At H it stops at the first slot that completes during
   setup, so later slots wait for the next EdgeZero poll
-  ([open defect 1](#open-edgezero-defects-at-h)). Axum, Cloudflare, and Spin
+  ([open defect 1](#open-edgezero-defects-at-h)). Fixed at the pin: EdgeZero's
+  fix is in `598f0a2a`, an ancestor of `14a6ca8b`, and Trusted Server keeps no
+  workaround for it. Axum, Cloudflare, and Spin
   spawn a local task
   (`edgezero:crates/edgezero-adapter-axum/src/outbound.rs:268`,
   `edgezero:crates/edgezero-adapter-cloudflare/src/outbound.rs:537`,
@@ -470,7 +474,8 @@ cache make no HTTP calls.
   unresolved. On Spin at H, a batch whose earlier-deadline slot is still
   unobserved when the cutoff passes fails that way with an internal error
   ([open defect 3](#open-edgezero-defects-at-h)). Trusted Server adds no
-  workaround.
+  workaround. Fixed at the pin: EdgeZero's fix is in `598f0a2a`, an ancestor
+  of `14a6ca8b`.
 - The mediator goes out after the batch finishes, with `client.send(..)`,
   `.timeout(mediator timeout)`, and `.deadline(auction_deadline)`. The guest
   budget takes the earlier of the two
@@ -498,19 +503,20 @@ cache make no HTTP calls.
   Cloudflare and Spin now fan out, which closes issue #1484.
 - The Fastly state builder keeps today's startup bound of 160 provider
   backends. It replaces the call at
-  `crates/trusted-server-adapter-fastly/src/app.rs:225`, and the limits 200 and
-  40 move with it (`crates/trusted-server-core/src/platform/backend_naming.rs:23-24`).
+  `crates/trusted-server-adapter-fastly/src/app.rs:225` with core's
+  `validate_fastly_backend_bound` (`plan.rs:455`). The limits 200 and 40 live
+  beside it in core (`crates/trusted-server-core/src/auction/plan.rs:21-23`).
   It counts distinct tuples of provider scheme, host, port, and configured
   timeout, because each tuple is at most one EdgeZero backend configuration.
   The count can only overstate. EdgeZero keys identity on the timer rung, so
   two timeouts that round to one rung share a configuration but count twice.
   Bidders set no host override, and the connect timeout is constant.
   The predicted-name collision check (`plan.rs:451-464`) goes, because EdgeZero
-  owns names. The Cloudflare and Spin tests
-  `startup_rejects_multi_provider_auction_plan`
-  (`crates/trusted-server-adapter-cloudflare/src/app.rs:934`,
-  `crates/trusted-server-adapter-spin/src/app.rs:1098`) now assert that the plan
-  loads. The `validate_for_target` tests (`plan.rs:695-830`) and the four
+  owns names. The Cloudflare and Spin tests that rejected the plan became
+  `cloudflare_and_spin_load_multi_provider_plan`
+  (`crates/trusted-server-adapter-cloudflare/src/app.rs:941`,
+  `crates/trusted-server-adapter-spin/src/app.rs:1105`), which assert that the
+  plan loads. The `validate_for_target` tests (`plan.rs:695-830`) and the four
   target-descriptor tests (`platform.rs` in each adapter) are deleted.
 - `canonicalize_transport_timeout_ms`, the backend-name prediction and
   uniqueness checks (`provider.rs:310-344`), and `reserved_backend_names` are
@@ -539,7 +545,8 @@ poll of the canonical handler and egress drivers
 earlier poll recorded, and never wait
 (`edgezero:crates/edgezero-adapter-fastly/src/outbound.rs:5456-5494`).
 Cross-cutting requirement 5 and EZ-6.11 require a check to record, so this is
-[open defect 2](#open-edgezero-defects-at-h). At the pin under Viceroy 0.21.0,
+[open defect 2](#open-edgezero-defects-at-h). Fixed at the pin: EdgeZero's fix
+is in `6f0cc74c`, an ancestor of `14a6ca8b`. At the pin under Viceroy 0.21.0,
 a `check` after the cutoff returns `Finished(Cutoff)` (section 8). Collection
 after the cutoff calls `batch.next()`, which also returns `Finished(Cutoff)`
 without a host wait. The
@@ -855,8 +862,10 @@ callback-owned batch drivers when the callback returns
 finish before it does. Neither delays the client, which already has its
 response. Each extends the sandbox's lifetime, as pull sync does today.
 
-Their `futures::executor::block_on` calls are safe only here. Inside the helper,
-dispatch already runs under `block_on`
+One outer `futures::executor::block_on` in `run_post_delivery`
+(`crates/trusted-server-adapter-fastly/src/post_delivery.rs:45-61`) drives
+both items, which await their sends inside it. That call is safe only here.
+Inside the helper, dispatch already runs under `block_on`
 (`edgezero:crates/edgezero-adapter-fastly/src/request.rs:427-431`), and nesting
 panics. EdgeZero's fixture uses `block_on` in the same position
 (`post_delivery.rs:93-178`).
@@ -869,14 +878,14 @@ panics. EdgeZero's fixture uses `block_on` in the same position
   and `prepare` inserts a clone into the request extensions.
   `build_per_request_services` wraps the clone from `ctx.extensions()` in a
   per-request sink that queues NDJSON instead of sending. After delivery the
-  callback drains the queue and sends each row with `block_on(client.send(..))`,
+  callback drains the queue and awaits `client.send(..)` for each row, with
   today's headers, `.timeout(2 s)`, the 1 s connect timeout, and `Bypass`. Each
   row is one short request. Axum, Cloudflare, and Spin keep their no-op sink.
 - **EC pull sync.** `dispatch_pull_sync` takes the post-delivery client and
   clock instead of the ones in `ec_state.services`
   (`crates/trusted-server-adapter-fastly/src/main.rs:679-686`). Each group of
   `ec.pull_sync_concurrency` requests (`pull_sync.rs:184`) goes out with
-  `block_on(client.send_all_until(group, cutoff))` (`outbound.rs:722`).
+  `client.send_all_until(group, cutoff).await` (`outbound.rs:722`).
   Requests carry `.timeout(15 s)` and `.max_response_bytes(64 KiB)`, and the
   cutoff is `clock.deadline_after(15 s)` per group. Today each request has 15 s
   idle timers and no total bound, so the per-group cutoff is new.
@@ -954,8 +963,7 @@ The callback runs these steps in order.
    and JA4 debug probe (`main.rs:172-208`, `:342`, `:362`) answer with native
    responses before EdgeZero runs. The metrics probe must stay ahead of app
    assembly. The callback takes `clock = MonotonicClock::default()` and
-   `request_start = clock.now()` at entry, for `send_assembly_error` and the
-   deadlines.
+   `request_start = clock.now()` at entry. Only `send_assembly_error` uses them.
 2. **Assembly.** `sandbox.initialize` builds the router and calls
    `App::from_router::<TrustedServerApp>(router, FASTLY_PLATFORM)`
    (`edgezero:crates/edgezero-core/src/app.rs:347`). `from_router` runs
@@ -995,8 +1003,12 @@ limits are checked (EZ-19.2, `request.rs:469`). Section 5 lists its fields.
 (`main.rs:65-70`, `:384-394`, `:489`) are deleted, because nothing reads it. A
 missing config store now fails settings load and surfaces as an assembly error.
 
-`finalize(&mut Response) -> FinalizeState` captures the resolved client IP by
-value and takes over today's post-routing steps, all synchronous:
+The `finalize` hook calls
+`finalize_response(&mut Response, &FinalizeInputs) -> Option<FinalizeState>`
+(`crates/trusted-server-adapter-fastly/src/main.rs:414-479`).
+`FinalizeInputs { settings, geo, counters }` carries the settings, the
+request's one geo lookup, and the sandbox counters. It takes over today's
+post-routing steps, all synchronous:
 
 1. If `TraceTerminalResponse` is present, return without touching the response.
    Today it is sent raw (`main.rs:508-516`). Now it passes EdgeZero's egress,
@@ -1009,7 +1021,10 @@ value and takes over today's post-routing steps, all synchronous:
    policy (`main.rs:541-543`), then EC finalize (`main.rs:545-547`).
 4. Apply the terminal privacy effects that `send_edgezero_response` applies
    today (`main.rs:776-808`), and the sandbox counter headers.
-5. Return the pull-sync inputs: the partner registry and the EC state.
+5. Return the pull-sync inputs: the partner registry and the EC state. It
+   returns `None` for a trace response, for a response that carries no EC
+   state to finalize, and when the partner registry cannot be built, which is
+   logged at error.
 
 `finalize` runs for every routed response, including handler errors and
 canonical 404 and 405, before egress policy and framing
@@ -1078,11 +1093,14 @@ counters and retirement log stay
   each append and passes source errors through unchanged.
 - It maps errors by status. 413 becomes `RequestTooLarge`. 408 becomes a new
   `TrustedServerError::RequestTimeout`, mapped to 408. Another 4xx becomes
-  `BadRequest` (400). A 5xx becomes `Proxy` (502) and logs at error. A Fastly
+  `BadRequest` (400). A 5xx becomes `Proxy` (502). A Fastly
   host read error is a 5xx (`edgezero:crates/edgezero-adapter-fastly/src/request.rs:917-921`).
   Today `collect_body_bounded` maps chunk errors to a 502 too
   (`crates/trusted-server-core/src/integrations/mod.rs:198-204`).
-- It logs client-caused 408 and 413 at warn and never logs body bytes.
+- It does not log, and body bytes never reach its report. Each adapter renders
+  the report through core's `error::http_error`, which logs it once: at warn
+  for a 4xx, which the client caused, and at error for a 5xx. The auction and
+  batch-sync routes answer their own 413 and log the report at warn.
 
 It replaces `request_body_bytes` (`proxy.rs:47`,
 `crates/trusted-server-core/src/request_signing/endpoints.rs:27`) and
@@ -1351,8 +1369,12 @@ and stay.
 - `AxumDevServerConfig` gains `ingress` (`dev_server.rs:58-64`), set from
   `AxumIngressConfig::from_env(&EnvConfig::from_env())` (D16). An invalid value
   fails startup. The variables are in [Configuration](#configuration).
-- The ingress caps close the connection on overflow, and response headers share
-  the raw-head budget
+- A request head over the raw-head byte limit or the field limit gets 431
+  (`edgezero:crates/edgezero-adapter-axum/src/dev_server.rs:2069-2088`). Only a
+  connection over `MAX_CONNECTIONS`, which is dropped on accept
+  (`edgezero:crates/edgezero-adapter-axum/src/dev_server.rs:434-437`), or a
+  head that misses its read timeout is closed. Response headers share the
+  raw-head budget
   (`edgezero:crates/edgezero-adapter-axum/src/ingress_config.rs:89-102`).
   Accepted for the dev server.
 - `EdgeZeroAxumService` is private (`edgezero:crates/edgezero-adapter-axum/src/lib.rs:29-30`).
@@ -1413,12 +1435,14 @@ and stay.
   (`platform.rs:449-456`). Whether WASI hosts forbid an explicit `Host` is
   unverified (EZ-13). H's Spin client rejects any override, so Spin's settings
   load ignores the setting with a warning (D9).
-- H's Spin client may send every buffered request body, bidder JSON included,
-  chunked with no `Content-Length`. Another reviewer raised this as an open
-  question on PR 275
-  (`edgezero:crates/edgezero-adapter-spin/src/outbound.rs:683`, `:1064-1130`).
-  A bidder that requires a length would then reject Spin auctions. Test 5's Spin
-  leg records the framing a loopback bidder receives.
+- At H, Spin's client could send every buffered request body, bidder JSON
+  included, chunked with no `Content-Length`. Another reviewer raised this as
+  an open question on PR 275. At `14a6ca8b` the client sets `Content-Length`
+  on a buffered body for every method but GET and HEAD, and frames an empty
+  body only for POST, PUT, and PATCH
+  (`edgezero:crates/edgezero-adapter-spin/src/outbound.rs:900-915`). Test 5's Spin
+  leg records the framing a loopback bidder receives. Task 6 observed
+  `Content-Length: 428` with no `Transfer-Encoding`.
 - Spin config reads go through `block_on(handle.get(..))` with
   `SpinConfigStore::for_label` (`crates/trusted-server-adapter-spin/src/app.rs:86-108`).
   Whether the fork's key-value future completes there is unverified. The Spin
@@ -1436,9 +1460,13 @@ adapter's production `platform.rs` and call `PlatformHttpClient`
 (`crates/trusted-server-adapter-cloudflare/tests/runtime/deadline.rs:1-11`).
 `scripts/test-worker-auction-deadlines.mjs` drives them against delayed headers,
 trickling bodies, and slow publisher work. The cut ports both examples to the
-adapter's EdgeZero `HttpClient`, through `start_batch_until` and `send`, against
-the same delayed origins, asserting the same outcomes. The script keeps its
-cases. Gate 15's text stays, because its build and run commands do not change.
+adapter's EdgeZero `HttpClient`, through `start_batch_until` and `collect`,
+against the same delayed origins, asserting the same outcomes. Every case models
+a bid, so the examples call no single `send`. The runtime integration tests in
+`crates/trusted-server-integration-tests/tests/integration.rs`, which CI runs
+with `--include-ignored` and the Spin filter, cover the real client's `send` on
+Cloudflare and Spin. The script keeps its cases. Gate 15's text stays, because
+its build and run commands do not change.
 
 **Fastly deadline harness.** The required `cargo test` job runs
 `crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs`
@@ -1825,8 +1853,8 @@ Cloudflare inbound read deadline can fire up to 1 ms early.
 
 Other reviewers' open threads also reach Trusted Server:
 
-- Spin may send buffered request bodies chunked with no `Content-Length`
-  (section 8).
+- At H, Spin could send buffered request bodies chunked with no
+  `Content-Length`. The pin sets the length (section 8).
 - Every non-batch Fastly send waits for its response head in 1 ms polls, which
   costs guest CPU while an origin is slow.
 - An upstream response with both `Transfer-Encoding` and `Content-Length` keeps
@@ -1951,7 +1979,10 @@ records the repaired-versus-stock disposition under G4-FASTLY-POLICY
   table.
 - Run the Viceroy response diff. On Fastly staging, run its read-only subset
   against production, with no admin writes or key rotation, and also normalize
-  geo headers, `x-ts-fastly-version`, and `x-ts-env`.
+  geo headers, `x-ts-fastly-version`, and `x-ts-env`. No read-only requests
+  file exists. Build the subset from `scripts/fastly-response-diff.requests.json`
+  by dropping `trace-enable-action`, the `POST /_ts/trace/enable` request, and
+  `admin-eids`, the `GET /_ts/admin/eids` request with fixture credentials.
 - Then deploy to production.
 
 ### Rollback
@@ -2071,8 +2102,11 @@ git grep -n into_core_request -- crates/trusted-server-adapter-fastly
    Test 1's `POST /auction`, publisher `POST`, and `HEAD /` cases join as Spin
    cases named `spin_runtime_*`, and that job gains a third filter for them
    (`:230-231`). The `--include-ignored` job skips them (`:105-107`). Test 6's
-   Spin leg uses the same prefix. A component that fails to instantiate fails
-   CI (D14). `scripts/smoke-spin.sh` stays a manual check.
+   Spin leg, `navigation_bids_include_180_and_320_ms_and_exclude_600_ms_spin`,
+   does not use the prefix, so both jobs name it on its own: the
+   `--include-ignored` job skips it and the Spin filter runs it. A component
+   that fails to instantiate fails CI (D14). `scripts/smoke-spin.sh` stays a
+   manual check.
 3. **Request readback.** The scripted client (D12) lives in
    `crates/trusted-server-core/src/test_support.rs` under
    `#[cfg(any(test, feature = "test-utils"))]`, as the EZ-24 interim says, so
@@ -2127,6 +2161,8 @@ git grep -n into_core_request -- crates/trusted-server-adapter-fastly
    - On Axum, workerd, and Spin, which have no KV graph, the plain path
      dispatches the auction first and sends the origin request while the bids
      are in flight.
+     Gap: the tests do not assert the Viceroy overlapped-path sub-bullet. The
+     Viceroy leg checks the bid outcome only.
 7. **Encoded passthrough (EZ-5 criterion 8).** On Viceroy, against origin
    fixtures:
    - A gzip HTML page reaches the client with `Content-Encoding: gzip` and
@@ -2143,7 +2179,10 @@ git grep -n into_core_request -- crates/trusted-server-adapter-fastly
 8. **Inbound readers.** For each reader in section 4, a declared
    `Content-Length` over the cap returns 413 without polling the body, a stream
    that crosses the cap returns 413, a read past the deadline returns 408, a
-   client-caused stream error returns 400, and a host-side read error returns 502.
+   stream error with a 4xx status returns 400, and a host-side read error
+   returns 502. The 400 case covers EdgeZero's ingress framing error. A
+   client-caused error in the middle of a body reaches the helper as an
+   internal error on every adapter, so it answers 502 (Failure handling).
    The trace action's check covers its declared case. A batch-sync stream that
    delivers more bytes than both its declared length and its cap returns 413
    (EZ-10 criterion 9).
@@ -2155,12 +2194,15 @@ git grep -n into_core_request -- crates/trusted-server-adapter-fastly
    every row of the outcome table, including the result of
    `send_assembly_error`, takes its listed action. A request head that cannot
    be converted gets the native 500, if Viceroy can deliver one (EZ-17
-   criterion 7). With the `reusable-sandbox` feature, a config key that points
-   at a missing blob gets EdgeZero's assembly error with today's startup
-   status, 500, where EZ-22 criterion 9's text says 503. After the blob is
-   restored, the next request in the same sandbox gets 200 with the same
-   `x-ts-sandbox-instance` and `x-ts-sandbox-builds` one higher (EZ-22
-   criterion 9).
+   criterion 7). The reuse leg is
+   `missing_config_blob_gets_500_then_recovers_in_same_sandbox`
+   (`crates/trusted-server-adapter-fastly/src/app.rs:2110`), which runs without
+   a feature gate. Assembly from a linked store with no app config blob fails,
+   and EdgeZero's assembly error answers 500, today's startup status (EZ-22
+   criterion 9's text says 503), with an EdgeZero JSON body and no
+   `x-ts-version`. With the blob restored, the next initialization of the same
+   `Sandbox` succeeds, and its `SandboxCounters` show one more build and the
+   same instance (EZ-22 criterion 9).
 10. **Validation.** `validate_settings_for_deploy` rejects each setting the
     Configuration table rejects, and each degrades as listed at runtime. Spin
     ignores `origin_host_header_override` with a warning. Settings load accepts
@@ -2241,6 +2283,12 @@ git grep -n into_core_request -- crates/trusted-server-adapter-fastly
       exceeds it fails with 502 before egress.
     - The processed output still fails at its own `max_buffered_body_bytes`
       cap when a rewrite grows past it.
+      Gap: coverage is partial. Axum covers only the raw case. The decoded size
+      over `cap` is tested only on Cloudflare and in core, a source error
+      mid-body only in core, and no test covers a raw `Buffered` body at `cap`.
+
+Fastly differences items 16 and 17 are EdgeZero ingress and forwarding
+behavior. No Trusted Server test covers them.
 
 Ported tests: every user of `StubHttpClient`, `NoopHttpClient`, and
 `StubBackend` moved to the scripted client or was deleted with the code it
@@ -2447,7 +2495,11 @@ change are D5, D7, D13, D18, and D20.
   - Trusted Server withdraws EZ-18.4's bodiless part, and EdgeZero amended
     EZ-18.4, EZ-18.6, and EZ-18 criteria 3 and 6 to match in `dcbf622`
     ([PR 275 thread r4504573926](https://github.com/IABTechLab/edgezero/pull/275#discussion_r4504573926)).
-    The response diff expects Fastly differences item 7.
+    The response diff's expected set
+    (`scripts/fastly-response-diff.expected.json`) cites Fastly differences
+    items 5, 6, and 25. Bodiless framing, item 7, shows no difference on the
+    diff's requests: the HEAD and 304 cases, `head-root` and
+    `conditional-get-root`, expect only item 6's hop-by-hop fields.
   - The amendment keeps the nine cases as recorded reference differences, not
     parity failures. Hosted qualification of EZ-18 is still open, and it does
     not block the cut (D5).
@@ -2458,13 +2510,15 @@ change are D5, D7, D13, D18, and D20.
 - `crates/trusted-server-core/src/platform/` (delete `http.rs`,
   `backend_naming.rs`, `pending_response.rs`, `image_optimizer.rs`, and the HTTP
   doubles in `test_support.rs`; change `traits.rs`, `types.rs`, `mod.rs`)
-- `crates/trusted-server-core/src/test_support.rs` (scripted client) and
-  `test_support/async_html_finalization.rs`
+- `crates/trusted-server-core/src/test_support.rs`,
+  `test_support/scripted_client.rs` (scripted client), `test_support/body_read.rs`,
+  `test_support/logging.rs`, and `test_support/async_html_finalization.rs`
 - `crates/trusted-server-core/src/http_util.rs`, `error.rs`, `config.rs`,
   `settings.rs`, `response_privacy.rs`, `auth.rs`, `forwarder.rs`,
   `publisher.rs`, `proxy.rs`, `cache_purge.rs`, `creative_opportunities.rs`,
   `asset_image_optimizer.rs`, `html_processor/finish.rs`, `config_payload.rs`,
-  `secret_resolution.rs`, `settings_data.rs`
+  `secret_resolution.rs`, `settings_data.rs`, `outbound.rs`,
+  `edge_app.rs`
 - `crates/trusted-server-core/src/auction/` (`mod.rs`, `orchestrator.rs`,
   `provider.rs`, `plan.rs`, `endpoints.rs`, `telemetry.rs`, `types.rs`,
   `test_support.rs`, `openrtb/test_executor.rs`, `openrtb/tests.rs`,
@@ -2479,8 +2533,9 @@ change are D5, D7, D13, D18, and D20.
   `request_signing/jwks.rs`
 - `crates/trusted-server-adapter-fastly/` (`Cargo.toml`, `src/main.rs`,
   `app.rs`, `middleware.rs`, `platform.rs`, `tinybird.rs`, `management_api.rs`,
-  `compat.rs`, a new deadline test module, `tests/deadline-origin.mjs`; delete
-  `backend.rs` and `platform/deadline.rs`)
+  `compat.rs`, `delivery.rs`, `post_delivery.rs`, `sandbox.rs`, a new deadline
+  test module, `tests/deadline-origin.mjs`; delete `backend.rs` and
+  `platform/deadline.rs`)
 - `crates/trusted-server-adapter-axum/` (`Cargo.toml`, `src/main.rs`, `app.rs`,
   `middleware.rs`, `platform.rs`, `tests/routes.rs`)
 - `crates/trusted-server-adapter-cloudflare/` (`src/app.rs`, `middleware.rs`,
@@ -2491,11 +2546,13 @@ change are D5, D7, D13, D18, and D20.
   `tests/runtime/deadline.rs`)
 - `crates/trusted-server-integration-tests/` (`src/bin/generate-viceroy-config.rs`,
   `tests/parity.rs`, `tests/integration.rs`, `tests/documentation_snippets.rs`,
+  `tests/html_eof_runtime.rs`, `tests/common/ec.rs`, `tests/common/runtime.rs`,
   environment helpers, the three
   fixture configs, and `browser/tests/nextjs/mobile-trace-live.spec.ts` if its
   bidder URL changes)
 - `crates/trusted-server-cli/tests/proxy_trusted_server.rs`
 - `.github/workflows/integration-tests.yml`, `.github/workflows/test.yml`,
+  `.github/workflows/format.yml`,
   `.github/actions/setup-integration-test-env/action.yml`, and
   `.github/workflows/worker-auction-deadlines.yml` if its build steps change
 - `scripts/integration-tests.sh`, `scripts/integration-tests-browser.sh`,
@@ -2505,6 +2562,7 @@ change are D5, D7, D13, D18, and D20.
   change, and the new response-diff script
 - `docs/guide/integration-guide.md`, `docs/guide/architecture.md`, the other
   guide pages from section 10, and `CHANGELOG.md`
+- `AGENTS.md`
 
 ## Review log
 
