@@ -1,15 +1,16 @@
-//! Native Axum adapter for local Trusted Server development.
+//! Native Axum adapter with strict prepared-store startup.
 //!
-//! Runs a full Axum HTTP server on `localhost` as a drop-in dev alternative to
-//! the Fastly Compute adapter (via Viceroy). All routes and middleware mirror
-//! the Fastly adapter; store and geo primitives fall back to env vars and no-ops.
+//! Runtime settings and immutable config/secret snapshots are validated before
+//! the framework listener becomes ready. Native geography is unavailable here.
 
 // Unit tests may buffer bodies with `Body::into_bytes`; production code must not.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
-/// Application routing and handler registration for the Axum dev server.
+/// Application routing and handler registration.
 pub mod app;
-/// Request middleware (auth, response finalisation).
+/// Request middleware for authentication and response finalization.
 pub mod middleware;
-/// Platform-trait implementations backed by env vars.
+/// Native request-scoped platform services.
 pub mod platform;
+/// Prepared-store initialization and immutable native snapshots.
+pub mod startup;

@@ -1,10 +1,7 @@
-use edgezero_adapter_axum::AXUM_PLATFORM;
-use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
-use edgezero_adapter_axum::ingress_config::AxumIngressConfig;
-use edgezero_core::app::App;
-use edgezero_core::env_config::EnvConfig;
+use edgezero_adapter_axum::dev_server::run_production_app_with_initializer;
 use log::LevelFilter;
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_adapter_axum::startup::initialize_native;
 
 /// Environment variable that sets the maximum log level.
 const LOG_LEVEL_ENV: &str = "RUST_LOG";
@@ -29,43 +26,15 @@ fn main() {
         eprintln!("warning: logger init failed: {e}");
     }
 
-    // `EDGEZERO__ADAPTER__INGRESS__*` sets the listener limits. An invalid
-    // value stops startup instead of falling back to a default.
-    let ingress = match AxumIngressConfig::from_env(&EnvConfig::from_env()) {
-        Ok(ingress) => ingress,
-        Err(error) => {
-            log::error!("trusted-server-adapter-axum failed to start: {error}");
-            std::process::exit(1);
-        }
-    };
-
-    let config = match port_from_env() {
-        // When PORT is set, bind to a specific address so integration tests
-        // can allocate a fresh OS port each run and avoid TIME_WAIT flakiness.
-        Some(port) => AxumDevServerConfig {
-            addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            enable_ctrl_c: true,
-            ingress,
-        },
-        // Normal development path: read bind address from axum.toml.
-        None => AxumDevServerConfig {
-            ingress,
-            ..AxumDevServerConfig::default()
-        },
-    };
-
-    // A settings failure stops startup before the listener binds. `routes`
-    // has already logged the full report.
-    let app = match App::build::<TrustedServerApp>(AXUM_PLATFORM) {
-        Ok(app) => app,
-        Err(error) => {
-            log::error!("trusted-server-adapter-axum failed to start: {error}");
-            std::process::exit(1);
-        }
-    };
-
-    log::info!("Listening on http://{}", config.addr);
-    if let Err(err) = AxumDevServer::with_config(app, config).run() {
+    if let Err(err) = run_production_app_with_initializer::<TrustedServerApp, _>(|app, stores| {
+        Box::pin(async move {
+            initialize_native(app, stores).await.inspect_err(|error| {
+                // RC classifies callback errors without their details. This safe
+                // application diagnostic tells operators which input to fix.
+                log::error!("Trusted Server initialization failed: {error}");
+            })
+        })
+    }) {
         log::error!("trusted-server-adapter-axum failed: {err}");
         std::process::exit(1);
     }
@@ -88,23 +57,6 @@ fn parse_log_level(configured: Option<&str>) -> Result<LevelFilter, &str> {
     match configured.map(str::trim) {
         None | Some("") => Ok(DEFAULT_LOG_LEVEL),
         Some(trimmed) => trimmed.parse().map_err(|_| trimmed),
-    }
-}
-
-/// Read a port number from the `PORT` environment variable.
-///
-/// Returns `None` when the variable is unset. Exits non-zero if the value
-/// is set but cannot be parsed — silently falling back to a different port
-/// would surprise tooling that expects the server at the requested address.
-#[allow(clippy::print_stderr)]
-fn port_from_env() -> Option<u16> {
-    let raw = std::env::var("PORT").ok()?;
-    match raw.parse() {
-        Ok(port) => Some(port),
-        Err(e) => {
-            eprintln!("error: PORT env var '{raw}' is not a valid u16: {e}");
-            std::process::exit(1);
-        }
     }
 }
 

@@ -1025,9 +1025,9 @@ fn fetch_signed_proxy_url(
         .as_str()
         .expect("should return the first-party proxy href");
     client
-        .get(format!("{base_url}{href}"))
+        .get(href)
         .send()
-        .expect("should send the first-party proxy request")
+        .expect("should fetch the absolute first-party proxy URL")
 }
 
 #[test]
@@ -2167,8 +2167,10 @@ fn axum_invalid_ingress_variable_fails_startup() {
     let envelope = common::config::integration_app_config_envelope(origin_port())
         .expect("should build the integration app config");
     let port = environments::find_available_port().expect("should reserve a port");
-    let mut child = environments::axum::AxumDevServer
+    let (mut command, _workspace) = environments::axum::AxumDevServer
         .command(&envelope, port)
+        .expect("should prepare isolated native config");
+    let mut child = command
         .env("EDGEZERO__ADAPTER__INGRESS__MAX_HEADER_COUNT", "0")
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
@@ -2738,7 +2740,7 @@ fn first_party_proxy_html_creative_keeps_br_fastly() {
                 .as_str()
                 .expect("should return the first-party proxy href");
             let response = client
-                .get(format!("{base_url}{href}"))
+                .get(href)
                 .header("accept-encoding", "br")
                 .send()
                 .expect("should fetch the proxied creative");
@@ -2860,7 +2862,7 @@ fn realistic_first_party_proxy_request_is_admitted(
     let href = signed["href"]
         .as_str()
         .expect("should return the first-party proxy href");
-    let mut request = client.get(format!("{base_url}{href}"));
+    let mut request = client.get(href);
     for index in 0..REALISTIC_HEADER_COUNT {
         request = request.header(
             format!("x-example-{index:02}"),

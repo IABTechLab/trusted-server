@@ -241,12 +241,20 @@ impl DataDomeIntegration {
     ) -> ProtectionPayload {
         let req = &*input.request;
         let client_info = input.services.client_info();
-        let public_info = crate::forwarder::public_origin(req.extensions())
-            .and_then(|_| RequestInfo::from_request(req, client_info).ok());
-        let request_host = public_info
+        let effective_info = if crate::forwarder::public_origin(req.extensions()).is_some()
+            || req
+                .extensions()
+                .get::<edgezero_core::ingress::RequestIngress>()
+                .is_some()
+        {
+            RequestInfo::from_request(req, client_info).ok()
+        } else {
+            None
+        };
+        let request_host = effective_info
             .as_ref()
             .map_or_else(|| request_host(req), |info| info.host.clone());
-        let request_protocol = public_info.as_ref().map_or_else(
+        let request_protocol = effective_info.as_ref().map_or_else(
             || req.uri().scheme_str().unwrap_or_default(),
             |info| info.scheme.as_str(),
         );
@@ -806,6 +814,10 @@ mod tests {
         ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
     };
     use edgezero_core::http::request_builder;
+    use edgezero_core::ingress::{
+        CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
+        TargetUnavailable,
+    };
     use edgezero_core::outbound::{OutboundCachePolicy, ResponseMode};
 
     use super::*;
@@ -984,6 +996,52 @@ mod tests {
             .extensions()
             .get::<super::super::DataDomeClientTagSuppressed>()
             .is_some()
+    }
+
+    #[test]
+    fn managed_datadome_payload_uses_origin_evidence_instead_of_absolute_target() {
+        let integration = protection_integration();
+        let settings = Settings::default();
+        let services = crate::platform::test_support::noop_services();
+        for scheme in [Some("http"), None] {
+            let mut request = Request::builder()
+                .uri("https://target.example.com/page")
+                .header(header::HOST, "listener.example.com")
+                .body(EdgeBody::empty())
+                .expect("should construct a contradictory absolute request target");
+            let origin = scheme.map(|scheme| {
+                InboundOrigin::parse(
+                    scheme,
+                    "listener.example.com",
+                    OriginSource::TransportBinding,
+                )
+                .expect("should validate the runtime-owned origin")
+            });
+            request.extensions_mut().insert(RequestIngress::new(
+                CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                origin,
+                HeaderFidelity::default(),
+            ));
+            let payload = integration.build_protection_payload(
+                &RequestFilterInput {
+                    settings: &settings,
+                    services: &services,
+                    request: &mut request,
+                    geo_info: None,
+                    is_integration_route: false,
+                },
+                &Redacted::new("fictional-server-side-key".to_owned()),
+            );
+            let fields: HashMap<_, _> = payload.fields.into_iter().collect();
+            assert_eq!(
+                fields["Host"], "listener.example.com",
+                "should not report a raw target authority as runtime evidence"
+            );
+            assert_eq!(
+                fields["Protocol"], "http",
+                "should not report a raw target scheme as runtime evidence"
+            );
+        }
     }
 
     #[test]
