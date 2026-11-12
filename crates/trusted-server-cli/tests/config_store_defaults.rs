@@ -122,7 +122,13 @@ fn development_overlay_replaces_the_template_public_origin() {
 #[cfg(unix)]
 #[test]
 fn smoke_setup_replaces_the_template_with_the_selected_listener() {
-    for listener_port in ["18894", "43123"] {
+    for (listener_port, adapter) in [
+        ("18894", "axum"),
+        ("43123", "axum"),
+        ("43123", "cloudflare"),
+        ("43123", "spin"),
+        ("43123", "fastly"),
+    ] {
         let project = project();
         fs::remove_file(project.path().join("trusted-server.toml"))
             .expect("should let smoke setup initialize the template");
@@ -131,10 +137,10 @@ fn smoke_setup_replaces_the_template_with_the_selected_listener() {
             concat!(
                 include_str!("../../../scripts/smoke-common.sh"),
                 "\nSMOKE_TS_BIN=\"$TS_BIN\"\n",
-                "smoke_initialize_config \"$PWD\" \"$PWD\" 19999 \"$1\"\n",
+                "smoke_initialize_config \"$PWD\" \"$PWD\" 19999 \"$1\" \"$2\"\n",
                 "\"$TS_BIN\" config push --adapter axum --local --yes --no-diff\n",
             ),
-            &[listener_port],
+            &[listener_port, adapter],
         );
         assert_eq!(
             config["publisher"]["public_origin"],
@@ -144,6 +150,11 @@ fn smoke_setup_replaces_the_template_with_the_selected_listener() {
         assert_eq!(
             config["publisher"]["origin_url"], "http://127.0.0.1:19999",
             "should keep the smoke upstream independent of the listener"
+        );
+        assert_eq!(
+            config["ec"].get("storage").is_some(),
+            adapter == "fastly",
+            "should retain the Fastly storage template only for its serving runtime"
         );
     }
 }
