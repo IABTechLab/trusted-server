@@ -11,9 +11,10 @@ Epics: #1558 (Trusted Server) and IABTechLab/edgezero#468 (EdgeZero). Plan:
    CloudFront and a load balancer.
 2. Server-side identity works on every adapter whose platform can meet the
    record contract in [Platform support](#platform-support), delivered in the
-   order Fastly, Axum, Cloudflare, Spin (DEC-4). An adapter that cannot meet
-   it rejects identity configuration at startup with a clear error and never
-   runs identity without a record.
+   order Fastly, Axum, Cloudflare, Spin (DEC-4). Fastly and Axum ship complete
+   without any Cloudflare or Spin work. An adapter that cannot meet the
+   contract rejects identity configuration at startup with a clear error and
+   never runs identity without a record.
 3. SharedID is read, stored and passed to bidders the way Prebid defines it,
    and shared state is passed through each adapter the right way.
 4. Identity is written back as first-party cookies on the HTML document
@@ -356,13 +357,14 @@ marks the record contract and geo as supported.
 ### EZI: asks of EdgeZero
 
 Behavior and acceptance only. EZI IDs are distinct from #1506's EZ-n
-requirement IDs. Each ask is delivered for Fastly and Axum first, then
-Cloudflare, then Spin (DEC-4).
+requirement IDs. Each ask is split by platform, in DEC-4 order: the Fastly
+and Axum parts ship in R1 and R2 and never wait on a Cloudflare or Spin part.
 
 - **EZI-1 After-response work.** A task registered during a request runs after
-  the response is delivered, bounded in time. Accept: on Fastly, Axum and
-  Cloudflare the task runs after delivery; on Axum SIGTERM waits for
-  registered tasks up to the grace; Spin returns a capability error.
+  the response is delivered, bounded in time. Accept: on Fastly and Axum the
+  task runs after delivery, and on Axum SIGTERM waits for registered tasks up
+  to the grace; later, on Cloudflare the task runs after delivery, and Spin
+  returns a capability error.
 - **EZI-2a Record contract and the Fastly provider.** `KvStore` gains a read
   that returns a generation marker, writes in `Add`, `Overwrite` and
   `IfGenerationMatch` modes with a precondition-failed outcome, and strongly
@@ -374,18 +376,26 @@ Cloudflare, then Spin (DEC-4).
   `CelldRecordStore` has the semantics on a separate API; IABTechLab/edgezero#414's DynamoDB
   provider has strong existence and listing but no CAS;
   IABTechLab/edgezero#410 and IABTechLab/edgezero#437 rule out conditional writes today.
+- **EZI-2c and EZI-2s Cloudflare and Spin stores.** A store on each platform
+  meets the EZI-2a contract or reports `KvError::Unsupported` (DEC-8). Accept:
+  the contract suite passes, or startup on that platform rejects identity
+  configuration.
 - **EZI-3 Trusted client IP.** One accessor returns the trusted client IP on
-  every adapter. Accept: the same accessor works on all four adapters.
-- **EZI-4 Geo with region.** `ctx.geo()` gives country and region on Fastly,
-  Cloudflare and Spin, or a capability error. Accept: a US request on Fastly
-  and Cloudflare reports country and region.
-- **EZI-5 Rate limiter.** A limiter with Fastly Edge Rate Limiting, in-memory
-  and shared-counter backends. Accept: a contract test passes per backend.
-- **EZI-6 Releases.** R1 contains IABTechLab/edgezero#275 through IABTechLab/edgezero#439 plus
-  EZI-2a and EZI-2b. R2 contains EZI-1 and EZI-5 for Fastly and Axum, and
-  EZI-3. R3 contains the Cloudflare parts of EZI-1, EZI-2, EZI-4 and EZI-5. R4
-  contains the Spin parts. Accept: each tag exists and Trusted Server main pins
-  it.
+  every adapter, Fastly and Axum first. Accept: the same accessor works on
+  each adapter as its part lands.
+- **EZI-4 Geo with region on Cloudflare and Spin.** `ctx.geo()` gives country
+  and region there, or a capability error. Fastly keeps its existing geo and
+  Axum uses CloudFront geo from IABTechLab/edgezero#439. Accept: a US request
+  on Cloudflare reports country and region.
+- **EZI-5 Rate limiter.** A limiter with Fastly Edge Rate Limiting and
+  in-memory and shared-counter backends for Axum, then Cloudflare and Spin
+  backends per DEC-11. Accept: a contract test passes per backend.
+- **EZI-6 Releases.** R1 contains IABTechLab/edgezero#275 through
+  IABTechLab/edgezero#439 plus EZI-2a and EZI-2b. R2 contains the Fastly and
+  Axum parts of EZI-1, EZI-3 and EZI-5. Together R1 and R2 cover Fastly and
+  Axum. R3 contains the Cloudflare parts of EZI-1 to EZI-5, and R4 the Spin
+  parts. Accept: each tag exists and Trusted Server main pins it; R1 and R2
+  contain no Cloudflare or Spin part.
 
 ## Configuration
 
@@ -453,7 +463,9 @@ Decided:
 - **DEC-3 Shared record store** (user, 2026-11-11). The EC record runs on one
   `EcKvStore` over EdgeZero's `KvStore`, with no per-adapter backends.
 - **DEC-4 Platform order** (user, 2026-11-12). Fastly, then Axum, then
-  Cloudflare, then Spin.
+  Cloudflare, then Spin. Fastly and Axum must ship complete without any
+  Cloudflare or Spin work, so every ticket and release is split by platform
+  and no Fastly or Axum item is blocked by a Cloudflare or Spin item.
 
 Proposed and assumed by the plan until confirmed:
 
