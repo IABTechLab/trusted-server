@@ -13,7 +13,7 @@
 **Changes from the earlier ID5 plan (built on the old descriptor framework):**
 
 - No hashed email and no `pd` field: every source is `SourceInput::Anonymous`.
-- No private provider state, so ID5's `signature` is not sent back.
+- A reply's non-empty `signature` is kept as private refresh state, due a tenth of the TTL before the UIDs expire, and sent back as `s`, as Prebid's ID5 module does.
 - Endpoint, sources and the TCF vendor ID come from the common provider config, not hard-coded defaults.
 - The legacy `universal_uid` fallback goes to the first configured source. An opted-out `universal_uid` of `0` is reported as `LookupOutcome::OptedOut`, detected on the reply as sent (not percent-decoded).
 
@@ -38,7 +38,7 @@ ID5's source is provider-owned, so the browser `ts-eids` copy is dropped. Prebid
 - `id5` declares the Lockr capability (see `2026-11-02-identity-provider-lockr-capability.md`): with `[settings.lockr] enabled = true`, the Lockr cookies (default `["id5id"]`) are read after `cookie_names` and before the lookup, with the same parser.
 - A value that is JSON after percent-decoding is parsed with the same code as a lookup response (lenient entries, opt-out `0` dropped, normalized sources, `cache_control.max_age_sec` bounded). When the value was percent-encoded, entries, `ext` objects included, are copied out of the decoded text.
 - Any other value is a bare ID: one UID on the first source with `atype = 1` and the default TTL.
-- `signature` is never stored as a UID. A cookie that yields no usable UID is ignored, and the lookup runs as usual; a kept UID skips the lookup.
+- `signature` is never stored as a UID, only as refresh state. A cookie that yields no usable UID is ignored, and the lookup runs as usual; a kept UID skips the lookup.
 
 ## Tasks
 
