@@ -1830,12 +1830,11 @@ mod trace_parity {
             );
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(Some(GeoInfo {
-                city: String::new(),
+                city: None,
                 country: "GB".to_owned(),
-                continent: String::new(),
-                latitude: 0.0,
-                longitude: 0.0,
-                metro_code: 0,
+                continent: None,
+                coordinates: None,
+                metro_code: None,
                 region: Some("EX".to_owned()),
                 asn: Some(64512),
             }))
