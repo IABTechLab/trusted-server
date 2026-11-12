@@ -2860,7 +2860,16 @@ fn realistic_first_party_proxy_request_is_admitted(
     let href = signed["href"]
         .as_str()
         .expect("should return the first-party proxy href");
-    let mut request = client.get(format!("{base_url}{href}"));
+    let serving_origin = reqwest::Url::parse(base_url).expect("should parse the serving origin");
+    let proxy_url = serving_origin
+        .join(href)
+        .expect("should resolve the signed first-party proxy URL");
+    assert_eq!(
+        proxy_url.origin(),
+        serving_origin.origin(),
+        "should sign a first-party URL at the configured serving origin"
+    );
+    let mut request = client.get(proxy_url);
     for index in 0..REALISTIC_HEADER_COUNT {
         request = request.header(
             format!("x-example-{index:02}"),
