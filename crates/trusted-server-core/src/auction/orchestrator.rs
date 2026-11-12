@@ -794,6 +794,15 @@ impl AuctionOrchestratorHarness {
                 };
                 // An error status is not a mediation decision, however the provider
                 // reports it, so it falls back to local ranking like other failures.
+                if mediated
+                    .as_ref()
+                    .is_some_and(|response| response.status == BidStatus::Error)
+                {
+                    log::warn!(
+                        "Planned mediator '{}' reported an error response; using local ranking",
+                        mediator.provider_name()
+                    );
+                }
                 if let Some(mediated) =
                     mediated.filter(|response| response.status != BidStatus::Error)
                 {
@@ -2697,6 +2706,15 @@ impl AuctionOrchestrator {
 
                 // An error status is not a mediation decision, however the provider
                 // reports it, so it falls back to local ranking like other failures.
+                if mediator_response
+                    .as_ref()
+                    .is_some_and(|response| response.status == BidStatus::Error)
+                {
+                    log::warn!(
+                        "Mediator '{}' reported an error response; using local ranking",
+                        mediator.provider_name()
+                    );
+                }
                 if let Some(mediator_response) =
                     mediator_response.filter(|response| response.status != BidStatus::Error)
                 {
@@ -7441,6 +7459,30 @@ mod tests {
                     "should rank provider bids locally with floors (harness={harness}, floor={floor})"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn mediator_error_status_response_logs_local_ranking_fallback() {
+        for (harness, expected) in [
+            (
+                false,
+                "Mediator 'error-status-mediator' reported an error response; using local ranking",
+            ),
+            (
+                true,
+                "Planned mediator 'error-status-mediator' reported an error response; using local ranking",
+            ),
+        ] {
+            let warnings = crate::test_support::logging::WarningCapture::start();
+            run_mediated_provider_auction(harness, Arc::new(ErrorStatusMediator), None, 1.0).await;
+            assert!(
+                warnings
+                    .take()
+                    .iter()
+                    .any(|warning| warning.message == expected),
+                "should warn when an error-status mediator response falls back to local ranking (harness={harness})"
+            );
         }
     }
 

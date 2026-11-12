@@ -1582,6 +1582,49 @@ mod tests {
     }
 
     #[test]
+    fn mediated_winner_keeping_provider_identity_marks_that_bid() {
+        let request = test_request("identity-preserving-mediation");
+        let mut lower = bid("slot-1", "example-bidder", None, Some(1.5));
+        lower.bid_id = Some("lower".to_owned());
+        let mut higher = bid("slot-1", "example-bidder", None, Some(2.0));
+        higher.bid_id = Some("higher".to_owned());
+        let result = OrchestrationResult {
+            provider_responses: vec![AuctionResponse::success(
+                "provider-a",
+                vec![lower, higher.clone()],
+                2,
+            )],
+            mediator_response: Some(AuctionResponse::success(
+                "adserver_mock",
+                vec![higher.clone()],
+                3,
+            )),
+            winning_bids: HashMap::from([("slot-1".to_owned(), higher)]),
+            total_time_ms: 5,
+            metadata: HashMap::new(),
+        };
+        let events = build_auction_events(
+            AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/auction", 1),
+            AuctionTerminalOutcome::Completed {
+                request: &request,
+                result: &result,
+                delivered_winner_slots: None,
+            },
+        );
+        let rows = events
+            .rows()
+            .iter()
+            .filter(|row| row.event_kind == "bid")
+            .map(|row| (row.price_cpm, row.is_win))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![(Some(1.5), Some(0)), (Some(2.0), Some(1))],
+            "should mark the provider bid whose ID and price the mediator kept"
+        );
+    }
+
+    #[test]
     fn local_tied_bids_keep_the_first_provider_as_the_only_winner() {
         let request = test_request("tied-auction");
         let first = bid("slot-1", "example-bidder", None, Some(2.0));
