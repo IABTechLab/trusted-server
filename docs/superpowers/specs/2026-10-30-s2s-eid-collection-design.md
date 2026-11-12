@@ -1762,3 +1762,23 @@ egress.
   expires (§5.6, §8.6 "keep serving until `exp`"). This is the intended
   behaviour, already pinned by a test; the §4 "due source" entry reads
   "owned UIDs" as UIDs on a provider-owned source.
+
+### Round 6 (2026-11-12, PR #1487 at 6719f19ea, Claude Code (Opus 5.5) review agent)
+
+Angle: adversarial. Malformed provider replies and browser input, config
+combinations and adapter differences, on the tree after round 5's fix.
+
+- No blocking findings. Re-checked round 5's gate across enabled, disabled
+  and reassigned providers and all three egress paths; provider replies with
+  unclaimed, unnormalized or oversized sources, empty or oversized UIDs,
+  negative `atype`, deep or non-object `ext`, past expiry and unusable
+  refresh state; per-phase coordinators validating only their own providers
+  while deploy validation covers the whole set; zero or out-of-range budgets,
+  vendor IDs and rate limits rejected at parse.
+- Non-blocking, no change: a client EID whose `source` fails normalization,
+  for example with surrounding whitespace or a port, matches no partner and
+  so passes the vendor filter unchanged. Such a source names no configured
+  partner; the page that sends it controls the request anyway.
+- Non-blocking, no change: only the Fastly adapter builds the registry with
+  provider ownership and vendor gates (§12.3 "On Fastly"); per-adapter deploy
+  validation stays with #1552.
