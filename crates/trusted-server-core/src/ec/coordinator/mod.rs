@@ -25,7 +25,7 @@ use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{allows_eid_persistence, tcf_vendor_consent_denied};
 use crate::ec::EcKvSnapshot;
 use crate::ec::consent::ec_consent_granted;
-use crate::ec::eid_types::{EidFields, ProviderId, SourceDomain, UnixSeconds};
+use crate::ec::eid_types::{EidFields, Expiry, ProviderId, SourceDomain, UnixSeconds};
 use crate::ec::generation::ec_hash;
 use crate::ec::kv_types::{KvEid, KvEntry, KvUid};
 use crate::ec::provider::{
@@ -587,7 +587,15 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                     continue;
                 }
                 CookieRead::Found(eids) => {
-                    let found = self.validated(provider, eids, lookup.now);
+                    let mut found = self.validated(provider, eids, lookup.now);
+                    // A cookie older than a server-side refresh does not
+                    // roll the refreshed UID back.
+                    if registered.provider.keeps_fresher_stored_uids() {
+                        found.entries.retain(|(source, eids)| {
+                            !stored_outlives_cookie(entry, source, eids, lookup.now)
+                        });
+                        recount_found(&mut found);
+                    }
                     if matches!(found.status, LookupStatus::Found { .. }) {
                         // Only the sources the cookies filled are spared a
                         // lookup; the provider's other due sources are
@@ -610,7 +618,6 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                         // on every navigation, and a failed lookup for a
                         // still-due source would replace the held record and
                         // its refresh state.
-                        let mut found = found;
                         found.entries.retain(|(source, eids)| {
                             !holds_same_uids_for(entry, source, eids, lookup.now)
                         });
@@ -848,6 +855,39 @@ fn recount_found(lookup: &mut ProviderLookup) {
     }
 }
 
+/// Whether the row holds a live UID for `source` whose absolute expiry is
+/// later than that of every UID in `eids`, so the cookie is older than the
+/// stored record.
+fn stored_outlives_cookie(
+    entry: Option<&KvEntry>,
+    source: &SourceDomain,
+    eids: &[KvEid],
+    now: UnixSeconds,
+) -> bool {
+    let Some(record) = entry.and_then(|entry| entry.ids.get(source.as_str())) else {
+        return false;
+    };
+    let Some(stored_until) = record
+        .eids()
+        .iter()
+        .flat_map(KvEid::uids)
+        .filter(|uid| uid.is_live(now))
+        .filter_map(|uid| match uid.expiry() {
+            Expiry::At(at) => Some(at),
+            Expiry::Never => None,
+        })
+        .max()
+    else {
+        return false;
+    };
+    eids.iter()
+        .flat_map(KvEid::uids)
+        .all(|uid| match uid.expiry() {
+            Expiry::At(at) => at < stored_until,
+            Expiry::Never => false,
+        })
+}
+
 /// Whether the row holds exactly the live UIDs in `eids` for `source`.
 ///
 /// UIDs are compared by ID, agent type, `ext` and their EID-level fields;
@@ -913,7 +953,7 @@ mod tests {
     use super::*;
     use crate::consent::types::TcfConsent;
     use crate::ec::coordinator::results::DropCounts;
-    use crate::ec::eid_types::{AgentType, EidFields, Expiry, UidValue};
+    use crate::ec::eid_types::{AgentType, UidValue};
     use crate::ec::kv::KvIdentityGraph;
     use crate::ec::kv_types::{KvEid, KvPartnerId, KvRefresh, KvUid};
     use crate::ec::provider::{
@@ -1136,9 +1176,9 @@ mod tests {
         )
     }
 
-    fn coordinator_with(
-        registered: RegisteredProvider<EchoProvider>,
-    ) -> ProviderCoordinator<EchoProvider> {
+    fn coordinator_with<P: IdentityProvider>(
+        registered: RegisteredProvider<P>,
+    ) -> ProviderCoordinator<P> {
         ProviderCoordinator::new(vec![registered], partners(), Duration::from_millis(200))
             .expect("should build coordinator")
     }
@@ -2649,6 +2689,103 @@ mod tests {
                 lookup.status
             );
         }
+    }
+
+    /// A cookie provider that keeps a stored UID outliving the cookie's.
+    struct RefreshingCookieProvider(EchoProvider);
+
+    impl IdentityProvider for RefreshingCookieProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            self.0.build_request(lookup)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            self.0.read_request_cookies(cookies)
+        }
+
+        fn keeps_fresher_stored_uids(&self) -> bool {
+            true
+        }
+    }
+
+    fn record_until(id: &str, until: u64) -> KvPartnerId {
+        let uid = KvUid::new(
+            UidValue::try_from(id).expect("should build uid"),
+            AgentType::try_from(3).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            Expiry::At(UnixSeconds::new(until)),
+        );
+        KvPartnerId::from_eids(
+            vec![KvEid::new(EidFields::default(), vec![uid])],
+            UnixSeconds::new(1000),
+        )
+        .expect("should build provider record")
+    }
+
+    #[test]
+    fn an_older_cookie_does_not_roll_back_a_refreshed_uid() {
+        // Arrange: the cookie's UID expires at 5000; a refresh stored one
+        // living until 6000.
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            RefreshingCookieProvider(cookie_provider(SourceInput::Anonymous, Some("vendor_id"))),
+        ));
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(record_until("p-2", 6000)),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NotDue),
+            "should keep the refreshed UID over the older cookie"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn a_newer_cookie_replaces_an_older_stored_uid() {
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            RefreshingCookieProvider(cookie_provider(SourceInput::Anonymous, Some("vendor_id"))),
+        ));
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(record_until("p-2", 4000)),
+            &granting(),
+        );
+
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { kept: 1, .. }),
+            "should take the cookie UID that outlives the stored one"
+        );
     }
 
     #[test]

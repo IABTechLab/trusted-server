@@ -287,6 +287,13 @@ impl IdentityProvider for Uid2Provider {
         true
     }
 
+    /// A server-side refresh does not rewrite the browser's cookies, so a
+    /// token stored by a refresh outlives the cookie's older token and is
+    /// kept until the browser SDK refreshes to a newer one.
+    fn keeps_fresher_stored_uids(&self) -> bool {
+        true
+    }
+
     fn build_request(
         &self,
         lookup: &LookupInput<'_>,
