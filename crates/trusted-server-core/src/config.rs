@@ -33,10 +33,9 @@ use crate::integrations::{
     sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
-use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
+use crate::settings::{AssetOriginAuth, IntegrationConfig, IntegrationSettings, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
-#[cfg(test)]
 const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
     #[cfg(feature = "test-utils")]
     crate::test_support::async_html_finalization::ID,
@@ -311,6 +310,16 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 /// Returns [`TrustedServerError`] when non-secret configuration or a secret key
 /// reference is invalid.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let unknown_ids = unknown_integration_ids(settings);
+    if !unknown_ids.is_empty() {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "Unknown integration IDs: {}. Known integration IDs: {}",
+                unknown_ids.join(", "),
+                DEPLOY_VALIDATED_INTEGRATION_IDS.join(", ")
+            ),
+        }));
+    }
     validate_secret_key_references(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
     validate_js_asset_proxy_config(settings)?;
@@ -335,6 +344,11 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
 pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
+    for id in unknown_integration_ids(settings) {
+        log::warn!(
+            "Unknown integration ID '{id}' is ignored; check the integration name or remove its configuration"
+        );
+    }
     settings.reject_placeholder_secrets()?;
     validate_js_asset_proxy_config(settings)?;
     validate_gpt_diagnostics_config(settings)?;
@@ -345,19 +359,25 @@ pub fn validate_settings_for_runtime(
     Ok(())
 }
 
+fn unknown_integration_ids(settings: &Settings) -> Vec<&str> {
+    let mut ids = settings
+        .integrations
+        .keys()
+        .map(String::as_str)
+        .filter(|id| !DEPLOY_VALIDATED_INTEGRATION_IDS.contains(id))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
+
 fn validate_gpt_diagnostics_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
     let Some(raw_config) = settings.integrations.get(GPT_DIAGNOSTICS_INTEGRATION_ID) else {
         return Ok(());
     };
     // Validate this dependency even when the normal integration lookup skips
     // disabled integrations, including the default when enabled is omitted.
-    let config: GptDiagnosticsConfig = serde_json::from_value(raw_config.clone()).map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "integration startup failed for `{GPT_DIAGNOSTICS_INTEGRATION_ID}`: configuration could not be parsed: {error}"
-            ),
-        })
-    })?;
+    let config: GptDiagnosticsConfig = serde_json::from_value(raw_config.clone())
+        .map_err(|error| IntegrationSettings::parse_error(GPT_DIAGNOSTICS_INTEGRATION_ID, error))?;
     config.validate().map_err(|error| {
         Report::new(TrustedServerError::Configuration {
             message: format!(
@@ -372,13 +392,8 @@ fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<Trus
         return Ok(());
     };
 
-    let config: JsAssetProxyConfig = serde_json::from_value(raw_config.clone()).map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "integration startup failed for `{JS_ASSET_PROXY_INTEGRATION_ID}`: configuration could not be parsed: {error}"
-            ),
-        })
-    })?;
+    let config: JsAssetProxyConfig = serde_json::from_value(raw_config.clone())
+        .map_err(|error| IntegrationSettings::parse_error(JS_ASSET_PROXY_INTEGRATION_ID, error))?;
     config.validate().map_err(|error| {
         Report::new(TrustedServerError::Configuration {
             message: format!(
@@ -1847,6 +1862,66 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
+    fn prepass_integration_parse_errors_hide_invalid_values() {
+        for (id, config) in [
+            (
+                GPT_DIAGNOSTICS_INTEGRATION_ID,
+                serde_json::json!({ "enabled": "fictional-private-value" }),
+            ),
+            (
+                JS_ASSET_PROXY_INTEGRATION_ID,
+                serde_json::json!({
+                    "enabled": true,
+                    "cache_ttl_seconds": "fictional-private-value"
+                }),
+            ),
+        ] {
+            for validate in [validate_settings_for_deploy, validate_settings_for_runtime] {
+                let mut settings = valid_settings();
+                settings.integrations.insert(id.to_owned(), config.clone());
+
+                let message = validate(&settings)
+                    .expect_err("should reject an invalid pre-pass integration value")
+                    .to_string();
+                assert!(
+                    message.contains(&format!(
+                        "Integration '{id}' configuration could not be parsed"
+                    )),
+                    "should name the integration: {message}"
+                );
+                assert!(
+                    !message.contains("fictional-private-value"),
+                    "should not echo invalid values in the outer error message: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepass_integration_parse_errors_name_unknown_fields() {
+        for id in [
+            GPT_DIAGNOSTICS_INTEGRATION_ID,
+            JS_ASSET_PROXY_INTEGRATION_ID,
+        ] {
+            let mut settings = valid_settings();
+            settings.integrations.insert(
+                id.to_owned(),
+                serde_json::json!({ "enabled": false, "made_up_key": true }),
+            );
+
+            let message = validate_settings_for_deploy(&settings)
+                .expect_err("should reject an unknown pre-pass integration field")
+                .to_string();
+            assert!(
+                message.contains(&format!(
+                    "Integration '{id}' configuration could not be parsed: unknown field `made_up_key`"
+                )),
+                "should name the integration and the unknown field: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn deploy_validation_rejects_external_prebid_bundle_without_proxy_allowed_domains() {
         let mut settings = valid_settings();
         settings.proxy.allowed_domains.clear();
@@ -1968,6 +2043,176 @@ password = "production-admin-password-32-bytes"
 
         validate_settings_for_deploy(&settings)
             .expect("test config with typed Prebid bundle build table should validate");
+    }
+
+    #[test]
+    fn deploy_validation_rejects_unknown_integration_id() {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert("prebdi".to_owned(), serde_json::json!({ "enabled": false }));
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should reject an unknown integration ID even when disabled");
+        let message = error.to_string();
+        assert!(
+            message.contains("prebdi"),
+            "should name the unknown ID: {message}"
+        );
+        for id in DEPLOY_VALIDATED_INTEGRATION_IDS {
+            assert!(message.contains(id), "should list known ID {id}: {message}");
+        }
+    }
+
+    #[test]
+    fn runtime_validation_warns_about_unknown_integration_id() {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert("prebdi".to_owned(), serde_json::json!({ "enabled": true }));
+        let capture = crate::test_support::logging::WarningCapture::start();
+
+        validate_settings_for_runtime(&settings)
+            .expect("should keep starting with an unknown stored integration ID");
+
+        let warnings = capture.take();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.message.contains("prebdi")),
+            "should warn about the ignored unknown ID"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_unknown_integration_fields() {
+        let cases = [
+            (
+                "adserver_mock",
+                serde_json::json!({ "endpoint": "https://mediator.example.com/mediate" }),
+            ),
+            ("aps", serde_json::json!({})),
+            ("datadome", serde_json::json!({})),
+            ("didomi", serde_json::json!({})),
+            (
+                "google_tag_manager",
+                serde_json::json!({ "container_id": "GTM-ABC1234" }),
+            ),
+            ("gpt", serde_json::json!({})),
+            ("gpt_diagnostics", serde_json::json!({})),
+            (
+                "js_asset_proxy",
+                serde_json::json!({ "assets": [{ "path": "/assets/vendor.js", "origin_url": "https://cdn.example.com/vendor.js" }] }),
+            ),
+            ("lockr", serde_json::json!({ "app_id": "example-app" })),
+            ("nextjs", serde_json::json!({})),
+            ("osano", serde_json::json!({})),
+            (
+                "permutive",
+                serde_json::json!({ "organization_id": "example", "workspace_id": "example" }),
+            ),
+            (
+                "prebid",
+                serde_json::json!({ "external_bundle_url": "https://cdn.example.com/prebid.js" }),
+            ),
+            ("sourcepoint", serde_json::json!({})),
+            (
+                "testlight",
+                serde_json::json!({ "endpoint": "https://testlight.example.com/auction" }),
+            ),
+        ];
+        let mut accepted = Vec::new();
+        for (id, base) in cases {
+            for enabled in [true, false] {
+                let mut config = base.clone();
+                config["enabled"] = serde_json::json!(enabled);
+                let mut settings = valid_settings();
+                settings.integrations.insert(id.to_owned(), config.clone());
+                validate_settings_for_deploy(&settings)
+                    .unwrap_or_else(|error| panic!("should accept baseline {id}: {error:?}"));
+
+                config["made_up_key"] = serde_json::json!("x");
+                settings.integrations.insert(id.to_owned(), config);
+                match validate_settings_for_deploy(&settings) {
+                    Ok(()) => accepted.push(format!("{id} (enabled = {enabled})")),
+                    Err(error) => {
+                        let message = error.to_string();
+                        assert!(
+                            message.contains("made_up_key"),
+                            "should name unknown field for {id}: {message}"
+                        );
+                        assert!(
+                            message.contains(id),
+                            "should name integration {id}: {message}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "should reject unknown fields in all integrations: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_unknown_fields_in_minimal_disabled_integrations() {
+        for id in DEPLOY_VALIDATED_INTEGRATION_IDS {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert((*id).to_owned(), serde_json::json!({ "enabled": false }));
+            validate_settings_for_deploy(&settings)
+                .unwrap_or_else(|error| panic!("should accept minimal disabled {id}: {error:?}"));
+
+            settings.integrations.insert(
+                (*id).to_owned(),
+                serde_json::json!({ "enabled": false, "made_up_key": true }),
+            );
+            let error = validate_settings_for_deploy(&settings)
+                .expect_err("should reject unknown fields even with missing enabled-only fields");
+            assert!(
+                error.to_string().contains("made_up_key"),
+                "should name unknown field for {id}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_validation_preserves_open_integration_payload_maps_and_aliases() {
+        let mut settings = valid_settings();
+        settings.integrations.insert(
+            "adserver_mock".to_owned(),
+            serde_json::json!({
+                "enabled": true,
+                "endpoint": "https://mediator.example.com/mediate",
+                "context_query_params": { "example_context": "example_query" }
+            }),
+        );
+        settings.integrations.insert(
+            "datadome".to_owned(),
+            serde_json::json!({
+                "enabled": true,
+                "client_side_configuration": { "example_option": { "custom_key": true } }
+            }),
+        );
+        settings.integrations.insert(
+            "prebid".to_owned(),
+            serde_json::json!({
+                "enabled": true,
+                "external_bundle_url": "https://cdn.example.com/prebid.js",
+                "managed_user_ids": [{ "name": "sharedId", "params": { "example_option": true } }]
+            }),
+        );
+        settings.integrations.insert(
+            "lockr".to_owned(),
+            serde_json::json!({
+                "enabled": true, "app_id": "example-app", "rewrite_sdk_host": false
+            }),
+        );
+
+        validate_settings_for_deploy(&settings)
+            .expect("should accept open payload maps and explicit compatibility fields");
     }
 
     #[test]
