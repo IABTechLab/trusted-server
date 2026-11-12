@@ -196,6 +196,23 @@ jobs:
       - name: Run host-target CLI tests
         run: ./scripts/test-cli.sh
 
+      - name: Run release producer primitive and process tests
+        run: |
+          set -euo pipefail
+          cargo test --package trusted-server-release --target x86_64-unknown-linux-gnu --locked --test commands -- --list > "$RUNNER_TEMP/ordinary-command-tests.txt"
+          grep -Fx 'ordinary_compare_mismatch_writes_no_companion: test' "$RUNNER_TEMP/ordinary-command-tests.txt"
+          cargo test --package trusted-server-release --target x86_64-unknown-linux-gnu --locked
+          cargo test --package trusted-server-release --target x86_64-unknown-linux-gnu --locked --test commands ordinary_compare_mismatch_writes_no_companion -- --exact > "$RUNNER_TEMP/ordinary-negative-result.txt"
+          cat "$RUNNER_TEMP/ordinary-negative-result.txt"
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/ordinary-negative-result.txt"
+
+      - name: Run checked and ordinary JS release build fixtures
+        shell: bash
+        run: |
+          cargo test --package trusted-server-js --target x86_64-unknown-linux-gnu --locked --test release_prebuilt -- --list > "$RUNNER_TEMP/js-release-tests.txt"
+          grep -Fx 'ordinary_release_without_prebuilt_builds_private_bundles: test' "$RUNNER_TEMP/js-release-tests.txt"
+          cargo test --package trusted-server-js --target x86_64-unknown-linux-gnu --locked --test release_prebuilt
+
       # The codegen crate is not a default member and no adapter alias builds it,
       # so its tests only run if invoked explicitly on the host target.
       - name: Run host-target OpenRTB codegen tests
@@ -351,6 +368,11 @@ jobs:
         run: |
           cargo clippy --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --all-targets -- -D warnings
 
+      - name: Run producer process supervision on macOS
+        if: runner.os == 'macOS'
+        run: |
+          cargo test --package trusted-server-release --target "$(rustc -vV | sed -n 's/host: //p')" --locked --bin trusted-server-release process::
+
       - name: Set up Chrome for browser fixture tests
         if: runner.os == 'macOS'
         id: setup-chrome
@@ -371,6 +393,11 @@ jobs:
           TRUSTED_SERVER__GIT_VERSION: abcdef0123456789abcdef0123456789abcdef01
         run: |
           cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --test release_build_facts
+          # The release cfg also selects resource discovery without the
+          # builder's checkout path; only a release-mode lib build reaches it.
+          cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --lib prebid_bundle::tests::actual_resource_discovery_uses_owning_release_cfg -- --exact > "$RUNNER_TEMP/release-cfg-result.txt"
+          cat "$RUNNER_TEMP/release-cfg-result.txt"
+          grep -E '^test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/release-cfg-result.txt"
 
       # A valid commit also passes when the release gate is bypassed, so check
       # that core's build script refuses a branch name in release mode.

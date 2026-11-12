@@ -31,9 +31,9 @@ use trusted_server_core::test_support::nextjs_auction;
 
 /// Shared test settings for all adapters.
 ///
-/// The settings baked into the binaries contain placeholder secrets that
-/// `get_settings()` rejects by design, so all routers are built through
-/// their `routes_with_settings` testing seams from this known-good config.
+/// All routers use their `routes_with_settings` testing seams with known-good
+/// settings so these tests do not depend on external runtime configuration
+/// or secret-store bindings.
 /// The handler regex is the production-shaped `^/_ts/admin`, matching
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.

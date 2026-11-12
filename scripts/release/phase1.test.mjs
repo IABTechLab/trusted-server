@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { gzipSync, gunzipSync } from 'node:zlib'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { completeSpdx, checkReleaseFormat } from './phase1.mjs'
 import { test } from 'node:test'
@@ -13,6 +14,7 @@ import {
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import * as fs from 'node:fs'
+import vm from 'node:vm'
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
 import {
@@ -22,6 +24,607 @@ import {
   sentinels,
 } from './phase1.mjs'
 import { publish, releaseAssets, releaseNotes } from './publish.mjs'
+import {
+  ordinaryApi,
+  ordinaryDownload,
+  acquireOrdinaryTransfers,
+} from './phase1.mjs'
+
+test('ordinary transport preserves raw metadata and uses only the fixed authenticated GET', async () => {
+  const calls = []
+  const bytes = '{"total_count":0,"jobs":[],"same":1,"same":2}'
+  const fetched = await ordinaryApi(
+    '/repos/example/release/actions/runs/17/attempts/2/jobs?per_page=100',
+    'fictional-token',
+    async (url, options) => {
+      calls.push({ url, options })
+      return new Response(bytes)
+    }
+  )
+  assert.equal(fetched.toString(), bytes)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].options.method, 'GET')
+  assert.equal(calls[0].options.redirect, 'manual')
+  assert.equal(calls[0].options.headers.Authorization, 'Bearer fictional-token')
+  // Assert the fixed metadata origin without permitting arbitrary destinations.
+  assert.equal(new URL(calls[0].url).origin, 'https://api.github.com') // allow-domain: api.github.com
+})
+
+test('ordinary transport rejects metadata failures and oversized responses without leaking details', async () => {
+  let discarded = 0
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+      'fictional-token',
+      async () =>
+        new Response(
+          new ReadableStream({
+            cancel() {
+              discarded++
+            },
+          }),
+          { status: 403 }
+        )
+    )
+  )
+  assert.equal(discarded, 1)
+  for (const response of [
+    new Response('fictional-sensitive-body', { status: 403 }),
+    new Response('fictional-sensitive-body', {
+      status: 302,
+      headers: { location: 'https://example.com/fictional-secret' },
+    }),
+    new Response(Buffer.alloc(1024 * 1024 + 1)),
+  ])
+    await assert.rejects(
+      ordinaryApi(
+        '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+        'fictional-token',
+        async () => response
+      ),
+      (error) =>
+        !/fictional-sensitive|fictional-secret|fictional-token/.test(
+          error.message
+        )
+    )
+  let called = false
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/releases',
+      'fictional-token',
+      async () => {
+        called = true
+      }
+    )
+  )
+  assert.equal(called, false)
+  for (const path of [
+    '/repos/../release/actions/runs/17/artifacts?per_page=100',
+    '/repos/example/../actions/runs/17/artifacts?per_page=100',
+  ]) {
+    await assert.rejects(
+      ordinaryApi(path, 'fictional-token', async () => {
+        called = true
+      })
+    )
+    assert.equal(called, false)
+  }
+  let thrown = 0
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+      'fictional-token',
+      async () => {
+        thrown++
+        throw Error('https://example.com/fictional-secret fictional-token')
+      },
+      undefined,
+      async () => {}
+    ),
+    (error) => !/fictional-secret|fictional-token/.test(error.message)
+  )
+  assert.equal(thrown, 3, 'should retry a network error at most twice')
+})
+
+test('ordinary transport retries only transient metadata failures inside its bound', async () => {
+  const path = '/repos/example/release/actions/runs/17/artifacts?per_page=100'
+  const waits = []
+  const wait = async (milliseconds) => {
+    waits.push(milliseconds)
+  }
+  for (const status of [503, 429]) {
+    let calls = 0
+    waits.length = 0
+    const fetched = await ordinaryApi(
+      path,
+      'fictional-token',
+      async () =>
+        ++calls === 1
+          ? new Response('busy', { status })
+          : new Response('{"total_count":0}'),
+      undefined,
+      wait
+    )
+    assert.equal(fetched.toString(), '{"total_count":0}')
+    assert.equal(calls, 2, `should retry one ${status}`)
+    assert.deepEqual(waits, [1_000], 'should back off before the retry')
+  }
+  let calls = 0
+  await assert.rejects(
+    ordinaryApi(
+      path,
+      'fictional-token',
+      async () => {
+        calls++
+        return new Response('busy', { status: 502 })
+      },
+      undefined,
+      wait
+    ),
+    /HTTP 502/
+  )
+  assert.equal(calls, 3, 'should stop after three attempts')
+  calls = 0
+  await assert.rejects(
+    ordinaryApi(
+      path,
+      'fictional-token',
+      async () => {
+        calls++
+        return new Response('missing', { status: 404 })
+      },
+      undefined,
+      wait
+    ),
+    /HTTP 404/
+  )
+  assert.equal(calls, 1, 'should never retry a non-transient status')
+  const deadline = AbortSignal.abort()
+  calls = 0
+  await assert.rejects(
+    ordinaryApi(
+      path,
+      'fictional-token',
+      async () => {
+        calls++
+        return new Response('{}')
+      },
+      deadline,
+      wait
+    )
+  )
+  assert.equal(calls, 0, 'should not start a request after the shared deadline')
+})
+
+test('ordinary archive retries request a fresh redirect for each attempt', async () => {
+  const directory = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const bytes = Buffer.from('fictional archive bytes')
+  const archive = {
+    id: 41,
+    size: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    file: 'canonical.zip',
+  }
+  const calls = []
+  try {
+    await ordinaryDownload(
+      {
+        repository: 'example/release',
+        archive,
+        token: 'fictional-token',
+        directory,
+      },
+      async (url) => {
+        calls.push(url)
+        if (url.endsWith('/zip'))
+          return new Response(null, {
+            status: 302,
+            headers: {
+              location: `https://example.com/archive?attempt=${calls.length}`,
+            },
+          })
+        return calls.length === 2
+          ? new Response('busy', { status: 503 })
+          : new Response(bytes)
+      },
+      async () => {}
+    )
+    assert.deepEqual(readFileSync(join(directory, archive.file)), bytes)
+    assert.equal(calls.length, 4, 'should retry the redirect and the blob')
+    assert.match(calls[0], /\/zip$/)
+    assert.match(calls[2], /\/zip$/)
+    assert.notEqual(calls[1], calls[3], 'should follow the fresh redirect')
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('ordinary archive retries only transient API and blob statuses', async () => {
+  const bytes = Buffer.from('fictional archive bytes')
+  for (const [apiStatus, blobStatus, expected] of [
+    [503, 200, 3],
+    [404, 200, 1],
+    [302, 404, 2],
+  ]) {
+    const directory = fs.realpathSync(
+      mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+    )
+    let calls = 0
+    try {
+      const download = ordinaryDownload(
+        {
+          repository: 'example/release',
+          archive: {
+            id: 41,
+            size: bytes.length,
+            sha256: createHash('sha256').update(bytes).digest('hex'),
+            file: 'canonical.zip',
+          },
+          token: 'fictional-token',
+          directory,
+        },
+        async (url) => {
+          calls++
+          if (!url.endsWith('/zip'))
+            return new Response(blobStatus === 200 ? bytes : 'missing', {
+              status: blobStatus,
+            })
+          return calls === 1 && apiStatus !== 302
+            ? new Response('busy', { status: apiStatus })
+            : new Response(null, {
+                status: 302,
+                headers: { location: 'https://example.com/archive' },
+              })
+        },
+        async () => {}
+      )
+      if (apiStatus === 503) await download
+      else await assert.rejects(download)
+      assert.equal(calls, expected, `${apiStatus}/${blobStatus}`)
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  }
+})
+
+test('ordinary retry backoff stops at the shared deadline', async () => {
+  let calls = 0
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+      'fictional-token',
+      async () => {
+        calls++
+        return new Response('busy', { status: 503 })
+      },
+      AbortSignal.timeout(200)
+    ),
+    /deadline exhausted/
+  )
+  assert.equal(calls, 1, 'should not retry after the deadline ends the backoff')
+})
+
+test('ordinary transport downloads exact archive bytes without forwarding the API token', async () => {
+  const directory = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const bytes = Buffer.from('fictional archive bytes')
+  const archive = {
+    id: 41,
+    size: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    file: 'canonical.zip',
+  }
+  const calls = []
+  try {
+    await ordinaryDownload(
+      {
+        repository: 'example/release',
+        archive,
+        token: 'fictional-token',
+        directory,
+      },
+      async (url, options) => {
+        calls.push({ url, options })
+        return calls.length === 1
+          ? new Response(null, {
+              status: 302,
+              headers: {
+                location: 'https://example.com/archive?fictional-secret',
+              },
+            })
+          : new Response(bytes)
+      }
+    )
+    assert.deepEqual(readFileSync(join(directory, archive.file)), bytes)
+    assert.equal(calls.length, 2)
+    assert.match(calls[0].url, /\/actions\/artifacts\/41\/zip$/)
+    assert.equal(
+      calls[0].options.headers.Authorization,
+      'Bearer fictional-token'
+    )
+    assert.equal(calls[1].options.headers?.Authorization, undefined)
+    assert.equal(calls[1].options.redirect, 'error')
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('ordinary transport rejects wrong archive hashes and reused output paths', async () => {
+  const directory = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const archive = {
+    id: 41,
+    size: 3,
+    sha256: 'a'.repeat(64),
+    file: 'canonical-observation.zip',
+  }
+  let calls = 0
+  const fetcher = async () =>
+    ++calls % 2 === 1
+      ? new Response(null, {
+          status: 302,
+          headers: { location: 'https://example.com/archive?fictional-secret' },
+        })
+      : new Response('bad')
+  try {
+    await assert.rejects(
+      ordinaryDownload(
+        {
+          repository: 'example/release',
+          archive,
+          token: 'fictional-token',
+          directory,
+        },
+        fetcher
+      ),
+      /archive/
+    )
+    writeFileSync(join(directory, archive.file), 'retained')
+    await assert.rejects(
+      ordinaryDownload(
+        {
+          repository: 'example/release',
+          archive,
+          token: 'fictional-token',
+          directory,
+        },
+        fetcher
+      )
+    )
+    assert.equal(
+      readFileSync(join(directory, archive.file), 'utf8'),
+      'retained'
+    )
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('ordinary transport stops before ZIP requests when current-run binding fails', async () => {
+  const root = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const input = join(root, 'input')
+  mkdirSync(input)
+  const calls = []
+  try {
+    await assert.rejects(
+      acquireOrdinaryTransfers(
+        {
+          producer: '/fictional/producer',
+          input,
+          archives: join(root, 'archives'),
+          repository: 'example/release',
+          runId: '17',
+          attempt: '2',
+          token: 'fictional-token',
+        },
+        async (url) => {
+          calls.push(url)
+          return new Response('{"total_count":0}')
+        },
+        () => {
+          assert.equal(
+            readFileSync(join(input, 'jobs.json'), 'utf8'),
+            '{"total_count":0}'
+          )
+          assert.equal(
+            readFileSync(join(input, 'artifacts.json'), 'utf8'),
+            '{"total_count":0}'
+          )
+          throw Error('rejected current-run metadata')
+        }
+      ),
+      /current-run/
+    )
+    assert.equal(calls.length, 2)
+    assert.ok(calls.every((url) => !url.endsWith('/zip')))
+    assert.equal(fs.existsSync(join(root, 'archives')), false)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('ordinary transport rejects unsafe redirects before any blob request', async () => {
+  for (const location of [
+    'http://example.com/archive',
+    'https://user:fictional-secret@example.com/archive',
+    'https://example.com:444/archive',
+    'not-a-url',
+  ]) {
+    const root = fs.realpathSync(
+      mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+    )
+    let calls = 0
+    try {
+      await assert.rejects(
+        ordinaryDownload(
+          {
+            repository: 'example/release',
+            token: 'fictional-token',
+            directory: root,
+            archive: {
+              id: 41,
+              file: 'canonical.zip',
+              size: 1,
+              sha256: 'a'.repeat(64),
+            },
+          },
+          async () => {
+            calls++
+            return new Response(null, { status: 302, headers: { location } })
+          }
+        ),
+        (error) => !error.message.includes('fictional-secret')
+      )
+      assert.equal(calls, 1)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+})
+
+test('ordinary transport enforces observation and body bounds and aborts before fetching', async () => {
+  let oversizedCalled = false
+  await assert.rejects(
+    ordinaryDownload(
+      {
+        repository: 'example/release',
+        token: 'fictional-token',
+        directory: '/unused',
+        archive: {
+          id: 41,
+          file: 'canonical-observation.zip',
+          size: 2 * 1024 * 1024 + 1,
+          sha256: 'a'.repeat(64),
+        },
+      },
+      async () => {
+        oversizedCalled = true
+      }
+    )
+  )
+  assert.equal(oversizedCalled, false)
+  for (const body of ['short', 'longer-than-the-bound']) {
+    const root = fs.realpathSync(
+      mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+    )
+    let calls = 0
+    try {
+      await assert.rejects(
+        ordinaryDownload(
+          {
+            repository: 'example/release',
+            token: 'fictional-token',
+            directory: root,
+            archive: {
+              id: 41,
+              file: 'canonical-observation.zip',
+              size: 8,
+              sha256: 'a'.repeat(64),
+            },
+          },
+          async () =>
+            ++calls === 1
+              ? new Response(null, {
+                  status: 302,
+                  headers: { location: 'https://example.com/archive' },
+                })
+              : new Response(body)
+        )
+      )
+      assert.equal(calls, 2)
+      assert.ok(fs.statSync(join(root, 'canonical-observation.zip')).size <= 8)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+  let called = false
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+      'fictional-token',
+      async () => {
+        called = true
+      },
+      AbortSignal.abort()
+    )
+  )
+  assert.equal(called, false)
+})
+
+test('ordinary transport acquires exactly the four Rust-bound archives in fixed order', async () => {
+  const root = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const input = join(root, 'input'),
+    archives = join(root, 'archives')
+  mkdirSync(input)
+  const bytes = Buffer.from('fictional bound ZIP bytes')
+  const names = [
+    'canonical.zip',
+    'canonical-observation.zip',
+    'reproduction.zip',
+    'reproduction-observation.zip',
+  ]
+  let planned = false,
+    calls = 0
+  try {
+    await acquireOrdinaryTransfers(
+      {
+        producer: '/fictional/producer',
+        input,
+        archives,
+        repository: 'example/release',
+        runId: '17',
+        attempt: '2',
+        token: 'fictional-token',
+      },
+      async (url, options) => {
+        calls++
+        assert.equal(options.method, 'GET')
+        if (url.endsWith('per_page=100'))
+          return new Response('{"total_count":0}')
+        assert.equal(planned, true)
+        // The mock distinguishes the fixed authenticated API from blob reads.
+        const apiOrigin = 'https://api.github.com/' // allow-domain: api.github.com
+        if (url.startsWith(apiOrigin))
+          return new Response(null, {
+            status: 302,
+            headers: { location: 'https://example.com/archive' },
+          })
+        assert.equal(options.headers?.Authorization, undefined)
+        return new Response(bytes)
+      },
+      (producer, metadataRoot) => {
+        assert.equal(producer, '/fictional/producer')
+        assert.equal(metadataRoot, input)
+        assert.equal(fs.existsSync(join(input, 'artifacts.json')), true)
+        planned = true
+        return {
+          version: 1,
+          archives: names.map((file, index) => ({
+            file,
+            id: index + 41,
+            size: bytes.length,
+            sha256: createHash('sha256').update(bytes).digest('hex'),
+          })),
+        }
+      }
+    )
+    assert.equal(calls, 10)
+    assert.deepEqual(fs.readdirSync(archives).sort(), [...names].sort())
+    for (const name of names)
+      assert.deepEqual(readFileSync(join(archives, name)), bytes)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('rejects every planted operator value, including inside binary data', () => {
   for (const marker of sentinels) {
     assert.throws(
@@ -193,7 +796,8 @@ test('signing job shell refuses symlinked, extra, empty and changed inputs', () 
     workflow,
     "Retain only this run's real bundles and signed-input digests"
   )
-  const asset = 'example-asset'
+  // Use a cohort asset without a companion; the validator rejects unknown names.
+  const asset = 'ts-x86_64-unknown-linux-gnu'
   for (const mode of [
     'success',
     'symlink-binary',
@@ -229,7 +833,18 @@ test('signing job shell refuses symlinked, extra, empty and changed inputs', () 
       if (mode === 'extra') writeFileSync(join(inputs, 'extra'), 'extra')
       if (mode === 'missing') rmSync(join(inputs, `${asset}.spdx.json`))
       if (mode === 'empty') writeFileSync(join(inputs, asset), '')
-      const env = { PATH: process.env.PATH, ASSET: asset }
+      const env = {
+        PATH: process.env.PATH,
+        ASSET: asset,
+        SOURCE_COMMIT: 'a'.repeat(40),
+        GITHUB_RUN_ID: '17',
+        GITHUB_RUN_ATTEMPT: '2',
+        GITHUB_OUTPUT: join(root, 'github-output'),
+        // The step checks the pinned Node; pin whichever node PATH selects.
+        NODE_VERSION: execFileSync('node', ['--version'], { encoding: 'utf8' })
+          .trim()
+          .slice(1),
+      }
       const run = (script, extra = {}) =>
         spawnSync('bash', ['-c', script], {
           cwd: root,
@@ -283,6 +898,299 @@ const assets = releaseAssets
 // The publisher fixture shadows `execFileSync`; this runs a real child process.
 const realExecFileSync = execFileSync
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex')
+
+test('isolated signing accepts only bound 4/2 input sets and retains exact provenance subjects', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const match = workflow.match(
+    /          \/\/ BEGIN SIGNING INPUTS\n([\s\S]*?)          \/\/ END SIGNING INPUTS/
+  )
+  assert.ok(match, 'should exercise the actual inline signer validation')
+  const script = match[1]
+    .split('\n')
+    .map((line) => line.slice(10))
+    .join('\n')
+  const canonical = (value) =>
+    Array.isArray(value)
+      ? value.map(canonical)
+      : value && typeof value === 'object'
+        ? Object.fromEntries(
+            Object.keys(value)
+              .sort()
+              .map((key) => [key, canonical(value[key])])
+          )
+        : value
+  for (const asset of assets)
+    for (const mode of asset === 'trusted-server-fastly.wasm'
+      ? [
+          'success',
+          'missing',
+          'extra',
+          'source',
+          'run',
+          'attempt',
+          'failed',
+          'profile',
+          'qualified',
+          'binary',
+          'spdx',
+          'duplicate-key',
+          'earlier-attempt',
+          'zero-attempt',
+          'version',
+          'asset',
+          'target',
+          'variant',
+          'reproduction-binary',
+          'same-job',
+          'job-id',
+          'fractional-job-id',
+          'size',
+          'build-binary',
+          'unsorted',
+          'unknown-asset',
+          'bad-source',
+          'bad-run',
+          'bad-attempt',
+          'oversized-binary',
+          'oversized-companion',
+          'oversized-spdx',
+          'fractional-attempt',
+          'missing-package',
+          'changed-package',
+          'package-size',
+          'package-digest',
+          'package-reproduction',
+          'package-manifest',
+          'build-package',
+        ]
+      : ['success', 'extra']) {
+      const root = mkdtempSync(join(tmpdir(), 'ordinary-sign-'))
+      try {
+        mkdirSync(join(root, 'release-assets'))
+        const binary = Buffer.from(`fixture ${asset}`),
+          spdx = Buffer.from('{}')
+        writeFileSync(join(root, 'release-assets', asset), binary)
+        writeFileSync(join(root, 'release-assets', `${asset}.spdx.json`), spdx)
+        if (asset === 'trusted-server-fastly.wasm') {
+          const packageBytes = Buffer.from('fixture deployable package')
+          writeFileSync(
+            join(root, 'release-assets', 'trusted-server-fastly.tar.gz'),
+            packageBytes
+          )
+          mkdirSync(join(root, 'comparison'))
+          const receipt = {
+            version: 1,
+            profile: 'ordinary-release-fastly-byte-equality-v1',
+            release_qualification: false,
+            source_commit: 'a'.repeat(40),
+            asset,
+            target: 'wasm32-wasip1',
+            variant: 'default',
+            outcome: 'matched',
+            package: {
+              asset: 'trusted-server-fastly.tar.gz',
+              size: packageBytes.length,
+              canonical_sha256: hash(packageBytes),
+              reproduction_sha256: hash(packageBytes),
+              manifest_sha256: hash(
+                Buffer.from(
+                  'manifest_version = 3\nname = "trusted-server-fastly"\n'
+                )
+              ),
+            },
+            canonical_sha256: hash(binary),
+            reproduction_sha256: hash(binary),
+            canonical: {
+              run_id: 17,
+              run_attempt: 2,
+              job_id: 101,
+              size: binary.length,
+              sha256: hash(binary),
+              spdx_sha256: hash(spdx),
+              package: {
+                size: packageBytes.length,
+                sha256: hash(packageBytes),
+              },
+            },
+            reproduction: {
+              run_id: 17,
+              run_attempt: 2,
+              job_id: 102,
+              package: {
+                size: packageBytes.length,
+                sha256: hash(packageBytes),
+              },
+              size: binary.length,
+              sha256: hash(binary),
+            },
+          }
+          if (mode === 'missing-package')
+            fs.unlinkSync(
+              join(root, 'release-assets', 'trusted-server-fastly.tar.gz')
+            )
+          if (mode === 'changed-package')
+            writeFileSync(
+              join(root, 'release-assets', 'trusted-server-fastly.tar.gz'),
+              'changed'
+            )
+          if (mode === 'package-size') receipt.package.size++
+          if (mode === 'package-digest')
+            receipt.package.canonical_sha256 = '0'.repeat(64)
+          if (mode === 'package-reproduction')
+            receipt.package.reproduction_sha256 = '0'.repeat(64)
+          if (mode === 'package-manifest')
+            receipt.package.manifest_sha256 = '0'.repeat(64)
+          if (mode === 'build-package')
+            receipt.reproduction.package.sha256 = '0'.repeat(64)
+          if (mode === 'source') receipt.source_commit = 'b'.repeat(40)
+          if (mode === 'run') receipt.canonical.run_id = 18
+          // A later attempt cannot have sealed this run's receipt; an earlier
+          // one can, when "Re-run failed jobs" retries only a signing leg.
+          if (mode === 'attempt') receipt.reproduction.run_attempt = 3
+          if (mode === 'earlier-attempt') {
+            receipt.canonical.run_attempt = 1
+            receipt.reproduction.run_attempt = 1
+          }
+          if (mode === 'zero-attempt') receipt.canonical.run_attempt = 0
+          if (mode === 'fractional-attempt') receipt.canonical.run_attempt = 1.5
+          if (mode === 'failed') receipt.outcome = 'mismatched'
+          if (mode === 'profile') receipt.profile = 'controlled-recipe'
+          if (mode === 'qualified') receipt.release_qualification = true
+          if (mode === 'binary') receipt.canonical_sha256 = '0'.repeat(64)
+          if (mode === 'spdx') receipt.canonical.spdx_sha256 = '0'.repeat(64)
+          if (mode === 'version') receipt.version = 2
+          if (mode === 'asset') receipt.asset = 'ts-x86_64-unknown-linux-gnu'
+          if (mode === 'target') receipt.target = 'wasm32-unknown-unknown'
+          if (mode === 'variant') receipt.variant = 'example'
+          if (mode === 'reproduction-binary')
+            receipt.reproduction_sha256 = '0'.repeat(64)
+          if (mode === 'same-job') receipt.reproduction.job_id = 101
+          if (mode === 'job-id') receipt.canonical.job_id = 0
+          if (mode === 'fractional-job-id') receipt.reproduction.job_id = 102.5
+          if (mode === 'size') receipt.reproduction.size += 1
+          if (mode === 'build-binary')
+            receipt.reproduction.sha256 = '0'.repeat(64)
+          let text =
+            JSON.stringify(mode === 'unsorted' ? receipt : canonical(receipt)) +
+            '\n'
+          if (mode === 'duplicate-key') {
+            assert.ok(text.startsWith('{'))
+            text = '{"version":0,' + text.slice(1)
+          }
+          if (mode !== 'missing')
+            writeFileSync(
+              join(root, 'comparison', `${asset}.rebuild-check.json`),
+              text
+            )
+          if (mode === 'extra')
+            writeFileSync(join(root, 'comparison', 'unexpected'), 'extra')
+          // Sparse files reach the size bound without allocating it.
+          if (mode === 'oversized-binary')
+            fs.truncateSync(
+              join(root, 'release-assets', asset),
+              512 * 1024 * 1024 + 1
+            )
+          if (mode === 'oversized-companion')
+            fs.truncateSync(
+              join(root, 'comparison', `${asset}.rebuild-check.json`),
+              32 * 1024 * 1024 + 1
+            )
+          if (mode === 'oversized-spdx')
+            fs.truncateSync(
+              join(root, 'release-assets', `${asset}.spdx.json`),
+              32 * 1024 * 1024 + 1
+            )
+        } else if (mode === 'extra')
+          writeFileSync(join(root, 'release-assets', 'unexpected'), 'extra')
+        const local = (path) => join(root, path)
+        const context = {
+          Buffer,
+          process: {
+            env: {
+              ASSET: mode === 'unknown-asset' ? 'ts-example-unknown' : asset,
+              SOURCE_COMMIT:
+                mode === 'bad-source' ? 'A'.repeat(40) : 'a'.repeat(40),
+              GITHUB_RUN_ID: mode === 'bad-run' ? '017' : '17',
+              GITHUB_RUN_ATTEMPT: mode === 'bad-attempt' ? '2x' : '2',
+              GITHUB_OUTPUT: 'outputs',
+            },
+          },
+          require(name) {
+            if (name === 'node:crypto') return { createHash }
+            if (name === 'node:fs')
+              return {
+                readdirSync: (path) => fs.readdirSync(local(path)),
+                lstatSync: (path) => fs.lstatSync(local(path)),
+                readFileSync: (path) => fs.readFileSync(local(path)),
+                writeFileSync: (path, ...args) =>
+                  fs.writeFileSync(local(path), ...args),
+                appendFileSync: (path, ...args) =>
+                  fs.appendFileSync(local(path), ...args),
+              }
+            throw Error(`Unexpected signing module: ${name}`)
+          },
+        }
+        const execute = () => vm.runInNewContext(script, context)
+        if (mode !== 'success' && mode !== 'earlier-attempt') {
+          // These modes must stop at their own guard, not a later check.
+          const reason = {
+            'unknown-asset': /Invalid signing identity/,
+            'bad-source': /Invalid signing identity/,
+            'bad-run': /Invalid signing identity/,
+            'bad-attempt': /Invalid signing identity/,
+            'oversized-binary': /Invalid signing input/,
+            'oversized-companion': /Invalid signing input/,
+            'oversized-spdx': /Invalid signing input/,
+          }[mode]
+          assert.throws(execute, reason, `${asset}: ${mode}`)
+          assert.equal(
+            fs.existsSync(join(root, 'inputs.sha256')),
+            false,
+            'should not seal failed inputs'
+          )
+          continue
+        }
+        execute()
+        const files = [
+          asset,
+          `${asset}.spdx.json`,
+          ...(asset === 'trusted-server-fastly.wasm'
+            ? ['trusted-server-fastly.tar.gz', `${asset}.rebuild-check.json`]
+            : []),
+        ]
+        assert.equal(
+          readFileSync(join(root, 'inputs.sha256'), 'utf8'),
+          files
+            .map(
+              (file) =>
+                `${hash(readFileSync(join(root, 'release-assets', file)))}  ${file}\n`
+            )
+            .join('')
+        )
+        const output = readFileSync(join(root, 'outputs'), 'utf8')
+        assert.equal(
+          output.match(
+            /sbom_subjects<<SBOM_SUBJECTS\n([\s\S]*?)SBOM_SUBJECTS\n/
+          )?.[1],
+          `release-assets/${asset}\n${asset === 'trusted-server-fastly.wasm' ? 'release-assets/trusted-server-fastly.tar.gz\n' : ''}`,
+          'should attest exactly the deployable files with SPDX'
+        )
+        for (const file of files)
+          assert.ok(
+            output.includes(`release-assets/${file}\n`),
+            'should attest every sealed input'
+          )
+        assert.equal(
+          readFileSync(join(root, 'inputs.sha256'), 'utf8').trim().split('\n')
+            .length,
+          files.length
+        )
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    }
+})
+
 const canonicalBlock = (markdown) => {
   const block = markdown.match(
     /<!-- release-verification:start -->\n\n```bash\n([\s\S]*?)\n```\n\n<!-- release-verification:end -->/
@@ -328,6 +1236,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'missing-tag',
     'malformed-tag',
     'bundle-verification-failure',
+    'package-provenance-failure',
+    'package-sbom-failure',
     'bundle-sbom-mismatch',
     'bundle-sbom-duplicate',
     'identity-late',
@@ -345,6 +1255,13 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'extra',
     'changed',
     'empty-bundle',
+    'missing-companion',
+    'changed-companion',
+    'extra-companion',
+    'unsigned-companion',
+    'changed-package',
+    'missing-package',
+    'unsigned-package',
     'symlink-input',
     'signed-extra',
     'created-wrong-tag',
@@ -430,6 +1347,37 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             bytes
           )
           entries.push(`${hash(bytes)}  ${asset}${suffix}\n`)
+        }
+        if (asset === 'trusted-server-fastly.wasm') {
+          const packageBytes = Buffer.from('fixture deployable package')
+          writeFileSync(
+            join(build, 'trusted-server-fastly.tar.gz'),
+            packageBytes
+          )
+          if (mode !== 'unsigned-package')
+            entries.splice(
+              2,
+              0,
+              `${hash(packageBytes)}  trusted-server-fastly.tar.gz\n`
+            )
+          if (mode === 'changed-package')
+            writeFileSync(
+              join(build, 'trusted-server-fastly.tar.gz'),
+              'changed'
+            )
+          if (mode === 'missing-package')
+            fs.unlinkSync(join(build, 'trusted-server-fastly.tar.gz'))
+          const companion = `${asset}.rebuild-check.json`,
+            bytes = Buffer.from('fixture signed ordinary rebuild check')
+          writeFileSync(join(signed, companion), bytes)
+          if (mode !== 'unsigned-companion')
+            entries.splice(3, 0, `${hash(bytes)}  ${companion}\n`)
+          if (mode === 'changed-companion')
+            writeFileSync(join(signed, companion), 'changed')
+          if (mode === 'missing-companion')
+            fs.unlinkSync(join(signed, companion))
+          if (mode === 'extra-companion')
+            writeFileSync(join(signed, 'unexpected'), 'extra')
         }
         writeFileSync(join(signed, 'SHA256SUMS'), entries.join(''))
       }
@@ -653,8 +1601,19 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             calls.filter(
               ([kind, call]) => kind === 'gh' && call[1][0] === 'attestation'
             ).length - 1
-          const name = assets[Math.floor(index / 2)]
-          const kind = index % 2 ? 'sbom' : 'provenance'
+          // Two predicates per binary; the Fastly provenance also names its
+          // rebuild check.
+          const [name, subject, kind] = assets.flatMap((asset) => [
+            [asset, asset, 'provenance'],
+            [asset, asset, 'sbom'],
+            ...(asset === 'trusted-server-fastly.wasm'
+              ? [
+                  [asset, `${asset}.rebuild-check.json`, 'provenance'],
+                  [asset, 'trusted-server-fastly.tar.gz', 'provenance'],
+                  [asset, 'trusted-server-fastly.tar.gz', 'sbom'],
+                ]
+              : []),
+          ])[index]
           assert.deepEqual(
             args,
             [
@@ -662,7 +1621,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
               [
                 'attestation',
                 'verify',
-                join(root, 'release-assets', name),
+                join(root, 'release-assets', subject),
                 '--repo',
                 'example/project',
                 '--bundle',
@@ -696,6 +1655,11 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             'should verify signing bundles before any API call'
           )
           if (mode === 'bundle-verification-failure' && index === 3)
+            throw Error('Signature verification failed')
+          if (
+            subject === 'trusted-server-fastly.tar.gz' &&
+            mode === `package-${kind}-failure`
+          )
             throw Error('Signature verification failed')
           // A provenance result carries an SLSA predicate, never the SPDX.
           const result = {
@@ -801,6 +1765,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'non-semver-tag': /Invalid repository or tag/,
         'invalid-repository': /Invalid repository or tag/,
         'invalid-source': /Invalid source commit/,
+        'package-provenance-failure': /Signature verification failed/,
+        'package-sbom-failure': /Signature verification failed/,
         'empty-bundle': /Invalid file/,
         'upload-error': /Asset upload failed/,
         'build-metadata-tag': /Invalid repository or tag/,
@@ -867,9 +1833,18 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           'extra',
           'changed',
           'empty-bundle',
+          'missing-companion',
+          'changed-companion',
+          'extra-companion',
+          'unsigned-companion',
+          'changed-package',
+          'missing-package',
+          'unsigned-package',
           'symlink-input',
           'signed-extra',
           'bundle-verification-failure',
+          'package-provenance-failure',
+          'package-sbom-failure',
           'bundle-sbom-mismatch',
           'bundle-sbom-duplicate',
         ].includes(mode)
@@ -890,7 +1865,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           ),
           'should read the second release page'
         )
-      const bundleChecks = releaseAssets.length * 2
+      // Two predicates per binary, plus the Fastly rebuild check.
+      const bundleChecks = releaseAssets.length * 2 + 3
       if (mode === 'api-error' || mode === 'upload-error')
         assert.equal(
           calls.length,
@@ -937,7 +1913,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         mode
       )
       if (successful) {
-        assert.equal(uploaded.length, assets.length * 4 + 1)
+        // Four files per binary, the Fastly rebuild check and SHA256SUMS.
+        assert.equal(uploaded.length, assets.length * 4 + 3)
         // Two-space lines are what `shasum -a 256 --check` accepts.
         assert.equal(
           uploaded.find((item) => item.name === 'SHA256SUMS').bytes.toString(),
@@ -1017,6 +1994,13 @@ test('acquires the locked workspace graph before offline SBOM resolution', () =>
   assert.ok(
     acquisition < script.indexOf('CARGO_NET_OFFLINE=true'),
     'should acquire before offline generation'
+  )
+  // The Fastly ordinary capture reads the locked graph this step writes.
+  const metadata = script.match(/^ {4}ORDINARY_METADATA="([^"]+)" \\$/m)?.[1]
+  assert.ok(metadata, 'should pass the metadata file to the ordinary capture')
+  assert.ok(
+    script.slice(acquisition).split('\n')[0].endsWith(` > "${metadata}"`),
+    'should write the metadata the ordinary capture reads'
   )
 })
 // SPDX conversion retains the binary root and conservative package inventory.
@@ -1396,12 +2380,43 @@ test('workflows build, sign and publish exactly the release assets and restrict 
   const names = [...releaseAssets].sort()
   const build = readFileSync('.github/workflows/release-build.yml', 'utf8')
   const release = readFileSync('.github/workflows/release.yml', 'utf8')
+  const canonical = build
+    .split('\n  fastly-canonical:')[1]
+    ?.split(/\n  [a-z][\w-]*:\n/)[0]
+  const fastly = canonical?.match(/^          RELEASE_ASSET: (\S+)/m)?.[1]
   assert.deepEqual(
-    [...build.matchAll(/^            asset: (\S+)/gm)].map((m) => m[1]).sort(),
+    [...build.matchAll(/^            asset: (\S+)/gm)]
+      .map((m) => m[1])
+      .concat(fastly ? [fastly] : [])
+      .sort(),
     names
   )
   const sign = build.split('\n  sign:')[1]
-  for (const name of names) assert.equal(sign.split(name).length - 1, 1)
+  const matrix = sign
+    .split('\n    steps:')[0]
+    .match(/\n        asset:\s*\[([\s\S]*?)\]/)[1]
+  assert.deepEqual(
+    matrix
+      .split(',')
+      .map((name) => name.trim())
+      .filter(Boolean)
+      .sort(),
+    names,
+    'should sign precisely the cohort'
+  )
+  const allowed = sign.match(/const names = (\[[^;]+\]);/)[1]
+  assert.deepEqual(
+    Array.from(vm.runInNewContext(allowed)).sort(),
+    names,
+    'should validate the same exact input cohort'
+  )
+  assert.deepEqual(
+    JSON.parse(readFileSync('scripts/release/release-cohort.json', 'utf8'))
+      .artifacts.map((artifact) => artifact.name)
+      .sort(),
+    names,
+    'should keep the closed cohort selection on the published binaries'
+  )
   for (const prefix of ['release-', 'signed-'])
     assert.deepEqual(
       [
@@ -1465,15 +2480,16 @@ test('workflows build, sign and publish exactly the release assets and restrict 
       'SOURCE_COMMIT',
     ]
   )
-  // Provenance covers the binary and its SPDX document.
+  // Provenance covers the validated subjects: the binary, its SPDX document
+  // and, for the Fastly leg, the rebuild-check companion.
   assert.match(
     sign,
-    /subject-path: \|\n {12}release-assets\/\$\{\{ matrix\.asset \}\}\n {12}release-assets\/\$\{\{ matrix\.asset \}\}\.spdx\.json\n/
+    /subject-path: \$\{\{ steps\.inputs\.outputs\.subjects \}\}\n/
   )
   // The SBOM attestation binds the SPDX document to the binary.
   assert.match(
     sign,
-    /subject-path: release-assets\/\$\{\{ matrix\.asset \}\}\n {10}sbom-path: release-assets\/\$\{\{ matrix\.asset \}\}\.spdx\.json\n/
+    /subject-path: \$\{\{ steps\.inputs\.outputs\.sbom_subjects \}\}\n {10}sbom-path: release-assets\/\$\{\{ matrix\.asset \}\}\.spdx\.json\n/
   )
   // The branch check needs every branch's history.
   assert.match(
@@ -1499,6 +2515,269 @@ test('workflows build, sign and publish exactly the release assets and restrict 
     'write',
   ])
 })
+
+test('ordinary Fastly gate binds dedicated A and B uploads before isolated signing', () => {
+  const build = readFileSync('scripts/release/phase1-build.sh', 'utf8')
+  assert.match(build, /ordinary-rustflags/)
+  assert.match(build, /cargo --config "\$ordinary_rustflags" build/)
+  assert.ok(
+    build.indexOf('ordinary-rustflags') < build.indexOf('npm --prefix'),
+    'should seal arguments before dependency preparation and compilation'
+  )
+  assert.match(build, /rustflags: env\.ORDINARY_RUSTFLAGS/)
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const caller = readFileSync('.github/workflows/release.yml', 'utf8')
+  const job = (name) =>
+    workflow.split(`\n  ${name}:`)[1]?.split(/\n  [a-z][\w-]*:\n/)[0]
+  const canonical = job('fastly-canonical'),
+    reproduction = job('fastly-reproduction'),
+    comparison = job('fastly-comparison')
+  assert.ok(
+    canonical && reproduction && comparison,
+    'should run two dedicated builds and a comparison'
+  )
+  assert.match(canonical, /name: Build trusted-server-fastly\.wasm/)
+  assert.match(reproduction, /name: Reproduce trusted-server-fastly\.wasm/)
+  assert.match(reproduction, /needs:.*fastly-canonical/)
+  for (const [role, body] of [
+    ['canonical', canonical],
+    ['reproduction', reproduction],
+  ]) {
+    assert.doesNotMatch(body, /id-token|attestations:|contents: write/)
+    assert.match(body, new RegExp(`path: ordinary-${role}-source`))
+    assert.match(body, new RegExp(`Upload ${role} release artifact`))
+    assert.match(body, new RegExp(`Upload ${role} observation`))
+    for (const output of [
+      'artifact-id',
+      'artifact-digest',
+      'observation-id',
+      'observation-digest',
+    ])
+      assert.match(body, new RegExp(`      ${output}:`))
+  }
+  assert.match(comparison, /needs: \[fastly-canonical, fastly-reproduction\]/)
+  assert.match(comparison, /actions: read/)
+  assert.match(comparison, /ref: \$\{\{ github\.sha \}\}/)
+  assert.match(
+    comparison,
+    /test "\$\(git rev-parse HEAD\)" = "\$SOURCE_COMMIT"/
+  )
+  assert.doesNotMatch(comparison, /id-token|attestations:|contents: write/)
+  assert.match(comparison, /ordinary-fetch/)
+  assert.match(comparison, /ordinary-compare/)
+  assert.match(comparison, /id: comparison/)
+  // Without a status function GitHub adds success(), so the companion uploads
+  // only after every earlier step and the comparison itself succeed.
+  assert.match(
+    comparison,
+    /- name: Upload the real Fastly rebuild check\n {8}if: steps\.comparison\.outcome == 'success'\n/
+  )
+  assert.match(comparison, /if ! env -i/)
+  assert.doesNotMatch(
+    comparison,
+    /(?:test -[ef]|existsSync).*rebuild-check\.json/
+  )
+  for (const role of ['canonical', 'reproduction'])
+    for (const output of [
+      'artifact-id',
+      'artifact-digest',
+      'observation-id',
+      'observation-digest',
+    ])
+      assert.ok(
+        comparison.includes(`needs.fastly-${role}.outputs.${output}`),
+        'should carry every direct upload output'
+      )
+  assert.match(job('sign'), /needs: \[checks, build, fastly-comparison\]/)
+  assert.match(caller.split('\n  release:')[0], /actions: read/)
+})
+
+test('canonical Fastly route verifies the pinned tool offline without credentials or deployment', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const canonical = workflow
+    .split('\n  fastly-canonical:')[1]
+    .split('\n  fastly-reproduction:')[0]
+  const route = readFileSync(
+    'scripts/release/validate-fastly-package.sh',
+    'utf8'
+  )
+  for (const [role, job] of [
+    ['canonical', canonical],
+    [
+      'reproduction',
+      workflow
+        .split('\n  fastly-reproduction:')[1]
+        .split('\n  fastly-comparison:')[0],
+    ],
+  ]) {
+    assert.ok(
+      job.indexOf('bash scripts/release/validate-fastly-package.sh') > 0 &&
+        job.indexOf('bash scripts/release/validate-fastly-package.sh') <
+          job.indexOf(`- name: Upload ${role} release artifact`),
+      'should validate each actual package before upload'
+    )
+  }
+  assert.match(route, /\.tool-versions/)
+  assert.match(route, /test "\$fastly_version" = 16\.0\.0/)
+  assert.match(
+    route,
+    /b1b89112f1f1291ff275393779ffdacba8724ac64091bda0fa6000ae06308459/
+  )
+  assert.match(route, /sha256sum --check/)
+  assert.ok(
+    route.indexOf('sha256sum --check') < route.indexOf('unshare --net'),
+    'should authenticate the downloaded CLI before any execution'
+  )
+  assert.match(route, /unshare --net -- setpriv/)
+  assert.match(route, /--bounding-set=-all --no-new-privs/)
+  assert.match(route, /env -i/)
+  assert.match(route, /guest_network=\$\(readlink \/proc\/self\/ns\/net\)/)
+  assert.match(route, /active_interfaces=\$\(ip -o link show up\)/)
+  assert.doesNotMatch(route, /test[^\n]*\$\((?:ip|readlink) /)
+  assert.match(route, /XDG_CONFIG_HOME="\$route\/config"/)
+  assert.doesNotMatch(
+    route,
+    /(?:^|\s)HOME=|--token|FASTLY_API_TOKEN|fastly compute deploy|contents: write|id-token/m
+  )
+  for (const command of [
+    'fastly compute pack --wasm-binary ./trusted-server-fastly.wasm',
+    'fastly compute validate --package ./pkg/example-app.tar.gz',
+    'tar -tzf ./pkg/example-app.tar.gz',
+    'cmp trusted-server-fastly.wasm packaged.wasm',
+    'cmp fastly.toml packaged.toml',
+    'inspect-fastly-package',
+    'fastly compute validate --package ./trusted-server-fastly.tar.gz',
+  ])
+    assert.ok(route.includes(command), `should execute ${command}`)
+  assert.match(route, /set -euxo pipefail/)
+  assert.match(route, /SUCCESS: pinned Fastly route/)
+  assert.doesNotMatch(
+    canonical.split('    steps:')[0],
+    /write|id-token|attestations:/
+  )
+})
+
+test('Fastly route diagnostics preserve literal directory headers and reject malformed size fields', () => {
+  const workflow = readFileSync(
+    'scripts/release/validate-fastly-package.sh',
+    'utf8'
+  )
+  const match = workflow.match(
+    /timeout 15 "\$6" --input-type=commonjs <<'HEADERS'\n([\s\S]*?)HEADERS/
+  )
+  assert.ok(match, 'should inspect the actual bounded diagnostic program')
+  const script = match[1]
+  const bytes = Buffer.alloc(3 * 512)
+  for (const [index, path] of ['example-app', 'example-app/bin'].entries()) {
+    const header = bytes.subarray(index * 512, (index + 1) * 512)
+    header.write(path)
+    header.write('00000000000\0', 124)
+    header[156] = 53
+  }
+  const records = []
+  let compressed = gzipSync(bytes)
+  const context = {
+    console: {
+      log: (label, data) => {
+        assert.equal(label, 'Fastly raw TAR header:')
+        records.push(JSON.parse(data))
+      },
+    },
+    require(name) {
+      if (name === 'node:fs')
+        return {
+          lstatSync: () => ({ isFile: () => true, size: compressed.length }),
+          readFileSync: () => compressed,
+        }
+      if (name === 'node:zlib') return { gunzipSync }
+      throw Error(`Unexpected diagnostic module: ${name}`)
+    },
+  }
+  vm.runInNewContext(script, { ...context })
+  assert.deepEqual(
+    records,
+    ['example-app', 'example-app/bin'].map((path) => ({
+      path,
+      type: '5',
+      size: 0,
+      prefix: '',
+      link: '',
+      nonzero_padding: false,
+    }))
+  )
+  bytes[64] = 1
+  compressed = gzipSync(bytes)
+  vm.runInNewContext(script, { ...context })
+  assert.equal(
+    records.at(-2).nonzero_padding,
+    true,
+    'should expose hidden nonzero name padding'
+  )
+  bytes[64] = 0
+  bytes.write('invalid-size', 124)
+  compressed = gzipSync(bytes)
+  assert.throws(
+    () => vm.runInNewContext(script, { ...context }),
+    /Unsupported diagnostic size encoding/
+  )
+  assert.ok(
+    workflow.indexOf('Fastly raw TAR header:') <
+      workflow.indexOf(
+        'timeout 30 "$2" inspect-fastly-package --package-dir ./pkg'
+      ),
+    'should log literal headers before the unchanged strict inspector'
+  )
+})
+
+test('failed comparison is proven by the Rust fixture and blocks the real sign and publish jobs', () => {
+  const workflow = readFileSync('.github/workflows/test.yml', 'utf8')
+  const job = (name, source = workflow) =>
+    source.split(`\n  ${name}:`)[1]?.split(/\n  [a-z][\w-]*:\n/)[0]
+  const native = job('test-axum')
+  assert.match(
+    native,
+    /ordinary_compare_mismatch_writes_no_companion -- --exact/
+  )
+  assert.match(native, /1 passed; 0 failed; 0 ignored;/)
+  const fixture = readFileSync(
+    'crates/trusted-server-release/tests/commands.rs',
+    'utf8'
+  )
+  assert.match(fixture, /fn ordinary_compare_mismatch_writes_no_companion\(/)
+  assert.match(
+    fixture,
+    /stderr\(&result\)\.contains\("ordinary final-byte mismatch"\)/
+  )
+  // A job `if:` without a status function gets GitHub's implicit success(),
+  // so a failed comparison skips signing and, through the reusable workflow,
+  // publication. A status function would let either job run after a failure.
+  const statusFunction = /\b(?:always|failure|cancelled)\(\)/
+  const jobCondition = (body) => body.match(/^ {4}if: (.+)$/m)?.[1] ?? ''
+  const build = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const sign = job('sign', build)
+  assert.match(sign, /needs: \[checks, build, fastly-comparison\]/)
+  // continue-on-error would turn a failed check, build or comparison into
+  // success and let signing run after it.
+  assert.doesNotMatch(
+    build,
+    /continue-on-error/,
+    'release jobs must fail closed'
+  )
+  assert.doesNotMatch(
+    jobCondition(sign),
+    statusFunction,
+    'should skip signing whenever the comparison fails'
+  )
+  const caller = readFileSync('.github/workflows/release.yml', 'utf8')
+  const release = job('release', caller)
+  assert.match(release, /needs: build\n/)
+  assert.doesNotMatch(
+    jobCondition(release),
+    statusFunction,
+    'should skip publication whenever the reusable build fails'
+  )
+})
+
 test('release build keeps locked builds, pinned generators and final integrity checks', () => {
   const script = readFileSync('scripts/release/phase1-build.sh', 'utf8')
   const commands = script.split('\n').filter((line) => !/^\s*#/.test(line))
@@ -1506,11 +2785,19 @@ test('release build keeps locked builds, pinned generators and final integrity c
   // set -e, and CI runs this suite on Linux, so each one must exit explicitly.
   for (const line of commands.filter((line) => line.startsWith('[[')))
     assert.match(line, /\]\] \|\| \{ .+; exit 1; \}$/, line)
-  const builds = commands.filter((line) => /\bcargo build\b/.test(line))
+  // Each Fastly role builds with its own fresh Cargo home, exported before
+  // the producer seals the arguments that remap it.
+  assert.match(
+    script,
+    /export CARGO_HOME="\$RUNNER_TEMP\/ordinary-\$ordinary_role-cargo-home"\n\s*\[\[ ! -e "\$CARGO_HOME" \]\] \|\| \{[^\n]+\}\n\s*mkdir "\$CARGO_HOME"\n[\s\S]*ordinary-rustflags/
+  )
+  const builds = commands.filter((line) =>
+    /\bcargo (?:--config "\$ordinary_rustflags" )?build\b/.test(line)
+  )
   assert.equal(
     builds.length,
-    2,
-    'should build in the GNU container and natively'
+    3,
+    'should build in the GNU container, the ordinary Fastly path and natively'
   )
   for (const line of builds) assert.match(line, /--locked/)
   // Native binaries drop line-level debug info in both build paths.
@@ -1579,10 +2866,21 @@ test('release build keeps locked builds, pinned generators and final integrity c
   )
   // The released bytes must be unchanged since checks ran, and the build must
   // not have rewritten the lockfiles or manifest.
-  const tail = commands.filter(Boolean).slice(-2)
+  const integrity = step(
+    'git diff --exit-code -- Cargo.lock crates/trusted-server-js/lib/package-lock.json edgezero.toml'
+  )
+  assert.equal(
+    commands[integrity - 1],
+    'shasum -a 256 --check "$RUNNER_TEMP/binary.sha256"'
+  )
+  // The ordinary Fastly observation re-checks the bytes after measuring them.
+  const tail = commands
+    .filter(Boolean)
+    .slice(-2)
+    .map((line) => line.trim())
   assert.deepEqual(tail, [
     'shasum -a 256 --check "$RUNNER_TEMP/binary.sha256"',
-    'git diff --exit-code -- Cargo.lock crates/trusted-server-js/lib/package-lock.json edgezero.toml',
+    'fi',
   ])
 })
 test('release preflight rejects inherited controls in an isolated script fixture', () => {
@@ -1961,6 +3259,35 @@ test('build checks refuse a tagged commit that is on no branch', () => {
       )
   }
 })
+test('signing step refuses a Node other than the pinned version before validating', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const step = 'Validate signing inputs and retain their digests'
+  assert.match(
+    workflow.split(`- name: ${step}`)[1],
+    /\n {10}NODE_VERSION: \$\{\{ needs\.checks\.outputs\.node \}\}\n/,
+    'should compare against the Node version the checks job pinned'
+  )
+  for (const [installed, status] of [
+    ['v24.20.0', 0],
+    ['v20.20.2', 1],
+  ]) {
+    const result = runStep(
+      workflow,
+      step,
+      {
+        node: `if [ "$1" = --version ]; then echo ${installed}; else cat >/dev/null; echo validated; fi`,
+      },
+      { NODE_VERSION: '24.20.0' }
+    )
+    assert.equal(result.status, status, `${installed}: ${result.stderr}`)
+    assert.equal(
+      result.stdout.includes('validated'),
+      status === 0,
+      `${installed}: should validate signing inputs only on the pinned Node`
+    )
+  }
+})
+
 test('publisher step refuses a Node other than the pinned version before publishing', () => {
   const release = readFileSync('.github/workflows/release.yml', 'utf8')
   const step = 'Verify handoff, create once, publish by release ID and verify'

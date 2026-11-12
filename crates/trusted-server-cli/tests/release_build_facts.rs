@@ -72,11 +72,22 @@ fn cli_build_script_emits_only_its_target() {
         )
         .expect("should emit UTF-8 directives"),
     );
-    for directives in &outputs {
+    for (index, directives) in outputs.iter().enumerate() {
+        // Release-only resource discovery is selected for the two release runs.
+        let release_cfg = if index < 2 {
+            "cargo:rustc-cfg=trusted_server_release_build\n"
+        } else {
+            ""
+        };
         assert_eq!(
             directives,
-            "cargo:rerun-if-changed=build.rs\n\
-             cargo:rustc-env=TRUSTED_SERVER__BUILD_TARGET=example-target\n",
+            &format!(
+                "cargo:rerun-if-changed=build.rs\n\
+                 cargo:rerun-if-env-changed=TRUSTED_SERVER__RELEASE_BUILD\n\
+                 cargo:rustc-check-cfg=cfg(trusted_server_release_build)\n\
+                 {release_cfg}\
+                 cargo:rustc-env=TRUSTED_SERVER__BUILD_TARGET=example-target\n"
+            ),
             "should emit only the target owned by Cargo TARGET"
         );
     }

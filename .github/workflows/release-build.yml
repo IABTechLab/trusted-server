@@ -8,6 +8,8 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+    outputs:
+      node: ${{ steps.tools.outputs.node }}
     steps:
       # Full history, so the branch check below can see every branch.
       - uses: actions/checkout@v5
@@ -56,6 +58,156 @@ jobs:
             exit 1
           fi
           printf 'Tagged commit is on:\n%s\n' "$branches"
+  fastly-canonical:
+    needs: checks
+    name: Build trusted-server-fastly.wasm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ordinary-canonical-source
+    outputs:
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+      observation-id: ${{ steps.observation.outputs.artifact-id }}
+      observation-digest: ${{ steps.observation.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: ordinary-canonical-source
+      - name: Read pinned toolchains
+        id: tools
+        run: |
+          set -euo pipefail
+          echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "rust=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+      - name: Install the pinned Rust toolchain without build caches
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --target wasm32-wasip1
+      - name: Build the ordinary measurement tool separately
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ordinary-producer-target
+        run: |
+          set -euo pipefail
+          test ! -e "$CARGO_TARGET_DIR"
+          cargo build --package trusted-server-release --release --target x86_64-unknown-linux-gnu --locked
+      - name: Build and observe the actual canonical Fastly release bytes
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          RELEASE_ASSET: trusted-server-fastly.wasm
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" HOME="$HOME" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            TMPDIR="${TMPDIR:-/tmp}" RUNNER_TEMP="$RUNNER_TEMP" \
+            SOURCE_COMMIT="$SOURCE_COMMIT" \
+            ORDINARY_RELEASE_PRODUCER="$RUNNER_TEMP/ordinary-producer-target/x86_64-unknown-linux-gnu/release/trusted-server-release" \
+            bash scripts/release/phase1-build.sh trusted-server-adapter-fastly wasm32-wasip1 "$RELEASE_ASSET" canonical
+      - name: Verify the pinned manual Fastly route offline
+        timeout-minutes: 5
+        run: bash scripts/release/validate-fastly-package.sh
+      - name: Upload canonical release artifact
+        id: artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-trusted-server-fastly.wasm
+          path: ordinary-canonical-source/release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload canonical observation
+        id: observation
+        uses: actions/upload-artifact@v6
+        with:
+          name: fastly-observation-canonical
+          path: ${{ runner.temp }}/fastly-observation/*
+          if-no-files-found: error
+          retention-days: 7
+
+  fastly-reproduction:
+    # Deliberately after canonical: the comparison rejects a pair whose
+    # whole-second start times match, and parallel jobs can start together.
+    needs: [checks, fastly-canonical]
+    name: Reproduce trusted-server-fastly.wasm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ordinary-reproduction-source
+    outputs:
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+      observation-id: ${{ steps.observation.outputs.artifact-id }}
+      observation-digest: ${{ steps.observation.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: ordinary-reproduction-source
+      - name: Read pinned toolchains
+        id: tools
+        run: |
+          set -euo pipefail
+          echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "rust=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+      - name: Install the pinned Rust toolchain without build caches
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --target wasm32-wasip1
+      - name: Build the ordinary measurement tool separately
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ordinary-producer-target
+        run: |
+          set -euo pipefail
+          test ! -e "$CARGO_TARGET_DIR"
+          cargo build --package trusted-server-release --release --target x86_64-unknown-linux-gnu --locked
+      - name: Build and observe the actual reproduction Fastly release bytes
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          RELEASE_ASSET: trusted-server-fastly.wasm
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" HOME="$HOME" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            TMPDIR="${TMPDIR:-/tmp}" RUNNER_TEMP="$RUNNER_TEMP" \
+            SOURCE_COMMIT="$SOURCE_COMMIT" \
+            ORDINARY_RELEASE_PRODUCER="$RUNNER_TEMP/ordinary-producer-target/x86_64-unknown-linux-gnu/release/trusted-server-release" \
+            bash scripts/release/phase1-build.sh trusted-server-adapter-fastly wasm32-wasip1 "$RELEASE_ASSET" reproduction
+      - name: Verify the pinned manual Fastly route offline
+        timeout-minutes: 5
+        run: bash scripts/release/validate-fastly-package.sh
+      - name: Upload reproduction release artifact
+        id: artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: reproduction-trusted-server-fastly.wasm
+          path: ordinary-reproduction-source/release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload reproduction observation
+        id: observation
+        uses: actions/upload-artifact@v6
+        with:
+          name: fastly-observation-reproduction
+          path: ${{ runner.temp }}/fastly-observation/*
+          if-no-files-found: error
+          retention-days: 7
+
   build:
     needs: checks
     name: Build ${{ matrix.asset }}
@@ -67,10 +219,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            package: trusted-server-adapter-fastly
-            target: wasm32-wasip1
-            asset: trusted-server-fastly.wasm
           - os: ubuntu-24.04
             package: trusted-server-cli
             target: x86_64-unknown-linux-gnu
@@ -127,9 +275,137 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  fastly-comparison:
+    needs: [fastly-canonical, fastly-reproduction]
+    name: Compare ordinary Fastly release bytes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Read pinned toolchains
+        id: tools
+        run: |
+          set -euo pipefail
+          echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "rust=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+      - name: Install the pinned Rust toolchain
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal
+      - name: Build the ordinary comparison tool from the expected source
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ordinary-compare-tool
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test ! -e "$CARGO_TARGET_DIR"
+          cargo build --package trusted-server-release --release --target x86_64-unknown-linux-gnu --locked
+      - name: Retain the invocation and all eight direct upload outputs
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          # Expected value, not a self-check: the comparator matches it against
+          # each artifact's API-reported workflow_run.head_repository_id. This
+          # workflow only runs on push and tag events, whose head repository is
+          # always this repository, so a fork-headed run's uploads are rejected.
+          HEAD_REPOSITORY_ID: ${{ github.repository_id }}
+          A_ARTIFACT_ID: ${{ needs.fastly-canonical.outputs.artifact-id }}
+          A_ARTIFACT_DIGEST: ${{ needs.fastly-canonical.outputs.artifact-digest }}
+          A_OBSERVATION_ID: ${{ needs.fastly-canonical.outputs.observation-id }}
+          A_OBSERVATION_DIGEST: ${{ needs.fastly-canonical.outputs.observation-digest }}
+          B_ARTIFACT_ID: ${{ needs.fastly-reproduction.outputs.artifact-id }}
+          B_ARTIFACT_DIGEST: ${{ needs.fastly-reproduction.outputs.artifact-digest }}
+          B_OBSERVATION_ID: ${{ needs.fastly-reproduction.outputs.observation-id }}
+          B_OBSERVATION_DIGEST: ${{ needs.fastly-reproduction.outputs.observation-digest }}
+        run: |
+          set -euo pipefail
+          node <<'JAVASCRIPT'
+          const fs = require('node:fs'), path = require('node:path'), e = process.env;
+          const directory = path.join(e.RUNNER_TEMP, 'ordinary-inputs');
+          fs.mkdirSync(directory, { mode: 0o700 });
+          const upload = prefix => ({
+            artifact_id: Number(e[`${prefix}_ARTIFACT_ID`]),
+            artifact_digest: e[`${prefix}_ARTIFACT_DIGEST`],
+            observation_id: Number(e[`${prefix}_OBSERVATION_ID`]),
+            observation_digest: e[`${prefix}_OBSERVATION_DIGEST`],
+          });
+          fs.writeFileSync(path.join(directory, 'context.json'), JSON.stringify({
+            repository: e.GITHUB_REPOSITORY, repository_id: Number(e.REPOSITORY_ID),
+            head_repository_id: Number(e.HEAD_REPOSITORY_ID), source_commit: e.SOURCE_COMMIT,
+            run_id: Number(e.GITHUB_RUN_ID), run_attempt: Number(e.GITHUB_RUN_ATTEMPT),
+            canonical: upload('A'), reproduction: upload('B'),
+          }) + '\n', { flag: 'wx', mode: 0o600 });
+          JAVASCRIPT
+      - name: Acquire only current-run bound archives through read-only APIs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node scripts/release/phase1.mjs ordinary-fetch \
+            "$RUNNER_TEMP/ordinary-compare-tool/x86_64-unknown-linux-gnu/release/trusted-server-release" \
+            "$RUNNER_TEMP/ordinary-inputs" "$RUNNER_TEMP/ordinary-archives"
+      - name: Compare every final byte and seal only a real matched companion
+        id: comparison
+        run: |
+          set -euo pipefail
+          if ! env -i PATH="$PATH" LC_ALL=C TZ=UTC \
+            "$RUNNER_TEMP/ordinary-compare-tool/x86_64-unknown-linux-gnu/release/trusted-server-release" \
+            ordinary-compare --input "$RUNNER_TEMP/ordinary-inputs" \
+            --archives "$RUNNER_TEMP/ordinary-archives" --source "$PWD" \
+            --output "$RUNNER_TEMP/ordinary-comparison" \
+            2> "$RUNNER_TEMP/ordinary-comparison-failure.txt"; then
+            head -c 16384 "$RUNNER_TEMP/ordinary-comparison-failure.txt"
+            exit 1
+          fi
+          echo 'SUCCESS: actual canonical and reproduction Fastly bytes match; ordinary unqualified companion sealed'
+      - name: Upload the real Fastly rebuild check
+        if: steps.comparison.outcome == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: fastly-rebuild-check
+          path: ${{ runner.temp }}/ordinary-comparison/trusted-server-fastly.wasm.rebuild-check.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Retain bounded nonpublishable comparison diagnostics
+        if: failure()
+        run: |
+          set -euo pipefail
+          diagnostic="$RUNNER_TEMP/ordinary-diagnostics/ordinary-comparison-diagnostic.json"
+          if ! test -f "$diagnostic"; then
+            if ! node scripts/release/phase1.mjs ordinary-diagnostic "$RUNNER_TEMP/ordinary-diagnostics"; then
+              echo 'outcome=failed: ordinary diagnostic writer failed; job remains failed' >&2
+              exit 1
+            fi
+          fi
+          if test -f "$RUNNER_TEMP/ordinary-comparison-failure.txt"; then
+            head -c 16384 "$RUNNER_TEMP/ordinary-comparison-failure.txt" > "$RUNNER_TEMP/ordinary-comparison-diagnostic.txt"
+          else
+            echo 'Ordinary inputs unavailable; no publishable equality result' > "$RUNNER_TEMP/ordinary-comparison-diagnostic.txt"
+          fi
+      - name: Upload only the failed comparison diagnostic
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fastly-comparison-failure
+          path: |
+            ${{ runner.temp }}/ordinary-comparison-diagnostic.txt
+            ${{ runner.temp }}/ordinary-diagnostics/ordinary-comparison-diagnostic.json
+          if-no-files-found: error
+          retention-days: 7
+
   sign:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.RELEASE_PUBLICATION_ENABLED == 'true'
-    needs: build
+    needs: [checks, build, fastly-comparison]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -147,32 +423,77 @@ jobs:
             ts-x86_64-unknown-linux-gnu,
           ]
     steps:
-      # Only fixed inline checks execute here; never checkout or execute build inputs.
+      # Only fixed inline checks execute here, on the pinned hosted Node; never
+      # checkout or execute build inputs.
+      # The checks job reads the pinned Node version, since this job has no checkout.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ needs.checks.outputs.node }}
       - uses: actions/download-artifact@v7
         with:
           name: release-${{ matrix.asset }}
           path: release-assets
+      - uses: actions/download-artifact@v7
+        if: matrix.asset == 'trusted-server-fastly.wasm'
+        with:
+          name: fastly-rebuild-check
+          path: comparison
       - name: Validate signing inputs and retain their digests
+        id: inputs
         env:
           ASSET: ${{ matrix.asset }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          NODE_VERSION: ${{ needs.checks.outputs.node }}
         run: |
           set -euo pipefail
-          cd release-assets
-          test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 2
-          for file in "$ASSET" "$ASSET.spdx.json"; do test -f "$file" && test ! -L "$file" && test -s "$file" || exit 1; done
-          sha256sum "$ASSET" "$ASSET.spdx.json" > ../inputs.sha256
+          # Validate only on the pinned Node that setup-node installed.
+          test "$(node --version)" = "v$NODE_VERSION"
+          node <<'NODE'
+          // BEGIN SIGNING INPUTS
+          const fs = require('node:fs');
+          const { createHash } = require('node:crypto');
+          const { ASSET: asset, SOURCE_COMMIT: source, GITHUB_RUN_ID: run, GITHUB_RUN_ATTEMPT: attempt } = process.env;
+          const names = ['trusted-server-fastly.wasm', 'ts-aarch64-apple-darwin', 'ts-x86_64-apple-darwin', 'ts-x86_64-unknown-linux-gnu'];
+          if (!names.includes(asset) || !/^[a-f0-9]{40}$/.test(source) || !/^[1-9][0-9]*$/.test(run) || !/^[1-9][0-9]*$/.test(attempt)) throw Error('Invalid signing identity');
+          const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+          const regular = (path, limit) => { const stat = fs.lstatSync(path); if (!stat.isFile() || !stat.size || stat.size > limit) throw Error('Invalid signing input'); return fs.readFileSync(path); };
+          const exact = (dir, files) => { if (JSON.stringify(fs.readdirSync(dir).sort()) !== JSON.stringify([...files].sort())) throw Error('Unexpected signing inputs'); };
+          const inputs = [asset, `${asset}.spdx.json`];
+          const packageName = 'trusted-server-fastly.tar.gz';
+          if (asset === 'trusted-server-fastly.wasm') inputs.push(packageName);
+          exact('release-assets', inputs);
+          const binary = regular(`release-assets/${asset}`, 512 * 1024 * 1024), spdx = regular(`release-assets/${asset}.spdx.json`, 32 * 1024 * 1024);
+          if (asset === 'trusted-server-fastly.wasm') {
+            const companion = `${asset}.rebuild-check.json`;
+            exact('comparison', [companion]);
+            const bytes = regular(`comparison/${companion}`, 32 * 1024 * 1024), receipt = JSON.parse(bytes.toString('utf8'));
+            const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+            if (!bytes.equals(Buffer.from(JSON.stringify(canonical(receipt)) + '\n'))) throw Error('Noncanonical or ambiguous rebuild check');
+            if (receipt.version !== 1 || receipt.profile !== 'ordinary-release-fastly-byte-equality-v1' || receipt.release_qualification !== false || receipt.source_commit !== source || receipt.asset !== asset || receipt.target !== 'wasm32-wasip1' || receipt.variant !== 'default' || receipt.outcome !== 'matched' || receipt.canonical_sha256 !== hash(binary) || receipt.reproduction_sha256 !== hash(binary)) throw Error('Rebuild check identity or equality mismatch');
+            for (const build of [receipt.canonical, receipt.reproduction]) if (!build || build.run_id !== Number(run) || !Number.isSafeInteger(build.run_attempt) || build.run_attempt < 1 || build.run_attempt > Number(attempt) || !Number.isSafeInteger(build.job_id) || build.job_id <= 0 || build.size !== binary.length || build.sha256 !== hash(binary)) throw Error('Rebuild check run or binary mismatch');
+            if (receipt.canonical.job_id === receipt.reproduction.job_id || receipt.canonical.spdx_sha256 !== hash(spdx)) throw Error('Rebuild check job or SPDX mismatch');
+            const packageBytes = regular(`release-assets/${packageName}`, 768 * 1024 * 1024), packaged = receipt.package;
+            if (!packaged || packaged.asset !== packageName || packaged.size !== packageBytes.length || packaged.canonical_sha256 !== hash(packageBytes) || packaged.reproduction_sha256 !== hash(packageBytes) || packaged.manifest_sha256 !== hash(Buffer.from('manifest_version = 3\nname = "trusted-server-fastly"\n'))) throw Error('Rebuild check package identity or equality mismatch');
+            for (const build of [receipt.canonical, receipt.reproduction]) if (build.package?.size !== packageBytes.length || build.package?.sha256 !== hash(packageBytes)) throw Error('Rebuild check observed package mismatch');
+            fs.writeFileSync(`release-assets/${companion}`, bytes, {flag:'wx'});
+            inputs.push(companion);
+          }
+          exact('release-assets', inputs);
+          fs.writeFileSync('inputs.sha256', inputs.map(file => `${hash(regular(`release-assets/${file}`, 768 * 1024 * 1024))}  ${file}\n`).join(''), {flag:'wx'});
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `subjects<<PROVENANCE_SUBJECTS\n${inputs.map(file => `release-assets/${file}`).join('\n')}\nPROVENANCE_SUBJECTS\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `sbom_subjects<<SBOM_SUBJECTS\nrelease-assets/${asset}\n${asset === 'trusted-server-fastly.wasm' ? `release-assets/${packageName}\n` : ''}SBOM_SUBJECTS\n`);
+          // END SIGNING INPUTS
+          NODE
       - name: Attest SLSA build provenance
         id: provenance
         uses: actions/attest@v4
         with:
-          subject-path: |
-            release-assets/${{ matrix.asset }}
-            release-assets/${{ matrix.asset }}.spdx.json
-      - name: Attest the binary's SPDX SBOM
+          subject-path: ${{ steps.inputs.outputs.subjects }}
+      - name: Attest the binary and package SPDX SBOM
         id: sbom
         uses: actions/attest@v4
         with:
-          subject-path: release-assets/${{ matrix.asset }}
+          subject-path: ${{ steps.inputs.outputs.sbom_subjects }}
           sbom-path: release-assets/${{ matrix.asset }}.spdx.json
       - name: Retain only this run's real bundles and signed-input digests
         env:
@@ -187,6 +508,9 @@ jobs:
           mkdir signed-assets
           cp "$PROVENANCE" "signed-assets/$ASSET.provenance.sigstore.json"
           cp "$SBOM" "signed-assets/$ASSET.sbom.sigstore.json"
+          if [[ "$ASSET" == trusted-server-fastly.wasm ]]; then
+            cp "release-assets/$ASSET.rebuild-check.json" "signed-assets/$ASSET.rebuild-check.json"
+          fi
           cp inputs.sha256 signed-assets/SHA256SUMS
           (cd signed-assets && sha256sum "$ASSET.provenance.sigstore.json" "$ASSET.sbom.sigstore.json" >> SHA256SUMS)
       - uses: actions/upload-artifact@v6

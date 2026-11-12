@@ -6079,6 +6079,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+]
+
+[[package]]
 name = "temp-env"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6779,8 +6789,11 @@ version = "0.1.0"
 dependencies = [
  "build-print",
  "hex",
+ "libc",
+ "serde",
  "serde_json",
  "sha2 0.11.1",
+ "tempfile",
  "which",
 ]
 
@@ -6798,6 +6811,26 @@ name = "trusted-server-openrtb-codegen"
 version = "0.1.0"
 dependencies = [
  "prost-build",
+]
+
+[[package]]
+name = "trusted-server-release"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "derive_more",
+ "error-stack",
+ "flate2",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tar",
+ "tempfile",
+ "time",
+ "toml",
+ "wasmparser",
 ]
 
 [[package]]
