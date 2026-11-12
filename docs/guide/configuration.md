@@ -1013,7 +1013,7 @@ cannot be set here: `Trailer`, `Content-Length`, and the hop-by-hop fields
 `Proxy-Connection`, `Proxy-Authenticate`, and `Proxy-Authorization`. Names
 match case-insensitively. `ts config validate` and `ts config push` reject an
 entry with any of them. A live config that predates the rule keeps loading, and
-each response skips such an entry with a warning that names it.
+each request skips such an entry with one warning that names it.
 
 Because the `Connection` entry is skipped, egress never sees its value, so a
 field that value names still reaches the client. For example, an operator

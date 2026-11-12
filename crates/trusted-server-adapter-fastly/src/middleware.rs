@@ -29,6 +29,7 @@ use trusted_server_core::constants::{
 use trusted_server_core::edge_app::synthesized_response_headers;
 use trusted_server_core::error::http_error;
 use trusted_server_core::geo::GeoInfo;
+use trusted_server_core::response_privacy::warn_skipped_operator_response_headers;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::version_header::apply_git_version_header;
 
@@ -194,6 +195,9 @@ pub(crate) fn resolve_geo_for_response<'geo>(
 /// 5. `settings.response_headers` — operator-configured overrides, except the
 ///    cache-controlling headers are skipped on uncacheable (`private`/`no-store`)
 ///    responses so operators cannot re-enable shared caching for per-user payloads
+///
+/// Operator entries that are never sent are skipped without a log here.
+/// [`per_request_synthesized_headers`] warns about them once per request.
 pub(crate) fn apply_finalize_headers(
     settings: &Settings,
     geo_info: Option<&GeoInfo>,
@@ -272,10 +276,15 @@ pub(crate) fn version_synthesized_headers(service_version: Option<&str>) -> Head
 /// not portable, such as a geo city with accents, is left out with a warning.
 /// When the rest still exceeds the set's bounds, only
 /// [`version_synthesized_headers`] remain, and the bound is logged.
+///
+/// The entry point builds this set once for every request, so it also warns
+/// about each operator entry the finalize headers skip. [`apply_finalize_headers`]
+/// skips them silently, so a routed response does not warn a second time.
 pub(crate) fn per_request_synthesized_headers(
     settings: &Settings,
     geo: Option<&GeoInfo>,
 ) -> SynthesizedResponseHeaders {
+    warn_skipped_operator_response_headers(settings);
     let mut finalized = Response::new(Body::empty());
     apply_finalize_headers(settings, geo, &mut finalized);
     let mut fields = HeaderMap::new();

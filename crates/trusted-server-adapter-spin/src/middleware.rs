@@ -177,6 +177,10 @@ pub(crate) fn apply_finalize_headers(
 
     trusted_server_core::version_header::apply_git_version_header(response);
 
+    // The finalize middleware runs once per request, so each skipped operator
+    // entry warns once.
+    trusted_server_core::response_privacy::warn_skipped_operator_response_headers(settings);
+
     // Cookie-bearing responses stay private to shared caches and operator
     // headers cannot re-enable caching for uncacheable per-user payloads.
     trusted_server_core::response_privacy::apply_response_headers_with_cache_privacy(
@@ -203,6 +207,7 @@ mod tests {
     use futures::executor::block_on;
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedClientIpConfig;
+    use trusted_server_core::test_support::logging::WarningCapture;
 
     fn empty_response() -> Response {
         response_builder()
@@ -248,6 +253,29 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         s
+    }
+
+    #[test]
+    fn warns_once_about_a_skipped_operator_entry() {
+        let settings = settings_with_response_headers(vec![("connection", "keep-alive")]);
+        let mut response = empty_response();
+        let capture = WarningCapture::start();
+
+        apply_finalize_headers(&settings, false, &mut response);
+
+        let skipped = capture
+            .take()
+            .into_iter()
+            .filter(|warning| warning.message.contains("`connection`"))
+            .count();
+        assert_eq!(
+            skipped, 1,
+            "should warn once about the skipped operator entry"
+        );
+        assert!(
+            !response.headers().contains_key("connection"),
+            "should skip the operator entry"
+        );
     }
 
     #[test]
