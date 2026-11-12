@@ -18,7 +18,8 @@ Epics: #1558 (Trusted Server) and IABTechLab/edgezero#468 (EdgeZero). Plan:
 3. SharedID is read, stored and passed to bidders the way Prebid defines it,
    and shared state is passed through each adapter the right way.
 4. Identity is written back as first-party cookies on the HTML document
-   response.
+   response, and on a same-origin EC route that the script Trusted Server
+   injects into the page calls once the reader consents.
 
 Target deployment profile: a publisher that runs client-side Prebid and wants
 identity without the auction orchestrator. Its pages pass through Trusted
@@ -194,7 +195,7 @@ marks the record contract and geo as supported.
 ### ID: Server-side identity on every adapter
 
 - **ID-1 One EC lifecycle.** On every supported adapter a consented document
-  navigation mints the EC, creates the record and sets `ts-ec` together. A
+  navigation or EC route call (ID-9) mints the EC, creates the record and sets `ts-ec` together. A
   cookie is never issued without a record. An existing EC is kept when geo is
   unknown. Accept: the conformance suite (T5) asserts on each supported
   adapter that a consented navigation creates the record and sets `ts-ec` in
@@ -249,6 +250,27 @@ marks the record contract and geo as supported.
   saved to the record. Accept: on each supported adapter a body EID is in the
   record after the request. State: main saves them on Fastly; the provider
   stack and the RC's Axum lifecycle do not.
+- **ID-9 EC route.** A same-origin route, `/_ts/api/v1/ec` by default, mints
+  the EC when the reader has none and consent allows, creates the record, runs
+  the providers as a navigation does, and sets `ts-ec`, the SharedID cookie and
+  the mirror cookie on its own response. The script Trusted Server injects
+  into proxied pages calls it once the CMP reports consent, so a reader who
+  consents after the page loads gets an EC on that page view instead of the
+  next navigation. A plain `GET` answers Prebid's SharedID `pixelUrl` with an
+  empty response; the script's call gets JSON with the SharedID and the EIDs
+  the record holds, which the script merges into Prebid. The route mints
+  nothing for a cross-site caller, a client ID-7 refuses or a call past the
+  record-creation limit (ID-6), and every response carries
+  `Cache-Control: no-store`. It is served from the page's own host, which
+  WebKit's cap on cookies from non-document responses exempts when the IP
+  matches the page's (read from WebKit's source, not yet tested in Safari).
+  Accept: on Fastly and Axum, a consented same-site call with no `ts-ec`
+  creates the record and sets `ts-ec` and the SharedID cookie in that
+  response; the JSON call returns the record's IDs; a cross-site `Origin`, a
+  scripted client and a call past the limit mint nothing; an unchanged
+  returning reader gets no `Set-Cookie`. State: on main only a real-browser
+  navigation through the publisher proxy mints an EC, and no such route
+  exists.
 
 ### SH: Shared state passed the right way
 
@@ -321,10 +343,10 @@ marks the record contract and geo as supported.
 
 ### WB: First-party write-back
 
-- **WB-1 Document response only.** Identity cookies are set on top-level HTML
-  document responses, on every supported adapter. Accept: identity
-  `Set-Cookie` headers appear on navigation responses and never on asset or
-  API responses. State: main mints `ts-ec` on Fastly navigations, and the RC
+- **WB-1 Document and EC route responses only.** Identity cookies are set on
+  top-level HTML document responses and on EC route responses (ID-9), on every
+  supported adapter. Accept: identity `Set-Cookie` headers appear on navigation
+  and EC route responses and never on asset or other API responses. State: main mints `ts-ec` on Fastly navigations, and the RC
   adds Axum.
 - **WB-2 `ts-ec` lifetime.** `ts-ec` keeps
   `Domain=.<publisher>; Path=/; Secure; SameSite=Lax; HttpOnly; Max-Age=31536000`.
@@ -424,6 +446,7 @@ part.
 - Environment overrides use the `TRUSTED_SERVER__` prefix only (AX-2).
 - Record stores are EdgeZero logical stores in `edgezero.toml`, with no
   adapter-local store setting (ID-2).
+- The EC route path is configurable; the default is `/_ts/api/v1/ec` (ID-9).
 
 ## Consent and privacy
 
@@ -435,6 +458,10 @@ part.
   and filtered per vendor (WB-4, DEC-10).
 - The `_pubcid_optout` cookie is honored; a localStorage opt-out is invisible
   to the server (SID-2).
+- The EC route reads consent from the request's cookies and `Sec-GPC`, as a
+  navigation does, or from the TCF or GPP string the injected script reads
+  from the CMP and sends with the call. Both pass through the same decoding
+  and the same Purpose 1 rule (ID-9).
 
 ## Failure handling
 
@@ -462,8 +489,9 @@ part.
 
 ## Out of scope
 
-- A narrow install with one path rule and no page proxy. It needs an EC minted
-  on a request that is not a navigation.
+- A narrow install with one path rule and no page proxy. The EC route (ID-9)
+  serves pages that Trusted Server proxies; that install would also need the
+  script served without the page proxy.
 - Conformance with the SharedID Edge specification.
 - An Akamai adapter.
 
@@ -568,3 +596,9 @@ Later that day the user decided the Axum half of DEC-11: each task keeps its
 own counter with every limit divided by the task count, and the MVP has no
 shared counter. EZI-5 no longer waits on a decision, and the rest of the old
 DEC-11 (keys, task count, Cloudflare and Spin backends) is now DEC-15.
+
+The user then brought the EC route into the MVP (ID-9): the script Trusted
+Server injects into proxied pages calls a same-origin route that mints the EC
+and writes the cookies on its own response, and the route answers both
+Prebid's `pixelUrl` and the script's JSON call. ID-1 and WB-1 now include that
+route, and the Axum mirror cookie (T14) is P1.
