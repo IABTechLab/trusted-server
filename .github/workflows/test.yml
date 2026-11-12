@@ -355,8 +355,8 @@ jobs:
         id: setup-chrome
         uses: browser-actions/setup-chrome@v1
         with:
-          # The default is an unreleased Chromium snapshot, not released Chrome.
-          chrome-version: stable
+          # An exact version selects Chrome for Testing, not a snapshot or the desktop DMG.
+          chrome-version: '157.0.8103.78'
 
       - name: cargo test
         if: runner.os == 'Linux'
