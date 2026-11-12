@@ -114,8 +114,9 @@ pull_sync_concurrency = 3
 # pull_sync_enabled = false  # default false
 
 # Optional server-side identity providers (Fastly only), looked up on publisher
-# navigations before the origin fetch. Their budgets are set in [ec] above. An
-# enabled provider whose kind this build does not include fails startup.
+# navigations before the origin fetch. Their budgets are set in [ec] above. This
+# release registers no provider kind, so `ts config push` rejects an enabled
+# provider and every runtime refuses to start with one.
 #
 # [[ec.identity_providers]]
 # id = "example-provider"
@@ -127,8 +128,8 @@ pull_sync_concurrency = 3
 # Each source needs an [[ec.partners]] entry with a matching source_domain and
 # must be claimed by only one enabled provider.
 # sources = ["ids.example.com"]
-# Optional: require TCF vendor consent for lookups and for sending this
-# provider's stored IDs to bidders.
+# Optional: require TCF vendor consent for lookups and for sending any ID of
+# these sources to bidders, including browser IDs, even while disabled.
 # tcf_vendor_id = 9999
 # "page" (default) collects before the response; "after_response" collects
 # after it is sent, only for an EC issued on an earlier request.

@@ -800,16 +800,22 @@ share the `identity_budget_ms` budget, and are collected before the response is
 finalized. Results go into the navigation's single EC row write. A lookup that
 times out or fails leaves the row unchanged.
 
-Lookups run only for an EC issued on an earlier request (an EC minted on this
+Lookups run only for an EC whose row already exists (an EC minted on this
 navigation is looked up on the next one), only when consent allows EID
 persistence, and, when `tcf_vendor_id` is set and TCF applies to the request,
 only with TCF vendor consent for that vendor. The same vendor consent gates
-egress: while it is withheld, the provider's stored UIDs are left out of
-auction `user.eids`, `x-ts-eids` and `/_ts/api/v1/identify`. Without
-`tcf_vendor_id`, a provider is gated by the EID-persistence purposes alone, so
-set it for any provider that has a TCF vendor ID.
+egress of the provider's `sources`, even while the provider is disabled: while
+it is withheld, every ID for those sources, whether a provider stored it or the
+browser sent it in `ts-eids` or the `/auction` body, is left out of auction
+`user.eids`, `x-ts-eids` and `/_ts/api/v1/identify`. Removing the provider's
+entry removes that gate, so keep a provider with `enabled = false` while its
+stored UIDs may still be live. Without `tcf_vendor_id`, a provider is gated by
+the EID-persistence purposes alone, so set it for any provider that has a TCF
+vendor ID.
 
-Identity providers run only on Fastly. The Axum, Cloudflare and Spin adapters
+Identity providers run only on Fastly. This release registers no provider kind,
+so `ts config validate`, `push` and `diff` reject an enabled provider; keep
+`enabled = false` until a kind ships. The Axum, Cloudflare and Spin adapters
 refuse to start when an enabled provider is configured. On Fastly, an enabled
 provider whose `kind` this build does not include, or whose `settings` its kind
 rejects, also fails startup. Lookups always verify the provider's TLS
@@ -866,10 +872,11 @@ token = "example_provider_token"
 `identity_after_response_budget_ms`, and only when `ec_store` is configured,
 the response is not a redirect, the navigation's own write succeeded (or had
 nothing to change), the row is live, and the EC was not minted on this
-navigation. A row recovered from an orphaned cookie on the same navigation
-qualifies. They also run behind an error response, including a `502` that
-Trusted Server generates when the origin is unreachable. Their results reach
-the row in a follow-up write. Providers run only on Fastly.
+navigation; a row recovered from an orphaned cookie gets a newly minted EC, so
+its lookups wait for the next navigation. They also run behind an error
+response, including a `502` that Trusted Server generates when the origin is
+unreachable. Their results reach the row in a follow-up write. Providers run
+only on Fastly.
 
 ::: warning Rate limit granularity
 `rate_limit_per_hour` is counted per EC hash, which is derived from the client

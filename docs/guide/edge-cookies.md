@@ -78,7 +78,7 @@ flowchart TD
 
     ConsentCheck -- "No" --> ExplicitWithdrawal{Explicit<br/>withdrawal?}
     ExplicitWithdrawal -- "Yes" --> CookiePresent{Cookie was<br/>present?}
-    CookiePresent -- "Yes" --> Withdraw["Expire ts-ec cookie<br/>Write withdrawal tombstone in ec_identity_store (24h TTL)<br/>Strip all x-ts-* headers"]
+    CookiePresent -- "Yes" --> Withdraw["Write withdrawal tombstone in ec_identity_store (24h TTL)<br/>Expire ts-ec cookie once it lands<br/>Strip all x-ts-* headers"]
     CookiePresent -- "No" --> HeaderOnly["Strip all x-ts-* headers only<br/>(no cookie expiry or KV tombstone)"]
     ExplicitWithdrawal -- "No" --> HeaderOnly
 
@@ -270,7 +270,7 @@ When the identity graph contains a UID for every pull-enabled partner, Trusted S
 
 A valid marker avoids a KV lookup only when pull-sync completeness is the sole reason to inspect the row. Auctions that need stored EIDs, browser EID-cookie ingestion, explicit withdrawal, and generation continue to use KV. The marker acts as recent proof that the row existed, so deletion of a previously complete row is not detected until the marker expires, at most one hour after issuance. Partner-set changes, passphrase rotation, malformed values, and expiration invalidate the marker and restore the normal lookup and orphan-recovery path.
 
-Pull sync runs after response delivery, so a partner response that fills the last missing UID cannot set the marker on that already-sent response. A later eligible request verifies the completed row and issues the marker. Explicit withdrawal expires both `ts-ec` and any present `ts-ec-pull-complete` marker once the row is tombstoned or proven absent. While the tombstone cannot be written (KV unavailable, CAS retries exhausted, or a row that cannot be read), the cookie is kept so the next request that carries it retries the withdrawal.
+Pull sync runs after response delivery, so a partner response that fills the last missing UID cannot set the marker on that already-sent response. A later eligible request verifies the completed row and issues the marker. Explicit withdrawal always expires any present `ts-ec-pull-complete` marker, and expires `ts-ec` once the row is tombstoned or proven absent. While the tombstone cannot be written (KV unavailable, CAS retries exhausted, or a row that cannot be read), `ts-ec` is kept so the next request that carries it retries the withdrawal.
 
 Issuing or expiring the marker adds `Set-Cookie` to the outgoing response. Cache-privacy handling makes an otherwise shareable response private when that happens. A valid marker is not refreshed on each request, so this cost is limited to responses that establish or clear marker state in exchange for avoiding later KV reads.
 
