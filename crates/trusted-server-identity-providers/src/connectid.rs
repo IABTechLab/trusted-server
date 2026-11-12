@@ -198,7 +198,7 @@ mod tests {
     fn expires_at(read: Option<(String, ProviderExpiry)>) -> u64 {
         match read.expect("should read the ID").1 {
             ProviderExpiry::At(at) => at.get(),
-            other => panic!("should expire at a time, got {other:?}"),
+            _ => panic!("should expire at a time"),
         }
     }
 
