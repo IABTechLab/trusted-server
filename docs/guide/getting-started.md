@@ -244,7 +244,7 @@ the external release tag is recorded separately in immutable release metadata.
 The header is not a binary checksum or attestation verification.
 
 For canonical Fastly bytes, use the separate
-[manual verified-byte production procedure](/guide/release-verification#deploy-the-verified-fastly-wasm).
+[manual verified-byte production procedure](/guide/release-verification#deploy-the-verified-fastly-package).
 The source-build commands above do not establish canonical release provenance.
 
 ## Next Steps
