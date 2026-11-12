@@ -20,7 +20,7 @@ flowchart TD
 
 ## 1. Select the release and private working directory
 
-Obtain the release tag and independently verified commit SHA. Use that complete checkout for the CLI, image and templates; do not mix in a CLI from another revision. Install the tool versions pinned by the checkout, including Terraform `1.16.2` and AWS CLI v2, plus Docker Buildx, native compiler tools and CMake. Keep the AWS `6.64.0` lockfiles unchanged.
+Obtain the release tag and independently verified commit SHA. Use that complete checkout for the CLI, image and templates; do not mix in a CLI from another revision. Install the tool versions pinned by the checkout, including Terraform `1.16.2` and AWS CLI v2, plus Docker Buildx, native compiler tools and CMake. Use the committed lockfiles with AWS `6.64.0` unchanged and `hashicorp/random` `3.9.1` in the workload root.
 
 From the verified checkout root, with Bash-compatible syntax:
 
@@ -75,7 +75,7 @@ This creates:
 - A new evaluation hosted zone unless an existing zone was supplied.
 - Four empty application-secret containers and a separate empty Agent-token container.
 
-No secret value is managed by Terraform. No IAM permission boundaries are invented. The bootstrap apply does **not** wait for certificate issuance, since external DNS delegation cannot happen until the nameservers exist.
+Bootstrap manages no secret values. No IAM permission boundaries are invented. The bootstrap apply does **not** wait for certificate issuance, since external DNS delegation cannot happen until the nameservers exist.
 
 Save the outputs after the reviewed apply:
 
@@ -108,7 +108,7 @@ terraform -chdir="$TF_BOOTSTRAP" state list
 
 Review the source and destination when Terraform asks to copy state. Confirm the bootstrap resource addresses remain present and its private backend metadata selects the expected S3 bucket/key. Keep the ignored backend override with the operational checkout, never in a commit. This is backend migration with `-migrate-state`, not `-reconfigure` and not a fresh empty state. See the [bootstrap state lifecycle](bootstrap/README.md#migrate-bootstrap-state-to-s3) for recovery and reverse migration.
 
-## 3. Delegate DNS and wait for both certificates
+## 3. Delegate DNS before the workload apply
 
 For a new child zone, get the four nameservers:
 
@@ -118,18 +118,9 @@ terraform -chdir="$TF_BOOTSTRAP" output -json route53_name_servers
 
 At the external parent DNS provider, add one NS record per value at the child label. For example, `ts-demo.example.com` under the parent `example.com` uses the label `ts-demo`. Do not replace the parent domain's nameservers, add an A/CNAME at that delegated label, or enable a parent provider's HTTP proxy for the delegation. If reusing a zone, verify its existing public delegation instead.
 
-Wait for the certificate requests only after public DNS reaches Route 53:
+Check that public DNS reaches the Route 53 zone and resolves the validation CNAME. No manual `aws acm wait` command is required. The workload apply in step 8 waits for regional issuance through `aws_acm_certificate_validation.regional` and, when Geo is enabled, `us-east-1` viewer issuance through `aws_acm_certificate_validation.viewer`. The ALB listener and CloudFront distribution use those waiters' `certificate_arn` outputs, so they cannot use pending certificates.
 
-```bash
-REGIONAL_CERTIFICATE_ARN="$(terraform -chdir="$TF_BOOTSTRAP" output -raw regional_certificate_arn)"
-VIEWER_CERTIFICATE_ARN="$(terraform -chdir="$TF_BOOTSTRAP" output -raw viewer_certificate_arn)"
-aws acm wait certificate-validated --region "$AWS_REGION" \
-  --certificate-arn "$REGIONAL_CERTIFICATE_ARN"
-aws acm wait certificate-validated --region us-east-1 \
-  --certificate-arn "$VIEWER_CERTIFICATE_ARN"
-```
-
-A waiter timeout is not a reason to recreate certificates. Inspect public delegation and their `DomainValidationOptions`, then wait again. Leave the validation CNAME in place for renewal. Bootstrap requests certificates but does not make application DNS live; the workload later creates the evaluation A alias.
+If DNS is not delegated, the workload apply may time out waiting for issuance. Fix public delegation or validation records, then rerun the workload plan/apply without recreating certificates. Leave the validation CNAME in place for renewal. Bootstrap requests certificates but does not make application DNS live; the workload later creates the evaluation A alias.
 
 ## 4. Seed secret values outside Terraform
 
@@ -183,7 +174,7 @@ These are whole-value secrets, not JSON-field bindings. Delete unnecessary local
 
 ## 5. Provision retained EC storage
 
-Copy `retained/terraform.tfvars.example` to `$TS_WORK/retained.tfvars`. Set the same account/region and a stable table name, exclusive namespace and retention owner. Agree identity/withdrawal retention, allocator continuity, backups, erasure and retirement before issuance.
+Copy `retained/terraform.tfvars.example` to `$TS_WORK/retained.tfvars`. Set the same account/region and a stable table name, exclusive namespace and retention owner. Agree identity/withdrawal retention, allocator continuity, erasure and retirement before issuance.
 
 ```bash
 terraform -chdir="$TF_RETAINED" init -lockfile=readonly \
@@ -272,12 +263,12 @@ Copy `terraform.tfvars.example` to `$TS_WORK/workload.tfvars` and replace every 
 - `preserve_publisher_hostname = true` for the publisher-origin browser proxy.
 - `application_image` to `APPLICATION_IMAGE`, `agent_image` to the reviewed official Agent digest, and `config_envelope_file` to the absolute CLI export path.
 - `ec_storage` to the exact retained output, matching the TOML.
-- `geo_front_door.rollout_phase = "dns-cutover"`, its `viewer_certificate_arn` from bootstrap, a separately generated private origin credential and reviewed current CloudFront origin-facing IPv4 CIDRs.
-- `runtime_boundaries = null` unless your organisation requires existing task/execution boundary policy ARNs. The scoped runtime policies are present with or without boundaries. Supply customer-managed secret KMS key ARNs only when needed.
+- `geo_front_door.rollout_phase = "dns-cutover"`, its `viewer_certificate_arn` from bootstrap and the stable `origin_credential_header_name` input.
+- `runtime_boundaries = null` unless your organisation requires existing task/execution boundary policy ARNs. Both roles may use the same boundary ARN; their role policies scope permissions independently. The scoped runtime policies are present with or without boundaries. Supply customer-managed secret KMS key ARNs only when needed.
 
-Obtain current forwarding ranges from the [AWS IP range publication](https://ip-ranges.amazonaws.com/ip-ranges.json) <!-- allow-domain: ip-ranges.amazonaws.com -->, selecting IPv4 `.prefixes` entries whose service is `CLOUDFRONT_ORIGIN_FACING`, not general viewer ranges or IPv6 entries. Review and retain the snapshot with its publication time and sync token. The managed CloudFront prefix list controls network ingress separately; reviewer CIDRs do not restrict CloudFront viewers. The example uses `reviewer_ipv4_cidrs = []` for this topology. Application authentication protects evaluation traffic.
+Do not supply `geo_front_door.origin_credential_value` or `cloudfront_ipv4_cidrs`. Terraform derives literal forwarding CIDRs from entries in the existing AWS-managed origin-facing CloudFront prefix list, the same source used for security-group admission. Forwarding CIDRs are a task-startup snapshot. A refreshed Terraform plan/apply updates the task definition when list entries change; the application does not poll or hot-reload the list. Reviewer CIDRs do not restrict CloudFront viewers. The example uses `reviewer_ipv4_cidrs = []` for this topology. For direct ALB ingress with `geo_front_door = null`, supply a nonempty set of valid IPv4 CIDRs; there is no prefix-width or count limit. Application authentication protects evaluation traffic.
 
-The CloudFront origin credential is distinct from all five secrets. Its value enters restricted Terraform plans/state despite sensitivity marking. Do not print the Geo object or publish saved plans. `staged` and `origin-enabled` are not uninterrupted migration steps; selecting Geo removes the unprotected path before DNS cutover. Plan existing-installation migrations separately.
+For Geo, workload Terraform owns `random_password.origin_credential`, distinct from all five secrets. It generates a stable password used only by the ALB rule and CloudFront origin header. There is no credential-value output or ECS/AppConfig exposure. The sensitive value remains in restricted workload plans/state, so do not publish those files. Ordinary applies and configuration/application updates do not rotate it. Preserve the workload state and keep the header-name input stable for rollback. `staged` and `origin-enabled` are not uninterrupted migration steps; selecting Geo removes the unprotected path before DNS cutover. Plan existing-installation migrations separately.
 
 ```bash
 terraform -chdir="$TF_ROOT" init -lockfile=readonly \
@@ -325,7 +316,7 @@ Native EC admin management is not the inspection path. Use approved backend acce
 
 ## 10. Updates and shutdown
 
-Configuration and secrets are startup snapshots. Export a new envelope and replace the task after changes. Retain compatible image/envelope/secret-version sets for rollback; ECS image rollback alone does not restore AppConfig. Do not restore old Terraform state or switch table/namespace to roll back. Preserve the CloudFront credential-removal header name for eligible rollback tasks.
+Configuration and secrets are startup snapshots. Export a new envelope and replace the task after changes. Retain compatible image/envelope/secret-version sets for rollback; ECS image rollback alone does not restore AppConfig. Do not restore old Terraform state or switch table/namespace to roll back. Preserve the generated CloudFront credential in workload state and its credential-removal header-name input for eligible rollback tasks. Configuration and application updates must not automatically rotate that credential.
 
 Destroy the workload through its own reviewed Terraform workflow. Desired count zero stops compute, not ALB/CloudFront or every charge. Leave retained storage intact until its owner approves erasure and allocator retirement. Bootstrap resources have a third independent lifetime, including secret recovery windows, ECR images and state-object versions.
 

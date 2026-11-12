@@ -27,6 +27,18 @@ mock_provider "aws" {
   }
 }
 
+mock_provider "aws" {
+  alias           = "us_east_1"
+  override_during = plan
+}
+
+mock_provider "random" {
+  override_during = plan
+  mock_resource "random_password" {
+    defaults = { result = "FictionalCredential000000000000000000000000" }
+  }
+}
+
 variables {
   run_id               = "review-example"
   owner                = "review-owner"
@@ -104,7 +116,7 @@ run "reject_empty_direct_ingress" {
   expect_failures = [var.reviewer_ipv4_cidrs]
 }
 
-run "reject_identical_permission_boundaries" {
+run "shared_permission_boundary" {
   command = plan
   variables {
     runtime_boundaries = {
@@ -112,13 +124,38 @@ run "reject_identical_permission_boundaries" {
       task      = "arn:aws:iam::000000000000:policy/example-boundary"
     }
   }
-  expect_failures = [var.runtime_boundaries]
+  assert {
+    condition     = aws_iam_role.execution.permissions_boundary == var.runtime_boundaries.execution && aws_iam_role.task.permissions_boundary == var.runtime_boundaries.execution
+    error_message = "Execution and task roles may share a boundary while retaining separate inline permissions."
+  }
 }
 
-run "reject_other_broad_ingress_ranges" {
+run "broad_reviewer_cidr" {
   command = plan
   variables {
     reviewer_ipv4_cidrs = ["10.0.0.0/8"]
+  }
+  assert {
+    condition     = aws_vpc_security_group_ingress_rule.reviewers["10.0.0.0/8"].cidr_ipv4 == "10.0.0.0/8"
+    error_message = "A valid broad IPv4 range must not be rejected by an invented prefix-width policy."
+  }
+}
+
+run "reviewer_cidrs_without_invented_count_limit" {
+  command = plan
+  variables {
+    reviewer_ipv4_cidrs = [for index in range(33) : "10.${index}.0.0/16"]
+  }
+  assert {
+    condition     = length(aws_vpc_security_group_ingress_rule.reviewers) == 33
+    error_message = "Actual AWS quotas, not a hardcoded example count limit, govern ingress rule capacity."
+  }
+}
+
+run "reject_invalid_reviewer_ipv4" {
+  command = plan
+  variables {
+    reviewer_ipv4_cidrs = ["not-a-cidr"]
   }
   expect_failures = [var.reviewer_ipv4_cidrs]
 }

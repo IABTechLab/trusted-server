@@ -23,13 +23,11 @@ ec_storage = {
   table     = "example-retained-ec"
   namespace = "example-staging"
 }
-# Fictional private origin credential and reviewed ranges. Replace before use.
+# Terraform generates the origin credential and reads origin-facing CIDRs from AWS.
 geo_front_door = {
   rollout_phase                 = "dns-cutover"
   viewer_certificate_arn        = "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
   origin_credential_header_name = "x-fictional-origin-check"
-  origin_credential_value       = "fictional_only_00000000000000000000000000000000"
-  cloudfront_ipv4_cidrs         = ["192.0.2.0/24", "198.51.100.0/24"]
 }
 application_secrets = {
   handler_password = {

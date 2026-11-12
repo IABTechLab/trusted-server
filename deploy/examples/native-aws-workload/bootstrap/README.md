@@ -19,9 +19,9 @@ flowchart TD
     Bootstrap --> DNS[Evaluation zone and ACM CNAME]
     DNS --> NS[Output child nameservers]
     NS --> Parent[Operator delegates from external parent]
-    Parent --> Issued[Read-only ACM issuance wait]
+    Parent --> Workload[Workload apply waits for ACM issuance]
     Bucket --> Migration[Explicit bootstrap state migration to S3]
-    Issued --> Workload[Workload can use issued certificates]
+    Workload --> Consumers[ALB and CloudFront use issued certificates]
     Bootstrap --> Secrets[Empty secret containers]
     Bootstrap --> ECR[Empty ECR repository]
 ```
@@ -48,22 +48,15 @@ terraform -chdir="$ROOT" output -json > "$TS_WORK/bootstrap-output.json"
 
 Keep `installation_name`, account, region, bucket and state paths stable on subsequent runs. The initial apply deliberately does not wait for ACM. Waiting here would block output of the nameservers needed to delegate a new zone.
 
-## Delegate DNS, then wait for issuance
+## Delegate DNS before the workload apply
 
 With `existing_route53_zone_id = null`, bootstrap creates a public child zone named exactly `demo_hostname`. Publish its `route53_name_servers` as an NS record at that hostname in the externally owned parent zone. This is not a publisher DNS cutover. Do not change production publisher records.
 
 With an existing zone ID, confirm it is the authoritative public zone covering the evaluation hostname. Bootstrap creates only its validation CNAME in that zone. It must not recreate or redelegate the existing zone.
 
-Check public delegation and CNAME resolution. Then run these read-only waiters with `AWS_REGION` set to the regional value in the private bootstrap tfvars:
+Check public delegation and CNAME resolution before applying the workload. Bootstrap intentionally has no issuance waiter, and no manual `aws acm wait` command is required. Workload Terraform waits through `aws_acm_certificate_validation.regional` and, only when Geo is enabled, `aws_acm_certificate_validation.viewer` in `us-east-1`. Its ALB listener and CloudFront distribution consume the respective waiters' `certificate_arn` outputs.
 
-```sh
-aws acm wait certificate-validated --region "$AWS_REGION" \
-  --certificate-arn "$(terraform -chdir="$ROOT" output -raw regional_certificate_arn)"
-aws acm wait certificate-validated --region us-east-1 \
-  --certificate-arn "$(terraform -chdir="$ROOT" output -raw viewer_certificate_arn)"
-```
-
-A waiter timeout does not require another certificate or another CNAME. Inspect external delegation and public validation records, fix their owner-controlled DNS path, then retry the read-only waiter. ACM uses the same validation token for the same hostname across AWS regions in one account, so Terraform owns exactly one CNAME. See [ACM DNS validation](https://docs.aws.amazon.com/acm/latest/userguide/dns-validation.html). <!-- allow-domain: docs.aws.amazon.com -->
+If DNS is not delegated, the workload apply may time out. Inspect external delegation and public validation records, fix their owner-controlled DNS path, then rerun the workload plan/apply. Do not recreate certificates or the validation CNAME. ACM uses the same validation token for the same hostname across AWS regions in one account, so Terraform owns exactly one CNAME. See [ACM DNS validation](https://docs.aws.amazon.com/acm/latest/userguide/dns-validation.html). <!-- allow-domain: docs.aws.amazon.com -->
 
 ## Migrate bootstrap state to S3
 
@@ -96,13 +89,13 @@ Initialize `retained/` and the workload separately with their respective private
 
 ## Handoff
 
-Use `route53_zone_id`, `regional_certificate_arn` and `viewer_certificate_arn` as workload inputs after issuance. Publish the final runtime-wrapper image to `ecr_repository_url`, then use its immutable digest as `application_image`. The repository output is not a runnable image. The Agent image remains a separate reviewed digest input.
+Use `route53_zone_id`, `regional_certificate_arn` and `viewer_certificate_arn` as workload inputs after DNS delegation. The workload owns the issuance waiters, not the certificate requests. Publish the final runtime-wrapper image to `ecr_repository_url`, then use its immutable digest as `application_image`. The repository output is not a runnable image. The Agent image remains a separate reviewed digest input.
 
 `application_secret_arns` maps exactly `handler_password`, `publisher_proxy_secret`, `ec_passphrase` and `browser_forwarder_secret`. `agent_secret_arn` is separate. Seed values outside Terraform, record each resulting immutable version ID and hand only ARN/version references to the workload. Do not add `aws_secretsmanager_secret_version`, secret-value variables or seed files to this root.
 
 The browser forwarder must receive the exact same bytes as its application secret. Its CLI accepts and strips one trailing line terminator from a token file; uploading that terminator into Secrets Manager would change the secret bytes. Generate a private token without a trailing LF, or remove it before seeding. Never reuse this token as the Agent token or CloudFront origin credential.
 
-See the parent guide for retained storage, exact matching CLI envelope export, CloudFront CIDRs, image publication and browser acceptance. Bootstrap does not select the application's Geo routing phase or publisher-hostname forwarding mode.
+See the parent guide for retained storage, exact matching CLI envelope export, generated CloudFront credentials and managed prefix-list CIDRs, image publication and browser acceptance. Bootstrap does not select the application's Geo routing phase or publisher-hostname forwarding mode.
 
 ## Final retirement
 
