@@ -21,8 +21,9 @@ the separate module-selection configuration redesign.
   Known limit: serde reports a nested struct's missing field as soon as it
   reaches that value, so in a disabled block with an incomplete nested entry
   (for example a Prebid `managed_user_ids` entry without `name`), unknown keys
-  visited after that entry are not reported. Enabling or completing the block
-  reports them. Distinguishing root-level from nested missing fields would need
+  visited after that entry are not reported. Enabling the block reports the
+  missing nested field first; the unknown keys appear once the entry is
+  complete. Distinguishing root-level from nested missing fields would need
   a new path-tracking dependency, so it is out of scope.
 - `tester_cookie` and `tinybird` reject unknown fields as well.
 - Integration parse errors include the offending field in the outer error text

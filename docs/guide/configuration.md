@@ -188,8 +188,8 @@ remain open for application-defined keys.
 A disabled block may omit fields that are required only when the integration is
 enabled. One limit applies: if a disabled block contains an incomplete nested
 entry, such as a Prebid managed user ID without `name`, parsing stops at that
-entry and unknown keys that follow it are not reported until the block is
-completed or enabled.
+entry and unknown keys that follow it are not reported until the entry is
+completed. Enabling the block reports the incomplete entry first.
 
 Runtime startup rejects unknown fields in known tables. For compatibility with
 previously stored configurations, an unknown integration ID only logs a warning
