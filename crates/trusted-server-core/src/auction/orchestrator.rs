@@ -4072,6 +4072,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mock_mediator_non_success_status_is_a_processing_failure() {
+        let warnings = crate::test_support::logging::WarningCapture::start();
+        run_mock_mediator_response(503, &serde_json::json!({"seatbid": []}), 1.0).await;
+        let warnings = warnings.take();
+        assert!(
+            warnings.iter().any(|warning| warning.message.starts_with(
+                "Mediator 'adserver_mock' response processing failed; using local ranking:"
+            ) && warning
+                .message
+                .contains("AdServer Mock returned non-success HTTP 503")),
+            "should fail mediator response processing on a non-success HTTP status"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.message.contains("reported an error response")),
+            "should not report a non-success HTTP status as an error-status mediation response"
+        );
+    }
+
+    #[tokio::test]
     async fn mock_mediator_success_and_no_bid_remain_authoritative() {
         for has_winner in [false, true] {
             let body = if has_winner {
