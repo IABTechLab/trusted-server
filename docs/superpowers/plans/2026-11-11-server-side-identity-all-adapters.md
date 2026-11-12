@@ -1,6 +1,9 @@
 # Server-side identity on every adapter Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use
+> superpowers:subagent-driven-development (recommended) or
+> superpowers:executing-plans to implement this plan task-by-task. Steps use
+> checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** File the missing tickets, move the existing issues under the new
 epics (#1558 and IABTechLab/edgezero#468), link every dependency, and tie
@@ -17,16 +20,16 @@ wave order, with its own plan when it needs one.
 blocked-by links, project fields) against IABTechLab/trusted-server and
 IABTechLab/edgezero.
 
-**Spec:**
-[server-side identity design](../specs/2026-11-11-server-side-identity-all-adapters-design.md)
+**Spec:** [server-side identity
+design](../specs/2026-11-11-server-side-identity-all-adapters-design.md)
 
 ## Global Constraints
 
 - One-account mode: every write acts as the PR author's login.
 - Platform order: Fastly, then Axum, then Cloudflare, then Spin (DEC-4). Fastly
-  and Axum ship without Cloudflare or Spin: no Fastly or Axum item is blocked
-  by a Cloudflare or Spin item, and Cloudflare and Spin work has its own tickets.
-  A Fastly or Axum ticket may still make Cloudflare and Spin reject identity
+  and Axum ship without Cloudflare or Spin: no Fastly or Axum item is blocked by
+  a Cloudflare or Spin item, and Cloudflare and Spin work has its own tickets. A
+  Fastly or Axum ticket may still make Cloudflare and Spin reject identity
   configuration, answer 501, report a capability as absent or mount the shared
   app (T1, T6, T21, IABTechLab/edgezero#283), because that needs no Cloudflare
   or Spin work.
@@ -46,10 +49,10 @@ IABTechLab/edgezero.
 - EdgeZero issue bodies state behavior and acceptance only.
 - Issue types are set with `updateIssue`: Feature `IT_kwDOBPEB8s4A35yA`, Task
   `IT_kwDOBPEB8s4A35x7`, Bug `IT_kwDOBPEB8s4A35x9`.
-- Project `PVT_kwDOBPEB8s4BFKrl`. Priority field `PVTSSF_lADOBPEB8s4BFKrlzg22nQg`
-  (P0 `c92c6358`, P1 `dca9fbdd`, P2 `afab7bc8`, P3 `71861fe7`). Size field
-  `PVTSSF_lADOBPEB8s4BFKrlzg22m2Q` (XS `771e90ab`, S `01b13689`, M `084dacdb`,
-  L `762f39e7`, XL `27016a48`).
+- Project `PVT_kwDOBPEB8s4BFKrl`. Priority field
+  `PVTSSF_lADOBPEB8s4BFKrlzg22nQg` (P0 `c92c6358`, P1 `dca9fbdd`, P2 `afab7bc8`,
+  P3 `71861fe7`). Size field `PVTSSF_lADOBPEB8s4BFKrlzg22m2Q` (XS `771e90ab`, S
+  `01b13689`, M `084dacdb`, L `762f39e7`, XL `27016a48`).
 - Dependencies use `addBlockedBy(input:{issueId, blockingIssueId})`. GitHub
   links issues only, so a PR or a decision in "Blocked by" goes in the issue
   body.
@@ -145,7 +148,7 @@ Close.
 | 2    | IABTechLab/edgezero#406 to IABTechLab/edgezero#439; IABTechLab/edgezero#397, IABTechLab/edgezero#410, IABTechLab/edgezero#437, IABTechLab/edgezero#432 | P1  | PR fix, Merge    | Resolve reviews, retarget to main, merge in order; delivers IABTechLab/edgezero#397, IABTechLab/edgezero#410, IABTechLab/edgezero#437 and IABTechLab/edgezero#432 | IABTechLab/edgezero#275                                                                                  |
 | 2    | EZ EZI-2a, EZI-3                                                                                                                                       | P1  | New              | Record contract with Fastly; ClientInfo contract                                                                                                                  | IABTechLab/edgezero#275                                                                                  |
 | 2    | TS T5                                                                                                                                                  | P1  | New              | Conformance suite for Fastly and Axum                                                                                                                             | #1507                                                                                                    |
-| 2    | TS T4, #1192                                                                                                                                           | P2  | New, Move        | Shared state once per process: Axum (T4) and Fastly (#1192)                                                                                                       | #1507                                                                                                    |
+| 2    | TS T4, #1192                                                                                                                                           | P2  | New, Move        | Measure Axum's per-request HTTP client (T4); Fastly per-request cost (#1192)                                                                                      | #1507                                                                                                    |
 | 2    | TS #1556                                                                                                                                               | P2  | Move             | Regression test that identity backends verify certificates, then close                                                                                            | #1507                                                                                                    |
 | 2    | IABTechLab/edgezero#389, IABTechLab/edgezero#401, IABTechLab/edgezero#444, IABTechLab/edgezero#452, then IABTechLab/edgezero#466                       | P2  | PR fix           | Rebase onto main and redo the RC-only merges                                                                                                                      | IABTechLab/edgezero#275 (IABTechLab/edgezero#466 also IABTechLab/edgezero#444)                           |
 | 3    | TS #1488                                                                                                                                               | P1  | PR fix, Merge    | Part C fixes                                                                                                                                                      | #1487                                                                                                    |
@@ -206,18 +209,22 @@ Fallback for wave 1: if the fold-in has not landed two weeks after #1557,
 
 The two longest chains:
 
-- Axum identity: IABTechLab/edgezero#460, IABTechLab/edgezero#275, IABTechLab/edgezero#406 to IABTechLab/edgezero#439, IABTechLab/edgezero#463, EZI-2b, R1b,
-  T6, A2, A10, A5. A1 runs beside it on R1, before the record contract lands.
-- SharedID: IABTechLab/edgezero#460, #1506, #1487, #1488, T3, T13 on Fastly, then A10 on Axum.
-- JA4: IABTechLab/edgezero#275, EZI-3, IABTechLab/edgezero#283 (section 13.1 of IABTechLab/edgezero#469), R2b, T12, T19, A10.
+- Axum identity: IABTechLab/edgezero#460, IABTechLab/edgezero#275,
+  IABTechLab/edgezero#406 to IABTechLab/edgezero#439, IABTechLab/edgezero#463,
+  EZI-2b, R1b, T6, A2, A10, A5. A1 runs beside it on R1, before the record
+  contract lands.
+- SharedID: IABTechLab/edgezero#460, #1506, #1487, #1488, T3, T13 on Fastly,
+  then A10 on Axum.
+- JA4: IABTechLab/edgezero#275, EZI-3, IABTechLab/edgezero#283 (section 13.1 of
+  IABTechLab/edgezero#469), R2b, T12, T19, A10.
 - LiveRamp: T22 waits on DEC-9 as well as T11 and A10.
 
 ## Part B: tickets
 
-Every ticket in waves 0 to 9 is MVP: P1 is required for it, and P2 can slip
-past its first release. The Cloudflare and Spin tickets (T8, T9, T17, T18, the
-EZI `c` and `s` tickets, R3, R4, IABTechLab/edgezero#91, IABTechLab/edgezero#89 and #1518) and the `any`
-rows are post-MVP.
+Every ticket in waves 0 to 9 is MVP: P1 is required for it, and P2 can slip past
+its first release. The Cloudflare and Spin tickets (T8, T9, T17, T18, the EZI
+`c` and `s` tickets, R3, R4, IABTechLab/edgezero#91, IABTechLab/edgezero#89 and
+#1518) and the `any` rows are post-MVP.
 
 "Blocked by" is set as a GitHub dependency between issues. A PR or a decision
 there goes in the issue body. "Blocks" is the inverse and is not set
@@ -259,9 +266,9 @@ New:
 | R3     | Integration-branch tag with the Cloudflare parts                                                                                                                       | EZI-6  | Task    | S    | P2  | EZI-1c, EZI-2c, EZI-4c, IABTechLab/edgezero#91; DEC-8                                                                                                      | R4, T8, T17, #1518                                                                                                                   |
 | R4     | Integration-branch tag with the Spin parts                                                                                                                             | EZI-6  | Task    | S    | P3  | EZI-1s, EZI-2s, EZI-3s, EZI-4s, R3                                                                                                                         | T9, T18                                                                                                                              |
 
-Existing, moved under IABTechLab/edgezero#468. IABTechLab/edgezero#89 to IABTechLab/edgezero#92 leave
-IABTechLab/edgezero#88 and the last six leave IABTechLab/edgezero#391 or have
-no parent; both old epics stay where they are:
+Existing, moved under IABTechLab/edgezero#468. IABTechLab/edgezero#89 to
+IABTechLab/edgezero#92 leave IABTechLab/edgezero#88 and the last six leave
+IABTechLab/edgezero#391 or have no parent; both old epics stay where they are:
 
 | Issue                   | Title                                                                                                                                                                                                                                                                                   | Type (set)   | Size | Pri | Blocked by                                                                            | Blocks                                              |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ | ---- | --- | ------------------------------------------------------------------------------------- | --------------------------------------------------- |
@@ -276,25 +283,26 @@ no parent; both old epics stay where they are:
 | IABTechLab/edgezero#438 | Axum: explicit local GeoIP provider (no open PR)                                                                                                                                                                                                                                        | Story (keep) | M    | P3  | none                                                                                  | none                                                |
 | IABTechLab/edgezero#283 | Expose JA4 through `ctx.ja4()` (design in PR IABTechLab/edgezero#469); R2b needs Fastly's runtime JA4 and Axum's JA4 from a trusted proxy header (the design's section 13.1); IABTechLab/edgezero#91 carries Cloudflare's Bot Management JA4 and EZI-3s Spin's absence; closes with R2b | Task (keep)  | M    | P1  | EZI-3, IABTechLab/edgezero#397                                                        | R2b                                                 |
 
-IABTechLab/edgezero#89 stays the umbrella story: EZI-3 carries its contract, and it completes
-with the last adapter's mapping. IABTechLab/edgezero#397, IABTechLab/edgezero#410 and IABTechLab/edgezero#432 leave
+IABTechLab/edgezero#89 stays the umbrella story: EZI-3 carries its contract, and
+it completes with the last adapter's mapping. IABTechLab/edgezero#397,
+IABTechLab/edgezero#410 and IABTechLab/edgezero#432 leave
 IABTechLab/edgezero#391, which stays an epic in place; R1 is linked from it.
 
 ### Axum deployable, under #1558
 
 New:
 
-| ID  | Ticket                                                                                                                                                                                                                                                                                                   | Reqs                                              | Type    | Size | Pri | Blocked by                      | Blocks                           |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ------- | ---- | --- | ------------------------------- | -------------------------------- |
-| A1  | Serve Axum in production mode from main: rebase #1531 onto #1506 (#1528 closes), with startup, stores and client IP from EdgeZero; repin to R1                                                                                                                                                           | AX-1, AX-2, AX-7                                  | Feature | L    | P1  | R1, #1507                       | A2, A3, A6, A7, A9, #1529, #1141 |
-| A2  | Identity on Axum through T21's shared app: a new PR that takes #1536's and #1537's tests but not their Axum-only stores, store selection or wiring; partner APIs included; passes T5's suite                                                                                                             | ID-1, ID-2, ID-3, ID-8, WB-1, SH-5                | Feature | M    | P1  | T5, T6, T21, A1, #1529          | A5, A7, A8, A10                  |
-| A3  | Drain after-response tasks on SIGTERM                                                                                                                                                                                                                                                                    | AX-1, ID-5                                        | Feature | S    | P1  | R2, A1                          | none                             |
-| A5  | Load-test the record store at the target page-load rate with provider refreshes                                                                                                                                                                                                                          | AX-4                                              | Task    | M    | P1  | A2, A7, A10                     | none                             |
-| A6  | Build the production image from source (#1539, #1538): its entrypoint starts the production server with `STOPSIGNAL SIGTERM`; no publishing or attestation                                                                                                                                               | AX-5                                              | Feature | S    | P1  | A1                              | A7                               |
-| A7  | Reference infrastructure: DynamoDB, a readiness signal that reports degraded identity without failing the load balancer health check, JSON logs, two or more tasks, IPv6 CloudFront ranges, geo on, CloudFront's JA4 header forwarded, and an example rate-based rule at CloudFront or the load balancer | AX-3, AX-6, ID-6, ID-7                            | Feature | L    | P1  | A1, A2, A6, #1529               | A5                               |
-| A8  | Run the SIGTERM-during-record-write test in CI (`scripts/test-native-ec-image.mjs` from #1536)                                                                                                                                                                                                           | AX-1                                              | Task    | S    | P1  | A2                              | none                             |
-| A9  | CI guard: runtime code reads only `TRUSTED_SERVER__` environment names                                                                                                                                                                                                                                   | AX-2                                              | Task    | XS   | P2  | A1                              | none                             |
-| A10 | Identity features pass on Axum from the shared app: providers checked with ID5, abuse protection, SharedID creation and write-back, the mirror cookie and the EC route, including Safari's cookie lifetime                                                                                               | ID-4, ID-7, ID-9, WB-3, WB-4, SID-1, SID-2, SID-6 | Feature | M    | P1  | A2, R2, R2b, T11, T12, T13, T19 | A5, T22                          |
+| ID  | Ticket                                                                                                                                                                                                                                                                                                          | Reqs                                              | Type    | Size | Pri | Blocked by                      | Blocks                           |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ------- | ---- | --- | ------------------------------- | -------------------------------- |
+| A1  | Serve Axum in production mode from main: rebase #1531 onto #1506 (#1528 closes), with startup, stores and client IP from EdgeZero; repin to R1                                                                                                                                                                  | AX-1, AX-2, AX-7                                  | Feature | L    | P1  | R1, #1507                       | A2, A3, A6, A7, A9, #1529, #1141 |
+| A2  | Identity on Axum through T21's shared app: a new PR that takes #1536's and #1537's tests but not their Axum-only stores, store selection or wiring, and switches the production image's store features (`aws-dynamodb-ec`, `celld-ec` in #1539) to EZI-2b's providers; partner APIs included; passes T5's suite | ID-1, ID-2, ID-3, ID-8, WB-1, SH-5                | Feature | M    | P1  | T5, T6, T21, A1, #1529          | A5, A7, A8, A10                  |
+| A3  | Drain after-response tasks on SIGTERM                                                                                                                                                                                                                                                                           | AX-1, ID-5                                        | Feature | S    | P1  | R2, A1                          | none                             |
+| A5  | Load-test the record store at the target page-load rate with provider refreshes                                                                                                                                                                                                                                 | AX-4                                              | Task    | M    | P1  | A2, A7, A10                     | none                             |
+| A6  | Build the production image from source (#1539, #1538): its entrypoint starts the production server with `STOPSIGNAL SIGTERM`; no publishing or attestation                                                                                                                                                      | AX-5                                              | Feature | S    | P1  | A1                              | A7                               |
+| A7  | Reference infrastructure: DynamoDB, a readiness signal that reports degraded identity without failing the load balancer health check, JSON logs, two or more tasks, IPv6 CloudFront ranges, geo on, CloudFront's JA4 header forwarded, and an example rate-based rule at the load balancer                      | AX-3, AX-6, ID-6, ID-7                            | Feature | L    | P1  | A1, A2, A6, #1529               | A5                               |
+| A8  | Run the SIGTERM-during-record-write test in CI (`scripts/test-native-ec-image.mjs` from #1536)                                                                                                                                                                                                                  | AX-1                                              | Task    | S    | P1  | A2                              | none                             |
+| A9  | CI guard: runtime code reads only `TRUSTED_SERVER__` environment names                                                                                                                                                                                                                                          | AX-2                                              | Task    | XS   | P2  | A1                              | none                             |
+| A10 | Identity features pass on Axum from the shared app: providers checked with ID5, abuse protection, SharedID creation and write-back, the mirror cookie and the EC route, including Safari's cookie lifetime                                                                                                      | ID-4, ID-7, ID-9, WB-3, WB-4, SID-1, SID-2, SID-6 | Feature | M    | P1  | A2, R2, R2b, T11, T12, T13, T19 | A5, T22                          |
 
 Existing, moved under #1558:
 
@@ -310,9 +318,9 @@ A1 replaces the local configuration bridge: #1528 starts Axum from
 `TRUSTED_SERVER_CONFIG_*` names, so #1141 then points `ts config push --local`
 and `ts serve` at that directory; #1531 starts Axum the same way. #1142 and
 #1139 cover all four adapters, so they sit outside the MVP; A7 carries Axum's
-readiness signal. #1566 overlaps A2 and A10; its Axum part is rebuilt on T21 (Part C).
-T7, T14 and A11 are folded into A2 and A10, because the shared app (T21)
-brings partner APIs, the mirror cookie and the EC route to every adapter.
+readiness signal. #1566 overlaps A2 and A10; its Axum part is rebuilt on T21
+(Part C). T7, T14 and A11 are folded into A2 and A10, because the shared app
+(T21) brings partner APIs, the mirror cookie and the EC route to every adapter.
 
 ### Trusted Server, under #1558
 
@@ -360,12 +368,13 @@ Existing, moved under #1558:
 
 Not moved:
 
-- IABTechLab/trusted-server#90 is an epic, so Task 1 Step 3 links it from #1558 and it is not moved; it and IABTechLab/trusted-server#353 close
-  when PR #1488 merges.
+- IABTechLab/trusted-server#90 is an epic, so Task 1 Step 3 links it from #1558
+  and it is not moved; it and IABTechLab/trusted-server#353 close when PR #1488
+  merges.
 - #1507 delivers the cutover and stays under #1505; it blocks A1, T4, T5,
   T21, #1192 and #1556.
-- Proposed closures: #1523 with #1527; IABTechLab/trusted-server#353 and #1310 once PR #1488 merges;
-  #1189, which `56a19229f` (#1157) fixed on main.
+- Proposed closures: #1523 with #1527; IABTechLab/trusted-server#353 and #1310
+  once PR #1488 merges; #1189, which `56a19229f` (#1157) fixed on main.
 - #1556 needs only a regression test: #1506 rejects
   `proxy.certificate_check = false` and drops the setting from pull sync.
 - Out of these epics: #1484 (auction), #1140 (Cloudflare config), #1164
@@ -380,7 +389,8 @@ expiry (#1489). Part C lists them.
 ## Part C: fixes to existing PRs
 
 Each item names the head it was checked at. Post it as a comment on that PR
-(Tasks 6 and 7); once posted, the PR thread is the source of truth. Task 6 re-checks each item at the PR's current head before posting.
+(Tasks 6 and 7); once posted, the PR thread is the source of truth. Task 6
+re-checks each item at the PR's current head before posting.
 
 ### Trusted Server
 
@@ -413,15 +423,15 @@ Each item names the head it was checked at. Post it as a comment on that PR
   `Expiry::Never` (`coordinator/validate.rs:135-138`), pull sync is its only
   production source (`pull_sync.rs:145`), and such IDs reach the cookie with no
   `exp` under a one-year `Max-Age`. The 30-day clamp on stated expiries comes
-  from #1488. Answer its open threads, including the one on `any_due` skipping cookie-read
-  opt-outs.
-- **#1566 at `117a58e0e` (SID-1, SID-3, SID-5, ID-2, SH-5).** Move
-  `0a2a00aaf` (SharedID name, source and retention) and `0c13d4272` (drops the
-  blanket provider rejection) into #1488. Rebuild the Axum part on T21's shared
-  app and EdgeZero capabilities: no Axum-only `EcKvStore` (`ec_kv.rs:87`;
-  ID-2, DEC-3), no Trusted Server rate limiter (none on Axum, DEC-11), no User-Agent-only
-  gate (EZI-3, ID-7), and no detached `block_on` task (EZI-1). Local
-  development uses EdgeZero's local store (EZI-2a). It then serves A2 and A10.
+  from #1488. Answer its open threads, including the one on `any_due` skipping
+  cookie-read opt-outs.
+- **#1566 at `117a58e0e` (SID-1, SID-3, SID-5, ID-2, SH-5).** Move `0a2a00aaf`
+  (SharedID name, source and retention) and `0c13d4272` (drops the blanket
+  provider rejection) into #1488. Rebuild the Axum part on T21's shared app and
+  EdgeZero capabilities: no Axum-only `EcKvStore` (`ec_kv.rs:87`; ID-2, DEC-3),
+  no Trusted Server rate limiter (none on Axum, DEC-11), no User-Agent-only gate
+  (EZI-3, ID-7), and no detached `block_on` task (EZI-1). Local development uses
+  EdgeZero's local store (EZI-2a). It then serves A2 and A10.
 - **#1488 at `7f55776f3` (SID-1, SID-2, SID-3, SID-5, SID-6).** Take #1566's
   `0a2a00aaf`, which reads the SharedID name from `managed_user_ids`, defaults
   the source to `pubcid.org` and keeps the stored value (still open here:
@@ -432,42 +442,40 @@ Each item names the head it was checked at. Post it as a comment on that PR
   enabling LiveRamp, not this merge. Answer its open threads.
 - **#1531 at `88a6ba596` (AX-1, AX-2, AX-7), which carries A1 in place of
   #1528.** It now targets #1506's branch but forks from main with its own
-  cutover rebuild (`82d7e3be8`) and the RC tag pin, so 15 files conflict with #1506 at `9ec4711d3`.
-  Rebase onto #1506's head, drop that rebuild and the pin, and repin to R1
-  (DEC-5). Startup, stores and the client IP come from EdgeZero
-  (IABTechLab/edgezero#406, IABTechLab/edgezero#414,
-  IABTechLab/edgezero#409). Carry #1528's open items where they apply: the CLI
-  test (`AxumDevServerConfig` lacks `ingress`), the type error, the CodeQL
-  alerts and the per-request `AtomicBool` in the Fastly `AppState`.
+  cutover rebuild (`82d7e3be8`) and the RC tag pin, so 15 files conflict with
+  #1506 at `9ec4711d3`. Rebase onto #1506's head, drop that rebuild and the pin,
+  and repin to R1 (DEC-5). Startup, stores and the client IP come from EdgeZero
+  (IABTechLab/edgezero#406, IABTechLab/edgezero#414, IABTechLab/edgezero#409).
+  Carry #1528's open items where they apply: the CLI test (`AxumDevServerConfig`
+  lacks `ingress`), the type error, the CodeQL alerts and the per-request
+  `AtomicBool` in the Fastly `AppState`.
 - **RC units, forward-ported (DEC-6).** #1531 goes on #1506 for A1 and #1532 on
   #1531 for #1529. #1539, #1538 and #1540 go on #1531 for A6 and A7, where they
-  apply cleanly. #1533
-  and #1534 close as copies of #1525 and #1526. #1536 and #1537 are not
-  restacked: their Axum-only stores, store selection and wiring give way to
-  EZI-2b, T6 and T21, and their tests move into A2, A8 and T5. #1535 (Sourcepoint
-  GPP capture and server consent reconciliation) feeds T19 and T20: its
-  reconciliation runs in the EC route and its GPP capture in the injected
+  apply cleanly. #1533 and #1534 close as copies of #1525 and #1526. #1536 and
+  #1537 are not restacked: their Axum-only stores, store selection and wiring
+  give way to EZI-2b, T6 and T21, and their tests move into A2, A8 and T5. #1535
+  (Sourcepoint GPP capture and server consent reconciliation) feeds T19 and T20:
+  its reconciliation runs in the EC route and its GPP capture in the injected
   script, in place of a separate `/_ts/consent` route wired into each adapter
-  (DEC-16). #1532 takes its geo provider from EdgeZero's manifest
-  once IABTechLab/edgezero#439 binds it, dropping `TS_NATIVE_GEO_PROFILE_FILE`.
-  The notes below were checked at the RC tag
-  `v0.1.1-rc-axum.202611.2` (`7c6e68d94`), which contains every unit. They are
-  forward-port notes: each applies to the PR that ports its unit to main, and
-  Task 6 posts it there once that PR exists, checked at its head. On the RC unit
-  PRs themselves Task 6 posts a note only after re-checking it at the unit's
-  head, read on 2026-11-12 as #1532 `852b875fe`, #1536 `296e05405`, #1537
-  `4a838272c`, #1539 `8d41cb06c`, #1540 `eb6e19ef4` and #1541 `7dd2e3056`.
-  #1532: drop the core change that
-  maps a US request with no region to `Unknown`, which fails every US
-  Cloudflare request closed (AX-3), and show that the same trusted country
-  and region reach EC creation and auction consent on Axum. #1536: do not port the adapter-local
+  (DEC-16). #1532 takes its geo provider from EdgeZero's manifest once
+  IABTechLab/edgezero#439 binds it, dropping `TS_NATIVE_GEO_PROFILE_FILE`. The
+  notes below were checked at the RC tag `v0.1.1-rc-axum.202611.2`
+  (`7c6e68d94`), which contains every unit. They are forward-port notes: each
+  applies to the PR that ports its unit to main, and Task 6 posts it there once
+  that PR exists, checked at its head. On the RC unit PRs themselves Task 6
+  posts a note only after re-checking it at the unit's head, read on 2026-11-12
+  as #1532 `852b875fe`, #1536 `296e05405`, #1537 `4a838272c`, #1539 `8d41cb06c`,
+  #1540 `eb6e19ef4` and #1541 `7dd2e3056`. #1532: drop the core change that maps
+  a US request with no region to `Unknown`, which fails every US Cloudflare
+  request closed (AX-3), and show that the same trusted country and region reach
+  EC creation and auction consent on Axum. #1536: do not port the adapter-local
   DynamoDB store (ID-2, AX-4). #1537: do not port its Axum celld store or
   storage selection, which EdgeZero's providers and logical stores replace
   (EZI-2b, DEC-16); its example config also breaks startup on Axum, Cloudflare
-  and Spin. #1539: fix the failing Axum test. #1540: trust
-  IPv6 CloudFront ranges, turn geo on, wire DynamoDB and add an example
-  rate-based rule (AX-3, AX-6, DEC-11). All units:
-  replace `TS_*` names (AX-2). #1541: drop the commits of closed #1545.
+  and Spin. #1539: fix the failing Axum test. #1540: trust IPv6 CloudFront
+  ranges, turn geo on, wire DynamoDB and add an example rate-based rule (AX-3,
+  AX-6, DEC-11). All units: replace `TS_*` names (AX-2). #1541: drop the commits
+  of closed #1545.
 - **Proposed closures.** #1527 once its tests move (DEC-1); #1528 once #1531
   carries A1; #1533 and #1534, the RC copies of #1525 and #1526; #1535, #1536
   and #1537 once T19, T20, A2 and A8 carry their code and tests; #1310, which
@@ -494,15 +502,17 @@ Each item names the head it was checked at. Post it as a comment on that PR
   `9a985c99`.
 - **IABTechLab/edgezero#414 at `3733482f`.** Drop those two commits once they
   move down.
-- **IABTechLab/edgezero#469 at `1d5bf2ff`.** Bring section 13.1, JA4 from a trusted proxy
-  header recorded as `Ja4Source::TrustedProxyHeader`, into the work that ships in R2b. Axum's ID-7 needs JA4 from a hop that IABTechLab/edgezero#409 or IABTechLab/edgezero#439 checks,
-  such as CloudFront's `CloudFront-Viewer-JA4-Fingerprint`; an unchecked peer
-  stays `NotExposed` (EZI-3, DEC-18).
+- **IABTechLab/edgezero#469 at `1d5bf2ff`.** Bring section 13.1, JA4 from a
+  trusted proxy header recorded as `Ja4Source::TrustedProxyHeader`, into the
+  work that ships in R2b. Axum's ID-7 needs JA4 from a hop that
+  IABTechLab/edgezero#409 or IABTechLab/edgezero#439 checks, such as
+  CloudFront's `CloudFront-Viewer-JA4-Fingerprint`; an unchecked peer stays
+  `NotExposed` (EZI-3, DEC-18).
 - **IABTechLab/edgezero#439 at `3a0e5eb4`.** Bind the geo provider from the
   manifest, so an application reads `ctx.geo()` without its own boot profile
   (EZI-4a, DEC-16); #1532 composes it from a Trusted Server profile today.
-- **IABTechLab/edgezero#463 at `6f9fa8bc` and IABTechLab/edgezero#464 at `6fe32531`.** Rebase as Part A's
-  table says.
+- **IABTechLab/edgezero#463 at `6f9fa8bc` and IABTechLab/edgezero#464 at
+  `6fe32531`.** Rebase as Part A's table says.
 - **IABTechLab/edgezero#389 at `0653e6e3` and IABTechLab/edgezero#401 at
   `1a6ae861`.** Land after IABTechLab/edgezero#275 merges, redoing the RC-only
   merges `7c07b8e7` (IABTechLab/edgezero#389) and `2510ecc9`
@@ -536,9 +546,10 @@ These belong to #1505 and IABTechLab/edgezero#436:
 **Interfaces:**
 
 - Consumes: Part B's "Existing, moved" tables and "Not moved" notes.
-- Produces: 16 issues under #1558 and 10 under IABTechLab/edgezero#468, each typed, sized and
-  prioritized; the Related sections of IABTechLab/edgezero#468 and #1558
-  updated; comments on IABTechLab/edgezero#391 and IABTechLab/edgezero#88.
+- Produces: 16 issues under #1558 and 10 under IABTechLab/edgezero#468, each
+  typed, sized and prioritized; the Related sections of IABTechLab/edgezero#468
+  and #1558 updated; comments on IABTechLab/edgezero#391 and
+  IABTechLab/edgezero#88.
 
 - [ ] **Step 1: Move each issue**
 
@@ -661,8 +672,9 @@ and list the pair in Step 2's readback.
 
 - [ ] **Step 2: Read back**
 
-For each issue, read its blocked-by list through GraphQL and compare it with
-Part B.
+For each issue, run
+`gh api graphql -f query='{repository(owner:"<owner>",name:"<repo>"){issue(number:<n>){blockedBy(first:50){nodes{number repository{nameWithOwner}}}}}}' --jq '.data.repository.issue.blockedBy.nodes'`
+and compare the list with Part B.
 Expected: every issue pair present, plus the list of pairs recorded only in
 bodies.
 
@@ -728,9 +740,9 @@ Expected: 45 and 32.
 
 - [ ] **Step 2: Check that Fastly and Axum stand alone**
 
-For every issue in waves 0 to 9, read its blocked-by list and confirm that
-none of its blockers is in wave 10 or later or in an `any` row (a Cloudflare
-or Spin ticket, IABTechLab/edgezero#91, R3, R4, EZI-2p, EZI-5, EZI-5c, EZI-5s, T10, T16,
+For every issue in waves 0 to 9, read its blocked-by list and confirm that none
+of its blockers is in wave 10 or later or in an `any` row (a Cloudflare or Spin
+ticket, IABTechLab/edgezero#91, R3, R4, EZI-2p, EZI-5, EZI-5c, EZI-5s, T10, T16,
 #1139, #1142, #1245, #1549, IABTechLab/edgezero#438 or IABTechLab/edgezero#464), reading the list as Task 5
 Step 2 does.
 Expected: no such blocker (DEC-4).
