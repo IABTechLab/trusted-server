@@ -379,12 +379,14 @@ mod tests {
         let request_geo = RequestGeo::new(
             Some(resolved_ip),
             Some(GeoInfo {
-                city: "Springfield".to_owned(),
+                city: Some("Springfield".to_owned()),
                 country: "US".to_owned(),
-                continent: "NorthAmerica".to_owned(),
-                latitude: 39.78,
-                longitude: -89.65,
-                metro_code: 648,
+                continent: Some("NorthAmerica".to_owned()),
+                coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                    latitude: 39.78,
+                    longitude: -89.65,
+                }),
+                metro_code: Some(648),
                 region: Some("IL".to_owned()),
                 asn: None,
             }),
@@ -398,7 +400,7 @@ mod tests {
             .expect("should answer another IP");
 
         assert_eq!(
-            held.map(|geo| geo.city),
+            held.and_then(|geo| geo.city),
             Some("Springfield".to_owned()),
             "should return the held geo for the resolved IP"
         );

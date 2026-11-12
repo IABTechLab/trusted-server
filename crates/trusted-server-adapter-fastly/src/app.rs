@@ -1696,12 +1696,14 @@ mod tests {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         let reader_ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7));
         let held = GeoInfo {
-            city: "Springfield".to_owned(),
+            city: Some("Springfield".to_owned()),
             country: "US".to_owned(),
-            continent: "NorthAmerica".to_owned(),
-            latitude: 39.78,
-            longitude: -89.65,
-            metro_code: 648,
+            continent: Some("NorthAmerica".to_owned()),
+            coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                latitude: 39.78,
+                longitude: -89.65,
+            }),
+            metro_code: Some(648),
             region: Some("IL".to_owned()),
             asn: None,
         };
@@ -1724,7 +1726,7 @@ mod tests {
                 .geo()
                 .lookup(services.client_info().client_ip)
                 .expect("should answer geo")
-                .map(|geo| geo.city),
+                .and_then(|geo| geo.city),
             Some("Springfield".to_owned()),
             "should answer the client IP from the entry point's lookup"
         );

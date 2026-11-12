@@ -1232,12 +1232,14 @@ mod tests {
 
     fn sample_geo() -> GeoInfo {
         GeoInfo {
-            city: "San Francisco".to_owned(),
+            city: Some("San Francisco".to_owned()),
             country: "US".to_owned(),
-            continent: "NorthAmerica".to_owned(),
-            latitude: 37.7749,
-            longitude: -122.4194,
-            metro_code: 807,
+            continent: Some("NorthAmerica".to_owned()),
+            coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                latitude: 37.7749,
+                longitude: -122.4194,
+            }),
+            metro_code: Some(807),
             region: Some("CA".to_owned()),
             asn: None,
         }
@@ -1657,12 +1659,14 @@ mod tests {
     fn entry_point_finalize_withholds_geo_from_401() {
         let settings = test_settings();
         let request_geo = GeoInfo {
-            city: "Springfield".to_owned(),
+            city: Some("Springfield".to_owned()),
             country: "US".to_owned(),
-            continent: "NorthAmerica".to_owned(),
-            latitude: 39.78,
-            longitude: -89.65,
-            metro_code: 648,
+            continent: Some("NorthAmerica".to_owned()),
+            coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                latitude: 39.78,
+                longitude: -89.65,
+            }),
+            metro_code: Some(648),
             region: Some("IL".to_owned()),
             asn: None,
         };

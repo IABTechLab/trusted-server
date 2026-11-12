@@ -864,12 +864,14 @@ mod tests {
 
     fn sample_geo(city: &str) -> GeoInfo {
         GeoInfo {
-            city: city.to_owned(),
+            city: Some(city.to_owned()),
             country: "US".to_owned(),
-            continent: "NorthAmerica".to_owned(),
-            latitude: 37.7749,
-            longitude: -122.4194,
-            metro_code: 807,
+            continent: Some("NorthAmerica".to_owned()),
+            coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                latitude: 37.7749,
+                longitude: -122.4194,
+            }),
+            metro_code: Some(807),
             region: Some("CA".to_owned()),
             asn: None,
         }
