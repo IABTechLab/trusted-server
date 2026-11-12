@@ -94,8 +94,11 @@ done
 info "Building (debug wasm + ts CLI)"
 cargo build --package trusted-server-adapter-fastly --target wasm32-wasip1 >/dev/null
 cargo build -p trusted-server-cli --target "$HOST_TRIPLE" >/dev/null
-WASM="$REPO_ROOT/target/wasm32-wasip1/debug/trusted-server-adapter-fastly.wasm"
-TS="$REPO_ROOT/target/$HOST_TRIPLE/debug/ts"
+TARGET_ROOT=$(cargo metadata --locked --offline --no-deps --format-version 1 \
+  --manifest-path "$REPO_ROOT/Cargo.toml" \
+  | node -e 'let input="";process.stdin.on("data",chunk=>input+=chunk);process.stdin.on("end",()=>process.stdout.write(JSON.parse(input).target_directory))')
+WASM="$TARGET_ROOT/wasm32-wasip1/debug/trusted-server-adapter-fastly.wasm"
+TS="$TARGET_ROOT/$HOST_TRIPLE/debug/ts"
 
 info "Starting stub origin on :$ORIGIN_PORT and HTTP bidder on :$BID_PORT"
 cat > "$WORK/origin.py" <<PYEOF
