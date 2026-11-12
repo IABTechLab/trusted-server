@@ -3,12 +3,10 @@ resource "aws_vpc" "review" {
   enable_dns_support   = true
   enable_dns_hostnames = true
   tags                 = { Name = var.run_id }
-  depends_on           = [terraform_data.draft_gate]
 }
 
 resource "aws_internet_gateway" "review" {
-  vpc_id     = aws_vpc.review.id
-  depends_on = [terraform_data.draft_gate]
+  vpc_id = aws_vpc.review.id
 }
 
 resource "aws_subnet" "alb" {
@@ -18,7 +16,6 @@ resource "aws_subnet" "alb" {
   cidr_block              = local.alb_subnet_cidrs[count.index]
   map_public_ip_on_launch = false
   tags                    = { Name = "${var.run_id}-alb-${count.index}" }
-  depends_on              = [terraform_data.draft_gate]
 }
 
 resource "aws_subnet" "task" {
@@ -27,40 +24,34 @@ resource "aws_subnet" "task" {
   cidr_block              = local.task_subnet_cidr
   map_public_ip_on_launch = false
   tags                    = { Name = "${var.run_id}-task" }
-  depends_on              = [terraform_data.draft_gate]
 }
 
 resource "aws_route_table" "public" {
-  vpc_id     = aws_vpc.review.id
-  depends_on = [terraform_data.draft_gate]
+  vpc_id = aws_vpc.review.id
 }
 
 resource "aws_route" "internet" {
   route_table_id         = aws_route_table.public.id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = aws_internet_gateway.review.id
-  depends_on             = [terraform_data.draft_gate]
 }
 
 resource "aws_route_table_association" "public" {
   for_each       = { alb0 = aws_subnet.alb[0].id, alb1 = aws_subnet.alb[1].id, task = aws_subnet.task.id }
   subnet_id      = each.value
   route_table_id = aws_route_table.public.id
-  depends_on     = [terraform_data.draft_gate]
 }
 
 resource "aws_security_group" "alb" {
   name_prefix = "${var.run_id}-alb-"
   description = "Reviewer HTTPS only; backend traffic limited to the task SG"
   vpc_id      = aws_vpc.review.id
-  depends_on  = [terraform_data.draft_gate]
 }
 
 resource "aws_security_group" "task" {
   name_prefix = "${var.run_id}-task-"
   description = "Only owned ALB ingress; no public application port"
   vpc_id      = aws_vpc.review.id
-  depends_on  = [terraform_data.draft_gate]
 }
 
 resource "aws_vpc_security_group_ingress_rule" "reviewers" {
@@ -70,7 +61,6 @@ resource "aws_vpc_security_group_ingress_rule" "reviewers" {
   from_port         = 443
   to_port           = 443
   cidr_ipv4         = each.value
-  depends_on        = [terraform_data.draft_gate]
 }
 
 resource "aws_vpc_security_group_egress_rule" "alb_to_task" {
@@ -79,7 +69,6 @@ resource "aws_vpc_security_group_egress_rule" "alb_to_task" {
   ip_protocol                  = "tcp"
   from_port                    = 8787
   to_port                      = 8787
-  depends_on                   = [terraform_data.draft_gate]
 }
 
 resource "aws_vpc_security_group_ingress_rule" "alb_to_task" {
@@ -88,7 +77,6 @@ resource "aws_vpc_security_group_ingress_rule" "alb_to_task" {
   ip_protocol                  = "tcp"
   from_port                    = 8787
   to_port                      = 8787
-  depends_on                   = [terraform_data.draft_gate]
 }
 
 resource "aws_vpc_security_group_egress_rule" "task_https" {
@@ -98,7 +86,6 @@ resource "aws_vpc_security_group_egress_rule" "task_https" {
   to_port           = 443
   cidr_ipv4         = "0.0.0.0/0"
   description       = "Reviewed public HTTPS origin/AWS/registry egress; no NAT or VPC endpoints"
-  depends_on        = [terraform_data.draft_gate]
 }
 
 resource "aws_vpc_security_group_egress_rule" "auction" {
@@ -109,7 +96,6 @@ resource "aws_vpc_security_group_egress_rule" "auction" {
   to_port           = var.auction_egress.port
   cidr_ipv4         = var.auction_egress.cidr_ipv4
   description       = "Reviewed single-endpoint auction TCP egress"
-  depends_on        = [terraform_data.draft_gate]
 }
 
 resource "aws_lb" "review" {
@@ -124,7 +110,6 @@ resource "aws_lb" "review" {
   desync_mitigation_mode     = "strictest"
   idle_timeout               = var.alb_idle_timeout_seconds
   enable_deletion_protection = false
-  depends_on                 = [terraform_data.draft_gate]
 }
 
 resource "aws_lb_target_group" "review" {
@@ -144,7 +129,6 @@ resource "aws_lb_target_group" "review" {
     healthy_threshold   = local.target_health.healthy_threshold
     unhealthy_threshold = local.target_health.unhealthy_threshold
   }
-  depends_on = [terraform_data.draft_gate]
 }
 
 resource "aws_lb_listener" "https" {
@@ -161,7 +145,6 @@ resource "aws_lb_listener" "https" {
       status_code  = "404"
     }
   }
-  depends_on = [terraform_data.draft_gate]
 }
 
 # Accept both the publisher-preserving CLI flow and direct demo browsing.
@@ -191,7 +174,6 @@ resource "aws_lb_listener_rule" "publisher" {
   condition {
     host_header { values = [var.publisher_hostname, var.demo_hostname] }
   }
-  depends_on = [terraform_data.draft_gate]
 }
 
 resource "aws_route53_record" "review" {
@@ -203,5 +185,4 @@ resource "aws_route53_record" "review" {
     zone_id                = local.geo_phase == "dns-cutover" ? aws_cloudfront_distribution.geo[0].hosted_zone_id : aws_lb.review.zone_id
     evaluate_target_health = local.geo_phase != "dns-cutover"
   }
-  depends_on = [terraform_data.draft_gate]
 }

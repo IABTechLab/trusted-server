@@ -1,12 +1,4 @@
 locals {
-  # These missing qualifications cannot be removed through tfvars. Every AWS
-  # resource depends on draft_gate. Remove a blocker only with reviewed proof.
-  deployment_blockers = toset([
-    "scoped-operator-and-locked-state-qualification",
-    "provider-enabled-final-image-and-nonroot-volume-runtime",
-    "alb-forwarding-host-scheme-auth-and-health-acceptance"
-  ])
-
   tags = merge(var.extra_tags, {
     Application = "trusted-server"
     Purpose     = "disposable-review"

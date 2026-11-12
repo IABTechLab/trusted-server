@@ -32,7 +32,6 @@ resource "aws_vpc_security_group_ingress_rule" "cloudfront" {
   ip_protocol       = "tcp"
   from_port         = 443
   to_port           = 443
-  depends_on        = [terraform_data.draft_gate]
 }
 
 # Never share this target group with the old Off service or its rollback history.
@@ -54,7 +53,6 @@ resource "aws_lb_target_group" "geo" {
     healthy_threshold   = local.target_health.healthy_threshold
     unhealthy_threshold = local.target_health.unhealthy_threshold
   }
-  depends_on = [terraform_data.draft_gate]
 }
 
 resource "aws_lb_listener_rule" "geo" {
@@ -74,7 +72,6 @@ resource "aws_lb_listener_rule" "geo" {
       values           = [var.geo_front_door.origin_credential_value]
     }
   }
-  depends_on = [terraform_data.draft_gate]
 }
 
 # Explicitly request generated assertions. Viewer-header forwarding alone does
@@ -89,7 +86,6 @@ resource "aws_cloudfront_origin_request_policy" "geo" {
   }
   cookies_config { cookie_behavior = "all" }
   query_strings_config { query_string_behavior = "all" }
-  depends_on = [terraform_data.draft_gate]
 }
 
 resource "aws_cloudfront_cache_policy" "geo" {
@@ -105,7 +101,6 @@ resource "aws_cloudfront_cache_policy" "geo" {
     cookies_config { cookie_behavior = "none" }
     query_strings_config { query_string_behavior = "none" }
   }
-  depends_on = [terraform_data.draft_gate]
 }
 
 resource "aws_cloudfront_distribution" "geo" {
@@ -163,5 +158,4 @@ resource "aws_cloudfront_distribution" "geo" {
     ssl_support_method       = "sni-only"
     minimum_protocol_version = "TLSv1.2_2021"
   }
-  depends_on = [terraform_data.draft_gate]
 }

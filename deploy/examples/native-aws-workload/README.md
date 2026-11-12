@@ -2,7 +2,7 @@
 
 One example combines retained DynamoDB EC storage with an Axum workload on Fargate, AppConfig, Secrets Manager, an ALB and protected CloudFront Geo. The main fictional tfvars select CloudFront at `dns-cutover`; explicit `geo_front_door = null` selects Geo Off. The retained table and disposable workload have separate Terraform roots and separate locked state keys.
 
-This is a closed-gate example, not an approved deployment recipe. It does not qualify an AWS account, final application image or public ingress. Operational deployment belongs in the separate, access-controlled deployer repository. Access to that repository is not required to understand this example or run its offline checks. No AWS deployment or cleanup is authorized here.
+This is a deployment reference, not evidence that an AWS account, final application image or public ingress has been qualified. Use your approved deployment credentials and infrastructure workflow. The separate, access-controlled deployer is optional; it is not required to apply this example or run its offline checks. Obtain the account owner's authorization before applying or destroying resources.
 
 ```mermaid
 flowchart TD
@@ -47,7 +47,28 @@ Both roots use S3 lockfile locking, but neither supplies a backend key. The oper
 
 The example creates no operator role, protected state bucket, permission boundary, certificate, hosted zone or image build/publisher. Fictional tfvars, reserved documentation client CIDRs and placeholder image digests are not deployable inputs. The Agent image placeholder is not a verified official image. Never publish credentials, actual tfvars, state, saved plans, licensed data or private qualification records.
 
-All workload AWS resources depend directly on `terraform_data.draft_gate`. Its source-controlled blockers cover scoped operator/locked-state authority, final-image/nonroot-volume behavior and live ALB forwarding/auth/health. No input declares those qualifications passed. Mock tests remove blockers only in disposable copies. Offline success is not permission to remove the gate. The retained root's separate lifecycle does not authorize deploying the workload.
+There is no unconditional draft or approval gate. The AppConfig hosted-configuration resource checks envelope shape, publisher binding and exact agreement with `ec_storage` before publication. The CLI/runtime still owns application semantics and checksum validation. Account authorization, final-image/nonroot-volume behavior and live ingress acceptance are operator checks, not hardcoded Terraform blockers. Successful planning does not prove those runtime checks passed.
+
+## Deployment permissions
+
+SSO, an assumed role or another approved credential source may be used. `AdministratorAccess` is not required, and a dedicated deployment-role name is not a Terraform input requirement. An organisation-approved administrator session is not rejected merely because it is broad; use a narrower deployment policy where available. SSO identity, permission scope and permission boundaries are separate concerns.
+
+The deployment principal needs the following capabilities for its selected resources, including provider read/list calls, tagging, updates and deliberate workload cleanup:
+
+| Scope | Required capability |
+| --- | --- |
+| Terraform state | List the selected S3 state prefixes; read/write the retained and workload state objects; read/write/delete their `.tflock` objects. Include applicable state-key KMS permissions. State-object deletion is not needed for the default workspace. |
+| Retained root | Create/read/update/tag the exact DynamoDB table and its TTL/protection settings. EC row reads/writes belong to the runtime task role, not the retained provisioner. Table retirement is separate. |
+| Workload networking and compute | Manage the installation's VPC, subnets, routes, security groups, ALB/listeners/targets, ECS cluster/task definitions/services and log group. |
+| Configuration and ingress | Manage its AppConfig resources, CloudFront distribution/cache/origin-request policies and the evaluation DNS record; read the CloudFront managed prefix list and existing certificate/zone metadata as needed. |
+| IAM | Manage only the installation's task/execution roles and inline policies, apply the supplied boundaries and pass those two roles to `ecs-tasks.amazonaws.com`. Do not grant unrestricted `iam:PassRole`. First use of ECS/ALB may also require their service-linked roles to be created by the account owner or a suitably restricted bootstrap principal. |
+| Image publication, if this principal also builds/pushes | ECR login, upload, image publication and digest lookup for the selected existing repository. This is separate from Terraform's workload permissions. |
+
+Scope writes to installation resource ARNs, DNS names, prefixes and supported tag conditions. Some discovery APIs do not support resource scoping. The exact action-level policy depends on the selected account, provider calls and resources; this is a capability checklist, not a tested universal least-privilege policy. No broad `service:*` grant is implied by a table row. Plan-only/read-only access cannot perform a first deployment.
+
+The workload creates separate task and execution roles with the policies in `iam.tf`. The operator does not need application-secret values merely to apply ARN/version references. Secret seeding, browser credential retrieval, certificates, state infrastructure and permission-boundary ownership can remain with separate owners. Existing SCP, boundary, resource and endpoint-policy denies still apply.
+
+See [S3 backend permissions](https://developer.hashicorp.com/terraform/language/backend/s3#s3-bucket-permissions) and [IAM PassRole](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_passrole.html).
 
 ## Ordered configuration handoff
 
@@ -115,7 +136,7 @@ The workload owner supplies the same `ec_storage` object and sets `config_envelo
 
 Review `ec_task_policy_json` with the boundary owner. An existing task boundary with an explicit deny excluding DynamoDB still denies the calls despite an inline allow. Review its action ceiling and constrained allows, plus organization and endpoint policy denies. Do not remove a boundary, grant administrator access or move application calls to the execution role. The execution role retains image-pull, logs and startup-secret responsibilities.
 
-The main `terraform.tfvars.example` selects protected CloudFront at `dns-cutover`. The `staged` and `origin-enabled` phases are also modeled; they are not an automated safe rollout or rollback procedure. An explicit `geo_front_door = null` selects the alternate Geo Off path. Neither setting bypasses qualification.
+The main `terraform.tfvars.example` selects protected CloudFront at `dns-cutover`. The `staged` and `origin-enabled` phases are also modeled; they are not an automated safe rollout or rollback procedure. An explicit `geo_front_door = null` selects the alternate Geo Off path. Both paths require their own live ingress and browser acceptance checks.
 
 ## Runtime image contract
 
@@ -166,7 +187,7 @@ env -u NODE_OPTIONS -u NODE_PATH node deploy/examples/native-aws-workload/test-d
 node --test deploy/examples/native-aws-workload/test-workflow.mjs
 ```
 
-Backend-disabled initialization prepares provider tooling, not a live backend or AWS resources; it may need a provider download or an existing local mirror. When using an external `TF_DATA_DIR`, pass the same absolute directory to initialization and the helper. The helper copies an explicit public-file allowlist into disposable roots, strips inherited credentials/provider configuration, and uses a filesystem-only provider mirror. It never reads operator overrides, real state or private tfvars. Its mocked plans include the retained root, closed workload gate, main CloudFront tfvars, explicit Geo Off, storage mismatches, scoped IAM, routing phases and a fictional gate-only delete plan. No cloud resource is applied.
+Backend-disabled initialization prepares provider tooling, not a live backend or AWS resources; it may need a provider download or an existing local mirror. When using an external `TF_DATA_DIR`, pass the same absolute directory to initialization and the helper. The helper copies an explicit public-file allowlist into disposable roots, strips inherited credentials/provider configuration, and uses a filesystem-only provider mirror. It never reads operator overrides, real state or private tfvars. Its mocked plans use unchanged Terraform source copies and cover the retained root, valid workload plans, main CloudFront tfvars, explicit Geo Off, invalid envelopes, storage mismatches, scoped IAM and routing phases. No qualification-blocker source patching is needed and no cloud resource is applied.
 
 Separately, with the repository's pinned Rust/Node toolchains, the Linux host target and build dependencies installed, check both committed envelopes through the actual runtime config loader:
 

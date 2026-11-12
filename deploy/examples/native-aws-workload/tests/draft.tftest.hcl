@@ -2,13 +2,28 @@ mock_provider "aws" {
   override_during = plan
 
   mock_resource "aws_appconfig_application" {
-    defaults = { id = "app1234" }
+    override_during = plan
+    defaults        = { id = "app1234" }
   }
   mock_resource "aws_appconfig_environment" {
-    defaults = { environment_id = "env1234" }
+    override_during = plan
+    defaults        = { environment_id = "env1234" }
   }
   mock_resource "aws_appconfig_configuration_profile" {
-    defaults = { configuration_profile_id = "cfg1234" }
+    override_during = plan
+    defaults        = { configuration_profile_id = "cfg1234" }
+  }
+  mock_resource "aws_appconfig_hosted_configuration_version" {
+    override_during = plan
+    defaults        = { version_number = 1 }
+  }
+  mock_resource "aws_appconfig_deployment" {
+    override_during = plan
+    defaults        = { deployment_number = 1 }
+  }
+  mock_resource "aws_cloudwatch_log_group" {
+    override_during = plan
+    defaults        = { arn = "arn:aws:logs:eu-west-2:000000000000:log-group:/trusted-server/review/review-example" }
   }
 }
 
@@ -57,30 +72,23 @@ variables {
   }
 }
 
-run "draft_cannot_apply_workload" {
-  command         = plan
-  expect_failures = [terraform_data.draft_gate]
-
-  assert {
-    condition     = length(local.deployment_blockers) == 3 && contains(local.deployment_blockers, "scoped-operator-and-locked-state-qualification")
-    error_message = "The source-controlled qualification blockers must not become an operator tfvars override."
-  }
+run "valid_source_plans_without_qualification_gate" {
+  command = plan
   assert {
     condition     = local.envelope_valid
     error_message = "The CLI envelope fixture must have the supported structure and selected publisher binding."
   }
 }
 
-run "public_https_retains_qualification_gate" {
+run "public_https_plans_with_valid_envelope" {
   command = plan
   variables {
     reviewer_ipv4_cidrs = ["0.0.0.0/0"]
   }
-  expect_failures = [terraform_data.draft_gate]
 
   assert {
     condition     = local.envelope_valid
-    error_message = "Public ingress does not bypass the envelope or qualification boundary."
+    error_message = "Public ingress must retain the envelope contract."
   }
 }
 
@@ -89,7 +97,7 @@ run "reject_other_broad_ingress_ranges" {
   variables {
     reviewer_ipv4_cidrs = ["10.0.0.0/8"]
   }
-  expect_failures = [var.reviewer_ipv4_cidrs, terraform_data.draft_gate]
+  expect_failures = [var.reviewer_ipv4_cidrs]
 }
 
 run "reject_tag_only_image" {
@@ -97,5 +105,5 @@ run "reject_tag_only_image" {
   variables {
     application_image = "public.ecr.aws/example/app:latest"
   }
-  expect_failures = [var.application_image, terraform_data.draft_gate]
+  expect_failures = [var.application_image]
 }
