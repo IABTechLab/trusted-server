@@ -291,6 +291,21 @@ impl CookieReader {
         Ok(reader)
     }
 
+    /// The Lockr cookie names to read for this request: none where GDPR
+    /// applies, because Lockr AIM does not run there, so a Lockr cookie on
+    /// such a request is a leftover rather than a current delivery.
+    fn lockr_names<'reader>(
+        &'reader self,
+        cookies: RequestCookies<'_>,
+    ) -> impl Iterator<Item = &'reader String> + 'reader {
+        let names: &[String] = if cookies.gdpr_applies() {
+            &[]
+        } else {
+            &self.lockr
+        };
+        names.iter()
+    }
+
     /// Whether any cookie name is configured.
     pub(crate) fn is_empty(&self) -> bool {
         self.own.is_empty() && self.lockr.is_empty()
@@ -301,7 +316,7 @@ impl CookieReader {
     pub(crate) fn any(&self, cookies: RequestCookies<'_>, matches: impl Fn(&str) -> bool) -> bool {
         self.own
             .iter()
-            .chain(self.lockr.iter())
+            .chain(self.lockr_names(cookies))
             .flat_map(|name| cookies.get_all(name))
             .any(matches)
     }
@@ -322,7 +337,7 @@ impl CookieReader {
         {
             return Some(found);
         }
-        let (name, found) = self.lockr.iter().find_map(|name| {
+        let (name, found) = self.lockr_names(cookies).find_map(|name| {
             let found = cookies.get_all(name).find_map(&mut parse)?;
             Some((name, found))
         })?;

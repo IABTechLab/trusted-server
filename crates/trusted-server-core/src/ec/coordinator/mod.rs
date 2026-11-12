@@ -563,10 +563,12 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             // The vendor's own first-party cookies are read on every
             // navigation, so an opt-out or a changed ID is noticed while the
             // sources still hold live UIDs. Their IDs stand in for a lookup.
-            match registered
-                .provider
-                .read_request_cookies(lookup.cookies.at(lookup.now))
-            {
+            match registered.provider.read_request_cookies(
+                lookup
+                    .cookies
+                    .at(lookup.now)
+                    .where_gdpr_applies(lookup.consent.gdpr_applies),
+            ) {
                 CookieRead::OptedOut => {
                     log::debug!(
                         "Identity lookup: provider={} opted out in its cookies",
@@ -669,7 +671,10 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 publisher_domain: lookup.publisher_domain,
                 due_sources: &due,
                 current: OwnedEntries::new(entry, &registered.policy.sources, &registered.id),
-                cookies: lookup.cookies.at(lookup.now),
+                cookies: lookup
+                    .cookies
+                    .at(lookup.now)
+                    .where_gdpr_applies(lookup.consent.gdpr_applies),
                 now: lookup.now,
                 hashed_email: None,
             };

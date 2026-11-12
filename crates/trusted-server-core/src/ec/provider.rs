@@ -195,6 +195,7 @@ impl<'cookie> From<Option<Vec<ProviderEid<'cookie>>>> for CookieRead<'cookie> {
 pub struct RequestCookies<'a> {
     header: &'a str,
     now: UnixSeconds,
+    gdpr_applies: bool,
 }
 
 impl Default for RequestCookies<'_> {
@@ -224,7 +225,26 @@ impl<'a> RequestCookies<'a> {
         Self {
             header,
             now: UnixSeconds::new(0),
+            gdpr_applies: false,
         }
+    }
+
+    /// The same cookies, for a request where GDPR does or does not apply.
+    ///
+    /// The coordinator sets it from the request consent, for readers whose
+    /// cookie writers stay off where GDPR applies.
+    #[must_use]
+    pub fn where_gdpr_applies(self, gdpr_applies: bool) -> Self {
+        Self {
+            gdpr_applies,
+            ..self
+        }
+    }
+
+    /// Whether GDPR applies to the request.
+    #[must_use]
+    pub fn gdpr_applies(&self) -> bool {
+        self.gdpr_applies
     }
 
     /// The same cookies, read at request time `now`.
