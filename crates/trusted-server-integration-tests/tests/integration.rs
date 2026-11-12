@@ -1005,6 +1005,15 @@ fn origin_request_path(request: &OriginRequest) -> &str {
     request.path.split('?').next().unwrap_or_default()
 }
 
+/// The path and query of a signed `href` from `/first-party/sign`.
+///
+/// The route answers with an absolute URL on `publisher.public_origin`, which
+/// need not be the runtime's listener, so callers resend it to their own base URL.
+fn signed_href_path_and_query(href: &str) -> String {
+    let url = url::Url::parse(href).expect("should return an absolute signed href");
+    url[url::Position::BeforePath..url::Position::AfterQuery].to_owned()
+}
+
 /// Signs `target` through the binary's `/first-party/sign` route and fetches
 /// the first-party proxy URL it returns.
 fn fetch_signed_proxy_url(
@@ -1025,7 +1034,7 @@ fn fetch_signed_proxy_url(
         .as_str()
         .expect("should return the first-party proxy href");
     client
-        .get(format!("{base_url}{href}"))
+        .get(format!("{base_url}{}", signed_href_path_and_query(href)))
         .send()
         .expect("should send the first-party proxy request")
 }
@@ -2738,7 +2747,7 @@ fn first_party_proxy_html_creative_keeps_br_fastly() {
                 .as_str()
                 .expect("should return the first-party proxy href");
             let response = client
-                .get(format!("{base_url}{href}"))
+                .get(format!("{base_url}{}", signed_href_path_and_query(href)))
                 .header("accept-encoding", "br")
                 .send()
                 .expect("should fetch the proxied creative");
@@ -2860,7 +2869,7 @@ fn realistic_first_party_proxy_request_is_admitted(
     let href = signed["href"]
         .as_str()
         .expect("should return the first-party proxy href");
-    let mut request = client.get(format!("{base_url}{href}"));
+    let mut request = client.get(format!("{base_url}{}", signed_href_path_and_query(href)));
     for index in 0..REALISTIC_HEADER_COUNT {
         request = request.header(
             format!("x-example-{index:02}"),

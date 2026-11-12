@@ -875,8 +875,8 @@ async fn first_party_sign_post_signs_the_url_in_its_body() {
         "should sign the URL from the request body: {body}"
     );
     assert!(
-        body.contains(r#""href":"/first-party/proxy?tsurl="#),
-        "should return the first-party proxy URL: {body}"
+        body.contains(r#""href":"https://test-publisher.example.com/first-party/proxy?tsurl="#),
+        "should return the first-party proxy URL on the default public origin: {body}"
     );
     server.assert_no_outbound_requests();
 }
