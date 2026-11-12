@@ -959,6 +959,15 @@ mod tests {
             "should read the Lockr cookie when the own cookie yields nothing"
         );
         assert!(neither.is_none(), "should leave the ID to the lookup");
+        assert!(
+            provider
+                .read_request_cookies(
+                    RequestCookies::new("example_lockr_id5=lockr-example").where_gdpr_applies(true)
+                )
+                .into_found()
+                .is_none(),
+            "should not read Lockr cookies where GDPR applies, as Lockr AIM does not run there"
+        );
     }
 
     #[test]

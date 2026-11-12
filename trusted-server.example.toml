@@ -154,11 +154,14 @@ pull_sync_concurrency = 3
 # `storage.type: 'cookie'`; with `html5` storage the lookup runs.
 #
 # Lockr capability (id5, liveramp and uid2 only): Lockr AIM writes other
-# vendors' IDs into first-party cookies under key names configured per
+# vendors' raw tokens into first-party cookies under key names configured per
 # publisher in Lockr. Enable `[ec.identity_providers.settings.lockr]` to read
-# them after the vendor's own cookies and before any lookup; `cookie_names`
-# defaults to the vendor's known Lockr key. connectid and liveintent reject a
-# `lockr` table.
+# them after the vendor's own cookies and before any lookup. Lockr cookies are
+# not read where GDPR applies, because Lockr AIM does not run there. The
+# default Lockr key of each kind equals one of its own cookie names, which are
+# already read, so the capability changes nothing until `cookie_names` lists
+# the key configured in Lockr when it differs. connectid and liveintent reject
+# a `lockr` table.
 # [[ec.identity_providers]]
 # id = "id5"
 # kind = "id5"
@@ -175,7 +178,7 @@ pull_sync_concurrency = 3
 # cookie_names = ["id5id"]
 # [ec.identity_providers.settings.lockr]
 # enabled = true
-# cookie_names = ["id5id"]
+# cookie_names = ["example_lockr_id5"]
 #
 # LiveIntent (kind "liveintent"): no hashed email, no secrets. Sends the
 # visitor's first-party LiveIntent cookie (the first present one of
@@ -234,7 +237,7 @@ pull_sync_concurrency = 3
 # custom_id_namespace = "ana-example"
 # [ec.identity_providers.settings.lockr]
 # enabled = true
-# cookie_names = ["_lr_env"]
+# cookie_names = ["example_lockr_lr_env"]
 #
 # Yahoo ConnectID (kind "connectid"): no lookup and no endpoint. Reads
 # ConnectID from Yahoo's own first-party `connectId` cookie and keeps it until
@@ -278,7 +281,7 @@ pull_sync_concurrency = 3
 # cookie_names = ["__uid2_advertising_token"]
 # [ec.identity_providers.settings.lockr]
 # enabled = true
-# cookie_names = ["__uid2_advertising_token"]
+# cookie_names = ["example_lockr_uid2"]
 #
 # Prebid SharedID (kind "sharedid"): no lookup and no endpoint. Reads the
 # publisher common ID from Prebid's first-party `_sharedid` cookie, falling
