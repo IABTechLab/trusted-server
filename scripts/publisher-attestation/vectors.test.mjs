@@ -30,12 +30,12 @@ for (const [name, object] of Object.entries(vectors.signed_objects)) {
     assert.equal(
       Buffer.from(header, 'base64url').toString(),
       canonical(object.protected),
-      "should equal for Buffer.from(header, 'base64url').toString()"
+      `${name}: protected segment should match canonical header bytes`
     )
     assert.equal(
       Buffer.from(payload, 'base64url').toString(),
       canonical(object.payload),
-      "should equal for Buffer.from(payload, 'base64url').toString()"
+      `${name}: payload segment should match canonical payload bytes`
     )
     assert.equal(
       object.signature_segment,
@@ -66,19 +66,19 @@ for (const [name, object] of Object.entries(vectors.signed_objects)) {
         Buffer.from(signature, 'base64url')
       ),
       true,
-      "should equal for verify( null, Buffer.from(`${header}.${payload}`), key, Buffer.from(signature, 'base64url') )"
+      `${name}: signature should verify over the original compact segments`
     )
     const binding = object.payload.binding
     if (binding) {
       assert.equal(
         object.payload.binding_id,
         digest(canonical(binding)),
-        'should equal for object.payload.binding_id'
+        `${name}: binding_id should match the canonical binding digest`
       )
       assert.equal(
         binding.configuration.digest.value,
         digest(canonical(binding.configuration.projection)),
-        'should equal for binding.configuration.digest.value'
+        `${name}: configuration digest should match the canonical projection`
       )
     }
   })
@@ -92,22 +92,22 @@ test('consumer challenges differ from the verifier collection', () => {
   assert.notEqual(
     evidence.payload.nonce,
     collected.payload.nonce,
-    'should notEqual for evidence.payload.nonce'
+    'consumer and verifier collection nonces should differ'
   )
   assert.notEqual(
     evidence.compact_sha256.value,
     collected.compact_sha256.value,
-    'should notEqual for evidence.compact_sha256.value'
+    'separately challenged evidence should have distinct compact digests'
   )
   assert.equal(
     evidence.payload.binding_id,
     collected.payload.binding_id,
-    'should equal for evidence.payload.binding_id'
+    'consumer and collection evidence should describe the same binding'
   )
   assert.equal(
     assessment.payload.evidence_digest.value,
     collected.compact_sha256.value,
-    'should equal for assessment.payload.evidence_digest.value'
+    'assessment should reference the verifier-collected evidence digest'
   )
 })
 test('every accepted evidence case answers its configured consumer nonce', () => {
@@ -118,7 +118,7 @@ test('every accepted evidence case answers its configured consumer nonce', () =>
       assert.equal(
         payload.nonce,
         item.context_overrides.nonce ?? vectors.external_context.nonce,
-        'should equal for payload.nonce'
+        `${item.id}: evidence should echo its configured consumer nonce`
       )
   }
 })
@@ -139,7 +139,7 @@ test('immutable assessment identities are unique', () => {
   assert.equal(
     new Set(objects.map((item) => item.payload.assessment_id)).size,
     objects.length,
-    'should equal for new Set(objects.map((item) => item.payload.assessment_id)).size'
+    'each immutable assessment should have a distinct assessment_id'
   )
 })
 test('every context override has a declared default', () => {
@@ -150,13 +150,13 @@ test('every context override has a declared default', () => {
   assert.equal(
     'trusted_publisher_kid' in vectors.external_context,
     false,
-    "should equal for 'trusted_publisher_kid' in vectors.external_context"
+    'consumer context should not supply an independently trusted publisher key'
   )
   for (const item of vectors.cases)
     assert.equal(
       typeof item.expected.stage,
       'number',
-      'should equal for typeof item.expected.stage'
+      `${item.id}: expected validation stage should be numeric`
     )
 })
 test('strict parsing negatives retain exact duplicate-member signed bytes', () => {
@@ -172,7 +172,7 @@ test('strict parsing negatives retain exact duplicate-member signed bytes', () =
       name === 'duplicate_member_top_level'
         ? raw.includes('"extensions":{},"extensions":{}')
         : raw.includes('"host":"news.example.com","host":"news.example.com"'),
-      'should ok for name === \'duplicate_member_top_level\' ? raw.includes(\'"extensions":{},"extensions":{}\') : raw.includes(\'"host":"news.exa'
+      `${name}: signed raw JSON should retain its own duplicate-member pattern`
     )
   }
 })

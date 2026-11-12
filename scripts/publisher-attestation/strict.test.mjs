@@ -24,17 +24,21 @@ test('ordinary fixture keys pass canonical point and small-order checks', () => 
 test('noncanonical public-key fixture isolates encoding from small-order admission', () => {
   const key = vectors.negative_unsigned_objects.non_canonical_public_key.keys[0]
   const bytes = Buffer.from(key.jwk.x, 'base64url')
-  assert.equal(integer(bytes), prime + 3n, 'should equal for integer(bytes)')
+  assert.equal(
+    integer(bytes),
+    prime + 3n,
+    'noncanonical public key should encode y = p + 3'
+  )
   assert.throws(
     () => strictPoint(bytes),
     /canonical/,
-    'should throws for () => strictPoint(bytes)'
+    'noncanonical public key should fail canonicality admission'
   )
   const reduced = Buffer.alloc(32)
   reduced[0] = 3
   assert.doesNotThrow(
     () => strictPoint(reduced),
-    'should doesNotThrow for () => strictPoint(reduced)'
+    'reduced public-key point should pass small-order admission'
   )
 })
 test('small-order discovery key fails admission', () => {
@@ -43,7 +47,7 @@ test('small-order discovery key fails admission', () => {
   assert.throws(
     () => strictPoint(Buffer.from(key.jwk.x, 'base64url')),
     /small order/,
-    "should throws for () => strictPoint(Buffer.from(key.jwk.x, 'base64url'))"
+    'small-order discovery key should fail point admission'
   )
 })
 test('R fixtures exercise overlapping canonicality and small-order rejection', () => {
@@ -55,12 +59,12 @@ test('R fixtures exercise overlapping canonicality and small-order rejection', (
   assert.throws(
     () => strictPoint(signature('non_canonical_r').subarray(0, 32)),
     /canonical/,
-    "should throws for () => strictPoint(signature('non_canonical_r').subarray(0, 32))"
+    'noncanonical R should fail canonicality admission'
   )
   assert.throws(
     () => strictPoint(signature('small_order_r').subarray(0, 32)),
     /small order/,
-    "should throws for () => strictPoint(signature('small_order_r').subarray(0, 32))"
+    'canonical identity R should fail small-order admission'
   )
   for (const object of Object.values(vectors.signed_objects))
     strictPoint(
@@ -86,18 +90,18 @@ test('duplicate-member examples carry genuine signatures over the raw invalid JS
         Buffer.from(signature, 'base64url')
       ),
       true,
-      "should equal for verify( null, Buffer.from(`${header}.${payload}`), key, Buffer.from(signature, 'base64url') )"
+      `${name}: original duplicate-member bytes should have a valid signature`
     )
     const raw = Buffer.from(payload, 'base64url').toString()
     // A permissive JSON parser accepts these. Admission must inspect original bytes.
     assert.doesNotThrow(
       () => JSON.parse(raw),
-      'should doesNotThrow for () => JSON.parse(raw)'
+      `${name}: ordinary JSON.parse should accept the duplicate-member bytes`
     )
     assert.notEqual(
       JSON.stringify(JSON.parse(raw)),
       raw,
-      'should notEqual for JSON.stringify(JSON.parse(raw))'
+      `${name}: ordinary parsing should lose the original duplicate-member bytes`
     )
   }
 })

@@ -58,12 +58,12 @@ for (const host of [
     assert.equal(
       validate('host', host),
       false,
-      "should equal for validate('host', host)"
+      `${host}: DNS host should obey the expected admission rule`
     )
     assert.equal(
       validate('httpsIdentifier', `https://${host}/path`),
       false,
-      "should equal for validate('httpsIdentifier', `https://${host}/path`)"
+      `${host}: HTTPS identifier should obey the expected host admission rule`
     )
   })
 }
@@ -76,12 +76,12 @@ for (const host of [
     assert.equal(
       validate('host', host),
       true,
-      "should equal for validate('host', host)"
+      `${host}: DNS host should obey the expected admission rule`
     )
     assert.equal(
       validate('httpsIdentifier', `https://${host}/path`),
       true,
-      "should equal for validate('httpsIdentifier', `https://${host}/path`)"
+      `${host}: HTTPS identifier should obey the expected host admission rule`
     )
   })
 }
@@ -90,7 +90,7 @@ test('reject identifier dot segments', () => {
     assert.equal(
       validate('httpsIdentifier', `https://example.com${path}`),
       false,
-      "should equal for validate('httpsIdentifier', `https://example.com${path}`)"
+      `${path}: identifier should reject dot segments`
     )
 })
 test('fingerprint requires a known staging flag', () => {
@@ -101,7 +101,7 @@ test('fingerprint requires a known staging flag', () => {
   assert.equal(
     validate('assessment', assessment),
     false,
-    "should equal for validate('assessment', assessment)"
+    'fingerprint assessment should reject unknown staging'
   )
 })
 for (const [staging, environment, valid] of [
@@ -121,7 +121,7 @@ for (const [staging, environment, valid] of [
     assert.equal(
       validate('binding', binding),
       valid,
-      "should equal for validate('binding', binding)"
+      'binding should enforce the provider/environment invariant'
     )
   })
 }
@@ -139,12 +139,12 @@ test('Axum is development only', () => {
   assert.equal(
     validate('binding', binding),
     false,
-    "should equal for validate('binding', binding)"
+    'binding should enforce the provider/environment invariant'
   )
   binding.environment = 'development'
   assert.equal(
     validate('binding', binding),
     true,
-    "should equal for validate('binding', binding)"
+    'binding should enforce the provider/environment invariant'
   )
 })
