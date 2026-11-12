@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use clap::Subcommand;
 
+use crate::ad_templates::output::escape_terminal_text;
 use crate::error::CliResult;
 use crate::run::RunOutcome;
 
@@ -114,6 +115,13 @@ fn send(endpoint: &str, request: &KeysRequest<'_>) -> CliResult<(reqwest::Status
             .text()
             .await
             .map_err(|error| format!("could not read the response from {endpoint}: {error}"))?;
+        // Error bodies are service-controlled and reach stderr, so escape them;
+        // successful bodies stay byte for byte for `--json` and parsing.
+        let text = if status.is_success() {
+            text
+        } else {
+            escape_terminal_text(text.trim()).into_owned()
+        };
         Ok((status, text))
     })
 }

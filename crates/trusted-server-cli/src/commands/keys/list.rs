@@ -124,7 +124,11 @@ mod tests {
         let body = json!({
             "version": "1.0",
             "jwks": { "keys": [
-                { "kty": "OKP", "crv": "Ed25519", "kid": "\u{1b}[2Kts-2024-09-09\tforged" },
+                {
+                    "kty": "OKP\u{7}",
+                    "crv": "Ed25519\u{1b}[1G",
+                    "kid": "\u{1b}[2Kts-2024-09-09\tforged"
+                },
             ]}
         })
         .to_string();
@@ -132,7 +136,8 @@ mod tests {
         let rendered = render_keys(&body).expect("should render a valid document");
 
         assert_eq!(
-            rendered, "\\u{001B}[2Kts-2024-09-09\\u{0009}forged\tOKP\tEd25519\n",
+            rendered,
+            "\\u{001B}[2Kts-2024-09-09\\u{0009}forged\tOKP\\u{0007}\tEd25519\\u{001B}[1G\n",
             "should escape control characters, tabs included, in service-controlled fields"
         );
     }

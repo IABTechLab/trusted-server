@@ -108,6 +108,30 @@ fn list_reports_a_failed_fetch_as_an_error() {
 }
 
 #[test]
+fn error_bodies_are_escaped_for_both_commands() {
+    let server = FixtureServer::start(|_request| {
+        FixtureResponse::html("\u{1b}[2Kforged\rline\n").with_status(500)
+    });
+
+    let mut out = Vec::new();
+    let list_error = run(KeysCommand::List(list_args(&server, false)), &mut out)
+        .expect_err("should fail on an error status");
+    let verify_error = run(KeysCommand::Verify(verify_args(&server)), &mut out)
+        .expect_err("should fail on an error status");
+
+    for error in [list_error, verify_error] {
+        assert!(
+            !error.contains('\u{1b}') && !error.contains('\r'),
+            "should not pass control characters to the terminal: {error:?}"
+        );
+        assert!(
+            error.ends_with("\\u{000D}line"),
+            "should trim the trailing newline before escaping: {error:?}"
+        );
+    }
+}
+
+#[test]
 fn list_does_not_follow_a_redirect() {
     let server = FixtureServer::start(|request| {
         if request.path == "/.well-known/trusted-server.json" {

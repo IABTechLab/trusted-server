@@ -180,6 +180,20 @@ mod tests {
             !line.contains('\u{1b}') && !line.contains('\u{7}'),
             "should not pass control characters to the terminal: {line:?}"
         );
+
+        let verified = json!({
+            "verified": true,
+            "kid": "ts-2024-01-15\u{1b}[2K",
+            "message": "Signature verified successfully",
+        })
+        .to_string();
+
+        let (line, _) = interpret(&verified).expect("should interpret");
+
+        assert!(
+            !line.contains('\u{1b}'),
+            "should not pass control characters to the terminal: {line:?}"
+        );
     }
 
     #[test]
