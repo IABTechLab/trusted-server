@@ -69,7 +69,7 @@ fi
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
 ORIGIN_PID=$SMOKE_ORIGIN_PID
 # The positive case uses the final listener in the case sequence.
-smoke_initialize_config "$FASTLY_PROJECT" "$WORKSPACE" "$ORIGIN_PORT" "$POSITIVE_PORT"
+smoke_initialize_config "$FASTLY_PROJECT" "$WORKSPACE" "$ORIGIN_PORT" "$POSITIVE_PORT" "fastly"
 
 run_case() {
     local case_name="$1"
