@@ -43,6 +43,7 @@ const REPLACEMENT: &[u8] = b"EXAMPLE_FINALIZED";
 const MAX_LOOKUP_RESPONSE_BYTES: u64 = 64;
 
 #[derive(Clone, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FixtureConfig {
     enabled: bool,
     #[validate(url)]
