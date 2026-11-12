@@ -138,6 +138,14 @@ Trusted Server provides a built-in endpoint for testing signatures:
 }
 ```
 
+From the CLI, `ts keys verify` sends this request and exits non-zero when the
+signature does not verify:
+
+```bash
+ts keys verify --service https://edge.example.com \
+  --kid ts-2024-01-15 --payload 'message to verify' --signature '<signature>'
+```
+
 ## Discovery Endpoint
 
 Public keys are published via a standardized discovery endpoint following IAB patterns.
@@ -164,6 +172,9 @@ Public keys are published via a standardized discovery endpoint following IAB pa
   }
 }
 ```
+
+From the CLI, `ts keys list --service https://edge.example.com` prints each
+published kid with its key type and curve.
 
 ### Using Discovery for Verification
 
@@ -332,14 +343,9 @@ Use the verification endpoint:
 # Sign a payload
 SIGNATURE=$(sign-payload "test message")
 
-# Verify via API
-curl -X POST https://your-domain/verify-signature \
-  -H "Content-Type: application/json" \
-  -d '{
-    "payload": "test message",
-    "signature": "'$SIGNATURE'",
-    "kid": "ts-2024-01-15"
-  }'
+# Verify via the service; exits non-zero when the signature does not verify
+ts keys verify --service https://edge.example.com \
+  --kid ts-2024-01-15 --payload 'test message' --signature "$SIGNATURE"
 ```
 
 ## Next Steps

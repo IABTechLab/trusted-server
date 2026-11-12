@@ -65,6 +65,9 @@ enum Command {
     /// Local developer tools (e.g. the macOS/Linux production-hostname proxy).
     #[command(subcommand)]
     Dev(crate::commands::dev::DevCommand),
+    /// Inspect a deployed service's request-signing keys.
+    #[command(subcommand)]
+    Keys(crate::commands::keys::KeysCommand),
     /// Questions about a publisher origin's behaviour.
     #[command(subcommand)]
     Origin(crate::commands::origin::OriginCommand),
@@ -189,6 +192,11 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
             let mut out = stdout.lock();
             crate::commands::cache::run(command, &mut out).map(|()| RunOutcome::Success)
         }
+        Command::Keys(command) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::commands::keys::run(command, &mut out)
+        }
         Command::Origin(command) => {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
@@ -245,6 +253,33 @@ mod tests {
                 .to_string()
                 .contains("Deployment descriptor; paths inside it are relative to this file")
         );
+    }
+
+    #[test]
+    fn keys_verify_accepts_values_that_start_with_a_hyphen() {
+        // Trusted Server signs with unpadded base64url, whose alphabet includes `-`, so
+        // about one signature in 64 starts with one.
+        let args = parse(&[
+            "ts",
+            "keys",
+            "verify",
+            "--service",
+            "https://edge.example.com",
+            "--kid",
+            "ts-2024-01-15",
+            "--payload",
+            "-example-payload",
+            "--signature",
+            "-LRTQNDx",
+        ]);
+        let Command::Keys(crate::commands::keys::KeysCommand::Verify(verify)) = args.command else {
+            panic!("expected keys verify command");
+        };
+        assert_eq!(
+            verify.payload, "-example-payload",
+            "should keep the payload"
+        );
+        assert_eq!(verify.signature, "-LRTQNDx", "should keep the signature");
     }
 
     #[test]
