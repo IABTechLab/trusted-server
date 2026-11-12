@@ -118,14 +118,14 @@ Identity runs on an adapter only where the record contract and geo are
 supported. Elsewhere, startup rejects identity configuration (ID-2). Delivery
 follows DEC-4: Fastly, Axum, Cloudflare, Spin.
 
-| Capability                                                                    | Fastly                                                               | Axum                                                                     | Cloudflare                                                                                                                                                          | Spin                                                                                                                                                                                                                    |
-| ----------------------------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Record contract (generation read, create-if-absent, CAS, strong exists, list) | Supported. Fastly KV generations, exposed through EdgeZero by EZI-2a | Supported. DynamoDB or celld through EZI-2b                              | Unsupported today. Workers KV is eventually consistent with no CAS, and EdgeZero has no Durable Objects or D1 store on main, IABTechLab/edgezero#275 or the RC tags | Unsupported today. `spin-sdk` 7.0.0 `key_value` has get, set, delete, exists and get_keys only, with no prefix listing. Its bundled `wasi:keyvalue/atomics` interface defines a CAS resource that the SDK does not wrap |
-| After-response work                                                           | Supported (after send)                                               | EZI-1, drained on SIGTERM                                                | EZI-1 over `waitUntil`                                                                                                                                              | Unsupported. DEC-14 picks before-response or skip                                                                                                                                                                       |
-| Rate limiter                                                                  | Supported (Edge Rate Limiting)                                       | EZI-5, in-memory per task, each limit divided by the task count (DEC-11) | EZI-5, backend per DEC-15                                                                                                                                           | EZI-5, backend per DEC-15                                                                                                                                                                                               |
-| Geo with region                                                               | Supported                                                            | CloudFront headers (A4, IABTechLab/edgezero#439)                         | Country only today; region needs EZI-4                                                                                                                              | None; needs EZI-4                                                                                                                                                                                                       |
-| TLS fingerprint (JA4)                                                         | Supported (Fastly SDK); EZI-3 accessor                               | EZI-3 from a trusted CloudFront hop                                      | EZI-3 accessor, or absent                                                                                                                                           | EZI-3 accessor, or absent                                                                                                                                                                                               |
-| Trusted client IP                                                             | Supported                                                            | IABTechLab/edgezero#409                                                  | `cf-connecting-ip`; EZI-3 accessor                                                                                                                                  | TCP peer; EZI-3 accessor                                                                                                                                                                                                |
+| Capability                                                                    | Fastly                                                               | Axum                                                                                        | Cloudflare                                                                                                                                                          | Spin                                                                                                                                                                                                                    |
+| ----------------------------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Record contract (generation read, create-if-absent, CAS, strong exists, list) | Supported. Fastly KV generations, exposed through EdgeZero by EZI-2a | Supported. DynamoDB or celld through EZI-2b                                                 | Unsupported today. Workers KV is eventually consistent with no CAS, and EdgeZero has no Durable Objects or D1 store on main, IABTechLab/edgezero#275 or the RC tags | Unsupported today. `spin-sdk` 7.0.0 `key_value` has get, set, delete, exists and get_keys only, with no prefix listing. Its bundled `wasi:keyvalue/atomics` interface defines a CAS resource that the SDK does not wrap |
+| After-response work                                                           | Supported (after send)                                               | EZI-1, drained on SIGTERM                                                                   | EZI-1 over `waitUntil`                                                                                                                                              | Unsupported. DEC-14 picks before-response or skip                                                                                                                                                                       |
+| Rate limiter                                                                  | Supported (Edge Rate Limiting)                                       | Off by default, the load balancer limits; when turned on, EZI-5 in memory per task (DEC-11) | EZI-5, backend per DEC-15                                                                                                                                           | EZI-5, backend per DEC-15                                                                                                                                                                                               |
+| Geo with region                                                               | Supported                                                            | CloudFront headers (A4, IABTechLab/edgezero#439)                                            | Country only today; region needs EZI-4                                                                                                                              | None; needs EZI-4                                                                                                                                                                                                       |
+| TLS fingerprint (JA4)                                                         | Supported (Fastly SDK); EZI-3 accessor                               | EZI-3 from a trusted CloudFront hop                                                         | EZI-3 accessor, or absent                                                                                                                                           | EZI-3 accessor, or absent                                                                                                                                                                                               |
+| Trusted client IP                                                             | Supported                                                            | IABTechLab/edgezero#409                                                                     | `cf-connecting-ip`; EZI-3 accessor                                                                                                                                  | TCP peer; EZI-3 accessor                                                                                                                                                                                                |
 
 Cloudflare and Spin move to Supported only when EZI-2 and EZI-4 deliver for
 them (DEC-8). Until then their startup rejects identity configuration, and
@@ -180,10 +180,12 @@ marks the record contract and geo as supported.
   production image without publishing it.
 - **AX-6 Reference infrastructure.** The reference stack wires the DynamoDB
   table, port 443 egress for vendor APIs, a readiness check that fails when a
-  dependency is down, JSON logs and two or more tasks. IABTechLab/edgezero#275 serves
+  dependency is down, JSON logs, two or more tasks and an example rate-based
+  rule at CloudFront or the load balancer, since Axum's own limits are off by
+  default (DEC-11). IABTechLab/edgezero#275 serves
   Axum on a current-thread runtime, so capacity comes from task count. Accept:
-  the stack applies with those properties, and readiness fails with DynamoDB
-  unreachable. State: #1540 has the 443 egress (IPv4 only), a static `/health`,
+  the stack applies with those properties, the rate rule refuses traffic over
+  its threshold, and readiness fails with DynamoDB unreachable. State: #1540 has the 443 egress (IPv4 only), a static `/health`,
   plain logs, one task and no DynamoDB wiring.
 - **AX-7 Ships from main.** Main never pins an EdgeZero RC tag
   (IABTechLab/edgezero#431, IABTechLab/edgezero#462) or a revision that exists only on an RC
@@ -229,11 +231,13 @@ marks the record contract and geo as supported.
   the DEC-14 choice holds: either the follow-up write lands before the
   response, or the work is skipped and the response is unchanged.
 - **ID-6 Rate limiting.** Provider lookups, batch sync, pull sync and record
-  creation are rate limited on every supported adapter. Batch sync is keyed
-  per partner; the other keys follow DEC-15. On Axum each task keeps its own
-  counter and enforces each limit divided by the configured task count
-  (DEC-11). Accept: per-adapter tests hit each limit and see the limited
-  request refused or skipped, and an Axum task configured for two tasks
+  creation are rate limited on every supported adapter except Axum, where
+  every limit is off by default because the deployer's load balancer limits
+  traffic (DEC-11). Batch sync is keyed per partner; the other keys follow
+  DEC-15. An Axum limit turned on in configuration runs per task and enforces
+  the limit divided by the configured task count. Accept: per-adapter tests hit
+  each limit and see the limited request refused or skipped; Axum's default
+  configuration applies no limit; and an Axum limit turned on for two tasks
   refuses at half the limit.
   State: Fastly Edge Rate Limiting is the only limiter; record creation is
   limited nowhere; #1487 keys lookups on the IP-derived EC prefix, so everyone
@@ -455,8 +459,8 @@ part.
 - The existing EC settings enable identity; startup rejects them where
   identity is unsupported (ID-2).
 - Provider `rate_limit_per_hour` and `mirror_enabled` from #1487 and #1489
-  follow DEC-15 and DEC-10. On Axum every limit is divided by the configured
-  task count (DEC-11).
+  follow DEC-15 and DEC-10. On Axum every limit is off by default and, when
+  turned on, divided by the configured task count (DEC-11).
 - The reference deployment turns geo on (AX-3).
 - Environment overrides use the `TRUSTED_SERVER__` prefix only (AX-2).
 - Record stores are EdgeZero logical stores in `edgezero.toml`, with no
@@ -525,10 +529,12 @@ Decided:
   without any Cloudflare or Spin work, so every ticket and release is split by
   platform and no Fastly or Axum item is blocked by a Cloudflare or Spin item.
   Cloudflare and Spin follow the MVP.
-- **DEC-11 Axum rate limiter backend** (user, 2026-11-12). Each Axum task
-  keeps its own in-memory counter and enforces each limit divided by the
-  configured task count, so the total across tasks stays within the limit.
-  The MVP has no shared counter.
+- **DEC-11 Axum rate limiting** (user, 2026-11-12). Every limit is off on
+  Axum by default, inbound and outbound, because deployers rate-limit at their
+  own load balancer; the reference stack shows one rule (AX-6). A limit a
+  deployer turns on keeps its own in-memory counter in each task and enforces
+  the limit divided by the configured task count. The MVP has no shared
+  counter.
 - **DEC-16 One implementation for every adapter** (user, 2026-11-12). Every
   feature is built once and works on every adapter, delivered in DEC-4's
   order. Shared logic lives in Trusted Server core; a platform capability an
@@ -564,7 +570,7 @@ Open:
   Blocks T9.
 - **DEC-15 Rate limiter keys, the Axum task count, and the Cloudflare and Spin
   limiter backends.** Batch sync stays keyed per partner. Blocks EZI-5c,
-  EZI-5s, T10, A7 and #1487's key item.
+  EZI-5s, T10 and #1487's key item.
 
 ## How the claims were checked
 
@@ -630,3 +636,8 @@ shrink to turning that app on with each adapter's EdgeZero capabilities and
 passing the conformance suite, and T7, T14 and A11 fold into A2 and A10.
 EZI-2a adds EdgeZero's local store for Axum development, and EZI-4 binds
 Axum's geo provider from EdgeZero's manifest.
+
+The user then turned every Axum limit off by default, inbound and outbound,
+because deployers rate-limit at their own load balancer (DEC-11), and asked
+for an example rate rule in the reference stack (AX-6). A7 no longer waits on
+DEC-15.
