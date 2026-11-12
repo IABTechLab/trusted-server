@@ -18,11 +18,14 @@ differences item 12 cites, is new in `9b31a697`. The cut is stacked on PR 275
 and follows its head, and `main` pins the head the cut was last rebased onto
 (D5, [Merge gate and pin](#merge-gate-and-pin)). On 2026-11-08 the head was
 `5ea8d93c`, and the 2026-11-08 revision rechecked at `5ea8d93c` only the facts
-the answers rely on. The cut now pins `a7d7fd0f`
-(`a7d7fd0f2face027e3810ed67e80f6341fcf68b6`), PR 275's head on 2026-11-11. It
-is five commits after `dcbf622`, the cut's first pin, and its only production
-change is the absolute target of the Axum native timer. Every other citation
-is still at H.
+the answers rely on. The cut now pins `14a6ca8b`
+(`14a6ca8bb5a5cbe055a1f725bdab8f42569a3bf0`), PR 275's head on 2026-11-11. It
+is four commits after `a7d7fd0f`, the previous pin, which was five commits
+after `dcbf622`, the cut's first pin, and changed only the absolute target of
+the Axum native timer in production code. The four commits change production
+code in two places: Spin frames an empty outbound body only for `POST`, `PUT`,
+and `PATCH`, and EdgeZero adds a received-head preparer that no adapter calls
+yet. Every other citation is still at H.
 
 **Trusted Server base:** `main` at `51730bdaf`, which pins EdgeZero `v0.0.11`.
 
@@ -166,7 +169,7 @@ decision sits in the section that implements it.
 
 **Pin.** The six EdgeZero crates move from `tag = "v0.0.11"` to a `rev` on the
 same `IABTechLab/edgezero` git source. Features and `default-features` stay as
-they are. The rev is PR 275's head, `a7d7fd0f` at the 2026-11-11 repin, and
+they are. The rev is PR 275's head, `14a6ca8b` at the 2026-11-11 repin, and
 the cut repins it at each rebase. At merge, `main` pins the head the cut was
 last rebased onto (D5).
 
@@ -1999,7 +2002,7 @@ it adds outbound sites or platform-type uses that need porting.
 PR #1516 runs on the old API, so the cut's next merge of `main` ports it onto
 `OutboundCachePolicy::Bypass` and keeps the optimized GET's Image Optimizer
 options. EdgeZero `c8fd1939` documents that split
-(`edgezero@a7d7fd0f:docs/guide/proxying.md:320-323`).
+(`edgezero@14a6ca8b:docs/guide/proxying.md:320-323`).
 
 Issue #1484 asks for multi-provider fan-out on Cloudflare and Spin. The cut
 closes it.
