@@ -12,7 +12,7 @@ Epics: #1558 (Trusted Server) and IABTechLab/edgezero#468 (EdgeZero). Plan:
 2. Server-side identity works on every adapter whose platform can meet the
    record contract in [Platform support](#platform-support), delivered in the
    order Fastly, Axum, Cloudflare, Spin (DEC-4). Fastly and Axum are the MVP
-   and ship complete without any Cloudflare or Spin work. An adapter that cannot meet the
+   (DEC-2) and ship complete without any Cloudflare or Spin work. An adapter that cannot meet the
    contract rejects identity configuration at startup with a clear error and
    never runs identity without a record.
 3. SharedID is read, stored and passed to bidders the way Prebid defines it,
@@ -35,8 +35,6 @@ cap.
   when it needs one. This design fixes the requirements, the platform support
   matrix and the order.
 - The EdgeZero cutover is #1506 (DEC-1).
-- Trusted Server PRs #1342 to #1423, and #1448 stacked on them, are out of
-  scope (DEC-2).
 
 ## Where things stand
 
@@ -457,7 +455,6 @@ and Axum parts ship in R1 and R2 and never wait on a Cloudflare or Spin part.
   on a request that is not a navigation.
 - Conformance with the SharedID Edge specification.
 - An Akamai adapter.
-- Trusted Server PRs #1342 to #1423 and #1448 (DEC-2).
 
 ## Decisions
 
@@ -465,12 +462,12 @@ Decided:
 
 - **DEC-1 Cutover** (user, 2026-11-11). #1506 is the EdgeZero cutover. #1527
   closes once #1506 covers its tests.
-- **DEC-2 Scope** (user, 2026-11-11). Trusted Server PRs #1342 to #1423, and
-  #1448 stacked on them, are out of scope.
+- **DEC-2 MVP** (user, 2026-11-12). Fastly and Axum are the MVP: plan waves 0
+  to 10. Cloudflare, Spin and the decision-gated work follow it.
 - **DEC-3 Shared record store** (user, 2026-11-11). The EC record runs on one
   `EcKvStore` over EdgeZero's `KvStore`, with no per-adapter backends.
 - **DEC-4 Platform order** (user, 2026-11-12). Fastly, then Axum, then
-  Cloudflare, then Spin. Fastly and Axum are the MVP and must ship complete
+  Cloudflare, then Spin. Fastly and Axum (the MVP, DEC-2) must ship complete
   without any Cloudflare or Spin work, so every ticket and release is split by
   platform and no Fastly or Axum item is blocked by a Cloudflare or Spin item.
   Cloudflare and Spin follow the MVP.

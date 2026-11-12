@@ -48,7 +48,6 @@ IABTechLab/edgezero.
   body.
 - An issue Part B names for reuse is reused, never duplicated.
 - EdgeZero code is never changed from here; EdgeZero items are requests.
-- Trusted Server PRs #1342 to #1423 and #1448 are out of scope (DEC-2).
 - Issue and comment text uses no em dashes and no names of people; comments
   start with `CREATOR: `.
 
@@ -164,7 +163,7 @@ issue under its epic), PR fix (changes the PR needs), Merge, Release, Close.
 | 12   | EZ EZI-1s, EZI-2s, EZI-3s, EZI-4s and EZI-5s, then R4; then TS T9, T18                                                           | P3  | New, Release       | Spin parts in EdgeZero; Spin release; Spin EC lifecycle; Spin providers, limits and cookies                                                                       | Part B blockers, DEC-8, DEC-14                                                                                                   |
 | any  | TS T16, TS #1245, IABTechLab/edgezero#438, IABTechLab/edgezero#287                                                               | P3  | New, Move, Merge   | `ts-ec` refresh; LiveRamp sync spec; local GeoIP with PR IABTechLab/edgezero#453; IABTechLab/edgezero#287 last                                                    | DEC-13; DEC-9; PR IABTechLab/edgezero#453; IABTechLab/edgezero#275                                                               |
 
-Waves 0 to 10 are the MVP: they complete Fastly and Axum. None of them waits
+Waves 0 to 10 are the MVP (DEC-2): they complete Fastly and Axum. None of them waits
 on a Cloudflare or Spin item, so the MVP ships without waves 11 and 12 (DEC-4).
 Wave 11 (Cloudflare), wave 12 (Spin) and the decision-gated row follow the
 MVP.
@@ -311,8 +310,6 @@ Not moved:
 - Proposed closures: #1523 with #1527; IABTechLab/trusted-server#353 and #1310 once PR #1488 merges.
 - Out of these epics: #1484 (auction), #1140 (Cloudflare config), #1164
   (Spin tooling), IABTechLab/trusted-server#518 (cleanup).
-- #1134, #1132 and #1125 overlap this work but stay out pending a decision on
-  whether DEC-2's exclusion covers issues.
 
 Requirements met inside open PRs, not by a ticket: ID-8 on main and SH-2
 (#1487), SID-1 to SID-3 and SID-6 for the provider, SID-5 (#1488), WB-4
