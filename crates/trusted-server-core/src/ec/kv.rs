@@ -708,8 +708,8 @@ impl KvIdentityGraph {
     /// Returns `proven` instead of a read outcome that cannot disprove it.
     ///
     /// Partner-ID enrichment is best effort. When the caller already held proof
-    /// that the row exists — an `Add`-confirmed create or an earlier
-    /// authoritative read in the same request — a refresh that misses or fails
+    /// that the row exists — the page-load write's `Add`-confirmed create or an
+    /// earlier authoritative read in the same request — a refresh that misses or fails
     /// says nothing about existence, so the proof is kept and the skipped
     /// update is logged. Write failures are *not* routed here: they are real
     /// operation failures and stay [`EcKvSnapshot::Failed`] so callers can
@@ -2454,6 +2454,14 @@ mod tests {
             self.lookups.load(std::sync::atomic::Ordering::Relaxed)
         }
 
+        fn operation_count(&self) -> usize {
+            self.lookup_count()
+                + self.exact_check_count()
+                + self.inserts().len()
+                + self.list_count()
+                + self.delete_count()
+        }
+
         fn exact_check_count(&self) -> usize {
             self.exact_checks.load(std::sync::atomic::Ordering::Relaxed)
         }
@@ -2997,8 +3005,8 @@ mod tests {
 
     #[test]
     fn snapshot_upsert_keeps_add_confirmed_present_when_refresh_misses() {
-        // `generate_if_needed` records a successful `Add` as `Present` without a
-        // generation. EID ingestion refreshes that snapshot to obtain one; on an
+        // The page-load write records its successful `Add` create as `Present`
+        // without a generation. EID ingestion refreshes that snapshot to obtain one; on an
         // eventually-consistent store the refresh can miss. Enrichment is best
         // effort, so the miss must not retract the confirmed create — otherwise
         // finalization suppresses the `ts-ec` cookie for a root that was written.
@@ -3835,5 +3843,513 @@ mod tests {
             .expect("should read store")
             .expect("should preserve existing key");
         assert!(!stored.consent.ok, "withdrawal must reach the store");
+    }
+
+    #[test]
+    fn stale_completion_marker_does_not_suppress_withdrawal_after_root_recreation() {
+        let operations = Arc::new(RecordedEcKvOperations::default());
+        let graph = KvIdentityGraph::new(RecordingEcKv::with_stale_lookups(
+            Arc::clone(&operations),
+            1,
+        ));
+        let ec_id = snapshot_ec_id();
+        let expired_updated = current_timestamp().saturating_sub(TOMBSTONE_TTL.as_secs() + 1);
+        let expired_tombstone = KvEntry::tombstone(expired_updated);
+        graph
+            .create(&ec_id, &expired_tombstone)
+            .expect("should seed old tombstone");
+        graph
+            .write_withdrawal_marker(&ec_id, expired_updated)
+            .expect("should seed old completion marker");
+
+        // Model the root expiring just before its later-written completion
+        // marker, followed by recreation of the same key.
+        graph.store.delete(&ec_id).expect("should expire root row");
+        graph
+            .create(&ec_id, &live_entry())
+            .expect("should make the same key live again after root expiry");
+
+        let outcome = graph.tombstone_existing_from_snapshot(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "an expired completion marker must not suppress withdrawal of a recreated live row"
+        );
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read recreated row")
+            .expect("should retain recreated row");
+        assert!(!stored.consent.ok, "recreated row should be tombstoned");
+    }
+
+    #[test]
+    fn tombstone_existing_from_repeated_stale_miss_preserves_first_write() {
+        let operations = Arc::new(RecordedEcKvOperations::default());
+        let graph = KvIdentityGraph::new(RecordingEcKv::with_stale_lookups(
+            Arc::clone(&operations),
+            2,
+        ));
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &live_entry())
+            .expect("should seed live row");
+        operations.reset();
+
+        let first_outcome = graph.tombstone_existing_from_snapshot(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+        let first_updated = first_outcome
+            .entry_for(&ec_id)
+            .expect("should return first tombstone")
+            .consent
+            .updated;
+        assert_eq!(
+            operations.lookup_count(),
+            1,
+            "first stale miss should retry its point read once"
+        );
+        assert_eq!(
+            operations.list_count(),
+            1,
+            "first stale miss should list completion markers once"
+        );
+        assert_eq!(
+            operations.exact_check_count(),
+            1,
+            "first stale miss should confirm root existence once"
+        );
+        assert_eq!(
+            operations.inserts().len(),
+            2,
+            "first stale miss should write the root and completion marker"
+        );
+        operations.reset();
+
+        graph.tombstone_existing_from_snapshot(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert_eq!(
+            operations.lookup_count(),
+            1,
+            "a repeated stale miss should retry its point read once"
+        );
+        assert_eq!(
+            operations.exact_check_count(),
+            0,
+            "a valid completion marker should avoid a root existence check"
+        );
+        assert_eq!(
+            operations.list_count(),
+            1,
+            "a repeated stale miss should list completion markers once"
+        );
+        assert_eq!(
+            operations.delete_count(),
+            0,
+            "a repeated withdrawal should not delete marker state"
+        );
+        assert!(
+            operations.inserts().is_empty(),
+            "a repeated stale miss should not rewrite the completed tombstone"
+        );
+        let (stored, generation) = graph
+            .get(&ec_id)
+            .expect("should read stored tombstone")
+            .expect("should preserve tombstone");
+        assert_eq!(
+            generation, 2,
+            "only the first withdrawal should advance the root generation"
+        );
+        assert_eq!(
+            stored.consent.updated, first_updated,
+            "repeated withdrawal should preserve the first tombstone timestamp"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_never_creates_missing_key() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let snapshot = EcKvSnapshot::Missing {
+            ec_id: ec_id.clone(),
+        };
+
+        let outcome = kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Missing { .. }),
+            "withdrawal should preserve the missing snapshot for an absent identity"
+        );
+        assert!(
+            kv.get(&ec_id).expect("should read store").is_none(),
+            "withdrawal must not create a tombstone for an absent key"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_non_authoritative_states_reread_live_row() {
+        let ec_id = snapshot_ec_id();
+        let states = [
+            EcKvSnapshot::NotRead,
+            EcKvSnapshot::Failed {
+                ec_id: ec_id.clone(),
+            },
+            EcKvSnapshot::Present {
+                ec_id: ec_id.clone(),
+                entry: Box::new(live_entry()),
+                generation: None,
+            },
+            EcKvSnapshot::Present {
+                ec_id: "different-ec-id".to_owned(),
+                entry: Box::new(KvEntry::tombstone(1_000)),
+                generation: Some(9),
+            },
+        ];
+
+        for state in states {
+            let operations = Arc::new(RecordedEcKvOperations::default());
+            let graph = KvIdentityGraph::new(RecordingEcKv::new(Arc::clone(&operations)));
+            graph
+                .create(&ec_id, &live_entry())
+                .expect("should seed live row");
+            operations.reset();
+
+            let outcome = graph.tombstone_existing_from_snapshot(&ec_id, state);
+
+            assert_eq!(
+                operations.lookup_count(),
+                1,
+                "state should force one reread"
+            );
+            assert_eq!(
+                operations.inserts().len(),
+                2,
+                "live reread should write the root and completion marker"
+            );
+            assert!(
+                outcome
+                    .entry_for(&ec_id)
+                    .is_some_and(|entry| !entry.consent.ok),
+                "reread live row should be tombstoned"
+            );
+        }
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_overrides_concurrent_live_update() {
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(1, true));
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &live_entry())
+            .expect("should seed live row");
+        let snapshot = graph.load_snapshot(&ec_id);
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        let entry = outcome
+            .entry_for(&ec_id)
+            .expect("should return persisted tombstone");
+        assert!(!entry.consent.ok, "withdrawal should win after retry");
+        assert!(
+            entry.ids.is_empty(),
+            "withdrawal should clear concurrent partner IDs"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_repeated_request_preserves_first_write() {
+        let operations = Arc::new(RecordedEcKvOperations::default());
+        let graph = KvIdentityGraph::new(RecordingEcKv::new(Arc::clone(&operations)));
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &live_entry())
+            .expect("should seed live row");
+        let live_snapshot = graph.load_snapshot(&ec_id);
+        operations.reset();
+
+        graph.tombstone_existing_from_snapshot(&ec_id, live_snapshot);
+
+        assert_eq!(
+            operations.lookup_count(),
+            0,
+            "usable generation should avoid a read"
+        );
+        assert_eq!(
+            operations.inserts(),
+            vec![
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::IfGenerationMatch(1),
+                    ttl: TOMBSTONE_TTL,
+                },
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::Add,
+                    ttl: TOMBSTONE_TTL,
+                },
+            ],
+            "first withdrawal should write the root and its completion marker"
+        );
+        let first_snapshot = graph.load_snapshot(&ec_id);
+        let (first_entry, first_generation) = match &first_snapshot {
+            EcKvSnapshot::Present {
+                entry, generation, ..
+            } => (entry.as_ref().clone(), *generation),
+            other => panic!("should load first tombstone, got {other:?}"),
+        };
+        operations.reset();
+
+        let second_outcome = graph.tombstone_existing_from_snapshot(&ec_id, first_snapshot);
+
+        assert_eq!(
+            operations.operation_count(),
+            0,
+            "repeated withdrawal should not access the backend"
+        );
+        assert_eq!(
+            second_outcome.generation_for(&ec_id),
+            first_generation,
+            "repeated withdrawal should preserve the stored generation"
+        );
+        assert_eq!(
+            second_outcome
+                .entry_for(&ec_id)
+                .map(|entry| entry.consent.updated),
+            Some(first_entry.consent.updated),
+            "repeated withdrawal should preserve the first tombstone timestamp"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_skips_backend_for_authoritative_tombstone() {
+        for generation in [Some(7), None] {
+            let operations = Arc::new(RecordedEcKvOperations::default());
+            let graph = KvIdentityGraph::new(RecordingEcKv::new(Arc::clone(&operations)));
+            let ec_id = snapshot_ec_id();
+            let snapshot = EcKvSnapshot::Present {
+                ec_id: ec_id.clone(),
+                entry: Box::new(KvEntry::tombstone(1_000)),
+                generation,
+            };
+
+            let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot.clone());
+
+            assert_eq!(
+                outcome, snapshot,
+                "should preserve authoritative tombstone state"
+            );
+            assert_eq!(
+                operations.operation_count(),
+                0,
+                "an authoritative tombstone should not access the backend"
+            );
+        }
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_succeeds_without_backend_for_tombstone() {
+        let graph = KvIdentityGraph::failing("unavailable-store");
+        let ec_id = snapshot_ec_id();
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(KvEntry::tombstone(1_000)),
+            generation: Some(3),
+        };
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot.clone());
+
+        assert_eq!(
+            outcome, snapshot,
+            "authoritative tombstone should not touch unavailable backend"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_uses_existing_generation() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        kv.create(&ec_id, &live_entry()).expect("should create");
+        let snapshot = kv.load_snapshot(&ec_id);
+
+        let outcome = kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "should return the persisted tombstone"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("should preserve existing key");
+        assert!(!stored.consent.ok, "should persist withdrawal state");
+    }
+
+    #[test]
+    fn tombstone_existing_from_stale_parallel_snapshot_stops_after_conflict() {
+        let operations = Arc::new(RecordedEcKvOperations::default());
+        let graph = KvIdentityGraph::new(RecordingEcKv::new(Arc::clone(&operations)));
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &live_entry())
+            .expect("should seed live row");
+        let stale_snapshot = graph.load_snapshot(&ec_id);
+        operations.reset();
+
+        let first_outcome = graph.tombstone_existing_from_snapshot(&ec_id, stale_snapshot.clone());
+        let second_outcome = graph.tombstone_existing_from_snapshot(&ec_id, stale_snapshot);
+
+        assert_eq!(
+            operations.inserts(),
+            vec![
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::IfGenerationMatch(1),
+                    ttl: TOMBSTONE_TTL,
+                },
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::Add,
+                    ttl: TOMBSTONE_TTL,
+                },
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::IfGenerationMatch(1),
+                    ttl: TOMBSTONE_TTL,
+                },
+            ],
+            "parallel loser should attempt stale CAS once and never replace the winner"
+        );
+        assert_eq!(
+            operations.lookup_count(),
+            1,
+            "parallel loser should reread exactly once after its conflict"
+        );
+        assert_eq!(
+            second_outcome.generation_for(&ec_id),
+            Some(2),
+            "parallel loser should return the winner's stored generation"
+        );
+        assert_eq!(
+            second_outcome
+                .entry_for(&ec_id)
+                .map(|entry| entry.consent.updated),
+            first_outcome
+                .entry_for(&ec_id)
+                .map(|entry| entry.consent.updated),
+            "parallel loser should preserve the winner's tombstone"
+        );
+    }
+
+    #[test]
+    fn withdrawal_failed_clock_does_not_create_absent_root() {
+        let operations = Arc::new(RecordedEcKvOperations::default());
+        let graph = KvIdentityGraph::new(RecordingEcKv::new(Arc::clone(&operations)));
+        let ec_id = snapshot_ec_id();
+        graph
+            .write_withdrawal_marker(&ec_id, 1000)
+            .expect("should seed a marker without a root");
+        operations.reset();
+        let missing = graph.load_snapshot(&ec_id);
+
+        let outcome = graph.tombstone_unproven_missing(&ec_id, missing, None);
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Missing { .. }),
+            "absent root should remain missing"
+        );
+        assert!(
+            graph
+                .get(&ec_id)
+                .expect("should read absent root")
+                .is_none(),
+            "clock failure must not mint an unknown root"
+        );
+        assert_eq!(
+            operations.exact_check_count(),
+            1,
+            "should prove root absence despite the marker"
+        );
+        assert!(
+            operations.inserts().is_empty(),
+            "absent identity should cause no writes"
+        );
+    }
+
+    #[test]
+    fn withdrawal_failed_clock_stale_miss_tombstones_live_root() {
+        let operations = Arc::new(RecordedEcKvOperations::default());
+        let graph = KvIdentityGraph::new(RecordingEcKv::with_stale_lookups(
+            Arc::clone(&operations),
+            1,
+        ));
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &concurrent_live_entry())
+            .expect("should seed a live row with partner IDs");
+        graph
+            .write_withdrawal_marker(&ec_id, 1000)
+            .expect("should seed a completion marker left after root recreation");
+        operations.reset();
+        let missing = graph.load_snapshot(&ec_id);
+        assert!(
+            matches!(missing, EcKvSnapshot::Missing { .. }),
+            "should reproduce a stale point-read miss for the live row"
+        );
+
+        // None is the checked clock's failure result, not Unix epoch zero.
+        let outcome = graph.tombstone_unproven_missing(&ec_id, missing, None);
+
+        let (stored, generation) = graph
+            .get(&ec_id)
+            .expect("should read back persisted withdrawal")
+            .expect("should retain the root");
+        assert!(
+            !stored.consent.ok,
+            "an unusable clock must not let a marker suppress withdrawal"
+        );
+        assert!(
+            stored.ids.is_empty(),
+            "withdrawal should clear stored partner IDs"
+        );
+        assert_eq!(
+            generation, 2,
+            "withdrawal should write the existing root once"
+        );
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "clock failure should not fail a strongly confirmed withdrawal"
+        );
+        assert_eq!(
+            operations.exact_check_count(),
+            1,
+            "should strongly check the root"
+        );
+        assert_eq!(
+            operations.inserts(),
+            vec![
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::Overwrite,
+                    ttl: TOMBSTONE_TTL
+                },
+                RecordedEcKvInsert {
+                    mode: EcKvWriteMode::Add,
+                    ttl: TOMBSTONE_TTL
+                },
+            ],
+            "should write only the root tombstone and its completion marker"
+        );
     }
 }
