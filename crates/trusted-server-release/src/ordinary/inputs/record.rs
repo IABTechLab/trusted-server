@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{SourceIdentity, javascript_identity, real_root, source_file, source_identity};
 use crate::documents::{self, Role};
@@ -241,23 +241,33 @@ fn validate(request: &Request) -> Result<(), Report<ReleaseError>> {
     Ok(())
 }
 
-/// Requires every resolved package source to come from the checkout or the
-/// role's private Cargo home, proving Cargo used the remapped home.
+/// Requires every resolved package source, and every package the build
+/// itself compiled, to come from the checkout or the role's private Cargo
+/// home, proving Cargo used the remapped home.
 fn dependency_sources(
     checkout: &Path,
     cargo_home: &Path,
     metadata: &[u8],
+    messages: &[u8],
 ) -> Result<(), Report<ReleaseError>> {
+    let inside = |value: &Value| {
+        value.as_str().is_some_and(|path| {
+            let path = Path::new(path);
+            path.starts_with(checkout) || path.starts_with(cargo_home)
+        })
+    };
     let metadata =
         documents::parse_json(metadata, Role::CargoObservation).map_err(|_| rejected())?;
     let packages = metadata["packages"].as_array().ok_or_else(rejected)?;
+    let messages = crate::ordinary::cargo::successful_messages(messages).map_err(|_| rejected())?;
     require(
-        packages.iter().all(|package| {
-            package["manifest_path"].as_str().is_some_and(|path| {
-                let path = Path::new(path);
-                path.starts_with(checkout) || path.starts_with(cargo_home)
-            })
-        }),
+        packages
+            .iter()
+            .all(|package| inside(&package["manifest_path"]))
+            && messages
+                .iter()
+                .filter(|message| message["reason"] == "compiler-artifact")
+                .all(|message| inside(&message["manifest_path"])),
         "ordinary package source is outside the checkout and private Cargo home",
     )
 }
@@ -340,6 +350,7 @@ fn finish(
         checkout,
         Path::new(&request.environment.cargo_home),
         &metadata.bytes,
+        &messages.bytes,
     )?;
     let binary = checkout.join("release-assets").join(ASSET);
     require(
@@ -347,6 +358,10 @@ fn finish(
         "ordinary final binary path is missing or aliased",
     )?;
     let binary = documents::read_bounded(&binary, Role::Executable)?;
+    let package = documents::read_bounded(
+        &checkout.join("release-assets").join(super::super::PACKAGE),
+        Role::ArtifactArchive,
+    )?;
     let flags = normalization::plan(checkout, target, &request.role)?;
     let retained = documents::read_bounded(&request.rustflags, Role::Metadata)?;
     require(
@@ -368,7 +383,8 @@ fn finish(
         "source_commit":request.source_commit,"asset":ASSET,"target":"wasm32-wasip1","variant":"default","role":request.role,
         "recipe_sha256":source.recipe_sha256,"cargo_lock_sha256":source.cargo_lock_sha256,"npm_lock_sha256":source.npm_lock_sha256,
         "js_inventory_sha256":js,"rustflags_sha256":retained.sha256,"tools":tools,"environment":request.environment,
-        "artifact":{"size":binary.bytes.len(),"sha256":binary.sha256},"gaps":GAPS,
+        "artifact":{"size":binary.bytes.len(),"sha256":binary.sha256},
+        "package":{"size":package.bytes.len(),"sha256":package.sha256},"gaps":GAPS,
     });
     observation(&documents::canonical_json(&value, Role::Metadata)?)
 }

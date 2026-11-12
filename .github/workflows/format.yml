@@ -253,7 +253,7 @@ jobs:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
       - name: Run shellcheck
-        run: shellcheck scripts/release/phase1-build.sh scripts/release/bootstrap.sh scripts/release/build.sh scripts/release/build-js.sh
+        run: shellcheck scripts/release/phase1-build.sh scripts/release/validate-fastly-package.sh scripts/release/bootstrap.sh scripts/release/build.sh scripts/release/build-js.sh
 
       - name: Test release producer scripts
         run: node --test scripts/release/phase1.test.mjs scripts/release/packages.test.mjs

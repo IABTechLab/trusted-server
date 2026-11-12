@@ -45,6 +45,7 @@ pub(super) fn source_identity(
     let mut files = BTreeMap::new();
     for file in [
         "scripts/release/phase1-build.sh",
+        "scripts/release/fastly.toml",
         ".cargo/config.toml",
         "Cargo.toml",
         "rust-toolchain.toml",
@@ -113,7 +114,7 @@ pub(super) fn javascript_identity(
     let metadata =
         documents::parse_json(metadata, Role::CargoObservation).map_err(|_| js_error())?;
     let package = js_package(checkout, &metadata)?;
-    let messages = crate::recipe::observed_cargo_messages(messages).map_err(|_| js_error())?;
+    let messages = crate::ordinary::cargo::successful_messages(messages).map_err(|_| js_error())?;
     let matching: Vec<_> = messages
         .iter()
         .filter(|message| {

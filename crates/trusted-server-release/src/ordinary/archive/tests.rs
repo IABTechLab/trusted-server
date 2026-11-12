@@ -69,6 +69,7 @@ fn reads_exact_ordinary_members_with_or_without_descriptors() {
             &[
                 ("trusted-server-fastly.wasm", b"final bytes"),
                 ("trusted-server-fastly.wasm.spdx.json", b"{}"),
+                ("trusted-server-fastly.tar.gz", b"package"),
             ],
             descriptor,
         );
@@ -80,7 +81,7 @@ fn reads_exact_ordinary_members_with_or_without_descriptors() {
         );
         assert_eq!(
             members.len(),
-            2,
+            3,
             "should retain only the fixed exact members"
         );
     }
@@ -93,6 +94,7 @@ fn ordinary_profiles_reject_missing_extra_duplicate_and_cross_role_members() {
         vec![
             ("trusted-server-fastly.wasm", b"x".as_slice()),
             ("trusted-server-fastly.wasm.spdx.json", b"{}"),
+            ("trusted-server-fastly.tar.gz", b"package"),
             ("extra", b"x"),
         ],
         vec![

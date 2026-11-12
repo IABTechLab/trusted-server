@@ -127,9 +127,10 @@ fn auto_reaps(action: &libc::sigaction) -> bool {
 
 /// Refuses to spawn while exited children would be reaped automatically.
 ///
-/// An ignored SIGCHLD or `SA_NOCLDWAIT` survives `exec`. On Linux it makes
-/// the kernel reap the leader at exit, so `waitid` reports `ECHILD` and the
-/// group ID is no longer pinned when [`settle`] would signal it.
+/// An ignored SIGCHLD survives `exec`, and on Linux it makes the kernel reap
+/// the leader at exit, so `waitid` reports `ECHILD` and the group ID is no
+/// longer pinned when [`settle`] would signal it. `SA_NOCLDWAIT` does the
+/// same but is cleared by `exec`, so only this process can set it.
 ///
 /// # Errors
 ///

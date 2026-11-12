@@ -164,11 +164,23 @@ pub(super) const SIGCHLD_RESTORED_RUN_FAILED: i32 = 83;
 /// They change process-wide signal state, so they run only here and never in
 /// the shared test process.
 fn supervisor_mode(mode: &str) -> Option<i32> {
-    (mode == "ignored-sigchld").then(|| {
-        // SAFETY: ignoring SIGCHLD changes only this helper process's
-        // disposition, the state an ignoring launcher would leave behind.
-        if unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) } == libc::SIG_ERR {
-            return HELPER_SETUP_FAILED;
+    let (handler, flags) = match mode {
+        "ignored-sigchld" => (libc::SIG_IGN, 0),
+        "nocldwait-sigchld" => (libc::SIG_DFL, libc::SA_NOCLDWAIT),
+        _ => return None,
+    };
+    Some({
+        // SAFETY: all-zero is a valid action with an empty mask; the handler
+        // and flags are set below.
+        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+        action.sa_sigaction = handler;
+        action.sa_flags = flags;
+        // SAFETY: the action changes only this helper process's SIGCHLD
+        // disposition, the auto-reaping state the mode names; a null old
+        // action is permitted.
+        if unsafe { libc::sigaction(libc::SIGCHLD, &raw const action, core::ptr::null_mut()) } != 0
+        {
+            return Some(HELPER_SETUP_FAILED);
         }
         let nested = workspace();
         let refused = helper(&nested, "print", limits(SLACK)).run();
@@ -176,10 +188,10 @@ fn supervisor_mode(mode: &str) -> Option<i32> {
             refused.as_ref().err().and_then(failure),
             Some(ProcessFailure::UnwaitableChildren)
         ) {
-            return SIGCHLD_NOT_REFUSED;
+            return Some(SIGCHLD_NOT_REFUSED);
         }
         if establish_waitable_children().is_err() {
-            return SIGCHLD_NOT_RESTORED;
+            return Some(SIGCHLD_NOT_RESTORED);
         }
         match helper(&nested, "print", limits(SLACK)).run() {
             Ok(result) if result.outcome() == (ProcessOutcome::Exited { code: 0 }) => 0,

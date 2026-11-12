@@ -81,7 +81,7 @@ fn unknown_import_module_is_rejected() {
 
         assert_eq!(
             violation(inspect_wasm(&bytes)),
-            Violation::WasmImport,
+            Violation::Import,
             "should reject {module}"
         );
     }
@@ -101,7 +101,7 @@ fn non_function_import_is_rejected() {
 
         assert_eq!(
             violation(inspect_wasm(&bytes)),
-            Violation::WasmImport,
+            Violation::Import,
             "should reject non-function imports from {module}"
         );
     }
@@ -111,7 +111,7 @@ fn non_function_import_is_rejected() {
 fn component_is_rejected() {
     assert_eq!(
         violation(inspect_wasm(b"\0asm\x0d\0\x01\0")),
-        Violation::WasmEncoding,
+        Violation::Encoding,
         "should reject a component before validation"
     );
 }
@@ -124,7 +124,7 @@ fn non_wasm_is_rejected() {
         b"\0asm\x02\0\0\0",
         b"\x7fELF\x02\x01\x01\0",
     ] {
-        assert_eq!(violation(inspect_wasm(bytes)), Violation::WasmEncoding);
+        assert_eq!(violation(inspect_wasm(bytes)), Violation::Encoding);
     }
 }
 
@@ -136,7 +136,7 @@ fn invalid_core_module_is_rejected() {
     section(&mut unknown_section, 99, &[0]);
 
     for bytes in [import_without_type, unknown_section] {
-        assert_eq!(violation(inspect_wasm(&bytes)), Violation::WasmValidation);
+        assert_eq!(violation(inspect_wasm(&bytes)), Violation::Validation);
     }
 }
 
@@ -223,7 +223,7 @@ fn debug_sections_are_required_and_nonempty() {
         let facts = inspect_wasm(&bytes).expect("should accept the module itself");
         assert_eq!(
             violation(facts.require_debug_sections()),
-            Violation::WasmDebugInfo,
+            Violation::DebugInfo,
             "should reject a {label} module for the no-strip check"
         );
     }
@@ -306,7 +306,7 @@ fn wrong_fastly_entry_abi_is_rejected() {
         let facts = inspect_wasm(&bytes).expect("should accept the module itself");
         assert_eq!(
             violation(facts.require_fastly_entry_abi()),
-            Violation::WasmAbi,
+            Violation::Abi,
             "should reject a {label} as the Fastly entry ABI"
         );
     }
@@ -326,7 +326,7 @@ fn foreign_host_abi_command_is_rejected_before_the_entry_check() {
 
     assert_eq!(
         violation(inspect_wasm(&bytes)),
-        Violation::WasmImport,
+        Violation::Import,
         "should reject a command importing a foreign host ABI"
     );
 }

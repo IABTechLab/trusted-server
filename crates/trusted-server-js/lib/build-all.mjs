@@ -117,9 +117,11 @@ export async function buildAll({
   return records.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-// Node before 24.2 leaves `import.meta.main` undefined, which would skip the build silently.
+// Node without import.meta.main (before 22.18 or 24.2) would skip the build silently.
 if (import.meta.main === undefined) {
-  throw new Error('[build-all] requires Node.js 24.2 or later; use the .tool-versions version');
+  throw new Error(
+    '[build-all] requires a Node.js with import.meta.main (22.18+ or 24.2+); use the .tool-versions version'
+  );
 }
 if (import.meta.main) {
   if (

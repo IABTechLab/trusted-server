@@ -335,6 +335,7 @@ pub(super) fn contents(bytes: &[u8], profile: Profile) -> Result<BTreeMap<String
     let limits = match profile {
         Profile::Build => BTreeMap::from([
             (super::ASSET.to_owned(), Role::Executable.limit()),
+            (super::PACKAGE.to_owned(), Role::ArtifactArchive.limit()),
             (format!("{}.spdx.json", super::ASSET), Role::Spdx.limit()),
         ]),
         Profile::Observation => {

@@ -37,6 +37,7 @@ pub(super) fn fixture() -> Value {
             "timezone": "UTC",
             "uid": 1001
         },
+        "package": {"size": 7, "sha256": hex::encode(Sha256::digest(b"package"))},
         "artifact": {"size": WASM.len(), "sha256": hex::encode(Sha256::digest(WASM))},
         "gaps": [
             "alternate-user-unqualified",

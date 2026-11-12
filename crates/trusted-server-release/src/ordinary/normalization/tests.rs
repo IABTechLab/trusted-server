@@ -316,6 +316,22 @@ fn preparation_requires_canonical_owned_roots_and_a_fresh_target() {
             OsString::from("CARGO_HOME"),
             OsString::from(parent.join("temp/ordinary-reproduction-cargo-home")),
         )],
+        // Cargo keeps these spellings verbatim in embedded paths, so only the
+        // exact private home is accepted.
+        vec![(
+            OsString::from("CARGO_HOME"),
+            OsString::from(format!(
+                "{}/temp/./ordinary-canonical-cargo-home",
+                parent.display()
+            )),
+        )],
+        vec![(
+            OsString::from("CARGO_HOME"),
+            OsString::from(format!(
+                "{}/temp//ordinary-canonical-cargo-home/",
+                parent.display()
+            )),
+        )],
     ] {
         assert!(
             super::prepare(&source, &target, "canonical", &wrong).is_err(),

@@ -116,6 +116,13 @@ impl CaptureFixture {
             crate::ordinary::normalization::TEST_WASM,
         )
         .expect("should write final artifact");
+        fs::write(
+            files
+                .checkout
+                .join("release-assets/trusted-server-fastly.tar.gz"),
+            b"package",
+        )
+        .expect("should write package");
         let cargo_metadata = files.target.join("metadata.json");
         let cargo_messages = files.target.join("messages.jsonl");
         fs::write(
@@ -435,24 +442,77 @@ fn dependency_sources_must_come_from_the_checkout_or_private_cargo_home() {
         }))
         .expect("should encode metadata")
     };
-    super::dependency_sources(
-        checkout,
-        home,
-        &metadata(&[
-            "/example/workspace/ordinary-canonical-source/crates/example/Cargo.toml",
-            "/example/temp/ordinary-canonical-cargo-home/registry/src/index/example-1.0.0/Cargo.toml",
-        ]),
-    )
-    .expect("should accept checkout and private Cargo home sources");
+    let messages = |paths: &[&str]| {
+        let mut bytes: Vec<u8> = paths
+            .iter()
+            .flat_map(|path| {
+                let mut line = serde_json::to_vec(
+                    &json!({"reason": "compiler-artifact", "manifest_path": path}),
+                )
+                .expect("should encode compiler artifact");
+                line.push(b'\n');
+                line
+            })
+            .collect();
+        bytes.extend_from_slice(b"{\"reason\":\"build-finished\",\"success\":true}\n");
+        bytes
+    };
+    let accepted = [
+        "/example/workspace/ordinary-canonical-source/crates/example/Cargo.toml",
+        "/example/temp/ordinary-canonical-cargo-home/registry/src/index/example-1.0.0/Cargo.toml",
+    ];
+    super::dependency_sources(checkout, home, &metadata(&accepted), &messages(&accepted))
+        .expect("should accept checkout and private Cargo home sources");
     for outside in [
         "/home/example/.cargo/registry/src/index/example-1.0.0/Cargo.toml",
         "/example/temp/ordinary-reproduction-cargo-home/git/checkouts/example/Cargo.toml",
     ] {
-        let error = super::dependency_sources(checkout, home, &metadata(&[outside]))
+        for (resolved, built) in [(outside, accepted[0]), (accepted[0], outside)] {
+            let error = super::dependency_sources(
+                checkout,
+                home,
+                &metadata(&[resolved]),
+                &messages(&[built]),
+            )
             .expect_err("should reject a source from another Cargo home");
-        assert!(
-            format!("{error:?}").contains("outside the checkout and private Cargo home"),
-            "should reach the dependency source rule for {outside}"
-        );
+            assert!(
+                format!("{error:?}").contains("outside the checkout and private Cargo home"),
+                "should reach the dependency source rule for {resolved} / {built}"
+            );
+        }
     }
+}
+
+#[test]
+fn recording_rejects_a_package_outside_the_checkout_and_private_cargo_home() {
+    let fixture = CaptureFixture::new();
+    let path = &fixture.captured.request.cargo_metadata;
+    let mut metadata: Value =
+        serde_json::from_slice(&fs::read(path).expect("should read retained metadata"))
+            .expect("should parse retained metadata");
+    metadata["packages"]
+        .as_array_mut()
+        .expect("should list resolved packages")
+        .push(json!({
+            "id": "registry+https://example.com/index#example@1.0.0",
+            "name": "example",
+            "manifest_path": "/home/example/.cargo/registry/src/index/example-1.0.0/Cargo.toml"
+        }));
+    fs::write(
+        path,
+        serde_json::to_vec(&metadata).expect("should encode metadata"),
+    )
+    .expect("should retain the changed metadata");
+    let Err(error) = finish(
+        &fixture.captured,
+        &fixture.initial,
+        &fixture.pins,
+        &fixture.tools(),
+    ) else {
+        panic!("should reject a package resolved outside the private Cargo home");
+    };
+    assert!(
+        format!("{error:?}").contains("outside the checkout and private Cargo home"),
+        "should reach the dependency source rule while recording"
+    );
 }

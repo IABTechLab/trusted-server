@@ -34,6 +34,8 @@ sha=0123456789abcdef0123456789abcdef01234567
 base_sha=fedcba9876543210fedcba9876543210fedcba98
 
 assert_eq "$(docs_proposal_branch "$sha")" "docs/auto/0123456789ab" "should derive the branch from the SHA"
+release_hash="$(printf 'release' | git hash-object --stdin)"
+assert_eq "$(DOCS_PROPOSAL_BRANCH=release docs_proposal_branch "$sha")" "docs/auto/${release_hash:0:12}/0123456789ab" "should scope a non-main proposal to its branch"
 
 bad="$(printf 'docs/guide/a.md\ndocs/index.md\ndocs/superpowers/x.md\nREADME.md\n' | docs_proposal_disallowed_paths || true)"
 assert_eq "$bad" $'docs/superpowers/x.md\nREADME.md' "should print only paths outside the allowlist"
@@ -51,13 +53,13 @@ body="$(docs_proposal_pr_body "$sha" "$base_sha" "Add example flag" 42 "$rationa
 assert_contains "$body" "<!-- docs-proposal: $sha -->" "should embed the SHA marker"
 assert_contains "$body" "<!-- docs-proposal-base: $base_sha -->" "should embed the base marker"
 assert_contains "$body" "inspected fedcba987654..0123456789ab" "should show the inspected range"
-assert_contains "$body" "merged change $sha (#42): Add example flag" "should link the merge and its PR"
+assert_contains "$body" "changes through $sha (#42): Add example flag" "should link the commit and its PR"
 assert_contains "$body" "documents the new flag" "should include the rationale"
 assert_contains "$body" $'## Rationale\n\n```text\n- docs/guide/cli.md' "should render the rationale as an inert text block"
 assert_contains "$body" "$(printf '@\342\200\213example-org/maintainers')" "should neutralize mentions in the rationale"
 : > "$rationale"
 body="$(docs_proposal_pr_body "$sha" "$base_sha" "Add example flag" "" "$rationale")"
-assert_contains "$body" "merged change $sha: Add example flag" "should omit a missing origin PR"
+assert_contains "$body" "changes through $sha: Add example flag" "should omit a missing origin PR"
 assert_contains "$body" "did not provide a rationale" "should note an empty rationale"
 rm -f "$rationale"
 
@@ -257,7 +259,7 @@ narrow_base=0000000000000000000000000000000000000001
 make_patch "" "$narrow_base"
 assert_eq "$(STUB_PR="7 OPEN $base_sha" run_publish)" 1 "should fail an empty retry over a different range"
 assert_eq "$(grep -c 'pr close' "$STUB_LOG" || true)" 0 "should not close a proposal from a narrower range"
-assert_contains "$(cat "$tmp/out.log")" "Rerun the workflow with base $base_sha" "should name the original base"
+assert_contains "$(cat "$tmp/out.log")" "Rerun the workflow with since $base_sha" "should name the original base"
 
 make_patch docs/index.md "$narrow_base"
 assert_eq "$(STUB_PR="7 OPEN $base_sha" run_publish)" 1 "should fail a retry over a different range"
@@ -335,9 +337,8 @@ assert_contains "$(cat "$STUB_LOG")" "pr comment 7 --body" "should explain why t
 assert_contains "$(cat "$STUB_LOG")" "pr close 7" "should close the proposal after deleting its branch"
 assert_eq "$(grep -c 'delete-branch' "$STUB_LOG" || true)" 0 "should not let gh delete the branch"
 
-# A push that added two commits is inspected from the previous main head; a
-# retry without that base falls back to the first parent, which publish.sh
-# then refuses to apply over the original proposal.
+# A range of two commits is inspected from its `since` commit; without one,
+# propose.sh falls back to the first parent.
 git switch -q --detach "$merge_sha"
 printf 'first\n' > docs/guide/first.md
 git add docs && git commit -q -m "Document the first change"
@@ -357,9 +358,10 @@ run_propose() {
   fi
 }
 
-assert_eq "$(run_propose "$merge_sha")" 0 "should propose for a multi-commit push"
-assert_eq "$(cat .docs-proposal/base)" "$merge_sha" "should record the push base"
-assert_contains "$(cat .docs-proposal/prompt.md)" "- Base: $merge_sha" "should inspect the whole push"
+assert_eq "$(run_propose "$merge_sha")" 0 "should propose for a multi-commit range"
+assert_eq "$(cat .docs-proposal/base)" "$merge_sha" "should record the range base"
+assert_contains "$(cat .docs-proposal/prompt.md)" "- Base: $merge_sha" "should inspect the whole range"
+assert_contains "$(cat .docs-proposal/prompt.md)" "- Branch: main" "should name the branch in the prompt"
 assert_contains "$(cat "$STUB_LOG")" "copilot -p" "should run Copilot"
 assert_contains "$(cat .docs-proposal/prompt.md)" ".docs-proposal/rationale.md" "should name the work dir in the prompt"
 assert_eq "$(grep -c '<work-dir>' .docs-proposal/prompt.md || true)" 0 "should fill every work dir placeholder"
@@ -372,13 +374,12 @@ rm -rf 'proposal&out'
 assert_eq "$(run_propose "")" 0 "should propose without a base"
 assert_eq "$(cat .docs-proposal/base)" "$first_sha" "should default the base to the first parent"
 
-assert_eq "$(run_propose 0000000000000000000000000000000000000000)" 0 "should propose for a push that created main"
-assert_eq "$(cat .docs-proposal/base)" "$first_sha" "should replace an all-zero base with the first parent"
-assert_eq "$(grep -c '::warning::' "$tmp/out.log" || true)" 0 "should not warn about an all-zero base"
+assert_eq "$(run_propose 0000000000000000000000000000000000000000)" 1 "should reject an all-zero base"
+assert_eq "$(run_propose "$second_sha")" 1 "should reject the commit itself as the base"
 
-assert_eq "$(run_propose "$published_head")" 0 "should propose with an unrelated base"
-assert_eq "$(cat .docs-proposal/base)" "$first_sha" "should replace an unrelated base with the first parent"
-assert_contains "$(cat "$tmp/out.log")" "is not an ancestor" "should warn about an unrelated base"
+assert_eq "$(run_propose "$published_head")" 1 "should reject an unrelated base"
+assert_contains "$(cat "$tmp/out.log")" "is not an earlier commit" "should explain an unrelated base"
+assert_eq "$(grep -c 'copilot -p' "$STUB_LOG" || true)" 0 "should not run Copilot for an unrelated base"
 
 assert_eq "$(run_propose "$second_sha~2")" 0 "should propose with a revision expression as the base"
 assert_eq "$(cat .docs-proposal/base)" "$merge_sha" "should record the base as a full SHA"
@@ -393,6 +394,76 @@ assert_eq "$(STUB_COPILOT_EDIT=docs/guide/cli.md STUB_COPILOT_FAIL_EVIDENCE=1 ru
 assert_contains "$(cat .docs-proposal/proposal.patch)" "+proposed" "should keep the patch when the evidence run fails"
 assert_eq "$(cat .docs-proposal/evidence.json)" "{}" "should fall back to no evidence"
 assert_contains "$(cat "$tmp/out.log")" "evidence run failed" "should warn that the evidence run failed"
+
+# A proposal for another branch is checked against that branch and opens its
+# pull request against it.
+git reset -q --hard "$merge_sha" && git clean -qfd
+printf 'release\n' > notes.txt
+git add notes.txt && git commit -q -m "Touch release notes"
+release_sha="$(git rev-parse HEAD)"
+git push -q origin HEAD:refs/heads/release
+git fetch -q origin
+
+if (DOCS_PROPOSAL_BRANCH=release docs_proposal_require_sha "$release_sha") 2>/dev/null; then
+  status=0
+else
+  status=1
+fi
+assert_eq "$status" 0 "should accept a commit on the chosen branch"
+
+if (DOCS_PROPOSAL_BRANCH=release docs_proposal_require_sha "$second_sha") 2>/dev/null; then
+  status=0
+else
+  status=1
+fi
+assert_eq "$status" 1 "should reject a commit that is only on main"
+
+rm -rf "$tmp/proposal" && mkdir -p "$tmp/proposal"
+printf 'proposed\n' >> docs/guide/cli.md
+git add -A && git diff --cached --binary "$release_sha" > "$tmp/proposal/proposal.patch"
+git reset -q --hard "$release_sha"
+printf -- '- docs/guide/cli.md: example rationale.\n' > "$tmp/proposal/rationale.md"
+printf '{}\n' > "$tmp/proposal/evidence.json"
+printf '%s\n' "$merge_sha" > "$tmp/proposal/base"
+: > "$STUB_LOG"
+if DOCS_PROPOSAL_BRANCH=release STUB_PR="" "$here/publish.sh" "$release_sha" "$tmp/proposal" > "$tmp/out.log" 2>&1; then
+  status=0
+else
+  status=1
+fi
+assert_eq "$status" 0 "should publish a proposal for the chosen branch"
+assert_contains "$(cat "$STUB_LOG")" "pr create --base release --head $(DOCS_PROPOSAL_BRANCH=release docs_proposal_branch "$release_sha")" "should open the PR against the chosen branch"
+assert_contains "$(cat "$STUB_LOG")" "pr list --head docs/auto/${release_hash:0:12}/" "should look up the release proposal by its own branch"
+
+# A range of several commits is titled after its size and latest commit, and
+# the same commit on two branches gets one proposal per branch.
+publish_range() {
+  rm -rf "$tmp/proposal" && mkdir -p "$tmp/proposal"
+  git reset -q --hard "$second_sha" && git clean -qfd
+  printf 'proposed for %s\n' "$1" >> docs/guide/cli.md
+  git add -A && git diff --cached --binary "$second_sha" > "$tmp/proposal/proposal.patch"
+  git reset -q --hard "$second_sha"
+  printf -- '- docs/guide/cli.md: example rationale.\n' > "$tmp/proposal/rationale.md"
+  printf '{}\n' > "$tmp/proposal/evidence.json"
+  printf '%s\n' "$merge_sha" > "$tmp/proposal/base"
+  : > "$STUB_LOG"
+  if DOCS_PROPOSAL_BRANCH="$1" STUB_PR="" STUB_ORIGIN_PR=42 "$here/publish.sh" "$second_sha" "$tmp/proposal" > "$tmp/out.log" 2>&1; then
+    printf '0'
+  else
+    printf '1'
+  fi
+}
+git push -q origin "$second_sha:refs/heads/mirror"
+git fetch -q origin
+main_range_branch="$(docs_proposal_branch "$second_sha")"
+mirror_range_branch="$(DOCS_PROPOSAL_BRANCH=mirror docs_proposal_branch "$second_sha")"
+assert_eq "$(publish_range main)" 0 "should publish a multi-commit range"
+assert_contains "$(cat "$STUB_LOG")" "--title Update documentation for 2 commits on main, latest: Touch notes" "should title a range after its size and latest commit"
+assert_eq "$(grep -c 'commits/.*/pulls' "$STUB_LOG" || true)" 0 "should not link one pull request for a range"
+main_range_head="$(git ls-remote origin "refs/heads/$main_range_branch" | cut -f1)"
+assert_eq "$(publish_range mirror)" 0 "should publish the same commit for another branch"
+assert_contains "$(cat "$STUB_LOG")" "pr create --base mirror --head $mirror_range_branch" "should open a separate proposal for the other branch"
+assert_eq "$(git ls-remote origin "refs/heads/$main_range_branch" | cut -f1)" "$main_range_head" "should leave the main proposal branch alone"
 
 cd "$here"
 

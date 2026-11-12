@@ -1,5 +1,13 @@
 # Phase 2 Fastly release integration — Gate 1
 
+## Current review amendment (2026-11-12)
+
+The [Phase 2 package amendment](../specs/2026-10-28-1235-binary-attestations-phase2-design.md#reproducible-deployment-package-amendment) supersedes the earlier producer-port and wasm-only asset/subject assignments below. Phase 2 retains only its live ordinary release path and Fastly packaging/inspection; unused controlled modules, tests, schemas and fixtures move to their enabling phase. `jsonschema` is removed and shipped dependency versions stay at `main`'s versions. Phase 3 #1463 must restore the deferred foundations it consumes; #1543 must reconcile the package artifact before landing. These branches are not changed here.
+
+The release now adds `trusted-server-fastly.tar.gz`, built reproducibly in both Fastly roles and compared alongside the wasm. Provenance covers wasm, SPDX, package and rebuild check; the SPDX attestation covers wasm and package. Existing binary/bundle names and the permanent companion remain stable. The set becomes **19 files**, with 18 checksum entries. Historical 18/30-file contracts, producer inventories and rehearsal results below describe their named revisions, not this amendment's candidate. Fresh current-input CI and signed-publication rehearsal are required; `.39` is historical evidence only.
+
+Implementation order: retain/extract live helpers and restore the lock; add deterministic package production and regression tests; extend observation, transfer and comparison; expand signer/publisher exact sets and operator verification; run local gates and internal review before signed publication; then qualify the actual new release inputs. A package-only mismatch fails closed. No deployment, production setting or controlled qualification is enabled.
+
 **Status:** Approved on 2026-10-26 for the ordinary-release adapter, writer, transfer binding and additive provenance subject, subject to the conditions below. The concrete implementation plan was written, independently reviewed and implemented.
 
 **Current state (2026-11-10):** this is the approved Gate 1 record, implemented in #1449, which is open for review. Since approval, Phase 1 narrowed the release to four binaries and 18 files and removed the publisher's post-publish byte comparison, and release CI runs the gate on every push to `main` and every `v*` tag. Rehearsal sections below are dated history for the source they name; the latest rehearsal before the fourth review round is `.30` at `44557229a`, and current rehearsal status lives in #1449 comments and #1235.
@@ -125,7 +133,7 @@ build before anything was signed: Phase 1 had stopped writing
 `cargo-metadata.json`, which the ordinary capture reads. `9eeccbb88` writes it
 again and tests that the capture reads the file the acquisition step writes.
 Rehearsal [`.27`](https://github.com/prk-Jr/trusted-server/actions/runs/41987840964)
-at `9eeccbb88` then passed all 13 jobs: both Fastly builds matched
+at `9eeccbb88` then passed all 12 jobs: both Fastly builds matched
 (`8fc36bb49a06f2182512d57976b26ee763f0ef06e9a40635f24540ef7c7980eb`; canonical
 399s, reproduction 443s, comparison 129s), the publisher verified every bundle
 and the rebuild check before creating the release, and it published 18
@@ -159,7 +167,7 @@ The carried tools and consumer policy name GitHub CLI 2.97.0 as a destination pi
 
 #### Controlled JS observer gap
 
-Controlled JS preparation does not support the current npm lock: the frozen observer admits esbuild 0.27.3, while the lock selects 0.28.2. The observer is ported unchanged. Ordinary release builds and the Gate 1 Fastly A/B adapter do not use it. Adapting the observer belongs to the gated controlled-recipe work and requires its own review of the esbuild change.
+Controlled JS preparation does not support the current npm lock: the frozen observer admits esbuild 0.27.3, while the lock selects 0.28.2. The observer is ported with one review change: the deletion pattern in `scripts/release/observe-npm.mjs` was rewritten in `f243408ce`; its esbuild admission is unchanged. Ordinary release builds and the Gate 1 Fastly A/B adapter do not use it. Adapting the observer belongs to the gated controlled-recipe work and requires its own review of the esbuild change.
 
 The full collector test stays ported with an explicit skipped reason naming both versions; no CI job claims it passes. A cheap configuration guard rejects `TRUSTED_SERVER__RELEASE_JS_TESTS=1` against an unsupported lock, and a pure regression test checks that refusal. Existing observer fixture tests and the ordinary/checked-prebuilt build fixtures remain separate.
 
@@ -217,7 +225,7 @@ An initial independent download hit a connection timeout. The 28 complete local 
 
 ### Phase 2 review follow-up and rehearsal .20
 
-**Verification at `5163241b9`:** Rehearsal `.20` passed at exact reviewed source `5163241b947b1aa335987bd832b9205e4364e4bb`: [all 18 jobs](https://github.com/prk-Jr/trusted-server/actions/runs/40812416995) succeeded, publishing 30 immutable prerelease assets, not Latest. Independent [transcript parts 1](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6487647974), [2](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6487649518) and [3](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6487649861) verify all release memberships and checksums, both predicates and reusable signer identities online/offline for all seven binaries, 14 SPDX equalities and negative controls, companion joins, native smoke and pinned Fastly packaging. The exact published Wasm also passed the local Viceroy 0.21.0 publisher/JS/source-header/logging check, with zero build-fact lines and owned-listener cleanup. Current-source CI passed 29 checks with four expected skips. This completion record is docs-only since rehearsed `5163241b9`; its subsequent hosted checks are assessed separately. Keep #1449 draft, without reviewers.
+**Verification at `5163241b9`:** Rehearsal `.20` passed at exact reviewed source `5163241b947b1aa335987bd832b9205e4364e4bb`: [all 18 jobs](https://github.com/prk-Jr/trusted-server/actions/runs/40812416995) succeeded, publishing 30 immutable prerelease assets, not Latest. Independent [transcript parts 1](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6487647974), [2](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6487649518) and [3](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6487649861) verify all release memberships and checksums, both predicates and reusable signer identities online/offline for all seven binaries, 14 SPDX equalities and negative controls, companion joins, native smoke and pinned Fastly packaging. The exact published Wasm also passed the local Viceroy 0.21.0 publisher/JS/source-header/logging check, with zero build-fact lines and owned-listener cleanup. Current-source CI passed 29 checks with four expected skips. This completion record is docs-only since rehearsed `5163241b9`; its subsequent hosted checks are assessed separately.
 
 The [`.16` runtime supplement](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6471330921) closes the original missing execution evidence for unchanged published bytes at `5fa384336`: three actual publisher responses and the injected JS route returned 200 with that full source header under pinned Viceroy 0.21.0. Actual request/response logs were visible and contained zero build-facts lines. Wrong-source and log-detector controls passed, the binary digest stayed unchanged, and owned listeners stopped. This is local Viceroy evidence, not deployed Fastly/browser qualification. The packaging inspector's `runtime_validated:false` still correctly describes that inspector; the separate execution check does not rewrite its output or any immutable asset.
 

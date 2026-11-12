@@ -45,46 +45,6 @@ export function releaseNotes(repo, tag) {
 }
 
 /**
- * Checks a release attestation statement for this repository and source
- * commit, and returns its asset subjects.
- */
-function checkStatement(statement, repo, source) {
-  const predicate = statement?.predicate
-  if (
-    statement?._type !== 'https://in-toto.io/Statement/v1' ||
-    statement.predicateType !== 'https://in-toto.io/attestation/release/v0.2' ||
-    predicate?.repository !== repo ||
-    typeof predicate.tag !== 'string' ||
-    !predicate.tag ||
-    !/^[1-9][0-9]*$/.test(predicate.databaseId) ||
-    !Array.isArray(statement.subject)
-  )
-    throw Error('Malformed release attestation statement')
-  const sources = statement.subject.filter(
-    (subject) => subject.uri === `pkg:github/${repo}@${predicate.tag}`
-  )
-  const subjects = statement.subject.filter(
-    (subject) => !sources.includes(subject)
-  )
-  if (
-    sources.length !== 1 ||
-    sources[0].digest?.sha1 !== source ||
-    Object.keys(sources[0].digest).length !== 1 ||
-    !subjects.length ||
-    subjects.some(
-      (subject) =>
-        typeof subject.name !== 'string' ||
-        !subject.name ||
-        !/^[a-f0-9]{64}$/.test(subject.digest?.sha256) ||
-        Object.keys(subject.digest).length !== 1
-    ) ||
-    new Set(subjects.map((subject) => subject.name)).size !== subjects.length
-  )
-    throw Error('Invalid release attestation subjects')
-  return { statement, subjects }
-}
-
-/**
  * Verifies the signing handoff and its bundles, creates one draft, uploads,
  * publishes it as an immutable release and verifies the published result.
  *
@@ -133,7 +93,13 @@ export async function publish({
   for (const name of releaseAssets) {
     const build = path('build', name)
     const signed = path('signed', name)
-    const inputs = [name, `${name}.spdx.json`]
+    const inputs = [
+      name,
+      `${name}.spdx.json`,
+      ...(name === 'trusted-server-fastly.wasm'
+        ? ['trusted-server-fastly.tar.gz']
+        : []),
+    ]
     const bundles = [
       `${name}.provenance.sigstore.json`,
       `${name}.sbom.sigstore.json`,
@@ -183,6 +149,18 @@ export async function publish({
             `${name}.rebuild-check.json`,
             'provenance',
             'https://slsa.dev/provenance/v1',
+          ],
+          [
+            name,
+            'trusted-server-fastly.tar.gz',
+            'provenance',
+            'https://slsa.dev/provenance/v1',
+          ],
+          [
+            name,
+            'trusted-server-fastly.tar.gz',
+            'sbom',
+            'https://spdx.dev/Document/v2.3',
           ],
         ]
       : []),
@@ -247,10 +225,7 @@ export async function publish({
       ...(body ? { body: JSON.stringify(body) } : {}),
     })
     if (!response.ok)
-      throw Object.assign(
-        Error(`GitHub API failed: ${method} ${endpoint} ${response.status}`),
-        { status: response.status }
-      )
+      throw Error(`GitHub API failed: ${method} ${endpoint} ${response.status}`)
     return response.json()
   }
   // Phase 1 uses the commit digest for both provenance and release membership.
@@ -317,16 +292,16 @@ export async function publish({
     prerelease,
     make_latest,
   })
-  // Post-publish reads can lag publication. Each read retries any failure at
-  // most five times within one shared three-minute window; a returned result
-  // that fails a check stops at once.
+  // Post-publish reads can lag publication. Each read retries any failure,
+  // with at most five attempts in one shared three-minute window; a returned
+  // result that fails a check stops at once.
   const deadline = now() + 180000
   const poll = async (label, limit, read) => {
     let failure
     for (const delay of [0, 2000, 5000, 10000, 20000]) {
       if (now() + delay >= deadline) break
       if (delay) {
-        warn(`${label}: ${failure.message}; retry in ${delay}ms`)
+        warn(`${label}: ${failure.message.trim()}; retry in ${delay}ms`)
         await sleep(delay)
       }
       try {
@@ -366,22 +341,31 @@ export async function publish({
         )
       )
   )
-  const { statement, subjects } = checkStatement(
-    proof?.verificationResult?.statement,
-    repo,
-    source
+  const statement = proof?.verificationResult?.statement
+  const subjects = Array.isArray(statement?.subject) ? statement.subject : []
+  const sources = subjects.filter(
+    (subject) => subject.uri === `pkg:github/${repo}@${tag}`
   )
+  const named = subjects.filter((subject) => !sources.includes(subject))
   if (
+    statement?._type !== 'https://in-toto.io/Statement/v1' ||
+    statement.predicateType !== 'https://in-toto.io/attestation/release/v0.2' ||
+    statement.predicate?.repository !== repo ||
     statement.predicate.tag !== tag ||
     statement.predicate.databaseId !== String(id) ||
-    subjects.length !== files.length ||
-    subjects.some(
+    sources.length !== 1 ||
+    !isDeepStrictEqual(sources[0].digest, { sha1: source }) ||
+    named.length !== files.length ||
+    new Set(named.map((subject) => subject.name)).size !== files.length ||
+    named.some(
       (subject) =>
         !files.includes(subject.name) ||
-        subject.digest.sha256 !== hash(asset(subject.name))
+        !isDeepStrictEqual(subject.digest, {
+          sha256: hash(asset(subject.name)),
+        })
     )
   )
-    throw Error('Current release attestation identity or assets mismatch')
+    throw Error('Release attestation statement mismatch')
   log('Verified release:', tag, 'signature and attestation statement match')
 }
 

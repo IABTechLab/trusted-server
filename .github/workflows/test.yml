@@ -428,7 +428,9 @@ jobs:
           cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --test release_build_facts
           # The release cfg also selects resource discovery without the
           # builder's checkout path; only a release-mode lib build reaches it.
-          cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --lib prebid_bundle::tests::actual_resource_discovery_uses_owning_release_cfg -- --exact
+          cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --lib prebid_bundle::tests::actual_resource_discovery_uses_owning_release_cfg -- --exact > "$RUNNER_TEMP/release-cfg-result.txt"
+          cat "$RUNNER_TEMP/release-cfg-result.txt"
+          grep -E '^test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/release-cfg-result.txt"
 
       # A valid commit also passes when the release gate is bypassed, so check
       # that core's build script refuses a branch name in release mode.

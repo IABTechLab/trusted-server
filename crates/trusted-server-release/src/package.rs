@@ -20,6 +20,75 @@ use crate::documents::{Role, read_bounded};
 use crate::error::ReleaseError;
 use crate::inspect::inspect_wasm;
 
+/// Fixed service-neutral manifest included in every release package.
+pub(crate) const RELEASE_MANIFEST: &[u8] = include_bytes!("../../../scripts/release/fastly.toml");
+
+/// Constructs the normalized ustar/gzip bytes, independent of host metadata.
+///
+/// # Errors
+///
+/// Rejects an invalid module, oversized inputs or an archive encoding failure.
+pub(crate) fn release_bytes(wasm: &[u8]) -> Result<Vec<u8>, Report<ReleaseError>> {
+    if wasm.is_empty() || wasm.len() as u64 > MODULE_LIMIT {
+        return Err(rejected("release package module exceeds its bound"));
+    }
+    inspect_wasm(wasm)?;
+    let name = manifest_name(RELEASE_MANIFEST)?;
+    let encoder = flate2::GzBuilder::new()
+        .mtime(0)
+        .operating_system(255)
+        .write(Vec::new(), flate2::Compression::best());
+    let mut archive = tar::Builder::new(encoder);
+    for (path, directory, bytes) in [
+        (format!("{name}/"), true, &b""[..]),
+        (format!("{name}/bin/"), true, &b""[..]),
+        (format!("{name}/bin/main.wasm"), false, wasm),
+        (format!("{name}/fastly.toml"), false, RELEASE_MANIFEST),
+    ] {
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(if directory {
+            tar::EntryType::Directory
+        } else {
+            tar::EntryType::Regular
+        });
+        header.set_mode(if directory { 0o755 } else { 0o644 });
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_size(bytes.len() as u64);
+        header.set_path(path).map_err(rejected)?;
+        header.set_cksum();
+        archive.append(&header, bytes).map_err(rejected)?;
+    }
+    archive
+        .into_inner()
+        .map_err(rejected)?
+        .finish()
+        .map_err(rejected)
+}
+
+/// Writes a fresh deterministic release package and verifies its exact readback.
+///
+/// # Errors
+///
+/// Rejects unsafe input, existing output, or any persistence/readback failure.
+pub(crate) fn build_package(wasm: &Path, output: &Path) -> Result<(), Report<ReleaseError>> {
+    let input = read_bounded(wasm, Role::Executable)?;
+    let bytes = release_bytes(&input.bytes)?;
+    let parent = output
+        .parent()
+        .ok_or_else(|| rejected("package needs a parent"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(rejected)?;
+    std::io::Write::write_all(&mut temporary, &bytes).map_err(rejected)?;
+    temporary.as_file().sync_all().map_err(rejected)?;
+    temporary.persist_noclobber(output).map_err(rejected)?;
+    let retained = read_bounded(output, Role::ArtifactArchive)?;
+    if retained.bytes != bytes || read_bounded(wasm, Role::Executable)?.bytes != input.bytes {
+        return Err(rejected("release package changed before handoff"));
+    }
+    Ok(())
+}
+
 const ARCHIVE_LIMIT: u64 = 768 * 1024 * 1024;
 const MODULE_LIMIT: u64 = 512 * 1024 * 1024;
 const MANIFEST_LIMIT: u64 = 1024 * 1024;
