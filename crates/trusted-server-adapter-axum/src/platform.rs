@@ -1,152 +1,20 @@
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use edgezero_adapter_axum::diagnostics::NativeIngressMetadata;
+use edgezero_core::context::RequestContext;
+use edgezero_core::error::EdgeError;
+use edgezero_core::http::{HeaderValue, Request, Uri, header};
+use edgezero_core::outbound::ResponseDecoding;
 use error_stack::{Report, ResultExt as _};
+use trusted_server_core::http_util::RequestInfo;
 use trusted_server_core::platform::{
     AuctionTargetId, BackendNamingPolicy, ClientInfo, EdgeZeroHttpClient, GeoInfo, PlatformBackend,
-    PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo, PlatformKvStore,
-    PlatformSecretStore, RuntimeServices, StoreId, StoreName,
+    PlatformBackendSpec, PlatformError, PlatformGeo, PlatformKvStore, RuntimeServices,
+    UnavailableKvStore,
 };
 
-// ---------------------------------------------------------------------------
-// Env-var naming helpers
-// ---------------------------------------------------------------------------
-
-/// Normalize a store name or key for use as an environment-variable segment.
-///
-/// Uppercases and replaces hyphens, dots, and spaces with underscores.
-fn normalize_env_segment(s: &str) -> String {
-    s.to_uppercase().replace(['-', '.', ' '], "_")
-}
-
-/// Returns the environment-variable name for a config store entry.
-#[must_use]
-pub fn config_env_var(store_name: &str, key: &str) -> String {
-    format!(
-        "TRUSTED_SERVER_CONFIG_{}_{}",
-        normalize_env_segment(store_name),
-        normalize_env_segment(key),
-    )
-}
-
-fn secret_env_var(store_name: &str, key: &str) -> String {
-    format!(
-        "TRUSTED_SERVER_SECRET_{}_{}",
-        normalize_env_segment(store_name),
-        normalize_env_segment(key),
-    )
-}
-
-// ---------------------------------------------------------------------------
-// PlatformConfigStore
-// ---------------------------------------------------------------------------
-
-/// Environment-variable–backed config store for the Axum dev server.
-///
-/// Reads from `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` (uppercased, hyphens→underscores).
-/// Write operations are unsupported in local development.
-pub struct AxumPlatformConfigStore;
-
-impl PlatformConfigStore for AxumPlatformConfigStore {
-    fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-        let var_name = config_env_var(store_name.as_ref(), key);
-        std::env::var(&var_name).map_err(|_| {
-            Report::new(PlatformError::ConfigStore).attach(format!(
-                "env var '{var_name}' not set — export it to supply this config value"
-            ))
-        })
-    }
-
-    fn put(
-        &self,
-        store_id: &StoreId,
-        key: &str,
-        _value: &str,
-    ) -> Result<(), Report<PlatformError>> {
-        log::warn!(
-            "AxumPlatformConfigStore: write to store '{}' key '{}' ignored \
-             (config store writes are not supported on the Axum dev server)",
-            store_id.as_ref(),
-            key
-        );
-        Err(Report::new(PlatformError::ConfigStore)
-            .attach("config store writes are not supported on the Axum dev server"))
-    }
-
-    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
-        log::warn!(
-            "AxumPlatformConfigStore: delete from store '{}' key '{}' ignored \
-             (config store deletes are not supported on the Axum dev server)",
-            store_id.as_ref(),
-            key
-        );
-        Err(Report::new(PlatformError::ConfigStore)
-            .attach("config store deletes are not supported on the Axum dev server"))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PlatformSecretStore
-// ---------------------------------------------------------------------------
-
-/// Environment-variable–backed secret store for the Axum dev server.
-///
-/// Reads from `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` as raw UTF-8 bytes.
-/// Write operations are unsupported in local development.
-pub struct AxumPlatformSecretStore;
-
-impl PlatformSecretStore for AxumPlatformSecretStore {
-    fn get_bytes(
-        &self,
-        store_name: &StoreName,
-        key: &str,
-    ) -> Result<Vec<u8>, Report<PlatformError>> {
-        let var_name = secret_env_var(store_name.as_ref(), key);
-        std::env::var(&var_name)
-            .map(String::into_bytes)
-            .map_err(|_| {
-                Report::new(PlatformError::SecretStore).attach(format!(
-                    "env var '{var_name}' not set — export it to supply this secret value"
-                ))
-            })
-    }
-
-    fn create(
-        &self,
-        store_id: &StoreId,
-        name: &str,
-        _value: &str,
-    ) -> Result<(), Report<PlatformError>> {
-        log::warn!(
-            "AxumPlatformSecretStore: create '{}' in store '{}' ignored \
-             (secret store writes are not supported on the Axum dev server)",
-            name,
-            store_id.as_ref()
-        );
-        Err(Report::new(PlatformError::SecretStore)
-            .attach("secret store writes are not supported on the Axum dev server"))
-    }
-
-    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
-        log::warn!(
-            "AxumPlatformSecretStore: delete '{}' from store '{}' ignored \
-             (secret store deletes are not supported on the Axum dev server)",
-            name,
-            store_id.as_ref()
-        );
-        Err(Report::new(PlatformError::SecretStore)
-            .attach("secret store deletes are not supported on the Axum dev server"))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PlatformBackend
-// ---------------------------------------------------------------------------
-
-/// No-op backend for the Axum dev server.
-///
-/// Returns a deterministic name; `ensure` is a no-op returning the same name.
-/// The Axum HTTP client sends directly to URIs and ignores backend names.
+/// Backend naming for native requests, whose RC transport connects directly to the URI.
 pub struct AxumPlatformBackend;
 
 impl PlatformBackend for AxumPlatformBackend {
@@ -166,11 +34,7 @@ impl PlatformBackend for AxumPlatformBackend {
     }
 }
 
-// ---------------------------------------------------------------------------
-// PlatformGeo
-// ---------------------------------------------------------------------------
-
-/// No-op geo implementation — geographic lookup is unavailable in local development.
+/// Reader geography is unavailable on native, regardless of deployment region.
 pub struct AxumPlatformGeo;
 
 impl PlatformGeo for AxumPlatformGeo {
@@ -179,193 +43,141 @@ impl PlatformGeo for AxumPlatformGeo {
     }
 }
 
-// ---------------------------------------------------------------------------
-// build_runtime_services
-// ---------------------------------------------------------------------------
-
-/// Construct [`RuntimeServices`] for an incoming Axum request.
+/// Install checked public URL facts without consuming or replacing the request body.
 ///
-/// # Degraded features in dev
+/// Raw forwarding headers are never consulted. Managed ingress validates proxy
+/// trust and syntax before creating this metadata. Requests outside the native
+/// runner remain unchanged, for explicit-services router tests and other adapters.
 ///
-/// The generic runtime KV slot uses
-/// [`trusted_server_core::platform::UnavailableKvStore`]. A `warn` log is
-/// emitted once per process.
-pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
-    static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    KV_WARNED.get_or_init(|| {
-        log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
-    });
+/// # Errors
+/// Returns a bad-request error when checked public URI/Host facts cannot be represented.
+pub(crate) fn apply_native_ingress(request: &mut Request) -> Result<(), EdgeError> {
+    let Some(metadata) = request.extensions().get::<NativeIngressMetadata>() else {
+        return Ok(());
+    };
+    let info = RequestInfo {
+        host: metadata
+            .effective_host()
+            .authority()
+            .unwrap_or_default()
+            .to_owned(),
+        scheme: metadata.effective_scheme().as_str().to_owned(),
+    };
+    // Some core consumers read URI/Host directly rather than RequestInfo.
+    // Normalize all three representations from the same checked facts so an
+    // absolute request target cannot override the selected public scheme.
+    let uri = Uri::builder()
+        .scheme(info.scheme.as_str())
+        .authority(info.host.as_str())
+        .path_and_query(
+            request
+                .uri()
+                .path_and_query()
+                .map_or("/", |path| path.as_str()),
+        )
+        .build()
+        .map_err(|_| {
+            EdgeError::bad_request("native request has no representable checked public URI")
+        })?;
+    let host = HeaderValue::from_str(&info.host).map_err(|_| {
+        EdgeError::bad_request("native request has no representable checked public host")
+    })?;
+    *request.uri_mut() = uri;
+    request.headers_mut().insert(header::HOST, host);
+    request.extensions_mut().insert(info);
+    Ok(())
+}
 
-    let client_ip = ctx
+/// Construct request-local runtime services from initialized immutable stores.
+///
+/// The RC client and application clock come from the incoming request. Only
+/// dependency handles are shared; checked visitor metadata is read afresh.
+/// Generic KV and reader geography are intentionally unavailable in this demo.
+///
+/// # Errors
+/// Returns an error when startup has not installed the store snapshot or the
+/// native runner has not supplied its HTTP client. There is no environment fallback.
+pub fn build_runtime_services(
+    context: &RequestContext,
+) -> Result<RuntimeServices, Report<PlatformError>> {
+    let snapshot = context
         .extensions()
-        .get::<edgezero_adapter_axum::context::AxumRequestContext>()
-        .and_then(|c| c.remote_addr)
-        .map(|addr| addr.ip());
+        .get::<Arc<crate::startup::NativeStoreSnapshot>>()
+        .ok_or_else(|| {
+            Report::new(PlatformError::ConfigStore)
+                .attach("native prepared-store snapshot is missing; initialize the application before serving")
+        })?;
+    let client = context.http_client().ok_or_else(|| {
+        Report::new(PlatformError::HttpClient)
+            .attach("request-scoped native HTTP client is missing")
+    })?;
+    let client_ip = context
+        .extensions()
+        .get::<NativeIngressMetadata>()
+        .and_then(NativeIngressMetadata::effective_client);
 
-    // Stateless shims are promoted to process-wide statics so callers clone
-    // an existing Arc instead of allocating a new one per request.
-    static CONFIG_STORE: std::sync::OnceLock<Arc<dyn PlatformConfigStore>> =
-        std::sync::OnceLock::new();
-    static SECRET_STORE: std::sync::OnceLock<Arc<dyn PlatformSecretStore>> =
-        std::sync::OnceLock::new();
-    static KV_STORE: std::sync::OnceLock<Arc<dyn PlatformKvStore>> = std::sync::OnceLock::new();
-    static BACKEND: std::sync::OnceLock<Arc<dyn PlatformBackend>> = std::sync::OnceLock::new();
-    static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
+    static KV: OnceLock<Arc<dyn PlatformKvStore>> = OnceLock::new();
+    static BACKEND: OnceLock<Arc<dyn PlatformBackend>> = OnceLock::new();
+    static GEO: OnceLock<Arc<dyn PlatformGeo>> = OnceLock::new();
 
-    static TIMER: std::sync::OnceLock<Arc<dyn trusted_server_core::platform::PlatformTimer>> =
-        std::sync::OnceLock::new();
-
-    RuntimeServices::builder()
-        .timer(Arc::clone(TIMER.get_or_init(|| Arc::new(AxumTimer))))
-        .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
-            Arc::new(AxumPlatformConfigStore) as Arc<dyn PlatformConfigStore>
-        })))
-        .secret_store(Arc::clone(SECRET_STORE.get_or_init(|| {
-            Arc::new(AxumPlatformSecretStore) as Arc<dyn PlatformSecretStore>
-        })))
-        .kv_store(Arc::clone(KV_STORE.get_or_init(|| {
-            Arc::new(trusted_server_core::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>
-        })))
-        .backend(Arc::clone(BACKEND.get_or_init(|| {
-            Arc::new(AxumPlatformBackend) as Arc<dyn PlatformBackend>
-        })))
-        .http_client(EdgeZeroHttpClient::for_request(ctx, AuctionTargetId::Axum))
-        .geo(Arc::clone(GEO.get_or_init(|| {
-            Arc::new(AxumPlatformGeo) as Arc<dyn PlatformGeo>
-        })))
+    Ok(RuntimeServices::builder()
+        .timer(native_timer())
+        .config_store(Arc::clone(&snapshot.config_store))
+        .secret_store(Arc::clone(&snapshot.secret_store))
+        .kv_store(Arc::clone(KV.get_or_init(|| Arc::new(UnavailableKvStore))))
+        .backend(Arc::clone(
+            BACKEND.get_or_init(|| Arc::new(AxumPlatformBackend)),
+        ))
+        .http_client(Arc::new(
+            EdgeZeroHttpClient::new(client, AuctionTargetId::Axum)
+                .response_decoding(ResponseDecoding::Decode),
+        ))
+        .geo(Arc::clone(GEO.get_or_init(|| Arc::new(AxumPlatformGeo))))
         .client_info(ClientInfo {
             client_ip,
-            tls_protocol: None,
-            tls_cipher: None,
             ..ClientInfo::default()
         })
-        .build()
+        .build())
 }
 
 struct AxumTimer;
 
 impl trusted_server_core::platform::PlatformTimer for AxumTimer {
     fn delay(&self, duration: std::time::Duration) -> futures::future::LocalBoxFuture<'static, ()> {
-        Box::pin(async move {
-            tokio::time::sleep(duration).await;
-        })
+        Box::pin(async move { tokio::time::sleep(duration).await })
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+fn native_timer() -> Arc<dyn trusted_server_core::platform::PlatformTimer> {
+    static TIMER: OnceLock<Arc<dyn trusted_server_core::platform::PlatformTimer>> = OnceLock::new();
+    Arc::clone(TIMER.get_or_init(|| Arc::new(AxumTimer)))
+}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use edgezero_core::body::Body;
+    use edgezero_core::http::request_builder;
+
+    use super::*;
 
     #[test]
     fn html_finalization_timer_is_shared_without_an_executor() {
-        let request = edgezero_core::http::request_builder()
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build a request");
-        let context = edgezero_core::context::RequestContext::new(request, Default::default());
-        let services = build_runtime_services(&context);
-        let next_services = build_runtime_services(&context);
+        let first = native_timer();
+        let second = native_timer();
         assert!(
-            std::ptr::eq(
-                services
-                    .timer()
-                    .expect("should install a cooperative timer"),
-                next_services
-                    .timer()
-                    .expect("should reuse the cooperative timer"),
-            ),
+            std::ptr::eq(first.as_ref(), second.as_ref()),
             "should share the stateless timer without requiring an executor"
         );
     }
 
     #[test]
-    fn auction_http_capabilities_are_explicit() {
-        let capabilities = trusted_server_core::platform::AuctionTargetId::Axum
-            .descriptor()
-            .capabilities();
-        assert!(capabilities.supports_concurrent_provider_fanout());
-    }
-
-    #[test]
-    fn config_env_var_normalizes_store_and_key() {
-        assert_eq!(
-            config_env_var("my-store.name", "my key"),
-            "TRUSTED_SERVER_CONFIG_MY_STORE_NAME_MY_KEY",
-            "should normalize environment-variable segments"
-        );
-    }
-
-    #[test]
-    fn config_store_reads_from_env_var() {
-        temp_env::with_var(
-            "TRUSTED_SERVER_CONFIG_MY_STORE_MY_KEY",
-            Some("test-value"),
-            || {
-                let store = AxumPlatformConfigStore;
-                let result = store
-                    .get(&StoreName::from("my-store"), "my-key")
-                    .expect("should read env var");
-                assert_eq!(result, "test-value", "should return env var value");
-            },
-        );
-    }
-
-    #[test]
-    fn config_store_returns_error_for_missing_env_var() {
-        let store = AxumPlatformConfigStore;
-        let result = store.get(
-            &StoreName::from("nonexistent-store-zzz"),
-            "nonexistent-key-zzz",
-        );
-        assert!(result.is_err(), "should error for missing env var");
-    }
-
-    #[test]
-    fn secret_store_reads_bytes_from_env_var() {
-        temp_env::with_var(
-            "TRUSTED_SERVER_SECRET_MY_SECRETS_MY_SECRET",
-            Some("hello"),
-            || {
-                let store = AxumPlatformSecretStore;
-                let result = store
-                    .get_bytes(&StoreName::from("my-secrets"), "my-secret")
-                    .expect("should read env var as bytes");
-                assert_eq!(result, b"hello", "should return raw bytes");
-            },
-        );
-    }
-
-    #[test]
-    fn backend_predict_name_returns_deterministic_string() {
+    fn backend_ensure_matches_prediction() {
         let backend = AxumPlatformBackend;
         let spec = PlatformBackendSpec {
-            scheme: "https".to_string(),
-            host: "example.com".to_string(),
-            port: None,
-            certificate_check: true,
-            first_byte_timeout: Duration::from_secs(15),
-            between_bytes_timeout: Duration::from_secs(15),
-            host_header_override: None,
-            discriminator: None,
-        };
-        let name1 = backend.predict_name(&spec).expect("should return a name");
-        let name2 = backend
-            .predict_name(&spec)
-            .expect("should return same name");
-        assert!(!name1.is_empty(), "should return a non-empty name");
-        assert_eq!(name1, name2, "should be deterministic");
-    }
-
-    #[test]
-    fn backend_ensure_returns_same_name_as_predict() {
-        let backend = AxumPlatformBackend;
-        let spec = PlatformBackendSpec {
-            scheme: "https".to_string(),
-            host: "example.com".to_string(),
+            scheme: "https".to_owned(),
+            host: "example.com".to_owned(),
             port: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
@@ -374,20 +186,48 @@ mod tests {
             discriminator: None,
         };
         assert_eq!(
-            backend.predict_name(&spec).expect("should return name"),
-            backend.ensure(&spec).expect("should return name"),
-            "ensure should equal predict_name"
+            backend.predict_name(&spec).expect("should predict backend"),
+            backend.ensure(&spec).expect("should ensure backend"),
+            "should preserve deterministic native backend names"
         );
     }
 
     #[test]
-    fn geo_always_returns_none() {
-        let geo = AxumPlatformGeo;
-        let no_ip = geo.lookup(None).expect("should not error");
-        assert!(no_ip.is_none(), "should return None for no IP");
-        let with_ip = geo
-            .lookup(Some("127.0.0.1".parse().expect("should parse IP")))
-            .expect("should not error");
-        assert!(with_ip.is_none(), "should return None for any IP");
+    fn reader_geography_remains_unavailable() {
+        assert!(
+            AxumPlatformGeo
+                .lookup(None)
+                .expect("should look up geography")
+                .is_none()
+        );
+        assert!(
+            AxumPlatformGeo
+                .lookup(Some("192.0.2.1".parse().expect("should parse client IP")))
+                .expect("should look up geography")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_prepared_snapshot_fails_without_environment_fallback() {
+        let request = request_builder()
+            .body(Body::empty())
+            .expect("should build request");
+        let context = RequestContext::new(request, edgezero_core::params::PathParams::default());
+        assert!(
+            build_runtime_services(&context).is_err(),
+            "should require prepared stores"
+        );
+    }
+
+    #[test]
+    fn unmanaged_test_request_is_not_rewritten_from_raw_forwarding_headers() {
+        let mut request = request_builder()
+            .header("forwarded", "host=spoof.example.com;proto=https")
+            .body(Body::from("body"))
+            .expect("should build request");
+        apply_native_ingress(&mut request).expect("should retain unmanaged test request");
+        assert!(request.extensions().get::<RequestInfo>().is_none());
+        assert_eq!(request.body().as_bytes(), Some(b"body".as_slice()));
     }
 }
