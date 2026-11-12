@@ -279,8 +279,7 @@ impl Prepared {
         trusted_proxy: bool,
         geo_profile: Option<&std::path::Path>,
     ) -> Running {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .expect("should reserve isolated port")
+        let port = reserve_port()
             .local_addr()
             .expect("should read reserved port")
             .port();
@@ -448,6 +447,27 @@ impl Drop for Running {
             self.log()
         );
     }
+}
+
+fn reserve_port() -> tokio::net::TcpSocket {
+    // A listening reservation can satisfy another test's negative startup probe.
+    let socket = tokio::net::TcpSocket::new_v4().expect("should create port reservation");
+    socket
+        .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("should reserve isolated port without listening");
+    socket
+}
+
+#[test]
+fn port_reservation_does_not_listen() {
+    let reservation = reserve_port();
+    let address = reservation
+        .local_addr()
+        .expect("should read reserved address");
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_millis(30)).is_err(),
+        "should allocate a fixture port without creating a listener seen by startup probes"
+    );
 }
 
 fn connected_to_listener(stream: &TcpStream) -> bool {
