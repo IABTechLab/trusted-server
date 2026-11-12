@@ -151,7 +151,7 @@ issue under its epic), PR fix (changes the PR needs), Merge, Release, Close.
 | 5    | TS T3                                                                                                                            | P1  | New                | SharedID cleanup                                                                                                                                                  | PR #1488, #1189                                                                                                                  |
 | 5    | TS #1555, #1556                                                                                                                  | P2  | Move               | Opt-out EIDs; backend certificate checks                                                                                                                          | PR #1488 (#1556 also #1507)                                                                                                      |
 | 5    | TS #1310, IABTechLab/trusted-server#90, IABTechLab/trusted-server#353                                                            | P2  | Close              | Superseded by #1488's ID5 provider                                                                                                                                | #1488 merged                                                                                                                     |
-| 6    | TS A1                                                                                                                            | P1  | New, PR fix        | Port #1528, repin to R1                                                                                                                                           | R1, #1507, #1141                                                                                                                 |
+| 6    | TS A1                                                                                                                            | P1  | New, PR fix        | Port #1528, repin to R1                                                                                                                                           | R1, #1507, #1141; DEC-5, DEC-6                                                                                                   |
 | 6    | TS T6, T10                                                                                                                       | P1  | New                | Shared record backend, Fastly first; rate limits                                                                                                                  | R1, #1522, #1139; R2                                                                                                             |
 | 7    | TS #1529 (A4), A6 with #1543, A3, A9                                                                                             | P1  | Move, New          | CloudFront IP and geo; production image; SIGTERM drain; env names                                                                                                 | A1 (A3 also R2)                                                                                                                  |
 | 7    | TS #1527, #1523                                                                                                                  | P2  | Close              | Tests moved to #1506                                                                                                                                              | #1506, A1                                                                                                                        |
@@ -167,8 +167,8 @@ issue under its epic), PR fix (changes the PR needs), Merge, Release, Close.
 Waves 0 to 10 complete Fastly and Axum. None of them waits on a Cloudflare or
 Spin item, so Fastly and Axum ship without waves 11 and 12 (DEC-4).
 
-Fallback for wave 1: if the fold-in has not landed two weeks after wave 0
-ends, #1506 merges pinned to IABTechLab/edgezero#275's head as it stands
+Fallback for wave 1: if the fold-in has not landed two weeks after #1557,
+#1526 and #1516 have all merged on main, #1506 merges pinned to IABTechLab/edgezero#275's head as it stands
 (allowed by AX-7) and keeps its readthrough rejection until the repin.
 
 The two longest chains:
@@ -233,22 +233,22 @@ R1 is linked from it.
 
 New:
 
-| ID  | Ticket                                                                                                      | Reqs                   | Type    | Size | Pri | Blocked by       | Blocks                    |
-| --- | ----------------------------------------------------------------------------------------------------------- | ---------------------- | ------- | ---- | --- | ---------------- | ------------------------- |
-| A1  | Serve Axum in production mode from main: port #1528 onto #1506's outbound API, repin to R1                  | AX-1, AX-2, AX-7       | Feature | L    | P1  | R1, #1507, #1141 | A2, A3, A6, A7, A9, #1529 |
-| A2  | Axum EC lifecycle on the shared backend, forward-ported from #1536 and #1537                                | ID-1, ID-3, ID-8, WB-1 | Feature | L    | P1  | T6, A1, #1529    | A5, A8, T7, T11, T12, T13 |
-| A3  | Drain after-response tasks on SIGTERM                                                                       | AX-1, ID-5             | Feature | S    | P1  | R2, A1           | none                      |
-| A5  | Load-test the record store at the target page-load rate with provider refreshes                             | AX-4                   | Task    | M    | P2  | A2, A7, T11      | none                      |
-| A6  | Publish and attest the production image; one contract for #1539 and #1543                                   | AX-5                   | Feature | M    | P1  | A1               | A7                        |
-| A7  | Reference infrastructure: DynamoDB, readiness, JSON logs, two or more tasks, IPv6 CloudFront ranges, geo on | AX-3, AX-6             | Feature | L    | P1  | A1, A6, #1142    | A5                        |
-| A8  | Run the SIGTERM-during-record-write test in CI                                                              | AX-1                   | Task    | S    | P2  | A2               | none                      |
-| A9  | `TRUSTED_SERVER__` environment names only                                                                   | AX-2                   | Task    | S    | P2  | A1               | none                      |
+| ID  | Ticket                                                                                                      | Reqs                   | Type    | Size | Pri | Blocked by                     | Blocks                    |
+| --- | ----------------------------------------------------------------------------------------------------------- | ---------------------- | ------- | ---- | --- | ------------------------------ | ------------------------- |
+| A1  | Serve Axum in production mode from main: port #1528 onto #1506's outbound API, repin to R1                  | AX-1, AX-2, AX-7       | Feature | L    | P1  | R1, #1507, #1141; DEC-5, DEC-6 | A2, A3, A6, A7, A9, #1529 |
+| A2  | Axum EC lifecycle on the shared backend, forward-ported from #1536 and #1537                                | ID-1, ID-3, ID-8, WB-1 | Feature | L    | P1  | T6, A1, #1529; DEC-6           | A5, A8, T7, T11, T12, T13 |
+| A3  | Drain after-response tasks on SIGTERM                                                                       | AX-1, ID-5             | Feature | S    | P1  | R2, A1                         | none                      |
+| A5  | Load-test the record store at the target page-load rate with provider refreshes                             | AX-4                   | Task    | M    | P2  | A2, A7, T11                    | none                      |
+| A6  | Publish and attest the production image; one contract for #1539 and #1543                                   | AX-5                   | Feature | M    | P1  | A1; DEC-6                      | A7                        |
+| A7  | Reference infrastructure: DynamoDB, readiness, JSON logs, two or more tasks, IPv6 CloudFront ranges, geo on | AX-3, AX-6             | Feature | L    | P1  | A1, A6, #1142; DEC-6, DEC-11   | A5                        |
+| A8  | Run the SIGTERM-during-record-write test in CI                                                              | AX-1                   | Task    | S    | P2  | A2                             | none                      |
+| A9  | `TRUSTED_SERVER__` environment names only                                                                   | AX-2                   | Task    | S    | P2  | A1                             | none                      |
 
 Existing, moved under #1558:
 
 | Issue | Title                                                        | Type (set)  | Size | Pri | Blocked by | Blocks |
 | ----- | ------------------------------------------------------------ | ----------- | ---- | --- | ---------- | ------ |
-| #1529 | Extract the protected CloudFront native Geo integration (A4) | Task (keep) | M    | P1  | A1         | A2     |
+| #1529 | Extract the protected CloudFront native Geo integration (A4) | Task (keep) | M    | P1  | A1; DEC-6  | A2     |
 | #1142 | Uniform cross-adapter health and startup-failure contract    | Task (keep) | M    | P1  | none       | A7     |
 | #1141 | Make Axum consume the local config store                     | Bug (keep)  | S    | P2  | none       | A1     |
 | #1139 | Implement adapter stores or retire dead store manifests      | Bug (keep)  | M    | P2  | none       | T6     |
@@ -266,8 +266,8 @@ New:
 | T5  | Identity conformance suite for Fastly and Axum, plus a startup-rejection test where identity is unsupported                                                                                        | ID-1                                           | Task    | M    | P1  | #1507                           | T8           |
 | T6  | One record backend over EdgeZero `KvStore`; delete the Fastly `ec_kv.rs`; adapters without a supported store reject identity configuration at startup                                              | ID-2                                           | Feature | L    | P1  | R1, #1522, #1139                | A2, T8       |
 | T7  | Axum partner APIs on the shared backend: batch sync, pull sync, admin lookup                                                                                                                       | ID-3, ID-5                                     | Feature | M    | P1  | A2, R2, T1                      | none         |
-| T8  | Cloudflare EC lifecycle: mint, record, `ts-ec`, identify, batch sync, pull sync, admin lookup, auction and body EIDs; build state once; drop the first-request `Env` capture and config `block_on` | ID-1, ID-2, ID-3, ID-8, WB-1, SH-1, SH-3, SH-4 | Feature | L    | P2  | T6, R3, T1, T5, #1518           | T9, T17      |
-| T9  | Spin EC lifecycle, the same scope as T8; port the config `block_on` removal from RC commit `933de5921`                                                                                             | ID-1, ID-2, ID-3, ID-8, WB-1, SH-1, SH-3       | Feature | L    | P3  | T8, R4; DEC-14                  | T18          |
+| T8  | Cloudflare EC lifecycle: mint, record, `ts-ec`, identify, batch sync, pull sync, admin lookup, auction and body EIDs; build state once; drop the first-request `Env` capture and config `block_on` | ID-1, ID-2, ID-3, ID-8, WB-1, SH-1, SH-3, SH-4 | Feature | L    | P2  | T6, R3, T1, T5, #1518; DEC-8    | T9, T17      |
+| T9  | Spin EC lifecycle, the same scope as T8; port the config `block_on` removal from RC commit `933de5921`                                                                                             | ID-1, ID-2, ID-3, ID-8, WB-1, SH-1, SH-3       | Feature | L    | P3  | T8, R4; DEC-8, DEC-14           | T18          |
 | T10 | Rate limits on Fastly and Axum: batch sync per partner, pull sync, provider lookups, record creation; shared counter across Axum tasks                                                             | ID-6                                           | Feature | M    | P1  | R2; DEC-11                      | T11, T17     |
 | T11 | Providers on Fastly and Axum, awaited before finalization; only follow-up writes after the response                                                                                                | ID-4, ID-5, WB-1                               | Feature | L    | P1  | A2, T10, R2, #1553; PR #1487    | A5, T14, T17 |
 | T12 | Refuse record creation from non-browser clients on Fastly and Axum                                                                                                                                 | ID-7                                           | Feature | M    | P2  | A2                              | T17          |
@@ -359,7 +359,14 @@ Each item names the head it was checked at. Post it as a comment on that PR
 - **#1543 at `dc1a063d8` (AX-5).** Rebase onto #1449. It publishes the
   dev-server image (`STOPSIGNAL SIGINT`), so it ships with A6's production
   image contract.
-- **RC units, fixed in their forward-ports.** #1532: drop the core change that
+- **RC units, fixed in their forward-ports.** These were checked at the RC tag
+  `v0.1.1-rc-axum.202611.2` (`7c6e68d94`), which contains every unit. They are
+  forward-port notes: each applies to the PR that ports its unit to main, and
+  Task 6 posts it there once that PR exists, checked at its head. On the RC unit
+  PRs themselves Task 6 posts a note only after re-checking it at the unit's
+  head, read on 2026-11-12 as #1532 `852b875fe`, #1536 `296e05405`, #1537
+  `4a838272c`, #1539 `8d41cb06c`, #1540 `eb6e19ef4` and #1541 `7dd2e3056`.
+  #1532: drop the core change that
   maps a US request with no region to `Unknown`, which fails every US
   Cloudflare request closed (AX-3). #1536: do not port the adapter-local
   DynamoDB store (ID-2, AX-4). #1537: its example config breaks startup on
@@ -432,10 +439,16 @@ These belong to #1505 and IABTechLab/edgezero#436:
 
 - [ ] **Step 1: Move each issue**
 
-For each row, run
-`gh api graphql -f query='mutation($p:ID!,$c:ID!){addSubIssue(input:{issueId:$p,subIssueId:$c}){issue{number}}}' -F p="$(gh issue view <epic> --json id --jq .id)" -F c="$(gh issue view <issue> --json id --jq .id)"`.
-Expected: the epic's number. A row whose issue already has a parent is
-reported, not moved.
+For each row, first read the issue's current parent with
+`gh api graphql -f query='{repository(owner:"<owner>",name:"<repo>"){issue(number:<issue>){parent{number}}}}' --jq '.data.repository.issue.parent.number'`.
+The expected parent is IABTechLab/edgezero#88 for IABTechLab/edgezero#89 to
+IABTechLab/edgezero#92, IABTechLab/edgezero#391 for IABTechLab/edgezero#397,
+IABTechLab/edgezero#410 and IABTechLab/edgezero#432, and none for every other
+row. Stop and report a row whose parent differs. Then run
+`gh api graphql -f query='mutation($p:ID!,$c:ID!){addSubIssue(input:{issueId:$p,subIssueId:$c,replaceParent:true}){issue{number}}}' -F p="$(gh issue view <epic> --json id --jq .id)" -F c="$(gh issue view <issue> --json id --jq .id)"`,
+and read the parent again.
+Expected: the new epic's number, and every moved issue's parent is now that
+epic.
 
 - [ ] **Step 2: Type, Priority and Size**
 

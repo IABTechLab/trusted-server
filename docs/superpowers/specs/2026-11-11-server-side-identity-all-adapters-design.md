@@ -48,8 +48,8 @@ Two lines of code carry Axum today.
   Cloudflare and Spin build an `EcContext` for consent alone, with no record
   store and no `ts-ec` cookie. They build a partner registry per request, for
   `/_ts/admin/eids` only.
-- **Axum RC line.** Tag `v0.1.1-rc-axum.202611.2` is the head of draft #1541
-  (`7c6e68d94`). It adds production startup, the EC record in DynamoDB and
+- **Axum RC line.** Tag `v0.1.1-rc-axum.202611.2` (`7c6e68d94`) was the head of
+  draft #1541 when read on 2026-11-11; #1541 has moved since. It adds production startup, the EC record in DynamoDB and
   celld, CloudFront geo, a container image and AWS examples. It branches from
   main at `2dd968aee` (2026-10-20), carries 74 commits that are not on main
   and is 29 commits behind it. It pins EdgeZero tag
@@ -223,9 +223,11 @@ marks the record contract and geo as supported.
   deadline is skipped and does not delay the response past it.
 - **ID-5 After-response work.** Only pull sync and guarded follow-up writes run
   after the response is sent: after send on Fastly, a task drained on SIGTERM
-  on Axum, `waitUntil` on Cloudflare. Spin follows DEC-14. Accept: on each
-  adapter a follow-up write recorded after send is in the record before the
-  next navigation; on Axum SIGTERM waits for it (A3).
+  on Axum, `waitUntil` on Cloudflare. Spin follows DEC-14. Accept: on Fastly,
+  Axum and Cloudflare a follow-up write recorded after send is in the record
+  before the next navigation, and on Axum SIGTERM waits for it (A3). On Spin
+  the DEC-14 choice holds: either the follow-up write lands before the
+  response, or the work is skipped and the response is unchanged.
 - **ID-6 Rate limiting.** Provider lookups, batch sync, pull sync and record
   creation are rate limited on every supported adapter. Batch sync is keyed
   per partner; the other keys follow DEC-11. With more than one Axum task the
@@ -249,7 +251,10 @@ marks the record contract and geo as supported.
 
 - **SH-1 Built once.** Settings, the partner registry, store clients and the
   HTTP client are built once per process or isolate. Accept: an adapter test
-  shows each built once across two requests. State: Cloudflare and Spin
+  shows settings, the partner registry and store clients built once across two
+  requests, and the HTTP client too, except Axum's, which stays per request
+  until a measurement shows the Next.js regression gone; after that
+  measurement Axum's client is held to the same rule. State: Cloudflare and Spin
   rebuild app state per request; Axum builds the partner registry per request
   (`app.rs:515` at #1506's head) and the HTTP client per request on purpose,
   because a pooled client regressed a Next.js flow (main `platform.rs:571-575`).
@@ -331,7 +336,8 @@ marks the record contract and geo as supported.
   Prebid rewrite the cookie from script, which Safari caps. Prebid's `extend`
   with a `pixelUrl` keeps working alongside it. Accept: record present and
   cookie absent gives both cookies with those attributes; an equal cookie
-  gives no `Set-Cookie`; Purpose 1 denied or `_pubcid_optout` expires both;
+  with a consistent `<name>_cst` gives no `Set-Cookie`; an equal cookie with a
+  missing or different `<name>_cst` re-sets only the companion; Purpose 1 denied or `_pubcid_optout` expires both;
   Purpose 4 denied with Purpose 1 granted gives no `Set-Cookie` and leaves the
   browser's cookie alone. State: no branch writes it.
 - **WB-4 Mirror cookie.** `__Host-ts-eids-mirror` as in #1489: opt-in per
@@ -517,4 +523,16 @@ revisions, not from PR descriptions:
 Reviews 5871533635 and 5871619954 at `00df85414`, from fresh agent sessions
 covering factual claims, consistency and coverage, merge-order feasibility, and
 repository policy. 34 findings: 8 blocking, 17 should-fix, 9 nits. This
-revision addresses them; each thread holds its disposition. Round 2 is pending.
+revision addresses them; each thread holds its disposition.
+
+### Round 2, 2026-11-12
+
+Review 5875159165 at `7cb8933f7`. It accepted and resolved 28 round-1
+findings and left six open: the fallback clock (thread 1), the review log and
+draft gate (7), SH-1's acceptance against the Axum HTTP client exception (14),
+the RC-unit baseline (15), ID-5's acceptance on Spin (18) and decision gates
+missing from plan cells (23). It added two should-fix findings: Task 1 must
+re-parent the EdgeZero issues it moves (35), and WB-3's no-write case must
+require a consistent `<name>_cst` (36). No blocking finding. The revision after
+it addresses all eight; round 3 is pending, and the PR stays in draft until a
+round finds nothing blocking.
