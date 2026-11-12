@@ -1656,13 +1656,13 @@ fn twelve_bidder_auction_registers_twelve_backends_fastly() {
                 "auction {auction} should deliver the highest of the twelve bids"
             );
         }
-        // Each auction runs with its own remaining budget, which never enters
-        // a backend's configuration, so the second auction configures the
-        // same twelve backends instead of twelve more.
+        // Each callback has its own observation, so this shows that each
+        // auction configures and registers exactly one backend per bidder
+        // and no other outbound backend.
         assert_eq!(
-            wait_for_configuration_counts(stdout, 2),
-            [12, 12],
-            "each auction should configure exactly one backend per bidder"
+            wait_for_outbound_observations(stdout, 2),
+            [(12, 12), (12, 12)],
+            "each auction should configure and register exactly one backend per bidder"
         );
     });
 
@@ -1670,32 +1670,38 @@ fn twelve_bidder_auction_registers_twelve_backends_fastly() {
 }
 
 /// Waits up to five seconds for the guest to log `expected` outbound
-/// observations, and returns the configuration count of each.
+/// observations, and returns the configuration and registration counts of each.
 ///
 /// The callback logs its observation after delivery, so the line can trail
 /// the response the client already read. Viceroy prints a line once for the
 /// `tslog` endpoint and once more as the guest's stdout echo, so only the
 /// endpoint copy counts.
-fn wait_for_configuration_counts(
+fn wait_for_outbound_observations(
     stdout: &environments::fastly::GuestStdout,
     expected: usize,
-) -> Vec<u64> {
+) -> Vec<(u64, u64)> {
+    let count = |line: &str, field: &str| -> u64 {
+        line.split_whitespace()
+            .find_map(|entry| entry.strip_prefix(field))
+            .and_then(|value| value.parse().ok())
+            .expect("should log every outbound observation count")
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let counts: Vec<u64> = stdout
+        let observations: Vec<(u64, u64)> = stdout
             .lines()
             .iter()
             .filter_map(|line| line.strip_prefix("tslog :: "))
             .filter(|line| line.contains("[outbound_observation]"))
             .map(|line| {
-                line.split_whitespace()
-                    .find_map(|field| field.strip_prefix("configurations="))
-                    .and_then(|count| count.parse().ok())
-                    .expect("should log the configuration count")
+                (
+                    count(line, "configurations="),
+                    count(line, "registrations="),
+                )
             })
             .collect();
-        if counts.len() >= expected || std::time::Instant::now() >= deadline {
-            return counts;
+        if observations.len() >= expected || std::time::Instant::now() >= deadline {
+            return observations;
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -2068,7 +2074,9 @@ fn oversized_head_request() -> Vec<u8> {
         "GET /health?padding={} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n",
         "a".repeat(7000)
     );
-    // 58 fields of about 1 KiB: about 60 KiB of header fields, 67 KiB of raw head.
+    // 58 fields of 1,040 bytes plus `Host` and `Connection`: 60 field lines
+    // of 60,356 bytes. With the 7,016-byte target the raw head is 67,389
+    // bytes (about 66 KiB), 1,853 over the default 65,536.
     for index in 0..58 {
         request.push_str(&format!("x-example-{index:02}: {}\r\n", "b".repeat(1024)));
     }

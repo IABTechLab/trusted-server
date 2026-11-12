@@ -1537,6 +1537,26 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
+    fn runtime_keeps_loading_operator_framing_headers() {
+        // Deploy validation rejects these entries, but a live config pushed
+        // before the rejection still has to load. The response-header helper
+        // skips them when it serves.
+        for (name, value) in [
+            ("connection", "keep-alive,"),
+            ("connection", ""),
+            ("trailer", "expires"),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .response_headers
+                .insert(name.to_owned(), value.to_owned());
+
+            validate_settings_for_runtime(&settings)
+                .expect("should keep loading a live config that predates the rejection");
+        }
+    }
+
+    #[test]
     fn validate_rejects_origin_url_with_userinfo() {
         for origin_url in [
             "https://example-user@origin.test-publisher.example.com",

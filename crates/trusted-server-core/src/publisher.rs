@@ -3050,7 +3050,8 @@ fn apply_datadome_client_tag_cache_privacy(
 /// §6.1 forbids it on a 204, and keeping it on a 205 alongside the
 /// `Content-Length: 0` inserted above would advertise two conflicting framings.
 /// `HEAD` and 304 keep it for the same reason they keep `Content-Length`: it
-/// describes the `GET` representation, not this message.
+/// describes the `GET` representation, not this message. Response egress
+/// strips `Transfer-Encoding` from every response before it is sent.
 fn make_response_bodiless(response: &mut Response<EdgeBody>) {
     *response.body_mut() = EdgeBody::empty();
     response.headers_mut().remove(header::TRAILER);
