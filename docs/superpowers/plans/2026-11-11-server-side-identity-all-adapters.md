@@ -164,8 +164,10 @@ issue under its epic), PR fix (changes the PR needs), Merge, Release, Close.
 | 12   | EZ EZI-1s, EZI-2s, EZI-3s, EZI-4s and EZI-5s, then R4; then TS T9, T18                                                           | P3  | New, Release       | Spin parts in EdgeZero; Spin release; Spin EC lifecycle; Spin providers, limits and cookies                                                                       | Part B blockers, DEC-8, DEC-14                                                                                                   |
 | any  | TS T16, TS #1245, IABTechLab/edgezero#438, IABTechLab/edgezero#287                                                               | P3  | New, Move, Merge   | `ts-ec` refresh; LiveRamp sync spec; local GeoIP with PR IABTechLab/edgezero#453; IABTechLab/edgezero#287 last                                                    | DEC-13; DEC-9; PR IABTechLab/edgezero#453; IABTechLab/edgezero#275                                                               |
 
-Waves 0 to 10 complete Fastly and Axum. None of them waits on a Cloudflare or
-Spin item, so Fastly and Axum ship without waves 11 and 12 (DEC-4).
+Waves 0 to 10 are the MVP: they complete Fastly and Axum. None of them waits
+on a Cloudflare or Spin item, so the MVP ships without waves 11 and 12 (DEC-4).
+Wave 11 (Cloudflare), wave 12 (Spin) and the decision-gated row follow the
+MVP.
 
 Fallback for wave 1: if the fold-in has not landed two weeks after #1557,
 #1526 and #1516 have all merged on main, #1506 merges pinned to IABTechLab/edgezero#275's head as it stands
@@ -178,6 +180,10 @@ The two longest chains:
 - SharedID: IABTechLab/edgezero#460, #1506, #1487, #1489, #1488, T3, and T13 once A2 lands.
 
 ## Part B: tickets
+
+Every ticket in waves 0 to 10 is MVP; the Cloudflare and Spin tickets (T8,
+T9, T17, T18, the EZI `c` and `s` tickets, R3, R4, IABTechLab/edgezero#91,
+IABTechLab/edgezero#89 and #1518) and the decision-gated row are post-MVP.
 
 "Blocked by" is set as a GitHub dependency between issues. A PR or a decision
 there goes in the issue body. "Blocks" is the inverse and is not set

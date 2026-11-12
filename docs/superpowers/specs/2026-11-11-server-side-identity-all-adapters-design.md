@@ -11,8 +11,8 @@ Epics: #1558 (Trusted Server) and IABTechLab/edgezero#468 (EdgeZero). Plan:
    CloudFront and a load balancer.
 2. Server-side identity works on every adapter whose platform can meet the
    record contract in [Platform support](#platform-support), delivered in the
-   order Fastly, Axum, Cloudflare, Spin (DEC-4). Fastly and Axum ship complete
-   without any Cloudflare or Spin work. An adapter that cannot meet the
+   order Fastly, Axum, Cloudflare, Spin (DEC-4). Fastly and Axum are the MVP
+   and ship complete without any Cloudflare or Spin work. An adapter that cannot meet the
    contract rejects identity configuration at startup with a clear error and
    never runs identity without a record.
 3. SharedID is read, stored and passed to bidders the way Prebid defines it,
@@ -445,8 +445,9 @@ and Axum parts ship in R1 and R2 and never wait on a Cloudflare or Spin part.
   `pubcid.org`, atype 1, on their next write (T3). There is no bulk migration.
 - `user.ext.eids` stays only for the downstreams T2 names.
 - `ts-ec` format and attributes do not change.
-- Adapters gain identity in the order Fastly, Axum, Cloudflare, Spin. Until an
-  adapter's tickets land, its startup rejects identity configuration.
+- Adapters gain identity in the order Fastly, Axum, Cloudflare, Spin. The MVP
+  is Fastly and Axum; Cloudflare and Spin follow it. Until an adapter's
+  tickets land, its startup rejects identity configuration.
 - The RC tag keeps its current use until main reaches parity; RC units close
   as their ports land.
 
@@ -469,9 +470,10 @@ Decided:
 - **DEC-3 Shared record store** (user, 2026-11-11). The EC record runs on one
   `EcKvStore` over EdgeZero's `KvStore`, with no per-adapter backends.
 - **DEC-4 Platform order** (user, 2026-11-12). Fastly, then Axum, then
-  Cloudflare, then Spin. Fastly and Axum must ship complete without any
-  Cloudflare or Spin work, so every ticket and release is split by platform
-  and no Fastly or Axum item is blocked by a Cloudflare or Spin item.
+  Cloudflare, then Spin. Fastly and Axum are the MVP and must ship complete
+  without any Cloudflare or Spin work, so every ticket and release is split by
+  platform and no Fastly or Axum item is blocked by a Cloudflare or Spin item.
+  Cloudflare and Spin follow the MVP.
 
 Proposed and assumed by the plan until confirmed:
 
