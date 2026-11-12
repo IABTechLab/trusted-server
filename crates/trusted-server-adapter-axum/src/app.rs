@@ -31,7 +31,7 @@ use trusted_server_core::proxy::{
 use trusted_server_core::publisher::{
     AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherOriginOptions,
     buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_owner_error,
+    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_input_cap, publisher_owner_error,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -238,8 +238,7 @@ async fn dispatch_fallback(
     };
     // Axum has no runtime memory limit of its own, so the publisher setting
     // alone bounds the origin body this adapter collects before egress.
-    let input_cap =
-        u64::try_from(state.settings.publisher.max_buffered_body_bytes).unwrap_or(u64::MAX);
+    let input_cap = publisher_input_cap(&state.settings, u64::MAX);
     let (publisher_response, owner) = handle_publisher_request(
         &state.settings,
         services,

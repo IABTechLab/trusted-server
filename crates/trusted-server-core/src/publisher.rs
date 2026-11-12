@@ -4894,6 +4894,27 @@ pub struct PublisherOriginOptions {
     pub response_decoding: ResponseDecoding,
 }
 
+/// Returns the [`PublisherOriginOptions::input_cap`] for an adapter whose runtime allows
+/// `platform_cap` bytes: the smaller of that and the publisher's `max_buffered_body_bytes`.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::publisher::publisher_input_cap;
+/// use trusted_server_core::settings::Settings;
+///
+/// let mut settings = Settings::default();
+/// settings.publisher.max_buffered_body_bytes = 4096;
+/// assert_eq!(publisher_input_cap(&settings, 1024), 1024);
+/// assert_eq!(publisher_input_cap(&settings, u64::MAX), 4096);
+/// ```
+#[must_use]
+pub fn publisher_input_cap(settings: &Settings, platform_cap: u64) -> u64 {
+    u64::try_from(settings.publisher.max_buffered_body_bytes)
+        .unwrap_or(u64::MAX)
+        .min(platform_cap)
+}
+
 /// Whether `override_authority` names a different authority than `origin`.
 ///
 /// Hosts compare case-insensitively and a default port counts as absent, so

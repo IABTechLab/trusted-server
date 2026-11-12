@@ -124,6 +124,7 @@ use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
+use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName,
 };
@@ -271,12 +272,7 @@ fn build_per_request_services(
                 .and_then(|c| c.client_ip),
             ..ClientInfo::default()
         });
-    let outbound_client = ctx
-        .http_client()
-        .ok_or_else(|| {
-            EdgeError::internal(std::io::Error::other("request has no outbound client"))
-        })?
-        .with_proxy_marker(false);
+    let outbound_client = request_outbound_client(ctx)?;
     let request_geo = ctx
         .extensions()
         .get::<RequestGeo>()
