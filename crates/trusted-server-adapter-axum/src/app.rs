@@ -22,7 +22,7 @@ use trusted_server_core::ec::admin::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::edge_app::install_edge_policies;
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError, startup_error};
+use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
@@ -112,25 +112,6 @@ impl AppState {
             .clone()
             .map_or_else(|| build_runtime_services(ctx), Ok)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Error helper
-// ---------------------------------------------------------------------------
-
-/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`].
-pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
-    let root_error = report.current_context();
-    log::error!("Error occurred: {:?}", report);
-
-    let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
-    let mut response = Response::new(body);
-    *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
 }
 
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`

@@ -7,6 +7,7 @@ use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
+use trusted_server_core::error::http_error;
 use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
 use trusted_server_core::settings::Settings;
 
@@ -117,7 +118,7 @@ impl Middleware for AuthMiddleware {
             Ok(None) => {}
             Err(report) => {
                 log::error!("auth check failed: {:?}", report);
-                return Ok(crate::app::http_error(&report));
+                return Ok(http_error(&report));
             }
         }
 

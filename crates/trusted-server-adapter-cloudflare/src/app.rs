@@ -27,7 +27,7 @@ use trusted_server_core::ec::admin::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::edge_app::install_edge_policies;
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError, startup_error};
+use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::StoreName;
@@ -338,25 +338,6 @@ async fn resolve_publisher_response(
     .await?;
     response.headers_mut().remove(header::TRANSFER_ENCODING);
     Ok(response)
-}
-
-// ---------------------------------------------------------------------------
-// Error helper
-// ---------------------------------------------------------------------------
-
-/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`].
-pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
-    let root_error = report.current_context();
-    log::error!("Error occurred: {:?}", report);
-
-    let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
-    let mut response = Response::new(body);
-    *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
 }
 
 fn admin_key_management_not_supported() -> Response {

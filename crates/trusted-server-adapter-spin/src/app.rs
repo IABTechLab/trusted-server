@@ -30,7 +30,7 @@ use trusted_server_core::ec::admin::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::edge_app::install_edge_policies;
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::http_util::{RuntimeRequestOrigin, sanitize_forwarded_headers};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::{ClientInfo, HttpClient, RuntimeServices};
@@ -475,25 +475,6 @@ fn admin_key_management_not_supported() -> Response {
 
 fn admin_ec_lookup_not_supported() -> Response {
     core_admin_ec_lookup_not_supported()
-}
-
-// ---------------------------------------------------------------------------
-// Error helper
-// ---------------------------------------------------------------------------
-
-/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`].
-pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
-    let root_error = report.current_context();
-    log::error!("Error occurred: {:?}", report);
-
-    let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
-    let mut response = Response::new(body);
-    *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
 }
 
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
