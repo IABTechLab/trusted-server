@@ -53,6 +53,10 @@ fn push(project: &TempDir, args: &[&str], overrides: &[(&str, &str)]) -> Output 
             "TRUSTED_SERVER__PUBLISHER__ORIGIN_URL",
             "https://upstream.example.com",
         )
+        .env(
+            "TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN",
+            "https://ads.publisher.example.com",
+        )
         .envs(overrides.iter().copied())
         .output()
         .expect("should run a local config push");
@@ -62,6 +66,86 @@ fn push(project: &TempDir, args: &[&str], overrides: &[(&str, &str)]) -> Output 
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+#[cfg(unix)]
+fn push_with_shell(project: &TempDir, script: &str, args: &[&str]) -> serde_json::Value {
+    let output = Command::new("bash")
+        .args(["-euc", script, "local-config-workflow"])
+        .args(args)
+        .current_dir(project.path())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("RUST_LOG", "info")
+        .env("TS_BIN", env!("CARGO_BIN_EXE_ts"))
+        .output()
+        .expect("should run the local config workflow");
+    assert!(
+        output.status.success(),
+        "local config workflow should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entries = stored_entries(project);
+    let envelope: serde_json::Value = serde_json::from_str(
+        entries
+            .get(CONFIG_BLOB_KEY)
+            .expect("should store the app-config blob"),
+    )
+    .expect("should parse the stored blob");
+    envelope["data"].clone()
+}
+
+#[cfg(unix)]
+#[test]
+fn development_overlay_replaces_the_template_public_origin() {
+    let project = project();
+    let config = push_with_shell(
+        &project,
+        concat!(
+            "set -a\n",
+            include_str!("../../../.env.dev"),
+            "\nset +a\n",
+            "\"$TS_BIN\" config push --adapter axum --local --yes --no-diff\n",
+        ),
+        &[],
+    );
+    assert_eq!(
+        config["publisher"]["public_origin"], "http://localhost:7676",
+        "should use the Viceroy quickstart listener rather than the template placeholder"
+    );
+    assert_eq!(
+        config["publisher"]["origin_url"], "http://localhost:9090",
+        "should keep the upstream separate from the public listener"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn smoke_setup_replaces_the_template_with_the_selected_listener() {
+    for listener_port in ["18894", "43123"] {
+        let project = project();
+        fs::remove_file(project.path().join("trusted-server.toml"))
+            .expect("should let smoke setup initialize the template");
+        let config = push_with_shell(
+            &project,
+            concat!(
+                include_str!("../../../scripts/smoke-common.sh"),
+                "\nSMOKE_TS_BIN=\"$TS_BIN\"\n",
+                "smoke_initialize_config \"$PWD\" \"$PWD\" 19999 \"$1\"\n",
+                "\"$TS_BIN\" config push --adapter axum --local --yes --no-diff\n",
+            ),
+            &[listener_port],
+        );
+        assert_eq!(
+            config["publisher"]["public_origin"],
+            format!("http://127.0.0.1:{listener_port}"),
+            "should use the selected smoke listener"
+        );
+        assert_eq!(
+            config["publisher"]["origin_url"], "http://127.0.0.1:19999",
+            "should keep the smoke upstream independent of the listener"
+        );
+    }
 }
 
 fn stored_entries(project: &TempDir) -> BTreeMap<String, String> {

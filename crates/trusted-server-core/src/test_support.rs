@@ -165,7 +165,7 @@ pub mod tests {
     pub async fn run_pre_dispatch_hook<H: PreDispatchHook>(
         hook: H,
         request: Request<Body>,
-    ) -> Result<Request<Body>, Response<Body>> {
+    ) -> Result<Request<Body>, Box<Response<Body>>> {
         let received: Arc<Mutex<Option<(RequestParts, Bytes)>>> = Arc::default();
         let sink = Arc::clone(&received);
         let record = move |context: RequestContext| {
@@ -193,7 +193,7 @@ pub mod tests {
             .take();
         match recorded {
             Some((parts, body)) => Ok(Request::from_parts(parts, Body::from(body))),
-            None => Err(response),
+            None => Err(Box::new(response)),
         }
     }
 

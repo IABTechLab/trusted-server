@@ -62,18 +62,22 @@ The four adapter smoke contracts are documented in the
 Repository-wide verification policy lives in [TESTING.md](../TESTING.md).
 
 The `Documentation proposal` workflow runs the propose, validate, and publish
-scripts after code merges to `main` and opens one pull request per merge on
-`docs/auto/<sha12>`. Its first run, including the one triggered by merging the
-workflow itself, fails unless the organization Copilot policy "Allow use of
-Copilot CLI billed to the organization" and the repository setting "Allow GitHub
-Actions to create and approve pull requests" are already enabled. Pull requests
-opened with `GITHUB_TOKEN` do not trigger other workflows, so the workflow's
-validate job runs the docs gates itself, without write credentials. The checks
-`main` requires never start on a proposal, so close and reopen it, or push to
-its branch, before merging. Retry a merge from the workflow's manual
-dispatch with its full commit SHA; the scripts always run from the workflow's
-revision, so any merge on `main` can be retried. When the original push added
-several commits, as a rebase merge does, also pass its `base`: the `main` head
-before that push, shown as `BASE_SHA` in the original run and recorded in the
-proposal's body. Publication refuses a retry whose range differs from an open
+scripts when a maintainer dispatches it from the Actions tab. "Use workflow
+from" picks the branch to propose documentation for and to open the pull
+request against, so that branch must contain the workflow. `since` is the
+last commit already documented, usually the `sha` of the previous proposal;
+the run covers every change after it up to `sha`, which defaults to the
+branch head. A `since` that is not an earlier commit of `sha` fails the run.
+Each run opens one pull request on `docs/auto/<sha12>` for `main`, or
+`docs/auto/<branch-hash12>/<sha12>` for another branch, so runs that end at
+different commits open separate proposals; choose `since` so their ranges do
+not overlap. Its first run fails unless the organization Copilot policy "Allow
+use of Copilot CLI billed to the organization" and the repository setting
+"Allow GitHub Actions to create and approve pull requests" are already
+enabled. Pull requests opened with `GITHUB_TOKEN` do not trigger other
+workflows, so the workflow's validate job runs the docs gates itself, without
+write credentials. The checks `main` requires never start on a proposal, so
+close and reopen it, or push to its branch, before merging. To retry a run,
+dispatch it again with the same `since` and `sha`, both recorded in the
+proposal's body; publication refuses a retry whose range differs from an open
 proposal's.

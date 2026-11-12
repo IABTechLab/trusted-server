@@ -17,10 +17,11 @@ type DynError = Box<dyn Error + Send + Sync + 'static>;
 #[derive(Debug, PartialEq)]
 struct Args {
     template: PathBuf,
-    app_config: PathBuf,
+    app_config: Option<PathBuf>,
     output: PathBuf,
     origin_url: Option<String>,
     provider_endpoint_origin: Option<String>,
+    public_origin: Option<String>,
 }
 
 fn main() -> Result<(), DynError> {
@@ -34,19 +35,27 @@ fn run(args: &Args) -> Result<(), DynError> {
             args.template.display()
         ))
     })?;
-    let app_config = fs::read_to_string(&args.app_config).map_err(|error| {
-        error_box(format!(
-            "failed to read Trusted Server app config `{}`: {error}",
-            args.app_config.display()
-        ))
-    })?;
-
-    let envelope_json = build_app_config_envelope(
-        &app_config,
-        args.origin_url.as_deref(),
-        args.provider_endpoint_origin.as_deref(),
-    )?;
-    let generated_config = inject_generated_config_stores(&template, &envelope_json)?;
+    let generated_config = if let Some(app_config_path) = &args.app_config {
+        let app_config = fs::read_to_string(app_config_path).map_err(|error| {
+            error_box(format!(
+                "failed to read Trusted Server app config `{}`: {error}",
+                app_config_path.display()
+            ))
+        })?;
+        let envelope_json = build_app_config_envelope(
+            &app_config,
+            args.origin_url.as_deref(),
+            args.public_origin.as_deref(),
+            args.provider_endpoint_origin.as_deref(),
+        )?;
+        inject_generated_config_stores(&template, &envelope_json)?
+    } else {
+        retarget_generated_config(
+            &template,
+            args.origin_url.as_deref(),
+            args.public_origin.as_deref(),
+        )?
+    };
 
     if let Some(parent) = args.output.parent() {
         fs::create_dir_all(parent).map_err(|error| {
@@ -72,12 +81,16 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, DynError> 
     let mut output = None;
     let mut origin_url = None;
     let mut provider_endpoint_origin = None;
+    let mut public_origin = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--template" => template = Some(next_path_arg(&mut iter, "--template")?),
             "--app-config" => app_config = Some(next_path_arg(&mut iter, "--app-config")?),
+            "--public-origin" => {
+                public_origin = Some(next_string_arg(&mut iter, "--public-origin")?)
+            }
             "--output" => output = Some(next_path_arg(&mut iter, "--output")?),
             "--origin-url" => origin_url = Some(next_string_arg(&mut iter, "--origin-url")?),
             "--provider-endpoint-origin" => {
@@ -94,14 +107,20 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, DynError> 
         }
     }
 
+    if provider_endpoint_origin.is_some() && app_config.is_none() {
+        return Err(error_box(
+            "--provider-endpoint-origin requires --app-config",
+        ));
+    }
+
     Ok(Args {
         template: template
             .ok_or_else(|| error_box(format!("missing --template\n\n{}", usage())))?,
-        app_config: app_config
-            .ok_or_else(|| error_box(format!("missing --app-config\n\n{}", usage())))?,
+        app_config,
         output: output.ok_or_else(|| error_box(format!("missing --output\n\n{}", usage())))?,
         origin_url,
         provider_endpoint_origin,
+        public_origin,
     })
 }
 
@@ -150,19 +169,37 @@ fn next_string_arg(
 }
 
 fn usage() -> String {
-    "usage: generate-viceroy-config --template <path> --app-config <path> --output <path> [--origin-url <url>] [--provider-endpoint-origin <url>]".to_string()
+    "usage: generate-viceroy-config --template <path> [--app-config <path>] --output <path> [--origin-url <url>] [--public-origin <url>] [--provider-endpoint-origin <url> (requires --app-config)]\nWithout --app-config, retarget the blob in an already generated Viceroy config.".to_string()
 }
 
 fn build_app_config_envelope(
     app_config_toml: &str,
     origin_url: Option<&str>,
+    public_origin: Option<&str>,
     provider_endpoint_origin: Option<&str>,
 ) -> Result<String, DynError> {
     let app_config: TrustedServerAppConfig = toml::from_str(app_config_toml)
         .map_err(|error| error_box(format!("invalid Trusted Server app config: {error}")))?;
+    serialize_app_config_envelope(
+        app_config,
+        origin_url,
+        public_origin,
+        provider_endpoint_origin,
+    )
+}
+
+fn serialize_app_config_envelope(
+    app_config: TrustedServerAppConfig,
+    origin_url: Option<&str>,
+    public_origin: Option<&str>,
+    provider_endpoint_origin: Option<&str>,
+) -> Result<String, DynError> {
     let mut settings = app_config.into_settings();
     if let Some(origin_url) = origin_url {
         settings.publisher.origin_url = origin_url.to_string();
+    }
+    if let Some(public_origin) = public_origin {
+        settings.publisher.public_origin = Some(public_origin.to_string());
     }
     if let Some(origin) = provider_endpoint_origin {
         rewrite_provider_endpoints(&mut settings, origin)?;
@@ -178,6 +215,31 @@ fn build_app_config_envelope(
     let envelope = BlobEnvelope::new(data, GENERATED_AT.to_string());
     serde_json::to_string(&envelope)
         .map_err(|error| error_box(format!("failed to serialize app-config envelope: {error}")))
+}
+
+fn retarget_generated_config(
+    config: &str,
+    origin_url: Option<&str>,
+    public_origin: Option<&str>,
+) -> Result<String, DynError> {
+    let mut config: toml::Value = toml::from_str(config)?;
+    let contents = config
+        .get_mut("local_server")
+        .and_then(|value| value.get_mut("config_stores"))
+        .and_then(|value| value.get_mut(DEFAULT_CONFIG_STORE_ID))
+        .and_then(|value| value.get_mut("contents"))
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| error_box("generated Viceroy config should contain an app-config store"))?;
+    let envelope_json = contents
+        .get(CONFIG_BLOB_KEY)
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| error_box("generated Viceroy config should contain an app-config blob"))?;
+    let envelope: BlobEnvelope = serde_json::from_str(envelope_json)?;
+    envelope.verify()?;
+    let app_config = serde_json::from_value(envelope.data)?;
+    let envelope_json = serialize_app_config_envelope(app_config, origin_url, public_origin, None)?;
+    contents[CONFIG_BLOB_KEY] = toml::Value::String(envelope_json);
+    Ok(toml::to_string(&config)?)
 }
 
 fn inject_generated_config_stores(template: &str, envelope_json: &str) -> Result<String, DynError> {
@@ -211,6 +273,7 @@ mod tests {
     use super::*;
     use error_stack::Report;
     use std::collections::HashMap;
+    use tempfile::tempdir;
     use trusted_server_core::config_payload::settings_from_config_blob;
     use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreId, StoreName};
 
@@ -335,8 +398,9 @@ mod tests {
             "endpoint = \"https://bidder.example.com/api/trace-bidder?route=example\"",
         );
 
-        let envelope = build_app_config_envelope(&app_config, None, Some("http://127.0.0.1:8888"))
-            .expect("should rewrite the provider endpoint onto the loopback origin");
+        let envelope =
+            build_app_config_envelope(&app_config, None, None, Some("http://127.0.0.1:8888"))
+                .expect("should rewrite the provider endpoint onto the loopback origin");
 
         assert_eq!(
             provider_endpoint(&envelope, "example"),
@@ -347,7 +411,7 @@ mod tests {
 
     #[test]
     fn provider_endpoints_are_unchanged_without_provider_endpoint_origin() {
-        let envelope = build_app_config_envelope(TRACE_APP_CONFIG, None, None)
+        let envelope = build_app_config_envelope(TRACE_APP_CONFIG, None, None, None)
             .expect("should build the trace envelope");
 
         assert_eq!(
@@ -367,7 +431,7 @@ mod tests {
             "http://bidder.example.com",
         ] {
             assert!(
-                build_app_config_envelope(TRACE_APP_CONFIG, None, Some(origin)).is_err(),
+                build_app_config_envelope(TRACE_APP_CONFIG, None, None, Some(origin)).is_err(),
                 "should reject `{origin}` as a provider endpoint origin"
             );
         }
@@ -391,19 +455,185 @@ mod tests {
             args,
             Args {
                 template: PathBuf::from("template.toml"),
-                app_config: PathBuf::from("trusted-server.toml"),
+                app_config: Some(PathBuf::from("trusted-server.toml")),
                 output: PathBuf::from("generated.toml"),
                 origin_url: Some("http://127.0.0.1:9999".to_string()),
                 provider_endpoint_origin: None,
+                public_origin: None,
             },
             "should parse expected args"
         );
     }
 
+    fn run_provider_fixture(origin: &str) -> Result<toml::Value, DynError> {
+        let directory = tempdir().expect("should create isolated generator fixture");
+        let template = directory.path().join("template.toml");
+        let app_config = directory.path().join("app.toml");
+        let output = directory.path().join("output.toml");
+        fs::write(&template, TEMPLATE).expect("should write runtime template");
+        fs::write(&app_config, TRACE_APP_CONFIG).expect("should write controlled app config");
+        run(&Args {
+            template,
+            app_config: Some(app_config),
+            output: output.clone(),
+            origin_url: None,
+            provider_endpoint_origin: Some(origin.to_string()),
+            public_origin: Some("http://127.0.0.1:43130".to_string()),
+        })?;
+        Ok(toml::from_str(&fs::read_to_string(output)?)?)
+    }
+
+    #[test]
+    fn controlled_provider_retargets_typed_endpoint_and_keeps_public_origin_independent() {
+        let generated = run_provider_fixture("http://127.0.0.1:8888")
+            .expect("should generate explicit loopback provider endpoints");
+        let read_envelope = |config: &toml::Value| {
+            let envelope: BlobEnvelope = serde_json::from_str(
+                config["local_server"]["config_stores"][DEFAULT_CONFIG_STORE_ID]["contents"]
+                    [CONFIG_BLOB_KEY]
+                    .as_str()
+                    .expect("should retain the app config blob"),
+            )
+            .expect("should parse the app config envelope");
+            envelope
+                .verify()
+                .expect("should verify the generated envelope");
+            envelope.data
+        };
+        let original = read_envelope(&generated);
+        assert_eq!(
+            original["auction"]["providers"]["example"]["endpoint"],
+            "http://127.0.0.1:8888/api/trace-bidder",
+            "should use the explicit typed provider endpoint without legacy backend aliases"
+        );
+        assert_eq!(
+            original["publisher"]["public_origin"], "http://127.0.0.1:43130",
+            "should configure the browser origin independently of the provider"
+        );
+        let retargeted = retarget_generated_config(
+            &toml::to_string(&generated).expect("should serialize the generated config"),
+            None,
+            Some("http://127.0.0.1:43131"),
+        )
+        .expect("should retarget the browser origin");
+        let retargeted: toml::Value =
+            toml::from_str(&retargeted).expect("should parse the retargeted config");
+        let changed = read_envelope(&retargeted);
+        assert_eq!(
+            changed["auction"], original["auction"],
+            "should preserve provider configuration while retargeting the listener"
+        );
+        assert_eq!(
+            changed["publisher"]["public_origin"], "http://127.0.0.1:43131",
+            "should apply the new browser-facing origin"
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_provider_endpoint_override_without_app_config() {
+        let result = parse_args([
+            "--template".to_string(),
+            "generated.toml".to_string(),
+            "--output".to_string(),
+            "runtime.toml".to_string(),
+            "--provider-endpoint-origin".to_string(),
+            "http://127.0.0.1:8888".to_string(),
+        ]);
+        assert!(
+            result.is_err(),
+            "should not silently ignore bidder injection when retargeting an existing blob"
+        );
+    }
+
+    #[test]
+    fn parse_args_accepts_retargeting_an_existing_config() {
+        let args = parse_args([
+            "--template".to_string(),
+            "generated.toml".to_string(),
+            "--output".to_string(),
+            "runtime.toml".to_string(),
+            "--public-origin".to_string(),
+            "http://127.0.0.1:43125".to_string(),
+        ])
+        .expect("should parse runtime retargeting args");
+
+        assert_eq!(
+            args.app_config, None,
+            "should reuse the embedded app config"
+        );
+        assert_eq!(
+            args.public_origin.as_deref(),
+            Some("http://127.0.0.1:43125"),
+            "should parse the runtime listener origin"
+        );
+    }
+
+    #[test]
+    fn generated_blob_applies_public_origin_independently_of_upstream() {
+        let json = build_app_config_envelope(
+            APP_CONFIG,
+            Some("http://127.0.0.1:9999"),
+            Some("http://127.0.0.1:43126"),
+            None,
+        )
+        .expect("should build runtime-specific config");
+        let envelope: BlobEnvelope =
+            serde_json::from_str(&json).expect("should parse runtime-specific envelope");
+        envelope
+            .verify()
+            .expect("should verify runtime-specific envelope");
+        assert_eq!(
+            envelope.data["publisher"]["origin_url"], "http://127.0.0.1:9999",
+            "should apply the upstream origin override"
+        );
+        assert_eq!(
+            envelope.data["publisher"]["public_origin"], "http://127.0.0.1:43126",
+            "should apply the public listener origin override"
+        );
+    }
+
+    #[test]
+    fn retargeting_generated_config_preserves_resources_and_app_policy() {
+        let json = build_app_config_envelope(APP_CONFIG, Some("http://127.0.0.1:9999"), None, None)
+            .expect("should build original envelope");
+        let generated = inject_generated_config_stores(TEMPLATE, &json)
+            .expect("should generate original config");
+        let original: toml::Value =
+            toml::from_str(&generated).expect("should parse original config");
+
+        for port in [43127, 43128] {
+            let public_origin = format!("http://127.0.0.1:{port}");
+            let retargeted = retarget_generated_config(&generated, None, Some(&public_origin))
+                .expect("should retarget existing config");
+            let mut retargeted: toml::Value =
+                toml::from_str(&retargeted).expect("should parse retargeted config");
+            let contents = &mut retargeted["local_server"]["config_stores"]
+                [DEFAULT_CONFIG_STORE_ID]["contents"];
+            let envelope: BlobEnvelope = serde_json::from_str(
+                contents[CONFIG_BLOB_KEY]
+                    .as_str()
+                    .expect("should contain a blob"),
+            )
+            .expect("should parse retargeted envelope");
+            envelope
+                .verify()
+                .expect("should verify retargeted envelope");
+            let mut expected: BlobEnvelope =
+                serde_json::from_str(&json).expect("should parse original envelope");
+            expected.data["publisher"]["public_origin"] = serde_json::json!(public_origin);
+            assert_eq!(
+                envelope.data, expected.data,
+                "should change only public_origin"
+            );
+            contents[CONFIG_BLOB_KEY] = toml::Value::String(json.clone());
+            assert_eq!(retargeted, original, "should preserve Viceroy resources");
+        }
+    }
+
     #[test]
     fn generated_config_contains_blob_without_removed_rollout_flags() {
         let envelope =
-            build_app_config_envelope(APP_CONFIG, None, None).expect("should build envelope");
+            build_app_config_envelope(APP_CONFIG, None, None, None).expect("should build envelope");
         let generated = inject_generated_config_stores(TEMPLATE, &envelope)
             .expect("should inject generated stores");
 
@@ -430,7 +660,7 @@ mod tests {
     #[test]
     fn generated_config_is_valid_toml() {
         let envelope =
-            build_app_config_envelope(APP_CONFIG, None, None).expect("should build envelope");
+            build_app_config_envelope(APP_CONFIG, None, None, None).expect("should build envelope");
         let generated = inject_generated_config_stores(TEMPLATE, &envelope)
             .expect("should inject generated stores");
         let parsed: toml::Value = toml::from_str(&generated).expect("should parse as TOML");
@@ -446,8 +676,9 @@ mod tests {
 
     #[test]
     fn generated_blob_verifies_and_applies_origin_override() {
-        let envelope = build_app_config_envelope(APP_CONFIG, Some("http://127.0.0.1:9999"), None)
-            .expect("should build envelope");
+        let envelope =
+            build_app_config_envelope(APP_CONFIG, Some("http://127.0.0.1:9999"), None, None)
+                .expect("should build envelope");
         let settings = settings_from_config_blob(
             &envelope,
             &integration_secret_store(),
@@ -463,7 +694,7 @@ mod tests {
 
     #[test]
     fn invalid_app_config_fails() {
-        let result = build_app_config_envelope("not valid toml", None, None);
+        let result = build_app_config_envelope("not valid toml", None, None, None);
 
         assert!(result.is_err(), "should reject invalid app config");
     }
@@ -472,12 +703,22 @@ mod tests {
     fn invalid_non_secret_app_config_fails_before_envelope_generation() {
         let invalid = APP_CONFIG.replace("domain = \"localhost\"", "domain = \"invalid/domain\"");
 
-        let err = build_app_config_envelope(&invalid, None, None)
+        let err = build_app_config_envelope(&invalid, None, None, None)
             .expect_err("should reject invalid non-secret config before creating an envelope");
 
         assert!(
             err.to_string().contains("invalid_publisher_domain"),
             "error should identify the structural validation failure: {err}"
+        );
+    }
+
+    #[test]
+    fn retargeting_a_template_without_a_generated_blob_fails() {
+        let result = retarget_generated_config(TEMPLATE, None, Some("http://127.0.0.1:43129"));
+
+        assert!(
+            result.is_err(),
+            "should reject config without an embedded app-config blob"
         );
     }
 

@@ -694,8 +694,22 @@ impl TrustedServerApp {
 fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
     let fallback = fallback_handler(Arc::clone(state));
     let trace_state = Arc::clone(state);
+    let forwarder_settings = Arc::clone(&state.settings);
 
     let mut router = RouterService::builder()
+        .received_head_preparer(move |headers, extensions| {
+            if extensions
+                .get::<trusted_server_core::forwarder::ForwarderPreparation>()
+                .is_none()
+            {
+                extensions.insert(
+                    trusted_server_core::forwarder::ForwarderPreparation::capture(
+                        headers,
+                        &forwarder_settings,
+                    ),
+                );
+            }
+        })
         .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
             Arc::clone(&state.settings),
             Arc::new(move |request| trace_metadata(&trace_state, request)),

@@ -664,7 +664,7 @@ mod tests {
         client
             .requests()
             .iter()
-            .map(|request| request.cache_policy)
+            .map(|request| request.cache_policy.clone())
             .collect()
     }
 

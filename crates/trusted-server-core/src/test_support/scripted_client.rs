@@ -417,7 +417,7 @@ pub struct RecordedRequest {
 }
 
 /// Transport settings a readback test expects one recorded request to carry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpectedTransport {
     /// Per-call timeout.
     pub timeout: Duration,
@@ -501,7 +501,7 @@ impl RecordedRequest {
             (
                 self.response_mode,
                 self.response_decoding,
-                self.cache_policy
+                self.cache_policy.clone()
             ),
             (
                 expected.response_mode,
@@ -1306,7 +1306,7 @@ mod tests {
         );
         assert_eq!(
             (
-                bid.cache_policy,
+                bid.cache_policy.clone(),
                 bid.response_decoding,
                 bid.max_decoded_response_bytes,
                 bid.max_encoded_response_bytes

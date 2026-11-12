@@ -661,10 +661,12 @@ fn actual_runtime() -> HarnessResult<()> {
         cases.push("streaming");
     }
     let mut baseline = Vec::new();
+    let mut baseline_origin_stamp = String::new();
     for case in cases {
         harness.cancellation.check()?;
+        let port = available_port()?;
         // Auction controls deliberately use an unreachable bidder and verify empty-bid assembly.
-        let config = config::fixture_config(&template, case, origin.port, available_port()?)?;
+        let config = config::fixture_config(&template, case, origin.port, available_port()?, port)?;
         fs::write(harness.workspace.join("trusted-server.toml"), config)
             .change_context(HarnessError::Io)?;
         fs::write(harness.workspace.join("fastly.toml"), "manifest_version = 3\nname = 'example-finalization'\nlanguage = 'rust'\n[local_server]\n").change_context(HarnessError::Io)?;
@@ -672,7 +674,6 @@ fn actual_runtime() -> HarnessResult<()> {
         if matches!(adapter.as_str(), "fastly" | "spin") {
             harness.push(&adapter)?;
         }
-        let port = available_port()?;
         let log = harness.workspace.join(format!("{case}.log"));
         let output = File::create(&log).change_context(HarnessError::Io)?;
         let mut command = harness.runtime_command(&adapter, &artifact, port)?;
@@ -743,6 +744,28 @@ fn actual_runtime() -> HarnessResult<()> {
             "should serve {case} HTML; see {}",
             log.display()
         );
+        let origin_stamp = format!("data-ts-public-origin=\"{base_url}\"");
+        assert_eq!(
+            String::from_utf8_lossy(&body)
+                .matches(&origin_stamp)
+                .count(),
+            1,
+            "should stamp the configured origin of this case's listener"
+        );
+        // Cases use separate listeners. Only their declared runtime-origin stamp
+        // may differ before applying the approved EOF transformation.
+        let expected_baseline = if baseline.is_empty() {
+            Vec::new()
+        } else {
+            let html = std::str::from_utf8(&baseline).expect("should retain UTF-8 baseline HTML");
+            assert_eq!(
+                html.matches(&baseline_origin_stamp).count(),
+                1,
+                "should retain exactly one baseline runtime-origin stamp"
+            );
+            html.replace(&baseline_origin_stamp, &origin_stamp)
+                .into_bytes()
+        };
         match case {
             "disabled" => {
                 assert!(
@@ -751,11 +774,12 @@ fn actual_runtime() -> HarnessResult<()> {
                     "should preserve disabled output"
                 );
                 baseline = body.clone();
+                baseline_origin_stamp = origin_stamp;
             }
             "success" => {
                 assert_eq!(
                     body,
-                    String::from_utf8_lossy(&baseline)
+                    String::from_utf8_lossy(&expected_baseline)
                         .replace("EXAMPLE_UNSIGNED", "EXAMPLE_FINALIZED")
                         .as_bytes(),
                     "should emit the exact approved rewrite"
@@ -766,7 +790,7 @@ fn actual_runtime() -> HarnessResult<()> {
                 );
             }
             "streaming" => {
-                let mut expected = baseline.clone();
+                let mut expected = expected_baseline;
                 expected.extend_from_slice(b"<!--example-async-eof-complete-->");
                 assert_eq!(body, expected, "should append only the EOF output");
             }
@@ -787,8 +811,8 @@ fn actual_runtime() -> HarnessResult<()> {
             }
             _ => {
                 assert_eq!(
-                    body, baseline,
-                    "should emit byte-identical timeout fallback"
+                    body, expected_baseline,
+                    "should emit byte-identical timeout fallback apart from its listener stamp"
                 );
                 assert!(
                     (Duration::from_millis(600)..Duration::from_secs(3))
