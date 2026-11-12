@@ -21,7 +21,7 @@
 // `cfg(test)` allow does not cover, and it buffers scripted bodies.
 #![allow(clippy::disallowed_methods)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::mem;
@@ -434,7 +434,8 @@ impl RecordedRequest {
     ///
     /// Checks a one second connect timeout, no caller deadline, no Image Optimizer options, the
     /// proxy marker off, the URI authority sent upstream with no override, and the timeout,
-    /// response mode, decoding, and cache policy in `expected`.
+    /// response mode, decoding, and cache policy in `expected`. A failure names the request by
+    /// its method only, never its URI or the authority it sent.
     ///
     /// # Panics
     ///
@@ -476,7 +477,8 @@ impl RecordedRequest {
         deadline: Option<Deadline>,
         image_optimizer: Option<&OutboundImageOptimizerOptions>,
     ) {
-        let request = format!("{} {}", self.method, self.uri);
+        // The request is named by its method only: its URI can carry a credential.
+        let request = format!("the {} request", self.method);
         assert_eq!(
             self.connect_timeout,
             Some(Duration::from_secs(1)),
@@ -515,15 +517,10 @@ impl RecordedRequest {
             OutboundProxyMarker::Off,
             "should send {request} with the proxy marker off"
         );
-        assert_eq!(
-            (
-                Some(self.host_authority.as_str()),
-                self.has_host_authority_override
-            ),
-            (
-                self.uri.authority().map(http::uri::Authority::as_str),
-                false
-            ),
+        assert!(
+            !self.has_host_authority_override
+                && self.uri.authority().map(http::uri::Authority::as_str)
+                    == Some(self.host_authority.as_str()),
             "should send {request} to its URI authority with no override"
         );
     }
@@ -531,33 +528,71 @@ impl RecordedRequest {
     /// Asserts the recorded headers are exactly `expected`, in any order.
     ///
     /// Names compare case-insensitively. `Host`, `Content-Length`, and hop-by-hop fields never
-    /// appear here, because `EdgeZero` strips them before dispatch.
+    /// appear here, because `EdgeZero` strips them before dispatch. A failure names the missing,
+    /// unexpected, and differing headers only. It never prints a header value or the request
+    /// URI, because either can carry a credential.
     ///
     /// # Panics
     ///
-    /// Panics when a header is missing, extra, or carries another value, or when a recorded
+    /// Panics when a header is missing, extra, or carries other values, or when a recorded
     /// value is not UTF-8.
     pub fn assert_headers(&self, expected: &[(&str, &str)]) {
-        let mut actual: Vec<(String, String)> = self
-            .headers
-            .iter()
-            .map(|(name, value)| {
-                let value = value.to_str().expect("should record UTF-8 header values");
-                (name.as_str().to_owned(), value.to_owned())
-            })
-            .collect();
-        let mut expected: Vec<(String, String)> = expected
-            .iter()
-            .map(|(name, value)| (name.to_ascii_lowercase(), (*value).to_owned()))
-            .collect();
-        actual.sort();
-        expected.sort();
         assert_eq!(
-            actual, expected,
-            "should send {} {} with exactly the expected headers",
-            self.method, self.uri
+            self.header_mismatch(expected),
+            HeaderMismatch::default(),
+            "should send exactly the expected headers"
         );
     }
+
+    /// Compares the recorded headers with `expected` by name, in any order.
+    fn header_mismatch(&self, expected: &[(&str, &str)]) -> HeaderMismatch {
+        let mut sent: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for (name, value) in &self.headers {
+            let value = value.to_str().expect("should record UTF-8 header values");
+            sent.entry(name.as_str().to_owned())
+                .or_default()
+                .push(value);
+        }
+        let mut wanted: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for (name, value) in expected {
+            wanted
+                .entry(name.to_ascii_lowercase())
+                .or_default()
+                .push(value);
+        }
+        for values in sent.values_mut().chain(wanted.values_mut()) {
+            values.sort_unstable();
+        }
+
+        HeaderMismatch {
+            missing: wanted
+                .keys()
+                .filter(|name| !sent.contains_key(*name))
+                .cloned()
+                .collect(),
+            unexpected: sent
+                .keys()
+                .filter(|name| !wanted.contains_key(*name))
+                .cloned()
+                .collect(),
+            differing: wanted
+                .iter()
+                .filter(|(name, values)| sent.get(*name).is_some_and(|sent| sent != *values))
+                .map(|(name, _)| name.clone())
+                .collect(),
+        }
+    }
+}
+
+/// The header names a [`RecordedRequest`] got wrong, without their values.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HeaderMismatch {
+    /// Expected names the request did not send.
+    missing: Vec<String>,
+    /// Sent names the test did not expect.
+    unexpected: Vec<String>,
+    /// Names sent with other values than the test expected.
+    differing: Vec<String>,
 }
 
 /// A scripted `EdgeZero` outbound client that records requests and answers them from a script.
@@ -1666,6 +1701,66 @@ mod tests {
             uri("/forbidden"),
             "should record its URI"
         );
+    }
+
+    #[test]
+    fn header_mismatch_names_headers_without_their_values() {
+        let client = ScriptedHttpClient::forbidding();
+        let request = get("/headers?example=query-value")
+            .header("authorization", "Bearer sent-value")
+            .expect("should add the authorization header")
+            .header("x-extra", "extra-value")
+            .expect("should add the extra header");
+        block_on(client.http_client().send(request)).expect_err("should fail every request");
+        let recorded = client.requests();
+
+        let mismatch = recorded[0].header_mismatch(&[
+            ("Authorization", "Bearer expected-value"),
+            ("accept", "application/json"),
+        ]);
+
+        assert_eq!(
+            mismatch,
+            HeaderMismatch {
+                missing: vec!["accept".to_owned()],
+                unexpected: vec!["x-extra".to_owned()],
+                differing: vec!["authorization".to_owned()],
+            },
+            "should name each wrong header"
+        );
+        let rendered = format!("{mismatch:?}");
+        for fragment in [
+            "sent-value",
+            "expected-value",
+            "extra-value",
+            "application/json",
+            "query-value",
+            "example.com",
+        ] {
+            assert!(
+                !rendered.contains(fragment),
+                "should leave `{fragment}` out of the failure output"
+            );
+        }
+    }
+
+    #[test]
+    fn header_mismatch_is_empty_for_the_same_headers_in_any_order_and_case() {
+        let client = ScriptedHttpClient::forbidding();
+        let request = get("/headers")
+            .header("x-example", "one")
+            .expect("should add the first value")
+            .header("accept", "application/json")
+            .expect("should add the accept header")
+            .header("x-example", "two")
+            .expect("should add the second value");
+        block_on(client.http_client().send(request)).expect_err("should fail every request");
+
+        client.requests()[0].assert_headers(&[
+            ("Accept", "application/json"),
+            ("x-example", "two"),
+            ("X-Example", "one"),
+        ]);
     }
 
     #[test]
