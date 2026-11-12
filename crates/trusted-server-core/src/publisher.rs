@@ -5439,7 +5439,7 @@ pub async fn handle_publisher_request(
         })?);
     }
     if should_preload_ec && let (Some(graph), Some(active_ec_id)) = (kv, active_ec_id) {
-        let refreshed = graph.load_snapshot(active_ec_id);
+        let refreshed = graph.load_snapshot(active_ec_id).await;
         // Never downgrade an in-request Add-confirmed Present snapshot: a
         // freshly created row can read back Missing/Failed on an
         // eventually-consistent store, and rotating or suppressing that
@@ -7927,7 +7927,7 @@ pub async fn handle_page_bids(
             // EIDs. Kill-switch, no-slot, bot/prefetch, and no-registry requests
             // never reach here, so they incur no billable KV read.
             let page_bids_kv_snapshot = match (kv, ec_id.as_deref(), auction.registry) {
-                (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
+                (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id).await,
                 _ => crate::ec::EcKvSnapshot::NotRead,
             };
             // Hand the loaded row to the request context so response
@@ -8728,37 +8728,41 @@ mod tests {
         ok: bool,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl EcKvStore for OrderRecordingKv {
         fn store_name(&self) -> &str {
             self.inner.store_name()
         }
-        fn lookup(&self, _key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+        async fn lookup(
+            &self,
+            _key: &str,
+        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
             self.lookups.fetch_add(1, Ordering::SeqCst);
             self.http_calls_at_lookup
                 .store(self.http.origin_requests().len(), Ordering::SeqCst);
             // Report a miss: the scheduling assertions only care about ordering.
             Ok(None)
         }
-        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-            self.inner.key_exists(key)
+        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key).await
         }
 
-        fn insert(
+        async fn insert(
             &self,
             key: &str,
             write: EcKvWrite<'_>,
         ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
-            self.inner.insert(key, write)
+            self.inner.insert(key, write).await
         }
-        fn list_keys_with_prefix(
+        async fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
         ) -> Result<Vec<String>, Report<TrustedServerError>> {
-            self.inner.list_keys_with_prefix(prefix, limit)
+            self.inner.list_keys_with_prefix(prefix, limit).await
         }
-        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
-            self.inner.delete(key)
+        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key).await
         }
     }
 
@@ -15718,6 +15722,7 @@ mod tests {
                                 crate::ec::current_timestamp(),
                             ),
                         )
+                        .await
                         .expect("should seed a live reader identity");
                 }
                 let registry = IntegrationRegistry::new(&settings)
@@ -15809,7 +15814,8 @@ mod tests {
                         None,
                         None,
                         &mut response,
-                    );
+                    )
+                    .await;
                     assert_eq!(
                         response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
                         if index == 0 { "miss-stored" } else { "hit" },
@@ -15891,6 +15897,7 @@ mod tests {
                 for (index, identity) in identities.iter().enumerate() {
                     let (entry, _) = graph
                         .get(identity)
+                        .await
                         .expect("should read reader identity")
                         .expect("should retain the live row or its tombstone");
                     assert_eq!(

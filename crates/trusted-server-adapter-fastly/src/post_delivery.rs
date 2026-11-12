@@ -344,7 +344,7 @@ mod tests {
     }
 
     /// Finalize state for a returning browser whose EC row the local store holds.
-    fn returning_reader_state(settings: &Settings) -> FinalizeState {
+    async fn returning_reader_state(settings: &Settings) -> FinalizeState {
         let request = edgezero_core::http::request_builder()
             .uri("https://test-publisher.example.com/article")
             .header("cookie", format!("ts-ec={}", seeded_ec_id()))
@@ -366,7 +366,7 @@ mod tests {
             EcContext::read_from_request_with_geo(settings, &request, &test_services(), Some(&geo))
                 .expect("should read the reader's EC context");
         let kv = require_identity_graph(settings).expect("should open the local identity store");
-        ec_context.set_kv_snapshot(kv.load_snapshot(&seeded_ec_id()));
+        ec_context.set_kv_snapshot(kv.load_snapshot(&seeded_ec_id()).await);
         FinalizeState {
             partner_registry: PartnerRegistry::from_config(&settings.ec.partners)
                 .expect("should build the partner registry"),
@@ -397,7 +397,7 @@ mod tests {
             );
         let settings = pull_sync_settings();
         let (queue, _body) = queue_with_one_auction();
-        let state = returning_reader_state(&settings);
+        let state = futures::executor::block_on(returning_reader_state(&settings));
 
         // The origin aborted after the page head was committed.
         handle_delivery(
@@ -435,7 +435,7 @@ mod tests {
         let client = ScriptedHttpClient::forbidding();
         let clock = TestClock::new();
         let settings = pull_sync_settings();
-        let state = returning_reader_state(&settings);
+        let state = futures::executor::block_on(returning_reader_state(&settings));
         let mut state = Some(state);
 
         handle_delivery(

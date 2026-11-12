@@ -43,8 +43,9 @@ const MAX_BODY_SIZE: usize = 2 * 1024 * 1024;
 
 use super::kv_types::MAX_UID_LENGTH;
 
+#[async_trait::async_trait(?Send)]
 trait BatchSyncWriter {
-    fn upsert_partner_id_if_exists(
+    async fn upsert_partner_id_if_exists(
         &self,
         ec_id: &str,
         partner_id: &str,
@@ -52,14 +53,15 @@ trait BatchSyncWriter {
     ) -> Result<UpsertResult, Report<TrustedServerError>>;
 }
 
+#[async_trait::async_trait(?Send)]
 impl BatchSyncWriter for KvIdentityGraph {
-    fn upsert_partner_id_if_exists(
+    async fn upsert_partner_id_if_exists(
         &self,
         ec_id: &str,
         partner_id: &str,
         uid: &str,
     ) -> Result<UpsertResult, Report<TrustedServerError>> {
-        KvIdentityGraph::upsert_partner_id_if_exists(self, ec_id, partner_id, uid)
+        KvIdentityGraph::upsert_partner_id_if_exists(self, ec_id, partner_id, uid).await
     }
 }
 
@@ -175,7 +177,7 @@ async fn handle_batch_sync_with_writer(
     }
 
     // 4. Process mappings with per-item validation and rejection reasons.
-    let (accepted, errors) = process_mappings(writer, &partner.source_domain, &body.mappings);
+    let (accepted, errors) = process_mappings(writer, &partner.source_domain, &body.mappings).await;
 
     let rejected = errors.len();
     let status = if rejected > 0 {
@@ -199,7 +201,7 @@ async fn handle_batch_sync_with_writer(
 /// group. On infrastructure failure, the failing group and all unprocessed
 /// valid groups are rejected as unavailable; already validated invalid inputs
 /// keep their specific errors. Errors are sorted by original input index.
-fn process_mappings(
+async fn process_mappings(
     writer: &dyn BatchSyncWriter,
     partner_id: &str,
     mappings: &[SyncMapping],
@@ -244,7 +246,10 @@ fn process_mappings(
 
     let mut accepted = 0;
     for (group_index, group) in groups.iter().enumerate() {
-        match writer.upsert_partner_id_if_exists(&group.ec_id, partner_id, &group.partner_uid) {
+        match writer
+            .upsert_partner_id_if_exists(&group.ec_id, partner_id, &group.partner_uid)
+            .await
+        {
             Ok(UpsertResult::Written | UpsertResult::Unchanged) => {
                 accepted += group.indexes.len();
             }
@@ -369,8 +374,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl BatchSyncWriter for MockWriter {
-        fn upsert_partner_id_if_exists(
+        async fn upsert_partner_id_if_exists(
             &self,
             ec_id: &str,
             partner_id: &str,
@@ -465,8 +471,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_batch_sync_uses_post_read_limit_for_malformed_content_length() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_uses_post_read_limit_for_malformed_content_length() {
         let writer = MockWriter::new(vec![]);
         let registry = test_registry();
         let limiter = MockRateLimiter {
@@ -566,8 +572,8 @@ mod tests {
         assert!(writer.calls().is_empty(), "should not write any mapping");
     }
 
-    #[test]
-    fn process_mappings_returns_multistatus_errors_per_mapping() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_returns_multistatus_errors_per_mapping() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         let mappings = vec![
             mapping("x", "u1", 1),
@@ -575,7 +581,7 @@ mod tests {
             mapping(&format!("{}.ABC123", "a".repeat(64)), "u3", 1),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 1, "should count successful writes as accepted");
         assert_eq!(errors.len(), 2, "should reject invalid mappings only");
@@ -585,8 +591,8 @@ mod tests {
         assert_eq!(errors[1].reason, REASON_INVALID_PARTNER_UID);
     }
 
-    #[test]
-    fn process_mappings_aborts_on_kv_unavailable() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_aborts_on_kv_unavailable() {
         let writer = MockWriter::new(vec![
             Ok(UpsertResult::Written),
             Err(Report::new(TrustedServerError::KvStore {
@@ -601,7 +607,7 @@ mod tests {
             mapping(&format!("{}.ABC123", "c".repeat(64)), "u3", 1),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 1, "should keep accepted count before failure");
         assert_eq!(
@@ -620,8 +626,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_batch_sync_rejects_missing_auth() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_rejects_missing_auth() {
         let kv = KvIdentityGraph::failing("test_store");
         let registry = PartnerRegistry::empty();
         let limiter = MockRateLimiter {
@@ -686,8 +692,8 @@ mod tests {
         assert_eq!(json["errors"][0]["reason"], REASON_INELIGIBLE);
     }
 
-    #[test]
-    fn process_mappings_collapses_missing_and_withdrawn_to_ineligible() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_collapses_missing_and_withdrawn_to_ineligible() {
         let writer = MockWriter::new(vec![
             Ok(UpsertResult::NotFound),
             Ok(UpsertResult::ConsentWithdrawn),
@@ -699,7 +705,7 @@ mod tests {
             mapping(&withdrawn_ec_id, "uid-2", 101),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 0, "should not accept ineligible mappings");
         assert_eq!(errors.len(), 2, "should report both errors");
@@ -710,13 +716,13 @@ mod tests {
         assert_eq!(writer.calls().len(), 2, "should exercise both outcomes");
     }
 
-    #[test]
-    fn process_mappings_fans_out_unchanged_to_group_members() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_fans_out_unchanged_to_group_members() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Unchanged)]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = vec![mapping(&ec_id, "uid-1", 100), mapping(&ec_id, "uid-1", 101)];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 2, "should accept every unchanged group member");
         assert!(
@@ -726,8 +732,8 @@ mod tests {
         assert_eq!(writer.calls().len(), 1, "should call once for the group");
     }
 
-    #[test]
-    fn process_mappings_does_not_order_by_timestamp() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_does_not_order_by_timestamp() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = vec![
@@ -735,7 +741,7 @@ mod tests {
             mapping(&ec_id, "uid-old", 100),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(
             accepted, 2,
@@ -753,8 +759,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_mappings_groups_normalized_ids_in_first_occurrence_order() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_groups_normalized_ids_in_first_occurrence_order() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written), Ok(UpsertResult::Unchanged)]);
         let ec_id_a = format!("{}.ABC123", "a".repeat(64));
         let ec_id_a_upper = format!("{}.ABC123", "A".repeat(64));
@@ -765,7 +771,7 @@ mod tests {
             mapping(&ec_id_a_upper, "a-last", 3),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 3, "should accept every valid group member");
         assert!(errors.is_empty(), "should report no errors");
@@ -787,15 +793,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_mappings_bounds_writer_calls_at_max_batch_size() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_bounds_writer_calls_at_max_batch_size() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = (0..MAX_BATCH_SIZE)
             .map(|index| mapping(&ec_id, &format!("uid-{index}"), index as u64))
             .collect::<Vec<_>>();
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(
             accepted, MAX_BATCH_SIZE,
@@ -813,8 +819,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_mappings_keeps_suffix_case_distinct() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_keeps_suffix_case_distinct() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written), Ok(UpsertResult::Written)]);
         let upper_suffix = format!("{}.ABC123", "a".repeat(64));
         let mixed_suffix = format!("{}.AbC123", "a".repeat(64));
@@ -823,7 +829,7 @@ mod tests {
             mapping(&mixed_suffix, "mixed", 2),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 2, "should accept both distinct EC IDs");
         assert!(errors.is_empty(), "should report no errors");
@@ -845,8 +851,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_mappings_invalid_duplicate_does_not_replace_last_valid_uid() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_invalid_duplicate_does_not_replace_last_valid_uid() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = vec![
@@ -855,7 +861,7 @@ mod tests {
             mapping(&ec_id, "   ", 3),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 2, "should accept valid group members");
         assert_eq!(errors.len(), 1, "should retain the invalid UID error");
@@ -868,8 +874,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_mappings_fans_out_ineligible_outcomes_to_group_members() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_fans_out_ineligible_outcomes_to_group_members() {
         let writer = MockWriter::new(vec![
             Ok(UpsertResult::NotFound),
             Ok(UpsertResult::ConsentWithdrawn),
@@ -883,7 +889,7 @@ mod tests {
             mapping(&ec_id_b, "b-2", 4),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 0, "should reject all ineligible group members");
         assert_eq!(
@@ -903,8 +909,8 @@ mod tests {
         assert_eq!(writer.calls().len(), 2, "should call once per group");
     }
 
-    #[test]
-    fn process_mappings_aborts_by_group_and_preserves_sorted_accounting() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_aborts_by_group_and_preserves_sorted_accounting() {
         let writer = MockWriter::new(vec![
             Ok(UpsertResult::Written),
             Err(Report::new(TrustedServerError::KvStore {
@@ -924,7 +930,7 @@ mod tests {
             mapping(&ec_id_c, "", 6),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(
             accepted, 2,
@@ -955,8 +961,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_batch_sync_accepts_every_member_of_a_written_group() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_accepts_every_member_of_a_written_group() {
         let registry = test_registry();
         let limiter = MockRateLimiter {
             should_exceed: false,
@@ -985,8 +991,8 @@ mod tests {
         assert_eq!(json["rejected"], 0, "should reject no group members");
     }
 
-    #[test]
-    fn handle_batch_sync_rejects_every_member_of_an_ineligible_group() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_rejects_every_member_of_an_ineligible_group() {
         let registry = test_registry();
         let limiter = MockRateLimiter {
             should_exceed: false,
@@ -1023,8 +1029,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_batch_sync_reports_validation_errors_without_writer_calls() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_reports_validation_errors_without_writer_calls() {
         let writer = MockWriter::new(vec![]);
         let registry = test_registry();
         let limiter = MockRateLimiter {
@@ -1060,8 +1066,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_batch_sync_reports_grouped_infrastructure_failure() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_reports_grouped_infrastructure_failure() {
         let writer = MockWriter::new(vec![
             Ok(UpsertResult::Written),
             Err(Report::new(TrustedServerError::KvStore {
