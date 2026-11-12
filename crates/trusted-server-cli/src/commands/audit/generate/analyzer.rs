@@ -11,6 +11,8 @@ use crate::commands::audit::generate::{
 };
 use crate::error::{CliResult, report_error};
 
+const LOCKR_APP_ID_SELECTOR: &str = "meta[name=\"lockr-signin-app_id\"]";
+
 static GTM_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bGTM-[A-Z0-9]{4,20}\b").expect("should compile GTM regex"));
 static GPT_INLINE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -65,6 +67,26 @@ pub(crate) fn analyze_collected_page(collected: &CollectedPage) -> CliResult<Aud
         ));
     }
 
+    let lockr_selector =
+        Selector::parse(LOCKR_APP_ID_SELECTOR).expect("should parse lockr app ID selector");
+    let mut lockr_metadata = document.select(&lockr_selector).peekable();
+    if lockr_metadata.peek().is_some() {
+        integrations.insert("lockr".to_string(), LOCKR_APP_ID_SELECTOR.to_string());
+    }
+    let mut lockr_app_ids = lockr_metadata
+        .filter_map(|element| element.value().attr("content"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let lockr_app_id = lockr_app_ids.next().map(ToOwned::to_owned);
+    if let Some(first) = &lockr_app_id
+        && lockr_app_ids.any(|other| other != first.as_str())
+    {
+        warnings.push(
+            "page carries more than one distinct lockr app ID; the draft uses the first"
+                .to_string(),
+        );
+    }
+
     for tag in &collected.script_tags {
         if let Some(src) = &tag.src {
             if let Ok(asset_url) = final_url.join(src) {
@@ -113,6 +135,7 @@ pub(crate) fn analyze_collected_page(collected: &CollectedPage) -> CliResult<Aud
         .or(derived_title);
 
     Ok(AuditArtifact {
+        lockr_app_id,
         audited_url: final_url.to_string(),
         page_title,
         js_asset_count: assets.len(),
@@ -313,6 +336,46 @@ mod tests {
                 .any(|integration| integration.id == "gpt"),
             "should detect GPT from browser collected scripts"
         );
+    }
+
+    #[test]
+    fn analyze_collected_page_warns_only_on_distinct_lockr_app_ids() {
+        for (other_id, conflicting) in [(" first-app-id ", false), ("second-app-id", true)] {
+            let collected = CollectedPage {
+                requested_url: "https://publisher.example/page".to_string(),
+                final_url: "https://publisher.example/page".to_string(),
+                page_title: None,
+                html: format!(
+                    r#"<meta name="lockr-signin-app_id"><meta name="lockr-signin-app_id" content=" "><meta name="lockr-signin-app_id" content=" first-app-id "><meta name="lockr-signin-app_id" content="{other_id}"><meta name="lockr-signin-app_id" content="{other_id}">"#
+                ),
+                script_tags: Vec::new(),
+                network_requests: Vec::new(),
+                gpt_slots: Vec::new(),
+                links: Vec::new(),
+                sitemap_locs: Vec::new(),
+                warnings: vec!["existing warning".to_string()],
+            };
+
+            let artifact =
+                analyze_collected_page(&collected).expect("should analyze collected page");
+
+            assert_eq!(
+                artifact.lockr_app_id.as_deref(),
+                Some("first-app-id"),
+                "should retain the first nonempty normalized ID"
+            );
+            let mut expected_warnings = vec!["existing warning".to_string()];
+            if conflicting {
+                expected_warnings.push(
+                    "page carries more than one distinct lockr app ID; the draft uses the first"
+                        .to_string(),
+                );
+            }
+            assert_eq!(
+                artifact.warnings, expected_warnings,
+                "should preserve existing warnings and warn once only for distinct IDs without echoing them"
+            );
+        }
     }
 
     #[test]
@@ -559,6 +622,7 @@ mod tests {
             "https://tags.example.com/gtm.js?id=GTM-ABC123&l=dataLayer",
         ] {
             let artifact = AuditArtifact {
+                lockr_app_id: None,
                 audited_url: "https://example.com".to_string(),
                 page_title: None,
                 js_asset_count: 0,
@@ -600,6 +664,7 @@ mod tests {
 
             let evidence = format!("https://tags.example.com/gtm.js?id={container_id}&l=dataLayer");
             let mut artifact = AuditArtifact {
+                lockr_app_id: None,
                 audited_url: "https://publisher.example.com".to_string(),
                 page_title: None,
                 js_asset_count: 0,
@@ -648,6 +713,7 @@ mod tests {
             ("https://tags.example.com/gtm.js?id=GTM-ABC", "GTM-BBB222"),
         ] {
             let artifact = AuditArtifact {
+                lockr_app_id: None,
                 audited_url: "https://publisher.example.com".to_string(),
                 page_title: None,
                 js_asset_count: 1,
@@ -677,6 +743,7 @@ mod tests {
     #[test]
     fn extract_gtm_container_id_reads_query_parameter_urls() {
         let artifact = AuditArtifact {
+            lockr_app_id: None,
             audited_url: "https://publisher.example".to_string(),
             page_title: None,
             js_asset_count: 1,
@@ -703,6 +770,7 @@ mod tests {
     #[test]
     fn artifact_serialization_uses_expected_shape() {
         let artifact = AuditArtifact {
+            lockr_app_id: None,
             audited_url: "https://publisher.example".to_string(),
             page_title: None,
             js_asset_count: 1,
