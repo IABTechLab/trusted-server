@@ -559,12 +559,15 @@ curl -X POST https://edge.example.com/first-party/sign \
 
 ```json
 {
-  "href": "/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fpixel.gif&tstoken=abc123...&tsexp=1234567890",
+  "href": "https://ads.publisher.example/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fpixel.gif&tstoken=abc123...&tsexp=1234567890",
   "base": "https://cdn.example.com/pixel.gif"
 }
 ```
 
-`href` is the signed proxy path. `base` is the normalized target without its query or fragment.
+`href` is an absolute signed proxy URL on
+[`publisher.public_origin`](/guide/configuration#public_origin). See that section
+for the default authority, EC cookie scope, and coordinated upgrade/rollback
+warning. `base` is the normalized target without its query or fragment.
 
 **Error Responses:**
 
@@ -609,13 +612,15 @@ Validation and re-signing depend on `publisher.proxy_secret`.
 }
 ```
 
-`tsclick` may be root-relative (the form the rewriter emits) or absolute.
+`tsclick` accepts absolute URLs emitted by the rewriter and existing
+root-relative signed URLs. The rebuilt `href` is absolute on
+[`publisher.public_origin`](/guide/configuration#public_origin).
 
 **Response:**
 
 ```json
 {
-  "href": "/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example&campaign=123&utm_source=banner&tstoken=new...",
+  "href": "https://ads.publisher.example/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example&campaign=123&utm_source=banner&tstoken=new...",
   "base": "https://advertiser.example",
   "added": { "utm_source": "banner" },
   "removed": ["old_param"]
@@ -631,7 +636,7 @@ Validation and re-signing depend on `publisher.proxy_secret`.
 
 ### GET /first-party/proxy-rebuild
 
-Navigation form of the same recovery, for creatives rendered in a sandboxed iframe without `allow-same-origin`. Their opaque origin makes the JSON POST a CORS-preflighted cross-origin request that the endpoint does not answer, so the click guard navigates here instead — navigations are not subject to CORS.
+Navigation form of the same recovery, for creatives rendered in a sandboxed iframe without `allow-same-origin`. Their opaque origin makes the JSON POST a CORS-preflighted cross-origin request that the endpoint does not answer, so the click guard navigates here instead. Navigations are not subject to CORS.
 
 **Query Parameters:**
 
@@ -641,7 +646,10 @@ Navigation form of the same recovery, for creatives rendered in a sandboxed ifra
 | `add`     | No       | URL-encoded JSON object of parameters to add      |
 | `del`     | No       | URL-encoded JSON array of parameter names to drop |
 
-**Response:** `302` with the rebuilt `/first-party/click?...` URL in `Location` and `Cache-Control: no-store, private`. The browser follows it to `/first-party/click`, which redirects on to the advertiser.
+**Response:** `302` with an absolute rebuilt click URL on
+[`publisher.public_origin`](/guide/configuration#public_origin), in
+`Location` and `Cache-Control: no-store, private`. The browser follows it to
+`/first-party/click`, which redirects on to the advertiser.
 
 Validation is identical to the POST form.
 
