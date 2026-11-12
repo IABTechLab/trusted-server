@@ -116,6 +116,17 @@ pub trait IdentityProvider: Send + Sync {
     fn keeps_fresher_stored_uids(&self) -> bool {
         false
     }
+
+    /// Whether a live UID the row already stores wins over a different one
+    /// in the provider's cookies.
+    ///
+    /// For a first-party ID that should stay stable for as long as the row
+    /// lives, such as Prebid's `SharedID`: when this returns `true`, a cookie
+    /// is taken only for a source with no live stored UID. A cookie opt-out
+    /// still wins. The default always takes the cookie.
+    fn keeps_stored_uids(&self) -> bool {
+        false
+    }
 }
 
 impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
@@ -154,6 +165,10 @@ impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
 
     fn keeps_fresher_stored_uids(&self) -> bool {
         (**self).keeps_fresher_stored_uids()
+    }
+
+    fn keeps_stored_uids(&self) -> bool {
+        (**self).keeps_stored_uids()
     }
 }
 
