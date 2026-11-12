@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use edgezero_core::outbound::{OutboundCachePolicy, OutboundResponse, ResponseDecoding};
 use error_stack::{Report, ResultExt};
-use http::{Method, header};
+use http::{Method, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, HashMap};
@@ -38,6 +38,7 @@ const MEDIATOR_MAX_RESPONSE_BYTES: u64 = UPSTREAM_RTB_MAX_RESPONSE_BYTES as u64;
 
 /// Configuration for mock ad server integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct AdServerMockConfig {
     /// Whether this integration is enabled
     #[serde(default = "default_enabled")]
@@ -377,7 +378,8 @@ impl AdServerMockProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error when the mediation response body is not valid JSON.
+    /// Returns an error when the mediation response has a non-success HTTP status,
+    /// its body cannot be read within the response limit, or it is not valid JSON.
     async fn parse_response_inner(
         &self,
         response: OutboundResponse,
@@ -385,9 +387,19 @@ impl AdServerMockProvider {
         bid_index: &BidIndex,
         dimensions_by_slot: Option<&BidDimensionIndex>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        // OpenRTB signals an empty auction with a bodiless 204, and the bidder
+        // providers already treat it that way. Keep it a final mediation no-bid.
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(AuctionResponse::no_bid("adserver_mock", response_time_ms));
+        }
+
         if !response.status().is_success() {
-            log::warn!("AdServer Mock returned non-success: {}", response.status());
-            return Ok(AuctionResponse::error("adserver_mock", response_time_ms));
+            return Err(Report::new(TrustedServerError::Auction {
+                message: format!(
+                    "AdServer Mock returned non-success HTTP {}",
+                    response.status()
+                ),
+            }));
         }
 
         // The request buffered the response under the same cap.
