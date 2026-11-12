@@ -29,7 +29,7 @@ cap.
 ## Relationship to other work
 
 - This is a program-level design across Trusted Server and EdgeZero. It is not
-  the design that #1236 asks for. The AX requirements feed #1236's tickets.
+  the design that #1236 asks for. #1236 keeps its own scope; A1 to A10 under #1558 deliver the AX requirements.
   #1236's own open choices (key rotation, backup and restore, which Fastly-only
   features stay unsupported on Axum) stay with #1236.
 - Each ticket's implementation PR carries its own design notes, and a plan
@@ -75,7 +75,9 @@ EdgeZero main provides none of these for Axum: production startup, SIGTERM
 drain, trusted client IP, AWS config and secret stores, DynamoDB, geo, or
 concurrent outbound HTTP with deadlines. Open PRs IABTechLab/edgezero#275
 through IABTechLab/edgezero#439 add them. No EdgeZero PR adds a portable
-after-response hook, conditional KV writes, a portable client-IP accessor, geo
+after-response hook, conditional writes on the `KvStore` trait
+(IABTechLab/edgezero#463's celld store has them on a separate API), a portable
+client-IP accessor, geo
 on Fastly, Cloudflare or Spin, or a rate limiter. EdgeZero main has no geo
 module; `ctx.geo()` exists only on the IABTechLab/edgezero#439 stack, and only
 Axum fills it there.
@@ -106,7 +108,12 @@ and celld backends inside the Axum adapter. EdgeZero's Fastly store drops what
 the record needs: at EdgeZero main and at IABTechLab/edgezero#275's head its
 read calls `lookup` without the generation, `exists` is a read, and inserts
 carry no mode. So the Fastly backend can move onto EdgeZero only once EZI-2a
-covers the Fastly provider.
+covers the Fastly provider. IABTechLab/edgezero#463's `CelldRecordStore` has
+the semantics on a separate API; IABTechLab/edgezero#414's DynamoDB provider
+has strong existence and listing but no CAS and keeps every key in one
+partition; IABTechLab/edgezero#410 and IABTechLab/edgezero#437 rule out
+conditional writes today; and the `edgezero-store-aws` and
+`edgezero-store-celld` crates compile only for native targets.
 
 The target is one `EcKvStore` implementation in core over EdgeZero's
 `KvStore` (DEC-3). The per-adapter backends are then deleted, and the DynamoDB
@@ -118,17 +125,17 @@ Identity runs on an adapter only where the record contract and geo are
 supported. Elsewhere, startup rejects identity configuration (ID-2). Delivery
 follows DEC-4: Fastly, Axum, Cloudflare, Spin.
 
-| Capability                                                                    | Fastly                                                                               | Axum                                                                 | Cloudflare                                                                                                                                                                                    | Spin                                                                                                                                                                                                                                                         |
-| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Record contract (generation read, create-if-absent, CAS, strong exists, list) | Supported. Fastly KV generations through EZI-2a, or DynamoDB or celld through EZI-2b | Supported. DynamoDB or celld through EZI-2b                          | DynamoDB or celld through EZI-2b and EZI-2c. Workers KV is eventually consistent with no CAS, and EdgeZero has no Durable Objects or D1 store on main, IABTechLab/edgezero#275 or the RC tags | DynamoDB or celld through EZI-2b and EZI-2s. Spin's own `spin-sdk` 7.0.0 `key_value` has get, set, delete, exists and get_keys only, with no prefix listing; its bundled `wasi:keyvalue/atomics` interface defines a CAS resource that the SDK does not wrap |
-| After-response work                                                           | Supported (after send)                                                               | EZI-1, drained on SIGTERM                                            | EZI-1 over `waitUntil`                                                                                                                                                                        | Unsupported. DEC-14 picks before-response or skip                                                                                                                                                                                                            |
-| Rate limiter                                                                  | Supported (Edge Rate Limiting)                                                       | None in the MVP; the load balancer limits (DEC-11, DEC-15)           | EZI-5, backend per DEC-15                                                                                                                                                                     | EZI-5, backend per DEC-15                                                                                                                                                                                                                                    |
-| Geo with region                                                               | Supported                                                                            | CloudFront headers (A4, IABTechLab/edgezero#439)                     | Country only today; region needs EZI-4                                                                                                                                                        | None; needs EZI-4                                                                                                                                                                                                                                            |
-| TLS fingerprint (JA4)                                                         | Runtime TLS through EdgeZero's `ctx.ja4()` (EZI-3)                                   | `ctx.ja4()` from a trusted proxy header such as CloudFront's (EZI-3) | `ctx.ja4()` from Bot Management, otherwise absent                                                                                                                                             | Absent (`NotExposed`)                                                                                                                                                                                                                                        |
-| Trusted client IP                                                             | Supported                                                                            | IABTechLab/edgezero#409                                              | `cf-connecting-ip`; EZI-3 accessor                                                                                                                                                            | TCP peer; EZI-3 accessor                                                                                                                                                                                                                                     |
+| Capability                                                                    | Fastly                                                                               | Axum                                                                 | Cloudflare                                                                                                                                                                                    | Spin                                                                                                                                                                                                                                                                                             |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Record contract (generation read, create-if-absent, CAS, strong exists, list) | Supported. Fastly KV generations through EZI-2a, or DynamoDB or celld through EZI-2b | Supported. DynamoDB or celld through EZI-2b                          | DynamoDB or celld through EZI-2b and EZI-2c. Workers KV is eventually consistent with no CAS, and EdgeZero has no Durable Objects or D1 store on main, IABTechLab/edgezero#275 or the RC tags | DynamoDB or celld through EZI-2b and EZI-2s. Spin's own `spin-sdk` 7.0.0 `key_value` has get, set, delete, exists and get_keys only, with no prefix listing; the SDK exposes `wasi:keyvalue/atomics`, which defines a CAS resource, only as raw bindings in its doc-hidden `experimental` module |
+| After-response work                                                           | Supported (after send)                                                               | EZI-1, drained on SIGTERM                                            | EZI-1 over `waitUntil`                                                                                                                                                                        | Unsupported. DEC-14 picks before-response or skip                                                                                                                                                                                                                                                |
+| Rate limiter                                                                  | Supported (Edge Rate Limiting)                                                       | None in the MVP; the load balancer limits (DEC-11, DEC-15)           | EZI-5, backend per DEC-15                                                                                                                                                                     | EZI-5, backend per DEC-15                                                                                                                                                                                                                                                                        |
+| Geo with region                                                               | Supported                                                                            | CloudFront headers (A4, IABTechLab/edgezero#439)                     | Country only today; region needs EZI-4                                                                                                                                                        | None; needs EZI-4                                                                                                                                                                                                                                                                                |
+| TLS fingerprint (JA4)                                                         | Runtime TLS through EdgeZero's `ctx.ja4()` (EZI-3)                                   | `ctx.ja4()` from a trusted proxy header such as CloudFront's (EZI-3) | `ctx.ja4()` from Bot Management, otherwise absent                                                                                                                                             | Absent (`NotExposed`)                                                                                                                                                                                                                                                                            |
+| Trusted client IP                                                             | Supported                                                                            | IABTechLab/edgezero#409                                              | `cf-connecting-ip`; EZI-3 accessor                                                                                                                                                            | TCP peer; EZI-3 accessor                                                                                                                                                                                                                                                                         |
 
-Cloudflare and Spin move to Supported only when EZI-2 and EZI-4 deliver for
-them (DEC-8). Until then their startup rejects identity configuration, and
+Cloudflare and Spin move to Supported only when EZI-2c, EZI-2s, EZI-4c and
+EZI-4s deliver for them (DEC-8 picks their store). Until then their startup rejects identity configuration, and
 Goal 2 is met for them by that rejection.
 
 ## Requirements
@@ -169,32 +176,38 @@ marks the record contract and geo as supported.
   IPv6; the reference Terraform in #1540 trusts IPv4 ranges only and leaves
   geo off.
 - **AX-4 Record store fit for production.** Writes are spread across partition
-  keys, with no item every insert updates, and retries are bounded. Accept: a
-  load test at the target page-load rate with provider refreshes (A5 sets the
-  rate) shows no throttling. State: #1536 puts every row under one partition
-  key and updates one allocator item per insert.
+  keys by listing prefix: an EC row's partition is its IP hash, and a
+  withdrawal marker's is the marker prefix and its EC ID, so no item is updated
+  by every insert and listing stays strong within a partition (EZI-2a).
+  Retries are bounded. Accept: a load test at the target page-load rate with
+  provider refreshes (A5 sets the rate) shows no throttling, and rows from
+  different IP hashes land in different partitions. State: #1536 puts every
+  row under one partition key and updates one allocator item per insert, and
+  IABTechLab/edgezero#414's DynamoDB store keeps every key in one partition.
 - **AX-5 Production image.** An image built from source runs the production
   server. Accept: its entrypoint starts the production server with
   `STOPSIGNAL SIGTERM`. Publishing and attesting the image are outside this
   design (DEC-19). State: #1539 builds the production image; #1543 publishes
   the dev-server image (`STOPSIGNAL SIGINT`).
 - **AX-6 Reference infrastructure.** The reference stack wires the DynamoDB
-  table, port 443 egress for vendor APIs, a readiness check that fails when a
-  dependency is down, JSON logs, two or more tasks and an example rate-based
-  rule at CloudFront or the load balancer, since Axum's own limits are off by
-  default (DEC-11). IABTechLab/edgezero#275 serves
-  Axum on a current-thread runtime, so capacity comes from task count. Accept:
-  the stack applies with those properties, the rate rule refuses traffic over
-  its threshold, and readiness fails with DynamoDB unreachable. State: #1540 has the 443 egress (IPv4 only), a static `/health`,
-  plain logs, one task and no DynamoDB wiring.
+  table, port 443 egress for vendor APIs, a readiness signal, JSON logs, two or
+  more tasks and an example rate-based rule at CloudFront or the load balancer,
+  since Axum's own limits are off by default (DEC-11). A store outage only
+  degrades identity (Failure handling), so the load balancer health check
+  stays green while identity reports itself degraded.
+  IABTechLab/edgezero#275 serves Axum on a current-thread runtime, so capacity
+  comes from task count. Accept: the stack applies with those properties, the
+  rate rule refuses traffic over its threshold, and with DynamoDB unreachable
+  pages keep serving while identity reports degraded. State: #1540 has the 443
+  egress (IPv4 only), a static `/health`, plain logs, one task and no DynamoDB
+  wiring; EdgeZero's readiness probe does not poll dependencies.
 - **AX-7 Ships from main.** Main never pins an EdgeZero RC tag
-  (IABTechLab/edgezero#431, IABTechLab/edgezero#462) or a revision that exists only on an RC
-  branch, such as `456313675`, which #1528 pins today. Main may pin
-  IABTechLab/edgezero#275's head under DEC-1, or a revision of EdgeZero's
-  integration branch under DEC-5, which carries only work headed for EdgeZero
-  main. Accept: `Cargo.lock` on main resolves every EdgeZero crate to a
-  released tag, IABTechLab/edgezero#275's head or an integration-branch
-  revision.
+  (IABTechLab/edgezero#431, IABTechLab/edgezero#462) or a revision that exists
+  only on an RC branch, such as `456313675`, which #1528 pins today. Main may
+  pin IABTechLab/edgezero#275's head under DEC-1, or a tag on EdgeZero's
+  protected integration branch under DEC-5, which carries only work headed for
+  EdgeZero main. Accept: `Cargo.lock` on main resolves every EdgeZero crate to
+  a released tag, IABTechLab/edgezero#275's head or an integration-branch tag.
 
 ### ID: Server-side identity on every adapter
 
@@ -227,70 +240,85 @@ marks the record contract and geo as supported.
   deadline is skipped and does not delay the response past it.
 - **ID-5 After-response work.** Only pull sync and guarded follow-up writes run
   after the response is sent: after send on Fastly, a task drained on SIGTERM
-  on Axum, `waitUntil` on Cloudflare. Spin follows DEC-14. Accept: on Fastly,
-  Axum and Cloudflare a follow-up write recorded after send is in the record
-  before the next navigation, and on Axum SIGTERM waits for it (A3). On Spin
-  the DEC-14 choice holds: either the follow-up write lands before the
-  response, or the work is skipped and the response is unchanged.
+  on Axum, `waitUntil` on Cloudflare. On Spin the work runs before the response
+  (DEC-14; DEC-16 rules out skipping it). Accept: on Fastly, Axum and Cloudflare
+  a follow-up write recorded after send is in the record before the next
+  navigation, and on Axum SIGTERM waits for it (A3). On Spin the follow-up write
+  lands before the response.
 - **ID-6 Rate limiting (after the MVP, DEC-15).** In the MVP, Fastly keeps
   main's limits on batch sync and pull sync and #1487's per-provider lookup
   limit, and Axum has none because the deployer's load balancer limits
-  traffic (DEC-11). After the MVP, provider lookups, batch sync, pull sync and
-  record creation are rate limited on every supported adapter except Axum,
-  where every limit stays off by default; batch sync is keyed per partner and
-  the other keys follow DEC-15, and an Axum limit turned on in configuration
-  runs per task, divided by the configured task count. Accept: in the MVP,
-  Fastly's existing limits still refuse or skip over-limit requests and Axum's
-  default configuration applies no limit; after the MVP, per-adapter tests hit
-  each limit, and an Axum limit turned on for two tasks refuses at half the
-  limit. State: Fastly Edge Rate Limiting is the only limiter; record creation
-  is limited nowhere; #1487 keys lookups on the IP-derived EC prefix, so
-  everyone behind one IPv4 address or IPv6 /64 shares a budget.
+  traffic (DEC-11). Until EZI-5, Fastly's limiter stays the existing
+  `fastly::erl` bridge in the Fastly adapter, and T21 keeps it when it moves
+  the handlers into core. After the MVP, provider lookups, batch sync, pull
+  sync and record creation are rate limited on every supported adapter except
+  Axum, where every limit stays off by default; batch sync is keyed per partner
+  and the other keys follow DEC-15, and an Axum limit turned on in
+  configuration runs per task, divided by the configured task count. Accept: in
+  the MVP, Fastly's existing limits still refuse or skip over-limit requests
+  after T21 and Axum's default configuration applies no limit; after the MVP,
+  per-adapter tests hit each limit, and an Axum limit turned on for two tasks
+  refuses at half the limit. State: Fastly Edge Rate Limiting is the only
+  limiter; record creation is limited nowhere; #1487 keys lookups on the
+  IP-derived EC prefix, so everyone behind one IPv4 address or IPv6 /64 shares
+  a budget.
 - **ID-7 Abuse resistance.** Where a trusted JA4 is available, record creation
-  is refused for clients whose JA4 and User-Agent are not a browser's; where
-  none is available, record creation is not blocked on its account (DEC-18).
-  JA4 comes only from EdgeZero's `ctx.ja4()` (EZI-3). Accept: on each supported
-  adapter a scripted client with a browser User-Agent and a non-browser JA4
-  creates no record, and a request with no trusted JA4 is not refused for
-  lacking one. State:
-  Fastly checks only that a JA4 exists plus a browser User-Agent platform; the
-  RC's Axum checks only the User-Agent, with request filters, because it has
-  no trusted JA4 (EZI-3); Cloudflare and Spin create no records yet. CloudFront
-  sends JA4 to the origin only in the `CloudFront-Viewer-JA4-Fingerprint`
-  header, which an origin request policy must forward. IABTechLab/edgezero#469's
-  draft design reports Axum as `NotExposed` and leaves the trusted proxy header
-  to its section 13.1.
+  is refused when the JA4's TLS client family contradicts the User-Agent's
+  browser family; a JA4 the rule does not recognize, or no trusted JA4 at all,
+  does not block (DEC-18). The family rule and its data live in core with T12,
+  which owns keeping them current; JA4 comes only from EdgeZero's `ctx.ja4()`
+  (EZI-3). Accept: on each supported adapter a scripted client with a browser
+  User-Agent and a non-browser JA4 creates no record, a current Chrome, Safari
+  and Firefox JA4 that no list names still creates one, and a request with no
+  trusted JA4 is not refused for lacking one. State: Fastly checks only that a
+  JA4 exists plus a browser User-Agent platform; main's known-browser table
+  (`ec/device.rs`) feeds analytics only and needs an HTTP/2 fingerprint that
+  Axum behind CloudFront lacks; the RC's Axum checks only the User-Agent, with
+  request filters, because it has no trusted JA4 (EZI-3); Cloudflare and Spin
+  create no records yet. CloudFront sends JA4 to the origin only in the
+  `CloudFront-Viewer-JA4-Fingerprint` header, which an origin request policy
+  must forward. IABTechLab/edgezero#469's draft design reports Axum as
+  `NotExposed` and leaves the trusted proxy header to its section 13.1.
 - **ID-8 Body EIDs keep being saved.** EIDs sent in the `/auction` body are
   saved to the record. Accept: on each supported adapter a body EID is in the
   record after the request. State: main saves them on Fastly; the provider
   stack and the RC's Axum lifecycle do not.
-- **ID-9 EC route.** A same-origin route, `/_ts/api/v1/ec` by default, mints
-  the EC when the reader has none and consent allows, creates the record, runs
-  the providers as a navigation does, and sets `ts-ec`, the SharedID cookie and
-  the mirror cookie on its own response. The script Trusted Server injects
-  into proxied pages calls it once the CMP reports consent, so a reader who
-  consents after the page loads gets an EC on that page view instead of the
-  next navigation. A plain `GET` answers Prebid's SharedID `pixelUrl` with an
-  empty response; the script's call gets JSON with the SharedID and the EIDs
-  the record holds, which the script merges into Prebid. The script also calls
-  it on every later CMP consent change, sending Sourcepoint's GPP string where
-  the page uses Sourcepoint, so a withdrawal expires `ts-ec`, the SharedID
-  cookie and the mirror cookie and tombstones the record in that response
-  instead of on the next navigation. The route mints
-  nothing for a cross-site caller or a client ID-7 refuses, and every response
-  carries `Cache-Control: no-store`; a rate limit on it waits with ID-6
-  (DEC-15). It is served from the page's own host, which
-  WebKit's cap on cookies from non-document responses exempts when the IP
-  matches the page's (read from WebKit's source, not yet tested in Safari).
-  Accept: on Fastly and Axum, a consented same-site call with no `ts-ec`
+- **ID-9 EC route.** A same-origin route, `/_ts/api/v1/ec` by default, lets the
+  script Trusted Server injects into proxied pages report consent and receive
+  identity, so a reader who consents after the page loads gets an EC on that
+  page view instead of the next navigation. A `POST` whose `Origin` matches
+  the page mints the EC when the reader has none and consent allows, creates
+  the record, runs the providers as a navigation does, and sets `ts-ec`, the
+  SharedID cookie and the mirror cookie on its own response. It carries the
+  consent strings the script reads from the CMP, the TCF string from
+  `__tcfapi` and the GPP string from `__gpp` (Sourcepoint's capture from #1535
+  where present), which replace the consent cookies for that request; a
+  withdrawal expires `ts-ec`, the SharedID cookie and the mirror cookie and
+  tombstones the record in that response. The `POST` answers with JSON holding
+  exactly what WB-4 would put in the mirror cookie for that request, and the
+  SharedID only under SID-2 and SID-6; the script merges it into Prebid, and
+  nothing else in the record reaches the page. A plain `GET` answers Prebid's
+  SharedID `pixelUrl` with an empty 204: it never mints, calls a provider or
+  changes consent, and only re-sets an existing SharedID cookie from the record
+  (WB-3). The script keeps at most one call in flight and sends the latest
+  consent after it settles, so a withdrawal always lands after any grant in
+  progress. Every response carries `Cache-Control: no-store`; a rate limit on
+  the route waits with ID-6 (DEC-15). The route is served from the page's own
+  host, which WebKit's cap on cookies from non-document responses exempts when
+  the IP matches the page's (read from WebKit's source; the Accept tests it).
+  Accept: on Fastly and Axum, a consented same-origin `POST` with no `ts-ec`
   creates the record and sets `ts-ec` and the SharedID cookie in that
-  response; the JSON call returns the record's IDs; a cross-site `Origin` and a
-  scripted client mint nothing; a withdrawal sent to it expires the
-  identity cookies and tombstones the record; an unchanged returning reader gets
-  no `Set-Cookie`. State: on main only a real-browser
-  navigation through the publisher proxy mints an EC, and no such route
-  exists. #1535 (RC line) posts Sourcepoint's GPP string to a separate
-  `/_ts/consent` route, wired into each adapter's router.
+  response; its JSON omits a non-mirrored partner's ID, an ID whose vendor's
+  TCF consent is denied and an expired ID; a withdrawal issued while a grant
+  call with no EC and delayed providers is in flight leaves no identity cookie
+  and no live record; a cross-site `Origin`, a `GET` and a client ID-7
+  refuses mint nothing and call no provider; an unchanged returning reader gets
+  no `Set-Cookie`; and in Safari, `ts-ec` and the SharedID cookie set by the
+  route keep their one-year `Max-Age` on Fastly and on Axum behind CloudFront.
+  State: on main only a real-browser navigation through the publisher proxy
+  mints an EC, and no such route exists. #1535 (RC line) posts Sourcepoint's
+  GPP string to a separate, non-minting `/_ts/consent` route, wired into each
+  adapter's router.
 
 ### SH: Shared state passed the right way
 
@@ -301,8 +329,8 @@ marks the record contract and geo as supported.
   until a measurement shows the Next.js regression gone; after that
   measurement Axum's client is held to the same rule. State: Cloudflare and Spin
   rebuild app state per request; Axum builds the partner registry per request
-  (`app.rs:515` at #1506's head) and the HTTP client per request on purpose,
-  because a pooled client regressed a Next.js flow (main `platform.rs:571-575`).
+  (`app.rs:495` at #1506's head `9ec4711d3`) and the HTTP client per request on purpose,
+  because a pooled client regressed a Next.js flow (main `platform.rs:620-623`).
   Keep that client choice unless a measurement shows the regression gone.
 - **SH-2 Per-request state in the request.** Per-request values travel in the
   request context, never in a `thread_local` or in retained app state. Accept:
@@ -320,16 +348,19 @@ marks the record contract and geo as supported.
   request's `Env` in a set-once `thread_local`. Accept: two requests with
   different `Env` values each see their own.
 - **SH-5 One app for every adapter.** The identity routes (identify, batch
-  sync, pull sync, admin lookup and the EC route), the EC lifecycle, provider
-  lookups and cookie write-back run from one router built in core, which every
-  adapter mounts. An adapter crate supplies only platform services, and a
-  capability an adapter lacks is an EdgeZero ask, never code in that adapter
-  (DEC-16). Accept: no adapter crate's non-test code calls EC generation,
-  finalization or an identity handler directly, and the same conformance
-  suite (T5) runs on each supported adapter. State: at #1506's head only the
-  Fastly adapter wires identity (EC generation, finalization, identify and
-  batch sync are called from its `app.rs` and `main.rs`); Axum, Cloudflare and
-  Spin each build their own router without it.
+  sync, admin lookup and the EC route), pull sync, the EC lifecycle, provider
+  lookups and cookie write-back run from one app built in core, which every
+  adapter mounts and which builds its state once (SH-1). An adapter crate
+  supplies only platform services: through EdgeZero where it offers them, and
+  otherwise through the adapter's existing platform bridge until the EdgeZero
+  ask lands (today Fastly's limiter, ID-6, and Fastly's geo, EZI-4). A
+  capability an adapter lacks is an EdgeZero ask, never new code in that
+  adapter (DEC-16). Accept: no adapter crate's non-test code calls EC
+  generation, finalization or an identity handler directly, and the same
+  conformance suite (T5) runs on each supported adapter. State: at #1506's head
+  only the Fastly adapter wires identity (EC generation and finalization are
+  called from its `app.rs` and `main.rs`); Axum, Cloudflare and Spin each
+  build their own router without it.
 
 ### SID: SharedID handled the way Prebid defines it
 
@@ -341,9 +372,12 @@ marks the record contract and geo as supported.
   not. State: main reads only `sharedId` (`constants.rs:10`), Prebid's module
   name, on Fastly for the record and on every adapter for `/_ts/admin/eids`.
 - **SID-2 Opt-out.** A `_pubcid_optout` cookie stops SharedID reads, storage,
-  sending and write-back. Prebid also reads the opt-out from localStorage,
-  which the server cannot see. Accept: with `_pubcid_optout` present nothing
-  SharedID-related is read, stored, sent or written.
+  sending, creation and write-back. Prebid also reads the opt-out from
+  localStorage, which the server cannot see, so the injected script copies a
+  localStorage `_pubcid_optout` into the cookie (T20). Accept: with
+  `_pubcid_optout` present nothing SharedID-related is read, stored, sent,
+  created or written, and a localStorage-only opt-out stops creation from the
+  next request on.
 - **SID-3 One canonical EID.** SharedID is stored and sent as source
   `pubcid.org`, atype 1, once. Accept: a bidder request built from cookie,
   `ts-eids`, body and record that carry the same UUID has exactly one EID
@@ -390,14 +424,18 @@ marks the record contract and geo as supported.
   value. When neither the record nor the request has one, the server creates
   a SharedID in the format Prebid writes (a UUID v4), stores it in the record
   and sets it the same way, because a browser may block Prebid.js from loading
-  at all (DEC-7). It uses Prebid's storage name and the Domain Prebid writes with, is
+  at all (DEC-7). It creates and writes back a SharedID only when the
+  configured `storage.type` is `cookie` (Prebid's `cookie&html5` counts as
+  `cookie`): with `html5` Prebid never reads the cookie, so a server-made
+  SharedID would split the reader's identity (SID-3). It uses Prebid's storage name and the Domain Prebid writes with, is
   not HttpOnly, and is `Secure; SameSite=Lax` for one year. It keeps Prebid's
   `<name>_cst` companion consistent, since a missing or different one makes
   Prebid rewrite the cookie from script, which Safari caps. Prebid's `extend`
   with a `pixelUrl` keeps working alongside it. Accept: record present and
   cookie absent gives both cookies with those attributes; a consented first
   visit with no SharedID anywhere gets one created, stored and set, and a
-  reader with `_pubcid_optout` gets none; an equal cookie
+  reader with `_pubcid_optout` gets none; with `storage.type = html5` the server
+  neither creates nor sets a SharedID; an equal cookie
   with a consistent `<name>_cst` gives no `Set-Cookie`; an equal cookie with a
   missing or different `<name>_cst` re-sets only the companion; Purpose 1 denied or `_pubcid_optout` expires both;
   Purpose 4 denied with Purpose 1 granted gives no `Set-Cookie` and leaves the
@@ -426,33 +464,38 @@ marks the record contract and geo as supported.
 
 Behavior and acceptance only. EZI IDs are distinct from #1506's EZ-n
 requirement IDs. Each ask is split by platform, in DEC-4 order: the Fastly
-and Axum parts ship in R1, R1b and R2 and never wait on a Cloudflare or Spin
-part.
+and Axum parts ship in R1, R1b, R2 and R2b, except EZI-2p and EZI-5, and never
+wait on a Cloudflare or Spin part.
 
 - **EZI-1 After-response work.** A task registered during a request runs after
   the response is delivered, bounded in time. Accept: on Fastly and Axum the
   task runs after delivery, and on Axum SIGTERM waits for registered tasks up
   to the grace; later, on Cloudflare the task runs after delivery, and Spin
   returns a capability error.
-- **EZI-2a Record contract, the Fastly provider and the local store.** `KvStore` gains a read
-  that returns a generation marker, writes in `Add`, `Overwrite` and
-  `IfGenerationMatch` modes with a precondition-failed outcome, and strongly
-  consistent existence and prefix listing, or `KvError::Unsupported`. Accept:
-  an EdgeZero contract suite passes against the Fastly provider under Viceroy
-  and against EdgeZero's local in-memory store, which the Axum development
-  server uses.
-- **EZI-2b DynamoDB and celld adapters for every platform.** Both meet the
-  EZI-2a contract and run on every adapter over EdgeZero's outbound HTTP, while
-  the native stores (Fastly KV, Cloudflare KV, Spin KV) stay on their own
-  platform (DEC-3). DynamoDB writes are spread across partition keys with no
-  item every insert updates. Accept: the contract suite passes against both on
-  Fastly and Axum; EZI-2c and EZI-2s run it on Cloudflare and Spin. State:
-  the IABTechLab/edgezero#414 and IABTechLab/edgezero#422 providers are
-  native-only. IABTechLab/edgezero#463's `CelldRecordStore` has the semantics on a separate API; IABTechLab/edgezero#414's DynamoDB
-  provider has strong existence and listing but no CAS;
-  IABTechLab/edgezero#410 and IABTechLab/edgezero#437 rule out conditional writes today.
+- **EZI-2a Record contract, the Fastly provider and the local store.** `KvStore`
+  gains a read that returns a generation marker, writes in `Add`, `Overwrite`
+  and `IfGenerationMatch` modes with a precondition-failed outcome, strongly
+  consistent existence, and prefix listing that is strongly consistent within
+  a partition: the caller declares how a key maps to its partition, and a
+  listing whose prefix is a whole partition reads strongly. A store that cannot
+  meet this reports `KvError::Unsupported`. Accept: an EdgeZero contract suite
+  passes against the Fastly provider under Viceroy and against EdgeZero's local
+  persistent store (`PersistentKvStore`), which the Axum development server
+  uses.
+- **EZI-2b DynamoDB and celld providers on Axum.** Both meet the EZI-2a
+  contract on Axum. DynamoDB uses each key's partition as its partition key, so
+  writes spread across partitions and no item is updated by every insert
+  (AX-4). Accept: the contract suite passes against both on Axum, listing
+  within a partition is strong, and keys in different partitions land in
+  different DynamoDB partitions.
+- **EZI-2p Portable DynamoDB and celld providers.** The same providers run on
+  every adapter over EdgeZero's outbound HTTP, while the native stores (Fastly
+  KV, Cloudflare KV, Spin KV) stay on their own platform (DEC-3). Each states
+  the credential source it uses on WASM targets and a latency budget for a
+  conditional write. Accept: the contract suite passes against both on Fastly;
+  EZI-2c and EZI-2s run it on Cloudflare and Spin.
 - **EZI-2c and EZI-2s Cloudflare and Spin stores.** On each platform the
-  DynamoDB and celld adapters pass the EZI-2a contract, and the native store
+  portable DynamoDB and celld providers (EZI-2p) pass the EZI-2a contract, and the native store
   meets it or reports `KvError::Unsupported`; DEC-8 picks the default. Accept:
   the contract suite passes for every store offered there, and a native store
   that cannot meet it reports `Unsupported`, so identity on it is rejected at
@@ -466,25 +509,32 @@ part.
   trusts, and Spin never (`NotExposed`). Trusted Server reads JA4 only through
   it. Accept: the same accessors work on each adapter as its part lands, and a
   JA4 header from an untrusted peer reads as absent.
-- **EZI-4 Geo with region on Cloudflare and Spin.** `ctx.geo()` gives country
-  and region there, or a capability error. Fastly keeps its existing geo and
-  Axum uses CloudFront geo from IABTechLab/edgezero#439, bound from EdgeZero's
-  manifest so an application reads `ctx.geo()` without its own boot profile.
-  Accept: a US request on Cloudflare reports country and region, and Axum's
-  geo loads with no Trusted Server geo setting.
+- **EZI-4 Geo with region on every adapter.** `ctx.geo()` gives country and
+  region. Fastly keeps its existing geo. Axum uses CloudFront geo from
+  IABTechLab/edgezero#439, bound from EdgeZero's manifest so an application
+  reads `ctx.geo()` without its own boot profile (EZI-4a). Cloudflare reads its
+  request metadata (EZI-4c). Spin, whose requests carry no geo, reads a trusted
+  ingress header the platform sets or a KV- or API-backed provider (EZI-4s, as
+  #1518 describes for WASM targets). Accept: a US request on Cloudflare and on
+  Spin reports country and region, and Axum's geo loads with no Trusted Server
+  geo setting.
 - **EZI-5 Rate limiter (after the MVP, DEC-15).** A limiter with Fastly Edge
   Rate Limiting and
   an in-memory backend for Axum, then Cloudflare and Spin backends per
   DEC-15. Accept: a contract test passes per backend.
-- **EZI-6 Integration points.** EdgeZero keeps an integration branch for this
-  work (DEC-5), and R1 to R4 are revisions on it that Trusted Server main pins
-  until EdgeZero releases them. R1 contains IABTechLab/edgezero#275 through
-  IABTechLab/edgezero#439, so Axum production serving does not wait for the
-  record contract. R1b contains EZI-2a and EZI-2b. R2 contains the Fastly and
-  Axum parts of EZI-1 and EZI-3. Together R1, R1b and R2 cover Fastly and Axum.
-  R3 contains the Cloudflare parts of EZI-1 to EZI-4, and R4 the Spin parts.
-  EZI-5 and its parts ship in a release after the MVP (DEC-15). Accept: each revision exists on the integration branch and Trusted Server
-  main pins it; R1, R1b and R2 contain no Cloudflare or Spin part.
+- **EZI-6 Integration points.** EdgeZero keeps a protected integration branch
+  for this work (DEC-5), and each integration point is a tag on it that Trusted
+  Server main pins until EdgeZero releases the work. R1 creates the branch and
+  tags IABTechLab/edgezero#275 through IABTechLab/edgezero#439, so Axum
+  production serving does not wait for the record contract. R1b adds EZI-2a and
+  EZI-2b. R2 adds the Fastly and Axum parts of EZI-1. R2b adds EZI-3,
+  IABTechLab/edgezero#90, IABTechLab/edgezero#92, the JA4 accessor
+  (IABTechLab/edgezero#283) and Axum's geo binding (EZI-4a), so providers never
+  wait on JA4. Together R1, R1b, R2 and R2b cover Fastly and Axum. R3 adds the
+  Cloudflare parts of EZI-1 to EZI-4, and R4 the Spin parts. EZI-2p and EZI-5
+  follow the MVP (DEC-15). Accept: each tag exists on the protected integration
+  branch and Trusted Server main pins it; R1, R1b, R2 and R2b contain no
+  Cloudflare or Spin part.
 
 ## Configuration
 
@@ -556,7 +606,7 @@ Decided:
 - **DEC-1 Cutover** (user, 2026-11-11). #1506 is the EdgeZero cutover. #1527
   closes once #1506 covers its tests.
 - **DEC-2 MVP** (user, 2026-11-12). Fastly and Axum are the MVP: plan waves 0
-  to 9. Cloudflare, Spin and the decision-gated work follow it.
+  to 9. The one open decision the MVP waits on is DEC-9, through T22. Cloudflare, Spin and the decision-gated work follow it.
 - **DEC-3 Shared record store** (user, 2026-11-11). The EC record runs on one
   `EcKvStore` over EdgeZero's `KvStore`, with no per-adapter backends. The
   user reaffirmed it on 2026-11-12: Axum's record uses EdgeZero's pluggable
@@ -565,33 +615,46 @@ Decided:
   adapter; the native stores (Fastly KV, Cloudflare KV, Spin KV) only to their
   own platform.
 - **DEC-4 Platform order** (user, 2026-11-12). Fastly, then Axum, then
-  Cloudflare, then Spin. Fastly and Axum (the MVP, DEC-2) must ship complete
-  without any Cloudflare or Spin work, so every ticket and release is split by
-  platform and no Fastly or Axum item is blocked by a Cloudflare or Spin item.
-  Cloudflare and Spin follow the MVP.
-- **DEC-11 Axum rate limiting** (user, 2026-11-12). Every limit is off on
-  Axum by default, inbound and outbound, because deployers rate-limit at their
-  own load balancer; the reference stack shows one rule (AX-6). Once rate
-  limiting returns (DEC-15), a limit a deployer turns on keeps its own in-memory counter in each task and enforces
-  the limit divided by the configured task count. The MVP has no shared
-  counter.
-- **DEC-7 SharedID retention and creation** (user, 2026-11-12). The stored
-  value wins and lives as long as the record (SID-5). When neither the record
-  nor the request has a SharedID, the server creates one, because a browser may
-  block Prebid.js from loading at all (WB-3).
+  Cloudflare, then Spin. Fastly and Axum (the MVP, DEC-2) must ship without any
+  Cloudflare or Spin work: no Fastly or Axum item is blocked by a Cloudflare or
+  Spin item. Shared work may touch every adapter (the shared app and the
+  rejection, 501 and absence paths in the plan's Global Constraints). Cloudflare
+  and Spin follow the MVP.
 - **DEC-5 EdgeZero integration branch** (user, 2026-11-12). EdgeZero keeps an
   integration branch that carries the unreleased work headed for EdgeZero
   main: IABTechLab/edgezero#275, the IABTechLab/edgezero#406 to
   IABTechLab/edgezero#439 chain and the EZI tickets. Trusted Server main pins
-  its revisions (R1, R1b, R2) instead of waiting for an EdgeZero release, and
+  its tags (R1, R1b, R2 and R2b in the MVP) instead of waiting for an EdgeZero release, and
   repins to a released tag once EdgeZero publishes one.
 - **DEC-6 Base for the Axum line** (user, 2026-11-12). Forward-port the RC
-  line to main rather than back-port the provider stack to it, which conflicts
-  in 13 to 23 files. #1531 restacks on #1506 for A1 and #1532 on #1531 for
+  line to main rather than back-port the provider stack to it, which conflicted
+  in 13 to 23 files at the heads first measured and 21 to 24 at the round-4
+  heads. #1531 restacks on #1506 for A1 and #1532 on #1531 for
   #1529. The image and Terraform units (#1539, #1538, #1540) restack on #1531,
   where they apply cleanly. #1536 and #1537 are not restacked: their
   Axum-only stores, store selection and wiring give way to EZI-2b, T6 and
   T21, and their tests move into A2, A8 and T5. #1535 goes into the EC route (T19, T20), and #1533 and #1534 close as copies of #1525 and #1526.
+- **DEC-7 SharedID creation and retention.** Creation (user, 2026-11-12): when
+  neither the record nor the request has a SharedID, the server creates one,
+  because a browser may block Prebid.js from loading at all (WB-3). Retention
+  (proposed, assumed by the plan): the stored value wins and lives as long as
+  the record (SID-5).
+- **DEC-10 Mirror partners** (user, 2026-11-12). ID5 and LiveRamp, the
+  important identity providers, get `mirror_enabled`, and the MVP's provider
+  and mirror checks (T11, A10) use them.
+- **DEC-11 Axum rate limiting** (user, 2026-11-12). Every limit is off on
+  Axum by default, inbound and outbound, because deployers rate-limit at their
+  own load balancer; the reference stack shows one rule (AX-6). Once rate
+  limiting returns (DEC-15), a limit a deployer turns on keeps its own in-memory counter in each task and enforces
+  the limit divided by the configured task count. No shared counter is
+  planned.
+- **DEC-16 One implementation for every adapter** (user, 2026-11-12). Every
+  feature is built once and works on every adapter, delivered in DEC-4's
+  order. Shared logic lives in Trusted Server core; a platform capability an
+  adapter lacks is an EdgeZero ask, never code in one adapter crate (SH-5).
+  SH-5 records the existing platform bridges that stay until their asks land.
+- **DEC-17 celld in the MVP** (user, 2026-11-12). EZI-2b delivers both the
+  DynamoDB and the celld provider before R1b.
 - **DEC-18 JA4 when available** (user, 2026-11-12). ID-7 relies on a trusted
   JA4 where the adapter supplies one; without one, record creation is not
   blocked. JA4 is EdgeZero's abstraction (EZI-3), never read by Trusted
@@ -600,15 +663,6 @@ Decided:
   attestation and package publishing (#1449, #1463, #1543) are not part of
   this work and carry lower priority. The MVP builds the production image
   from source (AX-5) without publishing or attesting it.
-- **DEC-10 Mirror partners** (user, 2026-11-12). ID5 and LiveRamp, the
-  important identity providers, get `mirror_enabled`, and the MVP's provider
-  and mirror checks (T11, A10) use them.
-- **DEC-17 celld in the MVP** (user, 2026-11-12). EZI-2b delivers both the
-  DynamoDB and the celld provider before R1b.
-- **DEC-16 One implementation for every adapter** (user, 2026-11-12). Every
-  feature is built once and works on every adapter, delivered in DEC-4's
-  order. Shared logic lives in Trusted Server core; a platform capability an
-  adapter lacks is an EdgeZero ask, never code in one adapter crate (SH-5).
 
 Open:
 
@@ -617,14 +671,15 @@ Open:
   meets the contract, per [Platform support](#platform-support). Blocks EZI-2c,
   EZI-2s, R3, T8 and T9.
 - **DEC-9 LiveRamp Custom ID.** The current value is the IP-derived EC prefix,
-  shared by everyone behind one IP. Blocks enabling LiveRamp in #1488, and
-  #1245. LiveRamp is in the MVP (DEC-10), so this is needed before launch;
-  the user is getting a LiveRamp test setup to settle it.
+  shared by everyone behind one IP. Blocks T22, which sets the Custom ID,
+  enables LiveRamp and checks it before launch because LiveRamp is in the MVP
+  (DEC-10), and #1245. The user is getting a LiveRamp test setup to settle it.
 - **DEC-12 EC EID source.** Which source name the EC uses, and whether it keeps
   going out as `user.id`. Blocks #1549; no other ticket until decided.
 - **DEC-13 `ts-ec` refresh** for returning readers. Blocks T16.
-- **DEC-14 Spin after-response work.** Run it before the response, or skip it.
-  Blocks T9.
+- **DEC-14 Spin after-response work.** The work runs before the response,
+  because DEC-16 rules out skipping it. Open: the latency it may add and its
+  bound. Blocks T9.
 - **DEC-15 Rate limiting after the MVP** (user, 2026-11-12, deferred). Rate
   limiting is punted past the MVP: the keys (batch sync stays per partner),
   EdgeZero's limiter with its Cloudflare and Spin backends, and new limits on
@@ -643,7 +698,8 @@ revisions, not from PR descriptions:
 - PR and issue state: `gh pr view` and `gh api graphql`, read on the dates in
   the status line.
 - The full CI gate list ran at this PR's first head, and the docs gates at
-  each later head; results are in the review threads.
+  each later head; results are in the review threads and the PR's head-move
+  comments.
 
 ## Review log
 
@@ -663,8 +719,16 @@ the RC-unit baseline (15), ID-5's acceptance on Spin (18) and decision gates
 missing from plan cells (23). It added two should-fix findings: Task 1 must
 re-parent the EdgeZero issues it moves (35), and WB-3's no-write case must
 require a consistent `<name>_cst` (36). No blocking finding. The revision after
-it addresses all eight; round 3 is pending, and the PR stays in draft until a
-round finds nothing blocking.
+it addresses all eight. The PR stays in draft until a round leaves no open
+finding.
+
+### Round 3, 2026-11-12
+
+Review 5877498110 at `fbdfbedef` accepted and resolved threads 1, 7, 14, 15,
+18, 23, 35 and 36, found nothing blocking and opened one should-fix, thread 37:
+the plan's `gh issue view` and `gh pr view` calls did not name the repository.
+The decision commits that followed (`ba106e554` to `c4417b7f8`) are recorded
+below.
 
 ### Ticket audit, 2026-11-12
 
@@ -739,3 +803,15 @@ defers to its section 13.1, which the plan asks to ship in R2.
 The user then excluded attestation and packaging (DEC-19): AX-5 keeps only the
 source-built production image, #1449 and #1543 leave the plan, and the image
 and Terraform units restack on #1531 instead of #1543.
+
+### Round 4, 2026-11-12
+
+Reviews 5881124556 and 5881450878 at `c4417b7f8` reviewed those decisions and
+opened 66 threads; four of the second duplicate the first (the LiveRamp gate,
+Fastly's limiter under T21, withdrawal ordering and the EC route's JSON). Three
+were blocking: LiveRamp had no MVP ticket (T22 now checks it, gated by DEC-9),
+the record contract asked DynamoDB for strong listing across partitions
+(EZI-2a now lists strongly within a partition, and AX-4 partitions by listing
+prefix), and the EC route's JSON exposed every EID (it now carries only the
+mirror's view). The revision after it addresses every open thread, including
+thread 37; each thread holds its disposition.
