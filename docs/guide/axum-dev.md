@@ -45,6 +45,47 @@ rewrite its origin URL to the Axum listener, and remove the original URL. The
 exit trap stops the Axum process and stub origin, then removes the temporary
 config, local-push output, bodies, headers, and logs.
 
+## Listen address
+
+Axum listens on `127.0.0.1:8787` by default. It reads EdgeZero's
+`EDGEZERO__ADAPTER__HOST` and `EDGEZERO__ADAPTER__PORT` first, so a container
+can listen on `0.0.0.0`. `PORT` is the port fallback local tooling uses. An
+invalid EdgeZero value falls back with a startup warning, as EdgeZero does; an
+invalid `PORT` stops the process. The container image sets
+`EDGEZERO__ADAPTER__PORT=8080`, so a `PORT` injected by a container platform is
+ignored there; set `EDGEZERO__ADAPTER__PORT` instead.
+
+## Run the container image
+
+`crates/trusted-server-adapter-axum/Dockerfile` builds the server image from the
+repository root. Releases with package publication enabled push it to GHCR as
+`trusted-server-axum`; see
+[Download from GitHub Packages](./release-verification#download-from-github-packages)
+to verify it. The image is Debian slim with CA certificates and the server binary
+only. It runs as UID `10001`, writes nothing, listens on `0.0.0.0:8080`, and
+reads the same config and secret variables as the smoke above. CI builds it and
+runs that smoke against it with a read-only root filesystem:
+`AXUM_SMOKE_IMAGE=<image> ./scripts/smoke-axum.sh` (Linux host networking). It
+stops on `SIGINT`, the signal the server handles, so `docker stop` shuts it
+down without waiting for the kill timeout. SIGTERM draining and readiness are
+not implemented yet (#1236).
+
+```bash
+docker build --file crates/trusted-server-adapter-axum/Dockerfile \
+  --build-arg TRUSTED_SERVER_VERSION="$(git rev-parse HEAD)" \
+  --tag trusted-server-axum .
+docker run --rm --read-only --cap-drop ALL --publish 8080:8080 \
+  --env TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG \
+  --env TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD \
+  --env TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET \
+  --env TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE \
+  trusted-server-axum
+```
+
+`--env NAME` without a value passes that variable from your shell, so secrets
+stay out of the command line. The support status above still applies inside the
+container.
+
 ## Logging
 
 Axum logs to standard output at `info` by default. Set `RUST_LOG` to a single
