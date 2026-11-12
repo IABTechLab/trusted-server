@@ -639,10 +639,11 @@ fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
 }
 
 /// Drops client EIDs whose source is owned by a configured identity provider
-/// whose TCF vendor consent is withheld.
+/// whose TCF vendor consent is withheld, and, for a visitor whose jurisdiction
+/// is GDPR, client EIDs whose source a provider excludes where GDPR applies.
 ///
-/// Only sources marked by a configured provider carry a vendor ID, so with no
-/// providers configured the input is returned unchanged.
+/// Only sources marked by a configured provider carry a vendor ID or a GDPR
+/// exclusion, so with no providers configured the input is returned unchanged.
 pub(crate) fn drop_vendor_denied_client_eids(
     client_eids: Option<Vec<Eid>>,
     registry: Option<&PartnerRegistry>,
@@ -653,9 +654,9 @@ pub(crate) fn drop_vendor_denied_client_eids(
     };
     let mut eids = client_eids?;
     eids.retain(|eid| {
-        !registry
-            .get(&eid.source)
-            .is_some_and(|partner| partner.owner_vendor_consent_denied(consent))
+        !registry.get(&eid.source).is_some_and(|partner| {
+            partner.owner_vendor_consent_denied(consent) || partner.excluded_for(consent)
+        })
     });
     Some(eids)
 }
@@ -876,6 +877,46 @@ mod tests {
             sources,
             vec!["other.example.com"],
             "should drop only the vendor-denied provider source"
+        );
+    }
+
+    #[test]
+    fn client_eids_of_a_gdpr_excluded_source_are_dropped_where_gdpr_applies() {
+        // Arrange: the browser sends a UID2 EID; the visitor is under GDPR
+        // with TCF Purposes 1 and 4 granted.
+        let mut registry = partner_registry(&["uidapi.com", "ids.example.com"]);
+        assert!(
+            registry.exclude_where_gdpr_applies("uidapi.com"),
+            "should mark the UID2 source"
+        );
+        let gdpr = crate::test_support::tests::consent_granting_vendors(vec![1]);
+
+        // Act
+        let under_gdpr = drop_vendor_denied_client_eids(
+            client_eids_for(&["uidapi.com", "ids.example.com"]),
+            Some(&registry),
+            &gdpr,
+        )
+        .expect("should keep the list");
+        let elsewhere = drop_vendor_denied_client_eids(
+            client_eids_for(&["uidapi.com", "ids.example.com"]),
+            Some(&registry),
+            &ConsentContext::default(),
+        )
+        .expect("should keep the list");
+
+        // Assert
+        let sources =
+            |eids: &[Eid]| -> Vec<String> { eids.iter().map(|eid| eid.source.clone()).collect() };
+        assert_eq!(
+            sources(&under_gdpr),
+            vec!["ids.example.com"],
+            "should not send the GDPR-excluded browser EID to bidders"
+        );
+        assert_eq!(
+            sources(&elsewhere),
+            vec!["uidapi.com", "ids.example.com"],
+            "should keep the browser EID outside GDPR"
         );
     }
 
