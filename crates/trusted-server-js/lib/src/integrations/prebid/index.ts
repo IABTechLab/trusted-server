@@ -35,6 +35,7 @@ import {
   userIdConfigNameAliases,
   userIdSubmoduleKey,
 } from './user_id_modules';
+import { createRelayConsentGuard } from './relay_consent';
 
 /**
  * Prebid.js public API surface (type-only; erased at build time).
@@ -187,6 +188,8 @@ interface InjectedPrebidConfig {
   accountId?: string;
   timeout?: number;
   debug?: boolean;
+  /** Opt-in relay basic-ads soft vendor exception for testing. Defaults to false. */
+  relaySoftVendorException?: boolean;
   /** Validated browser bidder route codes owned by the server auction plan. */
   serverSideBidders?: string[];
   /** Bidders that run client-side via native Prebid.js adapters. */
@@ -527,7 +530,10 @@ export function auctionBidsToPrebidBids(
 
 type PbjsConfig = Parameters<typeof pbjs.setConfig>[0];
 type PrebidGetConfig = (key?: string) => unknown;
-type ManagedTcfConsentActivation = { acceptCmpEvents: boolean };
+type ManagedTcfConsentActivation = {
+  acceptCmpEvents: boolean;
+  applyConfig: typeof pbjs.setConfig;
+};
 type TcfApi = (
   command: string,
   version: number,
@@ -806,7 +812,10 @@ function activateManagedUserIdTcfConsent(
     return undefined;
   }
 
-  const activation: ManagedTcfConsentActivation = { acceptCmpEvents: true };
+  const activation: ManagedTcfConsentActivation = {
+    acceptCmpEvents: true,
+    applyConfig: setConfig,
+  };
   try {
     const effectiveConsent = effectiveConsentManagement ?? {};
     if (publisherOwnsTcfConsentManagement(effectiveConsentManagement)) {
@@ -814,9 +823,8 @@ function activateManagedUserIdTcfConsent(
     }
 
     const originalTcfApi = tcfApi as TcfApi;
-    // Prebid owns the callback once it subscribes. Guard only the subscription
-    // created by this automatic activation so a delayed first CMP response
-    // cannot overwrite consent after publisher ownership transfers.
+    // Keep initial and internal rule-update subscriptions under the same owner
+    // so delayed CMP responses cannot overwrite a later publisher policy.
     const guardedTcfApi: TcfApi = function (command, version, callback, parameter) {
       if (command !== 'addEventListener' || typeof callback !== 'function') {
         return originalTcfApi.call(window, command, version, callback, parameter);
@@ -847,17 +855,21 @@ function activateManagedUserIdTcfConsent(
     };
 
     const tcfWindow = window as typeof window & { __tcfapi: TcfApi };
-    tcfWindow.__tcfapi = guardedTcfApi;
-    try {
-      setConfig({
-        consentManagement: {
-          ...effectiveConsent,
-          gdpr: { cmpApi: 'iab' },
-        },
-      } as PbjsConfig);
-    } finally {
-      if (tcfWindow.__tcfapi === guardedTcfApi) tcfWindow.__tcfapi = originalTcfApi;
-    }
+    activation.applyConfig = (value) => {
+      const previousTcfApi = tcfWindow.__tcfapi;
+      tcfWindow.__tcfapi = guardedTcfApi;
+      try {
+        return setConfig(value);
+      } finally {
+        if (tcfWindow.__tcfapi === guardedTcfApi) tcfWindow.__tcfapi = previousTcfApi;
+      }
+    };
+    activation.applyConfig({
+      consentManagement: {
+        ...effectiveConsent,
+        gdpr: { cmpApi: 'iab' },
+      },
+    } as PbjsConfig);
   } catch (error) {
     activation.acceptCmpEvents = false;
     log.error(
@@ -2048,6 +2060,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   const managedPbjs = pbjs as typeof pbjs & Record<string, unknown>;
   const injectedManagedUserIds = injected?.managedUserIds;
   let trySeedManagedUserIds: (() => void) | undefined;
+  let applyRelayConsentConfig = (value: PbjsConfig) => pbjs.setConfig(value);
   if (
     injectedManagedUserIds &&
     injectedManagedUserIds.length > 0 &&
@@ -2064,6 +2077,13 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     const getConfig = (pbjs as unknown as { getConfig?: PrebidGetConfig }).getConfig;
 
     let automaticTcfConsentActivation: ManagedTcfConsentActivation | undefined;
+    // Internal relay rules retain the automatic owner's CMP subscription guard.
+    applyRelayConsentConfig = (value) => {
+      const activeConsent = automaticTcfConsentActivation;
+      return activeConsent?.acceptCmpEvents
+        ? activeConsent.applyConfig(value)
+        : originalSetConfig(value);
+    };
     // Until CMP discovery resolves, managed entries stay out of every
     // configuration Prebid sees: a module seeded before the CMP is discoverable
     // would call its vendor with the GDPR handler disabled.
@@ -2478,6 +2498,11 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   });
 
   const originalRequestBids = pbjs.requestBids.bind(pbjs);
+  const prepareRelayConsent = createRelayConsentGuard(
+    ADAPTER_CODE,
+    (key) => (pbjs as unknown as { getConfig?: PrebidGetConfig }).getConfig?.(key),
+    (value) => applyRelayConsentConfig(value as PbjsConfig)
+  );
 
   // Browser demand ownership is explicit. Only validated auction-plan route
   // codes are folded; every other publisher bidder entry remains in Prebid.js.
@@ -2657,6 +2682,9 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     };
 
     try {
+      if (adUnits.length > 0 && injected?.relaySoftVendorException === true) {
+        prepareRelayConsent();
+      }
       return originalRequestBids(opts);
     } catch (error) {
       for (const [adUnitCode, token] of firstImpressionTokens) {

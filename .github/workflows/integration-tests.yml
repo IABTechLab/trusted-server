@@ -202,7 +202,7 @@ jobs:
           npm ci --prefix crates/trusted-server-js/lib
           npm ci --prefix crates/trusted-server-integration-tests/browser
           cd crates/trusted-server-integration-tests/browser
-          npx playwright install --with-deps chromium
+          npx playwright install chromium
           npm install -g wrangler@4.83.0
 
       - name: Install the verified Spin runtime
@@ -301,7 +301,7 @@ jobs:
         working-directory: crates/trusted-server-integration-tests/browser
         run: |
           npm ci
-          npx playwright install --with-deps chromium
+          npx playwright install chromium
 
       # startViceroy retargets the config after choosing its listener port. Build
       # on this runner rather than relying on an uncached binary or a native

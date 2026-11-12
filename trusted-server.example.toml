@@ -532,6 +532,8 @@ auction_timeout_ms = 500
 [integrations.prebid]
 enabled = false
 timeout_ms = 1000
+# Testing opt-in only. Leave false for production consent enforcement.
+relay_soft_vendor_exception = false
 debug = false
 client_side_bidders = []          # bidders running via native Prebid.js adapters
 # Keep selected GAM inventory out of Trusted Server's Prebid refresh auctions.

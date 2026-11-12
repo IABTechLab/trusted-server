@@ -40,8 +40,10 @@ use crate::auction::types::{AuctionContext, AuctionRequest, MediaType};
 use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
 use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
-use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
-use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar};
+use crate::constants::{
+    COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_SOURCEPOINT_TCF, COOKIE_US_PRIVACY,
+};
+use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar, tcf_consent_cookie};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
@@ -534,6 +536,11 @@ pub struct PrebidIntegrationConfig {
     pub timeout_ms: u32,
     #[serde(default)]
     pub debug: bool,
+    /// Opt into the relay's basic-ads soft vendor exception for testing.
+    ///
+    /// Defaults to false. Purpose consent and publisher GVL mappings remain enforced.
+    #[serde(default)]
+    pub relay_soft_vendor_exception: bool,
     #[serde(
         default = "default_script_patterns",
         deserialize_with = "crate::settings::vec_from_seq_or_map"
@@ -576,6 +583,7 @@ impl Default for PrebidIntegrationConfig {
             account_id: None,
             timeout_ms: default_timeout_ms(),
             debug: false,
+            relay_soft_vendor_exception: false,
             script_patterns: default_script_patterns(),
             external_bundle_url: None,
             external_bundle_sha256: None,
@@ -602,6 +610,7 @@ impl From<&LegacyPrebidServerConfig> for PrebidIntegrationConfig {
             account_id: config.account_id.clone(),
             timeout_ms: config.timeout_ms,
             debug: config.debug,
+            relay_soft_vendor_exception: false,
             script_patterns: config.script_patterns.clone(),
             external_bundle_url: config.external_bundle_url.clone(),
             external_bundle_sha256: config.external_bundle_sha256.clone(),
@@ -1578,6 +1587,7 @@ struct InjectedPrebidClientConfig<'a> {
     managed_user_ids: Vec<InjectedManagedUserId<'a>>,
     timeout: u32,
     debug: bool,
+    relay_soft_vendor_exception: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     bidders: Option<&'a [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1599,6 +1609,7 @@ impl<'a> From<&'a PrebidIntegrationConfig> for InjectedPrebidClientConfig<'a> {
                 .collect(),
             timeout: config.timeout_ms,
             debug: config.debug,
+            relay_soft_vendor_exception: config.relay_soft_vendor_exception,
             bidders: None,
             server_side_bidders: None,
             client_side_bidders: &config.client_side_bidders,
@@ -2124,7 +2135,15 @@ impl PrebidConsentCookies {
         let jar = parse_cookies_to_jar(header);
         let mut pairs = Vec::new();
         for name in CONSENT_COOKIE_NAMES {
-            let Some(cookie) = jar.get(name) else {
+            if *name == COOKIE_SOURCEPOINT_TCF {
+                continue;
+            }
+            let cookie = if *name == COOKIE_EUCONSENT_V2 {
+                tcf_consent_cookie(&jar)
+            } else {
+                jar.get(name)
+            };
+            let Some(cookie) = cookie else {
                 continue;
             };
             if let Some(value) = prebid_cookie_value(name, cookie.value()) {
@@ -5396,6 +5415,53 @@ external_bundle_sri = "sha384-AAAA"
             "should omit empty refresh-auction exclusions: {}",
             script
         );
+    }
+
+    #[test]
+    fn planned_registration_injects_relay_soft_vendor_exception() {
+        assert!(
+            !PrebidIntegrationConfig::default().relay_soft_vendor_exception,
+            "should default the relay exception to false"
+        );
+        for configured in [None, Some(false), Some(true)] {
+            let mut settings = make_settings();
+            let mut config = json!({
+                "enabled": true,
+                "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
+            });
+            if let Some(value) = configured {
+                config["relay_soft_vendor_exception"] = json!(value);
+            }
+            settings
+                .integrations
+                .insert_config("prebid", &config)
+                .expect("should configure prebid");
+            let plan = crate::auction::compile_auction_plan(&settings)
+                .expect("should compile auction plan");
+            let document_state = IntegrationDocumentState::default();
+            let ctx = IntegrationHtmlContext {
+                request_host: "pub.example",
+                request_scheme: "https",
+                origin_host: "origin.example",
+                document_state: &document_state,
+            };
+            for enabled in [true, false] {
+                let registration =
+                    register_for_plan(&settings, &plan.clone().with_enabled(enabled))
+                        .expect("should register prebid")
+                        .expect("should enable prebid");
+                let inserts = registration.head_injectors[0].head_inserts(&ctx);
+                let expected = format!(
+                    r#""relaySoftVendorException":{}"#,
+                    configured.unwrap_or(false)
+                );
+                assert!(
+                    inserts[0].contains(&expected),
+                    "should inject the configured relay exception for {configured:?}: {}",
+                    inserts[0]
+                );
+            }
+        }
     }
 
     #[test]
@@ -10105,6 +10171,49 @@ set = { networkId = 42 }
                 },
                 "should carry jurisdiction only with TC or GPP for {input:?}"
             );
+        }
+    }
+
+    #[test]
+    fn sourcepoint_tcf_forwarding_preserves_cmp_precedence_and_consent_only_policy() {
+        for mode in [
+            ConsentForwardingMode::Both,
+            ConsentForwardingMode::CookiesOnly,
+            ConsentForwardingMode::OpenrtbOnly,
+        ] {
+            for (input, selected) in [
+                (
+                    "session=secret; __Host-ts-tcf=bridge",
+                    Some("euconsent-v2=bridge"),
+                ),
+                (
+                    "session=secret; __Host-ts-tcf=bridge; euconsent-v2=publisher",
+                    Some("euconsent-v2=publisher"),
+                ),
+                ("__Host-ts-tcf=bridge; euconsent-v2=", Some("euconsent-v2=")),
+                ("__Host-ts-tcf=bridge; euconsent-v2=bad\\value", None),
+            ] {
+                let from = http::Request::builder()
+                    .header(header::COOKIE, input)
+                    .body(EdgeBody::empty())
+                    .expect("should build the consent selection request");
+                let mut to = http::Request::new(EdgeBody::empty());
+                to.headers_mut()
+                    .insert(header::COOKIE, HeaderValue::from_static("stale=secret"));
+                copy_request_headers(&from, to.headers_mut(), mode, None);
+                let expected = if mode == ConsentForwardingMode::OpenrtbOnly {
+                    None
+                } else {
+                    selected
+                };
+                assert_eq!(
+                    to.headers()
+                        .get(header::COOKIE)
+                        .and_then(|value| value.to_str().ok()),
+                    expected,
+                    "should select the CMP signal without unrelated or private bridge cookies in {mode:?}"
+                );
+            }
         }
     }
 

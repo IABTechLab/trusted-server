@@ -27,6 +27,7 @@ Prebid configuration has two independent owners:
 enabled = true
 timeout_ms = 1000
 debug = false
+relay_soft_vendor_exception = false
 client_side_bidders = ["example-browser"]
 excluded_gam_ad_unit_path_suffixes = ["/example-tracking-only"]
 script_patterns = ["/prebid.js", "/prebid.min.js"]
@@ -95,6 +96,7 @@ provider = "pbs-main"
 | `account_id`                                    | `None`                                                                 | Optional browser-injected account value                                             |
 | `timeout_ms`                                    | `1000`                                                                 | Browser Prebid.js timeout only                                                      |
 | `debug`                                         | `false`                                                                | Browser Prebid.js debug only                                                        |
+| `relay_soft_vendor_exception`                   | `false`                                                                | Testing opt-in for the relay basic-ads soft vendor exception                        |
 | `client_side_bidders`                           | `[]`                                                                   | Native browser adapters that are not folded into `trustedServer`                    |
 | `excluded_gam_ad_unit_path_suffixes`            | `[]`                                                                   | GAM suffixes omitted from Trusted Server refresh auctions                           |
 | `script_patterns`                               | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid scripts intercepted to prevent duplicate instances                 |
@@ -283,6 +285,31 @@ consent gate browser resolution and storage; Purpose 3 has no standalone default
 rule, and Purpose 4 controls user-provided-data activity rather than
 IdentityLink resolution. Validate a regenerated bundle against a live CMP before
 rolling it out broadly.
+
+The `trustedServer` bidder is a first-party auction relay without its own GVL
+vendor ID. Set `integrations.prebid.relay_soft_vendor_exception = true` to opt
+into a testing exception. With `consentManagement.gdpr` configured, before each
+relay auction the shim adds `trustedServer` to the `basicAds` rule's
+`softVendorExceptions`. Purpose 2 enforcement remains active; unrelated bidders,
+storage, and User ID modules keep their existing rules. Publisher rules and
+existing exceptions are preserved. If the publisher supplies a
+`gvlMapping.trustedServer` identity, that identity's vendor consent is enforced
+instead. The relay forwards the original consent signals; downstream auction
+endpoints remain responsible for enforcing consent for their individual vendors.
+Legacy top-level TCF settings are left unchanged; use the namespaced
+`consentManagement.gdpr` configuration for relay consent handling.
+
+Internal relay rule updates retain the automatic CMP subscription's ownership
+and guard. A later publisher consent configuration still takes ownership; stale
+CMP callbacks must not override that publisher decision, including when the
+CMP's first response is deferred.
+
+For production, leave `relay_soft_vendor_exception = false` or omit it, which
+also defaults to false. The shim then leaves publisher consent rules unchanged.
+Without a publisher-configured relay GVL identity or exception, Prebid's normal
+TCF vendor enforcement can still block relay auctions. Enabling this testing
+option is not a substitute for a production consent policy, and it does not set
+Prebid Server's `test_mode` or mark auction traffic as non-billable.
 
 When managed User IDs are configured and the page exposes a callable
 `window.__tcfapi`, the Trusted Server shim activates Prebid's standard IAB GDPR

@@ -3,6 +3,7 @@ import { log } from '../../core/log';
 import { ConsentSync } from './consent_sync';
 import { GppConsentCapture, isCookieSafeGppString, type GppWindow } from './gpp_capture';
 import { installSourcepointGuard } from './script_guard';
+import { installSourcepointTcfMirror } from './tcf_mirror';
 
 type SourcepointWindow = GppWindow & {
   __tsjs_sourcepoint?: {
@@ -63,6 +64,7 @@ let readyRetry: (() => void) | undefined;
 let gppCapture: GppConsentCapture | undefined;
 let apiMirrorSucceeded = false;
 let consentSync: ConsentSync | undefined;
+let disposeTcfMirror: (() => void) | undefined;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -331,6 +333,7 @@ export function initializeSourcepointConsentMirror(): void {
   );
   gppCapture.start();
 
+  disposeTcfMirror = installSourcepointTcfMirror(window);
   if (!mirrorSourcepointConsent() && !gppCapture.hasApi()) scheduleInitialRetry();
 
   // Retain legacy localStorage refresh for CMPs without the GPP API. When an
@@ -341,6 +344,8 @@ export function initializeSourcepointConsentMirror(): void {
 
 /** Releases this module's listeners without removing or replacing the publisher CMP. */
 export function disposeSourcepointConsentMirror(): void {
+  disposeTcfMirror?.();
+  disposeTcfMirror = undefined;
   gppCapture?.stop();
   gppCapture = undefined;
   consentSync?.stop();

@@ -223,12 +223,16 @@ function expectNoUnexpectedNetworkActivity(stubs) {
   ).toEqual([]);
 }
 
-function installServerState(pageWindow, { analytics = false, managedUserIds } = {}) {
+function installServerState(
+  pageWindow,
+  { analytics = false, managedUserIds, relaySoftVendorException } = {}
+) {
   pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
   pageWindow.__tsjs_prebid = {
     clientSideBidders: [],
     serverSideBidders: ['appnexus'],
     ...(managedUserIds ? { managedUserIds } : {}),
+    ...(relaySoftVendorException === undefined ? {} : { relaySoftVendorException }),
   };
 
   if (analytics) {
@@ -325,17 +329,90 @@ function expectManifest(manifest, analytics) {
 }
 
 describe('tsjs-prebid production artifacts', () => {
+  it.each([
+    { relaySoftVendorException: undefined, purpose2: true, mapping: undefined, auctionRequests: 0 },
+    { relaySoftVendorException: false, purpose2: true, mapping: undefined, auctionRequests: 0 },
+    { relaySoftVendorException: true, purpose2: true, mapping: undefined, auctionRequests: 1 },
+    { relaySoftVendorException: true, purpose2: false, mapping: undefined, auctionRequests: 0 },
+    { relaySoftVendorException: true, purpose2: true, mapping: 1, auctionRequests: 0 },
+  ])(
+    'enforces actual TCF rules for relay consent: %j',
+    async ({ relaySoftVendorException, purpose2, mapping, auctionRequests }) => {
+      const dom = createPage();
+      try {
+        const pageWindow = dom.window;
+        const stubs = installNetworkAndConsoleStubs(pageWindow);
+        installServerState(pageWindow, { relaySoftVendorException });
+        pageWindow.eval(noAnalyticsArtifact.bundleCode);
+        pageWindow.eval(shimCode);
+        expect(pageWindow.pbjs.installedModules).toContain('tcfControl');
+
+        // Grant purposes but no vendor identities: the first-party relay must
+        // not inherit a third-party bidder's GVL identity or vendor exemption.
+        const gdpr = {
+          cmpApi: 'static',
+          consentData: {
+            gdprApplies: true,
+            tcString: 'example-consent',
+            purpose: { consents: { 1: true, 2: purpose2 }, legitimateInterests: {} },
+            vendor: { consents: {}, legitimateInterests: {} },
+          },
+        };
+        pageWindow.pbjs.setConfig({
+          ...(mapping === undefined ? {} : { gvlMapping: { trustedServer: mapping } }),
+          consentManagement: { gdpr },
+        });
+        const slot = pageWindow.document.createElement('div');
+        slot.id = 'consent-slot';
+        pageWindow.document.body.appendChild(slot);
+
+        await new Promise((resolve) => {
+          pageWindow.pbjs.requestBids({
+            adUnits: [
+              {
+                code: slot.id,
+                mediaTypes: { banner: { sizes: [[300, 250]] } },
+                bids: [
+                  { bidder: 'appnexus', params: { placementId: 1 } },
+                  { bidder: 'rubicon', params: { accountId: 1, siteId: 1, zoneId: 1 } },
+                ],
+              },
+            ],
+            timeout: 1000,
+            bidsBackHandler: resolve,
+          });
+        });
+
+        const requests = stubs.fetchSpy.mock.calls.filter(
+          ([resource]) => new URL(requestUrl(resource)).pathname === '/auction'
+        );
+        expect(requests).toHaveLength(auctionRequests);
+        if (relaySoftVendorException !== true) {
+          expect(pageWindow.pbjs.getConfig('consentManagement').gdpr).toEqual(gdpr);
+        }
+        const enforcement = pageWindow.pbjs
+          .getEvents()
+          .filter(({ eventType }) => eventType === 'tcf2Enforcement')
+          .at(-1).args;
+        expect(enforcement.biddersBlocked).toContain('rubicon');
+        expect(enforcement.biddersBlocked.includes('trustedServer')).toBe(auctionRequests === 0);
+        expectNoUnexpectedNetworkActivity(stubs);
+      } finally {
+        dom.window.close();
+      }
+    }
+  );
+
   it('keeps the served shim Prebid-free', () => {
     expect(analyticsArtifact.bundleCode).toContain(analyticsArtifact.manifest.prebidVersion);
     expect(analyticsArtifact.bundleCode).toContain('_pbjsGlobals');
     expect(shimCode).not.toContain(analyticsArtifact.manifest.prebidVersion);
     expect(shimCode).not.toContain('_pbjsGlobals');
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
-    // The original shim measures 40,354 characters. Shared strict trace JSON
-    // validation, request-ID hook association, and bounded pending lifecycle add
-    // 11,676 characters (52,030 total). Keep a narrow 52.5 KB guard: Prebid remains a separate artifact above 200 KB, and importing
-    // its runtime or private rendering helpers must still fail this regression.
-    expect(shimCode.length).toBeLessThan(52_500);
+    // The current-main shim measures 52,462 characters. The relay adds 1,166,
+    // for 53,628 total. The reviewed 54,000-character budget keeps this shim
+    // separate from Prebid's 200 KB+ artifact and rejects runtime/helper imports.
+    expect(shimCode.length).toBeLessThan(54_000);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 
