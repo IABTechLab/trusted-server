@@ -718,7 +718,7 @@ impl IdentityProviderConfig {
             id,
             kind,
             enabled: true,
-            endpoint,
+            endpoint: Some(endpoint),
             allowed_domains,
             sources,
             tcf_vendor_id: None,

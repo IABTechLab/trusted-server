@@ -215,6 +215,7 @@ mod tests {
                 status: LookupStatus::Skipped(SkipReason::NotDue),
                 entries: Vec::new(),
                 cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
             }],
         );
 

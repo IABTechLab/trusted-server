@@ -62,9 +62,13 @@ impl ProviderKind for PullSync {
                 Ok::<_, Report<ProviderConfigError>>(value)
             })
             .transpose()?;
+        let endpoint = common.endpoint.cloned().ok_or_else(|| {
+            Report::new(ProviderConfigError::Invalid)
+                .attach("a pull-sync provider needs an endpoint")
+        })?;
         let one = NonZeroUsize::MIN;
         Ok(PullSyncProvider {
-            endpoint: common.endpoint.clone(),
+            endpoint,
             source: source.clone(),
             authorization,
             capabilities: ProviderCapabilities {
@@ -136,7 +140,8 @@ impl IdentityProvider for PullSyncProvider {
 mod tests {
     use super::*;
     use trusted_server_core::consent::ConsentContext;
-    use trusted_server_core::ec::provider::{ClientSignals, OwnedEntries};
+    use trusted_server_core::ec::eid_types::UnixSeconds;
+    use trusted_server_core::ec::provider::{ClientSignals, OwnedEntries, RequestCookies};
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::ProviderSecrets;
 
@@ -148,7 +153,8 @@ mod tests {
         };
         PullSync::build(
             &ProviderCommon {
-                endpoint: &endpoint,
+                id: "pull-sync:partner.example.com",
+                endpoint: Some(&endpoint),
                 sources: &sources,
                 secrets: &secrets,
             },
@@ -174,7 +180,9 @@ mod tests {
                 publisher_domain: "www.example.com",
                 due_sources: &due,
                 current: OwnedEntries::empty(),
+                cookies: RequestCookies::default(),
                 hashed_email: None,
+                now: UnixSeconds::new(1_700_000_000),
             })
             .expect("should build request");
 

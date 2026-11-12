@@ -2045,6 +2045,7 @@ mod tests {
                     vec![KvEid::new(EidFields::default(), vec![uid])],
                 )],
                 cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
             }],
         )
     }
@@ -2235,6 +2236,7 @@ mod tests {
                 },
                 entries: vec![entry("a.example.com"), entry("b.example.com")],
                 cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
             }],
         ));
         let partners = ["a.example.com", "b.example.com"].map(|source| {
