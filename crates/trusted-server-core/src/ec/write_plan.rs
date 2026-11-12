@@ -86,7 +86,7 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
         Vec::new()
     };
     let had_change = entry != pruned;
-    enforce_size_cap(&mut entry, &written, &ingested);
+    enforce_size_cap(&mut entry, &pruned, &written, &ingested);
     // The cap may trim the only real change away; trimming alone never writes.
     let changed = had_change && entry != pruned;
 
@@ -175,39 +175,51 @@ fn member_len(source: &str, record: &KvPartnerId) -> usize {
 
 /// Shrinks `entry` until it serializes within [`MAX_ENTRY_BYTES`].
 ///
+/// `base` is the stored row before this navigation's changes. A row that was
+/// already over the cap (written before the cap existed) loses its largest
+/// stored records first, so the change that triggered the write still lands.
+/// This navigation's provider UIDs then compete with the stored row only, and
+/// its browser UIDs, which the browser offers again, make way for them. A
+/// provider refresh that no longer fits keeps the record it would replace
+/// when that record fits.
+///
 /// # Performance
 ///
 /// Tracks the row size by the bytes each drop removes and serializes the
 /// whole row again only when that estimate reaches the cap, so the cost is
 /// linear in the number of dropped UIDs and records.
-fn enforce_size_cap(entry: &mut KvEntry, written: &[SourceDomain], ingested: &[String]) {
+fn enforce_size_cap(
+    entry: &mut KvEntry,
+    base: &KvEntry,
+    written: &[SourceDomain],
+    ingested: &[String],
+) {
     let mut size = serialized_len(entry);
-    // Drop this navigation's provider UIDs first, newest source last-in first.
-    while size > MAX_ENTRY_BYTES {
-        let Some(source) = written.iter().rev().find(|source| {
+    if size <= MAX_ENTRY_BYTES {
+        return;
+    }
+    if serialized_len(base) > MAX_ENTRY_BYTES {
+        drop_largest_records(entry, &mut size, |source| {
+            !written.iter().any(|written| written.as_str() == source)
+                && !ingested.iter().any(|ingested| ingested == source)
+        });
+    }
+    let browser_len: usize = ingested
+        .iter()
+        .filter_map(|source| {
             entry
                 .ids
-                .get(source.as_str())
-                .is_some_and(KvPartnerId::is_provider_written)
-        }) else {
+                .get(source)
+                .map(|record| member_len(source, record))
+        })
+        .sum();
+    // Drop this navigation's provider UIDs that do not fit, newest source
+    // last-in first.
+    for source in written.iter().rev() {
+        if size.saturating_sub(browser_len) <= MAX_ENTRY_BYTES {
             break;
-        };
-        let record = entry
-            .ids
-            .get_mut(source.as_str())
-            .expect("should hold a written source");
-        let before = member_len(source.as_str(), record);
-        record.drop_last_uid();
-        let after = if record.uid.is_empty() {
-            entry.ids.remove(source.as_str());
-            0
-        } else {
-            member_len(source.as_str(), record)
-        };
-        size = size.saturating_sub(before.saturating_sub(after));
-        if size <= MAX_ENTRY_BYTES {
-            size = serialized_len(entry);
         }
+        drop_provider_uids(entry, &mut size, base, source.as_str(), browser_len);
     }
     // Then this navigation's browser UIDs, newest first: the browser offers
     // them again, while a stored record would be lost.
@@ -225,29 +237,82 @@ fn enforce_size_cap(entry: &mut KvEntry, written: &[SourceDomain], ingested: &[S
             }
         }
     }
-    if size <= MAX_ENTRY_BYTES {
+    if size > MAX_ENTRY_BYTES {
+        drop_largest_records(entry, &mut size, |_| true);
+        if size > MAX_ENTRY_BYTES {
+            log::warn!("EC write planner: row exceeds size cap with no partner IDs left to drop");
+        }
+    }
+}
+
+/// Drops `source`'s provider UIDs, last first, until the row without this
+/// navigation's browser UIDs (`browser_len`) fits [`MAX_ENTRY_BYTES`].
+///
+/// When every UID is dropped, the record `base` stored for `source` is put
+/// back if it fits, so a refresh that no longer fits never deletes it.
+fn drop_provider_uids(
+    entry: &mut KvEntry,
+    size: &mut usize,
+    base: &KvEntry,
+    source: &str,
+    browser_len: usize,
+) {
+    let Some(record) = entry
+        .ids
+        .get_mut(source)
+        .filter(|record| record.is_provider_written())
+    else {
+        return;
+    };
+    while size.saturating_sub(browser_len) > MAX_ENTRY_BYTES && !record.uid.is_empty() {
+        let before = member_len(source, record);
+        record.drop_last_uid();
+        if record.uid.is_empty() {
+            break;
+        }
+        *size = size.saturating_sub(before.saturating_sub(member_len(source, record)));
+        if size.saturating_sub(browser_len) <= MAX_ENTRY_BYTES {
+            *size = serialized_len(entry);
+            return;
+        }
+    }
+    if !record.uid.is_empty() {
         return;
     }
-    // Only a row that was already over the cap (written before the cap
-    // existed) gets here: drop whole records, largest first, so every later
-    // write still fits the cap.
+    entry.ids.remove(source);
+    *size = serialized_len(entry);
+    if let Some(previous) = base.ids.get(source) {
+        let restored = size.saturating_add(member_len(source, previous));
+        if restored.saturating_sub(browser_len) <= MAX_ENTRY_BYTES {
+            log::info!(
+                "EC write planner: keeping the stored record for '{source}' as its refresh does not fit the row size cap"
+            );
+            entry.ids.insert(source.to_owned(), previous.clone());
+            *size = serialized_len(entry);
+        }
+    }
+}
+
+/// Drops whole records that `droppable` accepts, largest first, until `entry`
+/// fits [`MAX_ENTRY_BYTES`] or none is left.
+fn drop_largest_records(entry: &mut KvEntry, size: &mut usize, droppable: impl Fn(&str) -> bool) {
     let mut by_size: Vec<(usize, String)> = entry
         .ids
         .iter()
+        .filter(|(source, _)| droppable(source))
         .map(|(source, record)| (member_len(source, record), source.clone()))
         .collect();
     // A stable ascending sort pops the last of equally large records first.
     by_size.sort_by_key(|(len, _)| *len);
-    while size > MAX_ENTRY_BYTES {
+    while *size > MAX_ENTRY_BYTES {
         let Some((len, largest)) = by_size.pop() else {
-            log::warn!("EC write planner: row exceeds size cap with no partner IDs left to drop");
             return;
         };
         log::warn!("EC write planner: dropping '{largest}' to fit the row size cap");
         entry.ids.remove(&largest);
-        size = size.saturating_sub(len);
-        if size <= MAX_ENTRY_BYTES {
-            size = serialized_len(entry);
+        *size = size.saturating_sub(len);
+        if *size <= MAX_ENTRY_BYTES {
+            *size = serialized_len(entry);
         }
     }
 }
@@ -924,6 +989,147 @@ mod tests {
         assert!(
             change.is_none(),
             "should not write when only the cap would trim"
+        );
+    }
+
+    fn over_cap_snapshot() -> EcKvSnapshot {
+        let entry = over_cap_legacy_entry();
+        assert!(
+            serde_json::to_vec(&entry).expect("should serialize").len() > MAX_ENTRY_BYTES,
+            "should start over the cap"
+        );
+        EcKvSnapshot::Present {
+            ec_id: EC_ID.to_owned(),
+            entry: Box::new(entry),
+            generation: Some(1),
+        }
+    }
+
+    fn assert_fits(entry: &KvEntry) {
+        let size = serde_json::to_vec(entry).expect("should serialize").len();
+        assert!(
+            size <= MAX_ENTRY_BYTES,
+            "should fit the row cap, got {size}"
+        );
+    }
+
+    #[test]
+    fn over_cap_row_keeps_this_navigations_browser_uid() {
+        // Arrange
+        let registry = registry(&[]);
+        let snapshot = over_cap_snapshot();
+        let ingest = [PartnerIdUpdate::new("browser.example.com", "b-1")];
+        let lookups = LookupResults::default();
+
+        // Act
+        let change = plan_write(&input(&snapshot, None, &ingest, &lookups, &registry));
+
+        // Assert
+        let Some(RowChange::Update { entry, .. }) = change else {
+            panic!("should plan an update")
+        };
+        assert_fits(&entry);
+        assert_eq!(
+            entry
+                .ids
+                .get("browser.example.com")
+                .map(|record| record.uid.as_str()),
+            Some("b-1"),
+            "should keep the browser UID that triggered the write"
+        );
+    }
+
+    #[test]
+    fn over_cap_row_keeps_this_navigations_provider_uid() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let snapshot = over_cap_snapshot();
+        let lookups = found("ids.example.com", &["p-1"]);
+
+        // Act
+        let change = plan_write(&input(&snapshot, None, &[], &lookups, &registry));
+
+        // Assert
+        let Some(RowChange::Update { entry, .. }) = change else {
+            panic!("should plan an update")
+        };
+        assert_fits(&entry);
+        assert_eq!(
+            entry
+                .ids
+                .get("ids.example.com")
+                .map(|record| record.uid.as_str()),
+            Some("p-1"),
+            "should keep the provider UID that triggered the write"
+        );
+    }
+
+    fn fill_to(mut entry: KvEntry, limit: usize) -> KvEntry {
+        let mut filler = 0;
+        loop {
+            let mut candidate = entry.clone();
+            candidate.ids.insert(
+                format!("filler{filler:03}.example.com"),
+                KvPartnerId::single("f".repeat(100)),
+            );
+            if serde_json::to_vec(&candidate)
+                .expect("should serialize")
+                .len()
+                > limit
+            {
+                return entry;
+            }
+            entry = candidate;
+            filler += 1;
+        }
+    }
+
+    #[test]
+    fn provider_uid_wins_over_browser_uid_when_only_one_fits() {
+        // Arrange: room for either new UID alone, not both.
+        let registry = registry(&["ids.example.com"]);
+        let entry = fill_to(live_entry(), MAX_ENTRY_BYTES - 800);
+        let ingest = [PartnerIdUpdate::new("browser.example.com", "b".repeat(300))];
+        let provider_uid = "p".repeat(300);
+        let lookups = found("ids.example.com", &[provider_uid.as_str()]);
+
+        // Act
+        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+
+        // Assert
+        let Some(RowChange::Update { entry, .. }) = change else {
+            panic!("should plan an update")
+        };
+        assert_fits(&entry);
+        assert_eq!(
+            entry
+                .ids
+                .get("ids.example.com")
+                .map(|record| record.uid.as_str()),
+            Some(provider_uid.as_str()),
+            "should store the provider UID"
+        );
+        assert!(
+            !entry.ids.contains_key("browser.example.com"),
+            "should drop the browser UID, which the browser offers again"
+        );
+    }
+
+    #[test]
+    fn refresh_that_no_longer_fits_keeps_the_stored_provider_record() {
+        // Arrange: the stored provider UID fits; its larger refresh does not.
+        let registry = registry(&["ids.example.com"]);
+        let entry = fill_to(provider_entry(&["p-old"]), MAX_ENTRY_BYTES - 300);
+        let fresh = "p".repeat(900);
+        let lookups = found("ids.example.com", &[fresh.as_str()]);
+
+        // Act
+        let change = plan_write(&input(&present(&entry), None, &[], &lookups, &registry));
+
+        // Assert
+        assert!(
+            change.is_none(),
+            "should keep the stored provider record rather than delete it"
         );
     }
 
