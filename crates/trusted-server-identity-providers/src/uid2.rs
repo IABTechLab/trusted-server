@@ -785,6 +785,7 @@ mod tests {
     fn refresh_posts_the_stored_refresh_token() {
         let entry = stored_entry();
         let sources = [SourceDomain::try_from("uid2.example.com").expect("should build source")];
+        let owner = ProviderId::new("uid2");
         let consent = ConsentContext::default();
         let lookup = LookupInput {
             ec_id: "ec-example",
@@ -795,7 +796,7 @@ mod tests {
             },
             publisher_domain: "www.example.com",
             due_sources: &sources,
-            current: OwnedEntries::new(Some(&entry), &sources),
+            current: OwnedEntries::new(Some(&entry), &sources, &owner),
             cookies: RequestCookies::default(),
             hashed_email: None,
         };
@@ -826,6 +827,7 @@ mod tests {
     fn makes_no_request_without_an_endpoint() {
         let entry = stored_entry();
         let sources = [SourceDomain::try_from("uid2.example.com").expect("should build source")];
+        let owner = ProviderId::new("uid2");
         let consent = ConsentContext::default();
         let lookup = LookupInput {
             ec_id: "ec-example",
@@ -836,7 +838,7 @@ mod tests {
             },
             publisher_domain: "www.example.com",
             due_sources: &sources,
-            current: OwnedEntries::new(Some(&entry), &sources),
+            current: OwnedEntries::new(Some(&entry), &sources, &owner),
             cookies: RequestCookies::default(),
             hashed_email: None,
         };

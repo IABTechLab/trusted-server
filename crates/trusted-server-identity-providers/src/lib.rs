@@ -228,6 +228,10 @@ mod tests {
     use trusted_server_core::ec::provider::validate_enabled_configs;
     use trusted_server_core::settings::IdentityProviderConfig;
 
+    fn partners_for(settings: &Settings) -> Arc<PartnerRegistry> {
+        Arc::new(partner_registry(&settings.ec).expect("should build partner registry"))
+    }
+
     fn create_test_settings() -> Settings {
         Settings::from_toml(
             r#"
@@ -497,7 +501,7 @@ mod tests {
         ];
 
         let page = build_coordinator(&settings).expect("should build page coordinator");
-        let after = build_after_response_coordinator(&settings)
+        let after = build_after_response_coordinator(&settings, partners_for(&settings))
             .expect("should build after-response coordinator");
 
         assert!(
@@ -517,7 +521,7 @@ mod tests {
         let page = build_coordinator(&settings)
             .expect("should build page coordinator")
             .expect("should have a page provider");
-        let after = build_after_response_coordinator(&settings)
+        let after = build_after_response_coordinator(&settings, partners_for(&settings))
             .expect("should build after-response coordinator")
             .expect("should have an after-response provider");
 
@@ -530,7 +534,7 @@ mod tests {
         let settings = settings_with_cookie_providers("after_response", "after_response");
 
         let page = build_coordinator(&settings).expect("should build page coordinator");
-        let after = build_after_response_coordinator(&settings)
+        let after = build_after_response_coordinator(&settings, partners_for(&settings))
             .expect("should build after-response coordinator");
 
         assert!(page.is_none(), "should build no page coordinator");

@@ -1647,7 +1647,7 @@ mod tests {
     use trusted_server_core::ec::provider::{
         EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
         ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry, ProviderRequest,
-        ProviderResponse, ProviderUid, RequestCookies, SourceCapability, SourceInput,
+        ProviderResponse, ProviderUid, SourceCapability, SourceInput,
     };
     use trusted_server_core::ec::registry::PartnerRegistry;
     use trusted_server_core::error::TrustedServerError;

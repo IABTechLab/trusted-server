@@ -1005,6 +1005,7 @@ mod tests {
                     atype: None,
                     ext: None,
                     expiry: ProviderExpiry::At(UnixSeconds::new(5000)),
+                    refresh: None,
                 }],
             }])
         }
@@ -1183,8 +1184,8 @@ mod tests {
         )
     }
 
-    fn run_with_cookies(
-        coordinator: &ProviderCoordinator<EchoProvider>,
+    fn run_with_cookies<P: IdentityProvider>(
+        coordinator: &ProviderCoordinator<P>,
         transport: &CannedTransport,
         snapshot: &EcKvSnapshot,
         consent: &ConsentContext,
@@ -1551,8 +1552,8 @@ mod tests {
         .expect("should build coordinator");
         let transport = CannedTransport::new(ok_reply);
 
-        let gdpr = run(&coordinator, &transport, &missing(), &tcf_consent(vec![]));
-        let outside = run(&coordinator, &transport, &missing(), &granting());
+        let gdpr = run(&coordinator, &transport, &live_row(), &tcf_consent(vec![]));
+        let outside = run(&coordinator, &transport, &live_row(), &granting());
 
         let lookup = gdpr.iter().next().expect("should report the provider");
         assert_eq!(
@@ -1590,7 +1591,7 @@ mod tests {
         };
 
         // Act
-        let results = run(&coordinator, &transport, &missing(), &consent);
+        let results = run(&coordinator, &transport, &live_row(), &consent);
 
         // Assert
         assert!(
@@ -1700,7 +1701,7 @@ mod tests {
         ));
         let transport = CannedTransport::new(ok_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &granting());
 
         let lookup = results.iter().next().expect("should report the provider");
         assert!(
@@ -1736,7 +1737,7 @@ mod tests {
         let coordinator = cookie_coordinator();
         let transport = CannedTransport::new(ok_reply);
 
-        for snapshot in [missing(), held_snapshot("p-1")] {
+        for snapshot in [live_row(), held_snapshot("p-1")] {
             let results = run_with_cookies(
                 &coordinator,
                 &transport,
@@ -1804,7 +1805,7 @@ mod tests {
         ));
         let transport = CannedTransport::new(ok_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &granting());
 
         assert!(
             matches!(only_status(&results), LookupStatus::Found { kept: 1, .. }),
@@ -1821,7 +1822,7 @@ mod tests {
         ));
         let transport = CannedTransport::new(ok_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &tcf_consent(vec![]));
 
         assert_eq!(
             only_status(&results),
@@ -2421,13 +2422,10 @@ mod tests {
     #[test]
     fn a_provider_making_no_lookup_spends_no_rate_limit() {
         let coordinator = ProviderCoordinator::new(
-            vec![
-                RegisteredProvider::new(
-                    provider_config(""),
-                    NoLookupProvider(echo_provider(SourceInput::Anonymous)),
-                )
-                .with_rate_limit(NonZeroU32::new(1).expect("should be non-zero")),
-            ],
+            vec![RegisteredProvider::new(
+                provider_config("rate_limit_per_hour = 1"),
+                NoLookupProvider(echo_provider(SourceInput::Anonymous)),
+            )],
             partners(),
             Duration::from_millis(200),
         )
@@ -2435,12 +2433,12 @@ mod tests {
         let transport = CannedTransport::new(ok_reply);
         let limiter = CountingLimiter::default();
 
-        let results = run_with(&coordinator, &transport, &missing(), &granting(), &limiter);
+        let results = run_with(&coordinator, &transport, &live_row(), &granting(), &limiter);
 
         assert_eq!(
             only_status(&results),
-            LookupStatus::Skipped(SkipReason::Input),
-            "should skip a provider that builds no request"
+            LookupStatus::RequestFailed,
+            "should report a provider that builds no request"
         );
         assert_eq!(limiter.0.get(), 0, "should not check the rate limit");
     }
@@ -2527,7 +2525,7 @@ mod tests {
         let coordinator = two_source_coordinator(|provider| provider);
         let transport = CannedTransport::new(ok_reply);
 
-        let results = run(&coordinator, &transport, &missing(), &granting());
+        let results = run(&coordinator, &transport, &live_row(), &granting());
 
         assert_eq!(
             *transport.sent.borrow(),
@@ -2680,7 +2678,7 @@ mod tests {
         let transport = CannedTransport::new(ok_reply);
 
         // Act
-        let results = run(&coordinator, &transport, &missing(), &tcf_consent(vec![]));
+        let results = run(&coordinator, &transport, &live_row(), &tcf_consent(vec![]));
 
         // Assert
         let lookup = results.iter().next().expect("should report the provider");
