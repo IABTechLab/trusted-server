@@ -12,7 +12,7 @@ use edgezero_core::body::Body as EdgeBody;
 use http::Response;
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
-use crate::consent::{ConsentContext, allows_eid_persistence, tcf_vendor_consent_denied};
+use crate::consent::{ConsentContext, allows_eid_persistence};
 use crate::constants::{COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR};
 use crate::settings::Settings;
 
@@ -22,10 +22,10 @@ use super::eid_types::UnixSeconds;
 use super::generation::{generate_ec_id, is_valid_ec_id};
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
 use super::kv_types::KvEntry;
-use super::mirror::{MirrorCookie, build_mirror, mirror_consent};
+use super::mirror::{MirrorCookie, build_mirror, mirror_consent, mirror_sources};
 use super::page_load::{PageLoadWrite, RowChange};
 use super::prebid_eids::collect_eid_updates;
-use super::registry::PartnerRegistry;
+use super::registry::{PartnerConfig, PartnerRegistry};
 use super::write_plan::{WritePlanInput, plan_write};
 use super::{EcKvSnapshot, current_timestamp, log_id};
 
@@ -138,18 +138,29 @@ fn apply_mirror(
     }
 }
 
-/// Whether the request carries a mirror and denies TCF vendor consent to the
-/// owning provider of a mirrored partner, so the mirror may hold UIDs that
-/// must no longer reach the page.
+/// Whether the request carries a mirror that holds UIDs of a mirrored partner
+/// whose owning provider's TCF vendor is denied, so those UIDs must no longer
+/// reach the page.
+///
+/// A carried value that does not decode as a mirror may hold anything, so it
+/// counts as holding denied UIDs whenever any mirrored vendor is denied.
 fn mirror_vendor_denied(ec_context: &EcContext, registry: &PartnerRegistry) -> bool {
-    ec_context.mirror_cookie_present()
-        && registry.in_config_order().any(|partner| {
-            partner.bidstream_enabled
-                && partner.mirror_enabled
-                && partner
-                    .owner_tcf_vendor_id
-                    .is_some_and(|vendor| tcf_vendor_consent_denied(ec_context.consent(), vendor))
-        })
+    let Some(value) = ec_context.mirror_cookie() else {
+        return false;
+    };
+    let denied = |partner: &PartnerConfig| {
+        partner.bidstream_enabled
+            && partner.mirror_enabled
+            && partner.owner_vendor_consent_denied(ec_context.consent())
+    };
+    if !registry.in_config_order().any(denied) {
+        return false;
+    }
+    mirror_sources(value).is_none_or(|sources| {
+        sources
+            .iter()
+            .any(|source| registry.find_by_source_domain(source).is_some_and(denied))
+    })
 }
 
 /// The row the mirror is built from.
@@ -2175,6 +2186,136 @@ mod tests {
         assert!(
             cookies[0].contains("Max-Age=0"),
             "should expire the mirror without a readable row"
+        );
+    }
+
+    /// Runs a mirror request with two mirrored partners: `a.example.com`,
+    /// whose owning vendor 1111 is granted, and `b.example.com`, whose owning
+    /// vendor 9999 is denied. The lookup finds UIDs for both.
+    fn run_split_vendor_mirror_request(
+        mirror: Option<&str>,
+        navigation: bool,
+    ) -> Response<EdgeBody> {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("mirr01");
+        let graph = KvIdentityGraph::in_memory("mirror_store");
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .expect("should seed the live row");
+        let mut ec_context =
+            returning_user_context(&ec_id, graph.load_snapshot(&ec_id), navigation);
+        *ec_context.consent_mut() = consent_granting_vendors(vec![1111]);
+        ec_context.set_mirror_cookie_for_test(mirror);
+        let entry = |source: &str| {
+            let uid = KvUid::new(
+                UidValue::try_from("provider-uid").expect("should build uid"),
+                AgentType::try_from(1).expect("should build atype"),
+                None,
+                Some(ProviderId::new("example-provider")),
+                Expiry::Never,
+            );
+            (
+                SourceDomain::try_from(source).expect("should build source"),
+                vec![KvEid::new(EidFields::default(), vec![uid])],
+            )
+        };
+        ec_context.set_lookup_results(LookupResults::new(
+            &ec_id,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::Found {
+                    kept: 2,
+                    dropped: DropCounts::default(),
+                },
+                entries: vec![entry("a.example.com"), entry("b.example.com")],
+                cleared: Vec::new(),
+            }],
+        ));
+        let partners = ["a.example.com", "b.example.com"].map(|source| {
+            let mut partner = make_partner(source);
+            partner.mirror_enabled = true;
+            partner
+        });
+        let mut registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        registry.mark_provider_owned("a.example.com", NonZeroU16::new(1111));
+        registry.mark_provider_owned("b.example.com", NonZeroU16::new(9999));
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+        response
+    }
+
+    fn mirror_value(cookie: &str) -> &str {
+        cookie
+            .strip_prefix("__Host-ts-eids-mirror=")
+            .and_then(|rest| rest.split(';').next())
+            .expect("should carry a mirror value")
+    }
+
+    #[test]
+    fn partial_vendor_denial_keeps_a_mirror_without_the_denied_vendor() {
+        // Arrange
+        let navigation = run_split_vendor_mirror_request(None, true);
+        let set = mirror_cookies(&navigation);
+        assert_eq!(set.len(), 1, "should set the mirror on navigation");
+        let value = mirror_value(&set[0]).to_owned();
+        let sources = mirror_sources(&value).expect("should decode the mirror");
+        assert_eq!(
+            sources,
+            vec!["a.example.com".to_owned()],
+            "should mirror only the granted vendor's partner"
+        );
+
+        // Act
+        let non_navigation = run_split_vendor_mirror_request(Some(&value), false);
+        let next_navigation = run_split_vendor_mirror_request(Some(&value), true);
+
+        // Assert
+        assert!(
+            mirror_cookies(&non_navigation).is_empty(),
+            "should keep a mirror that holds no denied vendor's UIDs"
+        );
+        assert!(
+            mirror_cookies(&next_navigation).is_empty(),
+            "should not re-set an unchanged mirror on the next navigation"
+        );
+    }
+
+    #[test]
+    fn partial_vendor_denial_expires_a_mirror_holding_the_denied_vendor() {
+        // Arrange
+        let json = serde_json::json!({
+            "v": 1,
+            "eids": [
+                {"source": "a.example.com", "uids": [{"id": "provider-uid", "atype": 1}]},
+                {"source": "b.example.com", "uids": [{"id": "provider-uid", "atype": 1}]},
+            ],
+        });
+        let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.to_string());
+
+        // Act
+        let response = run_split_vendor_mirror_request(Some(&value), false);
+
+        // Assert
+        let cookies = mirror_cookies(&response);
+        assert_eq!(cookies.len(), 1, "should emit one mirror cookie");
+        assert!(
+            cookies[0].contains("Max-Age=0"),
+            "should expire a mirror holding a denied vendor's UIDs"
         );
     }
 

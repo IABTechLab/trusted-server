@@ -1439,12 +1439,14 @@ still due.
 - **Expired** (`Max-Age=0`) only when the request carried it: on any response
   where EID consent is absent or withdrawn, whatever happened to the KV write;
   on a navigation whose mirror would be empty; and, where the mirror cannot be
-  rebuilt (non-navigations, or a navigation whose row cannot be read), when the
-  request denies TCF vendor consent to the owning provider of a mirrored
-  partner.
+  rebuilt (non-navigations, or a navigation whose row cannot be read), when it
+  holds UIDs of a mirrored partner whose owning provider's TCF vendor the
+  request denies. A carried value that does not decode is treated as holding
+  them whenever any mirrored partner's vendor is denied.
 - **Left untouched** on a navigation whose row cannot be read authoritatively
   (KV failure), unless the vendor rule above expires it.
-- **The server never reads it.** Readers on the page must drop UIDs whose `exp`
+- **The server reads it only to decide whether to set or expire it**, and
+  never trusts it over KV. Readers on the page must drop UIDs whose `exp`
   has passed and strip `exp` before use.
 
 ## 11. Consumers

@@ -4,7 +4,7 @@ use base64::Engine as _;
 use serde_json::{Map, Value};
 
 use crate::consent::ConsentContext;
-use crate::consent::{allows_eid_persistence, tcf_vendor_consent_denied};
+use crate::consent::allows_eid_persistence;
 use crate::ec::consent::ec_consent_granted;
 use crate::ec::eid_types::{Expiry, UnixSeconds};
 use crate::ec::kv_types::{KvEid, KvEntry, KvUid};
@@ -67,9 +67,7 @@ pub fn build_mirror(
     for partner in partners.in_config_order().filter(|partner| {
         partner.bidstream_enabled
             && partner.mirror_enabled
-            && !partner
-                .owner_tcf_vendor_id
-                .is_some_and(|vendor| tcf_vendor_consent_denied(consent, vendor))
+            && !partner.owner_vendor_consent_denied(consent)
     }) {
         let Some(record) = row.ids.get(&partner.source_domain) else {
             continue;
@@ -192,6 +190,21 @@ fn open_uids_array(mut header: String) -> Option<String> {
         header.truncate(open);
         header
     })
+}
+
+/// The `source` of each EID in an encoded mirror value, or `None` when the
+/// value does not decode as a mirror.
+pub(crate) fn mirror_sources(value: &str) -> Option<Vec<String>> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .ok()?;
+    let mirror: Value = serde_json::from_slice(&bytes).ok()?;
+    mirror
+        .get("eids")?
+        .as_array()?
+        .iter()
+        .map(|eid| eid.get("source")?.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// Whether consent allows the mirror: EC consent and EID persistence.
