@@ -156,18 +156,6 @@ impl LookupResults {
         self.ec_id.as_deref() == Some(ec_id)
     }
 
-    /// Retargets results made for `orphan` to `replacement`.
-    ///
-    /// Orphan recovery replaces a proven-absent EC ID with a new one for the
-    /// same browser. Lookups depend on the browser, not on the EC ID, and the
-    /// orphan has no row left, so its results belong to the replacement row.
-    /// Results made for any other ID are left untouched.
-    pub(crate) fn retarget_orphan(&mut self, orphan: &str, replacement: &str) {
-        if self.is_for(orphan) {
-            self.ec_id = Some(replacement.to_owned());
-        }
-    }
-
     /// Iterates results in provider-config order.
     pub fn iter(&self) -> impl Iterator<Item = &ProviderLookup> {
         self.lookups.iter()

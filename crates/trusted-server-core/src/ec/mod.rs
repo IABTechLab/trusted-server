@@ -668,12 +668,6 @@ impl EcContext {
         &self.lookup_results
     }
 
-    /// Retargets this navigation's lookups from an orphaned EC ID to its
-    /// replacement; see [`LookupResults::retarget_orphan`].
-    pub(crate) fn retarget_orphan_lookups(&mut self, orphan: &str, replacement: &str) {
-        self.lookup_results.retarget_orphan(orphan, replacement);
-    }
-
     /// Takes the row built by [`Self::generate_if_needed`].
     pub(crate) fn take_pending_entry(&mut self) -> Option<KvEntry> {
         self.pending_entry.take().map(|entry| *entry)

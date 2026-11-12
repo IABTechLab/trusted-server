@@ -357,9 +357,6 @@ fn recover_orphaned_ec(
         .device_signals()
         .map(super::device::DeviceSignals::to_kv_device);
 
-    // Spec: the recovered row is created with this navigation's provider
-    // results, which were looked up under the orphaned ID.
-    ec_context.retarget_orphan_lookups(&orphan_id, &new_id);
     let missing = EcKvSnapshot::Missing {
         ec_id: new_id.clone(),
     };
@@ -1009,72 +1006,6 @@ mod tests {
         assert!(
             get_header(&response, "set-cookie").is_none(),
             "generated EC without KV should not set cookie"
-        );
-    }
-
-    #[test]
-    fn finalize_recovery_writes_lookups_made_for_the_orphan() {
-        let settings = create_test_settings();
-        let orphaned_ec = sample_ec_id("orphn2");
-        let consent = ConsentContext {
-            jurisdiction: Jurisdiction::NonRegulated,
-            source: ConsentSource::Cookie,
-            ..Default::default()
-        };
-        let mut ec_context = EcContext::new_for_test_with_ip(
-            Some(orphaned_ec.clone()),
-            consent,
-            Some("192.0.2.10".to_owned()),
-        );
-        ec_context.set_recovery_eligible(true);
-        ec_context.set_kv_snapshot(EcKvSnapshot::Missing {
-            ec_id: orphaned_ec.clone(),
-        });
-        let uid = KvUid::new(
-            UidValue::try_from("provider-uid-1").expect("should build uid"),
-            AgentType::try_from(1).expect("should build atype"),
-            None,
-            Some(ProviderId::new("example-provider")),
-            Expiry::Never,
-        );
-        ec_context.set_lookup_results(LookupResults::new(
-            &orphaned_ec,
-            vec![ProviderLookup {
-                provider: ProviderId::new("example-provider"),
-                status: LookupStatus::Found {
-                    kept: 1,
-                    dropped: DropCounts::default(),
-                },
-                entries: vec![(
-                    SourceDomain::try_from("provider.example.com").expect("should build source"),
-                    vec![KvEid::new(EidFields::default(), vec![uid])],
-                )],
-                cleared: Vec::new(),
-            }],
-        ));
-        let graph = KvIdentityGraph::in_memory("test_store");
-        ec_context.set_navigation_permit(NavigationPermit::for_test());
-        let mut response = empty_response();
-
-        ec_finalize_response(
-            &settings,
-            &mut ec_context,
-            Some(&graph),
-            &PartnerRegistry::empty(),
-            None,
-            None,
-            &mut response,
-        );
-
-        let replacement = ec_context.ec_value().expect("should rotate orphan");
-        assert_ne!(replacement, orphaned_ec, "should mint a replacement EC ID");
-        let (entry, _) = graph
-            .get(replacement)
-            .expect("should read replacement")
-            .expect("should create replacement row");
-        assert!(
-            entry.ids.contains_key("provider.example.com"),
-            "should write the orphan's provider results to the replacement row"
         );
     }
 
