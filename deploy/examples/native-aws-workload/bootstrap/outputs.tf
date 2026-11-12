@@ -30,7 +30,7 @@ output "route53_name_servers" {
 }
 
 output "regional_certificate_arn" {
-  description = "Regional ALB certificate request. Wait for issuance separately after public DNS delegation."
+  description = "Regional ALB certificate request. Workload Terraform waits for issuance after public DNS delegation."
   value       = aws_acm_certificate.regional.arn
 }
 

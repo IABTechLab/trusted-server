@@ -27,6 +27,18 @@ mock_provider "aws" {
   }
 }
 
+mock_provider "aws" {
+  alias           = "us_east_1"
+  override_during = plan
+}
+
+mock_provider "random" {
+  override_during = plan
+  mock_resource "random_password" {
+    defaults = { result = "FictionalCredential000000000000000000000000" }
+  }
+}
+
 variables {
   run_id               = "review-example"
   owner                = "review-owner"

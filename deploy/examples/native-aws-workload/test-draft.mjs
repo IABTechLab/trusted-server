@@ -12,6 +12,7 @@ const temporary = fs.mkdtempSync(
   path.join(os.tmpdir(), "ts-terraform-contract-"),
 );
 const sourceFiles = [
+  "certificates.tf",
   "config.tf",
   "ecs.tf",
   "geo.tf",
@@ -70,6 +71,21 @@ try {
     "Geo must require an explicit profile or null, never silently select Off",
   );
   assert.doesNotMatch(
+    geoVariable,
+    /origin_credential_value|cloudfront_ipv4_cidrs/,
+    "Geo credentials and AWS forwarding ranges must not remain operator inputs",
+  );
+  assert.match(
+    fs.readFileSync(path.join(root, "network.tf"), "utf8"),
+    /certificate_arn\s*=\s*aws_acm_certificate_validation\.regional\.certificate_arn/,
+    "ALB HTTPS must depend on regional certificate issuance",
+  );
+  assert.match(
+    fs.readFileSync(path.join(root, "geo.tf"), "utf8"),
+    /acm_certificate_arn\s*=\s*aws_acm_certificate_validation\.viewer\[0\]\.certificate_arn/,
+    "CloudFront HTTPS must depend on viewer certificate issuance",
+  );
+  assert.doesNotMatch(
     fs.readFileSync(path.join(root, "ecs.tf"), "utf8"),
     /^moved\s*\{/m,
     "The new public root has no historical service address to migrate",
@@ -89,13 +105,13 @@ try {
       assert.notEqual(
         match[1],
         "aws_secretsmanager_secret_version",
-        "secret values must not enter Terraform state",
+        "application and Agent secret values must not enter Terraform state",
       );
     }
   }
   assert.equal(
     resources,
-    40,
+    42,
     "all workload AWS resource blocks must retain the no-secret-values check",
   );
   assert.ok(
@@ -105,7 +121,7 @@ try {
   const cliConfig = path.join(temporary, "mirror.tfrc");
   fs.writeFileSync(
     cliConfig,
-    `provider_installation {\n  filesystem_mirror {\n    path = ${JSON.stringify(path.join(data, "providers"))}\n    include = ["registry.terraform.io/hashicorp/aws"]\n  }\n}\n`,
+    `provider_installation {\n  filesystem_mirror {\n    path = ${JSON.stringify(path.join(data, "providers"))}\n    include = ["registry.terraform.io/hashicorp/aws", "registry.terraform.io/hashicorp/random"]\n  }\n}\n`,
   );
   {
     // Plan unchanged public-source copies with fictional test variables, never
@@ -133,9 +149,6 @@ try {
         viewer_certificate_arn:
           "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000",
         origin_credential_header_name: "x-fictional-origin-check",
-        origin_credential_value:
-          "fictional_only_00000000000000000000000000000000",
-        cloudfront_ipv4_cidrs: ["192.0.2.0/24", "198.51.100.0/24"],
         ...overrides,
       };
       return `{${Object.entries(fields)
@@ -147,7 +160,7 @@ try {
       `mock_provider "aws" {
       mock_data "aws_ec2_managed_prefix_list" {
         override_during = plan
-        defaults = { id = "pl-0123456789abcdef0" }
+        defaults = { id = "pl-0123456789abcdef0", entries = [{ cidr = "192.0.2.0/24", description = "fictional origin range" }, { cidr = "198.51.100.0/24", description = "fictional origin range" }] }
       }
       mock_resource "aws_security_group" {
         override_during = plan
@@ -196,6 +209,18 @@ try {
         }
         ${[
           check(
+            `random_password.origin_credential[0].length == 43 && !random_password.origin_credential[0].special && random_password.origin_credential[0].keepers == null && issensitive(local.geo_credential_value) && length(local.geo_credential_value) == 43`,
+            "The workload must own one stable, sensitive, header-safe origin credential without update-triggered rotation.",
+          ),
+          check(
+            `aws_acm_certificate_validation.regional.certificate_arn == var.certificate_arn && length(aws_acm_certificate_validation.viewer) == 1 && aws_acm_certificate_validation.viewer[0].certificate_arn == var.geo_front_door.viewer_certificate_arn`,
+            "Geo requires issued regional and viewer certificates before its HTTPS consumers.",
+          ),
+          check(
+            `local.cloudfront_ipv4_cidrs == sort([for entry in data.aws_ec2_managed_prefix_list.cloudfront[0].entries : entry.cidr]) && local.trusted_proxy_cidrs == concat(local.alb_subnet_cidrs, local.cloudfront_ipv4_cidrs)`,
+            "Checked forwarding must use the entries of the exact managed prefix list used by ingress.",
+          ),
+          check(
             `aws_cloudfront_distribution.geo[0].enabled == ${phase !== "staged"} && !aws_cloudfront_distribution.geo[0].is_ipv6_enabled && aws_cloudfront_distribution.geo[0].tags.RunId == var.run_id && output.deployment_metadata.geo.phase == "${phase}" && output.deployment_metadata.manual_shutdown_required`,
             "Traffic must be separate from opt-in; IPv6 is not enabled.",
           ),
@@ -208,15 +233,15 @@ try {
             "Geo opt-in must immediately remove the unprotected ALB bypass.",
           ),
           check(
-            `length(aws_lb_listener_rule.geo[0].condition) == 2 && anytrue([for c in aws_lb_listener_rule.geo[0].condition : try(one(c.http_header).http_header_name == var.geo_front_door.origin_credential_header_name && toset(one(c.http_header).values) == toset([var.geo_front_door.origin_credential_value]), false)]) && anytrue([for c in aws_lb_listener_rule.geo[0].condition : try(toset(one(c.host_header).values) == toset([var.demo_hostname]), false)]) && one(aws_lb_listener_rule.geo[0].action).target_group_arn == aws_lb_target_group.geo[0].arn`,
+            `length(aws_lb_listener_rule.geo[0].condition) == 2 && anytrue([for c in aws_lb_listener_rule.geo[0].condition : try(one(c.http_header).http_header_name == var.geo_front_door.origin_credential_header_name && toset(one(c.http_header).values) == toset([local.geo_credential_value]), false)]) && anytrue([for c in aws_lb_listener_rule.geo[0].condition : try(toset(one(c.host_header).values) == toset([var.demo_hostname]), false)]) && one(aws_lb_listener_rule.geo[0].action).target_group_arn == aws_lb_target_group.geo[0].arn`,
             "Only exact credential plus demo Host may reach the isolated Geo targets.",
           ),
           check(
-            `strcontains(local.native_geo_profile, "alb_peer_cidrs = ") && strcontains(local.native_geo_profile, var.geo_front_door.origin_credential_header_name) && !strcontains(local.native_geo_profile, var.geo_front_door.origin_credential_value) && !strcontains(aws_ecs_task_definition.review.container_definitions, var.geo_front_door.origin_credential_value) && !strcontains(local.native_geo_profile, "192.0.2.0/24") && strcontains(local.application_environment.EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS, "192.0.2.0/24")`,
+            `strcontains(local.native_geo_profile, "alb_peer_cidrs = ") && strcontains(local.native_geo_profile, var.geo_front_door.origin_credential_header_name) && !strcontains(local.native_geo_profile, local.geo_credential_value) && !strcontains(aws_ecs_task_definition.review.container_definitions, local.geo_credential_value) && !strcontains(local.native_geo_profile, "192.0.2.0/24") && strcontains(local.application_environment.EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS, "192.0.2.0/24")`,
             "Geo ALB peers and ordinary proxy networks must stay distinct, and the credential value must never reach ECS.",
           ),
           check(
-            `var.preserve_publisher_hostname == ${preservePublisher} && length(one(aws_cloudfront_distribution.geo[0].origin).custom_header) == 2 && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == "X-Forwarded-Host" && h.value == ${forwardedHost}]) && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == var.geo_front_door.origin_credential_header_name && h.value == var.geo_front_door.origin_credential_value])`,
+            `var.preserve_publisher_hostname == ${preservePublisher} && length(one(aws_cloudfront_distribution.geo[0].origin).custom_header) == 2 && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == "X-Forwarded-Host" && h.value == ${forwardedHost}]) && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == var.geo_front_door.origin_credential_header_name && h.value == local.geo_credential_value])`,
             "Origin custom headers must be exactly the private credential and deployment-fixed forwarded Host override, never arbitrary viewer values or extra headers.",
           ),
           check(
@@ -242,6 +267,16 @@ try {
         ].join("\n")}
       }\n`;
     }
+    contract += `\nrun "managed_origin_ranges_follow_aws" {
+      command = plan
+      variables { geo_front_door = ${geoInput("dns-cutover")} }
+      override_data {
+        target = data.aws_ec2_managed_prefix_list.cloudfront[0]
+        override_during = plan
+        values = { id = "pl-0123456789abcdef1", entries = [{ cidr = "198.51.100.0/24", description = "fictional" }, { cidr = "192.0.2.128/25", description = "fictional" }] }
+      }
+      ${check('local.cloudfront_ipv4_cidrs == tolist(["192.0.2.128/25", "198.51.100.0/24"]) && aws_vpc_security_group_ingress_rule.cloudfront[0].prefix_list_id == "pl-0123456789abcdef1" && local.application_environment.EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS == join(",", concat(local.alb_subnet_cidrs, local.cloudfront_ipv4_cidrs))', "Refreshed AWS list entries must drive checked forwarding and the same list must drive network ingress.")}
+    }\n`;
     contract += `\nrun "auction_egress_scoped" {
       command = plan
       variables { auction_egress = { cidr_ipv4 = "192.0.2.80/32", port = 8000 } }
@@ -402,7 +437,7 @@ try {
         contract += `\nrun "explicit_off_unchanged_${preservePublisher ? "publisher" : "demo_default"}" {
           command = plan
           variables { ${preservePublisher ? "preserve_publisher_hostname = true" : ""} }
-          ${check(`var.preserve_publisher_hostname == ${preservePublisher} && length(aws_cloudfront_distribution.geo) == 0 && length(aws_ecs_service.geo) == 0 && length(aws_ecs_service.review) == 1 && aws_ecs_service.review[0].desired_count == 1 && one(aws_lb_listener_rule.publisher.action).type == "forward" && !contains(keys(local.application_environment), "TS_NATIVE_GEO_PROFILE_TOML") && local.trusted_proxy_cidrs == local.alb_subnet_cidrs`, "Explicit null must preserve the old Off topology and runtime regardless of browser identity.")}
+          ${check(`var.preserve_publisher_hostname == ${preservePublisher} && length(random_password.origin_credential) == 0 && length(aws_acm_certificate_validation.viewer) == 0 && aws_acm_certificate_validation.regional.certificate_arn == var.certificate_arn && length(aws_cloudfront_distribution.geo) == 0 && length(aws_ecs_service.geo) == 0 && length(aws_ecs_service.review) == 1 && aws_ecs_service.review[0].desired_count == 1 && one(aws_lb_listener_rule.publisher.action).type == "forward" && !contains(keys(local.application_environment), "TS_NATIVE_GEO_PROFILE_TOML") && local.trusted_proxy_cidrs == local.alb_subnet_cidrs`, "Explicit null must preserve the old Off topology and runtime regardless of browser identity.")}
         }\n`;
       }
       for (const [name, table] of [
@@ -435,11 +470,6 @@ try {
       }
       for (const [name, overrides] of [
         ["invalid_phase", { rollout_phase: "invalid" }],
-        ["unbounded_proxy_trust", { cloudfront_ipv4_cidrs: ["0.0.0.0/0"] }],
-        [
-          "wildcard_credential",
-          { origin_credential_value: "fictional_credential_000000000000000*" },
-        ],
         ["reserved_header", { origin_credential_header_name: "authorization" }],
         ...[
           "fictional-origin",
