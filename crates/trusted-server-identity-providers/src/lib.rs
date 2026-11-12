@@ -21,6 +21,7 @@ pub mod sharedid;
 pub mod uid2;
 pub mod unifiedid;
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +33,7 @@ use trusted_server_core::ec::provider::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::integrations::prebid::{PrebidIntegrationConfig, PrebidUserIdStorageType};
 use trusted_server_core::settings::{
     CollectTiming, Ec, IdentityProviderConfig, ProviderSecrets, Settings,
 };
@@ -214,6 +216,57 @@ pub fn validate_providers(settings: &Settings) -> Result<(), Report<ProviderConf
     Ok(())
 }
 
+/// Prebid `userSync.userIds` names of the `SharedID` module.
+const PREBID_SHAREDID_NAMES: [&str; 2] = ["sharedId", "pubCommonId"];
+
+/// The cookie Prebid's `SharedID` module stores its ID in, as configured in
+/// `integrations.prebid.managed_user_ids[].storage.name`.
+///
+/// `None` when Prebid is not configured, manages no `SharedID` module, or
+/// keeps it in local storage.
+fn prebid_sharedid_cookie(settings: &Settings) -> Option<String> {
+    let prebid = match settings.integration_config::<PrebidIntegrationConfig>("prebid") {
+        Ok(prebid) => prebid?,
+        Err(report) => {
+            log::warn!("Identity providers: Prebid config unreadable: {report}");
+            return None;
+        }
+    };
+    prebid
+        .managed_user_ids
+        .into_iter()
+        .filter(|entry| {
+            PREBID_SHAREDID_NAMES
+                .iter()
+                .any(|name| entry.name.eq_ignore_ascii_case(name))
+        })
+        .find_map(|entry| entry.storage)
+        .filter(|storage| storage.storage_type == PrebidUserIdStorageType::Cookie)
+        .map(|storage| storage.name)
+}
+
+/// Fills a `sharedid` provider's `cookie_names` with the cookie Prebid's
+/// `SharedID` module is configured to use, unless the provider sets its own.
+fn with_prebid_sharedid_cookie<'config>(
+    config: &'config IdentityProviderConfig,
+    settings: &Settings,
+) -> Cow<'config, IdentityProviderConfig> {
+    if config.kind() != sharedid::SharedId::KIND
+        || config.settings.contains_key(sharedid::COOKIE_NAMES_SETTING)
+    {
+        return Cow::Borrowed(config);
+    }
+    let Some(cookie) = prebid_sharedid_cookie(settings) else {
+        return Cow::Borrowed(config);
+    };
+    let mut config = config.clone();
+    config.settings.insert(
+        sharedid::COOKIE_NAMES_SETTING.to_owned(),
+        serde_json::Value::from(vec![cookie]),
+    );
+    Cow::Owned(config)
+}
+
 fn build_phase_coordinator(
     settings: &Settings,
     partners: Arc<PartnerRegistry>,
@@ -229,8 +282,9 @@ fn build_phase_coordinator(
         .iter()
         .filter(|config| config.enabled && config.collect == timing)
         .map(|config| {
-            build(config, &config.secrets)
-                .map(|provider| RegisteredProvider::new(config.clone(), provider))
+            let config = with_prebid_sharedid_cookie(config, settings);
+            build(&config, &config.secrets)
+                .map(|provider| RegisteredProvider::new(config.into_owned(), provider))
         })
         .collect::<Result<Vec<_>, Report<ProviderConfigError>>>()?;
     if registered.is_empty() {
@@ -483,6 +537,77 @@ mod tests {
             .expect("should parse criteo"),
         ];
         settings
+    }
+
+    fn with_prebid_sharedid(settings: &mut Settings, storage: &serde_json::Value) {
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": true,
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                    "bundle": { "modules": { "bidder": ["exampleBidderBidAdapter"] } },
+                    "managed_user_ids": [{ "name": "sharedId", "storage": storage }],
+                }),
+            )
+            .expect("should configure Prebid");
+    }
+
+    #[test]
+    fn sharedid_reads_the_cookie_prebid_is_configured_to_use() {
+        // Arrange
+        let mut settings = settings_with_cookie_providers("page", "page");
+        with_prebid_sharedid(
+            &mut settings,
+            &json!({ "type": "cookie", "name": "_pubcid" }),
+        );
+
+        // Act
+        let config = with_prebid_sharedid_cookie(&settings.ec.identity_providers[0], &settings);
+
+        // Assert
+        assert_eq!(
+            config.settings.get("cookie_names"),
+            Some(&json!(["_pubcid"])),
+            "should read only Prebid's storage name"
+        );
+    }
+
+    #[test]
+    fn sharedid_keeps_its_defaults_without_a_prebid_cookie() {
+        let mut settings = settings_with_cookie_providers("page", "page");
+        with_prebid_sharedid(
+            &mut settings,
+            &json!({ "type": "html5", "name": "_pubcid" }),
+        );
+
+        let config = with_prebid_sharedid_cookie(&settings.ec.identity_providers[0], &settings);
+
+        assert!(
+            matches!(config, Cow::Borrowed(_)),
+            "should not take a local-storage key as a cookie name"
+        );
+    }
+
+    #[test]
+    fn sharedid_cookie_names_setting_wins_over_prebid() {
+        let mut settings = settings_with_cookie_providers("page", "page");
+        with_prebid_sharedid(
+            &mut settings,
+            &json!({ "type": "cookie", "name": "_pubcid" }),
+        );
+        settings.ec.identity_providers[0]
+            .settings
+            .insert("cookie_names".to_owned(), json!(["_example_sharedid"]));
+
+        let config = with_prebid_sharedid_cookie(&settings.ec.identity_providers[0], &settings);
+
+        assert_eq!(
+            config.settings.get("cookie_names"),
+            Some(&json!(["_example_sharedid"])),
+            "should keep the provider's own cookie names"
+        );
     }
 
     fn liveramp_provider(collect: &str, settings: &str) -> IdentityProviderConfig {
