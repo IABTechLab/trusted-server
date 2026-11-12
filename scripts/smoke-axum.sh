@@ -16,6 +16,7 @@ smoke_require_command pgrep
 WORKSPACE=$(smoke_make_workspace axum)
 ORIGIN_PORT=${AXUM_SMOKE_ORIGIN_PORT:-18889}
 BASE_PORT=${AXUM_SMOKE_PORT:-18890}
+POSITIVE_PORT=$((BASE_PORT + 4))
 ORIGIN_PID=""
 APP_PID=""
 
@@ -35,7 +36,8 @@ fi
 
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
 ORIGIN_PID=$SMOKE_ORIGIN_PID
-smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT"
+# The positive case uses the final listener in the case sequence.
+smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT" "$POSITIVE_PORT"
 sed \
     -e "s|= \"crates/|= \"$REPO_ROOT/crates/|g" \
     -e "s|manifest = \"fastly.toml\"|manifest = \"$REPO_ROOT/fastly.toml\"|" \
@@ -110,7 +112,7 @@ run_case missing-proxy "$((BASE_PORT + 2))" "$ENVELOPE" \
 run_case missing-ec "$((BASE_PORT + 3))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "" 500 \
     "failed to resolve secret reference at \`ec.passphrase\`"
-run_case positive "$((BASE_PORT + 4))" "$ENVELOPE" \
+run_case positive "$POSITIVE_PORT" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 200
 
 echo "Axum first-success smoke passed"
