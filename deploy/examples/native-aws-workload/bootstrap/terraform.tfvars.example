@@ -1,0 +1,13 @@
+# Fictional inputs. Copy to a private file and replace before any cloud operation.
+aws_account_id    = "000000000000"
+aws_region        = "eu-west-2"
+installation_name = "example-staging"
+owner             = "example-operator"
+state_bucket_name = "replace-with-globally-unique-state-bucket"
+demo_hostname     = "ts-demo.example.com"
+
+# Null creates a dedicated public zone named demo_hostname. Delegate that child
+# from its externally owned parent after bootstrap outputs the NS values.
+existing_route53_zone_id = null
+# To use an existing approved public zone covering demo_hostname instead:
+# existing_route53_zone_id = "Z0000000000000"

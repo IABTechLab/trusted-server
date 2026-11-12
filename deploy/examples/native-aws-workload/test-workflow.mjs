@@ -20,7 +20,7 @@ test('example checks have no cloud authority or deployment operation', () => {
   )
   assert.doesNotMatch(
     workflow,
-    /terraform (?:apply|destroy)|run\.mjs|control-plane|bootstrap\/|deploy\/native-demo|docker (?:build|push|run)/
+    /terraform (?:apply|destroy)|run\.mjs|control-plane|deploy\/native-demo|docker (?:build|push|run)/
   )
   assert.match(workflow, /AWS_EC2_METADATA_DISABLED: ['"]true['"]/)
   assert.match(workflow, /init -backend=false -input=false -lockfile=readonly/)
@@ -34,10 +34,11 @@ test('example checks have no cloud authority or deployment operation', () => {
   )
 })
 
-test('both Terraform roots and provider locks are checked', () => {
+test('all three Terraform roots and provider locks are checked', () => {
   for (const root of [
     'deploy/examples/native-aws-workload',
     'deploy/examples/native-aws-workload/retained',
+    'deploy/examples/native-aws-workload/bootstrap',
   ]) {
     assert.ok(
       workflow.includes(
@@ -49,7 +50,7 @@ test('both Terraform roots and provider locks are checked', () => {
   assert.match(workflow, /fmt -check -recursive/)
   assert.match(
     workflow,
-    /git diff --exit-code -- deploy\/examples\/native-aws-workload\/\.terraform\.lock\.hcl deploy\/examples\/native-aws-workload\/retained\/\.terraform\.lock\.hcl/
+    /git diff --exit-code -- deploy\/examples\/native-aws-workload\/\.terraform\.lock\.hcl deploy\/examples\/native-aws-workload\/retained\/\.terraform\.lock\.hcl deploy\/examples\/native-aws-workload\/bootstrap\/\.terraform\.lock\.hcl/
   )
 })
 

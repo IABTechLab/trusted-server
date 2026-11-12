@@ -63,7 +63,7 @@ locals {
 
 resource "aws_iam_role" "execution" {
   name                 = "${var.run_id}-execution"
-  permissions_boundary = var.runtime_boundaries.execution
+  permissions_boundary = var.runtime_boundaries == null ? null : var.runtime_boundaries.execution
   assume_role_policy   = local.task_assume_role
 }
 
@@ -100,7 +100,7 @@ resource "aws_iam_role_policy" "execution" {
 
 resource "aws_iam_role" "task" {
   name                 = "${var.run_id}-task"
-  permissions_boundary = var.runtime_boundaries.task
+  permissions_boundary = var.runtime_boundaries == null ? null : var.runtime_boundaries.task
   assume_role_policy   = local.task_assume_role
 }
 

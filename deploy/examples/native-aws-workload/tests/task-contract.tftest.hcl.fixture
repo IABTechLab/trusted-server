@@ -61,6 +61,10 @@ variables {
       arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-ec-AbCdEf"
       version_id = "33333333333333333333333333333333"
     }
+    browser_forwarder_secret = {
+      arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-forwarder-AbCdEf"
+      version_id = "55555555555555555555555555555555"
+    }
   }
   runtime_boundaries = {
     execution = "arn:aws:iam::000000000000:policy/native-demo/review-example/execution-boundary"
@@ -125,7 +129,22 @@ run "task_contract" {
   }
   assert {
     condition     = aws_iam_role.execution.permissions_boundary == var.runtime_boundaries.execution && aws_iam_role.task.permissions_boundary == var.runtime_boundaries.task
-    error_message = "Workload roles must retain the exact approved bootstrap permission ceilings."
+    error_message = "Workload roles must retain the exact supplied organisation permission ceilings."
+  }
+}
+
+run "without_optional_permission_boundaries" {
+  command = plan
+  variables {
+    runtime_boundaries = null
+  }
+  assert {
+    condition     = aws_iam_role.execution.permissions_boundary == null && aws_iam_role.task.permissions_boundary == null
+    error_message = "A demo without organisation-required boundaries must not need fictional policies or invent new permission ceilings."
+  }
+  assert {
+    condition     = jsondecode(aws_iam_role_policy.task.policy).Statement != [] && jsondecode(aws_iam_role_policy.execution.policy).Statement != []
+    error_message = "Omitting a boundary must retain scoped task and execution policies."
   }
 }
 

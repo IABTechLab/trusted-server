@@ -89,8 +89,8 @@ variable "reviewer_ipv4_cidrs" {
   description = "HTTPS access CIDRs for direct ALB ingress. Application authentication belongs to TS; application and Agent ports remain ALB-only and loopback-only respectively."
   type        = set(string)
   validation {
-    condition     = length(var.reviewer_ipv4_cidrs) > 0 && length(var.reviewer_ipv4_cidrs) <= 32 && alltrue([for cidr in var.reviewer_ipv4_cidrs : can(cidrnetmask(cidr)) && (cidr == "0.0.0.0/0" || try(tonumber(split("/", cidr)[1]) >= 16, false))])
-    error_message = "Supply at most 32 explicit IPv4 CIDRs: /16 or narrower, or 0.0.0.0/0 for public HTTPS protected by Basic auth."
+    condition     = (length(var.reviewer_ipv4_cidrs) > 0 || var.geo_front_door != null) && length(var.reviewer_ipv4_cidrs) <= 32 && alltrue([for cidr in var.reviewer_ipv4_cidrs : can(cidrnetmask(cidr)) && (cidr == "0.0.0.0/0" || try(tonumber(split("/", cidr)[1]) >= 16, false))])
+    error_message = "Direct ALB ingress needs explicit IPv4 CIDRs: /16 or narrower, or 0.0.0.0/0 with application authentication. CloudFront may use an empty set because these CIDRs do not restrict viewers."
   }
 }
 
@@ -206,14 +206,17 @@ variable "agent_token" {
 }
 
 variable "runtime_boundaries" {
-  description = "Exact retained task/execution permission ceilings from the bootstrap. ARN presence is not document or runtime qualification."
+  description = "Optional organisation-required task/execution permission ceilings. Null creates roles without boundaries; supplied boundaries remain independently owned and must permit the scoped runtime calls."
   type = object({
     execution = string
     task      = string
   })
+  default = null
   validation {
-    condition     = var.runtime_boundaries.execution != var.runtime_boundaries.task && alltrue([for arn in values(var.runtime_boundaries) : can(regex("^arn:aws:iam::${var.aws_account_id}:policy/[A-Za-z0-9/+=,.@_-]+$", arn))])
-    error_message = "Supply two distinct same-account managed-policy ARNs from the retained bootstrap."
+    condition = var.runtime_boundaries == null ? true : (
+      var.runtime_boundaries.execution != var.runtime_boundaries.task && alltrue([for arn in values(var.runtime_boundaries) : can(regex("^arn:aws:iam::${var.aws_account_id}:policy/[A-Za-z0-9/+=,.@_-]+$", arn))])
+    )
+    error_message = "Omit runtime_boundaries or supply two distinct same-account managed-policy ARNs required by your organisation."
   }
 }
 

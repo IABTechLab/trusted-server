@@ -36,6 +36,7 @@ impl PlatformSecretStore for FictionalSecrets {
             "handler_password" => "fictional-reviewer-password",
             "publisher_proxy_secret" => "fictional-publisher-proxy-secret-32-bytes",
             "ec_passphrase" => "fictional-ec-passphrase-at-least-32-bytes",
+            "browser_forwarder_secret" => "fictional-browser-forwarder-secret-32-bytes",
             _ => return Err(Report::new(PlatformError::SecretStore)),
         };
         Ok(value.as_bytes().to_vec())
@@ -61,6 +62,7 @@ fn committed_aws_envelopes_pass_runtime_integrity_and_settings_validation() {
         "handler_password".to_owned(),
         "publisher_proxy_secret".to_owned(),
         "ec_passphrase".to_owned(),
+        "browser_forwarder_secret".to_owned(),
     ]);
     for (name, envelope) in ENVELOPES {
         let blob = VerifiedConfigBlob::parse(envelope)
@@ -69,7 +71,7 @@ fn committed_aws_envelopes_pass_runtime_integrity_and_settings_validation() {
             blob.required_secret_keys()
                 .expect("should collect reference-only secret keys"),
             expected_keys,
-            "should resolve only the three declared application secrets for {name}"
+            "should resolve only the four declared application secrets for {name}"
         );
         let settings = blob
             .into_settings(
@@ -86,6 +88,16 @@ fn committed_aws_envelopes_pass_runtime_integrity_and_settings_validation() {
             "fictional-publisher-proxy-secret-32-bytes",
             "should resolve the proxy reference without using a real provider"
         );
+        let forwarder = settings
+            .trusted_forwarder
+            .as_ref()
+            .expect("should authenticate the publisher-origin browser proxy");
+        assert_eq!(forwarder.auth_header, "x-ts-forwarder-auth");
+        assert!(
+            forwarder.authenticates("fictional-browser-forwarder-secret-32-bytes"),
+            "should resolve the browser token independently of other credentials"
+        );
+        assert!(!settings.auction.enabled, "should keep auctions disabled");
         let Some(EcStorageSelection::DynamoDb(storage)) = settings
             .ec
             .resolve_storage(EcRuntime::Native)
