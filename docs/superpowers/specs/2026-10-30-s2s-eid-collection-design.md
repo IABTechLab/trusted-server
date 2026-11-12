@@ -216,6 +216,9 @@ browser             TS (navigation)                          providers   KV
 - The follow-up write contains provider results only; browser ingest stays in
   the page write. It never creates or revives a row: a missing, tombstoned or
   withdrawn row, or one whose EC ID changed during the request, is skipped.
+- When no result can change the row (nothing found, nothing to clear), the
+  phase skips the read and the write and logs `unchanged`. A remembered
+  opt-out clears only sources the row still stores.
 - The write is a compare-and-swap on the generation read just before it. On
   conflict the results are dropped; the source stays due and is retried on the
   next navigation.
@@ -1730,3 +1733,13 @@ Reviewer findings and resolutions:
   §12.2, §12.3, §13.1, §14). Round 2's "Spec drift corrected" missed these.
 - Deferred: deploy validation per adapter and kind (#1552), a full-row pull
   sync loop (#1551).
+
+### Round 4 (2026-11-12, PR #1487 at 1ec3be72e, Claude Code (Opus 5.5) review agent)
+
+- No blocking findings. Re-checked the round-3 changes: the size cap's
+  over-cap trimming, provider UID dropping and stored-record restore; the
+  after-response re-read skip (a newly reported opt-out always clears at least
+  one source, since every provider claims one); `skipped_no_row` precedence
+  over consent; and that no caller still needed orphan retargeting.
+- §5.2.1 now states that the after-response phase skips its read when no
+  result can change the row.
