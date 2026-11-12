@@ -2214,8 +2214,17 @@ name = "edgezero-store-celld"
 version = "0.1.0"
 source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
 dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "edgezero-core",
+ "futures-util",
+ "reqwest 0.13.4",
  "serde",
+ "serde_json",
+ "sha2 0.11.1",
  "thiserror 2.0.18",
+ "tokio",
  "url",
 ]
 
@@ -7090,6 +7099,7 @@ dependencies = [
  "base64",
  "edgezero-adapter-axum",
  "edgezero-core",
+ "edgezero-store-celld",
  "error-stack",
  "futures",
  "log",
@@ -7164,6 +7174,7 @@ dependencies = [
  "error-stack",
  "futures",
  "log",
+ "serde_json",
  "spin-sdk",
  "tokio",
  "trusted-server-core",
@@ -7242,6 +7253,7 @@ dependencies = [
  "derive_more",
  "ed25519-dalek",
  "edgezero-core",
+ "edgezero-store-celld",
  "error-stack",
  "flate2",
  "futures",

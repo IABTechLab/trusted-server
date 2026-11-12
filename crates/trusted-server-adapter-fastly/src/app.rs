@@ -209,6 +209,9 @@ pub(crate) fn load_settings_from_config_store(
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    settings
+        .ec
+        .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Fastly)?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     validate_fastly_backend_bound(&plan)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
@@ -472,7 +475,11 @@ fn build_ec_request_state(
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
     // consent withdrawals. Revocations keep the write path so tombstones stay
     // authoritative even for privacy-extension-heavy clients.
-    let kv_graph = crate::maybe_identity_graph(settings);
+    let (kv_graph, storage_error) = match crate::maybe_identity_graph(settings) {
+        Ok(graph) => (graph, None),
+        Err(error) => (None, Some(error)),
+    };
+    let setup_error = setup_error.or(storage_error);
     let finalize_kv_graph = if setup_error.is_none()
         && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
     {
@@ -616,7 +623,7 @@ async fn execute_named(
                     // Deliberately do not use an EC request-state graph: that
                     // copy is bot-gated, while operators use curl for this
                     // authenticated diagnostic.
-                    let kv = crate::maybe_identity_graph(&state.settings);
+                    let kv = crate::maybe_identity_graph(&state.settings)?;
                     handle_admin_ec_lookup(kv.as_ref(), &registry, &req).await
                 }
                 NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),

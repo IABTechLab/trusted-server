@@ -10,10 +10,13 @@ use async_trait::async_trait;
 use edgezero_adapter_axum::dev_server::PreparedStores;
 use edgezero_core::app::App;
 use edgezero_core::error::EdgeError;
+#[cfg(feature = "celld-ec")]
+use edgezero_store_celld::settings::CelldAccessToken;
 use error_stack::Report;
 use trusted_server_core::config_payload::{
     DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID, VerifiedConfigBlob,
 };
+use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
 use trusted_server_core::integrations::datadome::{DataDomeConfig, ProtectionMatcherConfig};
 use trusted_server_core::platform::{
     PlatformConfigStore, PlatformError, PlatformSecretStore, StoreId, StoreName,
@@ -258,13 +261,63 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
         )
         .map_err(settings_error)?;
     validate_snapshot_consumers(&settings)?;
+    crate::ec_kv::reject_legacy_configuration()?;
     let mut state = build_state_with_settings(settings).map_err(settings_error)?;
     // EC records stay live. Only the validated provider handle is shared, never
     // mutable identity rows in the immutable config/secret snapshot.
-    if let Some(provider) = crate::ec_kv::prepare_from_env().await? {
-        Arc::get_mut(&mut state)
-            .expect("should uniquely own initializing app state")
-            .set_ec_store(provider.as_ref().clone());
+    let provider_settings = Arc::clone(&state.settings);
+    match provider_settings
+        .ec
+        .resolve_storage(EcRuntime::Native)
+        .map_err(settings_error)?
+    {
+        None => {}
+        Some(EcStorageSelection::DynamoDb(config)) => {
+            let provider = crate::ec_kv::prepare(config).await?;
+            Arc::get_mut(&mut state)
+                .expect("should uniquely own initializing app state")
+                .set_ec_store(provider.as_ref().clone());
+        }
+        Some(EcStorageSelection::Celld(config)) => {
+            #[cfg(feature = "celld-ec")]
+            {
+                // Capture only the selected bootstrap reference once. The live
+                // handle owns this credential; request paths never read env.
+                let token = config
+                    .access
+                    .token_env()
+                    .map(|name| {
+                        std::env::var(name)
+                            .map_err(|_| {
+                                configuration_error(
+                                    "selected EC celld bootstrap token is unavailable",
+                                )
+                            })
+                            .and_then(|value| {
+                                CelldAccessToken::new(value).map_err(|_| {
+                                    configuration_error(
+                                        "selected EC celld bootstrap token is invalid",
+                                    )
+                                })
+                            })
+                    })
+                    .transpose()?;
+                let provider = crate::celld_ec::CelldEcKv::prepare(config, token.as_ref()).await?;
+                Arc::get_mut(&mut state)
+                    .expect("should uniquely own initializing app state")
+                    .set_ec_store(provider);
+            }
+            #[cfg(not(feature = "celld-ec"))]
+            {
+                let _ = config;
+                return Err(configuration_error(
+                    "native EC celld selected but celld-ec build feature is unavailable",
+                ));
+            }
+        }
+        Some(EcStorageSelection::Fastly(_)) => {
+            unreachable!("native resolution should not select Fastly")
+        }
     }
     let finalize_settings = Arc::clone(&state.settings);
     let router = router_builder(&state).build();

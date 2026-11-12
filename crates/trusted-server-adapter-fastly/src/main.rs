@@ -64,6 +64,7 @@ use crate::sandbox::{
     metrics_enabled,
 };
 use crate::tinybird::TelemetryQueue;
+use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
 // Only the reuse path builds a serving loop, so the retirement snapshots have
 // no consumer in the default build.
 #[cfg(feature = "reusable-sandbox")]
@@ -598,7 +599,7 @@ async fn apply_edgezero_ec_finalize(
 ) -> Result<PartnerRegistry, Report<TrustedServerError>> {
     let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
     let finalize_kv_graph = if ec_state.use_finalize_kv {
-        maybe_identity_graph(settings)
+        maybe_identity_graph(settings)?
     } else {
         None
     };
@@ -686,12 +687,16 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
         .with_body(body)
 }
 
-pub(crate) fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
-    settings
-        .ec
-        .ec_store
-        .as_ref()
-        .map(|store_name| KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
+pub(crate) fn maybe_identity_graph(
+    settings: &Settings,
+) -> Result<Option<KvIdentityGraph>, Report<TrustedServerError>> {
+    match settings.ec.resolve_storage(EcRuntime::Fastly)? {
+        Some(EcStorageSelection::Fastly(store_name)) => {
+            Ok(Some(KvIdentityGraph::new(FastlyEcKvStore::new(store_name))))
+        }
+        None => Ok(None),
+        _ => unreachable!("Fastly resolution should select only Fastly storage"),
+    }
 }
 
 /// Constructs a `KvIdentityGraph` from settings, or returns an error if the
@@ -699,13 +704,12 @@ pub(crate) fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGrap
 pub(crate) fn require_identity_graph(
     settings: &Settings,
 ) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
-    let store_name = settings.ec.ec_store.as_deref().ok_or_else(|| {
+    maybe_identity_graph(settings)?.ok_or_else(|| {
         Report::new(TrustedServerError::KvStore {
-            store_name: "ec.ec_store".to_owned(),
-            message: "ec.ec_store is not configured".to_owned(),
+            store_name: "ec.storage".to_owned(),
+            message: "EC identity storage is not configured".to_owned(),
         })
-    })?;
-    Ok(KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
+    })
 }
 
 /// Extracts a named cookie value from the request's `Cookie` header.
@@ -1533,6 +1537,36 @@ mod tests {
         );
         assert!(response.headers().get("surrogate-control").is_none());
         assert!(response.headers().get("cdn-cache-control").is_none());
+    }
+
+    #[test]
+    fn fastly_graph_selection_preserves_legacy_and_new_binding_input() {
+        for storage in [
+            None,
+            Some(serde_json::json!({"store":"exact-fixture-binding"})),
+            Some(serde_json::json!({"provider":"fastly","store":"exact-fixture-binding"})),
+        ] {
+            let mut settings = diagnostics_settings();
+            settings.ec.storage = storage
+                .map(|value| serde_json::from_value(value).expect("should parse provider config"));
+            if settings.ec.storage.is_none() {
+                settings.ec.ec_store = Some("exact-fixture-binding".to_owned());
+            }
+            assert!(matches!(
+                settings
+                    .ec
+                    .resolve_storage(EcRuntime::Fastly)
+                    .expect("should resolve Fastly input"),
+                Some(EcStorageSelection::Fastly("exact-fixture-binding"))
+            ));
+            assert!(
+                maybe_identity_graph(&settings)
+                    .expect("should construct graph lazily")
+                    .is_some()
+            );
+            require_identity_graph(&settings)
+                .expect("should require the configured binding without opening it early");
+        }
     }
 
     fn diagnostics_settings() -> Settings {

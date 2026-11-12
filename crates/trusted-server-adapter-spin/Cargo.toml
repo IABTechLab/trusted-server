@@ -36,6 +36,7 @@ trusted-server-core = { workspace = true }
 spin-sdk = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 base64 = { workspace = true }
 edgezero-core = { workspace = true }
