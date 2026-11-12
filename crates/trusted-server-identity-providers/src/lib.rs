@@ -66,15 +66,36 @@ pub fn reads_lockr(kind: &str) -> bool {
     )
 }
 
+/// Whether a provider of `kind` excludes `source` where GDPR applies.
+fn excludes_where_gdpr_applies(kind: &str, source: &str) -> bool {
+    match kind {
+        uid2::Uid2::KIND => uid2::excludes_where_gdpr_applies(source),
+        liveintent::LiveIntent::KIND => liveintent::excludes_where_gdpr_applies(source),
+        _ => false,
+    }
+}
+
 /// Builds the partner registry, marking the sources claimed by enabled
 /// providers as provider-owned.
+///
+/// The sources any configured provider, enabled or disabled, excludes where
+/// GDPR applies are marked too, so the UIDs already stored for them are
+/// withheld from egress for a GDPR visitor.
 ///
 /// # Errors
 ///
 /// Returns the same errors as [`PartnerRegistry::from_ec_with_kinds`],
 /// including for an enabled provider whose kind is not registered.
 pub fn partner_registry(ec: &Ec) -> Result<PartnerRegistry, Report<TrustedServerError>> {
-    PartnerRegistry::from_ec_with_kinds(ec, is_registered_kind)
+    let mut registry = PartnerRegistry::from_ec_with_kinds(ec, is_registered_kind)?;
+    for provider in &ec.identity_providers {
+        for source in &provider.sources {
+            if excludes_where_gdpr_applies(provider.kind(), source) {
+                registry.exclude_where_gdpr_applies(source);
+            }
+        }
+    }
+    Ok(registry)
 }
 
 /// Builds the provider for a configured `kind`.
@@ -560,6 +581,50 @@ mod tests {
             result.is_err(),
             "should reject a source claimed by providers in different phases"
         );
+    }
+
+    #[test]
+    fn partner_registry_marks_sources_excluded_where_gdpr_applies() {
+        // Arrange: a disabled `uid2` provider still stored UIDs, and
+        // `liveintent` resolves UID2 next to its own source.
+        let mut settings = settings_with_cookie_providers("page", "page");
+        for source in ["uidapi.com", "liveintent.example.com"] {
+            settings.ec.partners.push(
+                toml::from_str(&format!(
+                    "name = \"{source}\"\nsource_domain = \"{source}\"\nbidstream_enabled = true"
+                ))
+                .expect("should parse partner"),
+            );
+        }
+        settings.ec.identity_providers.push(
+            toml::from_str(
+                "id = \"uid2\"\nkind = \"uid2\"\nenabled = false\nsources = [\"uidapi.com\"]",
+            )
+            .expect("should parse uid2"),
+        );
+        settings.ec.identity_providers.push(
+            toml::from_str(
+                "id = \"liveintent\"\nkind = \"liveintent\"\nenabled = false\n\
+                 sources = [\"liveintent.example.com\", \"uidapi.com\"]",
+            )
+            .expect("should parse liveintent"),
+        );
+
+        // Act
+        let registry = partner_registry(&settings.ec).expect("should build partner registry");
+
+        // Assert
+        let excluded = |source: &str| {
+            registry
+                .get(source)
+                .is_some_and(|partner| partner.excluded_where_gdpr_applies)
+        };
+        assert!(excluded("uidapi.com"), "should mark the UID2 source");
+        assert!(
+            !excluded("liveintent.example.com"),
+            "should not mark LiveIntent's own source"
+        );
+        assert!(!excluded("pubcid.org"), "should not mark other sources");
     }
 
     #[test]

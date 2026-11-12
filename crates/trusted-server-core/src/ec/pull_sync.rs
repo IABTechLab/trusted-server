@@ -562,6 +562,7 @@ mod tests {
             ts_pull_token: Some(Redacted::new("token".to_owned())),
             provider_owned: false,
             owner_tcf_vendor_ids: Vec::new(),
+            excluded_where_gdpr_applies: false,
         }
     }
 
