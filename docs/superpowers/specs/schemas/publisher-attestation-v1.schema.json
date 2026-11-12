@@ -854,6 +854,9 @@
               "artifact_sha256": {
                 "type": "null"
               },
+              "provider_files_hash": {
+                "type": "string"
+              },
               "release": {
                 "type": "null"
               },

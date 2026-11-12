@@ -282,6 +282,70 @@ export function generate(input) {
   negatives.contradictory_environment = {
     compact_jws: signed(evidence.protected, contradiction).compact_jws,
   }
+  // Each signed variant violates exactly one schema-valid cross-field rule.
+  const variant = (object, role, change, rebind = false) => {
+    const payload = structuredClone(object.payload)
+    change(payload)
+    if (rebind) payload.binding_id = hash(canonical(payload.binding))
+    return { compact_jws: signed(object.protected, payload, role).compact_jws }
+  }
+  const assessment = result.assessment
+  const zeroDigest = { algorithm: 'sha256', value: '0'.repeat(64) }
+  Object.assign(negatives, {
+    evidence_lifetime_exceeded: variant(evidence, 'publisher', (payload) => {
+      payload.expires_at = payload.issued_at + 61
+    }),
+    evidence_key_expires_first: variant(
+      evidence,
+      'publisher',
+      (payload) => {
+        payload.binding.attestation_key.not_after = payload.expires_at - 1
+      },
+      true
+    ),
+    evidence_key_not_yet_valid: variant(
+      evidence,
+      'publisher',
+      (payload) => {
+        payload.binding.attestation_key.not_before = payload.issued_at + 1
+      },
+      true
+    ),
+    status_lifetime_exceeded: variant(result.status, 'verifier', (payload) => {
+      payload.expires_at = payload.issued_at + 61
+    }),
+    mismatched_key_possession_digest: variant(
+      assessment,
+      'verifier',
+      (payload) => {
+        payload.checks.key_possession.evidence_digest = zeroDigest
+      }
+    ),
+    mismatched_configuration_digest: variant(
+      assessment,
+      'verifier',
+      (payload) => {
+        payload.checks.configuration.evidence_digest = zeroDigest
+      }
+    ),
+    reversed_observation_interval: variant(
+      assessment,
+      'verifier',
+      (payload) => {
+        payload.observed_from = payload.observed_until + 1
+      }
+    ),
+    observation_after_issuance: variant(assessment, 'verifier', (payload) => {
+      payload.observed_until = payload.issued_at + 1
+    }),
+    late_assessment_issuance: variant(assessment, 'verifier', (payload) => {
+      payload.observed_until = payload.issued_at - 61
+      payload.observed_from = payload.observed_until - 8
+    }),
+    assessment_lifetime_exceeded: variant(assessment, 'verifier', (payload) => {
+      payload.expires_at = payload.observed_from + 901
+    }),
+  })
   const raw = canonical(evidence.payload)
   for (const [name, text] of [
     [

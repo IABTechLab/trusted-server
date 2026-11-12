@@ -148,3 +148,19 @@ test('Axum is development only', () => {
     'binding should enforce the provider/environment invariant'
   )
 })
+test('fingerprint-only assurance requires a provider package hash', () => {
+  const build = structuredClone(
+    vectors.signed_objects.assessment_fingerprint_only.payload.build
+  )
+  assert.equal(
+    validate('build', build),
+    true,
+    'fingerprint-only build with a provider hash should be valid'
+  )
+  build.provider_files_hash = null
+  assert.equal(
+    validate('build', build),
+    false,
+    'fingerprint-only build without a provider hash should be invalid'
+  )
+})
