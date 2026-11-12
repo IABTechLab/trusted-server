@@ -144,11 +144,13 @@ fn stored_uid(
         return Ok(stored);
     };
     // Unusable refresh state is dropped, never the UID: a refresh with no
-    // stated time, with empty or oversized state, or due already (which
-    // would make the source due on every navigation) is simply not stored.
+    // stated time or with empty or oversized state is simply not stored.
+    // State that is already due is kept, so a live UID imported after its
+    // refresh time, or held through a failed refresh, can still be
+    // refreshed; `rate_limit_per_hour` bounds the retries.
     let usable = !refresh.state.is_empty() && refresh.state.len() <= MAX_REFRESH_STATE_BYTES;
     match resolve_expiry(refresh.from, policy.now) {
-        Some(from) if usable && from > policy.now => Ok(stored.with_refresh(KvRefresh {
+        Some(from) if usable => Ok(stored.with_refresh(KvRefresh {
             state: refresh.state.into_owned(),
             from,
         })),
@@ -265,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_uid_when_its_refresh_state_is_unusable() {
+    fn keeps_due_refresh_state_and_drops_only_unusable_state() {
         let partners = registry();
         let provider = ProviderId::new("example-provider");
         let claimed = claimed();
@@ -282,17 +284,17 @@ mod tests {
             (
                 "state".to_owned(),
                 ProviderExpiry::After(Duration::ZERO),
-                None,
+                Some(UnixSeconds::new(1000)),
             ),
             (
                 "state".to_owned(),
                 ProviderExpiry::At(UnixSeconds::new(1000)),
-                None,
+                Some(UnixSeconds::new(1000)),
             ),
             (
                 "state".to_owned(),
                 ProviderExpiry::At(UnixSeconds::new(999)),
-                None,
+                Some(UnixSeconds::new(999)),
             ),
         ];
 
@@ -314,7 +316,7 @@ mod tests {
                     .refresh()
                     .map(|refresh| refresh.from),
                 expected,
-                "should keep only usable refresh state"
+                "should keep usable refresh state, due or not"
             );
         }
     }
