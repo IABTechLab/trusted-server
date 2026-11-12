@@ -105,7 +105,8 @@ impl KvEntry {
     /// source order, borrowing from the row.
     ///
     /// A source whose owning provider has a TCF vendor ID is skipped while
-    /// `consent` withholds that vendor's consent.
+    /// `consent` withholds that vendor's consent, and a source a provider
+    /// excludes where GDPR applies is skipped for a GDPR visitor.
     pub fn live_eids<'row>(
         &'row self,
         registry: &'row PartnerRegistry,
@@ -114,7 +115,9 @@ impl KvEntry {
     ) -> impl Iterator<Item = EidView<'row>> + 'row {
         self.ids.iter().flat_map(move |(source, record)| {
             let partner = registry.get(source).filter(|partner| {
-                partner.bidstream_enabled && !partner.owner_vendor_consent_denied(consent)
+                partner.bidstream_enabled
+                    && !partner.owner_vendor_consent_denied(consent)
+                    && !partner.excluded_for(consent)
             });
             partner
                 .into_iter()
@@ -328,6 +331,38 @@ mod tests {
             1,
             "should serve the provider's UIDs with its vendor consent"
         );
+    }
+
+    #[test]
+    fn live_eids_withhold_a_gdpr_excluded_source_for_a_gdpr_visitor() {
+        // Arrange: a stored UID for a source a provider excludes where GDPR
+        // applies, written while the visitor was outside GDPR.
+        let mut registry = registry_with("ids.example.com", true);
+        assert!(
+            registry.exclude_where_gdpr_applies("ids.example.com"),
+            "should mark the source"
+        );
+        let mut entry = KvEntry::minimal("ids.example.com", "placeholder", 1);
+        entry.ids.insert(
+            "ids.example.com".to_owned(),
+            provider_record(&[("p-1", Expiry::Never)]),
+        );
+        let gdpr = consent_granting_vendors(vec![1]);
+
+        // Act
+        let under_gdpr = entry
+            .live_eids(&registry, &gdpr, UnixSeconds::new(0))
+            .count();
+        let elsewhere = entry
+            .live_eids(&registry, &ConsentContext::default(), UnixSeconds::new(0))
+            .count();
+
+        // Assert
+        assert_eq!(
+            under_gdpr, 0,
+            "should withhold the excluded source with TCF Purposes 1 and 4 granted"
+        );
+        assert_eq!(elsewhere, 1, "should serve the source outside GDPR");
     }
 
     #[test]

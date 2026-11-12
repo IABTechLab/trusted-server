@@ -248,6 +248,12 @@ fn expiry(headers: &HeaderMap) -> ProviderExpiry {
     bounded_expiry(ttl)
 }
 
+/// Whether a `liveintent` provider excludes `source` where GDPR applies: the
+/// UID2 tokens it resolves, matching the `uid2` provider.
+pub(crate) fn excludes_where_gdpr_applies(source: &str) -> bool {
+    source.eq_ignore_ascii_case(UID2_SOURCE)
+}
+
 impl IdentityProvider for LiveIntentProvider {
     fn capabilities(&self) -> &ProviderCapabilities {
         &self.capabilities
@@ -256,7 +262,7 @@ impl IdentityProvider for LiveIntentProvider {
     /// UID2 tokens `LiveIntent` resolves are not collected or kept where GDPR
     /// applies, matching the `uid2` provider.
     fn excluded_where_gdpr_applies(&self, source: &SourceDomain) -> bool {
-        source.as_str() == UID2_SOURCE
+        excludes_where_gdpr_applies(source.as_str())
     }
 
     fn build_request(

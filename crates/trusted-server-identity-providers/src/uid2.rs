@@ -276,6 +276,12 @@ fn prebid_tokens(json: &str) -> Option<TokenCookie> {
     Some(TokenCookie::Token(identity.advertising_token, expiry))
 }
 
+/// Whether a `uid2` provider excludes `source` where GDPR applies: UID2 is
+/// not offered there, so every source is excluded.
+pub(crate) fn excludes_where_gdpr_applies(_source: &str) -> bool {
+    true
+}
+
 impl IdentityProvider for Uid2Provider {
     fn capabilities(&self) -> &ProviderCapabilities {
         &self.capabilities
@@ -283,8 +289,8 @@ impl IdentityProvider for Uid2Provider {
 
     /// UID2 is not offered where GDPR applies, so none of its sources is
     /// collected or kept there.
-    fn excluded_where_gdpr_applies(&self, _source: &SourceDomain) -> bool {
-        true
+    fn excluded_where_gdpr_applies(&self, source: &SourceDomain) -> bool {
+        excludes_where_gdpr_applies(source.as_str())
     }
 
     /// A server-side refresh does not rewrite the browser's cookies, so a

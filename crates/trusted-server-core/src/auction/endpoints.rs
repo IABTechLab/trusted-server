@@ -2055,6 +2055,46 @@ mod tests {
     }
 
     #[test]
+    fn resolve_auction_eids_withholds_a_gdpr_excluded_source_where_gdpr_applies() {
+        // Arrange: the row holds a UID2 UID written while the visitor was
+        // outside GDPR; the visitor now arrives under GDPR with TCF Purposes
+        // 1 and 4 granted.
+        let mut registry = partner_registry(&["uidapi.com", "ids.example.com"]);
+        assert!(
+            registry.exclude_where_gdpr_applies("uidapi.com"),
+            "should mark the UID2 source"
+        );
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = crate::ec::kv_types::KvEntry::minimal("uidapi.com", "uid2-token", 1);
+        entry.ids.insert(
+            "ids.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId::single("other-uid"),
+        );
+        entry.consent.ok = true;
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: None,
+        };
+        let ec_context = EcContext::new_for_test(
+            Some(ec_id),
+            crate::test_support::tests::consent_granting_vendors(vec![1]),
+        );
+
+        // Act
+        let eids = resolve_auction_eids(&snapshot, Some(&registry), &ec_context)
+            .expect("should resolve EIDs under granted consent");
+
+        // Assert
+        let sources: Vec<&str> = eids.iter().map(|eid| eid.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            vec!["ids.example.com"],
+            "should not send the GDPR-excluded source to bidders"
+        );
+    }
+
+    #[test]
     fn resolve_auction_eids_returns_none_without_registry() {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
