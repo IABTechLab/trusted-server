@@ -2912,7 +2912,6 @@ mod tests {
         );
     }
 
-    /// Returns `p-1` for the lookup it was sent, then reports nothing left.
     /// Answers every lookup with `p-1` and counts the lookups sent.
     #[derive(Default)]
     struct LookupHttpClient(Arc<AtomicUsize>);
@@ -3282,6 +3281,8 @@ mod tests {
             finalized_navigation(&fixture, Some(&ec_id), IpAddr::V4(Ipv4Addr::LOCALHOST));
         let mut lookups = lookups.expect("should capture after-response work");
         lookups.ec_id = format!("{}.ar0003", "3".repeat(64));
+        // A live row for the other EC, so only the EC check can stop the send.
+        seed_live_row(&fixture.graph, &lookups.ec_id);
 
         // Act
         crate::run_after_response_lookups(&fixture.state, &mut ec_state, Some(lookups));

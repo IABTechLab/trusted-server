@@ -167,7 +167,7 @@ struct ProviderPolicy {
     rate_limit_per_hour: Option<NonZeroU32>,
 }
 
-/// The production coordinator, built per request from settings.
+/// The production coordinator, built once at startup.
 ///
 /// Generic over the provider type: production uses the boxed default, tests
 /// and single-provider builds use a concrete type.

@@ -745,7 +745,7 @@ pub struct Ec {
 }
 
 // Not derived: the identity budgets default to their serde defaults so a
-// default `Ec` passes validation and serializes no identity keys.
+// default `Ec` passes the budget range checks and serializes no identity keys.
 impl Default for Ec {
     fn default() -> Self {
         Self {
@@ -4380,6 +4380,18 @@ where
 mod tests {
     use super::*;
 
+    use crate::auction::build_orchestrator;
+    use crate::integrations::{
+        IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
+        prebid::PrebidIntegrationConfig,
+    };
+    use crate::redacted::Redacted;
+    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use regex::Regex;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
     #[test]
     fn default_ec_uses_the_identity_budget_defaults() {
         let ec = Ec::default();
@@ -4401,17 +4413,6 @@ mod tests {
             "should serialize no identity keys"
         );
     }
-    use crate::auction::build_orchestrator;
-    use crate::integrations::{
-        IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
-        prebid::PrebidIntegrationConfig,
-    };
-    use crate::redacted::Redacted;
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
-    use regex::Regex;
-    use serde_json::json;
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
 
     #[test]
     fn html_finalization_timeout_defaults_and_boundaries() {

@@ -743,9 +743,15 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
         geo: None,
     }
 }
+
 #[cfg(test)]
 mod trace_dispatch_tests {
     use super::*;
+
+    use futures::executor::block_on;
+    use trusted_server_core::redacted::Redacted;
+    use trusted_server_core::settings::TrustedClientIpConfig;
+    use trusted_server_core::trace::TraceTerminalResponse;
 
     #[test]
     fn enabled_identity_provider_fails_startup() {
@@ -763,10 +769,6 @@ mod trace_dispatch_tests {
             "should name the provider and the adapter: {message}"
         );
     }
-    use futures::executor::block_on;
-    use trusted_server_core::redacted::Redacted;
-    use trusted_server_core::settings::TrustedClientIpConfig;
-    use trusted_server_core::trace::TraceTerminalResponse;
 
     fn trace_settings(enabled: bool) -> Settings {
         Settings::from_toml(&format!(

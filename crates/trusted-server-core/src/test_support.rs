@@ -638,12 +638,12 @@ pub(crate) mod async_html_finalization;
 /// Fixtures shared with adapter crates through the `test-utils` feature.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod fixtures {
-    #[must_use]
     /// Returns an enabled identity provider configuration for tests.
     ///
     /// # Panics
     ///
     /// Panics if the embedded TOML is invalid.
+    #[must_use]
     pub fn enabled_identity_provider() -> crate::settings::IdentityProviderConfig {
         toml::from_str(
             "id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/v1\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]",
