@@ -36,9 +36,10 @@ are:
 - `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE`
 
 Before the positive request, the smoke omits the config and each secret in
-separate process starts. Each request must return 500 and its log must identify
-the missing environment variable or exact setting path. This prevents a port,
-launcher, or origin error from satisfying a negative case.
+separate process starts. Each start must fail before Axum listens: the process
+must exit non-zero and its log must identify the missing environment variable
+or exact setting path. This prevents a port, launcher, or origin error from
+satisfying a negative case.
 
 The final publisher request must return 200, include the stub-origin sentinel,
 rewrite its origin URL to the Axum listener, and remove the original URL. The

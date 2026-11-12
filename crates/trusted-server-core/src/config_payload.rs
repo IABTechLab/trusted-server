@@ -1009,6 +1009,31 @@ mod tests {
     }
 
     #[test]
+    fn live_blob_with_operator_framing_headers_still_loads() {
+        // Push rejects these entries, but a blob pushed before the rejection
+        // still has to load. The response-header helper skips them when it serves.
+        for (name, value) in [
+            ("connection", "keep-alive,"),
+            ("connection", ""),
+            ("trailer", "expires"),
+        ] {
+            let mut settings = test_settings();
+            settings
+                .response_headers
+                .insert(name.to_owned(), value.to_owned());
+
+            let loaded = load_settings(&envelope_json(&settings))
+                .expect("should keep loading a live config that predates the rejection");
+
+            assert_eq!(
+                loaded.response_headers.get(name).map(String::as_str),
+                Some(value),
+                "should keep the {name} entry for the response-header helper to skip"
+            );
+        }
+    }
+
+    #[test]
     fn tampered_blob_hash_is_rejected() {
         let mut envelope: BlobEnvelope =
             serde_json::from_str(&envelope_json(&test_settings())).expect("should parse envelope");

@@ -26,6 +26,34 @@ pub struct TerminalPrivateResponse;
 
 const INACTIVE_AD_STACK_BROWSER_CACHE_CONTROL: &str = "private, max-age=60";
 
+/// Operator `response_headers` names that Trusted Server never sends.
+///
+/// Response egress owns message framing: it refuses a response that declares
+/// `Trailer`, frames the body itself, and strips the hop-by-hop fields. A
+/// `Connection` value also removes the fields it names, and a malformed one
+/// fails the response with a 500 before commit.
+const FORBIDDEN_OPERATOR_RESPONSE_HEADERS: [&str; 10] = [
+    "trailer",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "te",
+    "transfer-encoding",
+    "upgrade",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+];
+
+/// Whether `name` is an operator response header that Trusted Server never sends.
+///
+/// Matches [`FORBIDDEN_OPERATOR_RESPONSE_HEADERS`] case-insensitively.
+pub(crate) fn is_forbidden_operator_response_header(name: &str) -> bool {
+    FORBIDDEN_OPERATOR_RESPONSE_HEADERS
+        .iter()
+        .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct GeneratedInactiveAdStackBrowserCachePolicy;
 
@@ -157,7 +185,9 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
 /// produce a shared-cacheable cookie-bearing response.
 ///
 /// Invalid header names/values are logged and skipped rather than panicking, so
-/// a misconfigured operator header can never take down a request.
+/// a misconfigured operator header can never take down a request. So are
+/// `Trailer`, `Content-Length`, and the hop-by-hop fields, which validation
+/// rejects but a config that predates the rejection can still carry.
 pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: &mut Response) {
     enforce_set_cookie_cache_privacy(response);
 
@@ -165,6 +195,12 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
     enforce_uncacheable_cache_privacy(response);
 
     for (key, value) in &settings.response_headers {
+        if is_forbidden_operator_response_header(key) {
+            log::warn!(
+                "Skipping configured response header `{key}`: framing and hop-by-hop fields belong to response egress"
+            );
+            continue;
+        }
         if response_is_uncacheable
             && (key.eq_ignore_ascii_case(header::CACHE_CONTROL.as_str())
                 || is_edge_cache_header_name(key))
@@ -204,6 +240,7 @@ mod tests {
     use edgezero_core::http::response_builder;
 
     use crate::cache_policy::EDGE_CACHE_HEADER_NAMES;
+    use crate::test_support::logging::WarningCapture;
 
     fn settings_with_response_headers(headers: &[(&str, &str)]) -> Settings {
         let mut s = Settings::from_toml(
@@ -608,6 +645,56 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("value"),
             "operator headers should still apply to cacheable responses"
+        );
+    }
+
+    #[test]
+    fn skips_operator_framing_and_hop_by_hop_entries_with_warning() {
+        let forbidden = [
+            "Trailer",
+            "Content-Length",
+            "Connection",
+            "Keep-Alive",
+            "TE",
+            "Transfer-Encoding",
+            "Upgrade",
+            "Proxy-Connection",
+            "Proxy-Authenticate",
+            "Proxy-Authorization",
+        ];
+        let mut entries: Vec<(&str, &str)> = forbidden
+            .iter()
+            .map(|name| (*name, "example-value"))
+            .collect();
+        entries.push(("x-example", "example-value"));
+        let settings = settings_with_response_headers(&entries);
+        let mut response = response_builder()
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+        let capture = WarningCapture::start();
+
+        apply_response_headers_with_cache_privacy(&settings, &mut response);
+
+        let warnings = capture.take();
+        for name in forbidden {
+            assert!(
+                !response.headers().contains_key(name),
+                "should skip the operator {name} entry"
+            );
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.message.contains(&format!("`{name}`"))),
+                "should warn that the operator {name} entry is skipped"
+            );
+        }
+        assert_eq!(
+            response
+                .headers()
+                .get("x-example")
+                .and_then(|value| value.to_str().ok()),
+            Some("example-value"),
+            "should still apply the other operator entries"
         );
     }
 }

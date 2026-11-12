@@ -33,6 +33,7 @@ use crate::integrations::{
     sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
+use crate::response_privacy::is_forbidden_operator_response_header;
 use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
@@ -316,6 +317,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     reject_disabled_certificate_check(settings)?;
     reject_origin_readthrough(settings)?;
     reject_origin_url_userinfo(settings)?;
+    reject_forbidden_operator_response_headers(settings)?;
     validate_js_asset_proxy_config(settings)?;
     validate_gpt_diagnostics_config(settings)?;
 
@@ -405,6 +407,36 @@ fn reject_origin_url_userinfo(settings: &Settings) -> Result<(), Report<TrustedS
         message:
             "publisher.origin_url must not contain userinfo; put credentials in a header instead"
                 .to_owned(),
+    }))
+}
+
+/// Rejects operator `response_headers` entries that Trusted Server never sends:
+/// `Trailer`, `Content-Length`, and the hop-by-hop fields.
+///
+/// Response egress owns message framing, so such an entry would fail the
+/// response or silently change it. Runtime skips one with a warning instead.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] naming every such entry.
+fn reject_forbidden_operator_response_headers(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
+    let mut names: Vec<String> = settings
+        .response_headers
+        .keys()
+        .filter(|name| is_forbidden_operator_response_header(name))
+        .map(|name| format!("`{name}`"))
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    names.sort_unstable();
+    Err(Report::new(TrustedServerError::Configuration {
+        message: format!(
+            "response_headers must not set {}; framing and hop-by-hop fields belong to response egress",
+            names.join(", ")
+        ),
     }))
 }
 
@@ -1724,6 +1756,26 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
+    fn runtime_keeps_loading_operator_framing_headers() {
+        // Deploy validation rejects these entries, but a live config pushed
+        // before the rejection still has to load. The response-header helper
+        // skips them when it serves.
+        for (name, value) in [
+            ("connection", "keep-alive,"),
+            ("connection", ""),
+            ("trailer", "expires"),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .response_headers
+                .insert(name.to_owned(), value.to_owned());
+
+            validate_settings_for_runtime(&settings)
+                .expect("should keep loading a live config that predates the rejection");
+        }
+    }
+
+    #[test]
     fn validate_rejects_origin_url_with_userinfo() {
         for origin_url in [
             "https://example-user@origin.test-publisher.example.com",
@@ -1783,6 +1835,48 @@ password = "production-admin-password-32-bytes"
                 .contains("creative_opportunities.origin_readthrough_enabled"),
             "should name the rejected setting on validate and push: {error:?}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_operator_trailer_and_connection_entries() {
+        let mut settings = valid_settings();
+        settings
+            .response_headers
+            .insert("x-example".to_owned(), "example-value".to_owned());
+        validate_settings_for_deploy(&settings)
+            .expect("should accept an operator header that is not a framing field");
+
+        for name in [
+            "Trailer",
+            "Content-Length",
+            "Connection",
+            "Keep-Alive",
+            "TE",
+            "Transfer-Encoding",
+            "Upgrade",
+            "Proxy-Connection",
+            "Proxy-Authenticate",
+            "Proxy-Authorization",
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .response_headers
+                .insert(name.to_owned(), "example-value".to_owned());
+
+            let quoted = format!("`{name}`");
+            let error = validate_settings_for_deploy(&settings)
+                .expect_err("should reject an operator framing or hop-by-hop header at deploy");
+            assert!(
+                format!("{error:?}").contains(&quoted),
+                "should name the rejected header {name}: {error:?}"
+            );
+            let error = TrustedServerAppConfig::new(settings)
+                .expect_err("should reject an operator framing or hop-by-hop header on push");
+            assert!(
+                error.to_string().contains(&quoted),
+                "should name the rejected header {name} on validate and push: {error:?}"
+            );
+        }
     }
 
     #[test]

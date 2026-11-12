@@ -18,11 +18,11 @@ use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_
 
 use crate::common::config::integration_app_config_envelope_with_trace;
 use crate::common::runtime::TestError;
-use crate::common::runtime::{
-    RuntimeEnvironment as _, RuntimeProcess, RuntimeProcessHandle, origin_port, wasm_binary_path,
-};
+use crate::common::runtime::{RuntimeProcess, RuntimeProcessHandle, origin_port, wasm_binary_path};
 use crate::environments::{
-    axum::AxumDevServer, cloudflare::CloudflareWorkers, fastly::FastlyViceroy,
+    axum::AxumDevServer,
+    cloudflare::CloudflareWorkers,
+    fastly::{FastlyViceroy, GuestStdout},
 };
 use crate::frameworks::{FrontendFramework as _, nextjs::NextJs};
 
@@ -172,10 +172,10 @@ pub(crate) fn with_trace_runtime(
     publisher_origin: Option<&str>,
     check: impl FnOnce(&str),
 ) {
-    let fixture = IsolatedFixture::new();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     match runtime {
         TraceRuntime::Cloudflare => {
+            let fixture = IsolatedFixture::new();
             let original = root.join("crates/trusted-server-adapter-cloudflare");
             copy_directory(&original.join("build"), &fixture.0.join("build"));
             let template = fs::read_to_string(original.join("wrangler.ci.toml"))
@@ -201,19 +201,9 @@ pub(crate) fn with_trace_runtime(
                 },
             );
         }
-        TraceRuntime::Fastly => {
-            let template = include_str!("../../fixtures/configs/viceroy-template.toml");
-            let config=template.replace("        # GENERATED_TRUSTED_SERVER_CONFIG_STORES",&format!("        [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}]\n            format = \"inline-toml\"\n        [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}.contents]\n            {CONFIG_BLOB_KEY} = '''{envelope}'''"));
-            let path = fixture.0.join("viceroy.toml");
-            fs::write(&path, config).expect("should write isolated Viceroy config");
-            temp_env::with_var("VICEROY_CONFIG_PATH", Some(path.as_os_str()), || {
-                let process = FastlyViceroy
-                    .spawn(&wasm_binary_path())
-                    .expect("should spawn isolated Fastly trace runtime");
-                check(&process.base_url);
-            });
-        }
+        TraceRuntime::Fastly => with_fastly_runtime(envelope, |base_url, _stdout| check(base_url)),
         TraceRuntime::Spin => {
+            let fixture = IsolatedFixture::new();
             let artifact =
                 root.join("target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm");
             assert!(
@@ -294,6 +284,26 @@ pub(crate) fn with_trace_runtime(
     }
 }
 
+/// Runs `check` against Viceroy serving the app config `envelope` in an isolated
+/// fixture, with what the guest has printed to stdout.
+///
+/// # Panics
+///
+/// Panics when the Fastly artifact or Viceroy is missing or the runtime never becomes ready.
+pub(crate) fn with_fastly_runtime(envelope: &str, check: impl FnOnce(&str, &GuestStdout)) {
+    let fixture = IsolatedFixture::new();
+    let template = include_str!("../../fixtures/configs/viceroy-template.toml");
+    let config=template.replace("        # GENERATED_TRUSTED_SERVER_CONFIG_STORES",&format!("        [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}]\n            format = \"inline-toml\"\n        [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}.contents]\n            {CONFIG_BLOB_KEY} = '''{envelope}'''"));
+    let path = fixture.0.join("viceroy.toml");
+    fs::write(&path, config).expect("should write isolated Viceroy config");
+    temp_env::with_var("VICEROY_CONFIG_PATH", Some(path.as_os_str()), || {
+        let (process, stdout) = FastlyViceroy
+            .spawn_capturing_stdout(&wasm_binary_path())
+            .expect("should spawn isolated Fastly trace runtime");
+        check(&process.base_url, &stdout);
+    });
+}
+
 /// Exercise a real host-only cookie and publisher-to-viewer browser workflow.
 ///
 /// Auction and shared assembly stay disabled. Only GPT callbacks are mocked;
@@ -319,7 +329,7 @@ pub(crate) fn exercise_browser(runtime: TraceBrowserRuntime) {
     match runtime {
         TraceBrowserRuntime::Axum => {
             let process = AxumDevServer
-                .spawn_with_app_config(&envelope)
+                .spawn_with_app_config(&envelope, &[])
                 .expect("should spawn the real native trace runtime");
             wait_for_trace_fixture_ready(&process.base_url)
                 .expect("should load native trace configuration");

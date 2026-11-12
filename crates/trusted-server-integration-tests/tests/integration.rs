@@ -14,6 +14,7 @@ use frameworks::{FRAMEWORKS, FrontendFramework};
 use reqwest::header::CONTENT_TYPE;
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -1047,7 +1048,7 @@ fn first_party_proxy_redirect_policy_runs_on_axum_binary() {
         common::config::proxy_allowlist_app_config_envelope(origin_port(), &["127.0.0.1"])
             .expect("should build the proxy allowlist app config");
     let process = environments::axum::AxumDevServer
-        .spawn_with_app_config(&envelope)
+        .spawn_with_app_config(&envelope, &[])
         .expect("should start the Axum dev server");
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -1629,40 +1630,81 @@ fn twelve_bidder_auction_registers_twelve_backends_fastly() {
     let envelope = common::config::auction_app_config_envelope(origin_port(), &fixtures, 2000)
         .expect("should build the twelve-bidder auction config");
 
-    common::trace_boundary::with_trace_runtime(
-        common::trace_boundary::TraceRuntime::Fastly,
-        &envelope,
-        None,
-        |base_url| {
-            // Each bidder listens on its own port, so each needs its own backend.
-            // Two auctions show the backends serve every later auction too.
-            for auction in 1..=2 {
-                let response = post_auction(base_url);
+    common::trace_boundary::with_fastly_runtime(&envelope, |base_url, stdout| {
+        // Each bidder listens on its own port, so each needs its own backend.
+        // Two auctions show the backends serve every later auction too.
+        for auction in 1..=2 {
+            let response = post_auction(base_url);
+            assert_eq!(
+                (
+                    &response["ext"]["orchestrator"]["providers"],
+                    &response["ext"]["orchestrator"]["total_bids"]
+                ),
+                (&serde_json::json!(12), &serde_json::json!(12)),
+                "auction {auction} should collect one bid from each of the twelve bidders: {response}"
+            );
+            for id in &ids {
                 assert_eq!(
-                    (
-                        &response["ext"]["orchestrator"]["providers"],
-                        &response["ext"]["orchestrator"]["total_bids"]
-                    ),
-                    (&serde_json::json!(12), &serde_json::json!(12)),
-                    "auction {auction} should collect one bid from each of the twelve bidders: {response}"
-                );
-                for id in &ids {
-                    assert_eq!(
-                        provider_detail(&response, id)["bid_count"],
-                        serde_json::json!(1),
-                        "auction {auction} should parse the bid from {id}"
-                    );
-                }
-                assert_eq!(
-                    response["seatbid"][0]["bid"][0]["price"],
-                    serde_json::json!(12.0),
-                    "auction {auction} should deliver the highest of the twelve bids"
+                    provider_detail(&response, id)["bid_count"],
+                    serde_json::json!(1),
+                    "auction {auction} should parse the bid from {id}"
                 );
             }
-        },
-    );
+            assert_eq!(
+                response["seatbid"][0]["bid"][0]["price"],
+                serde_json::json!(12.0),
+                "auction {auction} should deliver the highest of the twelve bids"
+            );
+        }
+        // Each callback has its own observation, so this shows that each
+        // auction configures and registers exactly one backend per bidder
+        // and no other outbound backend.
+        assert_eq!(
+            wait_for_outbound_observations(stdout, 2),
+            [(12, 12), (12, 12)],
+            "each auction should configure and register exactly one backend per bidder"
+        );
+    });
 
     assert_bidders_received("Fastly", &bidders.iter().collect::<Vec<_>>(), 2);
+}
+
+/// Waits up to five seconds for the guest to log `expected` outbound
+/// observations, and returns the configuration and registration counts of each.
+///
+/// The callback logs its observation after delivery, so the line can trail
+/// the response the client already read. Viceroy prints a line once for the
+/// `tslog` endpoint and once more as the guest's stdout echo, so only the
+/// endpoint copy counts.
+fn wait_for_outbound_observations(
+    stdout: &environments::fastly::GuestStdout,
+    expected: usize,
+) -> Vec<(u64, u64)> {
+    let count = |line: &str, field: &str| -> u64 {
+        line.split_whitespace()
+            .find_map(|entry| entry.strip_prefix(field))
+            .and_then(|value| value.parse().ok())
+            .expect("should log every outbound observation count")
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let observations: Vec<(u64, u64)> = stdout
+            .lines()
+            .iter()
+            .filter_map(|line| line.strip_prefix("tslog :: "))
+            .filter(|line| line.contains("[outbound_observation]"))
+            .map(|line| {
+                (
+                    count(line, "configurations="),
+                    count(line, "registrations="),
+                )
+            })
+            .collect();
+        if observations.len() >= expected || std::time::Instant::now() >= deadline {
+            return observations;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]
@@ -1756,7 +1798,7 @@ impl OriginRuntime {
         match self {
             Self::Axum => {
                 let process = environments::axum::AxumDevServer
-                    .spawn_with_app_config(envelope)
+                    .spawn_with_app_config(envelope, &[])
                     .expect("should start the Axum dev server");
                 check(&process.base_url);
             }
@@ -1905,6 +1947,264 @@ fn spin_runtime_head_root() {
             "Spin HEAD / should return the origin's status"
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// Bodiless publisher responses
+// ---------------------------------------------------------------------------
+
+/// Publisher path the bodiless-status cases request.
+const BODILESS_PAGE_PATH: &str = "/bodiless-page";
+
+/// Entity tag for which the origin answers a conditional GET with 304.
+const BODILESS_PAGE_ETAG: &str = "\"example-etag\"";
+
+/// Answers a HEAD or a matching conditional GET for [`BODILESS_PAGE_PATH`]
+/// with a bodiless head that declares `Trailer`, and anything else with a
+/// small HTML page.
+fn bodiless_page_response(request: &OriginRequest) -> Vec<u8> {
+    let head_only = request.method == "HEAD";
+    let not_modified = request.header("if-none-match") == Some(BODILESS_PAGE_ETAG);
+    if request.path != BODILESS_PAGE_PATH || !(head_only || not_modified) {
+        return html_response(200, head_only);
+    }
+    let status = if head_only {
+        ORIGIN_PASS_THROUGH_STATUS
+    } else {
+        304
+    };
+    raw_response(
+        status,
+        &[
+            ("Content-Type", "text/html; charset=utf-8".to_owned()),
+            ("ETag", BODILESS_PAGE_ETAG.to_owned()),
+            ("Trailer", "expires".to_owned()),
+        ],
+        b"",
+    )
+}
+
+/// A publisher HEAD and a conditional GET that the origin answers with 304
+/// return their real status, with no `Trailer`, although the origin declares one.
+fn publisher_head_and_conditional_304_return_real_status(runtime: OriginRuntime) {
+    init_logger();
+    let _port = lock_origin_port();
+    let origin = RecordingOrigin::serve(
+        TcpListener::bind(("127.0.0.1", origin_port())).expect("should bind origin port"),
+        Arc::new(bodiless_page_response),
+    );
+    let envelope = common::config::integration_app_config_envelope(origin_port())
+        .expect("should build the integration app config");
+
+    runtime.serve(&envelope, |base_url| {
+        let url = format!("{base_url}{BODILESS_PAGE_PATH}");
+        let head = raw_client()
+            .head(&url)
+            .send()
+            .expect("should send the publisher HEAD");
+        let conditional = raw_client()
+            .get(&url)
+            .header("if-none-match", BODILESS_PAGE_ETAG)
+            .send()
+            .expect("should send the conditional publisher GET");
+        for (request, response, expected) in [
+            ("HEAD", &head, ORIGIN_PASS_THROUGH_STATUS),
+            ("conditional GET", &conditional, 304),
+        ] {
+            assert_eq!(
+                response.status().as_u16(),
+                expected,
+                "{runtime:?} {request} should return the origin's status"
+            );
+            assert!(
+                response.headers().get("trailer").is_none(),
+                "{runtime:?} {request} should not send Trailer"
+            );
+        }
+    });
+
+    assert!(
+        origin.requests().iter().any(|request| {
+            request.method == "GET"
+                && request.path == BODILESS_PAGE_PATH
+                && request.header("if-none-match") == Some(BODILESS_PAGE_ETAG)
+        }),
+        "{runtime:?} should forward the validator, so the 304 is the origin's"
+    );
+}
+
+#[test]
+#[ignore = "requires Viceroy and the release Fastly WASM"]
+fn publisher_head_and_conditional_304_return_real_status_fastly() {
+    publisher_head_and_conditional_304_return_real_status(OriginRuntime::Fastly);
+}
+
+#[test]
+#[ignore = "requires the pre-built trusted-server-axum binary"]
+fn publisher_head_and_conditional_304_return_real_status_axum() {
+    publisher_head_and_conditional_304_return_real_status(OriginRuntime::Axum);
+}
+
+#[test]
+#[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
+fn publisher_head_and_conditional_304_return_real_status_cloudflare() {
+    publisher_head_and_conditional_304_return_real_status(OriginRuntime::Cloudflare);
+}
+
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn publisher_head_and_conditional_304_return_real_status_spin() {
+    publisher_head_and_conditional_304_return_real_status(OriginRuntime::Spin);
+}
+
+// ---------------------------------------------------------------------------
+// Axum ingress variables
+// ---------------------------------------------------------------------------
+
+/// Raw-head limit the raised case sets, twice the listener's 64 KiB default.
+const RAISED_RAW_HEAD_BYTES: &str = "131072";
+
+/// A `GET /health` whose raw head exceeds the Axum listener's default 64 KiB
+/// limit while its header fields stay under `EdgeZero`'s 64 KiB header limit.
+///
+/// `EdgeZero` counts only header fields toward its limit, so the request line
+/// carries the excess, with a target under `EdgeZero`'s 8192 bytes.
+fn oversized_head_request() -> Vec<u8> {
+    let mut request = format!(
+        "GET /health?padding={} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n",
+        "a".repeat(7000)
+    );
+    // 58 fields of 1,040 bytes plus `Host` and `Connection`: 60 field lines
+    // of 60,356 bytes. With the 7,016-byte target the raw head is 67,389
+    // bytes (about 66 KiB), 1,853 over the default 65,536.
+    for index in 0..58 {
+        request.push_str(&format!("x-example-{index:02}: {}\r\n", "b".repeat(1024)));
+    }
+    request.push_str("\r\n");
+    request.into_bytes()
+}
+
+/// Sends `request` to the runtime at `base_url` and returns the response
+/// status, or `None` when the runtime closed the connection without one.
+fn raw_request_status(base_url: &str, request: &[u8]) -> Option<u16> {
+    let address = base_url
+        .strip_prefix("http://")
+        .expect("should serve plain HTTP");
+    let mut stream = TcpStream::connect(address).expect("should connect to the runtime");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("should set a read timeout");
+    // A runtime that refuses the head may close before reading all of it.
+    let _ = stream.write_all(request);
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    std::str::from_utf8(&response)
+        .ok()?
+        .strip_prefix("HTTP/1.1 ")?
+        .get(..3)?
+        .parse()
+        .ok()
+}
+
+#[test]
+#[ignore = "requires the pre-built trusted-server-axum binary"]
+fn axum_ingress_variable_raises_limit() {
+    init_logger();
+    let envelope = common::config::integration_app_config_envelope(origin_port())
+        .expect("should build the integration app config");
+    let request = oversized_head_request();
+
+    let default = environments::axum::AxumDevServer
+        .spawn_with_app_config(&envelope, &[])
+        .expect("should start the Axum dev server");
+    let default_status = raw_request_status(&default.base_url, &request);
+    drop(default);
+    let raised = environments::axum::AxumDevServer
+        .spawn_with_app_config(
+            &envelope,
+            &[(
+                "EDGEZERO__ADAPTER__INGRESS__MAX_RAW_HEAD_BYTES",
+                RAISED_RAW_HEAD_BYTES,
+            )],
+        )
+        .expect("should start the Axum dev server with a raised raw-head limit");
+    let raised_status = raw_request_status(&raised.base_url, &request);
+
+    assert_ne!(
+        default_status,
+        Some(200),
+        "should refuse the head under the default raw-head limit, or the case proves nothing"
+    );
+    assert_eq!(
+        raised_status,
+        Some(200),
+        "should admit the same head once the variable raises the raw-head limit"
+    );
+}
+
+/// Waits up to `deadline` for `child` to exit, killing it if it does not.
+///
+/// Returns `None` when the child was still running at the deadline.
+fn wait_for_exit(child: &mut Child, deadline: Duration) -> Option<ExitStatus> {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("should poll the child process") {
+            return Some(status);
+        }
+        if started.elapsed() >= deadline {
+            child.kill().expect("should stop the child process");
+            child.wait().expect("should reap the child process");
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore = "requires the pre-built trusted-server-axum binary"]
+fn axum_invalid_ingress_variable_fails_startup() {
+    init_logger();
+    let envelope = common::config::integration_app_config_envelope(origin_port())
+        .expect("should build the integration app config");
+    let port = environments::find_available_port().expect("should reserve a port");
+    let mut child = environments::axum::AxumDevServer
+        .command(&envelope, port)
+        .env("EDGEZERO__ADAPTER__INGRESS__MAX_HEADER_COUNT", "0")
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("should spawn the Axum binary");
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(10));
+    let mut output = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        stdout
+            .read_to_string(&mut output)
+            .expect("should read the Axum binary stdout");
+    }
+    if let Some(mut stderr) = child.stderr.take() {
+        stderr
+            .read_to_string(&mut output)
+            .expect("should read the Axum binary stderr");
+    }
+
+    let status = status.unwrap_or_else(|| {
+        panic!("should exit instead of serving with an invalid ingress variable; output:\n{output}")
+    });
+    assert!(
+        !status.success(),
+        "should exit non-zero with an invalid ingress variable, got {status}; output:\n{output}"
+    );
+    assert!(
+        output.contains("invalid Axum ingress setting `max_header_count`"),
+        "should name the invalid ingress setting; output:\n{output}"
+    );
+    assert!(
+        !output.contains("Listening on"),
+        "should not reach the listener; output:\n{output}"
+    );
 }
 
 /// Page the navigation bid cases load.
@@ -2631,7 +2931,7 @@ fn realistic_first_party_proxy_request_is_admitted_axum() {
     init_logger();
     let (origin, envelope) = realistic_creative_origin();
     let process = environments::axum::AxumDevServer
-        .spawn_with_app_config(&envelope)
+        .spawn_with_app_config(&envelope, &[])
         .expect("should start the Axum dev server");
     realistic_first_party_proxy_request_is_admitted(&process.base_url, &origin);
 }
