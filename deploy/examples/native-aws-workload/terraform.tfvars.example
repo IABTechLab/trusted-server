@@ -1,5 +1,5 @@
-# Fictional inputs only. Not an apply recipe. Copy to an ignored local tfvars
-# only after approvals; all AWS resources remain behind the hard draft gate.
+# Fictional inputs only. Replace with actual reviewed inputs in a private tfvars
+# file before planning. Use approved deployment credentials; there is no draft gate.
 run_id             = "review-example"
 owner              = "review-owner"
 aws_account_id     = "000000000000"

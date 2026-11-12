@@ -76,8 +76,12 @@ run "task_contract" {
   command = plan
 
   assert {
-    condition     = local.tags.Lifecycle == "manual" && output.draft_status.manual_shutdown_required && terraform_data.draft_gate.input == { run_id = var.run_id }
-    error_message = "Keep the manual tag and shutdown declaration stable, with only run_id in the gate input."
+    condition     = local.tags.Lifecycle == "manual" && output.deployment_metadata.manual_shutdown_required && output.deployment_metadata.run_id == var.run_id
+    error_message = "Keep the manual tag, run identity and shutdown declaration stable."
+  }
+  assert {
+    condition     = toset(keys(output.deployment_metadata)) == toset(["run_id", "geo", "manual_shutdown_required", "config_envelope_transport_sha256", "external_inputs_retained_on_destroy"]) && output.deployment_metadata.geo == null && output.deployment_metadata.config_envelope_transport_sha256 == sha256(local.envelope_text) && jsonencode(output.deployment_metadata.external_inputs_retained_on_destroy) == jsonencode(["Retained DynamoDB table and allocator rows", "Supplied Secrets Manager secret versions", "ACM certificates", "Route53 hosted zone", "Published images", "Separately bootstrapped remote state/operator authority"])
+    error_message = "Deployment metadata must preserve config and retained-input identity, without deployable or blocker fields."
   }
 
   assert {
