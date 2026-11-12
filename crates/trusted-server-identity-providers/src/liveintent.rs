@@ -8,10 +8,11 @@
 //! sources. No hashed email is sent.
 //!
 //! As in Prebid's `LiveIntent` module, every attribute other than `nonId` is
-//! a partner ID and its UID carries `ext.provider` naming `LiveIntent`; the
-//! Trade Desk ID also carries `ext.rtiPartner` and its EID names
-//! `LiveIntent` as `matcher`. A non-empty `segments` array in the reply
-//! becomes the `nonId` EID's `ext`.
+//! a partner ID and its UID carries `ext.provider` naming `LiveIntent`. The
+//! Trade Desk ID instead carries `ext.rtiPartner` and an `ext.provider`
+//! naming the publisher's domain, and its EID names `LiveIntent` as
+//! `matcher`. A non-empty `segments` array and a non-empty `m` value in the
+//! reply go in the `nonId` EID's `ext`.
 //!
 //! This kind has no Lockr capability: Lockr AIM is not documented to
 //! deliver `LiveIntent` IDs, so a `lockr` settings table is rejected.
@@ -65,11 +66,10 @@ const UID2_SOURCE: &str = "uidapi.com";
 /// The attribute holding the Trade Desk ID `LiveIntent` resolved.
 const TDID_ATTRIBUTE: &str = "thetradedesk";
 
-/// `matcher` of the Trade Desk ID EID: `LiveIntent` matched it.
+/// `matcher` of the Trade Desk ID EID: `LiveIntent` matched it. It is also
+/// the Trade Desk ID's `ext.provider` when the publisher domain is unknown,
+/// as in Prebid.
 const TDID_MATCHER: &str = "liveintent.com";
-
-/// UID `ext` Prebid puts on the Trade Desk ID that `LiveIntent` resolved.
-const TDID_UID_EXT: &str = r#"{"rtiPartner":"TDID","provider":"liveintent.com"}"#;
 
 /// `LiveIntent`'s default first-party ID cookie on the publisher's domain.
 const FIRST_PARTY_COOKIE: &str = "_lc2_fpi";
@@ -134,7 +134,6 @@ pub struct LiveIntentProvider {
     attributes: Box<[(String, SourceDomain)]>,
     cookie_names: Box<[String]>,
     partner_uid_ext: &'static RawValue,
-    tdid_uid_ext: &'static RawValue,
 }
 
 /// Whether `id` has the `did-` form `LiveIntent` accepts; it answers any
@@ -192,8 +191,6 @@ impl ProviderKind for LiveIntent {
         }
         let partner_uid_ext = serde_json::from_str::<&'static RawValue>(PARTNER_UID_EXT)
             .change_context(ProviderConfigError::Invalid)?;
-        let tdid_uid_ext = serde_json::from_str::<&'static RawValue>(TDID_UID_EXT)
-            .change_context(ProviderConfigError::Invalid)?;
         let distributor = settings.distributor_id.as_deref().unwrap_or("prebid");
         let mut url = common
             .endpoint
@@ -229,7 +226,6 @@ impl ProviderKind for LiveIntent {
             attributes,
             cookie_names: settings.cookie_names.into_boxed_slice(),
             partner_uid_ext,
-            tdid_uid_ext,
         })
     }
 }
@@ -316,7 +312,8 @@ impl IdentityProvider for LiveIntentProvider {
             url,
             headers,
             body: Bytes::new(),
-            context: None,
+            // The publisher domain names the Trade Desk ID's provider.
+            context: Some(lookup.publisher_domain.to_owned()),
         })
     }
 
@@ -334,27 +331,8 @@ impl IdentityProvider for LiveIntentProvider {
         let reply: HashMap<String, &'body RawValue> =
             serde_json::from_slice(response.body).change_context(ProviderError::InvalidResponse)?;
         let expiry = expiry(response.headers);
-        // Only a non-empty segment array is kept, as Prebid does.
-        let segments = reply
-            .get("segments")
-            .filter(|segments| {
-                serde_json::from_str::<Vec<&RawValue>>(segments.get())
-                    .is_ok_and(|segments| !segments.is_empty())
-            })
-            .and_then(|segments| {
-                RawValue::from_string(format!(r#"{{"segments":{}}}"#, segments.get())).ok()
-            })
-            // An oversized EID `ext` would drop the whole `nonId` EID, so the
-            // segments are left out rather than the ID.
-            .filter(|ext| {
-                let fits = ext.get().len() <= MAX_EXT_BYTES;
-                if !fits {
-                    log::debug!(
-                        "LiveIntent: omitting segments over {MAX_EXT_BYTES} bytes from the nonId EID"
-                    );
-                }
-                fits
-            });
+        let non_id_ext = non_id_ext(&reply);
+        let tdid_uid_ext = tdid_uid_ext(response.context)?;
         let eids: Vec<ProviderEid<'body>> = self
             .attributes
             .iter()
@@ -368,17 +346,22 @@ impl IdentityProvider for LiveIntentProvider {
                 let (matcher, eid_ext, uid_ext, atype) = match attribute.as_str() {
                     NON_ID_ATTRIBUTE => (
                         None,
-                        segments.clone().map(Cow::Owned),
+                        non_id_ext.clone().map(Cow::Owned),
                         None,
                         LIVEINTENT_ATYPE,
                     ),
                     TDID_ATTRIBUTE => (
                         Some(Cow::Borrowed(TDID_MATCHER)),
                         None,
-                        Some(self.tdid_uid_ext),
+                        Some(Cow::Owned(tdid_uid_ext.clone())),
                         DEVICE_ATYPE,
                     ),
-                    _ => (None, None, Some(self.partner_uid_ext), LIVEINTENT_ATYPE),
+                    _ => (
+                        None,
+                        None,
+                        Some(Cow::Borrowed(self.partner_uid_ext)),
+                        LIVEINTENT_ATYPE,
+                    ),
                 };
                 Some(ProviderEid {
                     source: Cow::Owned(source.as_str().to_owned()),
@@ -389,7 +372,7 @@ impl IdentityProvider for LiveIntentProvider {
                     uids: vec![ProviderUid {
                         id,
                         atype: Some(atype),
-                        ext: uid_ext.map(Cow::Borrowed),
+                        ext: uid_ext,
                         expiry,
                         refresh: None,
                     }],
@@ -402,6 +385,65 @@ impl IdentityProvider for LiveIntentProvider {
             LookupOutcome::Found(eids)
         })
     }
+}
+
+/// Builds the `nonId` EID `ext` from the reply's `segments` and `m`, as
+/// Prebid's `LiveIntent` module does.
+///
+/// Only a non-empty `segments` array and a truthy `m` are kept. An
+/// oversized `ext` would drop the whole `nonId` EID, so the segments are
+/// left out first, then `m`, rather than the ID.
+fn non_id_ext(reply: &HashMap<String, &RawValue>) -> Option<Box<RawValue>> {
+    let field = |name: &str| -> Option<serde_json::Value> {
+        serde_json::from_str(reply.get(name)?.get()).ok()
+    };
+    let segments = field("segments").filter(|segments| {
+        segments
+            .as_array()
+            .is_some_and(|segments| !segments.is_empty())
+    });
+    let m = field("m").filter(|m| {
+        !matches!(m, serde_json::Value::Null | serde_json::Value::Bool(false))
+            && m.as_str() != Some("")
+            && m.as_f64() != Some(0.0)
+    });
+    let build = |segments: Option<&serde_json::Value>| -> Option<Box<RawValue>> {
+        let mut ext = serde_json::Map::new();
+        if let Some(segments) = segments {
+            ext.insert("segments".to_owned(), segments.clone());
+        }
+        if let Some(m) = &m {
+            ext.insert("m".to_owned(), m.clone());
+        }
+        if ext.is_empty() {
+            return None;
+        }
+        let ext = serde_json::value::to_raw_value(&ext).ok()?;
+        if ext.get().len() > MAX_EXT_BYTES {
+            log::debug!("LiveIntent: omitting a nonId EID ext over {MAX_EXT_BYTES} bytes");
+            return None;
+        }
+        Some(ext)
+    };
+    build(segments.as_ref()).or_else(|| segments.as_ref().and_then(|_| build(None)))
+}
+
+/// Builds the Trade Desk ID's UID `ext`: Prebid names the page's domain as
+/// its `provider`, falling back to `LiveIntent`'s domain.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::InvalidResponse`] if the `ext` cannot be
+/// serialized.
+fn tdid_uid_ext(publisher_domain: Option<&str>) -> Result<Box<RawValue>, Report<ProviderError>> {
+    let provider = publisher_domain
+        .filter(|domain| !domain.is_empty())
+        .unwrap_or(TDID_MATCHER);
+    serde_json::value::to_raw_value(&serde_json::json!({
+        "rtiPartner": "TDID",
+        "provider": provider,
+    }))
+    .change_context(ProviderError::InvalidResponse)
 }
 
 #[cfg(test)]
@@ -703,9 +745,13 @@ mod tests {
             "should name LiveIntent as the TDID matcher"
         );
         assert_eq!(
-            eids[1].uids[0].ext.as_deref().map(RawValue::get),
-            Some(r#"{"rtiPartner":"TDID","provider":"liveintent.com"}"#),
-            "should mark the TDID as LiveIntent-provided"
+            eids[1].uids[0]
+                .ext
+                .as_deref()
+                .map(|ext| serde_json::from_str::<serde_json::Value>(ext.get())
+                    .expect("should parse TDID ext")),
+            Some(json!({ "rtiPartner": "TDID", "provider": "liveintent.com" })),
+            "should fall back to LiveIntent as the TDID provider without a publisher domain"
         );
         assert!(eids[1].ext.is_none(), "should keep segments on nonId only");
         assert_eq!(eids[2].source, "pubmatic.com", "should map a partner ID");
@@ -714,6 +760,112 @@ mod tests {
             Some(r#"{"provider":"liveintent.com"}"#),
             "should name LiveIntent as the provider of a partner ID"
         );
+    }
+
+    #[test]
+    fn names_the_publisher_domain_as_the_tdid_provider() {
+        let provider = provider();
+        let headers = HeaderMap::new();
+        let consent = ConsentContext::default();
+        let due = due();
+        let lookup = LookupInput {
+            ec_id: "ec-example",
+            consent: &consent,
+            client: ClientSignals {
+                ip: None,
+                user_agent: None,
+            },
+            publisher_domain: "www.example.com",
+            due_sources: &due,
+            current: OwnedEntries::empty(),
+            cookies: RequestCookies::default(),
+            hashed_email: None,
+            now: trusted_server_core::ec::eid_types::UnixSeconds::new(1_700_000_000),
+        };
+        let request = provider
+            .build_request(&lookup)
+            .expect("should build request");
+        let body = json!({ "thetradedesk": "tdid-example" })
+            .to_string()
+            .into_bytes();
+
+        let outcome = provider
+            .parse_response(ProviderResponse {
+                status: StatusCode::OK,
+                headers: &headers,
+                body: &body,
+                context: request.context.as_deref(),
+            })
+            .expect("should parse response");
+        let LookupOutcome::Found(eids) = outcome else {
+            panic!("should find the TDID EID");
+        };
+
+        let ext: serde_json::Value = serde_json::from_str(
+            eids[0].uids[0]
+                .ext
+                .as_deref()
+                .expect("should set the TDID ext")
+                .get(),
+        )
+        .expect("should parse TDID ext");
+        assert_eq!(
+            ext,
+            json!({ "rtiPartner": "TDID", "provider": "www.example.com" }),
+            "should name the publisher domain as the TDID provider, as Prebid does"
+        );
+        assert_eq!(
+            eids[0].matcher.as_deref(),
+            Some("liveintent.com"),
+            "should keep LiveIntent as the TDID matcher"
+        );
+    }
+
+    #[test]
+    fn copies_m_into_the_non_id_ext() {
+        let provider = provider();
+        let headers = HeaderMap::new();
+        let cases = [
+            (
+                json!({ "nonId": "li-example", "segments": ["s1"], "m": "m-example" }),
+                Some(json!({ "segments": ["s1"], "m": "m-example" })),
+            ),
+            (
+                json!({ "nonId": "li-example", "m": "m-example" }),
+                Some(json!({ "m": "m-example" })),
+            ),
+            (json!({ "nonId": "li-example", "m": "" }), None),
+            (json!({ "nonId": "li-example", "m": null }), None),
+            (
+                json!({
+                    "nonId": "li-example",
+                    "segments": (0..120).map(|n| format!("seg{n:04}")).collect::<Vec<_>>(),
+                    "m": "m-example",
+                }),
+                Some(json!({ "m": "m-example" })),
+            ),
+        ];
+
+        for (reply, expected) in cases {
+            let body = reply.to_string().into_bytes();
+            let outcome = provider
+                .parse_response(ProviderResponse {
+                    status: StatusCode::OK,
+                    headers: &headers,
+                    body: &body,
+                    context: None,
+                })
+                .expect("should parse response");
+            let LookupOutcome::Found(eids) = outcome else {
+                panic!("should find the nonId EID");
+            };
+
+            let ext = eids[0].ext.as_deref().map(|ext| {
+                serde_json::from_str::<serde_json::Value>(ext.get())
+                    .expect("should parse nonId ext")
+            });
+            assert_eq!(ext, expected, "should build the nonId ext for {reply}");
+        }
     }
 
     #[test]
