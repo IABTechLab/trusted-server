@@ -177,6 +177,9 @@ pull_sync_concurrency = 3
 # tcf_vendor_id = 9999
 # [ec.identity_providers.settings]
 # partner_id = 1234
+# Optional: who operates this integration, sent to ID5 as `provider`.
+# Defaults to the publisher domain.
+# provider_name = "publisher.example.com"
 # cookie_names = ["id5id"]
 # [ec.identity_providers.settings.lockr]
 # enabled = true
