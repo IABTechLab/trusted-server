@@ -354,6 +354,9 @@ jobs:
         if: runner.os == 'macOS'
         id: setup-chrome
         uses: browser-actions/setup-chrome@v1
+        with:
+          # The default is an unreleased Chromium snapshot, not released Chrome.
+          chrome-version: stable
 
       - name: cargo test
         if: runner.os == 'Linux'
