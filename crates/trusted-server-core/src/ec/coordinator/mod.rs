@@ -489,9 +489,24 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 continue;
             }
             // A remembered opt-out keeps the provider from being called until
-            // it lapses.
-            if entry.is_some_and(|entry| entry.opted_out(&registered.id, lookup.now)) {
-                pending.early.push(skip(SkipReason::OptedOut));
+            // it lapses. It clears only sources the row still stores, so once
+            // they are gone the after-response path skips its re-read.
+            if let Some(entry) = entry.filter(|entry| entry.opted_out(&registered.id, lookup.now)) {
+                pending.generated.push(Tagged {
+                    provider,
+                    value: ProviderLookup {
+                        provider: registered.id.clone(),
+                        status: LookupStatus::Skipped(SkipReason::OptedOut),
+                        entries: Vec::new(),
+                        cleared: registered
+                            .policy
+                            .sources
+                            .iter()
+                            .filter(|source| entry.ids.contains_key(source.as_str()))
+                            .cloned()
+                            .collect(),
+                    },
+                });
                 continue;
             }
             let (due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
@@ -1414,6 +1429,40 @@ mod tests {
         assert!(
             transport.sent.borrow().is_empty(),
             "should not call a provider the visitor opted out of"
+        );
+        assert!(
+            results
+                .iter()
+                .next()
+                .expect("should report the provider")
+                .cleared
+                .is_empty(),
+            "should clear nothing when the row stores none of its sources"
+        );
+
+        // Arrange: a UID for a claimed source is still stored.
+        let mut stored = entry.clone();
+        stored
+            .ids
+            .insert("ids.example.com".to_owned(), KvPartnerId::single("p-1"));
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&stored),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            results
+                .iter()
+                .next()
+                .expect("should report the provider")
+                .cleared,
+            [SourceDomain::try_from("ids.example.com").expect("should parse")],
+            "should clear the claimed source the row still stores"
         );
 
         // Arrange: the opt-out lapsed.

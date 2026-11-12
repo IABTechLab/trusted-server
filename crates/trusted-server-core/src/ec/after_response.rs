@@ -7,7 +7,7 @@
 //! next page load. Browser ingest never runs here: it belongs to the
 //! navigation's own write.
 
-use super::coordinator::results::{LookupResults, LookupStatus, SkipReason};
+use super::coordinator::results::LookupResults;
 use super::eid_types::UnixSeconds;
 use super::kv::KvIdentityGraph;
 use super::page_load::{AfterResponseWrite, RowChange};
@@ -63,8 +63,9 @@ pub fn after_response_lookups_allowed(
 ///
 /// # Performance
 ///
-/// One KV read and at most one conditional KV write. Runs after the response
-/// has been sent, so it adds no page latency.
+/// At most one KV read, skipped when no lookup can change the row, and at
+/// most one conditional KV write. Runs after the response has been sent, so
+/// it adds no page latency.
 #[must_use]
 pub fn commit_after_response_lookups(
     graph: &KvIdentityGraph,
@@ -73,13 +74,13 @@ pub fn commit_after_response_lookups(
     ec_id: &str,
     lookups: &LookupResults,
 ) -> AfterResponseOutcome {
-    // Only found UIDs, cleared sources or an opt-out can change the row; a
-    // navigation whose lookups were all skipped or failed needs no re-read.
-    let can_change = lookups.iter().any(|lookup| {
-        !lookup.entries.is_empty()
-            || !lookup.cleared.is_empty()
-            || lookup.status == LookupStatus::Skipped(SkipReason::OptedOut)
-    });
+    // Only found UIDs or cleared sources can change the row. A newly reported
+    // opt-out clears every source of its provider, which claims at least one;
+    // a remembered one clears only sources the row still stores, so a
+    // navigation that finds nothing left to clear needs no re-read.
+    let can_change = lookups
+        .iter()
+        .any(|lookup| !lookup.entries.is_empty() || !lookup.cleared.is_empty());
     if !can_change {
         return AfterResponseOutcome::Unchanged;
     }
@@ -133,7 +134,7 @@ pub fn commit_after_response_lookups(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec::coordinator::results::{DropCounts, ProviderLookup};
+    use crate::ec::coordinator::results::{DropCounts, LookupStatus, ProviderLookup, SkipReason};
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, SourceDomain, UidValue};
     use crate::ec::kv::TombstoneOutcome;
     use crate::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvUid};
@@ -516,6 +517,83 @@ mod tests {
             &registry(),
             EC_ID,
             &skipped,
+        );
+
+        // Assert
+        assert_eq!(
+            outcome,
+            AfterResponseOutcome::Unchanged,
+            "should return before reading the row"
+        );
+    }
+
+    #[test]
+    fn an_opt_out_alone_still_re_reads_and_clears_the_source() {
+        // Arrange: the provider's UID is stored, then it reports an opt-out.
+        let graph = KvIdentityGraph::in_memory("after-response");
+        graph.create(EC_ID, &live_entry()).expect("should seed row");
+        let seeded = commit_after_response_lookups(
+            &graph,
+            AfterResponseWrite::for_test(),
+            &registry(),
+            EC_ID,
+            &found(EC_ID, "p-1"),
+        );
+        assert_eq!(
+            seeded,
+            AfterResponseOutcome::Written,
+            "should store the provider UID first"
+        );
+        let opted_out = opt_out(vec![
+            SourceDomain::try_from("ids.example.com").expect("should build source"),
+        ]);
+
+        // Act
+        let outcome = commit_after_response_lookups(
+            &graph,
+            AfterResponseWrite::for_test(),
+            &registry(),
+            EC_ID,
+            &opted_out,
+        );
+
+        // Assert
+        assert_eq!(
+            outcome,
+            AfterResponseOutcome::Written,
+            "should write the opt-out"
+        );
+        assert_eq!(
+            stored_uid(&graph, "ids.example.com"),
+            None,
+            "should clear the opted-out provider's source"
+        );
+    }
+
+    fn opt_out(cleared: Vec<SourceDomain>) -> LookupResults {
+        LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::Skipped(SkipReason::OptedOut),
+                entries: Vec::new(),
+                cleared,
+            }],
+        )
+    }
+
+    #[test]
+    fn a_remembered_opt_out_with_nothing_to_clear_skips_the_re_read() {
+        // Arrange: no row, so a re-read would report `NoRow`.
+        let graph = KvIdentityGraph::in_memory("after-response");
+
+        // Act
+        let outcome = commit_after_response_lookups(
+            &graph,
+            AfterResponseWrite::for_test(),
+            &registry(),
+            EC_ID,
+            &opt_out(Vec::new()),
         );
 
         // Assert
