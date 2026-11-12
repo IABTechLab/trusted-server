@@ -317,6 +317,9 @@ mod tests {
                 "should keep only usable refresh state"
             );
         }
+    }
+
+    #[test]
     fn clamps_absolute_expiry_to_thirty_days() {
         let partners = registry();
         let provider = ProviderId::new("example-provider");

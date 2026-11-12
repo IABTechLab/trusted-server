@@ -330,7 +330,7 @@ mod tests {
     use serde_json::json;
     use trusted_server_core::consent::types::ConsentContext;
     use trusted_server_core::ec::eid_types::{EidValidationError, UidValue};
-    use trusted_server_core::ec::kv_types::MAX_UID_LENGTH;
+    use trusted_server_core::ec::kv_types::MAX_STORED_UID_LENGTH;
     use trusted_server_core::ec::provider::{
         ClientSignals, OwnedEntries, ProviderExpiry, build_kind,
     };
@@ -391,7 +391,7 @@ mod tests {
     fn collects_envelopes_up_to_the_uid_length_limit_and_drops_longer_ones() {
         let provider = provider(&json!({}));
 
-        for len in [703, 1000, MAX_UID_LENGTH] {
+        for len in [703, 1000, MAX_STORED_UID_LENGTH] {
             let raw = "A".repeat(len);
             let ats = encoded(&json!({ "envelope": raw }), &STANDARD);
             for header in [format!("idl_env={raw}"), format!("_lr_env={ats}")] {
@@ -407,7 +407,7 @@ mod tests {
 
         let (id, _) = read(
             &*provider,
-            &format!("idl_env={}", "A".repeat(MAX_UID_LENGTH + 1)),
+            &format!("idl_env={}", "A".repeat(MAX_STORED_UID_LENGTH + 1)),
         )
         .expect("should read the oversized envelope");
         assert!(
@@ -566,7 +566,7 @@ mod tests {
             },
             publisher_domain: "www.example.com",
             due_sources: &[],
-            current: OwnedEntries::new(None, &[]),
+            current: OwnedEntries::empty(),
             cookies: RequestCookies::default(),
             hashed_email: None,
         };
@@ -599,7 +599,7 @@ mod tests {
             },
             publisher_domain: "www.example.com",
             due_sources: &[],
-            current: OwnedEntries::new(None, &[]),
+            current: OwnedEntries::empty(),
             cookies: RequestCookies::default(),
             hashed_email: None,
         }
