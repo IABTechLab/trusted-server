@@ -106,7 +106,7 @@ fn from_millis(ms: f64) -> Duration {
 }
 
 /// Decodes one cookie value into the ID and its expiry.
-fn connect_id(value: &str) -> Option<(String, ProviderExpiry)> {
+fn connect_id(value: &str, now: UnixSeconds) -> Option<(String, ProviderExpiry)> {
     let decoded = percent_decoded(value);
     let cookie: ConnectIdCookie = serde_json::from_str(&decoded).ok()?;
     if !is_usable_id(&cookie.connect_id) {
@@ -123,7 +123,7 @@ fn connect_id(value: &str) -> Option<(String, ProviderExpiry)> {
     let expires = from_millis(last_synced_ms).saturating_add(ttl);
     let expiry = ProviderExpiry::At(UnixSeconds::new(expires.as_secs()));
     // An expired cookie never hides a later live one.
-    (!is_expired(&expiry)).then_some((cookie.connect_id, expiry))
+    (!is_expired(&expiry, now)).then_some((cookie.connect_id, expiry))
 }
 
 impl IdentityProvider for ConnectIdProvider {
@@ -149,7 +149,10 @@ impl IdentityProvider for ConnectIdProvider {
         &self,
         cookies: RequestCookies<'cookie>,
     ) -> CookieRead<'cookie> {
-        let Some((id, expiry)) = self.cookies.read(cookies, connect_id) else {
+        let Some((id, expiry)) = self
+            .cookies
+            .read(cookies, |value| connect_id(value, cookies.now()))
+        else {
             return CookieRead::Absent;
         };
         CookieRead::Found(vec![cookie_eid(&self.source, Cow::Owned(id), expiry)])
@@ -163,6 +166,9 @@ mod tests {
     use trusted_server_core::settings::{IdentityProviderConfig, ProviderSecrets};
 
     use super::*;
+
+    /// Request time the tests read cookies at.
+    const NOW: UnixSeconds = UnixSeconds::new(1_700_000_000);
 
     fn provider() -> Box<dyn IdentityProvider> {
         let config: IdentityProviderConfig = serde_json::from_value(json!({
@@ -178,7 +184,7 @@ mod tests {
     fn read(cookie: &serde_json::Value) -> Option<(String, ProviderExpiry)> {
         let header = format!("connectId={}", urlencoding::encode(&cookie.to_string()));
         let eids = provider()
-            .read_request_cookies(RequestCookies::new(&header))
+            .read_request_cookies(RequestCookies::new(&header).at(NOW))
             .into_found()?;
         assert_eq!(
             eids[0].source, "connectid.example.com",
@@ -202,7 +208,7 @@ mod tests {
             "connectId": "cid-example-1",
             "he": "example-hashed-email",
             "puid": "example-puid",
-            "lastSynced": 4_700_000_000_000_u64,
+            "lastSynced": 1_800_000_000_000_u64,
             "lastUsed": 4_700_000_100_000_u64,
             "ttl": 86_400_000,
         });
@@ -216,7 +222,7 @@ mod tests {
         );
         assert_eq!(
             expires_at(read),
-            4_700_086_400,
+            1_800_086_400,
             "should expire at lastSynced + ttl"
         );
     }
@@ -224,7 +230,7 @@ mod tests {
     #[test]
     fn caps_the_ttl_and_defaults_a_missing_or_zero_one() {
         // A far-future sync keeps the cookie live whatever today's date is.
-        let synced_secs = 4_700_000_000_u64;
+        let synced_secs = 1_800_000_000_u64;
         let long = json!({ "connectId": "cid", "lastSynced": synced_secs * 1000, "ttl": 1e15 });
         let missing = json!({ "connectId": "cid", "lastSynced": synced_secs * 1000 });
         let zero = json!({ "connectId": "cid", "lastSynced": synced_secs * 1000, "ttl": 0 });
@@ -245,7 +251,7 @@ mod tests {
 
     #[test]
     fn reads_a_lowercase_key_and_a_missing_last_sync_as_fresh() {
-        let lowercase = json!({ "connectid": "cid", "lastSynced": 4_700_000_000_000_u64 });
+        let lowercase = json!({ "connectid": "cid", "lastSynced": 1_800_000_000_000_u64 });
         let unsynced = json!({ "connectId": "cid" });
 
         assert_eq!(
@@ -262,7 +268,7 @@ mod tests {
     #[test]
     fn an_expired_cookie_does_not_hide_a_later_live_one() {
         let expired = json!({ "connectId": "cid-old", "lastSynced": 1000, "ttl": 1000 });
-        let live = json!({ "connectId": "cid-live", "lastSynced": 4_700_000_000_000_u64 });
+        let live = json!({ "connectId": "cid-live", "lastSynced": 1_800_000_000_000_u64 });
         let header = format!(
             "connectId={}; connectId={}",
             urlencoding::encode(&expired.to_string()),
@@ -270,7 +276,7 @@ mod tests {
         );
 
         let eids = provider()
-            .read_request_cookies(RequestCookies::new(&header))
+            .read_request_cookies(RequestCookies::new(&header).at(NOW))
             .into_found()
             .expect("should read the live cookie");
 
@@ -293,7 +299,7 @@ mod tests {
         }
         assert!(
             provider()
-                .read_request_cookies(RequestCookies::new("connectId={broken"))
+                .read_request_cookies(RequestCookies::new("connectId={broken").at(NOW))
                 .into_found()
                 .is_none(),
             "should ignore malformed JSON"

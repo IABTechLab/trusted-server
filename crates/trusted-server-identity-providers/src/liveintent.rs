@@ -491,6 +491,7 @@ mod tests {
             current: OwnedEntries::empty(),
             cookies,
             hashed_email: None,
+            now: trusted_server_core::ec::eid_types::UnixSeconds::new(1_700_000_000),
         };
 
         for (header, expected) in [
@@ -532,6 +533,7 @@ mod tests {
             current: OwnedEntries::empty(),
             cookies: RequestCookies::default(),
             hashed_email: None,
+            now: trusted_server_core::ec::eid_types::UnixSeconds::new(1_700_000_000),
         };
 
         let request = provider
@@ -755,6 +757,7 @@ mod tests {
             current: OwnedEntries::empty(),
             cookies: RequestCookies::default(),
             hashed_email: None,
+            now: trusted_server_core::ec::eid_types::UnixSeconds::new(1_700_000_000),
         };
 
         let request = provider

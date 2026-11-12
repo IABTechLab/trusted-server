@@ -569,6 +569,7 @@ mod tests {
             current: OwnedEntries::empty(),
             cookies: RequestCookies::default(),
             hashed_email: None,
+            now: trusted_server_core::ec::eid_types::UnixSeconds::new(1_700_000_000),
         };
 
         assert!(
@@ -602,6 +603,7 @@ mod tests {
             current: OwnedEntries::empty(),
             cookies: RequestCookies::default(),
             hashed_email: None,
+            now: trusted_server_core::ec::eid_types::UnixSeconds::new(1_700_000_000),
         }
     }
 

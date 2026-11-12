@@ -222,6 +222,7 @@ mod tests {
             current: trusted_server_core::ec::provider::OwnedEntries::empty(),
             cookies: RequestCookies::default(),
             hashed_email: None,
+            now: trusted_server_core::ec::eid_types::UnixSeconds::new(1_700_000_000),
         };
         provider.generate(&lookup)
     }

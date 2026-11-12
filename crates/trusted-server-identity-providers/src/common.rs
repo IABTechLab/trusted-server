@@ -8,8 +8,7 @@ use std::time::Duration;
 use error_stack::Report;
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use trusted_server_core::ec::current_timestamp;
-use trusted_server_core::ec::eid_types::SourceDomain;
+use trusted_server_core::ec::eid_types::{SourceDomain, UnixSeconds};
 use trusted_server_core::ec::provider::{
     EidLevelFields, EidShape, ProviderCapabilities, ProviderCommon, ProviderConfigError,
     ProviderEid, ProviderExpiry, ProviderKind, ProviderUid, RequestCookies, SourceCapability,
@@ -335,11 +334,11 @@ impl CookieReader {
     }
 }
 
-/// Whether a cookie's stated expiry has already passed.
+/// Whether a cookie's stated expiry has passed at request time `now`.
 ///
 /// Cookie readers skip such a value so it never hides a later live one.
-pub(crate) fn is_expired(expiry: &ProviderExpiry) -> bool {
-    matches!(expiry, ProviderExpiry::At(at) if at.get() <= current_timestamp())
+pub(crate) fn is_expired(expiry: &ProviderExpiry, now: UnixSeconds) -> bool {
+    matches!(expiry, ProviderExpiry::At(at) if *at <= now)
 }
 
 /// A complete `OpenRTB` EID as a vendor returns it, borrowed from the body.

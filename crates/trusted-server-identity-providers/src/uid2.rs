@@ -365,15 +365,19 @@ impl IdentityProvider for Uid2Provider {
         let token = cookies
             .get_all(&self.identity_cookie_name)
             .filter_map(identity)
-            .find(|token| !is_expired(&token.expiry))
+            .find(|token| !is_expired(&token.expiry, cookies.now()))
             .or_else(|| {
                 self.cookies
                     .read(cookies, |value| match token_cookie(value)? {
-                        TokenCookie::Token(token, expiry) if !is_expired(&expiry) => Some(Token {
-                            token,
-                            expiry,
-                            refresh: None,
-                        }),
+                        TokenCookie::Token(token, expiry)
+                            if !is_expired(&expiry, cookies.now()) =>
+                        {
+                            Some(Token {
+                                token,
+                                expiry,
+                                refresh: None,
+                            })
+                        }
                         TokenCookie::Token(..) | TokenCookie::OptedOut => None,
                     })
             });
@@ -417,6 +421,9 @@ mod tests {
 
     use super::*;
 
+    /// Request time the tests read cookies at.
+    const NOW: UnixSeconds = UnixSeconds::new(1_700_000_000);
+
     fn provider(settings: &serde_json::Value) -> Box<dyn IdentityProvider> {
         let config: IdentityProviderConfig = serde_json::from_value(json!({
             "id": "uid2",
@@ -430,7 +437,7 @@ mod tests {
 
     fn read(provider: &dyn IdentityProvider, header: &str) -> Option<(String, ProviderExpiry)> {
         let eids = provider
-            .read_request_cookies(RequestCookies::new(header))
+            .read_request_cookies(RequestCookies::new(header).at(NOW))
             .into_found()?;
         assert_eq!(eids[0].source, "uid2.example.com", "should use the source");
         let uid = &eids[0].uids[0];
@@ -458,7 +465,7 @@ mod tests {
         let header = identity_cookie(&json!({
             "advertising_token": "AgAAAAexampletoken+/=",
             "refresh_token": "example-refresh-token",
-            "identity_expires": 4_700_000_000_123_u64,
+            "identity_expires": 1_800_000_000_123_u64,
             "refresh_from": 4_699_990_000_000_u64,
             "refresh_expires": 4_702_000_000_000_u64,
             "refresh_response_key": "example-response-key",
@@ -471,7 +478,7 @@ mod tests {
             "should store only the token"
         );
         assert!(
-            matches!(expiry, ProviderExpiry::At(at) if at.get() == 4_700_000_000),
+            matches!(expiry, ProviderExpiry::At(at) if at.get() == 1_800_000_000),
             "should expire at identity_expires"
         );
     }
@@ -507,7 +514,7 @@ mod tests {
                 "advertising_token": "AgAAAAlatesttoken",
                 "refresh_token": "example-refresh-token",
                 "refresh_response_key": "example-response-key",
-                "identity_expires": 4_700_000_000_456_u64,
+                "identity_expires": 1_800_000_000_456_u64,
                 "refresh_from": 4_699_990_000_000_u64,
                 "refresh_expires": 4_702_000_000_000_u64,
             },
@@ -520,7 +527,7 @@ mod tests {
             "should store only the latest advertising token"
         );
         assert!(
-            matches!(expiry, ProviderExpiry::At(at) if at.get() == 4_700_000_000),
+            matches!(expiry, ProviderExpiry::At(at) if at.get() == 1_800_000_000),
             "should expire at the latest identity_expires"
         );
     }
@@ -530,7 +537,7 @@ mod tests {
         let provider = provider(&json!({}));
         let own = identity_cookie(&json!({
             "advertising_token": "AgAAAAowntoken",
-            "identity_expires": 4_700_000_000_000_u64,
+            "identity_expires": 1_800_000_000_000_u64,
         }));
         let opt_out = prebid_cookie(&json!({
             "originalToken": { "advertising_token": "AgAAAAoriginaltoken" },
@@ -539,7 +546,7 @@ mod tests {
 
         let header = format!("{own}; {opt_out}");
 
-        let read = provider.read_request_cookies(RequestCookies::new(&header));
+        let read = provider.read_request_cookies(RequestCookies::new(&header).at(NOW));
 
         assert!(
             matches!(read, CookieRead::OptedOut),
@@ -552,18 +559,18 @@ mod tests {
         let provider = provider(&json!({}));
         let live = identity_cookie(&json!({
             "advertising_token": "AgAAAAowntoken",
-            "identity_expires": 4_700_000_000_000_u64,
+            "identity_expires": 1_800_000_000_000_u64,
         }));
         let opt_out = identity_cookie(&json!({ "status": "optout" }));
         let fallback = prebid_cookie(&json!({
             "latestToken": {
                 "advertising_token": "AgAAAAlatesttoken",
-                "identity_expires": 4_700_000_000_000_u64,
+                "identity_expires": 1_800_000_000_000_u64,
             },
         }));
         let header = format!("{live}; {opt_out}; {fallback}");
 
-        let read = provider.read_request_cookies(RequestCookies::new(&header));
+        let read = provider.read_request_cookies(RequestCookies::new(&header).at(NOW));
 
         assert!(
             matches!(read, CookieRead::OptedOut),
@@ -577,13 +584,13 @@ mod tests {
         let token = prebid_cookie(&json!({
             "latestToken": {
                 "advertising_token": "AgAAAAlatesttoken",
-                "identity_expires": 4_700_000_000_000_u64,
+                "identity_expires": 1_800_000_000_000_u64,
             },
         }));
         let opt_out = prebid_cookie(&json!({ "latestToken": "optout" }));
         let header = format!("{token}; {opt_out}");
 
-        let read = provider.read_request_cookies(RequestCookies::new(&header));
+        let read = provider.read_request_cookies(RequestCookies::new(&header).at(NOW));
 
         assert!(
             matches!(read, CookieRead::OptedOut),
@@ -601,7 +608,7 @@ mod tests {
         let live = prebid_cookie(&json!({
             "latestToken": {
                 "advertising_token": "AgAAAAlivetoken",
-                "identity_expires": 4_700_000_000_000_u64,
+                "identity_expires": 1_800_000_000_000_u64,
             },
         }));
         let header = format!("{expired}; {live}");
@@ -627,7 +634,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    provider.read_request_cookies(RequestCookies::new(&header)),
+                    provider.read_request_cookies(RequestCookies::new(&header).at(NOW)),
                     CookieRead::Absent
                 ),
                 "should read nothing from {header:?}"
@@ -658,7 +665,7 @@ mod tests {
         }));
         let own = identity_cookie(&json!({
             "advertising_token": "AgAAAAowntoken",
-            "identity_expires": 4_700_000_000_000_u64,
+            "identity_expires": 1_800_000_000_000_u64,
         }));
 
         let both = read(&*enabled, &format!("example_lockr_uid2=AgAAAAlockr; {own}"));
@@ -713,7 +720,7 @@ mod tests {
         identity_cookie(&json!({
             "advertising_token": "AgAAAAexampletoken",
             "refresh_token": "example-refresh-token",
-            "identity_expires": 4_700_000_000_000_u64,
+            "identity_expires": 1_800_000_000_000_u64,
             "refresh_from": 4_699_990_000_000_u64,
             "refresh_expires": 4_702_000_000_000_u64,
             "refresh_response_key": BASE64.encode([7_u8; 32]),
@@ -725,7 +732,7 @@ mod tests {
         header: &str,
     ) -> Option<(String, ProviderExpiry)> {
         let eids = provider
-            .read_request_cookies(RequestCookies::new(header))
+            .read_request_cookies(RequestCookies::new(header).at(NOW))
             .into_found()
             .expect("should read the token");
         let refresh = eids[0].uids[0].refresh.as_ref()?;
@@ -767,15 +774,15 @@ mod tests {
             AgentType::try_from(3).expect("should build atype"),
             None,
             Some(ProviderId::new("uid2")),
-            Expiry::At(UnixSeconds::new(4_700_000_000)),
+            Expiry::At(UnixSeconds::new(1_800_000_000)),
         )
         .with_refresh(KvRefresh {
             state,
-            from: UnixSeconds::new(4_699_990_000),
+            from: UnixSeconds::new(1_799_990_000),
         });
         let record = KvPartnerId::from_eids(
             vec![KvEid::new(EidFields::default(), vec![uid])],
-            UnixSeconds::new(4_699_995_000),
+            UnixSeconds::new(1_799_995_000),
         )
         .expect("should keep the live uid");
         let mut entry = KvEntry::tombstone(1);
@@ -802,6 +809,7 @@ mod tests {
             current: OwnedEntries::new(Some(&entry), &sources, &owner),
             cookies: RequestCookies::default(),
             hashed_email: None,
+            now: trusted_server_core::ec::eid_types::UnixSeconds::new(1_700_000_000),
         };
 
         let request = refreshing_provider()
@@ -844,6 +852,7 @@ mod tests {
             current: OwnedEntries::new(Some(&entry), &sources, &owner),
             cookies: RequestCookies::default(),
             hashed_email: None,
+            now: trusted_server_core::ec::eid_types::UnixSeconds::new(1_700_000_000),
         };
 
         assert!(
