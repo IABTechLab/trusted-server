@@ -27,12 +27,12 @@
 //! removed. A fetch reply whose `universal_uid` is `0` reports the same
 //! opt-out.
 //!
-//! `gpp_sid` is sent comma-joined, as ID5's own server-side client does.
-//! The client IP goes in `ip` (IPv4) or `ipv6`. The request field names for
-//! the client IP and user agent, and the `o`, `v`, `tml` and `nbPage`
-//! fields (ID5's server-side client sends `provider`, `domain` and `origin`
-//! instead), follow ID5's server-to-server integration and should be
-//! confirmed with ID5 for each partner account.
+//! The request follows ID5's server-side client (its Prebid Server module):
+//! `gpp_sid` is sent comma-joined, the client IP goes in `ip` (IPv4) or
+//! `ipv6`, `provider` names who operates the integration (`provider_name`,
+//! default the publisher domain), `domain` is the publisher domain and
+//! `origin` is `trusted-server`. The field names for the client IP and user
+//! agent should be confirmed with ID5 for each partner account.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -70,6 +70,10 @@ fn request_timestamp(now: UnixSeconds) -> Result<String, Report<ProviderError>> 
         .ok_or_else(|| Report::new(ProviderError::Request).attach("current time is out of range"))
 }
 
+/// Names this integration to ID5 in `origin`, as ID5's Prebid Server module
+/// sends `pbs-java`.
+const INTEGRATION_ORIGIN: &str = "trusted-server";
+
 /// The UID ID5 returns for a visitor who opted out.
 const OPTED_OUT_UID: &str = "0";
 
@@ -92,6 +96,10 @@ pub struct Id5Settings {
     /// yielding a usable UID wins.
     #[serde(default = "Id5Settings::default_cookie_names")]
     pub cookie_names: Vec<String>,
+    /// Who operates this integration, sent to ID5 as `provider`. Defaults
+    /// to the publisher domain.
+    #[serde(default)]
+    pub provider_name: Option<String>,
     /// The Lockr capability; see [`LockrSettings`].
     #[serde(default)]
     pub lockr: LockrSettings,
@@ -109,6 +117,7 @@ pub struct Id5Provider {
     capabilities: ProviderCapabilities,
     url: Url,
     partner_id: u32,
+    provider_name: Option<String>,
     cookies: CookieReader,
 }
 
@@ -159,6 +168,7 @@ impl ProviderKind for Id5 {
             },
             url,
             partner_id: settings.partner_id,
+            provider_name: settings.provider_name,
             cookies: CookieReader::with_lockr::<Self>(
                 common,
                 settings.cookie_names,
@@ -171,10 +181,9 @@ impl ProviderKind for Id5 {
 #[derive(Serialize)]
 struct FetchBody<'a> {
     partner: u32,
-    v: &'static str,
-    o: &'static str,
-    #[serde(rename = "nbPage")]
-    nb_page: u32,
+    provider: &'a str,
+    domain: &'a str,
+    origin: &'static str,
     gdpr: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     gdpr_consent: Option<&'a str>,
@@ -184,7 +193,6 @@ struct FetchBody<'a> {
     gpp_string: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gpp_sid: Option<String>,
-    tml: &'a str,
     ts: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     ua: Option<&'a str>,
@@ -352,15 +360,17 @@ impl IdentityProvider for Id5Provider {
         let routable_ip = lookup.client.ip.filter(|ip| is_routable_ip(*ip));
         let body = FetchBody {
             partner: self.partner_id,
-            v: env!("CARGO_PKG_VERSION"),
-            o: "trusted-server",
-            nb_page: 1,
+            provider: self
+                .provider_name
+                .as_deref()
+                .unwrap_or(lookup.publisher_domain),
+            domain: lookup.publisher_domain,
+            origin: INTEGRATION_ORIGIN,
             gdpr: u8::from(consent.gdpr_applies),
             gdpr_consent: consent.raw_tc_string.as_deref(),
             us_privacy: consent.raw_us_privacy.as_deref(),
             gpp_string: consent.raw_gpp_string.as_deref(),
             gpp_sid: consent.gpp_section_ids.as_deref().map(join_section_ids),
-            tml: &origin,
             ts: request_timestamp(lookup.now)?,
             ua: lookup.client.user_agent,
             ip: routable_ip.filter(IpAddr::is_ipv4).map(|ip| ip.to_string()),
@@ -549,6 +559,21 @@ mod tests {
             "should send the publisher origin"
         );
         assert_eq!(body["partner"], 1234, "should send the partner");
+        assert_eq!(
+            body["provider"], "www.example.com",
+            "should name the publisher as operator by default"
+        );
+        assert_eq!(
+            body["domain"], "www.example.com",
+            "should send the publisher domain"
+        );
+        assert_eq!(
+            body["origin"], "trusted-server",
+            "should name the integration"
+        );
+        for legacy in ["o", "v", "tml", "nbPage"] {
+            assert!(body.get(legacy).is_none(), "should not send `{legacy}`");
+        }
         let ts = body["ts"].as_str().expect("should send a ts string");
         DateTime::parse_from_rfc3339(ts).expect("should send ts as an RFC 3339 timestamp");
         assert_eq!(body["gdpr"], 0, "should send that GDPR does not apply");

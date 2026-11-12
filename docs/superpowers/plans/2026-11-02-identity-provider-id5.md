@@ -14,14 +14,13 @@
 
 - No hashed email and no `pd` field: every source is `SourceInput::Anonymous`.
 - No private provider state, so ID5's `signature` is not sent back.
-- No page URL in `LookupInput`, so `tml` is the publisher origin.
 - Endpoint, sources and the TCF vendor ID come from the common provider config, not hard-coded defaults.
 - The legacy `universal_uid` fallback goes to the first configured source. An opted-out `universal_uid` of `0` is reported as `LookupOutcome::OptedOut`, detected on the reply as sent (not percent-decoded).
 
 ## Request
 
 - `POST <endpoint>/<partner_id>.json`, with `Content-Type: application/json` and `Origin: https://<publisher_domain>`.
-- Body: `partner`, `v`, `o = "trusted-server"`, `nbPage = 1`, `gdpr`, and when present `gdpr_consent`, `us_privacy`, `gpp_string`, `gpp_sid` (comma-joined), `ua`, and `ip` (IPv4) or `ipv6` (only when routable, see `common::is_routable_ip`).
+- Body, following ID5's server-side client (its Prebid Server module): `partner`, `provider` (`provider_name`, default the publisher domain), `domain` (the publisher domain), `origin = "trusted-server"`, `gdpr`, and when present `gdpr_consent`, `us_privacy`, `gpp_string`, `gpp_sid` (comma-joined), `ua`, and `ip` (IPv4) or `ipv6` (only when routable, see `common::is_routable_ip`).
 - Confirm the `ip` and `ua` field names with ID5 for each partner account.
 
 ## Response
