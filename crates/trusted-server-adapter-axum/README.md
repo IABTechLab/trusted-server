@@ -7,10 +7,15 @@ deployment target.
 The crate owns Axum route registration, middleware, and environment-backed
 platform services. Outbound HTTP goes through EdgeZero's Axum client. Its
 route surface follows the shared core contract, but request-time KV operations
-are unavailable and a startup error makes every route, including `/health`,
-return 500. Application configuration reaches the process through the
-documented environment bridge; the local EdgeZero config-store file is not read
-directly.
+are unavailable. A startup error, such as a missing config or secret, stops the
+process with a non-zero exit before it listens. Application configuration
+reaches the process through the documented environment bridge; the local
+EdgeZero config-store file is not read directly.
+
+The listener's ingress limits come from `EDGEZERO__ADAPTER__INGRESS__*`
+environment variables, and an invalid value also stops startup. The
+[Axum development guide](../../docs/guide/axum-dev.md#ingress-limits) lists
+them.
 
 Build and test from the repository root:
 

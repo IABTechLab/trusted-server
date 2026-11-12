@@ -408,8 +408,15 @@ silently ignored. The example TOML above includes that leaf.
 - ✅ `https://origin.publisher.com:8080`
 - ✅ `http://192.168.1.1:9000`
 - ❌ `origin.publisher.com` (missing protocol)
+- ❌ `https://user:secret@origin.example.com` (userinfo)
 
 **Port Handling**: Includes port if non-standard (not 80/443).
+
+**Userinfo**: `ts config validate` and `ts config push` reject an `origin_url`
+with a username or password, and the error does not echo the URL. A live
+config that still has one answers every publisher request with 400, because
+the origin request cannot carry userinfo. Send origin credentials in a header
+instead.
 
 #### `public_origin` {#public_origin}
 
@@ -501,6 +508,10 @@ connecting to the host in `origin_url`.
 
 **Default**: When omitted, Trusted Server sends the host from `origin_url`.
 
+**Spin**: EdgeZero's Spin client cannot send a `Host` that differs from the
+connection target, so Spin ignores this setting and logs a warning at settings
+load. Fastly, Axum, and Cloudflare send it.
+
 #### `proxy_secret`
 
 **Purpose**: Secret-store key name for the HMAC-SHA256 value used to sign proxy URLs.
@@ -558,7 +569,7 @@ a cooperative timer that can cancel yielding callbacks. Fastly has no timer: cor
 checks the budget only before and after each callback, so an integration that does
 not bound its own blocking host calls can hold the response past this value.
 Opted-in processed HTML bypasses shared-template caching and uses private/no-store
-policy; raw-origin readthrough remains separate. Opted-in HTML with 206 or any
+policy. Opted-in HTML with 206 or any
 `Content-Range` bypasses rewriting and EOF work while preserving encoded bytes and
 range/framing metadata. Full error HTML remains eligible and exposes actual status.
 See [Asynchronous HTML processor completion](/guide/integration-guide#asynchronous-html-processor-completion).
@@ -972,8 +983,22 @@ Edit TOML, validate, and push again for those changes.
 - Debugging identifiers
 - CORS headers (if needed)
 
+**Rejected names**: Response egress owns message framing, so these ten names
+cannot be set here: `Trailer`, `Content-Length`, and the hop-by-hop fields
+`Connection`, `Keep-Alive`, `TE`, `Transfer-Encoding`, `Upgrade`,
+`Proxy-Connection`, `Proxy-Authenticate`, and `Proxy-Authorization`. Names
+match case-insensitively. `ts config validate` and `ts config push` reject an
+entry with any of them. A live config that predates the rule keeps loading, and
+each response skips such an entry with a warning that names it.
+
+Because the `Connection` entry is skipped, egress never sees its value, so a
+field that value names still reaches the client. For example, an operator
+`X-Example` entry stays on the response even when the skipped `Connection`
+entry names `X-Example`.
+
 ::: warning Header Precedence
-Custom headers may be overwritten by application logic. Standard headers (`Content-Type`, `Content-Length`) are controlled by the application.
+Custom headers may be overwritten by application logic. `Content-Type` is
+controlled by the application.
 :::
 
 ### Origin URLs in proxied response headers
@@ -1281,9 +1306,9 @@ include_domains = ["assets.example.com", "*.img.example.com"]
 
 **Environment Override**:
 
-EdgeZero v0.0.4 cannot replace these arrays or address their elements by index.
-Edit `exclude_domains` and `include_domains` in TOML, then validate and push the
-file again.
+The pinned EdgeZero loader cannot replace these arrays or address their elements
+by index. Edit `exclude_domains` and `include_domains` in TOML, then validate and
+push the file again.
 
 ### Pattern Matching
 
@@ -1398,7 +1423,7 @@ Controls first-party proxy security settings and path-based asset routes.
 | Field               | Type          | Required             | Description                                                 |
 | ------------------- | ------------- | -------------------- | ----------------------------------------------------------- |
 | `allowed_domains`   | Array[String] | No (default: `[]`)   | Hosts permitted for signing, initial fetches, and redirects |
-| `certificate_check` | Boolean       | No (default: `true`) | Verify TLS certificates when proxying HTTPS origins         |
+| `certificate_check` | Boolean       | No (default: `true`) | Must be `true`; origin TLS is always verified               |
 | `asset_routes`      | Array[Table]  | No (default: `[]`)   | Path prefixes proxied directly to configured origins        |
 
 **Example**:
@@ -1413,8 +1438,8 @@ allowed_domains = [
 
 **Environment Override**:
 
-EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
-`allowed_domains` in TOML, then validate and push the file again.
+The pinned EdgeZero loader cannot replace this array or address its elements by
+index. Edit `allowed_domains` in TOML, then validate and push the file again.
 
 ### Field Details
 
@@ -1456,11 +1481,16 @@ See [First-Party Proxy](/guide/first-party-proxy#proxy-allowlist) for usage deta
 
 #### `certificate_check`
 
-**Purpose**: Control TLS certificate verification for HTTPS proxy and asset-route origins.
+**Purpose**: None to configure. Every adapter always verifies origin TLS.
 
 **Default**: `true`
 
-Set this to `false` only for local development with self-signed certificates.
+`ts config validate` and `ts config push` reject `certificate_check = false`. A
+live config that still sets it keeps loading: settings load logs a warning,
+ignores the setting, and origin TLS stays verified. Remove the setting before
+the next push. An origin whose certificate fails verification fails the
+request with the route's 502. For local development, serve the origin over
+plain HTTP instead of with a self-signed certificate.
 
 ### `[[proxy.asset_routes]]`
 
@@ -2383,7 +2413,8 @@ inventory, debug, and creative controls to the `aps` `profile_config`.
 
 Only bidder codes listed in `[auction.bidders]` are folded into Trusted Server
 requests. Unlisted publisher bids remain native browser demand. All provider
-endpoints must be absolute HTTPS URLs.
+endpoints must be absolute HTTPS URLs, except plain HTTP to `127.0.0.1` or
+`[::1]` for a local test bidder.
 
 The old and new blobs are mutually incompatible. Activate the new binary and
 map-shaped config together. A binary-first or config-first rolling deployment
@@ -2391,8 +2422,8 @@ will put one version on a schema it rejects. Roll back by restoring the old
 binary and old-schema blob together.
 :::
 
-Each table name is the provider ID used for configuration, backend correlation,
-health, response metadata, and telemetry. Provider IDs must match
+Each table name is the provider ID used for configuration, health, response
+metadata, and telemetry. Provider IDs must match
 `^[a-z][a-z0-9-]{0,62}$`. Multiple instances may select the same profile and
 endpoint because the provider ID remains their distinct runtime identity.
 
@@ -2451,6 +2482,9 @@ timeout_ms = 500
 | `routing`        | No       | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles            |
 | `profile_config` | No       | `{}`            | Typed object owned by the selected profile                    |
 | `notifications`  | No       | No suppression  | Common `nurl`/`burl` suppression after response normalization |
+
+A local test bidder's `endpoint` may instead be plain HTTP to `127.0.0.1` or
+`[::1]`.
 
 ### Profile configuration
 
@@ -2518,36 +2552,28 @@ UTF-8 bytes and without ASCII control characters.
 `ts config validate` and ordinary deploy validation compile the complete
 target-independent plan: profiles and defaults, routes, endpoint ownership,
 extension bounds, notifications, signing structure, and mediator selection.
-Target-specific checks are deferred to adapter startup. Startup uses the same
-compiled plan and additionally validates backend-name prediction/collisions and
-provider fan-out capability.
+Every adapter startup compiles the same plan, and every adapter runs
+multi-provider auctions.
 
-Fastly and Axum support multiple configured providers. Cloudflare and Spin
-currently reject an enabled auction with more than one provider because those
-adapters do not support concurrent provider fan-out. Disabled auctions may keep
-dormant multi-provider maps without target rejection.
-
-A target-aware pre-write `ts config push --adapter <target>` callback is **not
-available in this tree** because the required EdgeZero callback is not yet
-available. Until it lands, push performs target-independent validation and
-adapter startup is the mandatory target-aware gate. Do not treat a successful
-push as proof that a Cloudflare or Spin multi-provider plan can start.
+Fastly startup adds one target check. An enabled plan may need at most 160
+Fastly backend configurations, counted as distinct tuples of provider scheme,
+host, port, and timeout; Fastly keeps the other 40 of its 200 dynamic backends
+for non-auction traffic. Config validation and push do not run this check, so
+Fastly startup is where it applies. Disabled auctions skip it.
 
 ### Deadline behavior
 
-Auction response collection waits only until an absolute deadline measured from
-dispatch, including headers and complete response bodies. One nonblocking snapshot
-retains complete available responses after a slow origin; unfinished providers
-become timeouts and mediation cannot start with an exhausted budget. Backend
-timeout rounding does not extend network waiting.
-Provider bids that are already complete at the final nonblocking snapshot remain
-eligible even after `tmax`; mediation starts only with remaining budget and
-rejects responses collected after its cutoff.
+All bidder requests leave together as one EdgeZero request batch whose cutoff
+is the auction deadline, measured from auction start. A bid that has not
+arrived by the cutoff becomes a provider timeout, and mediation cannot start
+with an exhausted budget. Each bidder request carries its provider timeout as a
+total timeout, and the cutoff bounds it by the remaining budget.
 
-Fastly abandons pending requests; Axum, Cloudflare, and Spin cancel outstanding
-operations where supported. Local processing and delivery can finish after the
-network cutoff. See [Timeout behavior](/guide/auction-orchestration#timeout-behavior)
-for runtime semantics and limitations.
+Dropping the batch cancels in-flight bidder and mediator requests on every
+adapter; Fastly host cancellation is best effort. Local processing and delivery
+can finish after the network cutoff. See
+[Timeout behavior](/guide/auction-orchestration#timeout-behavior) for runtime
+semantics and limitations.
 
 Creative sanitization is opt-in. `sanitize_creatives = true` strips executable
 markup before delivery. `rewrite_creatives = false` leaves asset URLs
@@ -2891,9 +2917,7 @@ Rollback must preserve configuration compatibility:
    services (`localhost`, `127.0.0.1`, or `::1`). The admin endpoint
    `POST /_ts/admin/cache/purge` is the same operation for a CMS webhook. Either clears
    the `ts-template` surrogate key; waiting out the bounded origin-derived lifetime also
-   works. With readthrough caching enabled, `--all` also purges tagged origin
-   documents, so the next requests refetch those documents from the origin. Check
-   whether the origin can absorb that load before purging during a traffic peak.
+   works.
 
 Run `scripts/template-cache-local-test.sh esi` before a rollout and
 `scripts/template-cache-local-test.sh inline` as its control. The harness uses a temporary
@@ -2905,164 +2929,17 @@ versus empty buckets, ignored compact JSON and comma-list cookies, and session
 bypass on warm and cold URLs. Each request checks the selected HTML, cache
 diagnostics, private response policy, winning-bid assembly, and origin fetch count.
 
-### Origin readthrough caching
+### Origin readthrough
 
-`origin_readthrough_enabled` controls a **different cache** from everything above.
-The template cache stores Trusted Server's own transformed HTML. Readthrough is the
-platform's own cache sitting in front of the publisher origin, and it stores the
-origin's bytes.
+Origin readthrough is unavailable. `ts config validate` and `ts config push`
+reject `origin_readthrough_enabled = true`. A live config that still sets it
+keeps loading: settings load logs a warning and treats it as `false`. Remove
+the setting before the next push.
 
-```toml
-[creative_opportunities]
-# Default false. Enable only after `ts origin probe-shareability` passes on every
-# axis and every verdict.
-origin_readthrough_enabled = true
-```
-
-Left at the default, the existing caching policy is preserved: ad-serving requests
-bypass the origin cache, while other publisher requests (including ordinary assets)
-keep the platform's default caching behavior. Setting it to `true` applies request
-shareability instead: eligible ad-serving requests can use the cache, while
-ineligible non-ad requests bypass it. Eligible requests are `GET`s with a `Host`,
-no disqualifying authorization or cookie, and no remaining conditional or range
-semantics.
-
-**Document requests only.** The gate answers a question about pages — whether the
-origin's HTML may be shared between readers — so it applies to document requests
-(`Sec-Fetch-Dest: document` and equivalents, or a navigation when that header is
-absent). Subresources keep the platform default whether the flag is on or off.
-Judging them on shareability would bypass the edge cache for every cookie-bearing
-or conditional asset request, which is most repeat-visitor asset traffic, and would
-tag every cached asset with `ts-template`, turning the template rollback purge into
-an origin-wide asset flush.
-
-#### This cache has far weaker guarantees than the template cache
-
-Read this before enabling it. The template cache refuses storage on inspection of
-the origin's _response_ — `Set-Cookie`, a CSP nonce, missing positive freshness, an
-uncovered `Vary`, and the rest of the list above. **Readthrough has none of those
-refusals**, and cannot: the decision is made before the origin replies, and no
-post-response hook is reachable on the Fastly adapter.
-
-What that means concretely, for each refusal the template cache performs:
-
-| Template-cache refusal      | Covered on readthrough?                           |
-| --------------------------- | ------------------------------------------------- |
-| No positive freshness       | **No** — probe verdict only                       |
-| Origin `Set-Cookie`         | **No** — probe verdict only                       |
-| Response CSP nonce          | **No** — probe verdict only                       |
-| Origin marks it unshareable | Yes — the platform honours `private` / `no-store` |
-| Non-`200` status            | Yes — the platform honours status                 |
-| Uncovered `Vary`            | Yes — the platform keys on the origin's `Vary`    |
-| Not HTML                    | Not applicable; readthrough caches per origin     |
-
-Every row marked **No** is an accepted risk carried by the operator, not by the
-code. An origin that personalises HTML without saying so in its headers can
-cross-serve one reader's page to another, including session fixation through a
-cached `Set-Cookie`. That last case is the sharpest: readthrough admits requests
-carrying _no_ cookie, which is exactly the first-time visitor an origin issues a
-session cookie to.
-
-`origin_is_cookie_independent = true` also widens this gate: cookie-bearing
-requests with unlisted cookies can become readthrough-eligible. Named bypass
-cookies and malformed cookie policies still refuse admission. Configuring any
-`template_cache_key_cookies` disables readthrough, even when those cookies are
-absent: the platform cache does not include their variant values in its key.
-The template cache continues to separate those variants. On the template cache,
-an origin's `Vary: Cookie` still overrides the independence assertion. On readthrough there is no such
-response-side guard. Setting both flags is the highest-risk configuration and
-requires a cookie-axis probe pass specifically.
-
-#### You cannot verify this locally
-
-Viceroy does not implement the readthrough cache. Measured with the gate enabled, the
-request judged shareable, and a stub origin answering `Cache-Control: public, max-age=60`
-with no `Set-Cookie`, two identical navigations still produced two origin fetches. The
-local harness can therefore show the _decision_ this gate makes, and never its effect.
-
-The first evidence either way comes from a deployed service. Treat any local timing as
-saying nothing about this setting.
-
-#### Enablement
-
-1. Run `ts origin probe-shareability --url <representative URLs>`. Publisher cookies a
-   real reader carries go in `TRUSTED_SERVER_PROBE_COOKIES` as one cookie header value
-   (`name=value; name=value`), and a bot-wall admission cookie in
-   `TRUSTED_SERVER_PROBE_ADMISSION_COOKIE`. Both are environment-only, never flags:
-   these are credentials, and an argument is visible to every process on the host
-   through `ps` and lands in shell history. Each `--url` must be HTTPS; plain HTTP is
-   accepted only for a loopback development origin. Admission-cookie runs are
-   diagnostic only: every request carries that cookie, so cookieless responses remain
-   untested and the safety gate fails. Rerun against the origin without it before
-   enabling caching.
-2. **Every axis and every verdict must pass.** Do not enable on a partial pass.
-   The probe checks status and safety headers on every sampled response, including
-   repeats. Each axis compares what a cache would store — the body **and** the policy
-   headers replayed with it, such as `Content-Security-Policy` — so an origin that
-   serves one document under two policies fails just as a varying document does.
-   Crawler user agents and prefetch requests are their own axes: neither
-   classification blocks readthrough, so an origin that answers a bot or a prefetch
-   with a different document without declaring `Vary` would otherwise have that
-   document cross-served to a reader. Any `Age` header, including `Age: 0`, blocks the verdict because a
-   fresh cached response can hide origin personalization. Pass `--vary-header <name>=<value>`
-   for each representative value of an additional request header, for example
-   `--vary-header x-exp-variant=A --vary-header x-exp-variant=B`. Each value is compared
-   against the absent baseline and the other supplied values, both with and without RSC.
-   Bare `--vary-header <name>` samples `1` for compatibility; it cannot establish safety
-   for categorical values the origin actually uses. Supply every relevant variant.
-   A declared `Vary` can explain a user-agent, RSC,
-   or custom-header difference only when every response declares it. Cookie
-   differences and different decoded gzip/identity documents always fail, because
-   the template cache requires those representations to be identical.
-   Navigation samples send HTML `Accept` and navigation Fetch Metadata and must
-   return `text/html`. RSC uses an explicit same-origin fetch profile, permitting
-   HTML fallback or `text/x-component`. A separate fetch control keeps `RSC`
-   variation independent of `Accept` and Fetch Metadata changes. If navigation
-   and fetch controls differ, all changed profile headers must be declared in
-   `Vary`; this conservative check cannot attribute a combined-profile difference
-   to one header. `Vary: *`, revalidation directives, and unreadable safety headers
-   always fail.
-   The probe is the only response-safety control on the readthrough path.
-3. Read the probe's stated limits. It runs from one client address, so
-   personalisation keyed on the reader's IP — geo, rate class — is invisible to
-   it, as are `Accept-Language` and client-hint variants it does not vary.
-4. Set `origin_readthrough_enabled = true` and push the configuration.
-5. Watch the `origin_cache_shareable` breakdown in publisher summary telemetry.
-   Its denominator is matching-slot candidates, including skipped auctions; it
-   does not measure every publisher origin fetch or a site-wide admission rate.
-   See the [telemetry population and query](https://github.com/IABTechLab/trusted-server/blob/main/tinybird/README.md#the-denominator-is-matching-slot-candidates-not-all-requests).
-   The predicate estimates eligibility in that population before or after enablement,
-   not actual cache hits.
-6. Confirm the origin's own hit rate and page correctness before widening to more
-   URLs.
-
-#### Rollback
-
-1. Set `origin_readthrough_enabled = false` and push. This takes effect on the
-   next request with no deploy and restores the previous policy: ad-serving
-   requests bypass, while non-ad traffic keeps the platform default. It does not
-   disable origin caching globally.
-2. Purge tagged objects with `ts cache purge --service <https-service-url> --all`,
-   or `--page <reader-url>` for one exact reader-facing URL. Both the template cache
-   and opted-in origin readthrough objects carry the page key and `ts-template`
-   purge-all key. The readthrough tags use the original reader URL, before origin
-   rewriting, and work in both inline and ESI assembly modes.
-3. Objects stored by older versions without readthrough tags remain unreachable
-   through these purge keys and must expire on the origin's TTL. Changing the
-   origin's TTL does not shorten an already-cached object's lifetime.
-4. **Use `--all` on multi-host or dual-scheme deployments.** The template cache keys
-   on scheme and host, so purging each spelling you serve covers it. Readthrough does
-   not line up the same way: reader URLs that rewrite to one origin URL — `http://`
-   and `https://`, or `www.` and the apex on one service — share a single stored
-   object, tagged with the reader URL of whichever request filled it first. A
-   `--page https://example.com/a` can therefore leave an `http://`-tagged object in
-   place, and the next template miss refetches through it and re-stores the stale page
-   into the freshly purged template cache. If you serve one page under more than one
-   reader-facing spelling, purge with `--all`.
-
-The Fastly SDK attaches these tags to cached objects; production hit and purge
-behavior still requires validation on a deployed service, since Viceroy does not
-implement readthrough caching.
+Publisher origin requests keep the default policy. Ad-serving requests bypass
+the platform's origin cache, and other publisher requests, ordinary assets
+included, keep the platform's default caching. The template cache above is
+unaffected.
 
 ### `gam_unit_path` templating
 
@@ -3194,9 +3071,9 @@ inject_adm_for_testing = false
 
 ## Fastly Runtime Config Store
 
-After the EdgeZero cutover, the Fastly adapter always dispatches through the
-EdgeZero entry point. The former `edgezero_enabled` and `edgezero_rollout_pct`
-canary keys are no longer read.
+The Fastly adapter serves every request through EdgeZero's canonical Fastly
+lifecycle. The former `edgezero_enabled` and `edgezero_rollout_pct` canary keys
+are no longer read.
 
 `[stores.config].default` in `edgezero.toml` supplies the logical config store
 ID, currently `trusted_server_config`. The Fastly runtime opens the store by
@@ -3278,7 +3155,7 @@ Configuration is validated at startup:
 **Error Format**:
 
 ```
-Configuration error: provider `pbs-main` endpoint must be an absolute HTTPS URL
+Configuration error: provider `pbs-main` endpoint must be absolute HTTPS, or plain HTTP to 127.0.0.1 or [::1], with a host and no credentials or fragment
 ```
 
 ## Best Practices
