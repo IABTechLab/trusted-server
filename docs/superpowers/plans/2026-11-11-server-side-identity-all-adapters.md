@@ -27,8 +27,12 @@ IABTechLab/edgezero.
   and Axum ship without Cloudflare or Spin: no Fastly or Axum item is blocked
   by a Cloudflare or Spin item, and Cloudflare and Spin work has its own tickets.
   A Fastly or Axum ticket may still make Cloudflare and Spin reject identity
-  configuration, answer 501 or report a capability as absent (T1, T6,
-  IABTechLab/edgezero#283), because that needs no Cloudflare or Spin work.
+  configuration, answer 501, report a capability as absent or mount the shared
+  app (T1, T6, T21, IABTechLab/edgezero#283), because that needs no Cloudflare
+  or Spin work.
+- Every feature is built once in core and works on every adapter in DEC-4's
+  order (DEC-16, SH-5). A capability an adapter lacks becomes an EdgeZero ask;
+  no ticket adds identity code to one adapter crate.
 - Only issues move, and they move under the new epics: #1558 for Trusted
   Server and IABTechLab/edgezero#468 for EdgeZero. Existing epics (#1236,
   #1505, IABTechLab/trusted-server#90, IABTechLab/edgezero#88,
@@ -75,24 +79,30 @@ IABTechLab/edgezero.
 
 Trusted Server:
 
-| PR                    | Head        | Base on GitHub | Fix                                                                                                                  |
-| --------------------- | ----------- | -------------- | -------------------------------------------------------------------------------------------------------------------- |
-| #1557                 | `76e1dd5f6` | main           | None                                                                                                                 |
-| #1525                 | `cd8977cad` | main           | None; #1526 does not need it                                                                                         |
-| #1526                 | `e529e5576` | #1525's branch | Retarget to main; its own diff applies cleanly there                                                                 |
-| #1516                 | `214cd4821` | main           | None                                                                                                                 |
-| #1503                 | `5e10c24e4` | main           | None; needs neither #1506 nor new EdgeZero                                                                           |
-| #1449                 | `fd33f2c74` | main           | None; needs neither #1506 nor new EdgeZero                                                                           |
-| #1506                 | `ba5790b8a` | main           | Rebase after #1557, #1526 and #1516                                                                                  |
-| #1487                 | `1600781eb` | main           | Rebase after #1526 and #1506                                                                                         |
-| #1488                 | `7f55776f3` | #1487's branch | None                                                                                                                 |
-| #1489                 | `d3780ba13` | #1488's branch | None                                                                                                                 |
-| #1527                 | `a020daeec` | #1526's branch | Close once #1506 covers its tests (DEC-1)                                                                            |
-| #1528                 | `ea779fb47` | #1527's branch | Port its two commits onto #1506's outbound API; they modify #1527-only `platform/outbound.rs`; repin off `456313675` |
-| #1543                 | `e5e6ea7fa` | #1449's branch | None; ships with A6                                                                                                  |
-| #1424                 | `2423a2ed2` | main           | Conflicting, head `rc/edgezero-431-demo`; close at parity                                                            |
-| #1499                 | `084fdbba9` | #1424's branch | Close at parity                                                                                                      |
-| #1541, #1531 to #1540 | various     | RC baselines   | Forward-port to main as new PRs; close each as its port lands                                                        |
+| PR                  | Head                                  | Base on GitHub                        | Fix                                                                                                                                                               |
+| ------------------- | ------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #1557               | `76e1dd5f6`                           | main                                  | None                                                                                                                                                              |
+| #1525               | `cd8977cad`                           | main                                  | None; #1526 does not need it                                                                                                                                      |
+| #1526               | `e529e5576`                           | #1525's branch                        | Retarget to main; its own diff applies cleanly there                                                                                                              |
+| #1516               | `214cd4821`                           | main                                  | None                                                                                                                                                              |
+| #1503               | `5e10c24e4`                           | main                                  | None; needs neither #1506 nor new EdgeZero                                                                                                                        |
+| #1449               | `fd33f2c74`                           | main                                  | None; needs neither #1506 nor new EdgeZero                                                                                                                        |
+| #1506               | `6c39a56a1`                           | main                                  | Rebase after #1557, #1526 and #1516; clear CodeQL alert 283                                                                                                       |
+| #1487               | `1600781eb`                           | main                                  | Rebase after #1526 and #1506: 8 and 17 files conflict                                                                                                             |
+| #1488               | `7f55776f3`                           | #1487's branch                        | Take #1566's two #1488 commits                                                                                                                                    |
+| #1489               | `d3780ba13`                           | #1488's branch                        | None                                                                                                                                                              |
+| #1566               | `117a58e0e`                           | #1488's branch                        | Move its two #1488 commits down; rebuild the Axum part on T21 and EdgeZero (Part C). 1 file conflicts with #1489, 19 with #1506                                   |
+| #1527               | `a020daeec`                           | #1526's branch                        | Close once #1506 covers its tests (DEC-1)                                                                                                                         |
+| #1528               | `ea779fb47`                           | #1527's branch                        | Close once #1531 carries A1                                                                                                                                       |
+| #1543               | `e5e6ea7fa`                           | #1449's branch                        | None; ships with A6                                                                                                                                               |
+| #1424               | `2423a2ed2`                           | main                                  | Conflicting, head `rc/edgezero-431-demo`; close at parity                                                                                                         |
+| #1499               | `084fdbba9`                           | #1424's branch                        | Close at parity                                                                                                                                                   |
+| #1531               | `88a6ba596`                           | #1506's branch                        | Retargeted without a rebase: it forks from main with its own cutover and the RC tag pin, and 13 files conflict with #1506. Rebase onto #1506; it then delivers A1 |
+| #1532               | `852b875fe`                           | #1531's branch                        | Delivers #1529 (A4); restack after #1531                                                                                                                          |
+| #1533, #1534        | `82d9a0e66`, `646c39a34`              | #1532's and #1533's branches          | RC-baseline copies of #1525 and #1526: drop from the chain and close                                                                                              |
+| #1536, #1535, #1537 | `296e05405`, `0666a9b4b`, `4a838272c` | #1534's, #1536's and #1535's branches | Restack on #1532. #1536 and #1537 feed A2 without their Axum-only stores; #1535 has no ticket                                                                     |
+| #1539, #1538, #1540 | `8d41cb06c`, `3111c2456`, `eb6e19ef4` | #1537's, #1539's and #1538's branches | Restack on #1532: they share no files with #1533 to #1537, so A6 and A7 stop waiting on A2                                                                        |
+| #1541               | `7dd2e3056`                           | main                                  | Close at parity                                                                                                                                                   |
 
 EdgeZero:
 
@@ -106,7 +116,8 @@ EdgeZero:
 | IABTechLab/edgezero#453                                                                                                                              | `633f0552` | IABTechLab/edgezero#439's branch | Rebase off its stale base                                                                                                 |
 | IABTechLab/edgezero#389, IABTechLab/edgezero#401, IABTechLab/edgezero#444, IABTechLab/edgezero#452                                                   | various    | main                             | Land after IABTechLab/edgezero#275 merges; they conflict with it in 7, 6, 4 and 4 files                                   |
 | IABTechLab/edgezero#466                                                                                                                              | `cb48c6b3` | main                             | Land after IABTechLab/edgezero#444; they conflict in `edgezero-cli` `config.rs` and `lib.rs`                              |
-| IABTechLab/edgezero#287                                                                                                                              | `d590f0eb` | main                             | Last; shares 52 files with IABTechLab/edgezero#275, 27 of them under `crates/`                                            |
+| IABTechLab/edgezero#469                                                                                                                              | `1d5bf2ff` | main                             | JA4 interface design for IABTechLab/edgezero#283; draft                                                                   |
+| IABTechLab/edgezero#287                                                                                                                              | `ce25ef5a` | main                             | Last; shares 52 files with IABTechLab/edgezero#275, 27 of them under `crates/`                                            |
 
 ### Waves
 
@@ -134,6 +145,7 @@ issue under its epic), PR fix (changes the PR needs), Merge, Release, Close.
 | 2    | IABTechLab/edgezero#406 to IABTechLab/edgezero#439; IABTechLab/edgezero#397, IABTechLab/edgezero#410, IABTechLab/edgezero#437, IABTechLab/edgezero#432 | P1  | PR fix, Merge    | Resolve reviews, retarget to main, merge in order; delivers IABTechLab/edgezero#397, IABTechLab/edgezero#410, IABTechLab/edgezero#437 and IABTechLab/edgezero#432 | IABTechLab/edgezero#275                                                                      |
 | 2    | EZ EZI-2a, EZI-3, EZI-5                                                                                                                                | P1  | New              | Record contract with Fastly; ClientInfo contract; rate limiter for Fastly and Axum                                                                                | IABTechLab/edgezero#275                                                                      |
 | 2    | TS T5                                                                                                                                                  | P1  | New              | Conformance suite for Fastly and Axum                                                                                                                             | #1507                                                                                        |
+| 2    | TS T21                                                                                                                                                 | P1  | New              | One identity app in core for every adapter                                                                                                                        | T1, #1507                                                                                    |
 | 2    | TS T4, #1192                                                                                                                                           | P2  | New, Move        | Shared state once per process: Axum (T4) and Fastly (#1192)                                                                                                       | #1507                                                                                        |
 | 2    | TS #1556                                                                                                                                               | P2  | Move             | Regression test that identity backends verify certificates, then close                                                                                            | #1507                                                                                        |
 | 2    | IABTechLab/edgezero#389, IABTechLab/edgezero#401, IABTechLab/edgezero#444, IABTechLab/edgezero#452, then IABTechLab/edgezero#466                       | P2  | PR fix           | Rebase onto main and redo the RC-only merges                                                                                                                      | IABTechLab/edgezero#275 (IABTechLab/edgezero#466 also IABTechLab/edgezero#444)               |
@@ -146,35 +158,35 @@ issue under its epic), PR fix (changes the PR needs), Merge, Release, Close.
 | 4    | TS #1489                                                                                                                                               | P1  | PR fix, Merge    | Cap mirrored-ID expiry                                                                                                                                            | #1488                                                                                        |
 | 4    | EZ EZI-2b                                                                                                                                              | P1  | New              | DynamoDB and celld providers                                                                                                                                      | EZI-2a, IABTechLab/edgezero#463, IABTechLab/edgezero#414                                     |
 | 4    | EZ R2                                                                                                                                                  | P1  | Release          | Fastly and Axum parts of EZI-1, EZI-3 and EZI-5                                                                                                                   | EZI-1, EZI-3, EZI-5, IABTechLab/edgezero#90, IABTechLab/edgezero#92, IABTechLab/edgezero#283 |
-| 4    | TS A1                                                                                                                                                  | P1  | New, PR fix      | Port #1528, repin to R1                                                                                                                                           | R1, #1507; DEC-5, DEC-6                                                                      |
+| 4    | TS A1                                                                                                                                                  | P1  | New, PR fix      | Rebase #1531 onto #1506, repin to R1; #1528 closes                                                                                                                | R1, #1507; DEC-5, DEC-6                                                                      |
 | 4    | TS T3                                                                                                                                                  | P1  | New              | SharedID cleanup                                                                                                                                                  | PR #1488                                                                                     |
 | 4    | TS #1555                                                                                                                                               | P2  | Move             | Opt-out EIDs                                                                                                                                                      | PR #1488                                                                                     |
 | 4    | TS #1310, IABTechLab/trusted-server#90, IABTechLab/trusted-server#353                                                                                  | P2  | Close            | Superseded by #1488's ID5 provider                                                                                                                                | #1488 merged                                                                                 |
 | 5    | EZ R1b                                                                                                                                                 | P1  | Release          | EZI-2a and EZI-2b                                                                                                                                                 | EZI-2a, EZI-2b                                                                               |
-| 5    | TS #1529 (A4), A6 with #1543, A3                                                                                                                       | P1  | Move, New        | CloudFront IP and geo; production image; SIGTERM drain                                                                                                            | A1 (A3 also R2; A6 also PR #1449)                                                            |
+| 5    | TS #1529 (A4), A6 with #1543, A3                                                                                                                       | P1  | Move, New        | CloudFront IP and geo via #1532; production image via #1539 and #1538; SIGTERM drain                                                                              | A1 (A3 also R2; A6 also PR #1449)                                                            |
 | 5    | TS T2                                                                                                                                                  | P1  | New              | EIDs in `user.eids`; after the provider stack, so open PRs need no test churn                                                                                     | #1489 merged                                                                                 |
-| 5    | TS T10, T12, T13                                                                                                                                       | P1  | New              | Rate limits on Fastly and Axum; abuse protection and SharedID write-back on Fastly                                                                                | R2; DEC-15 (T10); T3, PR #1488, DEC-7 (T13)                                                  |
+| 5    | TS T10, T12, T13                                                                                                                                       | P1  | New              | Rate limits on Fastly and Axum; abuse protection and SharedID write-back in the shared app                                                                        | R2, T21; DEC-15 (T10); T3, PR #1488, DEC-7 (T13)                                             |
 | 5    | TS T15                                                                                                                                                 | P1  | New              | Identity-only tsjs                                                                                                                                                | PR #1489                                                                                     |
 | 5    | TS A9, #1141                                                                                                                                           | P2  | New, Move        | `TRUSTED_SERVER__` guard; local config handoff                                                                                                                    | A1                                                                                           |
 | 5    | TS #1551                                                                                                                                               | P2  | Move             | Pull sync on a full row                                                                                                                                           | PR #1489                                                                                     |
-| 5    | TS #1527, #1523                                                                                                                                        | P2  | Close            | Tests moved to #1506                                                                                                                                              | #1506, A1                                                                                    |
+| 5    | TS #1527, #1528, #1523, #1533, #1534                                                                                                                   | P2  | Close            | Tests moved to #1506; A1 on #1531; RC copies of #1525 and #1526                                                                                                   | #1506, A1                                                                                    |
 | 6    | TS T6                                                                                                                                                  | P1  | New              | Shared record backend, Fastly first                                                                                                                               | R1b, #1522                                                                                   |
-| 6    | TS T11                                                                                                                                                 | P1  | New              | Providers awaited before finalization on Fastly                                                                                                                   | T10, R2, PR #1487                                                                            |
-| 6    | TS A7                                                                                                                                                  | P1  | New              | Reference infrastructure                                                                                                                                          | A1, A6, #1529; DEC-6, DEC-15                                                                 |
-| 7    | TS A2                                                                                                                                                  | P1  | New              | Axum EC lifecycle                                                                                                                                                 | T5, T6, A1, #1529; DEC-6                                                                     |
-| 7    | TS T19                                                                                                                                                 | P1  | New              | EC route on Fastly: mint and write back on a same-origin call; pixel and JSON responses                                                                           | T10, T11, T12, T13                                                                           |
-| 8    | TS A10, T7, A8                                                                                                                                         | P1  | New              | Axum providers, abuse protection and SharedID write-back; Axum partner APIs; SIGTERM test in CI                                                                   | A2 plus their Part B blockers                                                                |
+| 6    | TS T11                                                                                                                                                 | P1  | New              | Providers awaited before finalization in the shared app                                                                                                           | T10, T21, R2, PR #1487                                                                       |
+| 6    | TS A7                                                                                                                                                  | P1  | New              | Reference infrastructure via #1540                                                                                                                                | A1, A6, #1529; DEC-6, DEC-15                                                                 |
+| 7    | TS A2                                                                                                                                                  | P1  | New              | Identity on Axum through the shared app, from #1536 and #1537                                                                                                     | T5, T6, T21, A1, #1529; DEC-6                                                                |
+| 7    | TS T19                                                                                                                                                 | P1  | New              | EC route in the shared app: mint and write back on a same-origin call; pixel and JSON responses                                                                   | T10, T11, T12, T13, T21                                                                      |
+| 8    | TS A10, A8                                                                                                                                             | P1  | New              | Identity features pass on Axum; SIGTERM test in CI                                                                                                                | A2 plus their Part B blockers                                                                |
 | 8    | TS T20                                                                                                                                                 | P1  | New              | Injected script calls the EC route on consent and merges the IDs into Prebid                                                                                      | T15, T19                                                                                     |
-| 8    | TS #1541, #1424, #1499, #1531 to #1540                                                                                                                 | P2  | Close            | The RC line is on main                                                                                                                                            | A1, A2, A4, A6, A7                                                                           |
-| 9    | TS A5, A11, T14                                                                                                                                        | P1  | New              | Load test; EC route on Axum; mirror cookie on Axum                                                                                                                | A2, A7, A10 (A11 also T19; T14 also PR #1489, DEC-10)                                        |
+| 8    | TS #1541, #1424, #1499                                                                                                                                 | P2  | Close            | The RC line is on main                                                                                                                                            | A1, A2, A4, A6, A7                                                                           |
+| 9    | TS A5                                                                                                                                                  | P1  | New              | Load test                                                                                                                                                         | A2, A7, A10                                                                                  |
 | 10   | EZ EZI-1c, EZI-2c, EZI-4c, EZI-5c; IABTechLab/edgezero#91                                                                                              | P2  | New, Move        | Cloudflare parts in EdgeZero                                                                                                                                      | Part B blockers; DEC-8, DEC-15                                                               |
 | 11   | EZ R3                                                                                                                                                  | P2  | Release          | Cloudflare release                                                                                                                                                | wave 10                                                                                      |
-| 12   | TS #1518, T8                                                                                                                                           | P2  | Move, New        | Geo source check; Cloudflare EC lifecycle                                                                                                                         | R3 (T8 also T6, T1, T5; DEC-8)                                                               |
-| 13   | TS T17                                                                                                                                                 | P2  | New              | Cloudflare providers, limits, abuse protection and cookies                                                                                                        | T8, R3, T10 to T14                                                                           |
+| 12   | TS #1518, T8                                                                                                                                           | P2  | Move, New        | Geo source check; identity on Cloudflare through the shared app                                                                                                   | R3 (T8 also T6, T1, T5, T21; DEC-8)                                                          |
+| 13   | TS T17                                                                                                                                                 | P2  | New              | Identity features pass on Cloudflare                                                                                                                              | T8, R3, T10 to T13, T19                                                                      |
 | 14   | EZ EZI-1s, EZI-2s, EZI-3s, EZI-4s, EZI-5s                                                                                                              | P3  | New              | Spin parts in EdgeZero                                                                                                                                            | Part B blockers; DEC-8, DEC-15                                                               |
 | 15   | EZ R4; IABTechLab/edgezero#89                                                                                                                          | P3  | Release, Move    | Spin release; ClientInfo on every adapter                                                                                                                         | wave 14, R3                                                                                  |
-| 16   | TS T9                                                                                                                                                  | P3  | New              | Spin EC lifecycle                                                                                                                                                 | T8, R4; DEC-8, DEC-14                                                                        |
-| 17   | TS T18                                                                                                                                                 | P3  | New              | Spin providers, limits, abuse protection and cookies                                                                                                              | T9, R4, T17                                                                                  |
+| 16   | TS T9                                                                                                                                                  | P3  | New              | Identity on Spin through the shared app                                                                                                                           | T8, R4; DEC-8, DEC-14                                                                        |
+| 17   | TS T18                                                                                                                                                 | P3  | New              | Identity features pass on Spin                                                                                                                                    | T9, R4, T17                                                                                  |
 | any  | TS #1142                                                                                                                                               | P2  | Move             | Health and startup contract on all four adapters; A7 carries Axum readiness                                                                                       | none                                                                                         |
 | any  | TS #1549                                                                                                                                               | P2  | Move             | No `user.id` for a row-less EC                                                                                                                                    | DEC-12; PR #1487                                                                             |
 | any  | TS T16, TS #1245, IABTechLab/edgezero#438, IABTechLab/edgezero#287                                                                                     | P3  | New, Move, Merge | `ts-ec` refresh; LiveRamp sync spec; local GeoIP with PR IABTechLab/edgezero#453; IABTechLab/edgezero#287 last                                                    | DEC-13; DEC-9; PR IABTechLab/edgezero#453; IABTechLab/edgezero#275                           |
@@ -205,7 +217,8 @@ rows are post-MVP.
 "Blocked by" is set as a GitHub dependency between issues. A PR or a decision
 there goes in the issue body. "Blocks" is the inverse and is not set
 separately. No ticket mixes Fastly or Axum work with Cloudflare or Spin work
-(DEC-4), except the rejection, 501 and absence paths in Global Constraints.
+(DEC-4), except the shared app, rejection, 501 and absence paths in Global
+Constraints.
 
 ### EdgeZero, under IABTechLab/edgezero#468
 
@@ -213,7 +226,7 @@ New:
 
 | ID     | Ticket                                                                                                                           | Reqs   | Type    | Size | Pri | Blocked by                                                                                                                                                 | Blocks                                                                                                                              |
 | ------ | -------------------------------------------------------------------------------------------------------------------------------- | ------ | ------- | ---- | --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| EZI-2a | `KvStore` record contract and the Fastly provider                                                                                | EZI-2a | Feature | L    | P1  | PR IABTechLab/edgezero#275                                                                                                                                 | EZI-2b, EZI-2c, EZI-2s, R1b                                                                                                         |
+| EZI-2a | `KvStore` record contract, the Fastly provider and the local in-memory store                                                     | EZI-2a | Feature | L    | P1  | PR IABTechLab/edgezero#275                                                                                                                                 | EZI-2b, EZI-2c, EZI-2s, R1b                                                                                                         |
 | EZI-2b | DynamoDB and celld providers meet the record contract, with writes spread across partition keys                                  | EZI-2b | Feature | L    | P1  | EZI-2a, IABTechLab/edgezero#410, IABTechLab/edgezero#437; PR IABTechLab/edgezero#463                                                                       | R1b                                                                                                                                 |
 | EZI-3  | ClientInfo contract: portable client IP, geo and TLS metadata with explicit absence, the contract part of IABTechLab/edgezero#89 | EZI-3  | Feature | M    | P1  | PR IABTechLab/edgezero#275                                                                                                                                 | IABTechLab/edgezero#90, IABTechLab/edgezero#91, IABTechLab/edgezero#92, IABTechLab/edgezero#283, EZI-3s, IABTechLab/edgezero#89, R2 |
 | EZI-1  | Bounded work after the response on Fastly and Axum, drained on Axum SIGTERM                                                      | EZI-1  | Feature | M    | P1  | PRs IABTechLab/edgezero#275, IABTechLab/edgezero#406                                                                                                       | EZI-1c, EZI-1s, R2                                                                                                                  |
@@ -229,7 +242,7 @@ New:
 | EZI-5s | Rate limiter backend for Spin                                                                                                    | EZI-5  | Feature | S    | P3  | EZI-5; DEC-15                                                                                                                                              | R4                                                                                                                                  |
 | R1     | Release IABTechLab/edgezero#275 through IABTechLab/edgezero#439                                                                  | EZI-6  | Task    | S    | P1  | IABTechLab/edgezero#397, IABTechLab/edgezero#410, IABTechLab/edgezero#437, IABTechLab/edgezero#432; PRs IABTechLab/edgezero#275 to IABTechLab/edgezero#439 | A1                                                                                                                                  |
 | R1b    | Release the record contract: EZI-2a and EZI-2b                                                                                   | EZI-6  | Task    | S    | P1  | EZI-2a, EZI-2b                                                                                                                                             | T6                                                                                                                                  |
-| R2     | Release the Fastly and Axum parts of EZI-1, EZI-3 and EZI-5                                                                      | EZI-6  | Task    | S    | P1  | EZI-1, EZI-3, EZI-5, IABTechLab/edgezero#90, IABTechLab/edgezero#92, IABTechLab/edgezero#283                                                               | A3, A10, T7, T10, T11, T12                                                                                                          |
+| R2     | Release the Fastly and Axum parts of EZI-1, EZI-3 and EZI-5                                                                      | EZI-6  | Task    | S    | P1  | EZI-1, EZI-3, EZI-5, IABTechLab/edgezero#90, IABTechLab/edgezero#92, IABTechLab/edgezero#283                                                               | A3, A10, T10, T11, T12                                                                                                              |
 | R3     | Release the Cloudflare parts                                                                                                     | EZI-6  | Task    | S    | P2  | EZI-1c, EZI-2c, EZI-4c, EZI-5c, IABTechLab/edgezero#91; DEC-8                                                                                              | R4, T8, T17, #1518                                                                                                                  |
 | R4     | Release the Spin parts                                                                                                           | EZI-6  | Task    | S    | P3  | EZI-1s, EZI-2s, EZI-3s, EZI-4s, EZI-5s, R3                                                                                                                 | T9, T18                                                                                                                             |
 
@@ -237,18 +250,18 @@ Existing, moved under IABTechLab/edgezero#468. IABTechLab/edgezero#89 to IABTech
 IABTechLab/edgezero#88 and the last six leave IABTechLab/edgezero#391 or have
 no parent; both old epics stay where they are:
 
-| Issue                   | Title                                                                                                                  | Type (set)   | Size | Pri | Blocked by                                                                            | Blocks                                              |
-| ----------------------- | ---------------------------------------------------------------------------------------------------------------------- | ------------ | ---- | --- | ------------------------------------------------------------------------------------- | --------------------------------------------------- |
-| IABTechLab/edgezero#89  | As a developer I want to access client metadata in handlers (EZI-3)                                                    | Story (keep) | S    | P3  | EZI-3, IABTechLab/edgezero#90, IABTechLab/edgezero#91, IABTechLab/edgezero#92, EZI-3s | none                                                |
-| IABTechLab/edgezero#90  | Fastly ClientInfo                                                                                                      | Task (keep)  | S    | P1  | EZI-3                                                                                 | R2, IABTechLab/edgezero#89                          |
-| IABTechLab/edgezero#92  | Axum ClientInfo                                                                                                        | Task (keep)  | S    | P1  | EZI-3, IABTechLab/edgezero#397                                                        | R2, IABTechLab/edgezero#89                          |
-| IABTechLab/edgezero#91  | Cloudflare ClientInfo                                                                                                  | Task (keep)  | S    | P2  | EZI-3                                                                                 | R3, IABTechLab/edgezero#89                          |
-| IABTechLab/edgezero#397 | Axum: safe production diagnostics and trusted-proxy handling (delivered by PR IABTechLab/edgezero#409)                 | Task (keep)  | M    | P1  | none                                                                                  | R1, IABTechLab/edgezero#92, IABTechLab/edgezero#283 |
-| IABTechLab/edgezero#410 | Native AWS configuration, secret and KV store providers (PR IABTechLab/edgezero#414)                                   | Task (keep)  | L    | P1  | none                                                                                  | EZI-2b, R1                                          |
-| IABTechLab/edgezero#437 | Native celld configuration and KV store providers (PR IABTechLab/edgezero#422)                                         | Task (keep)  | M    | P1  | none                                                                                  | EZI-2b, R1                                          |
-| IABTechLab/edgezero#432 | Axum: protected CloudFront Geo metadata provider (PR IABTechLab/edgezero#439)                                          | Story (keep) | M    | P1  | none                                                                                  | R1, EZI-4c, EZI-4s                                  |
-| IABTechLab/edgezero#438 | Axum: explicit local GeoIP provider (PR IABTechLab/edgezero#453)                                                       | Story (keep) | M    | P3  | none                                                                                  | none                                                |
-| IABTechLab/edgezero#283 | Expose JA4 through a standard request interface; R2 needs its Fastly and Axum parts, and other adapters report absence | Task (keep)  | M    | P1  | EZI-3, IABTechLab/edgezero#397                                                        | R2                                                  |
+| Issue                   | Title                                                                                                                                                         | Type (set)   | Size | Pri | Blocked by                                                                            | Blocks                                              |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ | ---- | --- | ------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| IABTechLab/edgezero#89  | As a developer I want to access client metadata in handlers (EZI-3)                                                                                           | Story (keep) | S    | P3  | EZI-3, IABTechLab/edgezero#90, IABTechLab/edgezero#91, IABTechLab/edgezero#92, EZI-3s | none                                                |
+| IABTechLab/edgezero#90  | Fastly ClientInfo                                                                                                                                             | Task (keep)  | S    | P1  | EZI-3                                                                                 | R2, IABTechLab/edgezero#89                          |
+| IABTechLab/edgezero#92  | Axum ClientInfo                                                                                                                                               | Task (keep)  | S    | P1  | EZI-3, IABTechLab/edgezero#397                                                        | R2, IABTechLab/edgezero#89                          |
+| IABTechLab/edgezero#91  | Cloudflare ClientInfo                                                                                                                                         | Task (keep)  | S    | P2  | EZI-3                                                                                 | R3, IABTechLab/edgezero#89                          |
+| IABTechLab/edgezero#397 | Axum: safe production diagnostics and trusted-proxy handling (delivered by PR IABTechLab/edgezero#409)                                                        | Task (keep)  | M    | P1  | none                                                                                  | R1, IABTechLab/edgezero#92, IABTechLab/edgezero#283 |
+| IABTechLab/edgezero#410 | Native AWS configuration, secret and KV store providers (PR IABTechLab/edgezero#414)                                                                          | Task (keep)  | L    | P1  | none                                                                                  | EZI-2b, R1                                          |
+| IABTechLab/edgezero#437 | Native celld configuration and KV store providers (PR IABTechLab/edgezero#422)                                                                                | Task (keep)  | M    | P1  | none                                                                                  | EZI-2b, R1                                          |
+| IABTechLab/edgezero#432 | Axum: protected CloudFront Geo metadata provider (PR IABTechLab/edgezero#439)                                                                                 | Story (keep) | M    | P1  | none                                                                                  | R1, EZI-4c, EZI-4s                                  |
+| IABTechLab/edgezero#438 | Axum: explicit local GeoIP provider (PR IABTechLab/edgezero#453)                                                                                              | Story (keep) | M    | P3  | none                                                                                  | none                                                |
+| IABTechLab/edgezero#283 | Expose JA4 through a standard request interface (design in PR IABTechLab/edgezero#469); R2 needs its Fastly and Axum parts, and other adapters report absence | Task (keep)  | M    | P1  | EZI-3, IABTechLab/edgezero#397                                                        | R2                                                  |
 
 IABTechLab/edgezero#89 stays the umbrella story: EZI-3 carries its contract, and it completes
 with the last adapter's mapping. IABTechLab/edgezero#397, IABTechLab/edgezero#410 and IABTechLab/edgezero#432 leave
@@ -258,18 +271,17 @@ IABTechLab/edgezero#391, which stays an epic in place; R1 is linked from it.
 
 New:
 
-| ID  | Ticket                                                                                                                                         | Reqs                   | Type    | Size | Pri | Blocked by                   | Blocks                           |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | ------- | ---- | --- | ---------------------------- | -------------------------------- |
-| A1  | Serve Axum in production mode from main: port #1528 onto #1506's outbound API, repin to R1                                                     | AX-1, AX-2, AX-7       | Feature | L    | P1  | R1, #1507; DEC-5, DEC-6      | A2, A3, A6, A7, A9, #1529, #1141 |
-| A2  | Axum EC lifecycle on the shared backend, forward-ported from #1536 and #1537, passing T5's suite                                               | ID-1, ID-3, ID-8, WB-1 | Feature | L    | P1  | T5, T6, A1, #1529; DEC-6     | A5, A8, A10, T7                  |
-| A3  | Drain after-response tasks on SIGTERM                                                                                                          | AX-1, ID-5             | Feature | S    | P1  | R2, A1                       | none                             |
-| A5  | Load-test the record store at the target page-load rate with provider refreshes                                                                | AX-4                   | Task    | M    | P1  | A2, A7, A10                  | none                             |
-| A6  | Publish and attest the production image; one contract for #1539 and #1543                                                                      | AX-5                   | Feature | M    | P1  | A1; PR #1449; DEC-6          | A7                               |
-| A7  | Reference infrastructure: DynamoDB, readiness, JSON logs, two or more tasks, IPv6 CloudFront ranges, geo on, CloudFront's JA4 header forwarded | AX-3, AX-6, ID-7       | Feature | L    | P1  | A1, A6, #1529; DEC-6, DEC-15 | A5, A10                          |
-| A8  | Run the SIGTERM-during-record-write test in CI                                                                                                 | AX-1                   | Task    | S    | P1  | A2                           | none                             |
-| A9  | CI guard: runtime code reads only `TRUSTED_SERVER__` environment names                                                                         | AX-2                   | Task    | XS   | P2  | A1                           | none                             |
-| A10 | Axum identity features: providers, abuse protection and SharedID write-back, on the core work of T11 to T13                                    | ID-4, ID-7, WB-3       | Feature | L    | P1  | A2, A7, R2, T11, T12, T13    | A5, A11, T14                     |
-| A11 | EC route on Axum, on T19's core route                                                                                                          | ID-9, WB-1             | Feature | S    | P1  | A10, T19                     | none                             |
+| ID  | Ticket                                                                                                                                         | Reqs                               | Type    | Size | Pri | Blocked by                     | Blocks                           |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- | ------- | ---- | --- | ------------------------------ | -------------------------------- |
+| A1  | Serve Axum in production mode from main: rebase #1531 onto #1506 (#1528 closes), with startup, stores and client IP from EdgeZero; repin to R1 | AX-1, AX-2, AX-7                   | Feature | L    | P1  | R1, #1507; DEC-5, DEC-6        | A2, A3, A6, A7, A9, #1529, #1141 |
+| A2  | Identity on Axum through T21's shared app, from #1536 and #1537 without their Axum-only stores; partner APIs included; passes T5's suite       | ID-1, ID-2, ID-3, ID-8, WB-1, SH-5 | Feature | M    | P1  | T5, T6, T21, A1, #1529; DEC-6  | A5, A8, A10                      |
+| A3  | Drain after-response tasks on SIGTERM                                                                                                          | AX-1, ID-5                         | Feature | S    | P1  | R2, A1                         | none                             |
+| A5  | Load-test the record store at the target page-load rate with provider refreshes                                                                | AX-4                               | Task    | M    | P1  | A2, A7, A10                    | none                             |
+| A6  | Publish and attest the production image; one contract for #1539 and #1543                                                                      | AX-5                               | Feature | M    | P1  | A1; PR #1449; DEC-6            | A7                               |
+| A7  | Reference infrastructure: DynamoDB, readiness, JSON logs, two or more tasks, IPv6 CloudFront ranges, geo on, CloudFront's JA4 header forwarded | AX-3, AX-6, ID-7                   | Feature | L    | P1  | A1, A6, #1529; DEC-6, DEC-15   | A5, A10                          |
+| A8  | Run the SIGTERM-during-record-write test in CI                                                                                                 | AX-1                               | Task    | S    | P1  | A2                             | none                             |
+| A9  | CI guard: runtime code reads only `TRUSTED_SERVER__` environment names                                                                         | AX-2                               | Task    | XS   | P2  | A1                             | none                             |
+| A10 | Identity features pass on Axum from the shared app: providers, abuse protection, SharedID write-back, the mirror cookie and the EC route       | ID-4, ID-7, ID-9, WB-3, WB-4       | Feature | M    | P1  | A2, A7, R2, T11, T12, T13, T19 | A5                               |
 
 Existing, moved under #1558:
 
@@ -283,35 +295,37 @@ Existing, moved under #1558:
 A1 replaces the local configuration bridge: #1528 starts Axum from
 `EDGEZERO__ADAPTER__CONFIG_DIR` and never reads the old
 `TRUSTED_SERVER_CONFIG_*` names, so #1141 then points `ts config push --local`
-and `ts serve` at that directory. #1142 and #1139 cover all four adapters, so
-they sit outside the MVP; A7 carries Axum readiness.
+and `ts serve` at that directory; #1531 starts Axum the same way. #1142 and
+#1139 cover all four adapters, so they sit outside the MVP; A7 carries Axum
+readiness. #1566 overlaps A2 and A10; its Axum part is rebuilt on T21 (Part C).
+T7, T14 and A11 are folded into A2 and A10, because the shared app (T21)
+brings partner APIs, the mirror cookie and the EC route to every adapter.
 
 ### Trusted Server, under #1558
 
 New:
 
-| ID  | Ticket                                                                                                                                                                                                                            | Reqs                                           | Type    | Size | Pri | Blocked by                           | Blocks            |
-| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- | ------- | ---- | --- | ------------------------------------ | ----------------- |
-| T1  | Answer identify and batch sync locally on every adapter: run them with a record store, 501 without one                                                                                                                            | ID-3                                           | Task    | S    | P0  | none                                 | T7, T8            |
-| T2  | EIDs in OpenRTB 2.6 `user.eids`; every EID-absence test checks both `user.eids` and `user.ext.eids`                                                                                                                               | SID-4                                          | Feature | M    | P1  | none                                 | none              |
-| T3  | SharedID cleanup: legacy path, cross-source dedupe, re-filing, SID-6 gate, template-cache deny list                                                                                                                               | SID-1, SID-3, SID-6, WB-5                      | Feature | M    | P1  | PR #1488                             | T13               |
-| T4  | Build shared state once per process on Axum: settings, partner registry (built per request today), store clients; keep the per-request HTTP client unless measured. #1192 is the Fastly half                                      | SH-1, SH-3                                     | Task    | M    | P2  | #1507                                | none              |
-| T5  | Identity conformance suite for Fastly and Axum                                                                                                                                                                                    | ID-1                                           | Task    | M    | P1  | #1507                                | A2, T8            |
-| T6  | One record backend over EdgeZero `KvStore`; delete the Fastly `ec_kv.rs`; adapters without a supported store reject identity configuration at startup, with a test                                                                | ID-2                                           | Feature | L    | P1  | R1b, #1522                           | A2, T8            |
-| T7  | Axum partner APIs on the shared backend: batch sync, pull sync, admin lookup                                                                                                                                                      | ID-3, ID-5                                     | Feature | M    | P1  | A2, R2, T1, T10                      | none              |
-| T8  | Cloudflare EC lifecycle: mint, record, `ts-ec`, identify, batch sync, pull sync, admin lookup, auction and body EIDs; build state once; drop the first-request `Env` capture and config `block_on`. Split when scheduled          | ID-1, ID-2, ID-3, ID-8, WB-1, SH-1, SH-3, SH-4 | Feature | XL   | P2  | T6, R3, T1, T5; DEC-8                | T9, T17           |
-| T9  | Spin EC lifecycle, the same scope as T8; port the config `block_on` removal from RC commit `933de5921`. Split when scheduled                                                                                                      | ID-1, ID-2, ID-3, ID-8, WB-1, SH-1, SH-3       | Feature | XL   | P3  | T8, R4; DEC-8, DEC-14                | T18               |
-| T10 | Rate limits on Fastly and Axum: batch sync per partner, pull sync, provider lookups, record creation; on Axum each limit divided by the configured task count                                                                     | ID-6                                           | Feature | M    | P1  | R2; DEC-15                           | T7, T11, T17, T19 |
-| T11 | Providers on Fastly, awaited before finalization; only follow-up writes after the response                                                                                                                                        | ID-4, ID-5, WB-1                               | Feature | M    | P1  | T10, R2; PR #1487                    | A10, T17, T19     |
-| T12 | Refuse record creation from non-browser clients on Fastly, through EdgeZero's JA4 accessor                                                                                                                                        | ID-7                                           | Feature | M    | P1  | R2                                   | A10, T17, T19     |
-| T13 | SharedID cookie write-back on Fastly, with `<name>_cst`, under SID-2 and SID-6                                                                                                                                                    | WB-3, SID-6                                    | Feature | M    | P1  | T3; PR #1488; DEC-7                  | A10, T17, T19     |
-| T14 | Mirror cookie on Axum                                                                                                                                                                                                             | WB-4                                           | Feature | S    | P1  | A10; PR #1489; DEC-10                | T17               |
-| T15 | Identity-only tsjs mode                                                                                                                                                                                                           | WB-6                                           | Feature | M    | P1  | PR #1489                             | T20               |
-| T16 | `ts-ec` refresh for returning readers without breaking cacheability                                                                                                                                                               | WB-2, WB-5                                     | Task    | S    | P3  | DEC-13                               | none              |
-| T17 | Cloudflare identity features: providers, rate limits, abuse protection, SharedID write-back, mirror cookie and the EC route. Split when scheduled                                                                                 | ID-4, ID-6, ID-7, ID-9, WB-3, WB-4             | Feature | XL   | P2  | T8, R3, T10, T11, T12, T13, T14, T19 | T18               |
-| T18 | Spin identity features, the same scope as T17. Split when scheduled                                                                                                                                                               | ID-4, ID-6, ID-7, WB-3, WB-4                   | Feature | XL   | P3  | T9, R4, T17                          | none              |
-| T19 | EC route in core and on Fastly: `/_ts/api/v1/ec` mints, records, runs the providers and sets the identity cookies on a consented same-origin call, with a pixel response for Prebid's `pixelUrl` and a JSON response with the IDs | ID-9, WB-1, WB-3, WB-4                         | Feature | M    | P1  | T10, T11, T12, T13                   | A11, T17, T20     |
-| T20 | The injected script calls the EC route once the CMP reports consent and merges the returned IDs into Prebid                                                                                                                       | ID-9, WB-6                                     | Feature | M    | P1  | T15, T19                             | none              |
+| ID  | Ticket                                                                                                                                                                                                                                               | Reqs                                                       | Type    | Size | Pri | Blocked by                      | Blocks                          |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- | ------- | ---- | --- | ------------------------------- | ------------------------------- |
+| T1  | Answer identify and batch sync locally on every adapter: run them with a record store, 501 without one                                                                                                                                               | ID-3                                                       | Task    | S    | P0  | none                            | T8, T21                         |
+| T2  | EIDs in OpenRTB 2.6 `user.eids`; every EID-absence test checks both `user.eids` and `user.ext.eids`                                                                                                                                                  | SID-4                                                      | Feature | M    | P1  | none                            | none                            |
+| T3  | SharedID cleanup: legacy path, cross-source dedupe, re-filing, SID-6 gate, template-cache deny list                                                                                                                                                  | SID-1, SID-3, SID-6, WB-5                                  | Feature | M    | P1  | PR #1488                        | T13                             |
+| T4  | Build shared state once per process on Axum: settings, partner registry (built per request today), store clients; keep the per-request HTTP client unless measured. #1192 is the Fastly half                                                         | SH-1, SH-3                                                 | Task    | M    | P2  | #1507                           | none                            |
+| T5  | Identity conformance suite that runs against each adapter, Fastly and Axum first                                                                                                                                                                     | ID-1, SH-5                                                 | Task    | M    | P1  | #1507                           | A2, T8                          |
+| T6  | One record backend over EdgeZero `KvStore`; delete the Fastly `ec_kv.rs`; adapters without a supported store reject identity configuration at startup, with a test                                                                                   | ID-2                                                       | Feature | L    | P1  | R1b, #1522                      | A2, T8                          |
+| T8  | Identity on Cloudflare through T21's shared app with EZI-2c's store, passing T5's suite; build state once; drop the first-request `Env` capture and config `block_on`                                                                                | ID-1, ID-2, ID-3, ID-5, ID-8, WB-1, SH-1, SH-3, SH-4, SH-5 | Feature | L    | P2  | T6, R3, T1, T5, T21; DEC-8      | T9, T17                         |
+| T9  | Identity on Spin, the same scope as T8; port the config `block_on` removal from RC commit `933de5921`                                                                                                                                                | ID-1, ID-2, ID-3, ID-5, ID-8, WB-1, SH-1, SH-3, SH-5       | Feature | L    | P3  | T8, R4; DEC-8, DEC-14           | T18                             |
+| T10 | Rate limits on Fastly and Axum: batch sync per partner, pull sync, provider lookups, record creation; on Axum each limit divided by the configured task count                                                                                        | ID-6                                                       | Feature | M    | P1  | R2, T21; DEC-15                 | T11, T17, T19                   |
+| T11 | Providers in the shared app, awaited before finalization; only follow-up writes after the response; verified on Fastly                                                                                                                               | ID-4, ID-5, WB-1                                           | Feature | M    | P1  | T10, T21, R2; PR #1487          | A10, T17, T19                   |
+| T12 | Refuse record creation from non-browser clients in the shared app, through EdgeZero's JA4 accessor; verified on Fastly                                                                                                                               | ID-7                                                       | Feature | M    | P1  | R2, T21                         | A10, T17, T19                   |
+| T13 | SharedID cookie write-back in the shared app, with `<name>_cst`, under SID-2 and SID-6; verified on Fastly                                                                                                                                           | WB-3, SID-6                                                | Feature | M    | P1  | T3, T21; PR #1488; DEC-7        | A10, T17, T19                   |
+| T15 | Identity-only tsjs mode                                                                                                                                                                                                                              | WB-6                                                       | Feature | M    | P1  | PR #1489                        | T20                             |
+| T16 | `ts-ec` refresh for returning readers without breaking cacheability                                                                                                                                                                                  | WB-2, WB-5                                                 | Task    | S    | P3  | DEC-13                          | none                            |
+| T17 | Identity features pass on Cloudflare from the shared app: providers, rate limits, abuse protection, SharedID write-back, the mirror cookie and the EC route                                                                                          | ID-4, ID-6, ID-7, ID-9, WB-3, WB-4                         | Feature | M    | P2  | T8, R3, T10, T11, T12, T13, T19 | T18                             |
+| T18 | Identity features pass on Spin, the same scope as T17                                                                                                                                                                                                | ID-4, ID-6, ID-7, ID-9, WB-3, WB-4                         | Feature | M    | P3  | T9, R4, T17                     | none                            |
+| T19 | EC route in the shared app, verified on Fastly: `/_ts/api/v1/ec` mints, records, runs the providers and sets the identity cookies on a consented same-origin call, with a pixel response for Prebid's `pixelUrl` and a JSON response with the IDs    | ID-9, WB-1, WB-3, WB-4                                     | Feature | M    | P1  | T10, T11, T12, T13, T21         | A10, T17, T20                   |
+| T20 | The injected script calls the EC route once the CMP reports consent and merges the returned IDs into Prebid                                                                                                                                          | ID-9, WB-6                                                 | Feature | M    | P1  | T15, T19                        | none                            |
+| T21 | One identity app in core for every adapter: identify, batch sync, pull sync, admin lookup, the EC route, the EC lifecycle, providers and write-back in one router each adapter mounts; adapter crates supply only platform services through EdgeZero | SH-5, ID-1, ID-3                                           | Feature | L    | P1  | T1, #1507                       | A2, T8, T10, T11, T12, T13, T19 |
 
 Existing, moved under #1558:
 
@@ -335,7 +349,7 @@ Not moved:
 - IABTechLab/trusted-server#90 is an epic, so it is linked from #1558, not moved; it and IABTechLab/trusted-server#353 close
   when PR #1488 merges.
 - #1507 delivers the cutover and stays under #1505; it blocks A1, T4, T5,
-  #1192 and #1556.
+  T21, #1192 and #1556.
 - Proposed closures: #1523 with #1527; IABTechLab/trusted-server#353 and #1310 once PR #1488 merges;
   #1189, which `56a19229f` (#1157) fixed on main.
 - #1556 needs only a regression test: #1506 rejects
@@ -356,7 +370,11 @@ moved to the heads in Part A, so Task 6 re-checks each of their items first.
 
 ### Trusted Server
 
-- **#1506 at `851537045` (AX-7, SID-4).** Rebase after #1557, #1526 and #1516.
+- **#1506 at `6c39a56a1` (AX-7, SID-4).** Rebase after #1557, #1526 and #1516.
+  Clear CodeQL alert 283 (`rust/cleartext-logging`,
+  `test_support/scripted_client.rs:557`). Keep EdgeZero pinned to
+  IABTechLab/edgezero#275's head: an RC-tag pin pushed to this branch on
+  2026-11-12 was reverted.
   Repin after the fold-in, or under wave 1's fallback; drop the
   `origin_readthrough_enabled` rejection (`config.rs:317`) once cache tags
   return. The repin brings IABTechLab/edgezero `b97efec1`, which stops Spin
@@ -365,33 +383,60 @@ moved to the heads in Part A, so Task 6 re-checks each of their items first.
 - **#1526 at `e529e5576` (ID-2, SH-3).** Retarget to main. Address its round-1
   review, including the finalize-under-`block_on` test gap.
 - **#1525 at `cd8977cad`.** Address its round-1 review.
-- **#1487 at `4e7a6e02b` (ID-6, ID-8, SH-2, SH-3, SID-4).** Rebase onto #1526
-  and #1506 (13 and 28 shared files). Await lookup collection in the async
-  finalize: `main.rs:699` calls `block_on` inside a function #1526 wraps in
-  `block_on` (`main.rs:550`). Move per-request lookups out of the
-  `thread_local`. Keep saving `/auction` body EIDs; a test at
-  `finalize.rs:1434` asserts they are dropped. Send lookups through EdgeZero's
-  `HttpClient`. Key the limit per DEC-15.
-- **#1489 at `29de3d446` (WB-4).** Cap every mirrored ID's expiry at 30 days.
-  `coordinator/validate.rs:132-135` turns an unspecified expiry into
-  `Expiry::Never`, and
-  `crates/trusted-server-identity-providers/src/pull_sync.rs:128` writes such
-  IDs.
-- **#1488 at `25f35720b` (SID-1, SID-2, SID-3, SID-5, SID-6).** Read the cookie name
-  from `managed_user_ids[].storage.name` and default the source to
-  `pubcid.org`, atype 1. Gate reads, storage and sending on EID permission
-  (SID-6). Keep main's retention (SID-5, DEC-7). Refuse an enabled provider
-  kind that is not registered. Settle the LiveRamp Custom ID (DEC-9) and
-  response shape. Address its round-1 review.
-- **#1528 at `ea779fb47` (AX-7, SH-2).** Port its two commits onto #1506's
-  outbound API: a trial merge conflicts in 9 files, two of them modify/delete
-  on `platform/outbound.rs` and `platform/outbound_native_tests.rs`, which only
-  #1527 has. Repin off `456313675`. Fix the CLI test (`AxumDevServerConfig`
-  lacks `ingress`), the type error and the two new high CodeQL alerts. Remove
-  the per-request `AtomicBool` from the Fastly `AppState`. Feeds A1.
+- **#1487 at `1600781eb` (ID-6, ID-8, SH-2, SH-3, SID-4).** Every item from
+  `4e7a6e02b` is still open. Rebase onto #1526 and #1506 (8 and 17 files
+  conflict). Await lookup collection in the async finalize: `main.rs:699`
+  calls `block_on` inside a function #1526 wraps in `block_on`
+  (`main.rs:550`, `:577`), and `run_after_response_lookups` does the same at
+  `:793` and `:811`. Move per-request lookups out of the `thread_local`
+  (`app.rs:414-424`). Keep saving `/auction` body EIDs (ID-8): the test at
+  `finalize.rs:1365` asserts they are dropped and the PR's own spec now calls
+  that intended, so the comment argues against that spec line. Send lookups
+  through EdgeZero's `HttpClient`: #1506 deletes `platform/http.rs`, and its
+  `outbound_client().start_batch_until` has the same start-then-gather shape.
+  Key the limit per DEC-15.
+- **#1489 at `d3780ba13` (WB-4).** Cap every mirrored ID's expiry at 30 days
+  where the mirror is built (`mirror.rs:236-247`), not in validation, because
+  SID-5 keeps SharedID `Never` in the record. An unstated expiry still becomes
+  `Expiry::Never` (`coordinator/validate.rs:135-138`), pull sync is its only
+  production source (`pull_sync.rs:145`), and such IDs reach the cookie with no
+  `exp` under a one-year `Max-Age`. The 30-day clamp on stated expiries comes
+  from #1488. Answer the open thread on `any_due` skipping cookie-read
+  opt-outs.
+- **#1566 at `117a58e0e` (SID-1, SID-3, SID-5, ID-2, SH-5).** Move
+  `0a2a00aaf` (SharedID name, source and retention) and `0c13d4272` (drops the
+  blanket provider rejection) into #1488. Rebuild the Axum part on T21's shared
+  app and EdgeZero capabilities: no Axum-only `EcKvStore` (`ec_kv.rs:87`;
+  ID-2, DEC-3), no Trusted Server rate limiter (EZI-5), no User-Agent-only
+  gate (EZI-3, ID-7), and no detached `block_on` task (EZI-1). Local
+  development uses EdgeZero's local store (EZI-2a). It then serves A2 and A10.
+- **#1488 at `7f55776f3` (SID-1, SID-3, SID-5, SID-6).** Take #1566's
+  `0a2a00aaf`, which reads the SharedID name from `managed_user_ids`, defaults
+  the source to `pubcid.org` and keeps the stored value (still open here:
+  `sharedid.rs:46-59`, `common.rs:94,110,129-136`). Take `0c13d4272`: the
+  blanket `reject_providers_without_a_kind` (`config.rs:348`) makes
+  `ts config validate`, `push` and `diff` reject every enabled provider. SID-6
+  holds for the provider path. LiveRamp's Custom ID waits on DEC-9, which gates
+  enabling LiveRamp, not this merge. Answer the open round-1 thread and the
+  four newer ones.
+- **#1531 at `88a6ba596` (AX-1, AX-2, AX-7), which carries A1 in place of
+  #1528.** It now targets #1506's branch but forks from main with its own
+  cutover rebuild (`82d7e3be8`) and the RC tag pin, so 13 files conflict.
+  Rebase onto #1506's head, drop that rebuild and the pin, and repin to R1
+  (DEC-5). Startup, stores and the client IP come from EdgeZero
+  (IABTechLab/edgezero#406, IABTechLab/edgezero#414,
+  IABTechLab/edgezero#409). Carry #1528's open items where they apply: the CLI
+  test (`AxumDevServerConfig` lacks `ingress`), the type error, the CodeQL
+  alerts and the per-request `AtomicBool` in the Fastly `AppState`.
 - **#1543 at `dc1a063d8` (AX-5).** It publishes the dev-server image (`STOPSIGNAL SIGINT`), so it ships with A6's production
   image contract.
-- **RC units, fixed in their forward-ports.** These were checked at the RC tag
+- **RC units, restacked as the forward-ports.** #1531 goes on #1506, #1532 on
+  #1531, #1536 and #1537 on #1532 for A2, and #1539, #1538 and #1540 directly
+  on #1532 for A6 and A7; #1533 and #1534 close. #1535 (Sourcepoint GPP capture
+  and server consent reconciliation) has no ticket until the MVP's need for it
+  beyond #1557 is decided. #1532 takes its geo provider from EdgeZero's manifest
+  once IABTechLab/edgezero#439 binds it, dropping `TS_NATIVE_GEO_PROFILE_FILE`.
+  The notes below were checked at the RC tag
   `v0.1.1-rc-axum.202611.2` (`7c6e68d94`), which contains every unit. They are
   forward-port notes: each applies to the PR that ports its unit to main, and
   Task 6 posts it there once that PR exists, checked at its head. On the RC unit
@@ -402,13 +447,15 @@ moved to the heads in Part A, so Task 6 re-checks each of their items first.
   maps a US request with no region to `Unknown`, which fails every US
   Cloudflare request closed (AX-3), and show that the same trusted country
   and region reach EC creation and auction consent on Axum. #1536: do not port the adapter-local
-  DynamoDB store (ID-2, AX-4). #1537: its example config breaks startup on
-  Axum, Cloudflare and Spin. #1539: fix the failing Axum test. #1540: trust
+  DynamoDB store (ID-2, AX-4). #1537: do not port its Axum celld store or
+  storage selection, which EdgeZero's providers and logical stores replace
+  (EZI-2b, DEC-16); its example config also breaks startup on Axum, Cloudflare
+  and Spin. #1539: fix the failing Axum test. #1540: trust
   IPv6 CloudFront ranges, turn geo on, wire DynamoDB (AX-3, AX-6). All units:
   replace `TS_*` names (AX-2). #1541: drop the commits of closed #1545.
-- **Proposed closures.** #1527 once its tests move (DEC-1); #1310, which
-  #1488's ID5 provider supersedes; #1424, #1499, #1541 and the RC units at
-  parity.
+- **Proposed closures.** #1527 once its tests move (DEC-1); #1528 once #1531
+  carries A1; #1533 and #1534, the RC copies of #1525 and #1526; #1310, which
+  #1488's ID5 provider supersedes; #1424, #1499 and #1541 at parity.
 
 ### EdgeZero, requests to the PR authors
 
@@ -431,6 +478,9 @@ moved to the heads in Part A, so Task 6 re-checks each of their items first.
   `9a985c99`.
 - **IABTechLab/edgezero#414 at `3733482f`.** Drop those two commits once they
   move down.
+- **IABTechLab/edgezero#439 at `3a0e5eb4`.** Bind the geo provider from the
+  manifest, so an application reads `ctx.geo()` without its own boot profile
+  (EZI-4, DEC-16); #1532 composes it from a Trusted Server profile today.
 - **IABTechLab/edgezero#463 at `6f9fa8bc`, IABTechLab/edgezero#464 at
   `6fe32531`, IABTechLab/edgezero#453 at `633f0552`.** Rebase as Part A's table
   says.
@@ -537,13 +587,14 @@ issue, and one on IABTechLab/edgezero#391 linking R1.
 ### Task 3: File the Axum tickets under #1558
 
 Same steps as Task 2, against IABTechLab/trusted-server and #1558, for the
-ten new rows in table order. Each body has Summary (Ticket), Requirements
+nine new rows in table order. Each body has Summary (Ticket), Requirements
 (Reqs, linked to the spec section), Acceptance (each requirement's Accept
 line) and Blocked by. Record the map in a `CREATOR:` comment on #1558.
 
 ### Task 4: File the Trusted Server tickets under #1558
 
-Same steps as Task 3, for T1 to T20 in table order, under #1558. Record the
+Same steps as Task 3, for the T rows in table order (T1 to T21; T7 and T14
+are folded into A2 and A10), under #1558. Record the
 map in a `CREATOR:` comment on #1558.
 
 ### Task 5: Link the dependencies
@@ -582,8 +633,8 @@ new head before posting.
 
 Post one `CREATOR:` comment per PR with its Part C item and the ticket it
 serves (`Part of #<ticket>`): #1532 to #1529, #1526 to #1522, #1503 to #1432,
-#1506 to #1507, #1528 to A1, #1543 to A6, #1487 to T11, #1488 to T13 and
-#1489 to T14 and T15. For proposed closures, ask the author; do not close
+#1506 to #1507, #1531 to A1, #1536, #1537 and #1566 to A2, #1539, #1538 and
+#1543 to A6, #1540 to A7, #1487 to T11, #1488 to T13 and #1489 to T15. For proposed closures, ask the author; do not close
 another author's PR.
 
 ### Task 7: Tie out the EdgeZero PRs
@@ -597,7 +648,7 @@ issue from Task 2.
 
 Run `gh api graphql -f query='{repository(owner:"IABTechLab",name:"<repo>"){issue(number:<epic>){subIssues(first:100){totalCount}}}}' --jq '.data.repository.issue.subIssues.totalCount'`
 for #1558 and IABTechLab/edgezero#468.
-Expected: 46 and 29.
+Expected: 44 and 29.
 
 - [ ] **Step 2: Check that Fastly and Axum stand alone**
 

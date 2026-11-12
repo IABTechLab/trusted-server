@@ -299,6 +299,17 @@ marks the record contract and geo as supported.
 - **SH-4 No first-request capture.** Cloudflare does not keep the first
   request's `Env` in a set-once `thread_local`. Accept: two requests with
   different `Env` values each see their own.
+- **SH-5 One app for every adapter.** The identity routes (identify, batch
+  sync, pull sync, admin lookup and the EC route), the EC lifecycle, provider
+  lookups and cookie write-back run from one router built in core, which every
+  adapter mounts. An adapter crate supplies only platform services, and a
+  capability an adapter lacks is an EdgeZero ask, never code in that adapter
+  (DEC-16). Accept: no adapter crate's non-test code calls EC generation,
+  finalization or an identity handler directly, and the same conformance
+  suite (T5) runs on each supported adapter. State: at #1506's head only the
+  Fastly adapter wires identity (EC generation, finalization, identify and
+  batch sync are called from its `app.rs` and `main.rs`); Axum, Cloudflare and
+  Spin each build their own router without it.
 
 ### SID: SharedID handled the way Prebid defines it
 
@@ -397,11 +408,13 @@ part.
   task runs after delivery, and on Axum SIGTERM waits for registered tasks up
   to the grace; later, on Cloudflare the task runs after delivery, and Spin
   returns a capability error.
-- **EZI-2a Record contract and the Fastly provider.** `KvStore` gains a read
+- **EZI-2a Record contract, the Fastly provider and the local store.** `KvStore` gains a read
   that returns a generation marker, writes in `Add`, `Overwrite` and
   `IfGenerationMatch` modes with a precondition-failed outcome, and strongly
   consistent existence and prefix listing, or `KvError::Unsupported`. Accept:
-  an EdgeZero contract suite passes against the Fastly provider under Viceroy.
+  an EdgeZero contract suite passes against the Fastly provider under Viceroy
+  and against EdgeZero's local in-memory store, which the Axum development
+  server uses.
 - **EZI-2b DynamoDB and celld providers.** Both meet the EZI-2a contract.
   DynamoDB writes are spread across partition keys with no item every insert
   updates. Accept: the contract suite passes against both. State: IABTechLab/edgezero#463's
@@ -420,8 +433,10 @@ part.
   reads as absent.
 - **EZI-4 Geo with region on Cloudflare and Spin.** `ctx.geo()` gives country
   and region there, or a capability error. Fastly keeps its existing geo and
-  Axum uses CloudFront geo from IABTechLab/edgezero#439. Accept: a US request
-  on Cloudflare reports country and region.
+  Axum uses CloudFront geo from IABTechLab/edgezero#439, bound from EdgeZero's
+  manifest so an application reads `ctx.geo()` without its own boot profile.
+  Accept: a US request on Cloudflare reports country and region, and Axum's
+  geo loads with no Trusted Server geo setting.
 - **EZI-5 Rate limiter.** A limiter with Fastly Edge Rate Limiting and
   an in-memory backend for Axum, then Cloudflare and Spin backends per
   DEC-15. Accept: a contract test passes per backend.
@@ -514,6 +529,10 @@ Decided:
   keeps its own in-memory counter and enforces each limit divided by the
   configured task count, so the total across tasks stays within the limit.
   The MVP has no shared counter.
+- **DEC-16 One implementation for every adapter** (user, 2026-11-12). Every
+  feature is built once and works on every adapter, delivered in DEC-4's
+  order. Shared logic lives in Trusted Server core; a platform capability an
+  adapter lacks is an EdgeZero ask, never code in one adapter crate (SH-5).
 
 Proposed and assumed by the plan until confirmed:
 
@@ -536,7 +555,8 @@ Open:
 - **DEC-9 LiveRamp Custom ID.** The current value is the IP-derived EC prefix,
   shared by everyone behind one IP. Blocks enabling LiveRamp in #1488, and
   #1245.
-- **DEC-10 Mirror partners.** Which partners get `mirror_enabled`. Blocks T14.
+- **DEC-10 Mirror partners.** Which partners get `mirror_enabled`. It gates
+  turning the mirror on for a partner in a deployment, not a ticket.
 - **DEC-12 EC EID source.** Which source name the EC uses, and whether it keeps
   going out as `user.id`. Blocks #1549; no other ticket until decided.
 - **DEC-13 `ts-ec` refresh** for returning readers. Blocks T16.
@@ -602,3 +622,11 @@ Server injects into proxied pages calls a same-origin route that mints the EC
 and writes the cookies on its own response, and the route answers both
 Prebid's `pixelUrl` and the script's JSON call. ID-1 and WB-1 now include that
 route, and the Axum mirror cookie (T14) is P1.
+
+The user then required every feature to be built once and work on every
+adapter, with platform gaps sent to EdgeZero (DEC-16). SH-5 adds one identity
+app in core that every adapter mounts (T21). The per-adapter identity tickets
+shrink to turning that app on with each adapter's EdgeZero capabilities and
+passing the conformance suite, and T7, T14 and A11 fold into A2 and A10.
+EZI-2a adds EdgeZero's local store for Axum development, and EZI-4 binds
+Axum's geo provider from EdgeZero's manifest.
