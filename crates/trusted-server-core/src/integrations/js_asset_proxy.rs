@@ -37,6 +37,7 @@ const ERROR_ORIGIN_STATUS: &str = "js-asset-origin-status";
 
 /// Configuration for the JavaScript asset proxy integration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct JsAssetProxyConfig {
     /// Enables or disables the integration.
     #[serde(default)]
@@ -629,6 +630,7 @@ mod tests {
 
     fn process_html_with_registry(html: &str, integrations: IntegrationRegistry) -> String {
         let processor = create_html_processor(HtmlProcessorConfig {
+            public_origin: "https://publisher.example.com".to_string(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),

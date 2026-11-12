@@ -30,6 +30,7 @@ ids = ["trusted_server_secrets"]
 const REWRITE_ENV: &str = "TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES";
 const SANITIZE_ENV: &str = "TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES";
 const CLICKS_ENV: &str = "TRUSTED_SERVER__AUCTION__REWRITE_CLICKS";
+const PUBLIC_ORIGIN_ENV: &str = "TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN";
 const GAM_ATTRIBUTION_ENV: &str = "TRUSTED_SERVER__INTEGRATIONS__GPT__GAM_ATTRIBUTION_ENABLED";
 const AD_TEMPLATES_ENABLED_ENV: &str = "TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED";
 const PROVIDER_ENDPOINT_ENV: &str = "TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__ENDPOINT";
@@ -88,6 +89,14 @@ fn pushed_auction_with_env(
     key: &str,
     raw_value: &str,
 ) -> serde_json::Value {
+    pushed_config_with_env(project, key, raw_value)["auction"].clone()
+}
+
+fn pushed_config_with_env(
+    project: &MigratedProject,
+    key: &str,
+    raw_value: &str,
+) -> serde_json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_ts"))
         .args(["config", "push", "--adapter", "axum", "--manifest"])
         .arg(&project.manifest_path)
@@ -119,7 +128,259 @@ fn pushed_auction_with_env(
         .expect("should contain a blob envelope");
     let envelope: serde_json::Value =
         serde_json::from_str(envelope_json).expect("should parse blob envelope");
-    envelope["data"]["auction"].clone()
+    let config = envelope["data"].clone();
+    if config["publisher"].get("public_origin").is_none() {
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("publisher.public_origin is unset"),
+            "push should warn before publishing the HTTPS/domain fallback"
+        );
+    }
+    config
+}
+
+#[test]
+fn public_origin_environment_override_applies_and_normalizes_when_leaf_present() {
+    let project = migrated_project();
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read migrated config")
+        .parse::<DocumentMut>()
+        .expect("should parse migrated config");
+    document["publisher"]["public_origin"] = value("https://ads.example.com");
+    fs::write(&project.config_path, document.to_string()).expect("should write config");
+
+    let config = pushed_config_with_env(&project, PUBLIC_ORIGIN_ENV, "http:localhost:7676");
+
+    assert_eq!(
+        config["publisher"]["public_origin"], "http://localhost:7676",
+        "should push the normalized public origin from the existing-leaf override"
+    );
+}
+
+#[test]
+fn public_origin_environment_override_is_ignored_without_leaf() {
+    let project = migrated_project();
+
+    let config = pushed_config_with_env(&project, PUBLIC_ORIGIN_ENV, "http://localhost:7676");
+
+    assert!(
+        config["publisher"].get("public_origin").is_none(),
+        "should retain the omitted public origin when the TOML leaf is absent"
+    );
+}
+
+#[test]
+fn public_origin_omission_warns_during_validate_but_explicit_origin_does_not() {
+    let project = migrated_project();
+    let output = validate_with_overlay(&project, "true");
+    assert!(output.status.success(), "should validate the legacy config");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("publisher.public_origin is unset").count(),
+        1,
+        "should warn once for one effective validation load: {stderr}"
+    );
+    assert!(
+        stderr.contains("publisher.public_origin is unset")
+            && stderr.contains("https://{publisher.domain}")
+            && stderr.contains("not the serving page's scheme, host or port"),
+        "should explain the omitted-origin routing change: {stderr}"
+    );
+
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read migrated config")
+        .parse::<DocumentMut>()
+        .expect("should parse migrated config");
+    document["publisher"]["public_origin"] = value("http://localhost:7676");
+    fs::write(&project.config_path, document.to_string()).expect("should write explicit origin");
+    let output = validate_with_overlay(&project, "true");
+    assert!(
+        output.status.success(),
+        "should validate the explicit origin"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("publisher.public_origin is unset"),
+        "should not warn about a configured origin"
+    );
+}
+
+#[test]
+fn public_origin_advisories_do_not_reject_validate() {
+    let project = migrated_project();
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read migrated config")
+        .parse::<DocumentMut>()
+        .expect("should parse migrated config");
+    document["publisher"]["domain"] = value("publisher.example");
+    document["publisher"]["cookie_domain"] = value(".foreign.example");
+    document["publisher"]["public_origin"] = value("HTTP://FOREIGN.EXAMPLE:8080");
+    fs::write(&project.config_path, document.to_string()).expect("should write explicit origin");
+    let output = validate_with_overlay(&project, "true");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "should retain successful validation: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("outside the EC cookie scope").count(),
+        1,
+        "should use publisher.domain, not cookie_domain: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("HTTP on a non-loopback host").count(),
+        1,
+        "should warn once about transport: {stderr}"
+    );
+    assert!(
+        !stderr.contains("foreign.example") && !stderr.contains("FOREIGN.EXAMPLE"),
+        "should not interpolate settings in diagnostics: {stderr}"
+    );
+}
+
+fn origin_diagnostic_command(project: &MigratedProject, operation: &str, no_env: bool) -> Output {
+    let mut process = Command::new(env!("CARGO_BIN_EXE_ts"));
+    process.arg("config");
+    if operation == "loader" {
+        process.args(["ad-templates", "lint"]);
+    } else {
+        process.arg(operation);
+    }
+    process
+        .arg("--manifest")
+        .arg(&project.manifest_path)
+        .arg("--app-config")
+        .arg(&project.config_path)
+        .current_dir(project.directory.path());
+    match operation {
+        "push" => {
+            process.args(["--adapter", "axum", "--local", "--yes", "--no-diff"]);
+        }
+        "diff" => {
+            process.args(["--adapter", "axum", "--local", "--exit-code"]);
+        }
+        _ => {}
+    }
+    if no_env {
+        process.arg("--no-env");
+    }
+    process
+        .env(PUBLIC_ORIGIN_ENV, "HTTP://FOREIGN.EXAMPLE:8080")
+        .output()
+        .expect("should run config diagnostic command")
+}
+
+fn assert_origin_diagnostics(output: &Output, omitted: usize, scope: usize, transport: usize) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "should preserve successful command exit: {stderr}"
+    );
+    for (message, expected) in [
+        ("publisher.public_origin is unset", omitted),
+        ("outside the EC cookie scope", scope),
+        ("HTTP on a non-loopback host", transport),
+    ] {
+        assert_eq!(
+            stderr.matches(message).count(),
+            expected,
+            "should emit each diagnostic once per effective load: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("FOREIGN.EXAMPLE") && !stderr.contains("foreign.example"),
+        "should not include configured origin values in diagnostics: {stderr}"
+    );
+}
+
+#[test]
+fn public_origin_diagnostics_cover_validate_push_diff_and_shared_audit_loader() {
+    for (origin, omitted, scope, transport) in [
+        (None, 1, 0, 0),
+        (Some("http://localhost:7676"), 0, 0, 0),
+        (Some("http://127.0.0.1:7676"), 0, 1, 0),
+        (Some("http://foreign.example:8080"), 0, 1, 1),
+    ] {
+        let project = migrated_project();
+        if let Some(origin) = origin {
+            let mut document = fs::read_to_string(&project.config_path)
+                .expect("should read config")
+                .parse::<DocumentMut>()
+                .expect("should parse config");
+            document["publisher"]["public_origin"] = value(origin);
+            fs::write(&project.config_path, document.to_string()).expect("should write config");
+        }
+        for operation in ["validate", "push", "diff", "loader"] {
+            let output = origin_diagnostic_command(&project, operation, true);
+            assert_origin_diagnostics(&output, omitted, scope, transport);
+            if operation == "diff" {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("no changes"),
+                    "should preserve matching serialized config hashes"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn public_origin_diagnostics_follow_effective_overlay_and_no_env() {
+    let project = migrated_project();
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read config")
+        .parse::<DocumentMut>()
+        .expect("should parse config");
+    document["publisher"]["public_origin"] = value("http://localhost:7676");
+    fs::write(&project.config_path, document.to_string()).expect("should write config");
+    for no_env in [false, true] {
+        let expected = usize::from(!no_env);
+        for operation in ["validate", "push", "diff", "loader"] {
+            let output = origin_diagnostic_command(&project, operation, no_env);
+            assert_origin_diagnostics(&output, 0, expected, expected);
+        }
+    }
+}
+
+#[test]
+fn public_origin_template_placeholder_blocks_validate_and_push() {
+    let project = migrated_project();
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read migrated config")
+        .parse::<DocumentMut>()
+        .expect("should parse migrated config");
+    document["publisher"]["public_origin"] = value("https://ADS.EXAMPLE.COM:443");
+    fs::write(&project.config_path, document.to_string()).expect("should write placeholder origin");
+
+    for command in ["validate", "push"] {
+        let mut process = Command::new(env!("CARGO_BIN_EXE_ts"));
+        process
+            .args(["config", command, "--manifest"])
+            .arg(&project.manifest_path)
+            .arg("--app-config")
+            .arg(&project.config_path)
+            .current_dir(project.directory.path());
+        if command == "push" {
+            process.args(["--adapter", "axum", "--yes", "--no-diff"]);
+        }
+        let output = process
+            .output()
+            .expect("should run the real config command");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "should reject the template origin"
+        );
+        assert!(
+            stderr.contains("publisher.public_origin") && stderr.contains("Insecure default"),
+            "should identify the placeholder during {command}: {stderr}"
+        );
+    }
+    assert!(
+        !project
+            .directory
+            .path()
+            .join(".edgezero/local-config-trusted_server_config.json")
+            .exists(),
+        "should not publish a config with the template public origin"
+    );
 }
 
 #[test]
@@ -466,5 +727,62 @@ fn pushed_envelope_sha_is_stable_for_one_context_key_allowlist() {
             original,
             "should leave stored envelope unchanged"
         );
+    }
+}
+
+#[test]
+fn config_validate_and_push_reject_unknown_integration_ids_and_fields() {
+    let cases = [
+        ("prebdi", "enabled", true, "Unknown integration IDs: prebdi"),
+        (
+            "gpt",
+            "rewrite_scripts",
+            false,
+            "unknown field `rewrite_scripts`",
+        ),
+        ("gpt", "enable", false, "unknown field `enable`"),
+        ("osano", "made_up_key", false, "unknown field `made_up_key`"),
+    ];
+    for (id, field, field_value, expected) in cases {
+        for command in ["validate", "push"] {
+            let project = migrated_project();
+            let mut document = fs::read_to_string(&project.config_path)
+                .expect("should read valid config")
+                .parse::<DocumentMut>()
+                .expect("should parse valid config");
+            document["integrations"][id] = toml_edit::table();
+            document["integrations"][id][field] = value(field_value);
+            fs::write(&project.config_path, document.to_string())
+                .expect("should write invalid integration config");
+            let mut process = Command::new(env!("CARGO_BIN_EXE_ts"));
+            process
+                .args(["config", command, "--manifest"])
+                .arg(&project.manifest_path)
+                .arg("--app-config")
+                .arg(&project.config_path)
+                .current_dir(project.directory.path());
+            if command == "push" {
+                process.args(["--adapter", "axum", "--yes", "--no-diff"]);
+            }
+
+            let output = process.output().expect("should run config command");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "should reject {id}.{field} during {command}: {stderr}"
+            );
+            assert!(
+                stderr.contains(expected),
+                "should name {expected} during {command}: {stderr}"
+            );
+            assert!(
+                !project
+                    .directory
+                    .path()
+                    .join(".edgezero/local-config-trusted_server_config.json")
+                    .exists(),
+                "should reject invalid configuration before writing a local blob"
+            );
+        }
     }
 }

@@ -361,6 +361,34 @@ jobs:
         run: |
           cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')"
 
+      # Release builds take their facts from these inputs; check that the
+      # actual CLI binary embeds them unchanged. The fictional commit differs
+      # from the checkout, so a fallback to local git cannot pass.
+      - name: cargo test (release build facts)
+        if: runner.os == 'Linux'
+        env:
+          TRUSTED_SERVER__RELEASE_BUILD: "1"
+          TRUSTED_SERVER__GIT_VERSION: abcdef0123456789abcdef0123456789abcdef01
+        run: |
+          cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --test release_build_facts
+
+      # A valid commit also passes when the release gate is bypassed, so check
+      # that core's build script refuses a branch name in release mode.
+      - name: cargo check (release build refuses a branch source)
+        if: runner.os == 'Linux'
+        env:
+          TRUSTED_SERVER__RELEASE_BUILD: "1"
+          TRUSTED_SERVER__GIT_VERSION: main
+        run: |
+          if cargo check --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" 2> "$RUNNER_TEMP/release-refusal.log"; then
+            echo "release build accepted a branch source" >&2
+            exit 1
+          fi
+          if ! grep -F 'release source must be exactly 40 lowercase ASCII hexadecimal bytes' "$RUNNER_TEMP/release-refusal.log"; then
+            cat "$RUNNER_TEMP/release-refusal.log" >&2
+            exit 1
+          fi
+
       - name: cargo test (browser fixtures)
         if: runner.os == 'macOS'
         run: ./scripts/test-cli.sh

@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
 use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use url::{Host, Url};
 use validator::{Validate, ValidationError, ValidationErrors};
 
 use crate::ec::registry::PartnerRegistry;
@@ -32,10 +33,9 @@ use crate::integrations::{
     sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
-use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
+use crate::settings::{AssetOriginAuth, IntegrationConfig, IntegrationSettings, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
-#[cfg(test)]
 const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
     #[cfg(feature = "test-utils")]
     crate::test_support::async_html_finalization::ID,
@@ -73,14 +73,22 @@ impl TrustedServerAppConfig {
     ///
     /// Returns [`TrustedServerError::Configuration`] when push-safe validation
     /// fails.
-    pub fn new(settings: Settings) -> Result<Self, Report<TrustedServerError>> {
-        let app_config = Self { settings };
+    pub fn new(mut settings: Settings) -> Result<Self, Report<TrustedServerError>> {
+        settings.publisher.normalize()?;
+        let app_config = Self::from_normalized_settings(settings);
         edgezero_core::app_config::validate_excluding_secrets(&app_config).map_err(|errors| {
             Report::new(TrustedServerError::Configuration {
                 message: format!("Configuration validation failed: {errors}"),
             })
         })?;
         Ok(app_config)
+    }
+
+    fn from_normalized_settings(settings: Settings) -> Self {
+        for diagnostic in publisher_origin_diagnostics(&settings.publisher) {
+            log::warn!("{diagnostic}");
+        }
+        Self { settings }
     }
 
     /// Consumes the wrapper and returns the inner [`Settings`].
@@ -114,8 +122,54 @@ impl<'de> Deserialize<'de> for TrustedServerAppConfig {
         settings
             .normalize_deserialized()
             .map_err(serde::de::Error::custom)?;
-        Ok(Self { settings })
+        Ok(Self::from_normalized_settings(settings))
     }
+}
+
+fn publisher_origin_diagnostics(publisher: &crate::settings::Publisher) -> Vec<&'static str> {
+    let Some(origin) = publisher.public_origin.as_deref() else {
+        return vec![
+            "publisher.public_origin is unset; generated first-party URLs use https://{publisher.domain}, not the serving page's scheme, host or port. Verify this endpoint before deployment, or configure publisher.public_origin.",
+        ];
+    };
+    // Syntax errors belong to normalization and validation, not advisories.
+    let Ok(origin) = Url::parse(origin) else {
+        return Vec::new();
+    };
+    let Some(host) = origin.host() else {
+        return Vec::new();
+    };
+    let host_name = host.to_string().to_ascii_lowercase();
+    let domain = publisher.domain.to_ascii_lowercase();
+    let in_cookie_scope = host_name == domain
+        || host_name
+            .strip_suffix(&domain)
+            .is_some_and(|prefix| prefix.ends_with('.'));
+    let loopback = match host {
+        Host::Domain(name) => {
+            let name = name.trim_end_matches('.');
+            name == "localhost" || name.ends_with(".localhost")
+        }
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => {
+            address.is_loopback()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|address| address.is_loopback())
+        }
+    };
+    let mut diagnostics = Vec::new();
+    if !in_cookie_scope {
+        diagnostics.push(
+            "publisher.public_origin is outside the EC cookie scope derived from publisher.domain; EC cookies are not shared with this host. Verify this endpoint before deployment.",
+        );
+    }
+    if origin.scheme() == "http" && !loopback {
+        diagnostics.push(
+            "publisher.public_origin uses HTTP on a non-loopback host; first-party URLs do not use encrypted transport. Use HTTPS before deployment unless HTTP is intentional.",
+        );
+    }
+    diagnostics
 }
 
 impl Validate for TrustedServerAppConfig {
@@ -256,6 +310,16 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 /// Returns [`TrustedServerError`] when non-secret configuration or a secret key
 /// reference is invalid.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let unknown_ids = unknown_integration_ids(settings);
+    if !unknown_ids.is_empty() {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "Unknown integration IDs: {}. Known integration IDs: {}",
+                unknown_ids.join(", "),
+                DEPLOY_VALIDATED_INTEGRATION_IDS.join(", ")
+            ),
+        }));
+    }
     validate_secret_key_references(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
     validate_js_asset_proxy_config(settings)?;
@@ -280,6 +344,11 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
 pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
+    for id in unknown_integration_ids(settings) {
+        log::warn!(
+            "Unknown integration ID '{id}' is ignored; check the integration name or remove its configuration"
+        );
+    }
     settings.reject_placeholder_secrets()?;
     validate_js_asset_proxy_config(settings)?;
     validate_gpt_diagnostics_config(settings)?;
@@ -290,19 +359,25 @@ pub fn validate_settings_for_runtime(
     Ok(())
 }
 
+fn unknown_integration_ids(settings: &Settings) -> Vec<&str> {
+    let mut ids = settings
+        .integrations
+        .keys()
+        .map(String::as_str)
+        .filter(|id| !DEPLOY_VALIDATED_INTEGRATION_IDS.contains(id))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
+
 fn validate_gpt_diagnostics_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
     let Some(raw_config) = settings.integrations.get(GPT_DIAGNOSTICS_INTEGRATION_ID) else {
         return Ok(());
     };
     // Validate this dependency even when the normal integration lookup skips
     // disabled integrations, including the default when enabled is omitted.
-    let config: GptDiagnosticsConfig = serde_json::from_value(raw_config.clone()).map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "integration startup failed for `{GPT_DIAGNOSTICS_INTEGRATION_ID}`: configuration could not be parsed: {error}"
-            ),
-        })
-    })?;
+    let config: GptDiagnosticsConfig = serde_json::from_value(raw_config.clone())
+        .map_err(|error| IntegrationSettings::parse_error(GPT_DIAGNOSTICS_INTEGRATION_ID, error))?;
     config.validate().map_err(|error| {
         Report::new(TrustedServerError::Configuration {
             message: format!(
@@ -317,13 +392,8 @@ fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<Trus
         return Ok(());
     };
 
-    let config: JsAssetProxyConfig = serde_json::from_value(raw_config.clone()).map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "integration startup failed for `{JS_ASSET_PROXY_INTEGRATION_ID}`: configuration could not be parsed: {error}"
-            ),
-        })
-    })?;
+    let config: JsAssetProxyConfig = serde_json::from_value(raw_config.clone())
+        .map_err(|error| IntegrationSettings::parse_error(JS_ASSET_PROXY_INTEGRATION_ID, error))?;
     config.validate().map_err(|error| {
         Report::new(TrustedServerError::Configuration {
             message: format!(
@@ -406,6 +476,14 @@ fn validate_non_secret_deploy_placeholders(
     }
     if crate::settings::Publisher::is_placeholder_origin_url(&settings.publisher.origin_url) {
         insecure_fields.push("publisher.origin_url");
+    }
+    if settings
+        .publisher
+        .public_origin
+        .as_deref()
+        .is_some_and(crate::settings::Publisher::is_placeholder_public_origin)
+    {
+        insecure_fields.push("publisher.public_origin");
     }
     if let Some(request_signing) = &settings.request_signing {
         if crate::settings::RequestSigning::is_unusable_store_id(&request_signing.config_store_id) {
@@ -622,6 +700,162 @@ formats = [{ width = 300, height = 250 }]
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
         settings
+    }
+
+    #[test]
+    fn public_origin_diagnostics_use_ec_domain_and_dns_boundaries() {
+        let mut publisher = valid_settings().publisher;
+        publisher.domain = "PuBlIsHeR.ExAmPlE".to_owned();
+        publisher.cookie_domain = ".foreign.example".to_owned();
+        for (origin, outside_scope) in [
+            ("https://publisher.example", false),
+            ("https://ADS.PUBLISHER.EXAMPLE:8443", false),
+            ("https://nested.ads.publisher.example", false),
+            ("https://publisher.example.", true),
+            ("https://ads.publisher.example.", true),
+            ("https://notpublisher.example", true),
+            ("https://publisher.example.foreign.example", true),
+            ("https://foreign.example", true),
+        ] {
+            publisher.public_origin = Some(origin.to_owned());
+            let diagnostics = publisher_origin_diagnostics(&publisher);
+            assert_eq!(
+                diagnostics.len(),
+                usize::from(outside_scope),
+                "should classify {origin} against publisher.domain, not cookie_domain"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|message| message.contains("outside the EC cookie scope"))
+            );
+        }
+    }
+
+    #[test]
+    fn public_origin_transport_diagnostics_distinguish_loopback_hosts() {
+        let mut publisher = valid_settings().publisher;
+        publisher.domain = "localhost".to_owned();
+        for (scheme, host, transport_warning, scope_warning) in [
+            ("http", "localhost", false, false),
+            ("http", "LOCALHOST", false, false),
+            ("http", "localhost.", false, true),
+            ("http", "app.localhost", false, false),
+            ("http", "127.0.0.1", false, true),
+            ("http", "127.2.3.4", false, true),
+            ("http", "127.1", false, true),
+            ("http", "[::1]", false, true),
+            ("http", "[0:0:0:0:0:0:0:1]", false, true),
+            ("http", "[::ffff:127.0.0.1]", false, true),
+            ("http", "0.0.0.0", true, true),
+            ("http", "192.0.2.1", true, true),
+            ("http", "[::ffff:192.0.2.1]", true, true),
+            ("http", "[2001:db8::1]", true, true),
+            ("http", "notlocalhost", true, true),
+            ("http", "localhost.foreign.example", true, true),
+            ("https", "foreign.example", false, true),
+        ] {
+            let origin = format!("{scheme}://{host}:7676");
+            publisher.public_origin = Some(origin.clone());
+            let diagnostics = publisher_origin_diagnostics(&publisher);
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .any(|message| message.contains("HTTP on a non-loopback host")),
+                transport_warning,
+                "should classify transport for {origin}"
+            );
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .any(|message| message.contains("outside the EC cookie scope")),
+                scope_warning,
+                "should retain the localhost/IP scope mismatch for {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_origin_diagnostics_emit_once_per_boundary_and_validation_is_silent() {
+        let capture = crate::test_support::logging::WarningCapture::start();
+        for (origin, expected_warnings) in [
+            (None, 1),
+            (Some("HTTP://FOREIGN.EXAMPLE:8080"), 2),
+            (Some("HTTPS://ADS.PUBLISHER.EXAMPLE:443"), 0),
+            (Some("HTTPS://PUBLISHER.EXAMPLE.:443"), 1),
+        ] {
+            let mut settings = valid_settings();
+            settings.publisher.domain = "publisher.example".to_owned();
+            settings.publisher.public_origin = origin.map(str::to_owned);
+            let constructed = TrustedServerAppConfig::new(settings)
+                .expect("should construct config with advisory-only origin diagnostics");
+            let warnings = capture.take();
+            assert_eq!(warnings.len(), expected_warnings);
+            assert!(
+                warnings.iter().all(|warning| {
+                    warning.target == module_path!().trim_end_matches("::tests")
+                        && !warning.message.contains("FOREIGN")
+                        && !warning.message.contains("foreign.example")
+                }),
+                "should log only static diagnostic messages"
+            );
+            let data = serde_json::to_value(&constructed).expect("should serialize config");
+            let expected_hash =
+                BlobEnvelope::new(data.clone(), "2026-01-01T00:00:00Z".to_owned()).sha256;
+            let deserialized: TrustedServerAppConfig = serde_json::from_value(data.clone())
+                .expect("should deserialize config with advisory-only origin diagnostics");
+            assert_eq!(
+                capture.take().len(),
+                warnings.len(),
+                "should emit once on deserialization too"
+            );
+            for config in [&constructed, &deserialized] {
+                for _ in 0..3 {
+                    edgezero_core::app_config::validate_excluding_secrets(config)
+                        .expect("should retain successful push-safe validation");
+                    let _ = config.validate();
+                }
+                let serialized = serde_json::to_value(config).expect("should serialize config");
+                assert_eq!(serialized, data, "should not serialize diagnostic state");
+                assert_eq!(
+                    BlobEnvelope::new(serialized, "2026-01-01T00:00:00Z".to_owned()).sha256,
+                    expected_hash,
+                    "should preserve envelope hashes across validation"
+                );
+            }
+            assert!(
+                capture.take().is_empty(),
+                "should not log during repeated validation"
+            );
+        }
+    }
+
+    #[test]
+    fn app_config_normalizes_public_origin_before_serializing() {
+        for origin in [
+            "https:creative.example.com",
+            "HTTPS://CREATIVE.EXAMPLE.COM:443",
+        ] {
+            let mut settings = valid_settings();
+            settings.publisher.public_origin = Some(origin.to_owned());
+            let constructed = TrustedServerAppConfig::new(settings)
+                .expect("should normalize the public origin in constructed config");
+            let mut data =
+                serde_json::to_value(&constructed).expect("should serialize constructed config");
+            assert_eq!(
+                data["publisher"]["public_origin"], "https://creative.example.com",
+                "should serialize a normalized origin from the constructor"
+            );
+
+            data["publisher"]["public_origin"] = serde_json::json!(origin);
+            let deserialized: TrustedServerAppConfig = serde_json::from_value(data)
+                .expect("should normalize the public origin in deserialized config");
+            assert_eq!(
+                deserialized.settings().publisher.effective_public_origin(),
+                "https://creative.example.com",
+                "should normalize the public origin on both config boundaries"
+            );
+        }
     }
 
     #[test]
@@ -1402,6 +1636,79 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
+    fn deploy_and_runtime_validation_reject_remaining_public_origin_placeholder() {
+        let template = include_str!("../../../trusted-server.example.toml")
+            .replace("domain = \"example.com\"", "domain = \"publisher.example\"")
+            .replace(
+                "cookie_domain = \".example.com\"",
+                "cookie_domain = \".publisher.example\"",
+            )
+            .replace(
+                "https://origin.example.com",
+                "https://origin.publisher.example",
+            )
+            .replace(
+                "passphrase = \"ec_passphrase\"",
+                "passphrase = \"test-passphrase-at-least-32-bytes-long\"",
+            );
+        let settings = Settings::from_toml(&template).expect(
+            "should load the template after replacing the three existing host placeholders",
+        );
+
+        for result in [
+            validate_non_secret_deploy_placeholders(&settings),
+            settings.reject_placeholder_secrets(),
+        ] {
+            let err = result.expect_err("should still reject the public origin placeholder");
+            let TrustedServerError::InsecureDefault { field } = err.current_context() else {
+                panic!("should report insecure defaults: {err:?}");
+            };
+            assert!(
+                field
+                    .split(", ")
+                    .any(|field| field == "publisher.public_origin"),
+                "should identify the remaining public origin placeholder: {field}"
+            );
+            assert!(
+                !field.split(", ").any(|field| matches!(
+                    field,
+                    "publisher.domain" | "publisher.cookie_domain" | "publisher.origin_url"
+                )),
+                "should no longer flag the three edited fields: {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_config_public_origin_errors_include_the_reason() {
+        for (origin, reason) in [
+            (
+                "https://creative.example.com/",
+                "public_origin must not include a trailing slash",
+            ),
+            (
+                "https://creative.example.com/path",
+                "public_origin_has_path",
+            ),
+            (
+                "https://creative.example.com:0",
+                "public_origin_has_invalid_port",
+            ),
+        ] {
+            let mut data =
+                serde_json::to_value(valid_settings()).expect("should serialize settings");
+            data["publisher"]["public_origin"] = serde_json::json!(origin);
+            let err = serde_json::from_value::<TrustedServerAppConfig>(data)
+                .expect_err("should reject the invalid public origin");
+            let message = err.to_string();
+            assert!(
+                message.contains("publisher.public_origin") && message.contains(reason),
+                "should explain the public origin error: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn deploy_validation_rejects_placeholder_request_signing_store_ids() {
         let mut settings = valid_settings();
         settings.request_signing = Some(crate::settings::RequestSigning {
@@ -1555,6 +1862,66 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
+    fn prepass_integration_parse_errors_hide_invalid_values() {
+        for (id, config) in [
+            (
+                GPT_DIAGNOSTICS_INTEGRATION_ID,
+                serde_json::json!({ "enabled": "fictional-private-value" }),
+            ),
+            (
+                JS_ASSET_PROXY_INTEGRATION_ID,
+                serde_json::json!({
+                    "enabled": true,
+                    "cache_ttl_seconds": "fictional-private-value"
+                }),
+            ),
+        ] {
+            for validate in [validate_settings_for_deploy, validate_settings_for_runtime] {
+                let mut settings = valid_settings();
+                settings.integrations.insert(id.to_owned(), config.clone());
+
+                let message = validate(&settings)
+                    .expect_err("should reject an invalid pre-pass integration value")
+                    .to_string();
+                assert!(
+                    message.contains(&format!(
+                        "Integration '{id}' configuration could not be parsed"
+                    )),
+                    "should name the integration: {message}"
+                );
+                assert!(
+                    !message.contains("fictional-private-value"),
+                    "should not echo invalid values in the outer error message: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepass_integration_parse_errors_name_unknown_fields() {
+        for id in [
+            GPT_DIAGNOSTICS_INTEGRATION_ID,
+            JS_ASSET_PROXY_INTEGRATION_ID,
+        ] {
+            let mut settings = valid_settings();
+            settings.integrations.insert(
+                id.to_owned(),
+                serde_json::json!({ "enabled": false, "made_up_key": true }),
+            );
+
+            let message = validate_settings_for_deploy(&settings)
+                .expect_err("should reject an unknown pre-pass integration field")
+                .to_string();
+            assert!(
+                message.contains(&format!(
+                    "Integration '{id}' configuration could not be parsed: unknown field `made_up_key`"
+                )),
+                "should name the integration and the unknown field: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn deploy_validation_rejects_external_prebid_bundle_without_proxy_allowed_domains() {
         let mut settings = valid_settings();
         settings.proxy.allowed_domains.clear();
@@ -1676,6 +2043,176 @@ password = "production-admin-password-32-bytes"
 
         validate_settings_for_deploy(&settings)
             .expect("test config with typed Prebid bundle build table should validate");
+    }
+
+    #[test]
+    fn deploy_validation_rejects_unknown_integration_id() {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert("prebdi".to_owned(), serde_json::json!({ "enabled": false }));
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should reject an unknown integration ID even when disabled");
+        let message = error.to_string();
+        assert!(
+            message.contains("prebdi"),
+            "should name the unknown ID: {message}"
+        );
+        for id in DEPLOY_VALIDATED_INTEGRATION_IDS {
+            assert!(message.contains(id), "should list known ID {id}: {message}");
+        }
+    }
+
+    #[test]
+    fn runtime_validation_warns_about_unknown_integration_id() {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert("prebdi".to_owned(), serde_json::json!({ "enabled": true }));
+        let capture = crate::test_support::logging::WarningCapture::start();
+
+        validate_settings_for_runtime(&settings)
+            .expect("should keep starting with an unknown stored integration ID");
+
+        let warnings = capture.take();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.message.contains("prebdi")),
+            "should warn about the ignored unknown ID"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_unknown_integration_fields() {
+        let cases = [
+            (
+                "adserver_mock",
+                serde_json::json!({ "endpoint": "https://mediator.example.com/mediate" }),
+            ),
+            ("aps", serde_json::json!({})),
+            ("datadome", serde_json::json!({})),
+            ("didomi", serde_json::json!({})),
+            (
+                "google_tag_manager",
+                serde_json::json!({ "container_id": "GTM-ABC1234" }),
+            ),
+            ("gpt", serde_json::json!({})),
+            ("gpt_diagnostics", serde_json::json!({})),
+            (
+                "js_asset_proxy",
+                serde_json::json!({ "assets": [{ "path": "/assets/vendor.js", "origin_url": "https://cdn.example.com/vendor.js" }] }),
+            ),
+            ("lockr", serde_json::json!({ "app_id": "example-app" })),
+            ("nextjs", serde_json::json!({})),
+            ("osano", serde_json::json!({})),
+            (
+                "permutive",
+                serde_json::json!({ "organization_id": "example", "workspace_id": "example" }),
+            ),
+            (
+                "prebid",
+                serde_json::json!({ "external_bundle_url": "https://cdn.example.com/prebid.js" }),
+            ),
+            ("sourcepoint", serde_json::json!({})),
+            (
+                "testlight",
+                serde_json::json!({ "endpoint": "https://testlight.example.com/auction" }),
+            ),
+        ];
+        let mut accepted = Vec::new();
+        for (id, base) in cases {
+            for enabled in [true, false] {
+                let mut config = base.clone();
+                config["enabled"] = serde_json::json!(enabled);
+                let mut settings = valid_settings();
+                settings.integrations.insert(id.to_owned(), config.clone());
+                validate_settings_for_deploy(&settings)
+                    .unwrap_or_else(|error| panic!("should accept baseline {id}: {error:?}"));
+
+                config["made_up_key"] = serde_json::json!("x");
+                settings.integrations.insert(id.to_owned(), config);
+                match validate_settings_for_deploy(&settings) {
+                    Ok(()) => accepted.push(format!("{id} (enabled = {enabled})")),
+                    Err(error) => {
+                        let message = error.to_string();
+                        assert!(
+                            message.contains("made_up_key"),
+                            "should name unknown field for {id}: {message}"
+                        );
+                        assert!(
+                            message.contains(id),
+                            "should name integration {id}: {message}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "should reject unknown fields in all integrations: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_unknown_fields_in_minimal_disabled_integrations() {
+        for id in DEPLOY_VALIDATED_INTEGRATION_IDS {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert((*id).to_owned(), serde_json::json!({ "enabled": false }));
+            validate_settings_for_deploy(&settings)
+                .unwrap_or_else(|error| panic!("should accept minimal disabled {id}: {error:?}"));
+
+            settings.integrations.insert(
+                (*id).to_owned(),
+                serde_json::json!({ "enabled": false, "made_up_key": true }),
+            );
+            let error = validate_settings_for_deploy(&settings)
+                .expect_err("should reject unknown fields even with missing enabled-only fields");
+            assert!(
+                error.to_string().contains("made_up_key"),
+                "should name unknown field for {id}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_validation_preserves_open_integration_payload_maps_and_aliases() {
+        let mut settings = valid_settings();
+        settings.integrations.insert(
+            "adserver_mock".to_owned(),
+            serde_json::json!({
+                "enabled": true,
+                "endpoint": "https://mediator.example.com/mediate",
+                "context_query_params": { "example_context": "example_query" }
+            }),
+        );
+        settings.integrations.insert(
+            "datadome".to_owned(),
+            serde_json::json!({
+                "enabled": true,
+                "client_side_configuration": { "example_option": { "custom_key": true } }
+            }),
+        );
+        settings.integrations.insert(
+            "prebid".to_owned(),
+            serde_json::json!({
+                "enabled": true,
+                "external_bundle_url": "https://cdn.example.com/prebid.js",
+                "managed_user_ids": [{ "name": "sharedId", "params": { "example_option": true } }]
+            }),
+        );
+        settings.integrations.insert(
+            "lockr".to_owned(),
+            serde_json::json!({
+                "enabled": true, "app_id": "example-app", "rewrite_sdk_host": false
+            }),
+        );
+
+        validate_settings_for_deploy(&settings)
+            .expect("should accept open payload maps and explicit compatibility fields");
     }
 
     #[test]
