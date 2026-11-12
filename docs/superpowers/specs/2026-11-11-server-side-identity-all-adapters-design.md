@@ -190,9 +190,11 @@ marks the record contract and geo as supported.
 - **AX-7 Ships from main.** Main never pins an EdgeZero RC tag
   (IABTechLab/edgezero#431, IABTechLab/edgezero#462) or a revision that exists only on an RC
   branch, such as `456313675`, which #1528 pins today. Main may pin
-  IABTechLab/edgezero#275's head under DEC-1; other unmerged revisions need a
-  recorded decision (DEC-5). Accept: `Cargo.lock` on main resolves every
-  EdgeZero crate to a released tag or to the revision DEC-1 or DEC-5 allows.
+  IABTechLab/edgezero#275's head under DEC-1, or a revision of EdgeZero's
+  integration branch under DEC-5, which carries only work headed for EdgeZero
+  main. Accept: `Cargo.lock` on main resolves every EdgeZero crate to a
+  released tag, IABTechLab/edgezero#275's head or an integration-branch
+  revision.
 
 ### ID: Server-side identity on every adapter
 
@@ -453,13 +455,15 @@ part.
   Rate Limiting and
   an in-memory backend for Axum, then Cloudflare and Spin backends per
   DEC-15. Accept: a contract test passes per backend.
-- **EZI-6 Releases.** R1 contains IABTechLab/edgezero#275 through
+- **EZI-6 Integration points.** EdgeZero keeps an integration branch for this
+  work (DEC-5), and R1 to R4 are revisions on it that Trusted Server main pins
+  until EdgeZero releases them. R1 contains IABTechLab/edgezero#275 through
   IABTechLab/edgezero#439, so Axum production serving does not wait for the
   record contract. R1b contains EZI-2a and EZI-2b. R2 contains the Fastly and
   Axum parts of EZI-1 and EZI-3. Together R1, R1b and R2 cover Fastly and Axum.
   R3 contains the Cloudflare parts of EZI-1 to EZI-4, and R4 the Spin parts.
-  EZI-5 and its parts ship in a release after the MVP (DEC-15). Accept: each tag exists and Trusted Server main pins it; R1, R1b and
-  R2 contain no Cloudflare or Spin part.
+  EZI-5 and its parts ship in a release after the MVP (DEC-15). Accept: each revision exists on the integration branch and Trusted Server
+  main pins it; R1, R1b and R2 contain no Cloudflare or Spin part.
 
 ## Configuration
 
@@ -547,6 +551,12 @@ Decided:
   value wins and lives as long as the record (SID-5). When neither the record
   nor the request has a SharedID, the server creates one, because a browser may
   block Prebid.js from loading at all (WB-3).
+- **DEC-5 EdgeZero integration branch** (user, 2026-11-12). EdgeZero keeps an
+  integration branch that carries the unreleased work headed for EdgeZero
+  main: IABTechLab/edgezero#275, the IABTechLab/edgezero#406 to
+  IABTechLab/edgezero#439 chain and the EZI tickets. Trusted Server main pins
+  its revisions (R1, R1b, R2) instead of waiting for an EdgeZero release, and
+  repins to a released tag once EdgeZero publishes one.
 - **DEC-16 One implementation for every adapter** (user, 2026-11-12). Every
   feature is built once and works on every adapter, delivered in DEC-4's
   order. Shared logic lives in Trusted Server core; a platform capability an
@@ -554,8 +564,6 @@ Decided:
 
 Proposed and assumed by the plan until confirmed:
 
-- **DEC-5 EdgeZero pin for the Axum production stack.** Wait for release R1
-  (proposed), or follow the stack's head under AX-7. Blocks A1.
 - **DEC-6 Base and store path for Axum.** Forward-port the RC line to main and
   wait for EZI-2b (proposed), rather than back-port the provider stack to the
   RC line or port #1536's adapter-local store first. Applying each provider
@@ -657,3 +665,8 @@ Cloudflare and Spin parts and T10 move to a later row, and Fastly keeps main's
 limits. The user also decided DEC-7: the server creates a SharedID when the
 reader has none, because a browser may block Prebid.js from loading (WB-3,
 T13).
+
+The user then decided DEC-5: EdgeZero keeps an integration branch for the
+unreleased work, and Trusted Server main pins its revisions instead of waiting
+for a release. AX-7 allows those revisions, EZI-6 calls R1 to R4 integration
+points, and A1 no longer waits on a decision for its pin.
