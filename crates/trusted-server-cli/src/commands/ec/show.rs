@@ -4,7 +4,9 @@ use serde::Deserialize;
 use trusted_server_core::ec::generation::is_valid_ec_id;
 
 use crate::admin_client::{AdminClient, AdminRequest, UNAUTHORIZED_HINT};
-use crate::commands::ec::{ShowArgs, json_passthrough, unexpected_answer, write_report};
+use crate::commands::ec::{
+    ShowArgs, json_passthrough, terminal_text, unexpected_answer, write_report,
+};
 use crate::error::{CliResult, cli_error};
 
 const ADMIN_EC_PATH: &str = "/_ts/admin/ec";
@@ -81,7 +83,7 @@ pub fn run_show(args: &ShowArgs, out: &mut impl std::io::Write) -> CliResult<()>
         return cli_error(format!(
             "EC lookup failed: {}{explanation}\n{}",
             response.status,
-            response.error_text()
+            terminal_text(&response.error_text())
         ));
     }
 
@@ -101,10 +103,11 @@ pub fn run_show(args: &ShowArgs, out: &mut impl std::io::Write) -> CliResult<()>
 /// Render the lookup as an operator-readable summary.
 fn render(lookup: &LookupResponse) -> String {
     let mut lines = vec![
-        format!("EC ID:      {}", lookup.ec_id),
+        format!("EC ID:      {}", terminal_text(&lookup.ec_id)),
         format!(
             "Store:      {} (generation {})",
-            lookup.store, lookup.generation
+            terminal_text(&lookup.store),
+            lookup.generation
         ),
         format!(
             "Tombstone:  {}",
@@ -116,10 +119,10 @@ fn render(lookup: &LookupResponse) -> String {
         ),
     ];
     if let Some(error) = &lookup.entry_error {
-        lines.push(format!("Entry error: {error}"));
+        lines.push(format!("Entry error: {}", terminal_text(error)));
     }
     if let Some(error) = &lookup.metadata_error {
-        lines.push(format!("Metadata error: {error}"));
+        lines.push(format!("Metadata error: {}", terminal_text(error)));
     }
 
     match &lookup.auction {
@@ -137,7 +140,7 @@ fn render(lookup: &LookupResponse) -> String {
             lines.extend(auction.skipped.iter().map(|skipped| {
                 format!(
                     "  {}: {}",
-                    skipped.source_domain,
+                    terminal_text(&skipped.source_domain),
                     skipped_reason(&skipped.reason)
                 )
             }));
@@ -160,8 +163,16 @@ pub(super) fn render_eids(eids: &[EidView]) -> Vec<String> {
     eids.iter()
         .flat_map(|eid| {
             eid.uids.iter().map(|uid| match uid.atype {
-                Some(atype) => format!("  {}: {} (atype {atype})", eid.source, uid.id),
-                None => format!("  {}: {}", eid.source, uid.id),
+                Some(atype) => format!(
+                    "  {}: {} (atype {atype})",
+                    terminal_text(&eid.source),
+                    terminal_text(&uid.id)
+                ),
+                None => format!(
+                    "  {}: {}",
+                    terminal_text(&eid.source),
+                    terminal_text(&uid.id)
+                ),
             })
         })
         .collect()
@@ -173,7 +184,7 @@ fn skipped_reason(reason: &str) -> String {
         "empty_uid" => "the stored UID is empty",
         "not_in_registry" => "no configured partner has this source domain",
         "bidstream_disabled" => "the partner has bidstream_enabled = false",
-        _ => return reason.to_owned(),
+        _ => return terminal_text(reason).into_owned(),
     };
     format!("{reason} ({explanation})")
 }
@@ -233,6 +244,44 @@ mod tests {
         assert!(
             corrupt.contains("Auction preview: none"),
             "should say no EIDs would be attached, got: {corrupt}"
+        );
+    }
+
+    #[test]
+    fn summary_escapes_controls_in_every_response_text_field() {
+        let report = render(&lookup(serde_json::json!({
+            "ec_id": "id\nforged",
+            "store": "store\nforged",
+            "generation": 1,
+            "entry_error": "entry\nforged",
+            "metadata_error": "metadata\nforged",
+            "auction": {
+                "eids": [{
+                    "source": "source\nforged",
+                    "uids": [
+                        {"id": "uid\u{1b}[2J\r\n\t\u{7f}\u{85}", "atype": 1},
+                        {"id": "other\u{1b}[H"}
+                    ]
+                }],
+                "skipped": [{"source_domain": "skipped\nforged", "reason": "reason\nforged"}]
+            }
+        })));
+
+        for prefix in [
+            "id", "store", "entry", "metadata", "source", "skipped", "reason",
+        ] {
+            assert!(
+                report.contains(&format!("{prefix}\\nforged")),
+                "should keep {prefix} on one display line, got: {report:?}"
+            );
+        }
+        assert!(
+            report.contains(r"uid\u{1b}[2J\r\n\t\u{7f}\u{85} (atype 1)"),
+            "should escape C0, DEL, and C1 controls, got: {report:?}"
+        );
+        assert!(
+            report.contains(r"other\u{1b}[H"),
+            "should escape UIDs without an atype, got: {report:?}"
         );
     }
 }

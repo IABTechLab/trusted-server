@@ -8,6 +8,8 @@
 pub mod eids;
 pub mod show;
 
+use std::borrow::Cow;
+
 use clap::Subcommand;
 
 use crate::error::CliResult;
@@ -106,6 +108,25 @@ fn json_passthrough(body: &str) -> String {
     } else {
         format!("{body}\n")
     }
+}
+
+/// Escape response control characters before placing a value in a terminal report.
+///
+/// Escape only data fields, so the report's own line breaks and JSON passthrough stay
+/// unchanged. Cookie decoding can produce controls even when the cookie itself is ASCII.
+fn terminal_text(value: &str) -> Cow<'_, str> {
+    if !value.chars().any(char::is_control) {
+        return Cow::Borrowed(value);
+    }
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_debug());
+        } else {
+            escaped.push(character);
+        }
+    }
+    Cow::Owned(escaped)
 }
 
 /// Write the rendered report, mapping an I/O failure to a CLI error.

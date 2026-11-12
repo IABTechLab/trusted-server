@@ -6,8 +6,12 @@
 mod support_origin;
 
 use base64::Engine as _;
+use edgezero_core::body::Body as EdgeBody;
+use http::Request;
 use support_origin::{FixtureRequest, FixtureResponse, FixtureServer};
 use trusted_server_cli::commands::ec::{EcCommand, EidsArgs, ShowArgs, run};
+use trusted_server_core::ec::admin::handle_admin_eids_lookup;
+use trusted_server_core::ec::registry::PartnerRegistry;
 
 /// Serializes the environment across this binary's tests; see `tests/cache_purge.rs`.
 static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -391,5 +395,112 @@ fn both_commands_refuse_plaintext_remote_services() {
         let error = outcome.expect_err("should refuse plaintext remote transport");
         assert!(error.contains("HTTPS"), "got: {error}");
         assert!(rendered.is_empty());
+    }
+}
+
+#[test]
+fn eids_escapes_cookie_controls_through_the_real_admin_handler() {
+    let cookie = base64::engine::general_purpose::STANDARD.encode(
+        serde_json::json!([{
+            "source": "example.com\u{1b}[2J\nsource",
+            "uids": [{"id": "uid\u{1b}[H\nforged", "atype": 1}]
+        }])
+        .to_string(),
+    );
+    let server = FixtureServer::start(|request| {
+        let request = Request::builder()
+            .uri("https://edge.example.com/_ts/admin/eids")
+            .header(
+                "cookie",
+                request.header("cookie").expect("should send cookies"),
+            )
+            .body(EdgeBody::empty())
+            .expect("should build the admin request");
+        let registry = PartnerRegistry::from_config(&[]).expect("should build an empty registry");
+        let response = handle_admin_eids_lookup(&registry, &request)
+            .expect("should decode the browser cookie");
+        FixtureResponse::html(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("should read the response"),
+        )
+    });
+
+    let (outcome, rendered) = run_to_string(EcCommand::Eids(eids_args(
+        server.url(""),
+        Some(&cookie),
+        None,
+    )));
+
+    outcome.expect("should inspect a valid encoded cookie");
+    assert!(
+        rendered.contains(r"example.com\u{1b}[2J\nsource: uid\u{1b}[H\nforged (atype 1)"),
+        "should render decoded values as text, got: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains('\u{1b}'),
+        "should not emit terminal escape bytes, got: {rendered:?}"
+    );
+}
+
+#[test]
+fn both_commands_escape_control_characters_in_refusal_messages() {
+    for body in [
+        serde_json::json!({"error": "refused\u{1b}[2J\nforged"}).to_string(),
+        "refused\u{1b}[2J\nforged".to_owned(),
+    ] {
+        let server =
+            FixtureServer::start(move |_| FixtureResponse::html(body.clone()).with_status(500));
+        for command in [
+            EcCommand::Show(show_args(server.url(""), &ec_id(), false)),
+            EcCommand::Eids(eids_args(server.url(""), None, Some("shared-fictional"))),
+        ] {
+            let (outcome, rendered) = run_to_string(command);
+            let error = outcome.expect_err("should report the refusal");
+            assert!(
+                error.contains(r"refused\u{1b}[2J\nforged"),
+                "should escape server text before logging, got: {error:?}"
+            );
+            assert!(rendered.is_empty(), "should print no success report");
+        }
+    }
+}
+
+#[test]
+fn both_json_modes_preserve_response_escaping_and_formatting() {
+    for (is_show, mut body) in [
+        (
+            true,
+            serde_json::from_str::<serde_json::Value>(&lookup_body()).expect("should parse lookup"),
+        ),
+        (
+            false,
+            serde_json::from_str::<serde_json::Value>(&eids_body()).expect("should parse preview"),
+        ),
+    ] {
+        body["extra"] = serde_json::json!("raw\u{1b}[2J\n\tconsent");
+        let body = format!(
+            "{}\n\t",
+            serde_json::to_string_pretty(&body).expect("should encode response")
+        );
+        let served = body.clone();
+        let server = FixtureServer::start(move |_| FixtureResponse::html(served.clone()));
+        let command = if is_show {
+            EcCommand::Show(show_args(server.url(""), &ec_id(), true))
+        } else {
+            let mut args = eids_args(server.url(""), None, Some("shared-fictional"));
+            args.json = true;
+            EcCommand::Eids(args)
+        };
+
+        let (outcome, rendered) = run_to_string(command);
+
+        outcome.expect("should preserve a valid JSON response");
+        assert_eq!(
+            rendered,
+            format!("{body}\n"),
+            "should preserve every response byte"
+        );
     }
 }

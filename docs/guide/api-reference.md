@@ -867,6 +867,10 @@ response to standard output and write nothing to disk or to the CLI log. The
 responses carry raw consent strings and partner UIDs, so treat the output as
 sensitive. `curl` remains a fallback.
 
+Human-readable summaries and refusal messages escape control characters in response
+values, so decoded identifiers cannot change terminal state or insert extra report lines.
+`--json` preserves the service's JSON encoding and formatting.
+
 The examples below use fictional IDs and values only.
 
 ### GET /\_ts/admin/ec

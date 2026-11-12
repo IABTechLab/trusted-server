@@ -5,7 +5,9 @@ use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 
 use crate::admin_client::{AdminClient, AdminRequest, UNAUTHORIZED_HINT};
 use crate::commands::ec::show::{EidView, render_eids};
-use crate::commands::ec::{EidsArgs, json_passthrough, unexpected_answer, write_report};
+use crate::commands::ec::{
+    EidsArgs, json_passthrough, terminal_text, unexpected_answer, write_report,
+};
 use crate::error::{CliResult, cli_error};
 
 const ADMIN_EIDS_PATH: &str = "/_ts/admin/eids";
@@ -63,7 +65,7 @@ pub fn run_eids(args: &EidsArgs, out: &mut impl std::io::Write) -> CliResult<()>
         return cli_error(format!(
             "EIDs preview failed: {}{explanation}\n{}",
             response.status,
-            response.error_text()
+            terminal_text(&response.error_text())
         ));
     }
 
@@ -117,7 +119,7 @@ fn cookie_header(ts_eids: Option<&str>, shared_id: Option<&str>) -> CliResult<St
 fn render(preview: &EidsResponse) -> String {
     let ts_eids = match (preview.cookie_present, &preview.parse_error, &preview.eids) {
         (false, _, _) => "not received by the service".to_owned(),
-        (true, Some(error), _) => format!("received, not parsed: {error}"),
+        (true, Some(error), _) => format!("received, not parsed: {}", terminal_text(error)),
         (true, None, eids) => format!(
             "received, {} EID source(s) parsed",
             eids.as_ref().map_or(0, Vec::len)
@@ -147,13 +149,13 @@ fn render(preview: &EidsResponse) -> String {
         "Matched partner IDs ({}):",
         preview.ingest.matched.len()
     ));
-    lines.extend(
-        preview
-            .ingest
-            .matched
-            .iter()
-            .map(|matched| format!("  {}: {}", matched.source_domain, matched.uid)),
-    );
+    lines.extend(preview.ingest.matched.iter().map(|matched| {
+        format!(
+            "  {}: {}",
+            terminal_text(&matched.source_domain),
+            terminal_text(&matched.uid)
+        )
+    }));
     lines.push(String::new());
     lines.push(format!(
         "Unmatched EID sources ({}):",
@@ -162,7 +164,7 @@ fn render(preview: &EidsResponse) -> String {
     lines.extend(preview.ingest.unmatched.iter().map(|dropped| {
         format!(
             "  {}: {}",
-            dropped.source,
+            terminal_text(&dropped.source),
             unmatched_reason(&dropped.reason)
         )
     }));
@@ -184,7 +186,7 @@ fn unmatched_reason(reason: &str) -> String {
     let explanation = match reason {
         "no_partner" => "no configured partner recognizes this source",
         "no_valid_uid" => "every UID is empty or exceeds the storage limit",
-        _ => return reason.to_owned(),
+        _ => return terminal_text(reason).into_owned(),
     };
     format!("{reason} ({explanation})")
 }
@@ -269,7 +271,7 @@ mod tests {
     fn a_cookie_parse_error_is_shown() {
         let preview: EidsResponse = serde_json::from_value(serde_json::json!({
             "cookie_present": true,
-            "parse_error": "failed to parse ts-eids cookie: bad base64",
+            "parse_error": "failed to parse ts-eids cookie: bad base64\u{1b}[2J\nforged",
             "sharedid_present": true,
             "partners_configured": 0,
             "ingest": {"matched": [], "unmatched": []}
@@ -279,9 +281,36 @@ mod tests {
         let report = render(&preview);
 
         assert!(
-            report.contains("received, not parsed: failed to parse ts-eids cookie: bad base64"),
-            "got: {report}"
+            report.contains(
+                r"received, not parsed: failed to parse ts-eids cookie: bad base64\u{1b}[2J\nforged"
+            ),
+            "should escape diagnostic text, got: {report:?}"
         );
         assert!(report.contains("Matched partner IDs (0):"));
+    }
+
+    #[test]
+    fn summary_escapes_matched_and_unmatched_response_text() {
+        let preview: EidsResponse = serde_json::from_value(serde_json::json!({
+            "cookie_present": false,
+            "sharedid_present": true,
+            "partners_configured": 1,
+            "ingest": {
+                "matched": [{"source_domain": "matched\nforged", "uid": "uid\u{1b}[2J"}],
+                "unmatched": [{"source": "unmatched\nforged", "reason": "reason\nforged"}]
+            }
+        }))
+        .expect("should parse preview");
+
+        let report = render(&preview);
+
+        assert!(
+            report.contains(r"matched\nforged: uid\u{1b}[2J"),
+            "should escape both matched fields, got: {report:?}"
+        );
+        assert!(
+            report.contains(r"unmatched\nforged: reason\nforged"),
+            "should escape both unmatched fields, got: {report:?}"
+        );
     }
 }

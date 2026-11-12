@@ -95,7 +95,7 @@ The endpoint-joining and URL-rejection unit tests move with the code they test.
    `unknown` when the entry did not parse), any `entry_error` or
    `metadata_error`, the auction EIDs one UID per line, and each skipped
    partner ID with its server reason code plus a plain explanation. Reason codes
-   the CLI does not know are printed verbatim. When `auction` is absent, the
+   the CLI does not know are preserved, with control characters escaped. When `auction` is absent, the
    output says the entry did not validate, so the auction attaches no EIDs from
    it. A closing line repeats the server's caveat that live auctions also apply
    per-request consent checks.
@@ -163,6 +163,13 @@ The default `show` summary prints `entry_error` and `metadata_error`. The server
 builds these from parse failures, so they can quote stored values, and
 `metadata_error` can embed the raw metadata bytes. Like the rest of the record,
 they go to standard output only. `raw_body` is printed only by `--json`.
+
+Human-readable summaries escape control characters in all response-derived text,
+including sources, UIDs and diagnostic errors. Refusal messages apply the same
+escaping before reaching the CLI logger. This prevents decoded cookie values or
+stored records from injecting terminal controls or additional report lines.
+Printable text stays unchanged, and `--json` retains the original response bytes
+and formatting, apart from the documented missing final newline.
 
 `--ts-eids` and `--shared-id` are command-line arguments, as the issue
 specifies, so their values appear in shell history and `ps`. They are cookie
