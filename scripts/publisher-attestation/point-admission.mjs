@@ -30,6 +30,7 @@ function point(bytes) {
   return [x, y]
 }
 export function strictPoint(bytes) {
+  assert.equal(bytes.length, 32, 'point must contain exactly 32 bytes')
   let [x, y] = point(bytes)
   for (let i = 0; i < 3; i++) {
     const product = mod(curve * x * x * y * y)

@@ -104,11 +104,11 @@ This is a target support table, not a statement that endpoints are implemented t
 
 ### PA-IDENTITY: keep the identities distinct
 
-**Publisher host** is the public DNS name being checked, such as `news.example.com`. **Backend origin** is the upstream content source and is not publisher identity. **Publisher ID** is an opaque UUID assigned by the publisher; it is not evidence of legal identity. **Operator ID** is a stable HTTPS identifier for a separately claimed operator, or null when the publisher acts for itself. A non-null identifier requires independent technical authorization; it is not legal-entity certification or trusted merely because it is a URL. Verifiers MUST NOT fetch arbitrary operator-ID URLs. An operator identifier's optional path is descriptive scope only: its host's DNS controller can authorize every path beneath that host. Different paths do not prove independently controlled operators.
+**Publisher host** is the public DNS name being checked, such as `news.example.com`. **Backend origin** is the upstream content source and is not publisher identity. **Publisher ID** is the canonical owner DNS domain, such as `owner.example.com`, independently authorized by the verifier for an authenticated publisher account. A **site** is an exact enrolled host belonging to that publisher; one publisher may own many sites on unrelated domains. The signed identifier means that this verifier authorized that site for that publisher, not that it certified legal identity or a sellers.json account. Backend routing, cookie scope and the site domain do not establish publisher authority. Registry PA-PUBLISHER defines the proof and membership record. **Operator ID** is a stable HTTPS identifier for a separately claimed operator, or null when the publisher acts for itself. A non-null identifier requires independent technical authorization; it is not legal-entity certification or trusted merely because it is a URL. Verifiers MUST NOT fetch arbitrary operator-ID URLs. An operator identifier's optional path is descriptive scope only: its host's DNS controller can authorize every path beneath that host. Different paths do not prove independently controlled operators.
 
 **Deployment ID** is a publisher-assigned UUID stable for one intended logical deployment. Separate production/staging deployments MUST use different deployment IDs and keys. On Fastly, the runtime opens stores through logical IDs; isolation comes from the physical resources linked to the selected service version (`RuntimeStoreConfig::logical`). Distinct production and staging versions of the same service can link different physical configuration and secret stores; a separate service is another isolation option. Activating the same version on both networks retains that version's links and does not isolate its settings or key. Production and staging MUST NOT share attestation identity configuration or private keys, and any supported staging path must demonstrate its version-specific store isolation. PA-BINDING defines the fail-closed staging/environment consistency check; sharing a service ID alone is not a reason to reject an otherwise qualified isolated deployment. Cloning a service does not authorize reuse of an enrollment. **Binding ID** is the digest of the exact version/configuration/key descriptor defined below. A new service version, attestation key, or covered configuration value changes the binding ID. Assessment renewal does not change it.
 
-Consumers MUST compare the full binding, not assume UUID uniqueness makes assertions true. Enrollment authorizes the tuple `(host, publisher_id, operator_id, deployment_id, provider, service_id, environment, attestation_key_thumbprint)` for each authorization generation; a routine key rotation is a new generation of the same enrollment (registry PA-ENROLLMENT), while versions and binding IDs are separately checked at assessment time.
+Consumers MUST compare the full binding, not assume identifier uniqueness makes assertions true. Enrollment authorizes the tuple `(host, publisher_id, operator_id, deployment_id, provider, service_id, environment, attestation_key_thumbprint)` for each authorization generation; a routine key rotation is a new generation of the same enrollment (registry PA-ENROLLMENT), while versions and binding IDs are separately checked at assessment time.
 
 ### 2.1 Attacker capabilities and residual trust
 
@@ -175,9 +175,7 @@ Evidence, assessments, and status use compact JWS. The response body is the comp
 
 12. Library defaults are not assumed to be strict: the existing request-signing verifier calls `VerifyingKey::verify`, so attestation code must use a strict entry point such as `verify_strict` instead of reusing that call unchanged.
 
-13. Canonical public-key point encoding must also be checked explicitly by decoding and re-encoding the point and requiring the original bytes; a library's strict signature entry point is not assumed to perform every JWK admission check.
-
-Time comparisons use these boundaries throughout: an object is valid while `now < expires_at` (expiry is exclusive) and once `now >= not_before` (not-before is inclusive). Clock-skew allowances never extend an expiry.
+13. Time comparisons use exclusive expiry (`now < expires_at`) and inclusive not-before (`now >= not_before`). Clock skew applies only to future issuance, never to key validity or expiry. Canonical public-key point encoding must also be checked explicitly by decoding and re-encoding the point and requiring the original bytes; a library's strict signature entry point is not assumed to perform every JWK admission check. With ed25519-dalek, `to_bytes()` returns the supplied encoding; compare against `to_edwards().compress().to_bytes()` instead.
 
 14. Sign and verify the original JWS segments; never reserialize a decoded payload to check its signature.
 
@@ -191,7 +189,7 @@ Time comparisons use these boundaries throughout: an object is valid while `now 
 
 19. Claim strings have a 256-byte UTF-8 limit unless specified otherwise.
 
-20. This bound is not applied to compact JWS serialization or its encoded segments.
+20. The claim-string bound does not apply to compact JWS serialization or its encoded segments.
 
 21. An assessment-list item is an explicitly exempt compact-JWS string of at most 32,768 ASCII bytes; the list remains bounded to 16 items and 524,288 total response bytes.
 
@@ -225,7 +223,7 @@ Time comparisons use these boundaries throughout: an object is valid while `now 
 
 36. The accompanying [wire schema](schemas/publisher-attestation-v1.schema.json) uses JSON Schema draft-07 with local references and no remote schema fetch.
 
-37. It omits a `$schema` URI, so validators must select draft-07 explicitly.
+37. The wire schema omits a `$schema` URI, so validators must select draft-07 explicitly.
 
 38. Its definitions cover protected headers, signed payloads, discovery/list envelopes, enrollment challenges, and stored public metadata.
 
@@ -251,7 +249,7 @@ The `binding` object is closed and has these required fields:
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `schema`          | Literal `ts-publisher-binding-v1`                                                                                                                 |
 | `host`            | Canonical authorized publisher host                                                                                                               |
-| `publisher_id`    | Canonical lowercase UUID                                                                                                                          |
+| `publisher_id`    | Canonical owner DNS domain authorized under registry PA-PUBLISHER                                                                                 |
 | `operator_id`     | Canonical HTTPS identifier (PA-IDENTIFIER), or null for publisher self-operation                                                                  |
 | `deployment_id`   | Canonical lowercase UUID                                                                                                                          |
 | `environment`     | `production`, `staging`, or `development`                                                                                                         |
@@ -322,13 +320,77 @@ The normative assessment/status fields, policy outcomes and optional status mode
 | Invalid or mismatched host selection                                                 | `421`; no signing or origin fallback                   |
 | Optional configured platform admission limiter denies the request                    | MAY return `429`; no signed payload                    |
 
-Both endpoints support GET and HEAD. HEAD applies the same validation, status and headers as GET, suppresses the response body, and performs no signature operation; it does not itself prove key possession. Other methods, including OPTIONS, return 405 with `Allow: GET, HEAD` when enabled; disabled paths return 404 for every method. Browser clients need no custom request headers. Only the two exact paths in the table are reserved; neighboring paths retain existing routing and may reach the publisher fallback. No whole-prefix takeover or configurable endpoint is introduced in version 1. The evidence endpoint requires exactly one `nonce` parameter with the canonical encoding above. It accepts at most one optional `kid` parameter naming the JWK thumbprint of a key listed in `discovery_keys`; without it the endpoint signs with `active_key`. A syntactically valid `kid` that does not match the configured inventory returns 400 `unknown_kid`. An unresolved or ambiguous inventory, expired/not-yet-valid selected key, or metadata/seed mismatch returns 503 `unavailable`. Selection never falls back to another key. The `kid` parameter exists so a verifier can prove possession of a staged successor key before it becomes active (PA-KEYS); consumers never need it. A repeated parameter in one request is malformed; the stateless edge does not maintain a global used-nonce cache. Single-use outstanding challenges are tracked by the caller/verifier that generated them. The keys endpoint accepts no query parameters. Request bodies are rejected with 400. Nonce-free evidence is not a conforming freshness check.
+1. Both endpoints support GET and HEAD.
 
-Error responses on both paths carry `Content-Type: application/json` and a closed body `{"schema":"ts-publisher-error-v1","error":<code>}` of at most 256 bytes, where `<code>` is one of `invalid_request` (400), `unknown_kid` (400), `not_found` (404), `method_not_allowed` (405), `misdirected_request` (421), `rate_limited` (429) or `unavailable` (503). The body never names the failing setting, key or store. When several conditions apply, the endpoint evaluates them in this order and returns the first failure: exact reserved path (otherwise ordinary routing), attestation enabled for this deployment (404), method (neither GET nor HEAD is 405), trusted host selection (421), query/body syntax and bounds, including canonical `kid` encoding (400), optional configured platform admission limiter (429 when present), key-inventory resolution (400 `unknown_kid` or 503 `unavailable`), then selected-key validity, identity, clock, snapshot and staging/environment consistency (503). Inventory resolution and secret reads occur after admission; a well-formed unknown `kid` is therefore not looked up when admission already denies the request.
+2. HEAD applies the same validation, status and headers as GET, suppresses the response body, and performs no signature operation; it does not itself prove key possession.
 
-All responses on these paths, including errors and public discovery, MUST have `Cache-Control: no-store, private`, `Surrogate-Control: no-store`, and `X-Content-Type-Options: nosniff`. No ETag, Last-Modified, Set-Cookie, authentication redirect, or shared-cache lifetime is emitted. Conditional requests do not produce 304. Responses are independent of reader cookies and contain no user IDs or client IP. Wildcard CORS is permitted for these public GET resources with no credentials; credentialed CORS is prohibited. A human-readable status page is not required. Any later UI must explain declarations versus verifier results and cannot present its own rendering as verification.
+3. Other methods, including OPTIONS, return 405 with `Allow: GET, HEAD` when enabled; disabled paths return 404 for every method.
 
-Discovery is `{ "schema": "ts-publisher-key-discovery-v1", "host": <host>, "keys": [...], "verifiers": [...] }`. `verifiers` is a unique list of at most 16 canonical HTTPS issuer identifiers (PA-IDENTIFIER) configured by the publisher, empty by default. An entry advertises a possible source of assessments, not proof that the issuer endorses this host. Consumers match it to independently configured issuer/trust information before any lookup; it never supplies a trust key or authority to fetch arbitrary URLs. `keys` holds one to four entries, and each contains only `kid`, public `jwk`, `not_before`, and `not_after`. Include active and overlap keys; no private key, secret reference, provider token, or mutable URL-as-key-authority. Discovery is untrusted until matched to enrollment/assessment, and cannot replace retained historical key records. It contains no verifier trust roots.
+4. Browser clients need no custom request headers.
+
+5. Only the two exact paths in the table are reserved; neighboring paths retain existing routing and may reach the publisher fallback.
+
+6. No whole-prefix takeover or configurable endpoint is introduced in version 1.
+
+7. The evidence endpoint requires exactly one `nonce` parameter with the canonical encoding above.
+
+8. It accepts at most one optional `kid` parameter naming the JWK thumbprint of a key listed in `discovery_keys`; without it the endpoint signs with `active_key`.
+
+9. A syntactically valid `kid` that does not match the configured inventory returns 400 `unknown_kid`.
+
+10. An unresolved or ambiguous inventory, expired/not-yet-valid selected key, or metadata/seed mismatch returns 503 `unavailable`.
+
+11. Selection never falls back to another key.
+
+12. The `kid` parameter exists so a verifier can prove possession of a staged successor key before it becomes active (PA-KEYS); consumers never need it.
+
+13. A repeated parameter in one request is malformed; the stateless edge does not maintain a global used-nonce cache.
+
+14. Single-use outstanding challenges are tracked by the caller/verifier that generated them.
+
+15. The keys endpoint accepts no query parameters.
+
+16. Request bodies are rejected with 400.
+
+17. Nonce-free evidence is not a conforming freshness check.
+
+18. Error responses on both paths carry `Content-Type: application/json` and a closed body `{"schema":"ts-publisher-error-v1","error":<code>}` of at most 256 bytes, where `<code>` is one of `invalid_request` (400), `unknown_kid` (400), `not_found` (404), `method_not_allowed` (405), `misdirected_request` (421), `rate_limited` (429) or `unavailable` (503).
+
+19. The body never names the failing setting, key or store.
+
+20. When several conditions apply, the endpoint evaluates them in this order and returns the first failure: exact reserved path (otherwise ordinary routing), attestation enabled for this deployment (404), method (neither GET nor HEAD is 405), trusted host selection (421), query/body syntax and bounds, including canonical `kid` encoding (400), optional configured platform admission limiter (429 when present), key-inventory resolution (400 `unknown_kid` or 503 `unavailable`), then selected-key validity, identity, clock, snapshot and staging/environment consistency (503).
+
+21. Inventory resolution and secret reads occur after admission; a well-formed unknown `kid` is therefore not looked up when admission already denies the request.
+
+22. All responses on these paths, including errors and public discovery, MUST have `Cache-Control: no-store, private`, `Surrogate-Control: no-store`, and `X-Content-Type-Options: nosniff`.
+
+23. No ETag, Last-Modified, Set-Cookie, authentication redirect, or shared-cache lifetime is emitted.
+
+24. Conditional requests do not produce 304.
+
+25. Responses are independent of reader cookies and contain no user IDs or client IP.
+
+26. Wildcard CORS is permitted for these public GET resources with no credentials; credentialed CORS is prohibited.
+
+27. A human-readable status page is not required.
+
+28. Any later UI must explain declarations versus verifier results and cannot present its own rendering as verification.
+
+29. Discovery is `{ "schema": "ts-publisher-key-discovery-v1", "host": <host>, "keys": [...], "verifiers": [...] }`.
+
+30. `verifiers` is a unique list of at most 16 canonical HTTPS issuer identifiers (PA-IDENTIFIER) configured by the publisher, empty by default.
+
+31. An entry advertises a possible source of assessments, not proof that the issuer endorses this host.
+
+32. Consumers match it to independently configured issuer/trust information before any lookup; it never supplies a trust key or authority to fetch arbitrary URLs.
+
+33. `keys` holds one to four entries, and each contains only `kid`, public `jwk`, `not_before`, and `not_after`.
+
+34. Include active and overlap keys; no private key, secret reference, provider token, or mutable URL-as-key-authority.
+
+35. Discovery is untrusted until matched to enrollment/assessment, and cannot replace retained historical key records.
+
+36. It contains no verifier trust roots.
 
 ### PA-ROUTING: trusted host selection before evidence
 
@@ -336,7 +398,13 @@ Version 1 protocol boundaries accept canonical lowercase ASCII DNS names only. E
 
 For trusted ingress authority only, lowercase ASCII and remove one final ASCII dot before comparing with enrolled canonical host. Reject a second terminal dot, empty labels, userinfo, percent escapes, wildcards, IP literals, invalid ports, and ambiguous/conflicting authority sources. Reject a final host label consisting entirely of decimal digits or `0x` followed by zero or more hexadecimal digits before URL parsing; this includes shortened and hexadecimal IPv4 forms. Labels are 1–63 octets and the host at most 253 ASCII octets, with letters/digits/hyphens and no leading/trailing hyphen. Prefixed DNS challenge owners must separately fit DNS limits. Production uses HTTPS port 443; another port is not silently treated as the same origin. Host and URI authority, when both present, must agree after this normalization. Client-supplied forwarded headers never select signed host identity. Retain the original trusted ingress host before module header rewriting. International-name conversion rules belong to operator tooling and its compatibility tests, not a second implicit identity equivalence rule.
 
-The baseline has one settings snapshot per service and no host-based configuration selector. Use that verified snapshot and require its configured attestation host to match the trusted ingress host exactly. Configuration validation requires the attestation host to equal canonical `publisher.domain` or be its subdomain at a DNS label boundary; this accommodates a publisher cookie domain such as `example.com` and an exact attested host such as `news.example.com`. This relationship is a configuration consistency rule, not authorization: registry enrollment independently proves the exact attested host/key, and no parent domain or cookie scope grants that proof. Unknown/mismatched hosts MUST NOT borrow another host's settings or sign a statement; return 421 when host selection is invalid. Version 1 attests exactly one host per configured deployment: a service that also answers for another name (for example both `example.com` and `www.example.com`) returns 421 on the reserved paths for the unconfigured name. Each attested host has its own `[attestation]` configuration, enrollment and key, and the binding's `host` distinguishes them even if an operator reuses a `deployment_id` across hosts of one logical deployment. Several attested hosts on one service require configuration-by-host support, which this spec does not assume; that is a follow-up, not a version 1 capability.
+The baseline has one settings snapshot per service and no host-based configuration selector.
+
+1. Use that verified snapshot and require its configured attestation host to match the original trusted ingress host exactly; otherwise return 421. Do not borrow another host's settings.
+2. `publisher.domain` currently feeds site fields in the runtime; `publisher.cookie_domain` is a separate setting. Neither setting establishes owner identity. The attestation host is independently enrolled as the site, with no parent/subdomain restriction relative to either setting.
+3. Version 1 configuration remains a single `[attestation]` table and one attested host per deployment. Other aliases return 421 on reserved paths. Consumers check the exact `site.domain` or page host; an alias may be checked under its canonical host only after independently establishing the site's redirect and recording that comparison target. Never substitute `site.publisher.domain`, which describes the seller.
+4. Each site has its own enrollment, deployment configuration and attestation key. Cross-site key reuse is prohibited in v1 to limit a compromise to one site; separate production/staging keys remain mandatory. A site stores one to four seeds during rotation, so provisioning must account for per-site secret quota and repeated staged-key/DNS proofs. This is a deliberate operational cost, not a protocol replay limitation.
+5. Configuration-by-host, a list-shaped multi-site configuration, separately enrolled aliases sharing one deployment, and authorized publisher-wide keys are named follow-ups. They require their own configuration migration and compromise/rotation design; this v1 does not claim them.
 
 ### PA-IDENTIFIER: canonical HTTPS identifiers
 
@@ -344,7 +412,11 @@ The baseline has one settings snapshot per service and no host-based configurati
 
 Dispatch evidence after ingress sanitization and host/snapshot resolution, but before Edge Cookie creation, consent processing, device classification, bot challenges, request filters, publisher backend calls, and auctions. An explicit attestation exception to generic authentication is needed so a verifier can reach the public endpoint; it applies only to these exact read-only paths and is covered by route tests. Normal routes retain existing authentication and filtering.
 
-This needs an explicit startup seam as well as a route exception. The baseline constructs auction/integration state and resolves ordinary application secrets before normal dispatch. Implementation must acquire the verified, identically normalized nonsecret configuration snapshot without `resolve_secret_references`, then load attestation identity independently of those unrelated initialization steps, then dispatch the evidence request without creating the auction application. When ordinary application construction succeeds, both paths must use the same loader normalization and snapshot provenance; retained sandboxes must not mix snapshots. An unrelated bidder/secret initialization failure is not an attestation-key failure and must not force the proof path through that failing component. Evidence describes the attestation request's actual snapshot, not a guarantee that ordinary site traffic is healthy. Invalid own host/identity configuration still fails safely. On Fastly, the evidence path performs at most one secret-store read (the selected seed); public discovery performs zero. The [current provider documentation](https://www.fastly.com/documentation/guides/compute/edge-data-storage/working-with-secret-stores/) lists five secret reads per Compute request and a paid-account minimum of ten secrets across stores, with additional secrets purchasable; these are account-plan constraints to recheck when provisioning, not a universal ten-secret hard cap. Neither path resolves ordinary application secrets. These counts, including unrelated missing bidder secrets and staged-key selection, are T5/T7 acceptance criteria.
+This needs an explicit startup seam as well as a route exception. The baseline constructs auction/integration state and resolves ordinary application secrets before normal dispatch. Implementation must acquire the verified, identically normalized nonsecret configuration snapshot without `resolve_secret_references`, then load attestation identity independently of those unrelated initialization steps, then dispatch the evidence request without creating the auction application.
+
+When ordinary application construction succeeds, both paths must use the same loader normalization and snapshot provenance; retained sandboxes must not mix snapshots. An unrelated bidder/secret initialization failure is not an attestation-key failure and must not force the proof path through that failing component. Evidence describes the attestation request's actual snapshot, not a guarantee that ordinary site traffic is healthy. Invalid own host/identity configuration still fails safely.
+
+On Fastly, the evidence path performs at most one secret-store read (the selected seed); public discovery performs zero. The [current provider documentation](https://www.fastly.com/documentation/guides/compute/edge-data-storage/working-with-secret-stores/) lists five secret reads per Compute request and a paid-account minimum of ten secrets across stores, with additional secrets purchasable; these are account-plan constraints to recheck when provisioning, not a universal ten-secret hard cap. Neither path resolves ordinary application secrets. These counts, including unrelated missing bidder secrets and staged-key selection, are T5/T7 acceptance criteria.
 
 Use the existing terminal `/_ts/trace` dispatcher as the routing/finalization precedent, with an attestation-specific terminal response marker and no trace-session/auth dependency. Attestation paths bypass ordinary filters, Edge Cookie finalization, telemetry, geo headers, and configured `response_headers`, as well as version/environment diagnostic headers. Enforce the attestation status, headers and HEAD body suppression at the final adapter boundary. Ordinary finalizers must not append client-derived location or identity data after this terminal response. A diagnostic endpoint is not a path to execute arbitrary modules or sign arbitrary bytes. Provider identity and trusted host come from adapter-owned data, not custom integration headers.
 
@@ -354,7 +426,7 @@ Use the existing terminal `/_ts/trace` dispatcher as the routing/finalization pr
 [attestation]
 enabled = true
 host = "news.example.com"
-publisher_id = "11111111-1111-4111-8111-111111111111"
+publisher_id = "owner.example.com"
 operator_id = "https://operator.example.com/publisher-attestation"
 deployment_id = "22222222-2222-4222-8222-222222222222"
 environment = "production"
@@ -426,7 +498,7 @@ Version 1 claims a deliberately narrow identity projection:
 {
   "schema": "ts-publisher-identity-v1",
   "host": "news.example.com",
-  "publisher_id": "11111111-1111-4111-8111-111111111111",
+  "publisher_id": "owner.example.com",
   "operator_id": "https://operator.example.com/publisher-attestation",
   "deployment_id": "22222222-2222-4222-8222-222222222222",
   "environment": "production"
@@ -472,7 +544,7 @@ Version 1 attestation is a host-level check performed out of band, not a per-bid
 What a version 1 consumer can conclude about bid traffic is deliberately limited:
 
 - An accepted result says that, at evaluation time, an independently enrolled key for the host answered a fresh challenge and described the stated deployment.
-- A bid request naming the same domain in `site.domain`, `site.publisher.domain` or `ext.trusted_server.request_host` is not cryptographically linked to that result. Those fields are claims made by whoever sent the request.
+- Compare the attested site with `site.domain` or the independently selected page host, never `site.publisher.domain` (the seller domain). Such a match is still a sender claim, not a cryptographic link between the bid request and this result.
 - Trusted Server's existing request signing (`ext.trusted_server.signature` with a `kid` published at `/.well-known/trusted-server.json`) proves only that a key served from that host's HTTPS origin signed the request. Version 1 keeps request-signing keys separate from attestation keys and does not attest them.
 
 A separately versioned request-signing bridge is an optional future candidate, not a selected next profile or a version 1 deliverable. It could connect request-signing keys to an assessed deployment, but its claims, encoding, rotation and reassessment behavior require the later auction/bid design. This specification leaves stable deployment, key and assessment identifiers for that work; it does not prescribe an extension shape, freeze the later wire format, or pre-approve a cryptographic link. Signing auction or bid payloads with the attestation key remains out of scope.
@@ -489,6 +561,7 @@ This repository delivers the publisher endpoint, portable types/pure verificatio
 | ---------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------- |
 | `malformed`                  | Invalid syntax, schema, limits, or inconsistent hashes                             | Reject                                      |
 | `signature_invalid`          | Wrong key, message type, or signature                                              | Reject                                      |
+| `publisher_unauthorized`     | Publisher/account/site authorization absent, out of scope, expired or withdrawn    | Reject enrollment/issuance                  |
 | `operator_unauthorized`      | Claimed operator identifier lacks valid independent account association/delegation | Reject enrollment/issuance                  |
 | `state_recovery_required`    | Durable authorization history or fencing cannot be established                     | Stop signing/current status                 |
 | `host_mismatch`              | Expected host or enrolled authorization differs                                    | Reject                                      |
@@ -507,7 +580,7 @@ This repository delivers the publisher endpoint, portable types/pure verificatio
 | `withdrawn`                  | Assessment or enrollment withdrawn                                                 | Reject current acceptance                   |
 | `status_unavailable`         | Explicitly required live status cannot be validated                                | Reject current official assurance           |
 | `policy_untrusted`           | Unknown issuer/policy/method or threshold not met                                  | Reject endorsement                          |
-| `clock_unavailable`          | Reliable current time unavailable                                                  | Stop current assurance                      |
+| `clock_unavailable`          | Platform time operation fails; arbitrary clock drift is not detectable             | Stop current assurance                      |
 
 No API response should reduce these distinctions to a universal `trusted: true`. Public verdicts include expected host, issuer/policy, observation interval, expiry, build class/assurance, coverage, and reason codes. They also state the residual that applies to every profile, including the official one: the publisher key is held by the operator and is not bound to the code that uses it. A declaration can satisfy the declaration profile without satisfying official-deployment policy. A custom build is not intrinsically a failure; it fails a policy that requires official bytes.
 
@@ -583,7 +656,7 @@ Tests use fictional hosts/data and generated test-only keys, never operator cred
 | T4 routes/privacy      | No bot/auth/EC/consent/auction dependency; disabled reserved paths; unsupported methods; unchanged neighbors; no backend calls; conditional requests; final no-store; CORS; no user identifiers; closed error body and evaluation order when several conditions apply                                                                                                                                                                                                                                                  | PA-HTTP, PA-ROUTING, PA-PRIVACY        |
 | T5 runtime keys/stores | No key; corrupt seed; public-key mismatch; rotation propagation; staged-key proof before activation; bounded discovery list; missing overlap metadata; no enumeration; evidence at most one secret read, discovery zero, unrelated app-secret failures isolated; expiry in cached sandbox; Fastly staging flag contradicting the configured environment returns 503; no secret disclosure; namespace collisions; strict disabled validation/provision/config push without inventory expansion; absent optional entries | PA-CONFIG, PA-KEYS                     |
 | T6 runtime snapshots   | Actual retained versus latest config; projected versus uncovered changes; declared scope; multi-host mismatch; cached sandbox; version/config/key changes                                                                                                                                                                                                                                                                                                                                                              | PA-SNAPSHOT                            |
-| T7 adapter integration | Running Fastly evidence independently verified; isolated Axum development declarations; canonical host consistent across ingress/TLS; ordinary deploy emits new version binding and rejects old assessment combination                                                                                                                                                                                                                                                                                                 | PA-REFERENCE, PA-BINDING               |
+| T7 adapter integration | Running Fastly evidence independently verified; evidence reads at most one selected seed and discovery reads zero, even with missing ordinary bidder secrets; isolated Axum development declarations; canonical host consistent across ingress/TLS; ordinary deploy emits new version binding and rejects old assessment combination                                                                                                                                                                                   | PA-REFERENCE, PA-BINDING               |
 
 Registry enrollment, appraisal, consumer acceptance, provider collection and durable recovery tests belong to the [registry verification matrix](2026-11-04-publisher-attestation-registry-design.md#registry-verification-matrix). Provider executable-binding experiments belong to the Fastly qualification companion. These separate acceptance boundaries do not require auction/bid implementation.
 
@@ -625,7 +698,7 @@ Before implementation/production adoption, the task force must decide:
 
 1. Which Fastly selected-executable binding method passes qualification? If none does, is a clearly narrower declaration/fingerprint milestone useful without closing the strong feature?
 2. Who will operate verifiers, which policies/keys consumers should trust, and whether any consumer requires the optional live-status mode?
-3. Which operator DNS/account-delegation methods are accepted, and how DNS renewal automation is supported? Persistent issuer/key/scope authorization is a follow-up alternative, not an unreviewed replacement for fresh challenges.
+3. Which publisher/site and operator DNS/account-delegation methods are accepted, and how is DNS renewal automated for a multi-site publisher? The v1 baseline costs about 400 site DNS updates per 30 days for 200 sites and two verifiers, plus owner/operator proofs. Persistent per-site delegation with publisher-level fresh renewal is the named alternative and requires explicit revocation rules.
 4. Which governance/appeal procedures and registry service agreements apply, including allocation of legal responsibilities? Cryptographic validity does not settle those terms.
 5. What deployment and acceptance scope should the stacked demo registry have? It cannot present fictional evidence as production qualification.
 6. Is independently checked full configuration or outermost traffic placement required in a later profile? Each needs a new evidence/privacy contract and qualification; neither may be inferred from official bytes.
@@ -651,3 +724,5 @@ These are explicit approval/qualification gates, not implementation TODOs or per
 - **Correction follow-up (Codex, both independent reviewers):** No remaining blocking findings in the design/fixture scope. Forty focused cases cover expiry-only/live cache behavior, original timestamp deadlines, sequence invalidation and strict signature boundaries. This does not qualify runtime behavior or the Fastly method.
 
 - **Maintainer-feedback correction (Codex):** Corrected numeric-host exclusions, nonce/key endorsement, policy inputs, runtime seams and support scope; added reproducible fixture tooling. Historical clean review entries describe their examined revisions, not current approval. Runtime implementation and provider qualification remain outstanding.
+
+- **Round-2 correction (Codex, internal author check):** Separated owner identity from site/cookie configuration, defined verified publisher membership and explicit per-site key/renewal costs, and named alias/multi-site follow-ups. Updated the structural publisher identifier and synthetic cases before wire freeze; implementation still requires maintainer spec approval.

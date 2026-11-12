@@ -202,14 +202,16 @@ jobs:
           docs/node_modules/.bin/prettier --config docs/.prettierrc --check
           "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"
 
-      - name: Build with VitePress (fails on dead links)
-        run: npm run build
-
       - name: Check publisher attestation fixtures
         working-directory: .
         run: |
           node scripts/publisher-attestation/generate.mjs --check
           node --test scripts/publisher-attestation/*.test.mjs
+          docs/node_modules/.bin/eslint --config scripts/publisher-attestation/eslint.config.mjs "scripts/publisher-attestation/*.mjs"
+          docs/node_modules/.bin/prettier --config docs/.prettierrc --check "scripts/publisher-attestation/*.mjs"
+
+      - name: Build with VitePress (fails on dead links)
+        run: npm run build
 
   docs-proposal-scripts:
     name: docs-proposal scripts

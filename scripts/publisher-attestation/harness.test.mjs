@@ -46,77 +46,105 @@ function merge(target, patch) {
   return result
 }
 function parse(raw) {
-  // Walk tokens before JSON.parse so duplicate members survive long enough to reject.
-  const tokens =
-    raw.match(
-      /"(?:[^"\\]|\\.)*"|[{}\[\]:,]|true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g
-    ) ?? []
-  let index = 0
-  function value(depth = 0) {
-    if (depth > 16) reject(1, 'malformed')
-    const token = tokens[index++]
-    if (token === '{') {
-      const keys = new Set()
-      while (tokens[index] !== '}') {
-        const key = JSON.parse(tokens[index++])
-        if (keys.has(key)) reject(1, 'malformed')
-        keys.add(key)
-        assert.equal(tokens[index++], ':')
-        value(depth + 1)
-        if (tokens[index] !== ',') break
-        index++
-      }
-      assert.equal(tokens[index++], '}')
-    } else if (token === '[') {
-      while (tokens[index] !== ']') {
-        value(depth + 1)
-        if (tokens[index] !== ',') break
-        index++
-      }
-      assert.equal(tokens[index++], ']')
-    }
-  }
-  value()
-  return JSON.parse(raw)
-}
-function admittedKey(key, stage = 4) {
   try {
+    const parsed = JSON.parse(raw)
+    const tokens =
+      raw.match(
+        /"(?:[^"\\]|\\.)*"|[{}[\]:,]|true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g
+      ) ?? []
+    let index = 0
+    function value(depth = 0) {
+      const token = tokens[index++]
+      if (token !== '{' && token !== '[') return
+      if (depth >= 16) reject(1, 'malformed')
+      const keys = new Set()
+      const close = token === '{' ? '}' : ']'
+      while (tokens[index] !== close) {
+        if (token === '{') {
+          const key = JSON.parse(tokens[index++])
+          if (keys.has(key)) reject(1, 'malformed')
+          keys.add(key)
+          index++
+        }
+        value(depth + 1)
+        if (tokens[index] !== ',') break
+        index++
+      }
+      index++
+    }
+    value()
+    return parsed
+  } catch (error) {
+    if (error?.accept === false) throw error
+    reject(1, 'malformed')
+  }
+}
+function admittedKey(key, stage = 4, reason = 'malformed') {
+  try {
+    if (
+      key.kid !==
+      Buffer.from(hash(canonical(key.jwk)), 'hex').toString('base64url')
+    )
+      reject(stage, reason)
     strictPoint(Buffer.from(key.jwk.x, 'base64url'))
   } catch {
-    reject(stage, 'malformed')
+    reject(stage, reason)
   }
-  assert.equal(
-    key.kid,
-    Buffer.from(hash(canonical(key.jwk)), 'hex').toString('base64url')
-  )
 }
 function decoded(compact, context, expectedType) {
+  const limits = {
+    'ts-publisher-evidence+jws': 16384,
+    'ts-publisher-assessment+jws': 32768,
+    'ts-publisher-status+jws': 8192,
+  }
+  if (!limits[expectedType]) reject(2, 'signature_invalid')
   const segments = compact.split('.')
-  if (segments.length !== 3 || compact.length > 32768) reject(1, 'malformed')
+  if (
+    segments.length !== 3 ||
+    Buffer.byteLength(compact) > limits[expectedType]
+  )
+    reject(1, 'malformed')
   const [headerSegment, payloadSegment, signatureSegment] = segments
   for (const segment of segments)
-    if (Buffer.from(segment, 'base64url').toString('base64url') !== segment)
+    if (
+      !segment ||
+      Buffer.from(segment, 'base64url').toString('base64url') !== segment
+    )
       reject(1, 'malformed')
-  const header = parse(Buffer.from(headerSegment, 'base64url').toString())
-  const payload = parse(Buffer.from(payloadSegment, 'base64url').toString())
-  const evidence = payload.schema === 'ts-publisher-evidence-v1'
-  const type =
-    expectedType ??
-    (evidence
-      ? 'ts-publisher-evidence+jws'
-      : payload.schema === 'ts-publisher-status-v1'
-        ? 'ts-publisher-status+jws'
-        : 'ts-publisher-assessment+jws')
-  if (!ajv.validate('attestation', header) || header.typ !== type)
+  const json = (segment) => {
+    try {
+      return parse(
+        new TextDecoder('utf-8', { fatal: true }).decode(
+          Buffer.from(segment, 'base64url')
+        )
+      )
+    } catch (error) {
+      if (error?.accept === false) throw error
+      reject(1, 'malformed')
+    }
+  }
+  const header = json(headerSegment)
+  const payload = json(payloadSegment)
+  const evidence = expectedType === 'ts-publisher-evidence+jws'
+  if (!ajv.validate('attestation', header) || header.typ !== expectedType)
     reject(2, 'signature_invalid')
   if (!evidence && payload.issuer !== context.trusted_verifier.issuer)
     reject(2, 'policy_untrusted')
   const key = evidence
-    ? payload.binding.attestation_key
-    : vectors.public_keys.verifier
-  admittedKey(key)
-  if (header.kid !== key.kid) reject(2, 'signature_invalid')
+    ? payload.binding?.attestation_key
+    : context.trusted_verifier
+  if (
+    !key?.jwk ||
+    header.kid !== key.kid ||
+    key.kid !==
+      Buffer.from(hash(canonical(key.jwk)), 'hex').toString('base64url') ||
+    (!evidence &&
+      !(key.not_before <= context.now && context.now < key.not_after))
+  )
+    reject(2, 'signature_invalid')
+  admittedKey(key, 3, 'signature_invalid')
   const signature = Buffer.from(signatureSegment, 'base64url')
+  if (signature.length !== 64) reject(3, 'signature_invalid')
   try {
     strictPoint(signature.subarray(0, 32))
   } catch {
@@ -127,15 +155,19 @@ function decoded(compact, context, expectedType) {
   )
   if (scalar >= (1n << 252n) + 27742317777372353535851937790883648493n)
     reject(3, 'signature_invalid')
-  if (
-    !verify(
-      null,
-      Buffer.from(`${headerSegment}.${payloadSegment}`),
-      createPublicKey({ key: key.jwk, format: 'jwk' }),
-      signature
+  try {
+    if (
+      !verify(
+        null,
+        Buffer.from(`${headerSegment}.${payloadSegment}`),
+        createPublicKey({ key: key.jwk, format: 'jwk' }),
+        signature
+      )
     )
-  )
+      reject(3, 'signature_invalid')
+  } catch {
     reject(3, 'signature_invalid')
+  }
   const platform = payload.binding?.platform
   if (
     platform?.provider === 'fastly' &&
@@ -144,7 +176,16 @@ function decoded(compact, context, expectedType) {
       (platform.staging === false && payload.binding.environment === 'staging'))
   )
     reject(4, 'environment_mismatch')
-  if (!ajv.validate('attestation', payload)) reject(4, 'malformed')
+  const payloadSchemas = {
+    'ts-publisher-evidence+jws': 'ts-publisher-evidence-v1',
+    'ts-publisher-assessment+jws': 'ts-publisher-assessment-v1',
+    'ts-publisher-status+jws': 'ts-publisher-status-v1',
+  }
+  if (
+    payload.schema !== payloadSchemas[expectedType] ||
+    !ajv.validate('attestation', payload)
+  )
+    reject(4, 'malformed')
   if (payload.binding) {
     if (payload.binding_id !== hash(canonical(payload.binding)))
       reject(4, 'malformed')
@@ -156,6 +197,11 @@ function decoded(compact, context, expectedType) {
   }
   if (!(payload.issued_at < payload.expires_at)) reject(4, 'malformed')
   return payload
+}
+function freshTime(payload, context) {
+  if (payload.nonce !== context.nonce) reject(6, 'nonce_mismatch')
+  if (payload.issued_at > context.now + 30 || context.now >= payload.expires_at)
+    reject(6, 'stale')
 }
 function evaluate(item) {
   const context = merge(vectors.external_context, item.context_overrides)
@@ -173,10 +219,36 @@ function evaluate(item) {
     : vectors.negative_encodings[item.negative_encoding].compact_jws
   const payload = decoded(compact, context, item.expected_type)
   if (item.pipeline === 'verifier_issuance') {
+    const publisher = context.publisher_authorization
+    if (
+      payload.binding &&
+      (!publisher?.authorization_record_active ||
+        publisher.proof_verified !== true ||
+        !Number.isSafeInteger(publisher.not_before) ||
+        !Number.isSafeInteger(publisher.not_after) ||
+        !(publisher.not_before < publisher.not_after) ||
+        typeof context.authenticated_account !== 'string' ||
+        !Array.isArray(publisher.authorized_sites) ||
+        publisher.publisher_id !== payload.binding.publisher_id ||
+        publisher.authenticated_account !== context.authenticated_account ||
+        !publisher.authorized_sites.includes(payload.binding.host) ||
+        context.now < publisher.not_before ||
+        context.now >= publisher.not_after ||
+        payload.expires_at > publisher.not_after)
+    )
+      reject(2, 'publisher_unauthorized')
     const authority = context.operator_authorization
     if (
       payload.binding?.operator_id &&
       (!authority?.authorization_record_active ||
+        authority.operator_id !== payload.binding.operator_id ||
+        authority.authenticated_account !== context.authenticated_account ||
+        authority.publisher_id !== payload.binding.publisher_id ||
+        authority.deployment_id !== payload.binding.deployment_id ||
+        !Number.isSafeInteger(authority.not_before) ||
+        !Number.isSafeInteger(authority.not_after) ||
+        !(authority.not_before < authority.not_after) ||
+        context.now < authority.not_before ||
         !authority.operator_dns_account_proof_verified ||
         context.now >= authority.not_after ||
         payload.expires_at > authority.not_after)
@@ -190,6 +262,13 @@ function evaluate(item) {
     return { accept: true, stage: 3 }
   }
   const assessment = payload.schema === 'ts-publisher-assessment-v1'
+  const fresh = assessment
+    ? decoded(
+        vectors.signed_objects[context.fresh_evidence].compact_jws,
+        context,
+        'ts-publisher-evidence+jws'
+      )
+    : null
   let policy
   if (assessment) {
     policy = context.trusted_verifier.policy_documents
@@ -209,6 +288,7 @@ function evaluate(item) {
       reject(5, 'policy_untrusted')
     for (const [name, check] of Object.entries(payload.checks)) {
       if (
+        check.outcome === 'pass' &&
         check.method &&
         (!context.trusted_verifier.allowed_methods.includes(check.method) ||
           (policy.checks[name].methods !== null &&
@@ -231,8 +311,8 @@ function evaluate(item) {
     )
       reject(5, 'policy_untrusted')
   }
-  if (payload.nonce && payload.nonce !== context.nonce)
-    reject(6, 'nonce_mismatch')
+  if (fresh) freshTime(fresh, context)
+  if (payload.schema === 'ts-publisher-evidence-v1') freshTime(payload, context)
   if (
     payload.issued_at > context.now + 30 ||
     context.now >= payload.expires_at ||
@@ -247,11 +327,6 @@ function evaluate(item) {
     if (payload.binding.environment !== context.expected_environment)
       reject(7, 'environment_mismatch')
     if (assessment) {
-      const fresh = decoded(
-        vectors.signed_objects[context.fresh_evidence].compact_jws,
-        context
-      )
-      if (fresh.nonce !== context.nonce) reject(6, 'nonce_mismatch')
       if (
         fresh.binding_id !== payload.binding_id ||
         canonical(fresh.binding) !== canonical(payload.binding)
@@ -260,6 +335,7 @@ function evaluate(item) {
     }
   }
   if (assessment) {
+    if (payload.result !== 'satisfied') reject(8, 'policy_untrusted')
     for (const [name, requirement] of Object.entries(policy.checks)) {
       const outcome = payload.checks[name].outcome
       if (
@@ -284,14 +360,41 @@ function evaluate(item) {
     )
       reject(9, 'artifact_binding_unproven')
   }
-  const status =
-    payload.schema === 'ts-publisher-status-v1'
-      ? payload
-      : vectors.signed_objects.status.payload
+  if (context.known_key_compromise) reject(10, 'key_compromised')
+  if (context.known_withdrawal) reject(10, 'withdrawn')
+  let status
   if (context.require_status || payload.schema === 'ts-publisher-status-v1') {
+    if (!context.status_available) reject(10, 'status_unavailable')
+    try {
+      status =
+        payload.schema === 'ts-publisher-status-v1'
+          ? payload
+          : decoded(
+              (
+                vectors.signed_objects[context.status_object] ??
+                vectors.negative_encodings[context.status_object]
+              ).compact_jws,
+              context,
+              'ts-publisher-status+jws'
+            )
+    } catch {
+      reject(10, 'status_unavailable')
+    }
+    const target = assessment
+      ? payload
+      : decoded(
+          vectors.signed_objects[context.target_assessment].compact_jws,
+          context,
+          'ts-publisher-assessment+jws'
+        )
     if (
-      !context.status_available ||
+      status.issuer !== target.issuer ||
+      status.enrollment_id !== target.enrollment_id ||
+      status.assessment_id !== target.assessment_id ||
+      status.binding_id !== target.binding_id ||
+      status.publisher_key_kid !== target.binding.attestation_key.kid ||
       status.sequence < context.highest_status_sequence ||
+      status.issued_at > context.now + 30 ||
       context.now >=
         Math.min(
           status.expires_at,
@@ -299,6 +402,14 @@ function evaluate(item) {
         )
     )
       reject(10, 'status_unavailable')
+    if (status.publisher_key_status === 'compromised')
+      reject(10, 'key_compromised')
+    if (
+      status.assessment_status !== 'current' ||
+      status.enrollment_status !== 'active' ||
+      status.publisher_key_status !== 'active'
+    )
+      reject(10, 'withdrawn')
   }
   if (
     context.cache_action === 'reuse' &&
@@ -307,6 +418,7 @@ function evaluate(item) {
     )
   )
     reject(10, 'status_unavailable')
+  if (context.distinct_issuer_threshold > 1) reject(11, 'policy_untrusted')
   if (!assessment) return { accept: true, stage: payload.nonce ? 7 : 11 }
   const deadlines = [
     payload.expires_at,
@@ -345,5 +457,46 @@ test('merge patch preserves nested policy pins and removes null members', () => 
       { policy: { method: 4 }, cache: null }
     ),
     { policy: { pin: 1, method: 4 } }
+  )
+})
+test('strict JSON parser enforces depth, duplicate names, syntax and trailing-data bounds', () => {
+  assert.doesNotThrow(
+    () => parse('['.repeat(16) + '0' + ']'.repeat(16)),
+    '16 containers should be allowed'
+  )
+  for (const raw of [
+    '['.repeat(17) + '0' + ']'.repeat(17),
+    '{"x":1,"x":2}',
+    '{"x":{"y":1,"y":2}}',
+    '{} trailing',
+    '{"x":}',
+    '',
+  ])
+    assert.throws(
+      () => parse(raw),
+      (error) => error.stage === 1 && error.reason_code === 'malformed',
+      `invalid JSON should reject at stage 1: ${raw}`
+    )
+})
+test('compact envelope bounds follow the independently expected message type', () => {
+  for (const [type, limit] of [
+    ['ts-publisher-evidence+jws', 16384],
+    ['ts-publisher-status+jws', 8192],
+    ['ts-publisher-assessment+jws', 32768],
+  ])
+    assert.throws(
+      () => decoded('a'.repeat(limit + 1), vectors.external_context, type),
+      (error) => error.stage === 1,
+      `${type} should enforce its own size limit`
+    )
+  assert.throws(
+    () =>
+      decoded(
+        'e30._w.YQ',
+        vectors.external_context,
+        'ts-publisher-evidence+jws'
+      ),
+    (error) => error.stage === 1,
+    'invalid UTF-8 should reject at stage 1'
   )
 })

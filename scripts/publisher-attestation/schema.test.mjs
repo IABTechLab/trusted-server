@@ -55,8 +55,16 @@ for (const host of [
   '1.2.3.4.5',
 ]) {
   test(`reject numeric host ${host}`, () => {
-    assert.equal(validate('host', host), false)
-    assert.equal(validate('httpsIdentifier', `https://${host}/path`), false)
+    assert.equal(
+      validate('host', host),
+      false,
+      "should equal for validate('host', host)"
+    )
+    assert.equal(
+      validate('httpsIdentifier', `https://${host}/path`),
+      false,
+      "should equal for validate('httpsIdentifier', `https://${host}/path`)"
+    )
   })
 }
 for (const host of [
@@ -65,15 +73,24 @@ for (const host of [
   `${'a'.repeat(63)}.example`,
 ]) {
   test(`preserve DNS host ${host}`, () => {
-    assert.equal(validate('host', host), true)
-    assert.equal(validate('httpsIdentifier', `https://${host}/path`), true)
+    assert.equal(
+      validate('host', host),
+      true,
+      "should equal for validate('host', host)"
+    )
+    assert.equal(
+      validate('httpsIdentifier', `https://${host}/path`),
+      true,
+      "should equal for validate('httpsIdentifier', `https://${host}/path`)"
+    )
   })
 }
 test('reject identifier dot segments', () => {
   for (const path of ['/./x', '/x/..', '/../x'])
     assert.equal(
       validate('httpsIdentifier', `https://example.com${path}`),
-      false
+      false,
+      "should equal for validate('httpsIdentifier', `https://example.com${path}`)"
     )
 })
 test('fingerprint requires a known staging flag', () => {
@@ -81,7 +98,11 @@ test('fingerprint requires a known staging flag', () => {
     vectors.signed_objects.assessment_fingerprint_only.payload
   )
   assessment.binding.platform.staging = null
-  assert.equal(validate('assessment', assessment), false)
+  assert.equal(
+    validate('assessment', assessment),
+    false,
+    "should equal for validate('assessment', assessment)"
+  )
 })
 for (const [staging, environment, valid] of [
   [true, 'production', false],
@@ -97,7 +118,11 @@ for (const [staging, environment, valid] of [
     )
     binding.platform.staging = staging
     binding.environment = environment
-    assert.equal(validate('binding', binding), valid)
+    assert.equal(
+      validate('binding', binding),
+      valid,
+      "should equal for validate('binding', binding)"
+    )
   })
 }
 test('Axum is development only', () => {
@@ -111,7 +136,15 @@ test('Axum is development only', () => {
     staging: null,
   }
   binding.environment = 'production'
-  assert.equal(validate('binding', binding), false)
+  assert.equal(
+    validate('binding', binding),
+    false,
+    "should equal for validate('binding', binding)"
+  )
   binding.environment = 'development'
-  assert.equal(validate('binding', binding), true)
+  assert.equal(
+    validate('binding', binding),
+    true,
+    "should equal for validate('binding', binding)"
+  )
 })

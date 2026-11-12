@@ -1,5 +1,5 @@
 {
-  "$comment": "JSON Schema draft-07. Local references only. Structural validation is necessary but never verifies cryptography, trust, authorization, provider qualification or current acceptance under independently configured policy. Reject duplicate members/trailing bytes and enforce depth <=16, UTF-8 byte limits (ordinary strings <=256), HTTP limits and canonical encodings before validation. External checks include JWK thumbprints, JCS hashes, equality of projected/bound/enrolled identities, ASCII-only host canonicalization, time ordering/lifetimes/key validity, nonce consumption, policy-required checks, release eligibility/digest equality, status sequence/withdrawal and independent trust settings. Ed25519 verification is strict: reject non-canonical S, non-canonical R or public-key encodings and small-order R points or public keys. Times are exclusive at expiry (valid while now < expires_at) and inclusive at not_before. Evidence/status lifetime <=60 seconds; assessment expiry <=observed_from+900, issued_at<=observed_until+60; key validity <=90 days; challenge expiry <=issued_at+600. No schema alone establishes these relationships. Assessment expiry must not exceed independently authorized operator-record, enrollment, publisher-key or verifier-key expiry. Current status expiry must not exceed those bounds, assessment expiry or issued_at+60. Recheck authority at publication/commit and status reuse even when authorization generation is unchanged; expired operator authority stops positive assessment/current status. Configuration checks concern signed publisher-declared identity/enrollment consistency only, never a registry read of full configuration. Default acceptance is expiry-only (require_status=false); live status is an optional stricter policy. A cached positive consumer result never outlives the earliest accepted-threshold assessment expiry, independently configured trust-key acceptance deadline, original observation time plus configured observation age, evaluated_at plus configured cache lifetime, or required live-status expiry and original issued_at plus configured status maximum age (at most 60 seconds); expiry-only acceptance adds no status-expiry dependency. Non-null operator identity requires independent exact operator DNS/account proof; null denotes self-operated with no distinct operator claim.",
+  "$comment": "JSON Schema draft-07. Local references only. Structural validation is necessary but never verifies cryptography, trust, authorization, provider qualification or current acceptance under independently configured policy. Reject duplicate members/trailing bytes and enforce depth <=16, UTF-8 byte limits (ordinary strings <=256), HTTP limits and canonical encodings before validation. External checks include JWK thumbprints, JCS hashes, equality of projected/bound/enrolled identities, ASCII-only host canonicalization, time ordering/lifetimes/key validity, nonce consumption, policy-required checks, release eligibility/digest equality, status sequence/withdrawal and independent trust settings. Ed25519 verification is strict: reject non-canonical S, non-canonical R or public-key encodings and small-order R points or public keys. Times are exclusive at expiry (valid while now < expires_at) and inclusive at not_before. Evidence/status lifetime <=60 seconds; assessment expiry <=observed_from+900, issued_at<=observed_until+60; key validity <=90 days; challenge expiry <=issued_at+600. No schema alone establishes these relationships. Assessment expiry must not exceed independently authorized publisher-record, operator-record, enrollment, publisher-key or verifier-key expiry. Current status expiry must not exceed those bounds, assessment expiry or issued_at+60. Recheck authority at publication/commit and status reuse even when authorization generation is unchanged; expired publisher/operator authority stops positive assessment/current status. Configuration checks concern signed publisher-declared identity/enrollment consistency only, never a registry read of full configuration. Default acceptance is expiry-only (require_status=false); live status is an optional stricter policy. A cached positive consumer result never outlives the earliest accepted-threshold assessment expiry, independently configured trust-key acceptance deadline, original observation time plus configured observation age, evaluated_at plus configured cache lifetime, or required live-status expiry and original issued_at plus configured status maximum age (at most 60 seconds); expiry-only acceptance adds no status-expiry dependency. Non-null operator identity requires independent exact operator DNS/account proof; null denotes self-operated with no distinct operator claim. Publisher IDs are canonical owner domains; independent publisher/account/site membership must be authorized before positive issuance. Missing, expired, foreign-account or out-of-scope publisher authority fails publisher_unauthorized.",
   "title": "Publisher attestation version 1 structural contract",
   "oneOf": [
     {
@@ -318,7 +318,7 @@
           "$ref": "#/definitions/host"
         },
         "publisher_id": {
-          "$ref": "#/definitions/uuid"
+          "$ref": "#/definitions/host"
         },
         "operator_id": {
           "anyOf": [
@@ -377,7 +377,7 @@
           "$ref": "#/definitions/host"
         },
         "publisher_id": {
-          "$ref": "#/definitions/uuid"
+          "$ref": "#/definitions/host"
         },
         "operator_id": {
           "anyOf": [
@@ -928,7 +928,8 @@
           "policy_untrusted",
           "clock_unavailable",
           "operator_unauthorized",
-          "state_recovery_required"
+          "state_recovery_required",
+          "publisher_unauthorized"
         ]
       },
       "uniqueItems": true,
@@ -1231,7 +1232,7 @@
           "$ref": "#/definitions/host"
         },
         "publisher_id": {
-          "$ref": "#/definitions/uuid"
+          "$ref": "#/definitions/host"
         },
         "operator_id": {
           "anyOf": [
@@ -1433,7 +1434,7 @@
           ]
         }
       },
-      "$comment": "methods null means the consumer's method allowlist governs this check; an array fixes the permitted methods."
+      "$comment": "methods null means a passing check must use a method in the consumer's independent allowlist. An array additionally restricts passing methods to its members, so both must allow the method; an empty array permits no passing method. A not-assessed check needs no method."
     },
     "policyDocument": {
       "type": "object",

@@ -30,6 +30,9 @@ const digest = (value) => ({ algorithm: 'sha256', value: hash(value) })
 const encode = (value) => Buffer.from(value).toString('base64url')
 const seeds = {
   publisher: Buffer.from(Array.from({ length: 32 }, (_, index) => index)),
+  publisher_site: Buffer.from(
+    Array.from({ length: 32 }, (_, index) => index + 64)
+  ),
   verifier: Buffer.from(Array.from({ length: 32 }, (_, index) => index + 32)),
 }
 const keys = Object.fromEntries(
@@ -102,6 +105,17 @@ export function generate(input) {
     map.set(output.public_keys[role].kid, kid)
     map.set(output.public_keys[role].jwk.x, jwk.x)
   }
+  for (const [name, document] of Object.entries(output.unsigned_objects)) {
+    if (document.schema !== 'ts-publisher-policy-v1') continue
+    output.unsigned_objects[name] = JSON.parse(
+      readFileSync(
+        new URL(
+          `../../docs/superpowers/specs/policies/${document.id}.json`,
+          import.meta.url
+        )
+      )
+    )
+  }
   for (const document of Object.values(output.unsigned_objects).filter(
     (item) => item.schema === 'ts-publisher-policy-v1'
   )) {
@@ -130,26 +144,37 @@ export function generate(input) {
   const result = output.signed_objects
   for (const [name, object] of Object.entries(result)) {
     if (object.payload.schema !== 'ts-publisher-evidence-v1') continue
-    result[name] = signed(object.protected, object.payload)
+    const role = Object.keys(keys).find(
+      (role) =>
+        output.public_keys[role].kid ===
+        object.payload.binding.attestation_key.kid
+    )
+    result[name] = signed(object.protected, object.payload, role)
   }
-  const collected = result.collected_evidence
   for (const [name, object] of Object.entries(result)) {
     const payload = object.payload
     if (payload.schema !== 'ts-publisher-assessment-v1') continue
+    const collected = result[object.evidence_source ?? 'collected_evidence']
     payload.evidence_digest = collected.compact_sha256
     payload.checks.key_possession.evidence_digest = collected.compact_sha256
     payload.checks.configuration.evidence_digest =
       payload.binding.configuration.digest
     result[name] = signed(object.protected, payload, 'verifier')
+    if (object.evidence_source)
+      result[name].evidence_source = object.evidence_source
   }
   for (const [name, object] of Object.entries(result)) {
     if (object.payload.schema !== 'ts-publisher-status-v1') continue
-    object.payload.assessment_id = result.assessment.payload.assessment_id
-    object.payload.binding_id = result.assessment.payload.binding_id
     result[name] = signed(object.protected, object.payload, 'verifier')
   }
   const evidence = result.evidence
   const negatives = {}
+  const statusSignature = Buffer.from(
+    result.status.signature_segment,
+    'base64url'
+  )
+  statusSignature[63] ^= 1
+  negatives.tampered_status = withSignature(result.status, statusSignature)
   negatives.legacy_algorithm = {
     compact_jws: signed(
       { ...evidence.protected, alg: 'EdDSA' },
@@ -208,12 +233,35 @@ export function generate(input) {
       ),
     ])
   )
-  // y = p + 3 reduces to a non-small-order point, isolating canonicality from torsion rejection.
-  const nonCanonical = littleBytes((1n << 255n) - 16n)
+  // Noncanonical identity y = p + 1 necessarily overlaps the small-order-R case.
+  // Hash its original bytes and set S = k*a so relaxed point comparison accepts.
+  const nonCanonicalIdentity = littleBytes((1n << 255n) - 18n)
+  const nonCanonicalChallenge =
+    littleInteger(
+      createHash('sha512')
+        .update(
+          Buffer.concat([
+            nonCanonicalIdentity,
+            Buffer.from(output.public_keys.publisher.jwk.x, 'base64url'),
+            Buffer.from(
+              `${evidence.protected_segment}.${evidence.payload_segment}`
+            ),
+          ])
+        )
+        .digest()
+    ) % order
   negatives.non_canonical_r = withSignature(
     evidence,
-    Buffer.concat([nonCanonical, signature.subarray(32)])
+    Buffer.concat([
+      nonCanonicalIdentity,
+      littleBytes(
+        (nonCanonicalChallenge * littleInteger(expanded.subarray(0, 32))) %
+          order
+      ),
+    ])
   )
+  // Public-key admission separately isolates encoding from small-order rejection.
+  const nonCanonical = littleBytes((1n << 255n) - 16n)
   const fingerprint = structuredClone(
     result.assessment_fingerprint_only.payload
   )
@@ -276,7 +324,6 @@ export function generate(input) {
     },
   ]
   // TXT values and canonical policy digests are part of the executable fixture contract.
-  delete output.enrollment_dns_txt
   output.enrollment_txt_value = `ts-publisher-v1=${encode(createHash('sha256').update(canonical(output.unsigned_objects.enrollment_challenge)).digest())}`
   return output
 }
