@@ -544,14 +544,25 @@ fn edgezero_main(
 
     if let Some(mut ec_state) = ec_state {
         if let Some(settings) = settings_snapshot.as_deref() {
-            match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response) {
+            // Fastly's entry-point hooks are synchronous, and its KV SDK
+            // completes I/O through blocking hostcalls. Keep this bridge here,
+            // never in native or worker executors.
+            match futures::executor::block_on(apply_edgezero_ec_finalize(
+                settings,
+                &mut ec_state,
+                &mut response,
+            )) {
                 Ok(partner_registry) => {
                     send_edgezero_response(
                         response,
                         request_filter_effects.as_ref(),
                         counters.as_ref(),
                     );
-                    run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
+                    futures::executor::block_on(run_edgezero_pull_sync_after_send(
+                        settings,
+                        &partner_registry,
+                        &ec_state,
+                    ));
                     return;
                 }
                 Err(e) => {
@@ -563,18 +574,22 @@ fn edgezero_main(
         } else {
             match load_settings_from_config_store(&runtime_stores) {
                 Ok(settings) => {
-                    match apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response) {
+                    match futures::executor::block_on(apply_edgezero_ec_finalize(
+                        &settings,
+                        &mut ec_state,
+                        &mut response,
+                    )) {
                         Ok(partner_registry) => {
                             send_edgezero_response(
                                 response,
                                 request_filter_effects.as_ref(),
                                 counters.as_ref(),
                             );
-                            run_edgezero_pull_sync_after_send(
+                            futures::executor::block_on(run_edgezero_pull_sync_after_send(
                                 &settings,
                                 &partner_registry,
                                 &ec_state,
-                            );
+                            ));
                             return;
                         }
                         Err(e) => {
@@ -636,7 +651,7 @@ fn apply_entry_point_finalize_headers(
     apply_finalize_headers(settings, geo_info.as_ref(), response);
 }
 
-fn apply_edgezero_ec_finalize(
+async fn apply_edgezero_ec_finalize(
     settings: &Settings,
     ec_state: &mut EcFinalizeState,
     response: &mut HttpResponse,
@@ -655,11 +670,12 @@ fn apply_edgezero_ec_finalize(
         ec_state.eids_cookie.as_deref(),
         ec_state.sharedid_cookie.as_deref(),
         response,
-    );
+    )
+    .await;
     Ok(partner_registry)
 }
 
-fn run_edgezero_pull_sync_after_send(
+async fn run_edgezero_pull_sync_after_send(
     settings: &Settings,
     partner_registry: &PartnerRegistry,
     ec_state: &EcFinalizeState,
@@ -683,7 +699,8 @@ fn run_edgezero_pull_sync_after_send(
         &limiter,
         &context,
         &ec_state.services,
-    );
+    )
+    .await;
 }
 
 fn prepare_pull_sync_after_send<F>(

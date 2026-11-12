@@ -555,7 +555,7 @@ async fn execute_named(
     // legacy route_request. Batch-sync also skips request filters, matching
     // legacy, which returns before the filter step for this route.
     if matches!(handler, NamedRouteHandler::BatchSync) {
-        return Ok(run_batch_sync(&state, &services, req));
+        return Ok(run_batch_sync(&state, &services, req).await);
     }
 
     // An operator cache purge is not a reader request: running the EC lifecycle would
@@ -579,19 +579,22 @@ async fn execute_named(
         handler,
         NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
     ) {
-        let response = PartnerRegistry::from_config(&state.settings.ec.partners)
-            .and_then(|registry| match handler {
+        let response = async {
+            let registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            match handler {
                 NamedRouteHandler::AdminEcLookup => {
                     // Deliberately do not use an EC request-state graph: that
                     // copy is bot-gated, while operators use curl for this
                     // authenticated diagnostic.
                     let kv = crate::maybe_identity_graph(&state.settings);
-                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
+                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req).await
                 }
                 NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
                 _ => unreachable!("admin diagnostics should use early dispatch"),
-            })
-            .unwrap_or_else(|error| http_error(&error));
+            }
+        }
+        .await
+        .unwrap_or_else(|error| http_error(&error));
         return Ok(response);
     }
 
@@ -668,6 +671,7 @@ async fn run_named_route(
                     &req,
                     &ec.ec_context,
                 )
+                .await
             }
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
@@ -738,17 +742,19 @@ async fn run_named_route(
 /// Handles `POST /_ts/api/v1/batch-sync`, mirroring the legacy arm: identity
 /// graph + partner registry + rate limiter, with a default EC context for
 /// response finalization.
-fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
+async fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
     let device_signals = device_signals_for(&req);
     let is_real_browser = device_signals.looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
-    let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
+    let result = async {
+        let kv = crate::require_identity_graph(&state.settings)?;
         let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-        handle_batch_sync(&kv, &partner_registry, &limiter, req)
-    });
+        handle_batch_sync(&kv, &partner_registry, &limiter, req).await
+    }
+    .await;
 
     let mut response = result.unwrap_or_else(|e| http_error(&e));
     // Legacy parity: batch-sync responses still pass through
@@ -856,6 +862,7 @@ async fn dispatch_fallback(
             && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
+                .await
         {
             log::warn!("EC generation failed for publisher proxy: {err:?}");
         }
