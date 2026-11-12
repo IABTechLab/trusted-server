@@ -42,6 +42,35 @@ describe('creative/click.ts', () => {
     expect(finalHref).toContain('del=%5B%22foo%22%5D');
   });
 
+  it('targets the captured script origin for rebuild requests and fallbacks', async () => {
+    vi.useFakeTimers();
+    const descriptor = Object.getOwnPropertyDescriptor(document, 'currentScript');
+    const script = Object.assign(document.createElement('script'), {
+      src: 'https://ads.example.com:8443/static/tsjs=tsjs-unified.min.js?v=hash',
+    });
+    Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+    const fetchMock = vi.fn().mockRejectedValue(new Error('network'));
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      const anchor = document.createElement('a');
+      anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
+      anchor.setAttribute('href', FIRST_PARTY_CLICK);
+      document.body.appendChild(anchor);
+      await importCreativeModule();
+      anchor.setAttribute('href', MUTATED_CLICK);
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(fetchMock.mock.calls.map((call) => call[0])).toContain(
+        'https://ads.example.com:8443/first-party/proxy-rebuild'
+      );
+    } finally {
+      if (descriptor) Object.defineProperty(document, 'currentScript', descriptor);
+      else Reflect.deleteProperty(document, 'currentScript');
+    }
+  });
+
   it('updates anchors using proxy rebuild response payload', async () => {
     vi.useFakeTimers();
 
@@ -65,7 +94,7 @@ describe('creative/click.ts', () => {
 
     expect(fetchMock).toHaveBeenCalled();
     const call = fetchMock.mock.calls[0];
-    expect(call[0]).toBe('/first-party/proxy-rebuild');
+    expect(call[0]).toBe('http://localhost:3000/first-party/proxy-rebuild');
     const payload = JSON.parse(call[1]?.body as string);
     expect(payload).toEqual({
       tsclick: FIRST_PARTY_CLICK,
@@ -74,15 +103,13 @@ describe('creative/click.ts', () => {
     });
 
     expect(anchor.getAttribute('href')).toBe(absolute(PROXY_RESPONSE));
-    // data-tsclick keeps the server's root-relative shape: it is echoed back as
-    // the rebuild payload's `tsclick`, which the server parses as a click path.
-    expect(anchor.getAttribute('data-tsclick')).toBe(PROXY_RESPONSE);
+    // Legacy relative responses still work, but persistence keeps the resolved
+    // authority for later navigation and rebuilds.
+    expect(anchor.getAttribute('data-tsclick')).toBe(absolute(PROXY_RESPONSE));
   });
 
-  it('sends a root-relative tsclick on a second rebuild after a successful one', async () => {
-    // Regression: persisting an absolute canonical click made the next rebuild
-    // POST a value the server rejects as an invalid click path, so the second
-    // mutation was silently lost on non-opaque consumers.
+  it('sends the persisted absolute tsclick on a second rebuild after a legacy response', async () => {
+    // The server accepts both absolute and legacy root-relative signed clicks.
     vi.useFakeTimers();
 
     const fetchMock = vi.fn().mockResolvedValue({
@@ -102,7 +129,7 @@ describe('creative/click.ts', () => {
     await Promise.resolve();
     await vi.runAllTimersAsync();
 
-    expect(anchor.getAttribute('data-tsclick')).toBe(PROXY_RESPONSE);
+    expect(anchor.getAttribute('data-tsclick')).toBe(absolute(PROXY_RESPONSE));
 
     // A second mutation now diffs against the rebuilt canonical click.
     anchor.setAttribute('href', 'https://example.com/landing?baz=3');
@@ -113,12 +140,8 @@ describe('creative/click.ts', () => {
     const payloads = fetchMock.mock.calls.map(
       (call) => JSON.parse(call[1]?.body as string) as { tsclick: string }
     );
-    // Every payload must carry the server's root-relative click form: an
-    // absolute one is rejected as an invalid click path.
-    for (const payload of payloads) {
-      expect(payload.tsclick.startsWith('/first-party/click?')).toBe(true);
-    }
-    expect(payloads.some((payload) => payload.tsclick === PROXY_RESPONSE)).toBe(true);
+    expect(payloads[0].tsclick).toBe(FIRST_PARTY_CLICK);
+    expect(payloads.some((payload) => payload.tsclick === absolute(PROXY_RESPONSE))).toBe(true);
   });
 
   it('skips the doomed POST and uses the GET fallback in an opaque origin', async () => {

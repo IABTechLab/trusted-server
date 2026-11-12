@@ -1,4 +1,4 @@
-use crate::common::config::integration_app_config_envelope;
+use crate::common::config::{envelope_with_public_origin, integration_app_config_envelope};
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
@@ -82,8 +82,11 @@ impl AxumDevServer {
         let binary = self.binary_path();
         let port = super::find_available_port().unwrap_or(AXUM_DEFAULT_PORT);
 
+        let base_url = format!("http://127.0.0.1:{port}");
+        let app_config = envelope_with_public_origin(app_config, &base_url)?;
+
         let mut child = self
-            .command(app_config, port)
+            .command(&app_config, port)
             .envs(env.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -106,7 +109,6 @@ impl AxumDevServer {
         }
 
         let handle = AxumHandle { child };
-        let base_url = format!("http://127.0.0.1:{port}");
 
         // The Axum dev server returns 403 at root (no publisher config in test env),
         // so we poll until we get any HTTP response rather than a specific status.

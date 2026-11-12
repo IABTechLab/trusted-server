@@ -79,6 +79,8 @@ the variables into your shell before starting the server.
 # Create the local app config and apply the non-secret development overlay.
 cp trusted-server.example.toml trusted-server.toml
 set -a && source .env.dev && set +a
+# Axum listens on 8787, not the Viceroy port in .env.dev.
+export TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:8787
 
 # Use the repository's default app-config store name and key for this quickstart.
 unset EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME
@@ -100,8 +102,10 @@ export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD="$(openssl 
 cargo run -p trusted-server-adapter-axum
 ```
 
-The server will be available at `http://localhost:8787`. Set `PORT=<port>` before
-`cargo run` to bind the dev server to a different local port.
+The server will be available at `http://localhost:8787`. To use a different port,
+set `PORT=<port>` before `cargo run` and set
+`TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:<port>` before
+`ts config push` so rewritten creative URLs use the same listener.
 
 **Environment variable conventions used by the Axum adapter:**
 

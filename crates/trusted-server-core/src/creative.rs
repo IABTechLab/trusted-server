@@ -8,7 +8,7 @@
 //!
 //! Key behaviors:
 //! - Absolute and protocol-relative asset URLs (http/https or `//`) are proxied to
-//!   `/first-party/proxy?tsurl=<base-url>&<original-query-params>&tstoken=<sig>` across these locations:
+//!   `{public_origin}/first-party/proxy?tsurl=<base-url>&<original-query-params>&tstoken=<sig>` across these locations:
 //!   - `<img src>`, `data-src`, `[srcset]`, `[imagesrcset]`
 //!   - `<script src>`
 //!   - `<video src>`, `<audio src>`, `<source src>`
@@ -154,8 +154,7 @@ const MAX_CSS_NESTING_DEPTH: usize = 64;
 /// Covers every form the browser fetches: `url()` and `src()`, a bare string
 /// candidate in `image-set()`, and an `@import` prelude string.
 ///
-/// `base_origin` is prefixed onto the proxy path — empty for root-relative
-/// output, `https://<domain>` for absolute output (see [`build_proxy_url`]).
+/// `base_origin` is the already resolved browser-facing origin.
 ///
 /// Values are read with a CSS tokenizer rather than by scanning for quotes, so
 /// the extent of a value comes from the grammar and escapes are already
@@ -598,11 +597,27 @@ fn takes_bare_string_urls(name: &str) -> bool {
     name.eq_ignore_ascii_case("image-set") || name.eq_ignore_ascii_case("-webkit-image-set")
 }
 
+/// Prefixes a controlled root-relative Trusted Server endpoint with its browser-facing origin.
+#[inline]
+pub(crate) fn first_party_url(public_origin: &str, path: &str) -> String {
+    debug_assert!(path.starts_with('/'));
+    format!("{public_origin}{path}")
+}
+
+/// Builds the creative runtime tag on the configured browser-facing origin.
+fn creative_runtime_script_tag(public_origin: &str) -> String {
+    tsjs::tsjs_script_tag_with_public_origin(
+        &first_party_url(public_origin, &tsjs::tsjs_unified_script_src()),
+        &[],
+        public_origin,
+    )
+}
+
 #[inline]
 fn build_signed_url_for(
     settings: &Settings,
     clear_url: &str,
-    base_path: &str,
+    endpoint: &str,
     extra: &[(String, String)],
 ) -> String {
     let Ok(mut u) = url::Url::parse(clear_url) else {
@@ -641,14 +656,12 @@ fn build_signed_url_for(
         qs.append_pair(k, v);
     }
     qs.append_pair("tstoken", &token);
-    format!("{}?{}", base_path, qs.finish())
+    format!("{}?{}", endpoint, qs.finish())
 }
 
-/// Build a signed first-party proxy URL, prefixing `base_origin` before the
-/// `/first-party/proxy` path. An empty `base_origin` yields a root-relative URL
-/// (the default, for creatives rendered from the first-party origin); a
-/// `https://<domain>` origin yields an absolute URL that resolves correctly when
-/// the creative is rendered in a foreign origin (e.g. PUC's `srcdoc` under GAM).
+/// Build an absolute signed first-party proxy URL.
+///
+/// `base_origin` is resolved once by the caller before rewriting or signing.
 #[inline]
 pub(super) fn build_proxy_url(settings: &Settings, clear_url: &str, base_origin: &str) -> String {
     build_signed_url_for(
@@ -663,9 +676,15 @@ pub(super) fn build_proxy_url(settings: &Settings, clear_url: &str, base_origin:
 pub(super) fn build_proxy_url_with_extras(
     settings: &Settings,
     clear_url: &str,
+    base_origin: &str,
     extra: &[(String, String)],
 ) -> String {
-    build_signed_url_for(settings, clear_url, "/first-party/proxy", extra)
+    build_signed_url_for(
+        settings,
+        clear_url,
+        &first_party_url(base_origin, "/first-party/proxy"),
+        extra,
+    )
 }
 
 /// Build a signed first-party click URL, prefixing `base_origin` before the
@@ -827,7 +846,14 @@ impl core::error::Error for CssRewriteError {}
 /// [`MAX_CSS_NESTING_DEPTH`], or [`CssRewriteError::OutputTooLarge`] when the
 /// rewritten output exceeds [`MAX_REWRITABLE_BODY_SIZE`].
 pub fn rewrite_css_body(settings: &Settings, css: &str) -> Result<String, CssRewriteError> {
-    rewrite_style_urls_in_context(settings, css, "", true, MAX_REWRITABLE_BODY_SIZE)
+    let public_origin = settings.publisher.effective_public_origin();
+    rewrite_style_urls_in_context(
+        settings,
+        css,
+        &public_origin,
+        true,
+        MAX_REWRITABLE_BODY_SIZE,
+    )
 }
 
 /// Maximum byte length of creative HTML accepted by [`sanitize_creative_html`].
@@ -1034,7 +1060,15 @@ pub fn sanitize_creative_html(markup: &str) -> String {
 #[must_use]
 pub(crate) fn process_auction_creative(settings: &Settings, raw: &str) -> String {
     process_auction_creative_with_rewriter(settings, raw, |sanitized, features| {
-        rewrite_creative_html_impl(settings, sanitized, "", true, MAX_CREATIVE_SIZE, features)
+        let public_origin = settings.publisher.effective_public_origin();
+        rewrite_creative_html_impl(
+            settings,
+            sanitized,
+            &public_origin,
+            true,
+            MAX_CREATIVE_SIZE,
+            features,
+        )
     })
 }
 
@@ -1050,10 +1084,11 @@ pub(crate) fn process_inline_auction_creative(
     raw: &str,
 ) -> String {
     process_auction_creative_with_rewriter(settings, raw, |sanitized, features| {
+        let public_origin = inline_public_origin(settings, base_origin);
         rewrite_creative_html_impl(
             settings,
             sanitized,
-            base_origin,
+            &public_origin,
             false,
             MAX_CREATIVE_SIZE,
             features,
@@ -1095,22 +1130,18 @@ fn process_auction_creative_with_rewriter(
     }
 }
 
-/// Rewrite ad creative HTML to first-party endpoints, for creatives rendered
-/// from the first-party origin (the `/auction` iframe `srcdoc`).
-/// - 1x1 `<img>` pixels → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
-/// - Non-pixel absolute images → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
-/// - `<iframe src>` (absolute or protocol-relative) → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
-/// - `<a href>` / `<area href>` → `/first-party/click?tsurl=…`, copied into `data-tsclick`
-/// - Injects the unified TSJS bundle (`/static/tsjs=tsjs-unified.min.js`), whose creative
-///   runtime installs the click guard, once at the top of `<body>`.
+/// Rewrite ad creative HTML to absolute first-party endpoints.
+/// - Eligible resource URLs → `{public_origin}/first-party/proxy?tsurl=…&tstoken=…`
+/// - `<a href>` / `<area href>` → `{public_origin}/first-party/click?tsurl=…`, copied into `data-tsclick`
+/// - Injects the unified TSJS bundle on the configured public origin, whose creative
+///   runtime installs the click guard, once at the top of `<body>` or before a fragment.
 ///
 /// Rewrites assets and clicks unconditionally; the auction settings are applied by
 /// the auction processing entry points, not here.
 ///
-/// The proxy/click URLs are emitted **root-relative** (`/first-party/…`), which
-/// resolves only when the creative's document base URL is the first-party origin.
-/// For creatives handed to a renderer in a foreign origin (e.g. the Prebid
-/// Universal Creative's `srcdoc` under GAM), use [`rewrite_inline_creative_html`].
+/// Proxy, click and runtime URLs use [`crate::settings::Publisher::effective_public_origin`].
+/// The publisher inline renderer instead supplies its request origin through
+/// [`rewrite_inline_creative_html`] and does not inject the runtime.
 ///
 /// # Warning
 ///
@@ -1122,7 +1153,7 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
     rewrite_creative_html_impl(
         settings,
         markup,
-        "",
+        &settings.publisher.effective_public_origin(),
         true,
         MAX_CREATIVE_SIZE,
         CreativeFeatures::ALL,
@@ -1145,7 +1176,7 @@ pub fn rewrite_proxied_html(settings: &Settings, markup: &str) -> String {
     rewrite_creative_html_impl(
         settings,
         markup,
-        "",
+        &settings.publisher.effective_public_origin(),
         true,
         MAX_REWRITABLE_BODY_SIZE,
         CreativeFeatures {
@@ -1185,14 +1216,27 @@ pub fn rewrite_inline_creative_html(
     base_origin: &str,
     markup: &str,
 ) -> String {
+    let public_origin = inline_public_origin(settings, base_origin);
     rewrite_creative_html_impl(
         settings,
         markup,
-        base_origin,
+        &public_origin,
         false,
         MAX_CREATIVE_SIZE,
         CreativeFeatures::ALL,
     )
+}
+
+/// Retains the inline renderer's request-origin override, including its empty fallback.
+fn inline_public_origin<'a>(
+    settings: &Settings,
+    request_origin: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    if request_origin.is_empty() {
+        std::borrow::Cow::Owned(settings.publisher.effective_public_origin())
+    } else {
+        std::borrow::Cow::Borrowed(request_origin)
+    }
 }
 
 /// The clear-price auction macro DSPs embed in creative markup and tracking URLs.
@@ -1243,8 +1287,8 @@ impl CreativeFeatures {
     }
 }
 
-/// Shared creative rewriter. `base_origin` is prefixed onto first-party proxy and
-/// click paths (empty for root-relative, `https://<domain>` for absolute);
+/// Shared creative rewriter with an explicitly resolved `base_origin` for
+/// first-party proxy, click and runtime URLs;
 /// `inject_tsjs` controls the `<body>` tsjs bundle injection; `max_output_size`
 /// bounds the rewritten result; `features` selects which handlers run. `<base>`
 /// handling always runs, and TSJS injection runs when `inject_tsjs` is set,
@@ -1301,7 +1345,7 @@ fn rewrite_creative_html_impl(
             let injected = std::rc::Rc::clone(&injected_ts_creative);
             move |el| {
                 if inject_tsjs && !injected.get() {
-                    let script_tag = tsjs::tsjs_unified_script_tag();
+                    let script_tag = creative_runtime_script_tag(base_origin);
                     el.prepend(&script_tag, ContentType::Html);
                     injected.set(true);
                 }
@@ -1522,7 +1566,8 @@ fn rewrite_creative_html_impl(
     // rewrote to nothing, and a script-only result would read as an accepted
     // creative that renders blank.
     if inject_tsjs && !injected_ts_creative.get() && !rewritten.is_empty() {
-        rewritten.insert_str(0, &tsjs::tsjs_unified_script_tag());
+        let script_tag = creative_runtime_script_tag(base_origin);
+        rewritten.insert_str(0, &script_tag);
         if rewritten.len() > max_output_size {
             log::warn!(
                 "rewrite_creative_html: output exceeds {} byte cap after runtime injection; rejecting",
@@ -1631,10 +1676,10 @@ impl StreamProcessor for CreativeCssProcessor<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CreativeCssProcessor, StreamProcessor as _, normalize_creative_url,
-        process_auction_creative, proxy_if_abs, rewrite_creative_html, rewrite_css_body,
-        rewrite_inline_creative_html, rewrite_proxied_html, rewrite_srcset, rewrite_style_urls,
-        sanitize_creative_html,
+        CreativeCssProcessor, StreamProcessor as _, build_click_url, build_proxy_url,
+        normalize_creative_url, process_auction_creative, proxy_if_abs, rewrite_creative_html,
+        rewrite_css_body, rewrite_inline_creative_html, rewrite_proxied_html, rewrite_srcset,
+        rewrite_style_urls, sanitize_creative_html,
     };
 
     use crate::settings::Settings;
@@ -1783,12 +1828,17 @@ mod tests {
         // GAM), so proxy/click URLs must be absolute against the publisher origin
         // — a root-relative `/first-party/…` would resolve against GAM and 404 —
         // and the tsjs bundle must not be injected into that iframe.
-        let settings = crate::test_support::tests::create_test_settings();
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.publisher.public_origin = Some("https://ads.example.com:8443".to_string());
         let html = "<html><body>\
              <img src=\"https://cdn.example/pixel.png\">\
              <a href=\"https://ads.example/click\">go</a>\
              </body></html>";
         let out = rewrite_inline_creative_html(&settings, "https://test-publisher.com", html);
+        assert!(
+            !out.contains("https://ads.example.com:8443"),
+            "should retain the inline renderer's request-origin override: {out}"
+        );
 
         assert!(
             out.contains("https://test-publisher.com/first-party/proxy?tsurl="),
@@ -1874,8 +1924,9 @@ mod tests {
                 {
                     let settings = matrix_settings(assets, Some(clicks));
                     let label = format!("{path:?} assets={assets} clicks={clicks} body={has_body}");
+                    let public_origin = settings.publisher.effective_public_origin();
                     let prefix = match path {
-                        CreativePath::Auction => "",
+                        CreativePath::Auction => public_origin.as_str(),
                         CreativePath::Inline => INLINE_ORIGIN,
                     };
 
@@ -1977,8 +2028,8 @@ mod tests {
         }
     }
 
-    // Captured from `main` before `rewrite_clicks` existed: default settings must
-    // keep producing these bytes on both auction paths.
+    // Keep the policy matrix's byte-for-byte baseline, changing only the general
+    // auction output to absolute endpoints. The inline origin and signatures stay unchanged.
     const MATRIX_DEFAULT_AUCTION_OUTPUT: &str = r#"<html><head><style>.b{background:url("/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fbg.png&tstoken=xi0bmg4Ik6UU7KsG5z_quFeN5BGt_G8bt4oxgD3HiH8")}</style></head><body><script src="/static/tsjs=tsjs-unified.min.js" id="trustedserver-js"></script><img src="/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad.png&tstoken=FU5VJC5ElXC43PfbzzR-TBVu0h4TFKH82LkDw5NP4to" srcset="/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad-2x.png&tstoken=2WEq5obXUSJyIHjXhx_MatPqzMJtU1_tb_ZMZTKU1m8 2x"><div style="background:url(&quot;/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Finline.png&tstoken=eV8lwVA2y6dcTtIC8RopnFTYnb1R9VZ9fqxbMaolCBY&quot;)"></div><a href="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY" data-tsclick="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY">Ad</a><map><area href="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE" data-tsclick="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a></body></html>"#;
     const MATRIX_DEFAULT_INLINE_OUTPUT: &str = r#"<html><head><style>.b{background:url("https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fbg.png&tstoken=xi0bmg4Ik6UU7KsG5z_quFeN5BGt_G8bt4oxgD3HiH8")}</style></head><body><img src="https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad.png&tstoken=FU5VJC5ElXC43PfbzzR-TBVu0h4TFKH82LkDw5NP4to" srcset="https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad-2x.png&tstoken=2WEq5obXUSJyIHjXhx_MatPqzMJtU1_tb_ZMZTKU1m8 2x"><div style="background:url(&quot;https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Finline.png&tstoken=eV8lwVA2y6dcTtIC8RopnFTYnb1R9VZ9fqxbMaolCBY&quot;)"></div><a href="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY" data-tsclick="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY">Ad</a><map><area href="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE" data-tsclick="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a></body></html>"#;
 
@@ -2022,15 +2073,31 @@ mod tests {
     #[test]
     fn default_settings_rewrite_matrix_fixture_byte_for_byte_as_before() {
         let settings = matrix_settings(true, None);
+        let auction_expected = MATRIX_DEFAULT_AUCTION_OUTPUT
+            .replace(
+                "/first-party/",
+                &format!("https://{}/first-party/", settings.publisher.domain),
+            )
+            .replace(
+                "/static/tsjs=",
+                &format!("https://{}/static/tsjs=", settings.publisher.domain),
+            )
+            .replace(
+                "id=\"trustedserver-js\"",
+                &format!(
+                    "id=\"trustedserver-js\" data-ts-public-origin=\"{}\"",
+                    settings.publisher.effective_public_origin()
+                ),
+            );
 
         for (path, expected) in [
-            (CreativePath::Auction, MATRIX_DEFAULT_AUCTION_OUTPUT),
+            (CreativePath::Auction, auction_expected.as_str()),
             (CreativePath::Inline, MATRIX_DEFAULT_INLINE_OUTPUT),
         ] {
             assert_eq!(
                 process_for_path(&settings, path, MATRIX_FIXTURE_WITH_BODY),
                 expected,
-                "{path:?}: default settings should match the pre-rewrite_clicks output exactly"
+                "{path:?}: should preserve the policy baseline with absolute generated endpoints"
             );
         }
     }
@@ -2102,7 +2169,11 @@ mod tests {
     fn rewrite_style_urls_handles_absolute_and_relative() {
         let settings = crate::test_support::tests::create_test_settings();
         let css = "background:url(https://cdn.example/a.png) no-repeat; mask: url('//cdn.example/m.svg') 0 0 / cover; border-image: url(/local/border.png) 30";
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
         // Absolute and protocol-relative rewritten
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
@@ -2117,7 +2188,11 @@ mod tests {
     fn rewrite_style_urls_handles_unterminated_quote_before_multibyte() {
         let settings = crate::test_support::tests::create_test_settings();
         let css = "background:url(\"café)";
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
         assert_eq!(
             out, css,
             "should leave an unterminated quoted url unchanged"
@@ -2128,8 +2203,16 @@ mod tests {
     fn rewrite_style_urls_keeps_paren_inside_quoted_url() {
         let settings = crate::test_support::tests::create_test_settings();
         let css = "background:url(\"https://cdn.example/a)b.png\")";
-        let out = rewrite_style_urls(&settings, css, "");
-        let expected = super::build_proxy_url(&settings, "https://cdn.example/a)b.png", "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
+        let expected = super::build_proxy_url(
+            &settings,
+            "https://cdn.example/a)b.png",
+            &settings.publisher.effective_public_origin(),
+        );
         assert!(
             out.contains(&expected),
             "the whole quoted value, parens included, should be proxied: {out}"
@@ -2143,13 +2226,17 @@ mod tests {
         // URL and it resolves with a literal quote in the path.
         let css = r#"background:url("https://cdn.example/a\")b.png")"#;
 
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
 
         assert!(
             out.contains(&super::build_proxy_url(
                 &settings,
                 "https://cdn.example/a\")b.png",
-                ""
+                &settings.publisher.effective_public_origin()
             )),
             "should proxy the resolved value: {out}"
         );
@@ -2159,7 +2246,11 @@ mod tests {
     fn rewrite_style_urls_ends_unquoted_url_at_first_paren() {
         let settings = crate::test_support::tests::create_test_settings();
         let css = "background:url(https://cdn.example/a)b.png)";
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
         assert!(
             out.contains("/first-party/proxy?tsurl="),
             "an unquoted url still ends at the first paren: {out}"
@@ -2174,7 +2265,11 @@ mod tests {
     fn rewrite_style_urls_leaves_string_broken_by_newline_unchanged() {
         let settings = crate::test_support::tests::create_test_settings();
         let css = "background:url(\"https://cdn.example/a\nb)";
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
         assert_eq!(
             out, css,
             "a string a newline has already ended should be left alone"
@@ -2193,7 +2288,11 @@ mod tests {
             "background:url(\"https://cdn.example/a\\\r\nb.png\")",
             "background:url(\"https://cdn.example/a\\\r\nb)c.png\")",
         ] {
-            let out = rewrite_style_urls(&settings, css, "");
+            let out = rewrite_style_urls(
+                &settings,
+                css,
+                &settings.publisher.effective_public_origin(),
+            );
             assert!(
                 out.contains("/first-party/proxy?tsurl="),
                 "an escaped absolute URL must still be proxied: {css} -> {out}"
@@ -2209,14 +2308,14 @@ mod tests {
         let out = rewrite_style_urls(
             &settings,
             "background:url(\"https://tracker.example/\\70 ixel.gif\")",
-            "",
+            &settings.publisher.effective_public_origin(),
         );
 
         assert!(
             out.contains(&super::build_proxy_url(
                 &settings,
                 "https://tracker.example/pixel.gif",
-                ""
+                &settings.publisher.effective_public_origin()
             )),
             "should proxy the resolved URL: {out}"
         );
@@ -2230,7 +2329,11 @@ mod tests {
         // is never requested.
         let css = "background:url(\"https://cdn.example/a\u{c}b.png\")";
 
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
 
         assert_eq!(out, css, "should not proxy a value the browser discards");
     }
@@ -2240,7 +2343,11 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         let css = "background:url(\"https://cdn.example/plain.png\")";
 
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
 
         assert!(
             out.contains("/first-party/proxy?tsurl="),
@@ -2258,7 +2365,11 @@ mod tests {
         let css = "a{background:url(\"https://cdn.example/a.png);\
 b{background:url(\"https://cdn.example/c.png\")}";
 
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
 
         assert_eq!(out, css, "should not invent a value out of a bad string");
         assert!(
@@ -2275,7 +2386,7 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let out = rewrite_style_urls(
             &settings,
             "a{background:url('https://tracker.example/pixel.gif'",
-            "",
+            &settings.publisher.effective_public_origin(),
         );
 
         assert!(
@@ -2345,7 +2456,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
                 css.push_str(alphabet[(next() as usize) % alphabet.len()]);
             }
 
-            let out = rewrite_style_urls(&settings, &css, "");
+            let out = rewrite_style_urls(
+                &settings,
+                &css,
+                &settings.publisher.effective_public_origin(),
+            );
 
             // Output either keeps the original bytes, is rejected outright,
             // or carries the proxy token it was rewritten for. Anything else
@@ -2366,13 +2481,17 @@ b{background:url(\"https://cdn.example/c.png\")}";
             "background:image-set(\"https://tracker.example/a.png\" 1x)",
             "background:-webkit-image-set(\"https://tracker.example/a.png\" 1x)",
         ] {
-            let out = rewrite_style_urls(&settings, css, "");
+            let out = rewrite_style_urls(
+                &settings,
+                css,
+                &settings.publisher.effective_public_origin(),
+            );
 
             assert!(
                 out.contains(&super::build_proxy_url(
                     &settings,
                     "https://tracker.example/a.png",
-                    ""
+                    &settings.publisher.effective_public_origin()
                 )),
                 "should proxy a bare image-set candidate: {css} -> {out}"
             );
@@ -2385,7 +2504,7 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let out = rewrite_style_urls(
             &settings,
             "background:image-set(\"https://tracker.example/a.png\" 1x,\"https://tracker.example/b.png\" 2x)",
-            "",
+            &settings.publisher.effective_public_origin(),
         );
 
         for name in ["a.png", "b.png"] {
@@ -2393,7 +2512,7 @@ b{background:url(\"https://cdn.example/c.png\")}";
                 out.contains(&super::build_proxy_url(
                     &settings,
                     &format!("https://tracker.example/{name}"),
-                    ""
+                    &settings.publisher.effective_public_origin()
                 )),
                 "should proxy {name}: {out}"
             );
@@ -2406,14 +2525,14 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let out = rewrite_style_urls(
             &settings,
             "@font-face{src:src(\"https://tracker.example/a.woff2\")}",
-            "",
+            &settings.publisher.effective_public_origin(),
         );
 
         assert!(
             out.contains(&super::build_proxy_url(
                 &settings,
                 "https://tracker.example/a.woff2",
-                ""
+                &settings.publisher.effective_public_origin()
             )),
             "should proxy a src() argument: {out}"
         );
@@ -2423,13 +2542,17 @@ b{background:url(\"https://cdn.example/c.png\")}";
     fn rewrite_style_urls_proxies_a_bare_import_prelude() {
         let settings = crate::test_support::tests::create_test_settings();
         // `@import "…";` loads a whole third-party stylesheet.
-        let out = rewrite_style_urls(&settings, "@import \"https://tracker.example/s.css\";", "");
+        let out = rewrite_style_urls(
+            &settings,
+            "@import \"https://tracker.example/s.css\";",
+            &settings.publisher.effective_public_origin(),
+        );
 
         assert!(
             out.contains(&super::build_proxy_url(
                 &settings,
                 "https://tracker.example/s.css",
-                ""
+                &settings.publisher.effective_public_origin()
             )),
             "should proxy an @import prelude string: {out}"
         );
@@ -2447,7 +2570,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
             "@media \"https://tracker.example/a.png\"{a{color:red}}",
             "@import \"https://tracker.example/s.css\";content:\"https://tracker.example/a.png\"",
         ] {
-            let out = rewrite_style_urls(&settings, css, "");
+            let out = rewrite_style_urls(
+                &settings,
+                css,
+                &settings.publisher.effective_public_origin(),
+            );
 
             assert!(
                 !out.contains("content:\"/first-party")
@@ -2468,7 +2595,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let css = "@import \"https://tracker.example/x.css\"";
 
         let attribute = super::rewrite_style_attribute_urls(&settings, css, "");
-        let stylesheet = rewrite_style_urls(&settings, css, "");
+        let stylesheet = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
 
         assert_eq!(
             attribute, css,
@@ -2478,7 +2609,7 @@ b{background:url(\"https://cdn.example/c.png\")}";
             stylesheet.contains(&super::build_proxy_url(
                 &settings,
                 "https://tracker.example/x.css",
-                ""
+                &settings.publisher.effective_public_origin()
             )),
             "should still read the same bytes as a rule in a stylesheet: {stylesheet}"
         );
@@ -2492,14 +2623,14 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let out = rewrite_style_urls(
             &settings,
             "@import \"https://cdn.example/x.css\" \"https://tracker.example/z.css\";",
-            "",
+            &settings.publisher.effective_public_origin(),
         );
 
         assert!(
             out.contains(&super::build_proxy_url(
                 &settings,
                 "https://cdn.example/x.css",
-                ""
+                &settings.publisher.effective_public_origin()
             )),
             "should proxy the prelude's URL: {out}"
         );
@@ -2516,7 +2647,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
         // following string sits inside the at-rule. It is still not a URL, and
         // rewriting it would rewrite a `content` value.
         let css = "@import \"https://cdn.example/x.css\" content:\"https://legit.example/y.png\"";
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
 
         assert!(
             !out.contains("content:url("),
@@ -2534,7 +2669,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let settings = crate::test_support::tests::create_test_settings();
         let css = ".a{--metadata:@import \"https://tracker.example/text\";}";
 
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
 
         assert_eq!(
             out, css,
@@ -2547,7 +2686,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let settings = crate::test_support::tests::create_test_settings();
         let css = "@unknown @import \"https://tracker.example/text\";";
 
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
 
         assert_eq!(
             out, css,
@@ -2561,14 +2704,14 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let out = rewrite_style_urls(
             &settings,
             "@import  /*c*/ \"https://cdn.example/x.css\";",
-            "",
+            &settings.publisher.effective_public_origin(),
         );
 
         assert!(
             out.contains(&super::build_proxy_url(
                 &settings,
                 "https://cdn.example/x.css",
-                ""
+                &settings.publisher.effective_public_origin()
             )),
             "should not spend the prelude's value on whitespace: {out}"
         );
@@ -2582,13 +2725,17 @@ b{background:url(\"https://cdn.example/c.png\")}";
             "<!-- @import \"https://cdn.example/x.css\";",
             "--> @import \"https://cdn.example/x.css\";",
         ] {
-            let out = rewrite_style_urls(&settings, css, "");
+            let out = rewrite_style_urls(
+                &settings,
+                css,
+                &settings.publisher.effective_public_origin(),
+            );
 
             assert!(
                 out.contains(&super::build_proxy_url(
                     &settings,
                     "https://cdn.example/x.css",
-                    ""
+                    &settings.publisher.effective_public_origin()
                 )),
                 "should ignore a top-level CDO/CDC token before @import: {css} -> {out}"
             );
@@ -2603,11 +2750,19 @@ b{background:url(\"https://cdn.example/c.png\")}";
             "a{".repeat(super::MAX_CSS_NESTING_DEPTH),
             "}".repeat(super::MAX_CSS_NESTING_DEPTH)
         );
-        let out = rewrite_style_urls(&settings, &css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            &css,
+            &settings.publisher.effective_public_origin(),
+        );
 
         for url in ["https://cdn.example/x.css", "https://tracker.example/y.png"] {
             assert!(
-                out.contains(&super::build_proxy_url(&settings, url, "")),
+                out.contains(&super::build_proxy_url(
+                    &settings,
+                    url,
+                    &settings.publisher.effective_public_origin()
+                )),
                 "should proxy {url} without treating later CSS as part of the import: {out}"
             );
         }
@@ -2630,13 +2785,17 @@ b{background:url(\"https://cdn.example/c.png\")}";
                 "}".repeat(blocks)
             );
 
-            let out = rewrite_style_urls(&settings, &css, "");
+            let out = rewrite_style_urls(
+                &settings,
+                &css,
+                &settings.publisher.effective_public_origin(),
+            );
 
             assert_eq!(
                 out.contains(&super::build_proxy_url(
                     &settings,
                     "https://cdn.example/a.png",
-                    ""
+                    &settings.publisher.effective_public_origin()
                 )),
                 admitted,
                 "image-set() at {blocks} nested blocks should be admitted: {admitted}"
@@ -2652,14 +2811,14 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let out = rewrite_style_urls(
             &settings,
             "background:image-set(@x \"https://tracker.example/a.png\" 1x)",
-            "",
+            &settings.publisher.effective_public_origin(),
         );
 
         assert!(
             out.contains(&super::build_proxy_url(
                 &settings,
                 "https://tracker.example/a.png",
-                ""
+                &settings.publisher.effective_public_origin()
             )),
             "should proxy a candidate following an unexpected token: {out}"
         );
@@ -2674,7 +2833,7 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let out = rewrite_style_urls(
             &settings,
             "background-image:src(\"https://tracker.example/a.png\")",
-            "",
+            &settings.publisher.effective_public_origin(),
         );
 
         assert!(
@@ -2685,7 +2844,7 @@ b{background:url(\"https://cdn.example/c.png\")}";
             out.contains(&super::build_proxy_url(
                 &settings,
                 "https://tracker.example/a.png",
-                ""
+                &settings.publisher.effective_public_origin()
             )),
             "should still proxy the value: {out}"
         );
@@ -2699,14 +2858,14 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let out = rewrite_style_urls(
             &settings,
             "background-image:image-set(var(--missing, \"https://tracker.example/a.png\") 1x)",
-            "",
+            &settings.publisher.effective_public_origin(),
         );
 
         assert!(
             out.contains(&super::build_proxy_url(
                 &settings,
                 "https://tracker.example/a.png",
-                ""
+                &settings.publisher.effective_public_origin()
             )),
             "should proxy a var() fallback candidate: {out}"
         );
@@ -2721,7 +2880,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
             "content:var(--missing, \"https://tracker.example/a.png\")",
             "@import var(--missing, \"https://tracker.example/x.css\");",
         ] {
-            let out = rewrite_style_urls(&settings, css, "");
+            let out = rewrite_style_urls(
+                &settings,
+                css,
+                &settings.publisher.effective_public_origin(),
+            );
 
             assert_eq!(
                 out, css,
@@ -2739,19 +2902,23 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let indirect = rewrite_style_urls(
             &settings,
             "a{--c:\"https://tracker.example/a.png\";background-image:image-set(var(--c) 1x)}",
-            "",
+            &settings.publisher.effective_public_origin(),
         );
         assert!(
             !indirect.contains("/first-party/proxy?tsurl="),
             "substitution is out of reach, so nothing is claimed: {indirect}"
         );
 
-        let token = rewrite_style_urls(&settings, "a{--c:url(https://tracker.example/a.png)}", "");
+        let token = rewrite_style_urls(
+            &settings,
+            "a{--c:url(https://tracker.example/a.png)}",
+            &settings.publisher.effective_public_origin(),
+        );
         assert!(
             token.contains(&super::build_proxy_url(
                 &settings,
                 "https://tracker.example/a.png",
-                ""
+                &settings.publisher.effective_public_origin()
             )),
             "a url() token in a custom property is still a URL: {token}"
         );
@@ -2765,14 +2932,14 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let out = rewrite_style_urls(
             &settings,
             "@font-face{src:src(var(--missing, \"https://tracker.example/a.woff2\"))}",
-            "",
+            &settings.publisher.effective_public_origin(),
         );
 
         assert!(
             out.contains(&super::build_proxy_url(
                 &settings,
                 "https://tracker.example/a.woff2",
-                ""
+                &settings.publisher.effective_public_origin()
             )),
             "should proxy the fallback: {out}"
         );
@@ -2791,7 +2958,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
         // never the URL it requests, and rewriting it would claim otherwise.
         let css = "background:url(var(--missing, \"https://tracker.example/a.png\"))";
 
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
 
         assert_eq!(out, css, "should leave a url() argument unsubstituted");
     }
@@ -2804,15 +2975,18 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let candidate = rewrite_style_urls(
             &settings,
             "background:image-set(\"https://tracker.example/a.png\" 1x)",
-            "",
+            &settings.publisher.effective_public_origin(),
         );
         assert!(
             candidate.starts_with("background:image-set(\"") && !candidate.contains("set(url("),
             "an image-set candidate stays a string: {candidate}"
         );
 
-        let prelude =
-            rewrite_style_urls(&settings, "@import \"https://tracker.example/s.css\";", "");
+        let prelude = rewrite_style_urls(
+            &settings,
+            "@import \"https://tracker.example/s.css\";",
+            &settings.publisher.effective_public_origin(),
+        );
         assert!(
             prelude.starts_with("@import \"") && !prelude.contains("@import url("),
             "an @import prelude stays a string: {prelude}"
@@ -2829,13 +3003,17 @@ b{background:url(\"https://cdn.example/c.png\")}";
             "background:image-set(env(--nope, \"https://tracker.example/a.png\") 1x)",
             "background:image-set(env(--a, var(--b, \"https://tracker.example/a.png\")) 1x)",
         ] {
-            let out = rewrite_style_urls(&settings, css, "");
+            let out = rewrite_style_urls(
+                &settings,
+                css,
+                &settings.publisher.effective_public_origin(),
+            );
 
             assert!(
                 out.contains(&super::build_proxy_url(
                     &settings,
                     "https://tracker.example/a.png",
-                    ""
+                    &settings.publisher.effective_public_origin()
                 )),
                 "should proxy a substituted fallback: {css} -> {out}"
             );
@@ -2852,7 +3030,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
             "background:image-set(linear-gradient(\"https://tracker.example/a.png\") 1x)",
             "background:image-set(counter(x, \"https://tracker.example/a.png\") 1x)",
         ] {
-            let out = rewrite_style_urls(&settings, css, "");
+            let out = rewrite_style_urls(
+                &settings,
+                css,
+                &settings.publisher.effective_public_origin(),
+            );
 
             assert_eq!(
                 out, css,
@@ -2868,7 +3050,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
             "content:env(--nope, \"https://tracker.example/a.png\")",
             "background:url(env(--nope, \"https://tracker.example/a.png\"))",
         ] {
-            let out = rewrite_style_urls(&settings, css, "");
+            let out = rewrite_style_urls(
+                &settings,
+                css,
+                &settings.publisher.effective_public_origin(),
+            );
 
             assert_eq!(
                 out, css,
@@ -2884,7 +3070,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
         // unbounded walk would abort the request rather than answer it.
         let css = "{".repeat(super::MAX_CSS_NESTING_DEPTH * 40);
 
-        let out = rewrite_style_urls(&settings, &css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            &css,
+            &settings.publisher.effective_public_origin(),
+        );
 
         assert!(
             out.is_empty(),
@@ -2911,13 +3101,17 @@ b{background:url(\"https://cdn.example/c.png\")}";
                 "}".repeat(super::MAX_CSS_NESTING_DEPTH)
             );
 
-            let out = rewrite_style_urls(&settings, &css, "");
+            let out = rewrite_style_urls(
+                &settings,
+                &css,
+                &settings.publisher.effective_public_origin(),
+            );
 
             assert!(
                 out.contains(&super::build_proxy_url(
                     &settings,
                     "https://cdn.example/a.png",
-                    ""
+                    &settings.publisher.effective_public_origin()
                 )),
                 "should still rewrite {reference} at the deepest supported level: {out}"
             );
@@ -2929,13 +3123,17 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let settings = crate::test_support::tests::create_test_settings();
         let css = "@media screen{.a{background:url(https://cdn.example/a.png)}}";
 
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
 
         assert!(
             out.contains(&super::build_proxy_url(
                 &settings,
                 "https://cdn.example/a.png",
-                ""
+                &settings.publisher.effective_public_origin()
             )),
             "should rewrite a url() inside a media query: {out}"
         );
@@ -2945,7 +3143,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
     fn rewrite_style_urls_handles_mismatched_quotes() {
         let settings = crate::test_support::tests::create_test_settings();
         let css = "background:url('/local/a.png\")";
-        let out = rewrite_style_urls(&settings, css, "");
+        let out = rewrite_style_urls(
+            &settings,
+            css,
+            &settings.publisher.effective_public_origin(),
+        );
         assert_eq!(out, css, "should leave a mismatched quoted url unchanged");
     }
 
@@ -3223,12 +3425,24 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let limit = 256;
         let settings = crate::test_support::tests::create_test_settings();
         let reference = "@import \"https://cdn.example.com/a.css\";";
-        super::rewrite_style_urls_in_context(&settings, reference, "", true, limit)
-            .expect("should fit the rewritten reference before appending the tail");
+        super::rewrite_style_urls_in_context(
+            &settings,
+            reference,
+            &settings.publisher.effective_public_origin(),
+            true,
+            limit,
+        )
+        .expect("should fit the rewritten reference before appending the tail");
         let css = format!("{reference}{}", " ".repeat(limit - reference.len()));
         assert!(
             matches!(
-                super::rewrite_style_urls_in_context(&settings, &css, "", true, limit),
+                super::rewrite_style_urls_in_context(
+                    &settings,
+                    &css,
+                    &settings.publisher.effective_public_origin(),
+                    true,
+                    limit
+                ),
                 Err(super::CssRewriteError::OutputTooLarge)
             ),
             "should reject the expanded output including the unchanged tail"
@@ -3270,7 +3484,7 @@ b{background:url(\"https://cdn.example/c.png\")}";
             let rewritten = super::rewrite_style_urls_in_context(
                 &settings,
                 &css,
-                "",
+                &settings.publisher.effective_public_origin(),
                 allows_import_rules,
                 limit,
             );
@@ -3297,7 +3511,14 @@ b{background:url(\"https://cdn.example/c.png\")}";
         let reference = "@import \"https://cdn.example.com/a.css\";";
         let css = format!("{}{reference}", " ".repeat(limit - reference.len()));
         assert!(
-            super::rewrite_style_urls_in_context(&settings, &css, "", true, limit).is_err(),
+            super::rewrite_style_urls_in_context(
+                &settings,
+                &css,
+                &settings.publisher.effective_public_origin(),
+                true,
+                limit
+            )
+            .is_err(),
             "should reject URL expansion beyond the output budget"
         );
     }
@@ -3331,7 +3552,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
     fn rewrite_srcset_w_and_x_descriptors() {
         let settings = crate::test_support::tests::create_test_settings();
         let srcset = "https://cdn.example/a.png 100w, //cdn.example/b.png 2x, /local/c.png 1x";
-        let out = rewrite_srcset(&settings, srcset, "");
+        let out = rewrite_srcset(
+            &settings,
+            srcset,
+            &settings.publisher.effective_public_origin(),
+        );
         assert!(out.contains(" 100w"));
         assert!(out.contains(" 2x"));
         assert!(out.contains("/local/c.png 1x"));
@@ -3346,7 +3571,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
     fn rewrite_srcset_ignores_non_network_schemes() {
         let settings = crate::test_support::tests::create_test_settings();
         let srcset = "data:image/png;base64,AAAA 1x, https://cdn.example/a.png 2x";
-        let out = rewrite_srcset(&settings, srcset, "");
+        let out = rewrite_srcset(
+            &settings,
+            srcset,
+            &settings.publisher.effective_public_origin(),
+        );
         assert!(out.contains("data:image/png;base64,AAAA 1x"), "{}", out);
         assert!(out.contains("/first-party/proxy?tsurl="), "{}", out);
     }
@@ -3764,7 +3993,10 @@ b{background:url(\"https://cdn.example/c.png\")}";
           <img data-srcset="https://cdn.example/img-1x.png 1x, //cdn.example/img-2x.png 2x, /local/img.png 1x">
         "#;
         let out = rewrite_creative_html(&settings, html);
-        assert!(out.contains("data-src=\"/first-party/proxy?tsurl="));
+        assert!(out.contains(&format!(
+            "data-src=\"{}/first-party/proxy?tsurl=",
+            settings.publisher.effective_public_origin()
+        )));
         assert!(out.matches("/first-party/proxy?tsurl=").count() >= 1);
         // relative candidate remains
         assert!(out.contains("/local/img.png 1x"));
@@ -3785,7 +4017,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
             "//cdnjs.publisher.example.org/lib.js",
         ] {
             assert_eq!(
-                proxy_if_abs(&settings, excluded, ""),
+                proxy_if_abs(
+                    &settings,
+                    excluded,
+                    &settings.publisher.effective_public_origin()
+                ),
                 None,
                 "should leave excluded URL `{excluded}` unproxied"
             );
@@ -3796,8 +4032,17 @@ b{background:url(\"https://cdn.example/c.png\")}";
             "https://notpublisher.example.org/lib.js",
         ] {
             assert!(
-                proxy_if_abs(&settings, proxied, "")
-                    .is_some_and(|url| url.starts_with("/first-party/proxy?tsurl=")),
+                proxy_if_abs(
+                    &settings,
+                    proxied,
+                    &settings.publisher.effective_public_origin()
+                )
+                .is_some_and(|url| {
+                    url.starts_with(&format!(
+                        "{}/first-party/proxy?tsurl=",
+                        settings.publisher.effective_public_origin()
+                    ))
+                }),
                 "should proxy non-excluded URL `{proxied}`"
             );
         }
@@ -4200,7 +4445,174 @@ b{background:url(\"https://cdn.example/c.png\")}";
         // Non-excluded should be rewritten and SHOULD have data-tsclick
         assert!(out.contains("/first-party/click?tsurl="));
         assert!(out.contains("advertiser.example.com"));
-        assert!(out.contains("data-tsclick=\"/first-party/click"));
+        assert!(out.contains(&format!(
+            "data-tsclick=\"{}/first-party/click",
+            settings.publisher.effective_public_origin()
+        )));
+    }
+
+    #[test]
+    fn creative_runtime_stamps_normalized_origin_for_documents_and_fragments() {
+        for configured in [
+            None,
+            Some("HTTPS://ADS.PUBLISHER.EXAMPLE:443"),
+            Some("https://ads.publisher.example:8443"),
+        ] {
+            let mut settings = crate::test_support::tests::create_test_settings();
+            settings.publisher.public_origin = configured.map(str::to_owned);
+            settings
+                .publisher
+                .normalize()
+                .expect("should normalize publisher settings");
+            let origin = settings.publisher.effective_public_origin();
+            for markup in ["<body>ad</body>", "<p>ad</p>"] {
+                let output = rewrite_creative_html(&settings, markup);
+                let expected = format!(
+                    "<script src=\"{origin}/static/tsjs=tsjs-unified.min.js\" id=\"trustedserver-js\" data-ts-public-origin=\"{origin}\"></script>"
+                );
+                assert_eq!(
+                    output.matches(&expected).count(),
+                    1,
+                    "should stamp the same configured origin used for the creative runtime source"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inline_origin_resolution_preserves_signatures_and_query_order() {
+        let clear = "https://cdn.example.com:9443/ad.png?b=two+words&a=1&a=2#fragment";
+        let expected_signed_target = "https://cdn.example.com:9443/ad.png?b=two+words&a=1&a=2";
+        for configured in [None, Some("https://ads.publisher.example:8443")] {
+            let mut settings = crate::test_support::tests::create_test_settings();
+            settings.publisher.public_origin = configured.map(str::to_owned);
+            for request_origin in [
+                "",
+                "http://localhost:7676",
+                "https://forwarded.publisher.example:8443",
+            ] {
+                let expected_origin = if request_origin.is_empty() {
+                    settings.publisher.effective_public_origin()
+                } else {
+                    request_origin.to_owned()
+                };
+                let output = rewrite_inline_creative_html(
+                    &settings,
+                    request_origin,
+                    &format!("<img src=\"{clear}\"><a href=\"{clear}\">ad</a>"),
+                );
+                for (attribute, path) in [
+                    ("src", "/first-party/proxy"),
+                    ("href", "/first-party/click"),
+                ] {
+                    let value = output
+                        .split(&format!("{attribute}=\""))
+                        .nth(1)
+                        .expect("should emit attribute")
+                        .split('"')
+                        .next()
+                        .expect("should close attribute");
+                    let parsed = url::Url::parse(value).expect("should emit absolute URL");
+                    assert_eq!(
+                        parsed.origin().ascii_serialization(),
+                        expected_origin,
+                        "should retain inline origin precedence and empty fallback"
+                    );
+                    assert_eq!(parsed.path(), path, "should use the selected endpoint");
+                    let pairs = parsed.query_pairs().collect::<Vec<_>>();
+                    assert_eq!(
+                        pairs
+                            .iter()
+                            .map(|(key, _)| key.as_ref())
+                            .collect::<Vec<_>>(),
+                        ["tsurl", "b", "a", "a", "tstoken"],
+                        "should preserve target ordering and duplicates"
+                    );
+                    assert_eq!(
+                        pairs[0].1, "https://cdn.example.com:9443/ad.png",
+                        "should remove query and fragment from tsurl"
+                    );
+                    assert_eq!(
+                        pairs[4].1,
+                        crate::http_util::compute_encrypted_sha256_token(
+                            &settings,
+                            expected_signed_target,
+                        ),
+                        "should sign the unchanged target, not the chosen origin"
+                    );
+                }
+                assert!(
+                    !output.contains("trustedserver-js"),
+                    "should preserve the inline runtime omission"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_first_party_urls_use_public_origin() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.publisher.public_origin = Some("https://ads.publisher.example:8443".to_string());
+
+        let proxy = build_proxy_url(
+            &settings,
+            "https://cdn.example.com/ad.png?campaign=1",
+            &settings.publisher.effective_public_origin(),
+        );
+        let click = build_click_url(
+            &settings,
+            "https://advertiser.example.com/landing",
+            &settings.publisher.effective_public_origin(),
+        );
+        for generated in [&proxy, &click] {
+            let parsed = url::Url::parse(generated).expect("should build an absolute URL");
+            assert_eq!(
+                parsed.origin().ascii_serialization(),
+                "https://ads.publisher.example:8443"
+            );
+        }
+
+        let out = rewrite_creative_html(
+            &settings,
+            r#"<body><img src="https://cdn.example.com/ad.png" srcset="https://cdn.example.com/ad-2x.png 2x" style="background:url(https://cdn.example.com/bg.png)"><a href="https://advertiser.example.com/landing">ad</a></body>"#,
+        );
+        assert!(out.contains("https://ads.publisher.example:8443/first-party/proxy?"));
+        assert!(out.contains("https://ads.publisher.example:8443/first-party/click?"));
+        assert_eq!(
+            out.matches("https://ads.publisher.example:8443/first-party/proxy?")
+                .count(),
+            3,
+            "should qualify resource, srcset, and CSS rewrites"
+        );
+        assert!(out.contains("https://ads.publisher.example:8443/static/tsjs="));
+        assert!(!out.contains(&settings.publisher.origin_url));
+        assert!(!out.contains(&format!(
+            "https://{}/first-party",
+            settings.publisher.domain
+        )));
+
+        let fragment = rewrite_creative_html(&settings, "<p>Body-less creative</p>");
+        assert_eq!(
+            fragment
+                .matches("https://ads.publisher.example:8443/static/tsjs=")
+                .count(),
+            1,
+            "should inject the absolute runtime once into a body-less creative"
+        );
+    }
+
+    #[test]
+    fn generated_first_party_urls_fall_back_to_publisher_domain() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let proxy = build_proxy_url(
+            &settings,
+            "https://cdn.example.com/ad.png",
+            &settings.publisher.effective_public_origin(),
+        );
+        assert!(proxy.starts_with(&format!(
+            "https://{}/first-party/proxy?",
+            settings.publisher.domain
+        )));
     }
 
     // ── sanitize_creative_html tests ────────────────────────────────────────

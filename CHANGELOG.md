@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add Phase 1 attested release binaries: the Fastly wasm and the `ts` CLI for Linux x86-64 and macOS (ARM64 and x86-64), with SPDX 2.3 inventories, provenance/SBOM bundles, immutable verification and a GNU glibc 2.34 startup check. Reproducibility, other adapters and the custom verifier remain later work; production publication requires maintainer settings.
+
 ### Changed
 
 - **Breaking:** EdgeZero is pinned to `14a6ca8bb5a5cbe055a1f725bdab8f42569a3bf0`, the head of EdgeZero pull request 275, in place of `v0.0.11` (#1506). Every adapter now serves requests through EdgeZero's request lifecycle and sends outbound HTTP through EdgeZero's `HttpClient`. Trusted Server's own outbound layer is removed: `PlatformHttpClient`, `PlatformBackend`, backend naming, the adapter HTTP clients, the redirect loop, the capability methods, and Trusted Server's Fastly response delivery. `RuntimeServices` drops `http_client` and `backend` and requires `outbound_client` and `clock`, and the config and secret store write methods are async. Code that implemented or called the removed traits must move to EdgeZero's client; see the [integration guide](docs/guide/integration-guide.md#proxy-implementation-rules).
@@ -22,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `ts config validate` and `ts config push` reject `creative_opportunities.origin_readthrough_enabled = true`, because origin readthrough is unavailable; a live config keeps loading and treats it as `false` with a warning (#1506). They also reject a `publisher.origin_url` with userinfo, which would answer every publisher request with 400.
 - Spin logs a warning at settings load when `publisher.origin_host_header_override` is set, because EdgeZero's Spin client cannot send a different `Host` (#1506). Fastly, Axum, and Cloudflare send the override as the origin `Host`.
 - `ts build`, `ts serve`, and `ts deploy` find the manifest through `EDGEZERO_MANIFEST`, then the nearest `edgezero.toml` in the working directory or a parent, then the nearest one under the workspace root, in place of only `./edgezero.toml` (#1506).
+- The attested Fastly wasm reports `x-ts-version` as the full 40-character source commit; deploy-pipeline builds keep the tag, branch or short-commit value described below.
+- **Breaking:** `ts --version` now prints `ts package=<version> source=<source> target=<triple> variant=default` instead of `ts <version>`. `source` is the full commit in attested release binaries, and otherwise the development ref, short commit or `unknown`. Update scripts that parse the old output.
+- **Breaking:** Creative rewrite proxy, click, CSS, `srcset`, sign-response, rebuild-response, and injected creative TSJS URLs are now absolute on `publisher.public_origin`. Review the [default authority, cookie scope, and coordinated upgrade/rollback warning for `public_origin`](docs/guide/configuration.md#publisher-configuration) before deployment. Existing root-relative signed proxy and click inputs remain accepted. TSJS bundle selection and hash calculation are unchanged.
 - The Lockr browser module no longer polls for private SDK state or mutates its API host, removing the "Lockr SDK not detected" timeout warning (#1247). Root-relative Lockr XHR API requests and rewritten SDK URLs now stay on the page origin even with an external `<base href>`. Custom or unreplaced legacy SDKs that relied on the removed host rewrite must route their own API calls through `/integrations/lockr/api`; `rewrite_sdk = false` leaves static SDK tags unchanged but does not disable dynamic interception. See the [Lockr migration guide](docs/guide/integrations/lockr.md#migration-from-the-sdk-host-shim).
 - Auction response collection now bounds network waiting by `[auction].timeout_ms`
   measured from dispatch, including delayed headers and trickling bodies on all

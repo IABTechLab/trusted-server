@@ -1,13 +1,19 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as setTimeoutPromise } from "node:timers/promises";
 import { createServer } from "node:net";
+import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
+import { resolve } from "node:path";
 import { waitForReady } from "./wait-for-ready.js";
 
 const ORIGIN_PORT = process.env.INTEGRATION_ORIGIN_PORT || "8888";
 
 /** Framework-specific container configuration. */
 const FRAMEWORK_CONFIG: Record<string, { image: string; port: number }> = {
-  nextjs: { image: "test-nextjs:latest", port: 3000 },
+  nextjs: {
+    image: process.env.NEXTJS_TEST_IMAGE || "test-nextjs:latest",
+    port: 3000,
+  },
   wordpress: { image: "test-wordpress:latest", port: 80 },
 };
 
@@ -90,38 +96,70 @@ export function stopContainer(containerId: string): void {
 export async function startViceroy(
   wasmPath: string,
   configPath: string,
+  options: { publicOriginHostname?: string } = {},
 ): Promise<{ process: ChildProcess; baseUrl: string }> {
   const port = await findAvailablePort();
-
-  const child = spawn(
-    "viceroy",
-    [wasmPath, "-C", configPath, "--addr", `127.0.0.1:${port}`],
-    // stdin: ignore, stdout: pipe (drained), stderr: pipe (logged).
-    // IMPORTANT: stdout MUST be drained to prevent pipe buffer deadlock.
-    // If the OS pipe buffer (~64KB) fills, Viceroy blocks on write.
-    { stdio: ["ignore", "pipe", "pipe"] },
-  );
-
-  // Drain stdout to prevent pipe buffer deadlock
-  child.stdout?.resume();
-
-  // Surface Viceroy stderr for debugging
-  child.stderr?.on("data", (data: Buffer) => {
-    const line = data.toString().trim();
-    if (line) console.error(`[viceroy] ${line}`);
-  });
-
   const baseUrl = `http://127.0.0.1:${port}`;
-
-  try {
-    await waitForReady(baseUrl, "/health");
-  } catch (err) {
-    // Viceroy spawned but never became ready — kill it before propagating.
-    if (child.pid) await stopViceroy(child.pid);
-    throw err;
+  const publicOrigin = new URL(baseUrl);
+  if (options.publicOriginHostname) {
+    publicOrigin.hostname = options.publicOriginHostname;
+  }
+  let generator = process.env.VICEROY_CONFIG_GENERATOR_PATH;
+  if (!generator) {
+    const host = execFileSync("rustc", ["-vV"], { encoding: "utf-8" }).match(
+      /^host: (.+)$/m,
+    )?.[1];
+    if (!host) throw new Error("Failed to detect Rust host target");
+    generator = resolve(
+      __dirname,
+      "../../target",
+      host,
+      "debug/generate-viceroy-config",
+    );
   }
 
-  return { process: child, baseUrl };
+  // Retarget the existing envelope after choosing the listener port. Keep the
+  // config beside its source so relative Viceroy resource paths still work.
+  const runtimeConfig = `${configPath}.${randomUUID()}.toml`;
+  try {
+    execFileSync(generator, [
+      "--template",
+      configPath,
+      "--output",
+      runtimeConfig,
+      "--public-origin",
+      publicOrigin.origin,
+    ]);
+    const child = spawn(
+      "viceroy",
+      [wasmPath, "-C", runtimeConfig, "--addr", `127.0.0.1:${port}`],
+      // stdin: ignore, stdout: pipe (drained), stderr: pipe (logged).
+      // IMPORTANT: stdout MUST be drained to prevent pipe buffer deadlock.
+      // If the OS pipe buffer (~64KB) fills, Viceroy blocks on write.
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+
+    // Drain stdout to prevent pipe buffer deadlock
+    child.stdout?.resume();
+
+    // Surface Viceroy stderr for debugging
+    child.stderr?.on("data", (data: Buffer) => {
+      const line = data.toString().trim();
+      if (line) console.error(`[viceroy] ${line}`);
+    });
+
+    try {
+      await waitForReady(baseUrl, "/health");
+    } catch (err) {
+      // Viceroy spawned but never became ready, kill it before propagating.
+      if (child.pid) await stopViceroy(child.pid);
+      throw err;
+    }
+
+    return { process: child, baseUrl };
+  } finally {
+    rmSync(runtimeConfig, { force: true });
+  }
 }
 
 /**
