@@ -1995,9 +1995,12 @@ it adds outbound sites or platform-type uses that need porting.
 | #917 absolute creative URLs                                  | Textual conflict in the `proxy.rs` rebuild handler and Fastly `app.rs` tests                                                     |
 | #839 EdgeZero Phase 1                                        | Superseded by the cut                                                                                                            |
 | #1343 to #1448 stack (55 PRs)                                | 36 heavy, 9 moderate. The worst (#1448, #1390, #1348, #1399) touch the HTTP layer, backend naming, and the Image Optimizer types |
-| #1310 ID5, #1325 and #1493 instream video, #1460 CWV loading | New outbound calls or uses of `StubHttpClient`, `PlatformBackendSpec`, and `BackendNamingPolicy`                                 |
+| #1310 ID5, #1325 and #1437 instream video, #1460 CWV loading | New outbound calls or uses of `StubHttpClient`, `PlatformBackendSpec`, and `BackendNamingPolicy`                                 |
 | #1499 MaxMind geo (base `rc/edgezero-431-demo`)              | Imports `edgezero_adapter_axum::geo`, which H does not have                                                                      |
 | #1516 S3 preflight cache bypass                              | Merges first. The port sets `Bypass` on the signed S3 HEAD and the raw error GET; the optimized GET stays `PlatformDefault`      |
+
+While the cut was open, #917, #1435, #1504, #1493, and #1455 merged to `main`,
+and the cut's Task 12 merges ported them. #1516 is still open.
 
 PR #1516 runs on the old API, so the cut's next merge of `main` ports it onto
 `OutboundCachePolicy::Bypass` and keeps the optimized GET's Image Optimizer
