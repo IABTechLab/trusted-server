@@ -23,7 +23,7 @@ No Lockr capability.
 
 - One EID for the single configured source, one UID with `atype = 1`, as Prebid sends `pubcid.org`.
 - Cookie IDs: default bounded expiry; a cookie repeating the held ID is not rewritten, so the expiry renews only when the source is due.
-- Generated IDs expire after 30 days (`MAX_TTL`), not the default 24 hours.
+- Generated IDs expire after 30 days (`MAX_TTL`), not the default 24 hours. When one expires while the row still holds it, it is renewed with the same ID rather than replaced by a new UUID, so it stays stable for as long as the row lives.
 
 ## Tasks
 
