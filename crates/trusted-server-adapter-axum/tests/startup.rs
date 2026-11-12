@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{Read as _, Write as _};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +24,28 @@ struct ServerFixture {
     child: Option<Child>,
 }
 
+fn reserve_port() -> tokio::net::TcpSocket {
+    // A listening reservation can survive another test's concurrent spawn and
+    // satisfy a negative startup probe before that child reaches exec.
+    let socket = tokio::net::TcpSocket::new_v4().expect("should create a port reservation");
+    socket
+        .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("should bind without creating a listener");
+    socket
+}
+
+#[test]
+fn fixture_port_reservation_does_not_create_a_listener() {
+    let reservation = reserve_port();
+    let address = reservation
+        .local_addr()
+        .expect("should read the reserved address");
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_err(),
+        "port allocation itself must not create a listener observed by concurrent startup probes"
+    );
+}
+
 impl ServerFixture {
     fn new(envelope: Option<&str>) -> Self {
         let root = std::env::temp_dir().join(format!(
@@ -41,9 +63,11 @@ impl ServerFixture {
             )
             .expect("should write a local config envelope map");
         }
-        let listener = TcpListener::bind("127.0.0.1:0").expect("should reserve a fresh test port");
-        let addr = listener.local_addr().expect("should read the test address");
-        drop(listener);
+        let reservation = reserve_port();
+        let addr = reservation
+            .local_addr()
+            .expect("should read the test address");
+        drop(reservation);
         Self {
             root,
             addr,
