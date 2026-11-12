@@ -12,6 +12,8 @@
 //! stored, Trusted Server generates one itself: a random UUID v4, stored in
 //! the row only. No cookie is set, so Prebid's own cookie is never touched;
 //! when Prebid later writes one, the cookie's ID replaces the generated one.
+//! An expired generated ID the row still holds is renewed with the same
+//! value, so it stays stable for as long as the row lives.
 //! Generation is off by default: Prebid may keep its opt-out in localStorage,
 //! which the server cannot see, so only a publisher who knows its opt-out
 //! lives in the `_pubcid_optout` cookie should turn it on.
@@ -128,13 +130,23 @@ impl IdentityProvider for SharedIdProvider {
         )])
     }
 
-    fn generate(&self, _lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
+    fn generate(&self, lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
         if !self.generate {
             return None;
         }
+        // An expired ID the row still holds is renewed rather than replaced,
+        // so the generated ID stays stable for as long as the row lives.
+        let id = lookup
+            .current
+            .iter()
+            .filter(|(source, _)| *source == self.source.as_str())
+            .flat_map(|(_, eid)| eid.uids())
+            .map(|uid| uid.id().as_str().to_owned())
+            .next()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         Some(vec![device_eid(
             &self.source,
-            Cow::Owned(Uuid::new_v4().to_string()),
+            Cow::Owned(id),
             // A generated ID has no cookie to renew it, so it keeps the
             // longest lifetime rather than changing every day.
             bounded_expiry(Some(MAX_TTL)),
@@ -145,7 +157,11 @@ impl IdentityProvider for SharedIdProvider {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use trusted_server_core::ec::provider::{ProviderExpiry, build_kind};
+    use trusted_server_core::ec::eid_types::{
+        AgentType, EidFields, Expiry, ProviderId, UidValue, UnixSeconds,
+    };
+    use trusted_server_core::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvUid};
+    use trusted_server_core::ec::provider::{OwnedEntries, ProviderExpiry, build_kind};
     use trusted_server_core::settings::{IdentityProviderConfig, ProviderSecrets};
 
     use super::*;
@@ -209,6 +225,13 @@ mod tests {
     }
 
     fn generate_with(provider: &dyn IdentityProvider) -> Option<Vec<ProviderEid<'static>>> {
+        generate_holding(provider, OwnedEntries::empty())
+    }
+
+    fn generate_holding(
+        provider: &dyn IdentityProvider,
+        current: OwnedEntries<'_>,
+    ) -> Option<Vec<ProviderEid<'static>>> {
         let consent = trusted_server_core::consent::ConsentContext::default();
         let lookup = LookupInput {
             ec_id: "ec-example",
@@ -219,7 +242,7 @@ mod tests {
             },
             publisher_domain: "www.example.com",
             due_sources: &[],
-            current: trusted_server_core::ec::provider::OwnedEntries::empty(),
+            current,
             cookies: RequestCookies::default(),
             hashed_email: None,
             now: trusted_server_core::ec::eid_types::UnixSeconds::new(1_700_000_000),
@@ -232,6 +255,43 @@ mod tests {
         assert!(
             generate_with(&*provider()).is_none(),
             "should not generate without generate = true"
+        );
+    }
+
+    #[test]
+    fn renews_an_expired_generated_id_the_row_still_holds() {
+        // Arrange: the row holds the generated ID, expired at 1000.
+        let provider = provider_with(&json!({ "generate": true }));
+        let uid = KvUid::new(
+            UidValue::try_from("11111111-2222-4333-8444-555555555555").expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("sharedid")),
+            Expiry::At(UnixSeconds::new(1000)),
+        );
+        let mut entry = KvEntry::tombstone(1);
+        entry.ids.insert(
+            "sharedid.example.com".to_owned(),
+            KvPartnerId::from_eids(
+                vec![KvEid::new(EidFields::default(), vec![uid])],
+                UnixSeconds::new(500),
+            )
+            .expect("should build record"),
+        );
+        let sources = [SourceDomain::try_from("sharedid.example.com").expect("should parse")];
+        let owner = ProviderId::new("sharedid");
+
+        // Act
+        let eids = generate_holding(
+            &*provider,
+            OwnedEntries::new(Some(&entry), &sources, &owner),
+        )
+        .expect("should generate an ID");
+
+        // Assert
+        assert_eq!(
+            eids[0].uids[0].id, "11111111-2222-4333-8444-555555555555",
+            "should keep the held ID rather than mint a new one"
         );
     }
 
